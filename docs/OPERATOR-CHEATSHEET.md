@@ -32,6 +32,7 @@ ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
 ./scripts/verify-controller.sh
 ssh worker '/opt/engineering-control/source/scripts/verify-worker.sh'
 ./scripts/verify-end-to-end.sh
+./scripts/validate-temporal-lifecycle.py
 ```
 
 ## Operate

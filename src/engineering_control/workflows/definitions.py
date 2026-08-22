@@ -8,6 +8,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 from engineering_control.workflows.inputs import (
+    AcceptanceLifecycleInput,
     AuditCampaignInput,
     CleanupInput,
     FindingVerificationInput,
@@ -336,6 +337,34 @@ class CleanupWorkflow(ControlledWorkflow):
         return {"status": "COMPLETE", "result": result}
 
 
+@workflow.defn(name="AcceptanceLifecycleWorkflow")
+class AcceptanceLifecycleWorkflow(ControlledWorkflow):
+    """Synthetic end-to-end lifecycle used only by the explicit validation worker."""
+
+    @workflow.run
+    async def run(self, request: AcceptanceLifecycleInput) -> dict[str, Any]:
+        context: dict[str, Any] = asdict(request)
+        for step, timeout in (
+            ("acceptance.project_snapshot", 2),
+            ("acceptance.worktree", 2),
+            ("acceptance.maker", 2),
+            ("acceptance.checker", 2),
+            ("acceptance.evidence", 2),
+            ("acceptance.transition", 2),
+        ):
+            if not await self._checkpoint(step.upper().replace(".", "_")):
+                return {"status": "CANCELLED", **context}
+            context = await workflow.execute_activity(
+                step,
+                context,
+                task_queue="engineering-acceptance",
+                start_to_close_timeout=timedelta(minutes=timeout),
+                heartbeat_timeout=timedelta(seconds=10),
+                retry_policy=ACTIVITY_RETRY,
+            )
+        return context
+
+
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     FindingVerificationWorkflow,
@@ -346,4 +375,5 @@ ALL_WORKFLOWS = [
     RecoveryWorkflow,
     QuotaRefreshWorkflow,
     CleanupWorkflow,
+    AcceptanceLifecycleWorkflow,
 ]

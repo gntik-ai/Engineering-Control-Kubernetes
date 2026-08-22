@@ -78,6 +78,8 @@ def parser() -> argparse.ArgumentParser:
     rollback.add_argument("deployment_id")
     rollback.add_argument("artifact_binding_sha256")
     rollback.add_argument("--execute", action="store_true")
+    validation = commands.add_parser("validate-lifecycle")
+    validation.add_argument("--hold-seconds", type=int, default=5)
     return root
 
 
@@ -141,6 +143,12 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "expected_artifact_binding_sha256": arguments.artifact_binding_sha256,
                 "dry_run": not arguments.execute,
             },
+        )
+    if command == "validate-lifecycle":
+        return client.request(
+            "POST",
+            "/v1/validation/lifecycle",
+            {"hold_seconds": arguments.hold_seconds},
         )
     raise ValueError(f"unsupported command: {command}")
 

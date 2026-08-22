@@ -68,3 +68,10 @@ class QuotaRefreshInput:
 class CleanupInput:
     dry_run: bool = True
     retention_policy: str = "standard"
+
+
+@dataclass
+class AcceptanceLifecycleInput:
+    change_set_id: str
+    validation_root: str
+    hold_seconds: int = 5

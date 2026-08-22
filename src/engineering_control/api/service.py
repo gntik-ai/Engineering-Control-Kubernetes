@@ -7,6 +7,7 @@ from uuid import uuid4
 from temporalio.client import Client
 
 from engineering_control.api.schemas import (
+    AcceptanceLifecycleStart,
     ApprovalRecord,
     CampaignStart,
     DeliveryStart,
@@ -17,6 +18,7 @@ from engineering_control.api.schemas import (
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.workflows.inputs import (
+    AcceptanceLifecycleInput,
     AuditCampaignInput,
     IssueDeliveryInput,
     RecoveryInput,
@@ -33,6 +35,9 @@ class ControlService(Protocol):
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]: ...
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
+    async def start_acceptance(
+        self, request: AcceptanceLifecycleStart, validation_root: str
+    ) -> OperationAccepted: ...
 
 
 class TemporalControlService:
@@ -129,3 +134,22 @@ class TemporalControlService:
             "status": description.status.name if description.status is not None else "UNKNOWN",
             "workflow_type": description.workflow_type,
         }
+
+    async def start_acceptance(
+        self, request: AcceptanceLifecycleStart, validation_root: str
+    ) -> OperationAccepted:
+        change_set_id = uuid4()
+        workflow_id = f"acceptance-{change_set_id}"
+        handle = await self.client.start_workflow(
+            WorkflowName.ACCEPTANCE_LIFECYCLE.value,
+            AcceptanceLifecycleInput(
+                change_set_id=str(change_set_id),
+                validation_root=validation_root,
+                hold_seconds=request.hold_seconds,
+            ),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )

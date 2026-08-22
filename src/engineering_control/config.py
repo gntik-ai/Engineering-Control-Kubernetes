@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     mirror_root: Path = Path("/srv/engineering/mirrors")
     worktree_root: Path = Path("/srv/engineering/worktrees")
     run_root: Path = Path("/srv/engineering/runs")
+    acceptance_root: Path = Path("/srv/engineering/tmp/acceptance")
     lease_root: Path = Path("/var/lib/engineering-control/leases")
     log_level: str = "INFO"
     synthetic_mode: bool = False

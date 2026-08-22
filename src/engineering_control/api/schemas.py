@@ -58,3 +58,7 @@ class OperationAccepted(APIModel):
 class RecordList(APIModel):
     items: list[dict[str, Any]]
     next_cursor: str | None = None
+
+
+class AcceptanceLifecycleStart(APIModel):
+    hold_seconds: int = Field(default=5, ge=1, le=30)

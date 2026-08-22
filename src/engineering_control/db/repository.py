@@ -12,9 +12,12 @@ from engineering_control.api.schemas import ApprovalRecord, CampaignStart, Deliv
 from engineering_control.db.models import (
     Approval,
     ApprovalCandidate,
+    Artifact,
     Campaign,
     ChangeSet,
+    Deployment,
     Finding,
+    QuotaSnapshot,
     Run,
 )
 
@@ -42,6 +45,9 @@ class MetadataRepository(Protocol):
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
     async def list_findings(self, limit: int) -> list[dict[str, Any]]: ...
+    async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None: ...
+    async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None: ...
+    async def latest_quota_snapshots(self) -> dict[str, dict[str, Any]]: ...
     async def workflow_for_change_set(self, change_set_id: UUID) -> str | None: ...
     async def current_approval_candidate(self, change_set_id: UUID) -> dict[str, Any] | None: ...
     async def persist_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
@@ -137,6 +143,36 @@ class SQLMetadataRepository:
             ).all()
             return [serialize_row(row) for row in rows]
 
+    async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_artifact, artifact_id)
+
+    def _get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            row = session.get(Artifact, artifact_id)
+            return serialize_row(row) if row else None
+
+    async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_deployment, deployment_id)
+
+    def _get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            row = session.get(Deployment, deployment_id)
+            return serialize_row(row) if row else None
+
+    async def latest_quota_snapshots(self) -> dict[str, dict[str, Any]]:
+        return await asyncio.to_thread(self._latest_quota_snapshots)
+
+    def _latest_quota_snapshots(self) -> dict[str, dict[str, Any]]:
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(QuotaSnapshot).order_by(QuotaSnapshot.captured_at.desc())
+            ).all()
+            latest: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                if row.provider not in latest:
+                    latest[row.provider] = serialize_row(row)
+            return latest
+
     async def workflow_for_change_set(self, change_set_id: UUID) -> str | None:
         return await asyncio.to_thread(self._workflow_for_change_set, change_set_id)
 
@@ -217,6 +253,15 @@ class EmptyMetadataRepository:
 
     async def list_findings(self, limit: int) -> list[dict[str, Any]]:
         return []
+
+    async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None:
+        return None
+
+    async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None:
+        return None
+
+    async def latest_quota_snapshots(self) -> dict[str, dict[str, Any]]:
+        return {}
 
     async def workflow_for_change_set(self, change_set_id: UUID) -> str | None:
         return None

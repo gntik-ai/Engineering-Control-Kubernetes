@@ -11,3 +11,4 @@ class WorkflowName(StrEnum):
     RECOVERY = "RecoveryWorkflow"
     QUOTA_REFRESH = "QuotaRefreshWorkflow"
     CLEANUP = "CleanupWorkflow"
+    ACCEPTANCE_LIFECYCLE = "AcceptanceLifecycleWorkflow"

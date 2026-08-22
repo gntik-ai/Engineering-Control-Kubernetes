@@ -13,6 +13,7 @@ from temporalio.client import Client
 
 from engineering_control.api.auth import bearer_auth
 from engineering_control.api.schemas import (
+    AcceptanceLifecycleStart,
     ApprovalRecord,
     CampaignStart,
     DeliveryStart,
@@ -211,13 +212,59 @@ def create_app(
     ) -> OperationAccepted:
         return await service.rollback(body)
 
+    @app.get("/v1/deployments/{deployment_id}")
+    async def deployment_get(
+        deployment_id: UUID,
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        deployment = await repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise HTTPException(status_code=404, detail="deployment not found")
+        return deployment
+
     @app.get("/v1/usage")
-    async def usage_get(_subject: str = auth_dependency) -> dict[str, Any]:
-        return {"codex": {"capacity": None}, "claude": {"capacity": None}}
+    async def usage_get(
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        snapshots = await repository.latest_quota_snapshots()
+        return {
+            provider: snapshots.get(
+                provider,
+                {
+                    "provider": provider,
+                    "remaining_capacity": None,
+                    "total_capacity": None,
+                    "reset_at": None,
+                    "running_jobs": 0,
+                    "rate_limited": False,
+                    "source": "not-reported",
+                },
+            )
+            for provider in ("codex", "claude")
+        }
 
     @app.get("/v1/evidence/{artifact_id}")
-    async def evidence_get(artifact_id: str, _subject: str = auth_dependency) -> dict[str, str]:
-        return {"artifact_id": artifact_id, "status": "METADATA_ONLY"}
+    async def evidence_get(
+        artifact_id: UUID,
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        artifact = await repository.get_artifact(artifact_id)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        return artifact
+
+    @app.post("/v1/validation/lifecycle", response_model=OperationAccepted, status_code=202)
+    async def validation_lifecycle(
+        body: AcceptanceLifecycleStart,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        if not resolved.synthetic_mode:
+            raise HTTPException(status_code=404, detail="synthetic validation is disabled")
+        return await service.start_acceptance(body, str(resolved.acceptance_root))
 
     metrics = make_asgi_app()
     app.mount("/internal/metrics", metrics)
