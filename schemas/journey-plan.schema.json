@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engineering.gntik.ai/schemas/journey-plan.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["start_url", "allowed_origins", "steps"],
+  "properties": {
+    "start_url": {"type": "string", "pattern": "^https?://[^\\s]+$", "maxLength": 2048},
+    "allowed_origins": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$",
+        "maxLength": 300
+      }
+    },
+    "browser": {"type": "string", "enum": ["chromium", "firefox"]},
+    "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 120000},
+    "capture_visual_evidence": {"type": "boolean"},
+    "steps": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "role", "name"],
+            "properties": {
+              "action": {"const": "click"},
+              "role": {"type": "string", "minLength": 1, "maxLength": 80},
+              "name": {"type": "string", "minLength": 1, "maxLength": 300}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "label", "value_from_env"],
+            "properties": {
+              "action": {"const": "fill"},
+              "label": {"type": "string", "minLength": 1, "maxLength": 300},
+              "value_from_env": {
+                "type": "string",
+                "pattern": "^JOURNEY_[A-Z0-9_]+$",
+                "maxLength": 100
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "path_contains"],
+            "properties": {
+              "action": {"const": "expect-url"},
+              "path_contains": {"type": "string", "minLength": 1, "maxLength": 1000}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "text"],
+            "properties": {
+              "action": {"const": "wait-for-text"},
+              "text": {"type": "string", "minLength": 1, "maxLength": 1000},
+              "exact": {"type": "boolean"}
+            }
+          }
+        ]
+      }
+    }
+  }
+}

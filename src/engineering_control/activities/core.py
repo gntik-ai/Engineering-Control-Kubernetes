@@ -12,9 +12,11 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
 
+from .browser import BrowserActivityHandler
 from .metadata import MetadataActivityHandler
 from .provider import ProviderActivityHandler
 from .release import ReleaseActivityHandler
+from .scan import ScanActivityHandler
 
 
 class ControlActivities:
@@ -135,6 +137,10 @@ class ControlActivities:
         self.metadata_handler = (
             MetadataActivityHandler(settings) if self.worker_kind == "controller" else None
         )
+        self.browser_handler = (
+            BrowserActivityHandler(settings) if self.worker_kind == "browser" else None
+        )
+        self.scan_handler = ScanActivityHandler(settings) if self.worker_kind == "scan" else None
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -166,6 +172,10 @@ class ControlActivities:
             return await self.provider_handler.handle(step, safe_payload)
         if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:
             return await self.metadata_handler.handle(step, safe_payload)
+        if self.browser_handler is not None:
+            return await self.browser_handler.handle(step, safe_payload)
+        if self.scan_handler is not None:
+            return await self.scan_handler.handle(step, safe_payload)
         if self.settings.synthetic_mode or self.worker_kind == "synthetic":
             return self._synthetic_step(step, safe_payload)
         raise ApplicationError(

@@ -85,7 +85,45 @@ class GitWorktreeManager:
 
     def fetch(self, repository: str) -> None:
         mirror = self.verify_mirror(repository)
-        self._run(["git", "fetch", "--prune", "origin"], mirror, timeout=900)
+        # Never use a mirror clone's default +refs/*:refs/* refspec here: pruning it can
+        # delete the agent branch that backs an active linked worktree.
+        self._run(
+            [
+                "git",
+                "fetch",
+                "--prune",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            mirror,
+            timeout=900,
+        )
+
+    @staticmethod
+    def _fetched_ref(base_ref: str) -> str:
+        prefix = "refs/heads/"
+        if base_ref.startswith(prefix):
+            return f"refs/remotes/origin/{base_ref.removeprefix(prefix)}"
+        return base_ref
+
+    def snapshot(self, repository: str, *, base_ref: str, expected_sha: str) -> dict[str, str]:
+        if not re.fullmatch(r"[a-f0-9]{40}", expected_sha):
+            raise ValueError("expected snapshot SHA must contain 40 hexadecimal characters")
+        mirror = self.verify_mirror(repository)
+        self.fetch(repository)
+        fetched_ref = self._fetched_ref(base_ref)
+        actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
+        if actual != expected_sha:
+            raise WorktreeError(
+                f"snapshot SHA mismatch for {repository}: expected {expected_sha}, got {actual}"
+            )
+        return {
+            "repository": repository,
+            "mirror": str(mirror),
+            "base_ref": fetched_ref,
+            "sha": actual,
+        }
 
     def allocate(
         self,
@@ -105,7 +143,8 @@ class GitWorktreeManager:
         lease = FileLease(self.lease_root, f"{repository}/{change_set_id}", owner)
         with lease:
             self.fetch(repository)
-            actual = self._run(["git", "rev-parse", f"{base_ref}^{{commit}}"], mirror)
+            fetched_ref = self._fetched_ref(base_ref)
+            actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
             if actual != expected_base_sha:
                 raise WorktreeError(
                     f"base SHA mismatch for {repository}: expected {expected_base_sha}, "
@@ -113,12 +152,20 @@ class GitWorktreeManager:
                 )
             repo_slug = self._slug(repository)
             target = self.worktree_root / repo_slug / str(change_set_id)
-            if target.exists():
-                raise WorktreeError(
-                    f"worktree target already exists and will not be reused: {target}"
-                )
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
             branch = f"agent/{self._slug(project)}/{self._slug(issue)}/{str(change_set_id)}"
+            if target.exists():
+                actual_head = self._run(["git", "rev-parse", "HEAD"], target)
+                actual_branch = self._run(["git", "branch", "--show-current"], target)
+                if actual_head != expected_base_sha or actual_branch != branch:
+                    raise WorktreeError(
+                        f"existing worktree does not match the ChangeSet allocation: {target}"
+                    )
+                if self.is_dirty(target):
+                    raise WorktreeError(
+                        f"existing worktree is dirty and will not be reused: {target}"
+                    )
+                return WorktreeAllocation(repository, target, branch, actual, change_set_id)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
             self._run(
                 ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha],
                 mirror,

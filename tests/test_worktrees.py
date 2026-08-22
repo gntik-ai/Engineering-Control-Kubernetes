@@ -63,6 +63,33 @@ def test_allocate_and_cleanup_clean_worktree(tmp_path: Path) -> None:
     assert not allocation.path.exists()
 
 
+def test_allocation_retry_reuses_only_same_clean_changeset(tmp_path: Path) -> None:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    change_set_id = uuid4()
+    first = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="125",
+        change_set_id=change_set_id,
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    second = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="125",
+        change_set_id=change_set_id,
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    assert second == first
+
+
 def test_dirty_worktree_is_protected(tmp_path: Path) -> None:
     mirror_root, sha = create_mirror(tmp_path)
     manager = GitWorktreeManager(

@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     helm_executable: Path = Path("/usr/local/bin/helm")
     argocd_executable: Path = Path("/usr/local/bin/argocd")
     release_credential_root: Path = Path("/etc/engineering-control/env/release")
+    node_executable: Path = Path("/usr/local/bin/node")
+    browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
+    journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
+    journey_plan_root: Path = Path("/etc/engineering-control/journeys")
+    browser_credential_root: Path = Path("/etc/engineering-control/env/browser")
+    browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
     acceptance_root: Path = Path("/srv/engineering/tmp/acceptance")
     lease_root: Path = Path("/var/lib/engineering-control/leases")
     log_level: str = "INFO"

@@ -41,7 +41,10 @@ done
 
 install -d -o root -g root -m 0755 "${INSTALL_ROOT}/releases" "${CLI_ROOT}"
 install -d -o root -g root -m 0755 "${CONFIG_ROOT}"
-install -d -o root -g root -m 0750 "${CONFIG_ROOT}/env"
+install -d -o root -g root -m 0711 "${CONFIG_ROOT}/env"
+install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/journeys"
+install -d -o browser-runner -g browser-runner -m 0700 "${CONFIG_ROOT}/env/browser"
+install -d -o release-runner -g release-runner -m 0700 "${CONFIG_ROOT}/env/release"
 install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
 install -d -o root -g root -m 0711 \
   "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \

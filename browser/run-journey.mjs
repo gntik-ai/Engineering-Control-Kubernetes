@@ -6,6 +6,7 @@ const allowedBrowsers = new Map([
   ["chromium", chromium],
   ["firefox", firefox],
 ]);
+const allowedActions = new Set(["click", "fill", "expect-url", "wait-for-text"]);
 
 function required(name) {
   const value = process.env[name];
@@ -15,19 +16,31 @@ function required(name) {
 
 const planPath = required("ENGINEERING_JOURNEY_PLAN");
 const outputRoot = path.resolve(required("ENGINEERING_JOURNEY_OUTPUT"));
-const credentialPath = process.env.ENGINEERING_JOURNEY_CREDENTIAL_FILE;
 const plan = JSON.parse(await fs.readFile(planPath, "utf8"));
 if (!Array.isArray(plan.allowed_origins) || !plan.allowed_origins.length) {
   throw new Error("journey plan requires allowed_origins");
 }
+if (!Array.isArray(plan.steps) || plan.steps.length > 100) {
+  throw new Error("journey plan requires at most 100 bounded steps");
+}
+const origins = new Set(plan.allowed_origins.map((value) => new URL(value).origin));
 const target = new URL(plan.start_url);
-if (!plan.allowed_origins.includes(target.origin)) {
-  throw new Error("start_url is outside the journey allowlist");
+if (!origins.has(target.origin)) throw new Error("start_url is outside the journey allowlist");
+for (const step of plan.steps) {
+  if (!allowedActions.has(step.action)) throw new Error("unsupported journey action");
+  if (step.action === "fill") {
+    if (
+      typeof step.value_from_env !== "string" ||
+      !/^JOURNEY_[A-Z0-9_]+$/.test(step.value_from_env)
+    ) {
+      throw new Error("fill actions require a JOURNEY_* credential environment reference");
+    }
+    if (Object.hasOwn(step, "value")) throw new Error("literal fill values are forbidden");
+  }
 }
-if (credentialPath) {
-  await fs.access(credentialPath);
-}
-await fs.mkdir(outputRoot, { recursive: true, mode: 0o750 });
+const usesCredentials = plan.steps.some((step) => step.action === "fill");
+const captureVisualEvidence = !usesCredentials && plan.capture_visual_evidence !== false;
+await fs.mkdir(outputRoot, { recursive: true, mode: 0o700 });
 
 const browserType = allowedBrowsers.get(plan.browser || "chromium");
 if (!browserType) throw new Error("unsupported browser");
@@ -36,41 +49,86 @@ const context = await browser.newContext({
   ignoreHTTPSErrors: false,
   serviceWorkers: "block",
 });
-await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+await context.route("**/*", async (route) => {
+  let origin;
+  try {
+    origin = new URL(route.request().url()).origin;
+  } catch {
+    await route.abort("blockedbyclient");
+    return;
+  }
+  if (origins.has(origin)) await route.continue();
+  else await route.abort("blockedbyclient");
+});
+if (captureVisualEvidence) {
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
+}
 const page = await context.newPage();
 const consoleEvents = [];
 const networkEvents = [];
-page.on("console", (message) => consoleEvents.push({ type: message.type(), text: message.text() }));
+page.on("console", (message) => {
+  if (consoleEvents.length < 5000) {
+    consoleEvents.push({ type: message.type(), text: message.text().slice(0, 4000) });
+  }
+});
 page.on("response", (response) => {
-  const url = new URL(response.url());
-  networkEvents.push({ origin: url.origin, path: url.pathname, status: response.status() });
+  if (networkEvents.length < 5000) {
+    const url = new URL(response.url());
+    networkEvents.push({ origin: url.origin, path: url.pathname, status: response.status() });
+  }
 });
 
 let status = "PASS";
 let error = null;
 try {
-  await page.goto(plan.start_url, { waitUntil: "networkidle", timeout: plan.timeout_ms || 30000 });
-  for (const step of plan.steps || []) {
-    if (step.action === "click") await page.getByRole(step.role, { name: step.name }).click();
-    else if (step.action === "fill") await page.getByLabel(step.label).fill(step.value_from_env ? required(step.value_from_env) : step.value);
-    else if (step.action === "expect-url") {
-      if (!page.url().includes(step.contains)) throw new Error("URL expectation failed");
-    } else throw new Error(`unsupported journey action: ${step.action}`);
+  await page.goto(plan.start_url, {
+    waitUntil: "networkidle",
+    timeout: Math.min(Math.max(plan.timeout_ms || 30000, 1000), 120000),
+  });
+  for (const step of plan.steps) {
+    if (step.action === "click") {
+      await page.getByRole(step.role, { name: step.name }).click();
+    } else if (step.action === "fill") {
+      await page.getByLabel(step.label).fill(required(step.value_from_env));
+    } else if (step.action === "expect-url") {
+      const current = new URL(page.url());
+      if (!origins.has(current.origin) || !current.pathname.includes(step.path_contains)) {
+        throw new Error("URL expectation failed");
+      }
+    } else if (step.action === "wait-for-text") {
+      await page.getByText(step.text, { exact: Boolean(step.exact) }).waitFor();
+    }
   }
-  await page.screenshot({ path: path.join(outputRoot, "final.png"), fullPage: true });
+  if (captureVisualEvidence) {
+    await page.screenshot({ path: path.join(outputRoot, "final.png"), fullPage: true });
+  }
 } catch (caught) {
   status = "FAIL";
   error = caught instanceof Error ? caught.message : "journey failed";
-  await page.screenshot({ path: path.join(outputRoot, "failure.png"), fullPage: true });
+  if (captureVisualEvidence) {
+    await page.screenshot({ path: path.join(outputRoot, "failure.png"), fullPage: true });
+  }
 } finally {
-  await context.tracing.stop({ path: path.join(outputRoot, "trace.zip") });
+  if (captureVisualEvidence) {
+    await context.tracing.stop({ path: path.join(outputRoot, "trace.zip") });
+  }
   await context.close();
   await browser.close();
 }
 
 await fs.writeFile(
   path.join(outputRoot, "result.json"),
-  JSON.stringify({ status, error, console: consoleEvents, network: networkEvents }, null, 2),
-  { mode: 0o640 },
+  JSON.stringify(
+    {
+      status,
+      error,
+      console: consoleEvents,
+      network: networkEvents,
+      visual_evidence: captureVisualEvidence ? "CAPTURED" : "DISABLED_CREDENTIAL_SAFETY",
+    },
+    null,
+    2,
+  ),
+  { mode: 0o600 },
 );
 if (status !== "PASS") process.exitCode = 1;
