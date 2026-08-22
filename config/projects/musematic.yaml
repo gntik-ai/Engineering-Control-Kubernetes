@@ -1,0 +1,43 @@
+version: 1
+project: musematic
+source:
+  repository: gntik-ai/musematic
+  default_branch: main
+  discovered_controller_path: /home/hermes/projects/musematic
+  discovered_head: 3e609bd80c10a7645cea3a1bb62e0f59392806c8
+deployment:
+  repository: gntik-ai/musematic-deploy
+  default_branch: main
+  strategy: argocd-gitops
+  discovered_controller_path: /home/hermes/projects/musematic-deploy
+  discovered_head: 419aebf8d1269a178dff3ba0a2974c311c67d0c9
+  adapter: engineering_control.adapters.musematic.gitops.MusematicGitOpsAdapter
+  required_gates:
+    - protected-deployment-pr
+    - immutable-image-digests
+    - approved-git-sha
+    - argocd-observed-revision
+    - post-sync-verification
+  prohibited:
+    - newest-build-promotion
+    - latest-tag-promotion
+    - direct-main-image-writeback
+    - undocumented-live-kubernetes-patch
+    - llm-direct-argocd-sync
+components:
+  - musematic:control-plane
+  - musematic:runtime-controller
+  - musematic:web
+  - musematic:deploy:staging
+security_blockers:
+  - id: SECURITY_BLOCKER_MUSEMATIC_GIT_SECRETS
+    source_write_enablement: false
+    deployment_write_enablement: false
+    remediation: rotate credentials and remove them from current Git state/history through an R3 ChangeSet
+  - id: SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY
+    write_enablement: false
+    remediation: provision scoped observer and GitOps verification identities
+discovered_argocd_risk:
+  image_updater_strategy: newest-build
+  writeback_target: main
+  status: MUST_BE_REPLACED_BEFORE_PROMOTION_ENABLEMENT

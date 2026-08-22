@@ -1,0 +1,15 @@
+version: 1
+reserve_fraction: 0.25
+providers: [codex, claude]
+model_classes: [scout, routine, worker, judge]
+routing:
+  implementation: [codex, claude]
+  architecture_spec: [claude, codex]
+  review: opposite-provider
+  security_high_risk: both-providers
+fallback:
+  paid_api: false
+  silent_provider_switch: false
+on_exhaustion:
+  status: RATE_LIMITED
+  persist_handoff: true

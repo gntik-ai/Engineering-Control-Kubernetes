@@ -1,0 +1,32 @@
+version: 1
+environment: production
+api:
+  bind: 127.0.0.1
+  port: 8740
+  authentication: bearer-token-file
+  token_file: /etc/engineering-control/env/api.token
+  arbitrary_shell: false
+temporal:
+  target: 127.0.0.1:7233
+  namespace: engineering-control
+  task_queue: engineering-control
+postgresql:
+  host: 127.0.0.1
+  port: 55432
+  database: engineering_control
+  credentials_from: /etc/engineering-control/env/database.env
+evidence:
+  root: /srv/engineering/evidence
+  retention_policy: standard
+  redact_before_persist: true
+repositories:
+  mirrors: /srv/engineering/mirrors
+  worktrees: /srv/engineering/worktrees
+runtime:
+  runs: /srv/engineering/runs
+  cache: /srv/engineering/cache
+  temporary: /srv/engineering/tmp
+  state: /var/lib/engineering-control
+  logs: journald
+paid_api_fallback:
+  enabled: false

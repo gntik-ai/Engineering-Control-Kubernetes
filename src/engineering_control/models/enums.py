@@ -1,0 +1,109 @@
+from enum import StrEnum
+
+
+class Project(StrEnum):
+    FALCONE = "falcone"
+    MUSEMATIC = "musematic"
+
+
+class Provider(StrEnum):
+    CODEX = "codex"
+    CLAUDE = "claude"
+
+
+class ModelClass(StrEnum):
+    SCOUT = "scout"
+    ROUTINE = "routine"
+    WORKER = "worker"
+    JUDGE = "judge"
+
+
+class RunStatus(StrEnum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    RATE_LIMITED = "RATE_LIMITED"
+    CANCELLED = "CANCELLED"
+    TIMED_OUT = "TIMED_OUT"
+    BLOCKED = "BLOCKED"
+
+
+class RiskClass(StrEnum):
+    R0 = "R0"
+    R1 = "R1"
+    R2 = "R2"
+    R3 = "R3"
+
+
+class CoverageStatus(StrEnum):
+    NOT_STARTED = "NOT_STARTED"
+    IN_PROGRESS = "IN_PROGRESS"
+    CANDIDATE_FOUND = "CANDIDATE_FOUND"
+    BLOCKED = "BLOCKED"
+    NO_FINDING = "NO_FINDING"
+    CONFIRMED_FINDING = "CONFIRMED_FINDING"
+    RETEST_REQUIRED = "RETEST_REQUIRED"
+    VERIFIED_FIXED = "VERIFIED_FIXED"
+
+
+class FindingDisposition(StrEnum):
+    CANDIDATE = "CANDIDATE"
+    CONFIRMED = "CONFIRMED"
+    REJECTED = "REJECTED"
+    FLAKY = "FLAKY"
+    BLOCKED = "BLOCKED"
+    DUPLICATE = "DUPLICATE"
+
+
+class ChangeSetState(StrEnum):
+    CANDIDATE = "CANDIDATE"
+    REJECTED = "REJECTED"
+    BLOCKED = "BLOCKED"
+    CONFIRMED = "CONFIRMED"
+    PLANNED = "PLANNED"
+    IMPLEMENTING = "IMPLEMENTING"
+    SOURCE_PR = "SOURCE_PR"
+    CI_VALIDATED = "CI_VALIDATED"
+    CANDIDATE_BUILT = "CANDIDATE_BUILT"
+    PREVIEW_DEPLOYED = "PREVIEW_DEPLOYED"
+    PREVIEW_VERIFIED = "PREVIEW_VERIFIED"
+    SOURCE_MERGED = "SOURCE_MERGED"
+    FINAL_ARTIFACT_BUILT = "FINAL_ARTIFACT_BUILT"
+    DEPLOY_PR = "DEPLOY_PR"
+    AWAITING_STAGING_APPROVAL = "AWAITING_STAGING_APPROVAL"
+    STAGING_APPROVED = "STAGING_APPROVED"
+    STAGING_DEPLOYED = "STAGING_DEPLOYED"
+    RUNTIME_VERIFIED = "RUNTIME_VERIFIED"
+    ISSUE_CLOSED = "ISSUE_CLOSED"
+    REQUEST_CHANGES = "REQUEST_CHANGES"
+    SUPERSEDED = "SUPERSEDED"
+    CANCELLED = "CANCELLED"
+    DEPLOYMENT_FAILED = "DEPLOYMENT_FAILED"
+    ROLLED_BACK = "ROLLED_BACK"
+    FORWARD_RECOVERY_REQUIRED = "FORWARD_RECOVERY_REQUIRED"
+    INCIDENT_OPEN = "INCIDENT_OPEN"
+
+
+class AuditLens(StrEnum):
+    CORRECTNESS = "correctness"
+    CONTRACT = "contract"
+    SECURITY = "security"
+    AUTHORIZATION = "authorization"
+    TENANT_ISOLATION = "tenant-isolation"
+    RELIABILITY = "reliability"
+    DATA_LIFECYCLE = "data-lifecycle"
+    PERFORMANCE = "performance"
+    UX = "ux"
+    ACCESSIBILITY = "accessibility"
+    OBSERVABILITY = "observability"
+    OPERATIONS = "operations"
+    DEPLOYMENT = "deployment"
+    SUPPLY_CHAIN = "supply-chain"
+    DOCUMENTATION = "documentation"
+
+
+class RedactionStatus(StrEnum):
+    NOT_REQUIRED = "NOT_REQUIRED"
+    REDACTED = "REDACTED"
+    REJECTED = "REJECTED"

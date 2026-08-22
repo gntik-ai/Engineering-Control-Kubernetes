@@ -1,0 +1,63 @@
+# Operator cheatsheet
+
+## Before activation
+
+```bash
+less /home/hermes/engineering-bootstrap/INVENTORY-SUMMARY.md
+less /home/hermes/engineering-bootstrap/SECURITY-REPORT.md
+less /home/hermes/engineering-bootstrap/CLEANUP-PLAN.md
+```
+
+Cleanup requires the exact operator response `APPROVE CLEANUP`. Remote repository creation,
+credential rotation, and real staging deployment require separate authorization.
+
+## Bootstrap
+
+```bash
+cd /home/hermes/engineering/engineering-control
+sudo ./scripts/bootstrap-controller.sh
+ssh worker 'cd /home/hermes/engineering/engineering-control && sudo ./scripts/bootstrap-worker.sh'
+```
+
+## Manual provider authentication
+
+```bash
+ssh -t worker 'sudo -u codex-runner -H /usr/local/bin/codex login'
+ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
+```
+
+## Verify
+
+```bash
+./scripts/verify-controller.sh
+ssh worker '/opt/engineering-control/source/scripts/verify-worker.sh'
+./scripts/verify-end-to-end.sh
+```
+
+## Operate
+
+```bash
+engineering-ctl campaigns --limit 20
+engineering-ctl findings --limit 20
+engineering-ctl status <workflow-id>
+engineering-ctl pause <workflow-id>
+engineering-ctl resume <workflow-id>
+engineering-ctl cancel <workflow-id>
+engineering-ctl usage
+engineering-ctl evidence <artifact-id>
+engineering-ctl delivery <finding-uuid> --risk R1
+engineering-ctl approve <change-set-uuid> <binding-sha256>
+engineering-ctl rollback <deployment-uuid> <binding-sha256>
+```
+
+Commands default to dry-run where applicable. Use `--execute` only after all corresponding write,
+approval, and credential gates are satisfied.
+
+## Service control
+
+```bash
+sudo systemctl status engineering-api engineering-temporal-worker
+sudo systemctl restart engineering-api
+sudo journalctl -u engineering-api -f
+ssh worker 'sudo systemctl restart engineering-worker@codex'
+```

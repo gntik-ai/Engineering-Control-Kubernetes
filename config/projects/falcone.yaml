@@ -1,0 +1,35 @@
+version: 1
+project: falcone
+source:
+  repository: gntik-ai/falcone
+  default_branch: main
+  discovered_controller_path: /home/hermes/projects/falcone
+  discovered_head: 3ecc86496e6fa121910471f893a44017aa75fb78
+deployment:
+  repository: gntik-ai/falcone-charts
+  default_branch: main
+  strategy: helm
+  discovered_controller_path: /home/hermes/projects/falcone-charts
+  discovered_head: 95dd05540ae04815051c77ecf2a426d27af4f373
+  adapter: engineering_control.adapters.falcone.release.FalconeHelmAdapter
+  required_gates:
+    - chart-lint
+    - chart-template
+    - immutable-image-digests
+    - migration-parity
+    - real-backup-evidence-when-required
+    - independent-release-review
+    - immutable-approval-binding
+  prohibited:
+    - fake-backup-evidence
+    - migration-safety-bypass
+    - llm-direct-helm
+components:
+  - falcone:control-plane
+  - falcone:gateway
+  - falcone:web-console
+  - falcone:charts:staging
+security_blockers:
+  - id: SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY
+    write_enablement: false
+    remediation: provision scoped observer and Falcone release identities

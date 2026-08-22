@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engineering.gntik.ai/schemas/handoff.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "provider", "role", "status", "files"],
+  "properties": {
+    "run_id": {"type": "string", "format": "uuid"},
+    "provider": {"enum": ["codex", "claude"]},
+    "role": {"type": "string"},
+    "status": {"const": "RATE_LIMITED"},
+    "files": {
+      "type": "array",
+      "items": {"enum": ["TASK.md", "CONTEXT.json", "DECISIONS.md", "SOURCE-REFS.json", "DIFF.patch", "TEST-RESULTS.json", "OPEN-QUESTIONS.md"]},
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true
+    }
+  }
+}

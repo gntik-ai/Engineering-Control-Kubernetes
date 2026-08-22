@@ -1,0 +1,33 @@
+[Unit]
+Description=Engineering Control bounded %i worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i-runner
+Group=%i-runner
+WorkingDirectory=/var/lib/engineering-control/workers/%i
+EnvironmentFile=/etc/engineering-control/env/worker-common.env
+EnvironmentFile=-/etc/engineering-control/env/%i-worker.env
+Environment=ENGINEERING_WORKER_KIND=%i
+ExecStart=/opt/engineering-control/venv/bin/engineering-role-worker
+Restart=on-failure
+RestartSec=8
+TimeoutStopSec=60
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/engineering-control/workers/%i /srv/engineering/worktrees /srv/engineering/runs/%i /srv/engineering/evidence/%i /srv/engineering/cache/%i /srv/engineering/tmp/%i
+MemoryMax=3G
+CPUQuota=250%
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

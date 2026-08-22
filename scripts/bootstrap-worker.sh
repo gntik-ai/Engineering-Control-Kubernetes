@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+if [[ ${EUID} -ne 0 ]]; then
+  echo "Run on worker with sudo: sudo $0" >&2
+  exit 1
+fi
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+INSTALL_ROOT=/opt/engineering-control
+CONFIG_ROOT=/etc/engineering-control
+STATE_ROOT=/var/lib/engineering-control
+PLATFORM_ROOT=/srv/engineering
+CLI_ROOT=/opt/engineering-cli
+
+NODE_BIN=$(command -v node || true)
+NPM_BIN=$(command -v npm || true)
+if [[ -z "${NODE_BIN}" || -z "${NPM_BIN}" ]]; then
+  NODE_BIN=/home/hermes/.local/node-v22/bin/node
+  NPM_BIN=/home/hermes/.local/node-v22/bin/npm
+fi
+[[ -x "${NODE_BIN}" && -x "${NPM_BIN}" ]] || {
+  echo "Node.js 22 and npm are required before worker bootstrap" >&2
+  exit 1
+}
+for command_name in python3 git setfacl systemctl install; do
+  command -v "${command_name}" >/dev/null || {
+    echo "Required command missing: ${command_name}" >&2
+    exit 1
+  }
+done
+
+for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+  getent group "${identity}" >/dev/null || groupadd --system "${identity}"
+  id "${identity}" >/dev/null 2>&1 || useradd --system --create-home \
+    --home-dir "${STATE_ROOT}/identities/${identity}" --gid "${identity}" \
+    --shell /usr/sbin/nologin "${identity}"
+done
+
+install -d -o root -g root -m 0755 "${INSTALL_ROOT}/releases" "${CLI_ROOT}"
+install -d -o root -g root -m 0755 "${CONFIG_ROOT}"
+install -d -o root -g root -m 0750 "${CONFIG_ROOT}/env"
+install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
+install -d -o root -g root -m 0711 \
+  "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
+  "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
+for repository in falcone falcone-charts musematic musematic-deploy; do
+  install -d -o scan-runner -g scan-runner -m 0730 \
+    "${PLATFORM_ROOT}/worktrees/${repository}"
+done
+for kind in codex claude browser scan release; do
+  owner="${kind}-runner"
+  install -d -o "${owner}" -g "${owner}" -m 0750 "${STATE_ROOT}/workers/${kind}"
+  install -d -o "${owner}" -g "${owner}" -m 0700 \
+    "${PLATFORM_ROOT}/runs/${kind}" "${PLATFORM_ROOT}/evidence/${kind}" \
+    "${PLATFORM_ROOT}/cache/${kind}" "${PLATFORM_ROOT}/tmp/${kind}"
+done
+for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+  chmod 0700 "${STATE_ROOT}/identities/${identity}"
+  chown "${identity}:${identity}" "${STATE_ROOT}/identities/${identity}"
+done
+
+if git -C "${SOURCE_ROOT}" rev-parse --verify HEAD >/dev/null 2>&1; then
+  RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse HEAD)
+else
+  RELEASE_ID=uncommitted-bootstrap
+fi
+RELEASE_ROOT="${INSTALL_ROOT}/releases/${RELEASE_ID}"
+if [[ ! -d "${RELEASE_ROOT}/source" ]]; then
+  install -d -o root -g root -m 0755 "${RELEASE_ROOT}/source"
+  tar --exclude=.git --exclude=.venv -C "${SOURCE_ROOT}" -cf - . | \
+    tar -C "${RELEASE_ROOT}/source" -xf -
+fi
+ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
+python3 -m venv "${INSTALL_ROOT}/venv"
+"${INSTALL_ROOT}/venv/bin/pip" install --disable-pip-version-check --upgrade \
+  --constraint "${INSTALL_ROOT}/source/requirements.lock" "${INSTALL_ROOT}/source"
+"${INSTALL_ROOT}/source/scripts/install-scanners.sh"
+
+"${NPM_BIN}" install --prefix "${CLI_ROOT}" \
+  @openai/codex@0.149.0 @anthropic-ai/claude-code@2.1.239
+ln -sfn "${NODE_BIN}" /usr/local/bin/node
+ln -sfn "${CLI_ROOT}/node_modules/.bin/codex" /usr/local/bin/codex
+ln -sfn "${CLI_ROOT}/node_modules/.bin/claude" /usr/local/bin/claude
+
+install -d -o browser-runner -g browser-runner -m 0750 /opt/engineering-browser
+cp -a "${SOURCE_ROOT}/browser/." /opt/engineering-browser/
+cd /opt/engineering-browser
+"${NPM_BIN}" install --omit=dev
+"${NODE_BIN}" node_modules/@playwright/test/cli.js install-deps chromium firefox
+PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers \
+  "${NODE_BIN}" node_modules/@playwright/test/cli.js install chromium firefox
+chown -R browser-runner:browser-runner /opt/engineering-browser
+
+if [[ ! -f "${CONFIG_ROOT}/env/worker-common.env" ]]; then
+  {
+    printf 'ENGINEERING_ENVIRONMENT=production\n'
+    printf 'ENGINEERING_TEMPORAL_TARGET=10.10.0.2:7233\n'
+    printf 'ENGINEERING_TEMPORAL_NAMESPACE=engineering-control\n'
+    printf 'ENGINEERING_TEMPORAL_TASK_QUEUE=engineering-control\n'
+    printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
+    printf 'PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers\n'
+  } >"${CONFIG_ROOT}/env/worker-common.env"
+  chmod 0644 "${CONFIG_ROOT}/env/worker-common.env"
+fi
+
+install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/engineering-worker@.service" \
+  /etc/systemd/system/engineering-worker@.service
+install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/engineering-release-worker.service" \
+  /etc/systemd/system/engineering-release-worker.service
+systemd-analyze verify /etc/systemd/system/engineering-worker@.service \
+  /etc/systemd/system/engineering-release-worker.service
+systemctl daemon-reload
+systemctl enable --now engineering-worker@codex.service engineering-worker@claude.service \
+  engineering-worker@browser.service engineering-worker@scan.service \
+  engineering-release-worker.service
+
+if ! sudo -u codex-runner -H /usr/local/bin/codex login status >/dev/null 2>&1; then
+  touch "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"
+fi
+if ! sudo -u claude-runner -H /usr/local/bin/claude auth status >/dev/null 2>&1; then
+  touch "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"
+fi
+echo "Worker bootstrap completed; inspect MANUAL_AUTH_REQUIRED markers without copying credentials."

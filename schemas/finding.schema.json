@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engineering.gntik.ai/schemas/finding.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fingerprint", "project", "domain", "persona", "severity", "confidence", "risk_class",
+    "expected_behavior", "actual_behavior", "evidence", "minimal_reproduction",
+    "affected_source_sha", "affected_component", "recommended_action"
+  ],
+  "properties": {
+    "fingerprint": {"type": "string", "minLength": 16, "maxLength": 128},
+    "project": {"enum": ["falcone", "musematic"]},
+    "domain": {"type": "string"},
+    "persona": {"type": "string"},
+    "severity": {"enum": ["critical", "high", "medium", "low", "informational"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "risk_class": {"enum": ["R0", "R1", "R2", "R3"]},
+    "expected_behavior": {"type": "string"},
+    "actual_behavior": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "string"}},
+    "minimal_reproduction": {"type": "array", "items": {"type": "string"}},
+    "affected_source_sha": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "affected_deployment_sha": {"type": ["string", "null"], "pattern": "^[a-f0-9]{40}$"},
+    "affected_running_image_digest": {"type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$"},
+    "affected_component": {"type": "string"},
+    "security_impact": {"type": ["string", "null"]},
+    "data_impact": {"type": ["string", "null"]},
+    "recommended_action": {"type": "string"},
+    "duplicate_issue": {"type": ["string", "null"], "format": "uri"}
+  }
+}

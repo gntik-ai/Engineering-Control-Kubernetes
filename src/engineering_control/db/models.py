@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from engineering_control.db.base import Base, Timestamps, UUIDPrimaryKey
+
+
+class Campaign(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "campaigns"
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    source_sha: Mapped[str] = mapped_column(String(40))
+    deployment_sha: Mapped[str] = mapped_column(String(40))
+    required_cells: Mapped[int] = mapped_column(Integer, default=0)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class CoverageCell(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "coverage_cells"
+    campaign_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
+    )
+    domain: Mapped[str] = mapped_column(String(120))
+    persona: Mapped[str] = mapped_column(String(120))
+    lens: Mapped[str] = mapped_column(String(64))
+    environment: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    blocker: Mapped[str | None] = mapped_column(Text)
+    exclusion_approval_id: Mapped[UUID | None] = mapped_column(Uuid)
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "domain", "persona", "lens", "environment", name="uq_coverage_cell"
+        ),
+    )
+
+
+class Finding(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "findings"
+    campaign_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("campaigns.id"), index=True)
+    coverage_cell_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("coverage_cells.id"))
+    fingerprint: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    domain: Mapped[str] = mapped_column(String(120))
+    persona: Mapped[str] = mapped_column(String(120))
+    severity: Mapped[str] = mapped_column(String(32), index=True)
+    confidence: Mapped[float] = mapped_column(Float)
+    risk_class: Mapped[str] = mapped_column(String(8), index=True)
+    disposition: Mapped[str] = mapped_column(String(32), index=True)
+    expected_behavior: Mapped[str] = mapped_column(Text)
+    actual_behavior: Mapped[str] = mapped_column(Text)
+    minimal_reproduction: Mapped[list[Any]] = mapped_column(JSON)
+    affected_source_sha: Mapped[str] = mapped_column(String(40))
+    affected_deployment_sha: Mapped[str | None] = mapped_column(String(40))
+    affected_image_digest: Mapped[str | None] = mapped_column(String(80))
+    affected_component: Mapped[str] = mapped_column(String(200))
+    impact_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    recommended_action: Mapped[str] = mapped_column(Text)
+
+
+class FindingVerification(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "finding_verifications"
+    finding_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("findings.id"), index=True)
+    run_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("runs.id", use_alter=True))
+    verifier_provider: Mapped[str] = mapped_column(String(32))
+    disposition: Mapped[str] = mapped_column(String(32), index=True)
+    reproduction_count: Mapped[int] = mapped_column(Integer)
+    positive_control: Mapped[bool] = mapped_column(Boolean)
+    negative_control: Mapped[bool] = mapped_column(Boolean)
+    duplicate_issue_url: Mapped[str | None] = mapped_column(Text)
+    summary: Mapped[str] = mapped_column(Text)
+
+
+class Issue(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "issues"
+    finding_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("findings.id"), unique=True)
+    repository: Mapped[str] = mapped_column(String(200))
+    number: Mapped[int | None] = mapped_column(Integer)
+    url: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    openspec_change: Mapped[str | None] = mapped_column(String(240))
+
+
+class ChangeSet(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "change_sets"
+    finding_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("findings.id"), index=True)
+    issue_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("issues.id"))
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    risk_class: Mapped[str] = mapped_column(String(8), index=True)
+    state: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    source_repository: Mapped[str] = mapped_column(String(200))
+    source_branch: Mapped[str | None] = mapped_column(String(240))
+    source_base_sha: Mapped[str] = mapped_column(String(40))
+    source_head_sha: Mapped[str | None] = mapped_column(String(40))
+    source_pr_url: Mapped[str | None] = mapped_column(Text)
+    deployment_repository: Mapped[str] = mapped_column(String(200))
+    deployment_branch: Mapped[str | None] = mapped_column(String(240))
+    deployment_base_sha: Mapped[str] = mapped_column(String(40))
+    deployment_head_sha: Mapped[str | None] = mapped_column(String(40))
+    deployment_pr_url: Mapped[str | None] = mapped_column(Text)
+    image_digests: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    chart_version: Mapped[str | None] = mapped_column(String(80))
+    recovery_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class Run(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "runs"
+    campaign_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("campaigns.id"), index=True)
+    change_set_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("change_sets.id"), index=True
+    )
+    workflow_id: Mapped[str] = mapped_column(String(240), index=True)
+    run_type: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    worker: Mapped[str | None] = mapped_column(String(120))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    summary: Mapped[str | None] = mapped_column(Text)
+
+
+class Step(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "steps"
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("runs.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(120))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(240), unique=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class AgentInvocation(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "agent_invocations"
+    run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    role: Mapped[str] = mapped_column(String(80), index=True)
+    model_class: Mapped[str] = mapped_column(String(32))
+    provider_session_id: Mapped[str | None] = mapped_column(String(240))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    summary: Mapped[str | None] = mapped_column(Text)
+    structured_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorktreeLease(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "worktree_leases"
+    change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), unique=True)
+    repository: Mapped[str] = mapped_column(String(200))
+    worktree_path: Mapped[str] = mapped_column(Text, unique=True)
+    branch: Mapped[str] = mapped_column(String(240), unique=True)
+    owner_run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"))
+    base_sha: Mapped[str] = mapped_column(String(40))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ComponentLease(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "component_leases"
+    component_key: Mapped[str] = mapped_column(String(240), index=True)
+    owner_run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"))
+    mode: Mapped[str] = mapped_column(String(32))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ProviderUsage(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "provider_usage"
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
+    role: Mapped[str] = mapped_column(String(80))
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    cached_input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    estimated_cost: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(80))
+
+
+class QuotaSnapshot(UUIDPrimaryKey, Base):
+    __tablename__ = "quota_snapshots"
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    remaining_capacity: Mapped[float | None] = mapped_column(Float)
+    total_capacity: Mapped[float | None] = mapped_column(Float)
+    reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    running_jobs: Mapped[int] = mapped_column(Integer)
+    rate_limited: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(80))
+
+
+class Artifact(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "artifacts"
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    campaign_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("campaigns.id"), index=True)
+    change_set_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("change_sets.id"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"), index=True)
+    relative_path: Mapped[str] = mapped_column(Text, unique=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    content_type: Mapped[str] = mapped_column(String(160))
+    producer: Mapped[str] = mapped_column(String(120))
+    redaction_status: Mapped[str] = mapped_column(String(32))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    retention_class: Mapped[str] = mapped_column(String(64), default="standard")
+
+
+class Approval(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "approvals"
+    change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), index=True)
+    approval_type: Mapped[str] = mapped_column(String(80))
+    decision: Mapped[str] = mapped_column(String(16))
+    artifact_binding_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    approver_subject: Mapped[str] = mapped_column(String(240))
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ApprovalCandidate(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "approval_candidates"
+    change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(240), index=True)
+    risk_class: Mapped[str] = mapped_column(String(8))
+    artifact_binding_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Deployment(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "deployments"
+    change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), index=True)
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    environment: Mapped[str] = mapped_column(String(80), index=True)
+    strategy: Mapped[str] = mapped_column(String(32))
+    target_context: Mapped[str] = mapped_column(String(160))
+    target_namespace: Mapped[str] = mapped_column(String(160))
+    desired_sha: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    transaction_id: Mapped[str | None] = mapped_column(String(240))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recovery_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class VerificationResult(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "verification_results"
+    change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), index=True)
+    deployment_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("deployments.id"))
+    run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"))
+    verification_type: Mapped[str] = mapped_column(String(80))
+    verifier_provider: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class Incident(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "incidents"
+    change_set_id: Mapped[UUID | None] = mapped_column(
+        Uuid, ForeignKey("change_sets.id"), index=True
+    )
+    deployment_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("deployments.id"))
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    severity: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    summary: Mapped[str] = mapped_column(Text)
+    recovery_state: Mapped[str] = mapped_column(String(64))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NotificationOutbox(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "notification_outbox"
+    topic: Mapped[str] = mapped_column(String(120), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="PENDING")
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(120))
+
+
+Index("ix_runs_active", Run.status, Run.project)
+Index("ix_change_sets_project_state", ChangeSet.project, ChangeSet.state)
+Index("ix_findings_project_disposition", Finding.project, Finding.disposition)
+Index(
+    "uq_component_leases_active_key",
+    ComponentLease.component_key,
+    unique=True,
+    postgresql_where=ComponentLease.released_at.is_(None),
+    sqlite_where=ComponentLease.released_at.is_(None),
+)
+Index(
+    "uq_approval_candidates_active_change_set",
+    ApprovalCandidate.change_set_id,
+    unique=True,
+    postgresql_where=ApprovalCandidate.invalidated_at.is_(None),
+    sqlite_where=ApprovalCandidate.invalidated_at.is_(None),
+)

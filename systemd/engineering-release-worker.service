@@ -1,0 +1,35 @@
+[Unit]
+Description=Engineering Control deterministic release worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=release-runner
+Group=release-runner
+WorkingDirectory=/var/lib/engineering-control/workers/release
+EnvironmentFile=/etc/engineering-control/env/worker-common.env
+EnvironmentFile=-/etc/engineering-control/env/release-worker.env
+Environment=ENGINEERING_WORKER_KIND=release
+ExecStart=/opt/engineering-control/venv/bin/engineering-role-worker
+Restart=on-failure
+RestartSec=8
+TimeoutStopSec=90
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadOnlyPaths=/srv/engineering/worktrees
+ReadWritePaths=/var/lib/engineering-control/workers/release /srv/engineering/runs/release /srv/engineering/evidence/release /srv/engineering/cache/release /srv/engineering/tmp/release
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

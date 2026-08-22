@@ -1,0 +1,31 @@
+version: 1
+risk_classes:
+  R0:
+    examples: [documentation, comments, isolated-tests]
+    required_reviews: 1
+    human_staging_approval: false
+  R1:
+    examples: [bounded-ui-bug, bounded-backend-bug]
+    required_reviews: 1
+    human_staging_approval: false
+  R2:
+    examples: [api-contract, gateway, resource-lifecycle, deployment-values]
+    required_reviews: 1
+    prefer_cross_provider: true
+    human_staging_approval: true
+  R3:
+    examples:
+      - tenant-isolation
+      - authentication
+      - authorization
+      - secrets
+      - encryption
+      - database-migration
+      - backup-restore
+      - cluster-scoped
+      - production
+      - destructive-lifecycle
+    required_reviews: 2
+    mandatory_cross_provider: true
+    human_staging_approval: true
+    typed_confirmation: true
