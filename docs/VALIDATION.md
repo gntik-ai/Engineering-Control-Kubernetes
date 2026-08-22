@@ -4,14 +4,14 @@ This file distinguishes source-level validation from activation validation. It d
 services, provider identities, or Kubernetes release credentials are active.
 
 Validated on 2026-08-22 at engineering-control functional commit
-`3adacfa1b7a27fb47075c0585557174f9b68dd20` and engineering-agent-pack commit
+`89488e2` and engineering-agent-pack commit
 `47a6353dafbf0c1ecea649d434db5dd555e6249e`.
 
 ## Passed before activation
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | Ruff; strict mypy across 72 source files; 114 pytest tests |
+| Control-plane Python | PASS | Ruff; strict mypy across 73 source files; 126 pytest tests; wheel build |
 | Agent pack | PASS | deterministic generation changed 0 files; validator passed; Ruff; 2 tests |
 | Database | PASS | fresh SQLite migrations `0001 -> 0002 -> 0003 -> 0004` reached head |
 | Infrastructure definition | PASS | pinned Docker Compose renders with required variables |
@@ -21,6 +21,8 @@ Validated on 2026-08-22 at engineering-control functional commit
 | Worktrees | PASS | per-ChangeSet shadow Git metadata, read-only canonical alternates, allocation/retry, dirty protection, branch-bound cleanup, leases and ACL bounds |
 | Maker/checker lifecycle | PASS | bounded real-Git synthetic activity chain reaches `AWAITING_STAGING_APPROVAL` |
 | Draft PR publication | PASS | exact clean heads, scoped askpass, no force/merge, idempotent draft lookup, structured missing-credential handoff |
+| CI/artifact reconciliation | PASS/FAIL-CLOSED | exact source PR head and named checks, cross-provider review binding, exact-run manifest, per-image provenance, digest-only Falcone promotion and retryable draft PR; both candidate-build contracts and Musematic digest rendering remain intentionally disabled |
+| Falcone chart reality check | PASS | discovered staging values pass Helm 4.2.3 lint/template; 181 documents render and all six configured digests appear |
 | Approval drift | PASS | source, deployment, preflight, runtime, and recovery drift tests fail closed |
 | Preview deployment | PASS | dry-run preflight and enabled-target deterministic mutation/verification path; R0/R1 policy approval and R2/R3 human gate |
 | Deployment failure | PASS | terminal Run, lease release, candidate invalidation, recovery baseline, incident |
