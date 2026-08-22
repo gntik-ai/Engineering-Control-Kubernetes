@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import subprocess
 from dataclasses import dataclass
@@ -21,6 +23,14 @@ class WorktreeAllocation:
     branch: str
     base_sha: str
     change_set_id: UUID
+
+
+@dataclass(frozen=True)
+class AuditSnapshotAllocation:
+    repository: str
+    path: Path
+    base_sha: str
+    campaign_id: UUID
 
 
 @dataclass(frozen=True)
@@ -181,6 +191,55 @@ class GitWorktreeManager:
                     raise
             return WorktreeAllocation(repository, target, branch, actual, change_set_id)
 
+    def allocate_audit_snapshot(
+        self,
+        *,
+        repository: str,
+        campaign_id: UUID,
+        base_ref: str,
+        expected_base_sha: str,
+    ) -> AuditSnapshotAllocation:
+        if not re.fullmatch(r"[a-f0-9]{40}", expected_base_sha):
+            raise ValueError("expected base must be a full 40-character SHA")
+        mirror = self.verify_mirror(repository)
+        lease = FileLease(
+            self.lease_root,
+            f"audit/{repository}/{campaign_id}",
+            f"campaign:{campaign_id}",
+        )
+        with lease:
+            self.fetch(repository)
+            fetched_ref = self._fetched_ref(base_ref)
+            actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
+            if actual != expected_base_sha:
+                raise WorktreeError(
+                    f"audit base SHA mismatch for {repository}: expected {expected_base_sha}, "
+                    f"got {actual}"
+                )
+            target = self.worktree_root / self._slug(repository) / str(campaign_id)
+            if target.exists():
+                if self._run(["git", "rev-parse", "HEAD"], target) != expected_base_sha:
+                    raise WorktreeError("existing audit snapshot has the wrong immutable SHA")
+                if self._run(["git", "branch", "--show-current"], target):
+                    raise WorktreeError("existing audit snapshot is not detached")
+                if self.is_dirty(target):
+                    raise WorktreeError("existing audit snapshot is dirty and protected")
+                return AuditSnapshotAllocation(repository, target, actual, campaign_id)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+            self._run(
+                ["git", "worktree", "add", "--detach", str(target), expected_base_sha],
+                mirror,
+                timeout=900,
+            )
+            if self.is_dirty(target):
+                raise WorktreeError("new audit snapshot is unexpectedly dirty")
+            try:
+                self._grant_read_access(target, ("codex-runner", "claude-runner"))
+            except Exception:
+                self._run(["git", "worktree", "remove", str(target)], mirror)
+                raise
+            return AuditSnapshotAllocation(repository, target, actual, campaign_id)
+
     def _grant_access(self, target: Path, access: WorktreeAccess) -> None:
         """Grant the maker write and checker read access to exactly one worktree."""
         resolved_root = self.worktree_root.resolve()
@@ -193,8 +252,44 @@ class GitWorktreeManager:
         for directory in (target, *(item for item in target.rglob("*") if item.is_dir())):
             self._run(["setfacl", "--modify", default_acl, str(directory)], target)
 
+    def _grant_read_access(self, target: Path, identities: tuple[str, ...]) -> None:
+        if any(identity not in WorktreeAccess._allowed_identities for identity in identities):
+            raise WorktreeError("audit snapshot reader is not an allowed model worker")
+        resolved_root = self.worktree_root.resolve()
+        resolved_target = target.resolve()
+        if not resolved_target.is_relative_to(resolved_root) or resolved_target == resolved_root:
+            raise WorktreeError("refusing to grant access outside a bounded audit snapshot")
+        reader_acl = ",".join(f"u:{identity}:r-X" for identity in identities)
+        default_acl = ",".join(f"d:u:{identity}:r-x" for identity in identities)
+        traverse_acl = ",".join(f"u:{identity}:--x" for identity in identities)
+        self._run(["setfacl", "--modify", traverse_acl, str(target.parent)], target)
+        self._run(["setfacl", "--recursive", "--modify", reader_acl, str(target)], target)
+        for directory in (target, *(item for item in target.rglob("*") if item.is_dir())):
+            self._run(["setfacl", "--modify", default_acl, str(directory)], target)
+
     def is_dirty(self, path: Path) -> bool:
         return bool(self._run(["git", "status", "--porcelain=v1"], path))
+
+    def inspect_snapshot(self, path: Path, *, expected_sha: str) -> dict[str, str | int]:
+        root = self.worktree_root.resolve()
+        resolved = path.resolve()
+        if resolved == root or not resolved.is_dir() or not resolved.is_relative_to(root):
+            raise WorktreeError("snapshot inspection escaped the bounded worktree root")
+        actual = self._run(["git", "rev-parse", "HEAD"], resolved)
+        if actual != expected_sha:
+            raise WorktreeError(
+                f"snapshot inspection SHA mismatch: expected {expected_sha}, got {actual}"
+            )
+        if self.is_dirty(resolved):
+            raise WorktreeError("snapshot inspection found a dirty protected worktree")
+        tracked = self._run(["git", "ls-files", "-z"], resolved)
+        files = [item for item in tracked.split("\0") if item]
+        canonical = json.dumps(files, separators=(",", ":"), ensure_ascii=True).encode()
+        return {
+            "sha": actual,
+            "file_count": len(files),
+            "tracked_files_sha256": hashlib.sha256(canonical).hexdigest(),
+        }
 
     def cleanup(self, allocation: WorktreeAllocation, *, evidence_captured: bool) -> None:
         mirror = self.verify_mirror(allocation.repository)

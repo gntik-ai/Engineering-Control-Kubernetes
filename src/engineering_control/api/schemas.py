@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from engineering_control.models.enums import Project, RiskClass
+from engineering_control.models.enums import AuditLens, Project, RiskClass
+
+CoverageSlug = Annotated[
+    str,
+    Field(pattern=r"^[a-z][a-z0-9-]{0,119}$"),
+]
 
 
 class APIModel(BaseModel):
@@ -17,11 +22,18 @@ class CampaignStart(APIModel):
     name: str = Field(min_length=1, max_length=200)
     source_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     deployment_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
-    domains: list[str] = Field(min_length=1, max_length=100)
-    personas: list[str] = Field(min_length=1, max_length=100)
-    lenses: list[str] = Field(min_length=1, max_length=20)
-    environments: list[str] = Field(min_length=1, max_length=10)
+    domains: list[CoverageSlug] = Field(min_length=1, max_length=100)
+    personas: list[CoverageSlug] = Field(min_length=1, max_length=100)
+    lenses: list[AuditLens] = Field(min_length=1, max_length=20)
+    environments: list[CoverageSlug] = Field(min_length=1, max_length=10)
     dry_run: bool = True
+
+    @model_validator(mode="after")
+    def bounded_coverage_matrix(self) -> CampaignStart:
+        cells = len(self.domains) * len(self.personas) * len(self.lenses) * len(self.environments)
+        if cells > 100_000:
+            raise ValueError("coverage matrix exceeds the 100000-cell safety bound")
+        return self
 
 
 class DeliveryStart(APIModel):

@@ -46,6 +46,8 @@ class CoverageCell(UUIDPrimaryKey, Timestamps, Base):
     status: Mapped[str] = mapped_column(String(64), index=True)
     blocker: Mapped[str | None] = mapped_column(Text)
     exclusion_approval_id: Mapped[UUID | None] = mapped_column(Uuid)
+    evidence_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     __table_args__ = (
         UniqueConstraint(
             "campaign_id", "domain", "persona", "lens", "environment", name="uq_coverage_cell"
@@ -67,6 +69,7 @@ class Finding(UUIDPrimaryKey, Timestamps, Base):
     disposition: Mapped[str] = mapped_column(String(32), index=True)
     expected_behavior: Mapped[str] = mapped_column(Text)
     actual_behavior: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
     minimal_reproduction: Mapped[list[Any]] = mapped_column(JSON)
     affected_source_sha: Mapped[str] = mapped_column(String(40))
     affected_deployment_sha: Mapped[str | None] = mapped_column(String(40))

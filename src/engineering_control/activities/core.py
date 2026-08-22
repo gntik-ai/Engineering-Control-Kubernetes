@@ -25,8 +25,10 @@ class ControlActivities:
     _allowed_steps = {
         "project.snapshot",
         "campaign.persist_coverage",
+        "audit.prepare_agent_cell",
         "audit.deterministic_cell",
         "audit.agent_cell",
+        "campaign.persist_cell_result",
         "campaign.finalize",
         "finding.fresh_snapshot",
         "finding.reproduce",
@@ -157,6 +159,8 @@ class ControlActivities:
         safe_payload = self.redactor.redact(payload).value
         safe_payload = self._attach_orchestration_context(safe_payload)
         activity.heartbeat({"step": step, "phase": "validated"})
+        if self.settings.synthetic_mode or self.worker_kind == "synthetic":
+            return self._synthetic_step(step, safe_payload)
         if step in self._mutation_steps:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:
@@ -176,8 +180,6 @@ class ControlActivities:
             return await self.browser_handler.handle(step, safe_payload)
         if self.scan_handler is not None:
             return await self.scan_handler.handle(step, safe_payload)
-        if self.settings.synthetic_mode or self.worker_kind == "synthetic":
-            return self._synthetic_step(step, safe_payload)
         raise ApplicationError(
             f"{step} has no configured production activity handler",
             type="NotConfigured",

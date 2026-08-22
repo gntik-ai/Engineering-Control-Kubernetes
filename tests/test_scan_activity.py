@@ -37,6 +37,17 @@ class FakeWorktreeManager:
             change_set_id=values["change_set_id"],
         )
 
+    def allocate_audit_snapshot(self, **values: Any) -> WorktreeAllocation:
+        target = self.root / values["repository"] / str(values["campaign_id"])
+        target.mkdir(parents=True, exist_ok=True)
+        return WorktreeAllocation(
+            repository=values["repository"],
+            path=target,
+            branch="",
+            base_sha=values["expected_base_sha"],
+            change_set_id=values["campaign_id"],
+        )
+
 
 @pytest.mark.asyncio
 async def test_project_snapshot_maps_both_transaction_repositories(tmp_path: Path) -> None:
@@ -50,6 +61,7 @@ async def test_project_snapshot_maps_both_transaction_repositories(tmp_path: Pat
         "project.snapshot",
         {
             "project": "musematic",
+            "campaign_id": str(uuid4()),
             "source_sha": "a" * 40,
             "deployment_sha": "b" * 40,
         },

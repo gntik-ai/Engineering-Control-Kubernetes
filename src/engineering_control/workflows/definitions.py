@@ -170,14 +170,25 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 "audit.deterministic_cell",
                 {"campaign_id": campaign_id, "cell": cell, "snapshot": snapshot},
             )
-            agent_result = await self._step(
-                "audit.agent_cell",
+            prepared = await self._step(
+                "audit.prepare_agent_cell",
                 {
                     "campaign_id": campaign_id,
                     "cell": cell,
                     "snapshot": snapshot,
                     "deterministic": deterministic,
                 },
+            )
+            if prepared.get("status") in {"RATE_LIMITED", "BLOCKED"}:
+                return {
+                    "status": prepared["status"],
+                    "campaign_id": campaign_id,
+                    "next_cell_offset": index,
+                    "context": prepared,
+                }
+            agent_result = await self._step(
+                "audit.agent_cell",
+                prepared,
                 timeout_minutes=120,
             )
             if agent_result.get("status") in {
@@ -193,6 +204,15 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "next_cell_offset": index,
                     "context": agent_result,
                 }
+            await self._step(
+                "campaign.persist_cell_result",
+                {
+                    "campaign_id": campaign_id,
+                    "cell": cell,
+                    "agent_result": agent_result.get("agent_result"),
+                    "deterministic_evidence_sha256": deterministic.get("evidence_sha256"),
+                },
+            )
         next_offset = request.cell_offset + len(batch)
         if next_offset < len(cells):
             workflow.continue_as_new(
@@ -201,7 +221,11 @@ class AuditCampaignWorkflow(ControlledWorkflow):
         summary = await self._step(
             "campaign.finalize", {"campaign_id": campaign_id, "expected_cells": len(cells)}
         )
-        return {"status": "COMPLETE", "campaign_id": campaign_id, "summary": summary}
+        return {
+            "status": summary.get("status", "INCOMPLETE"),
+            "campaign_id": campaign_id,
+            "summary": summary,
+        }
 
 
 @workflow.defn(name="FindingVerificationWorkflow")
