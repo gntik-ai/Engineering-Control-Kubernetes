@@ -24,6 +24,12 @@ mutation both fail closed unless the exact target record is enabled and all cred
 immutable artifacts, and approval evidence validate. R0/R1 receive an auditable deterministic
 policy approval; R2/R3 pause for human approval, and R3 also requires its typed confirmation.
 
+Before either project reaches deployment preparation, `DeliveryReconciliationWorkflow` must bind
+the exact source PR head, named CI checks, signed candidate image manifest, per-image GitHub
+provenance, and deployment PR. Falcone promotion is digest-only and Helm-render validated.
+Musematic promotion remains disabled until its charts render digests, mutable image-updater policy
+is removed, and its active security blocker is remediated. Reconciliation cannot merge or deploy.
+
 ## Target activation
 
 The four templates in `config/targets/` install into `/etc/engineering-control/targets/`. They are

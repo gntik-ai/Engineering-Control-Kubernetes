@@ -45,3 +45,15 @@ cannot deploy: CI must first produce immutable image digests, then a bounded dep
 update must publish the digest-bearing PR and transition the same ChangeSet through `CANDIDATE_BUILT`
 and `DEPLOY_PR`. `RELEASE_EVIDENCE_INCOMPLETE` is the expected fail-closed result until that later
 reconciliation is complete.
+
+Reconciliation is a separate durable workflow so provider sessions and implementation leases need
+not remain alive while CI/builds run:
+
+```bash
+engineering-ctl reconcile <change-set-uuid>
+engineering-ctl reconcile <change-set-uuid> --candidate-build-run-id <github-run-id>
+```
+
+It defaults to observation only. `--execute` permits an allowlisted digest-only deployment commit
+and draft PR, never merge or deployment. See `CI-ARTIFACT-RECONCILIATION.md` for the signed artifact
+contract and current project blockers.

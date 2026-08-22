@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from engineering_control.api.schemas import (
     ApprovalRecord,
     CampaignStart,
+    DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
     RollbackRequest,
@@ -54,6 +55,9 @@ class MetadataRepository(Protocol):
     ) -> None: ...
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
+    async def create_delivery_reconciliation_run(
+        self, workflow_id: str, request: DeliveryReconcile
+    ) -> None: ...
     async def create_deployment_run(
         self, workflow_id: str, request: DeploymentPrepare
     ) -> Project: ...
@@ -143,6 +147,45 @@ class SQLMetadataRepository:
                     run_type="issue-delivery",
                     status="QUEUED",
                     project=finding.project,
+                )
+            )
+
+    async def create_delivery_reconciliation_run(
+        self, workflow_id: str, request: DeliveryReconcile
+    ) -> None:
+        await asyncio.to_thread(self._create_delivery_reconciliation_run, workflow_id, request)
+
+    def _create_delivery_reconciliation_run(
+        self, workflow_id: str, request: DeliveryReconcile
+    ) -> None:
+        allowed_states = {"SOURCE_PR", "CI_VALIDATED", "CANDIDATE_BUILT"}
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, request.change_set_id)
+            if change_set is None:
+                raise ValueError("delivery reconciliation requires an existing ChangeSet")
+            if change_set.state not in allowed_states:
+                raise ValueError("ChangeSet has not reached a reconcilable source PR state")
+            active = session.scalar(
+                select(Run).where(
+                    Run.change_set_id == change_set.id,
+                    Run.run_type == "delivery-reconciliation",
+                    Run.status.in_({"QUEUED", "RUNNING"}),
+                )
+            )
+            if active is not None:
+                raise ValueError("an active reconciliation already owns this ChangeSet")
+            session.add(
+                Run(
+                    change_set_id=change_set.id,
+                    workflow_id=workflow_id,
+                    run_type="delivery-reconciliation",
+                    status="QUEUED",
+                    project=change_set.project,
+                    summary=(
+                        str(request.candidate_build_run_id)
+                        if request.candidate_build_run_id is not None
+                        else None
+                    ),
                 )
             )
 
@@ -623,6 +666,11 @@ class EmptyMetadataRepository:
         return None
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
+        return None
+
+    async def create_delivery_reconciliation_run(
+        self, workflow_id: str, request: DeliveryReconcile
+    ) -> None:
         return None
 
     async def create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:

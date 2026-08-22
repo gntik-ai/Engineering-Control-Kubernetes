@@ -41,3 +41,32 @@ discovered_argocd_risk:
   image_updater_strategy: newest-build
   writeback_target: main
   status: MUST_BE_REPLACED_BEFORE_PROMOTION_ENABLEMENT
+delivery_control:
+  source_ci_workflow: CI
+  candidate_build:
+    enabled: false
+    workflow_name: Release
+    artifact_name: engineering-control-artifacts
+    manifest_file: engineering-artifacts.json
+    signer_workflow: gntik-ai/musematic/.github/workflows/deploy.yml
+    deny_self_hosted_runners: true
+    blocker: MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING
+  immutable_promotion:
+    enabled: false
+    deployment_file: apps/musematic-platform/values.override.yaml
+    component_lease: musematic:deploy:staging
+    image_repositories:
+      control-plane: ghcr.io/gntik-ai/musematic-control-plane
+      web: ghcr.io/gntik-ai/musematic-web
+      reasoning-engine: ghcr.io/gntik-ai/musematic-reasoning-engine
+      runtime-controller: ghcr.io/gntik-ai/musematic-runtime-controller
+      sandbox-manager: ghcr.io/gntik-ai/musematic-sandbox-manager
+      simulation-controller: ghcr.io/gntik-ai/musematic-simulation-controller
+    digest_paths:
+      control-plane: images.controlPlane.digest
+      web: images.web.digest
+      reasoning-engine: images.reasoningEngine.digest
+      runtime-controller: images.runtimeController.digest
+      sandbox-manager: images.sandboxManager.digest
+      simulation-controller: images.simulationController.digest
+    blocker: MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED

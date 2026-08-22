@@ -15,6 +15,7 @@ from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
     ApprovalRecord,
     CampaignStart,
+    DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
     OperationAccepted,
@@ -157,6 +158,17 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
         return await service.start_delivery(body)
+
+    @app.post("/v1/deliveries/reconcile", response_model=OperationAccepted, status_code=202)
+    async def delivery_reconcile(
+        body: DeliveryReconcile,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        try:
+            return await service.reconcile_delivery(body)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/v1/runs/{workflow_id}")
     async def run_get(

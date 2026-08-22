@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engineering.gntik.ai/schemas/ci-artifact-manifest.schema.json",
+  "title": "Engineering Control candidate artifact manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "project", "source_repository", "source_sha", "workflow_run_id", "images"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "project": {"enum": ["falcone", "musematic"]},
+    "source_repository": {"enum": ["gntik-ai/falcone", "gntik-ai/musematic"]},
+    "source_sha": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "workflow_run_id": {"type": "integer", "minimum": 1},
+    "images": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["component", "repository", "digest"],
+        "properties": {
+          "component": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,79}$"},
+          "repository": {"type": "string", "pattern": "^ghcr\\.io/gntik-ai/[a-z0-9._-]{1,160}$"},
+          "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+        }
+      }
+    }
+  }
+}

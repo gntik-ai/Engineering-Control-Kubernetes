@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from engineering_control.cli import APIClient
+from engineering_control.cli import APIClient, dispatch, parser
 
 
 def test_cli_accepts_service_group_read_token(tmp_path: Path) -> None:
@@ -23,3 +23,20 @@ def test_cli_rejects_group_writable_token(tmp_path: Path) -> None:
 
     with pytest.raises(PermissionError, match="permissions are too broad"):
         APIClient("http://127.0.0.1:8740", token)
+
+
+def test_cli_reconciliation_defaults_to_observation_only() -> None:
+    class FakeClient:
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            return {"method": method, "path": path, "payload": payload or {}}
+
+    arguments = parser().parse_args(
+        ["reconcile", "11111111-1111-4111-8111-111111111111", "--candidate-build-run-id", "42"]
+    )
+    result = dispatch(FakeClient(), arguments)  # type: ignore[arg-type]
+
+    assert result["path"] == "/v1/deliveries/reconcile"
+    assert result["payload"]["dry_run"] is True
+    assert result["payload"]["candidate_build_run_id"] == 42

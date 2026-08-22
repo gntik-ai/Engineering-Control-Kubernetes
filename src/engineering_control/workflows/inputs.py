@@ -33,6 +33,13 @@ class IssueDeliveryInput:
 
 
 @dataclass
+class DeliveryReconciliationInput:
+    change_set_id: str
+    candidate_build_run_id: int | None = None
+    dry_run: bool = True
+
+
+@dataclass
 class PreviewDeploymentInput:
     change_set_id: str
     project: str

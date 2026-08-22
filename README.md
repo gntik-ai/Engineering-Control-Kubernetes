@@ -26,4 +26,5 @@ repository creation, or credential copy is performed by this repository's bootst
 - all persisted output passes through central secret redaction.
 
 See `docs/ARCHITECTURE.md`, `docs/REQUIREMENTS-MATRIX.md`, `docs/VALIDATION.md`, and
-`docs/OPERATOR-CHEATSHEET.md`.
+`docs/OPERATOR-CHEATSHEET.md`. Exact PR/CI, signed candidate image, and digest-only deployment
+reconciliation is specified in `docs/CI-ARTIFACT-RECONCILIATION.md`.

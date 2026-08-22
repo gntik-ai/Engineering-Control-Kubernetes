@@ -69,6 +69,10 @@ def parser() -> argparse.ArgumentParser:
     delivery.add_argument("finding_id")
     delivery.add_argument("--risk", choices=("R0", "R1", "R2", "R3"), required=True)
     delivery.add_argument("--execute", action="store_true")
+    reconcile = commands.add_parser("reconcile")
+    reconcile.add_argument("change_set_id")
+    reconcile.add_argument("--candidate-build-run-id", type=int)
+    reconcile.add_argument("--execute", action="store_true")
     deployment = commands.add_parser("deployment")
     deployment.add_argument("change_set_id")
     deployment.add_argument("--environment", choices=("preview", "staging"), required=True)
@@ -126,6 +130,16 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             {
                 "finding_id": arguments.finding_id,
                 "risk_class": arguments.risk,
+                "dry_run": not arguments.execute,
+            },
+        )
+    if command == "reconcile":
+        return client.request(
+            "POST",
+            "/v1/deliveries/reconcile",
+            {
+                "change_set_id": arguments.change_set_id,
+                "candidate_build_run_id": arguments.candidate_build_run_id,
                 "dry_run": not arguments.execute,
             },
         )

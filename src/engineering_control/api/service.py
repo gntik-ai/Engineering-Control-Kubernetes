@@ -10,6 +10,7 @@ from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
     ApprovalRecord,
     CampaignStart,
+    DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
     OperationAccepted,
@@ -21,6 +22,7 @@ from engineering_control.policy.approvals import ApprovalService
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
+    DeliveryReconciliationInput,
     IssueDeliveryInput,
     PreviewDeploymentInput,
     RecoveryInput,
@@ -33,6 +35,7 @@ from engineering_control.workflows.names import WorkflowName
 class ControlService(Protocol):
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted: ...
     async def start_delivery(self, request: DeliveryStart) -> OperationAccepted: ...
+    async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
@@ -72,6 +75,19 @@ class TemporalControlService:
         handle = await self.client.start_workflow(
             WorkflowName.ISSUE_DELIVERY.value,
             IssueDeliveryInput(**request.model_dump()),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted:
+        workflow_id = f"reconcile-{request.change_set_id}-{uuid4()}"
+        await self.repository.create_delivery_reconciliation_run(workflow_id, request)
+        handle = await self.client.start_workflow(
+            WorkflowName.DELIVERY_RECONCILIATION.value,
+            DeliveryReconciliationInput(**request.model_dump(mode="json")),
             id=workflow_id,
             task_queue=self.task_queue,
         )

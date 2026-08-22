@@ -33,3 +33,34 @@ security_blockers:
   - id: SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY
     write_enablement: false
     remediation: provision scoped observer and Falcone release identities
+delivery_control:
+  source_ci_workflow: ci
+  candidate_build:
+    enabled: false
+    workflow_name: release-images
+    artifact_name: engineering-control-artifacts
+    manifest_file: engineering-artifacts.json
+    signer_workflow: gntik-ai/falcone/.github/workflows/release-images.yml
+    deny_self_hosted_runners: true
+    blocker: FALCONE_CANDIDATE_BUILD_CONTRACT_MISSING
+  immutable_promotion:
+    enabled: true
+    deployment_file: charts/in-falcone/values/staging.yaml
+    chart_directory: charts/in-falcone
+    values_files:
+      - charts/in-falcone/values/staging.yaml
+    component_lease: falcone:charts:staging
+    image_repositories:
+      control-plane: ghcr.io/gntik-ai/in-falcone-control-plane
+      control-plane-executor: ghcr.io/gntik-ai/in-falcone-control-plane-executor
+      web-console: ghcr.io/gntik-ai/in-falcone-web-console
+      function-runtime: ghcr.io/gntik-ai/in-falcone-fn-runtime
+      workflow-worker: ghcr.io/gntik-ai/in-falcone-workflow-worker
+      mcp-runtime: ghcr.io/gntik-ai/in-falcone-mcp-runtime
+    digest_paths:
+      control-plane: controlPlane.image.digest
+      control-plane-executor: controlPlaneExecutor.image.digest
+      web-console: webConsole.image.digest
+      function-runtime: controlPlane.functionExecutor.runtimeImage.digest
+      workflow-worker: workflowWorker.image.digest
+      mcp-runtime: mcp.runtimeImage.digest

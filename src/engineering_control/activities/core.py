@@ -59,6 +59,14 @@ class ControlActivities:
         "delivery.prepare_publication",
         "delivery.publish",
         "delivery.persist_publication",
+        "reconcile.prepare",
+        "reconcile.inspect_ci",
+        "reconcile.persist_ci",
+        "reconcile.prepare_promotion",
+        "reconcile.apply_promotion",
+        "reconcile.persist_promotion",
+        "reconcile.publish_promotion",
+        "reconcile.persist_promotion_publication",
         "preview.preflight",
         "preview.prepare",
         "preview.record_candidate",
@@ -100,6 +108,8 @@ class ControlActivities:
         "staging.deploy",
         "recovery.execute",
         "cleanup.execute",
+        "reconcile.apply_promotion",
+        "reconcile.publish_promotion",
     }
 
     _worker_steps = {
@@ -121,6 +131,9 @@ class ControlActivities:
             "delivery.invoke_deployment_maker",
             "delivery.invoke_checker",
             "delivery.publish",
+            "reconcile.inspect_ci",
+            "reconcile.apply_promotion",
+            "reconcile.publish_promotion",
             "quota.refresh",
             "runtime.browser_checks",
             "staging.preflight",
@@ -139,6 +152,7 @@ class ControlActivities:
             "runtime.deterministic_checks",
             "cleanup.protect_active",
             "cleanup.execute",
+            "reconcile.apply_promotion",
         },
         "codex": {
             "audit.agent_cell",
@@ -161,7 +175,11 @@ class ControlActivities:
             "runtime.independent_review",
         },
         "browser": {"runtime.browser_checks"},
-        "delivery": {"delivery.publish"},
+        "delivery": {
+            "delivery.publish",
+            "reconcile.inspect_ci",
+            "reconcile.publish_promotion",
+        },
         "release": {
             "preview.preflight",
             "staging.preflight",
@@ -221,6 +239,10 @@ class ControlActivities:
                 return self._envelope(step, safe_payload, "DRY_RUN")
             if step == "cleanup.execute" and self.scan_handler is not None:
                 return await self.scan_handler.handle(step, safe_payload)
+            if step == "reconcile.apply_promotion" and self.scan_handler is not None:
+                return await self.scan_handler.handle(step, safe_payload)
+            if step == "reconcile.publish_promotion" and self.delivery_handler is not None:
+                return await self.delivery_handler.handle(step, safe_payload)
             if self.release_handler is not None:
                 return await self.release_handler.handle(step, safe_payload)
             raise ApplicationError(

@@ -20,9 +20,9 @@ gate that this bootstrap must not bypass. No row claims live deployment or provi
 | 10 Native CLIs | PREPARED/BLOCKED | Pinned installers; independent worker OAuth remains `MANUAL_AUTH_REQUIRED_CODEX` and `MANUAL_AUTH_REQUIRED_CLAUDE` |
 | 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction |
 | 12 Quota broker | IMPLEMENTED | Provider-independent snapshots, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff |
-| 13 Temporal | IMPLEMENTED/PENDING LIVE TEST | All nine required workflows, signals/retries/compensation/activity boundaries; reboot/restart proof awaits activation |
+| 13 Temporal | IMPLEMENTED/PENDING LIVE TEST | All nine required workflows plus durable delivery reconciliation, signals/retries/compensation/activity boundaries; reboot/restart proof awaits activation |
 | 14 PostgreSQL metadata | IMPLEMENTED | Alembic models/migrations for every required table plus approval candidates, notification outbox and worker heartbeats |
-| 15 ChangeSet | IMPLEMENTED | First-class model, strict state policy, artifact-bound approvals and deterministic metadata transitions |
+| 15 ChangeSet | IMPLEMENTED | First-class model, strict state policy, exact PR/CI/provenance reconciliation, digest promotion, artifact-bound approvals and deterministic metadata transitions |
 | 16 Worktrees | IMPLEMENTED | Mirrors, exact-SHA fetch/allocation, branch naming, leases, dirty protection and ACL isolation |
 | 17 Component leases | IMPLEMENTED | Project/component/environment/global safety keys and configured concurrency/recursion limits |
 | 18 Agent pack | IMPLEMENTED | Fourteen provider-neutral roles, including every requested role; deterministic release remains code, not an agent |
@@ -36,8 +36,8 @@ gate that this bootstrap must not bypass. No row claims live deployment or provi
 | 26 Finding schema | IMPLEMENTED | Draft 2020-12 schema includes every requested identity, impact, evidence and affected-state field |
 | 27 Risk classes | IMPLEMENTED | R0-R3 policy, cross-provider gates, deterministic low-risk approval, human R2/R3 approval and typed R3 confirmation |
 | 28 OpenSpec | IMPLEMENTED | Existing assets preserved; bounded OpenSpec generated per delivery and passed without historical audit context |
-| 29 Falcone adapter | IMPLEMENTED/BLOCKED LIVE | Helm lint/template/preflight, immutable plans, real backup/migration gates, atomic deploy, verification/recovery; target disabled and scoped kubeconfig absent |
-| 30 Musematic adapter | IMPLEMENTED/SECURITY BLOCKED | Immutable GitOps validation, draft deployment PR, exact Argo revision observation and Git recovery plan; committed secrets/newest-build policy block write enablement |
+| 29 Falcone adapter | IMPLEMENTED/BLOCKED LIVE | Exact-SHA CI/provenance and digest-only chart promotion plus Helm lint/template/preflight, immutable plans, real backup/migration gates, atomic deploy, verification/recovery; current release workflow lacks the signed candidate contract, target is disabled, and scoped kubeconfig is absent |
+| 30 Musematic adapter | IMPLEMENTED/SECURITY BLOCKED | Exact-SHA CI gate, immutable GitOps validation, draft deployment PR, exact Argo revision observation and Git recovery plan; committed secrets, missing signed candidate contract, tag-only chart rendering and newest-build policy block promotion/write enablement |
 | 31 Kubernetes identity separation | PREPARED/BLOCKED | RBAC templates and negative authorization checks exist; operator must create scoped credentials before activation |
 | 32 Hermes normalization | PREPARED | Canonical 0.20.0 vendor install retained; extension/hook implements fixed allowlisted Telegram commands with no shell; restart awaits checkpoint/backup |
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |

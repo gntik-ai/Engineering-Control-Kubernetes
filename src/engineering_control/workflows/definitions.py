@@ -12,6 +12,7 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     CleanupInput,
+    DeliveryReconciliationInput,
     FindingVerificationInput,
     IssueDeliveryInput,
     PreviewDeploymentInput,
@@ -146,6 +147,10 @@ class ControlledWorkflow:
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step == "delivery.publish":
             return "engineering-delivery"
+        if step in {"reconcile.inspect_ci", "reconcile.publish_promotion"}:
+            return "engineering-delivery"
+        if step == "reconcile.apply_promotion":
+            return "engineering-scan"
         if step in {"runtime.browser_checks"}:
             return "engineering-browser"
         if step in {
@@ -352,6 +357,45 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                     context = await self._step("delivery.persist_handoff", context)
                 return {"status": context["status"], "context": context}
         return {"status": context.get("status", "SOURCE_PR"), "context": context}
+
+
+@workflow.defn(name="DeliveryReconciliationWorkflow")
+class DeliveryReconciliationWorkflow(ControlledWorkflow):
+    @workflow.run
+    async def run(self, request: DeliveryReconciliationInput) -> dict[str, Any]:
+        context: dict[str, Any] = asdict(request)
+        ordered = (
+            "reconcile.prepare",
+            "reconcile.inspect_ci",
+            "reconcile.persist_ci",
+        )
+        for step in ordered:
+            if not await self._checkpoint(step.upper().replace(".", "_")):
+                return {"status": "CANCELLED", "context": context}
+            context = await self._step(step, context, timeout_minutes=30)
+        if context.get("status") != "CANDIDATE_BUILT":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
+
+        if not await self._checkpoint("RECONCILE_PREPARE_PROMOTION"):
+            return {"status": "CANCELLED", "context": context}
+        context = await self._step("reconcile.prepare_promotion", context)
+        if context.get("status") == "PROMOTION_PUBLICATION_READY":
+            pass
+        elif context.get("status") != "PROMOTION_READY":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
+        else:
+            if not await self._checkpoint("RECONCILE_APPLY_PROMOTION"):
+                return {"status": "CANCELLED", "context": context}
+            context = await self._step("reconcile.apply_promotion", context, timeout_minutes=60)
+            context = await self._step("reconcile.persist_promotion", context)
+            if context.get("status") != "PROMOTION_PUBLICATION_READY":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
+
+        if not await self._checkpoint("RECONCILE_PUBLISH_PROMOTION"):
+            return {"status": "CANCELLED", "context": context}
+        context = await self._step("reconcile.publish_promotion", context, timeout_minutes=30)
+        context = await self._step("reconcile.persist_promotion_publication", context)
+        return {"status": context.get("status", "DEPLOY_PR"), "context": context}
 
 
 @workflow.defn(name="PreviewDeploymentWorkflow")
@@ -697,6 +741,7 @@ ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     FindingVerificationWorkflow,
     IssueDeliveryWorkflow,
+    DeliveryReconciliationWorkflow,
     PreviewDeploymentWorkflow,
     StagingDeploymentWorkflow,
     RuntimeVerificationWorkflow,

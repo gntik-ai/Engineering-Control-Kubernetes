@@ -39,10 +39,12 @@ Trust boundaries:
 
 Every delivery is one ChangeSet spanning source and deployment repositories. An unchanged
 deployment repository is recorded as deferred until a real immutable artifact exists; the control
-plane never creates a no-diff PR or invents a digest. Deterministic policy code validates evidence
-before state transitions. Maker and checker contexts differ; R3 requires both providers and typed
-human approval. Large campaigns use coverage cells and Temporal continue-as-new rather than one
-permanent model session.
+plane never creates a no-diff PR or invents a digest. `DeliveryReconciliationWorkflow` later binds
+the exact source PR head and CI, verifies the configured candidate manifest and every OCI
+attestation, and may ask the non-LLM promotion activity for one allowlisted digest-only deployment
+commit and draft PR. Deterministic policy code validates evidence before state transitions. Maker
+and checker contexts differ; R3 requires both providers and typed human approval. Large campaigns
+use coverage cells and Temporal continue-as-new rather than one permanent model session.
 
 Current fail-closed controls are intentional: production activity steps without a configured
 handler raise `NotConfigured`; missing native authentication is a manual blocker; deployment

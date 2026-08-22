@@ -16,6 +16,9 @@ class FakeService:
     async def start_delivery(self, request: Any) -> OperationAccepted:
         return OperationAccepted(workflow_id="delivery-test", run_id="run-test")
 
+    async def reconcile_delivery(self, request: Any) -> OperationAccepted:
+        return OperationAccepted(workflow_id="reconcile-test", run_id="run-test")
+
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None:
         return None
 
@@ -117,6 +120,33 @@ def test_api_rejects_extra_fields() -> None:
             json=body,
         )
         assert response.status_code == 422
+
+
+def test_delivery_reconciliation_accepts_only_bounded_identifiers() -> None:
+    app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/deliveries/reconcile",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={
+                "change_set_id": str(uuid4()),
+                "candidate_build_run_id": 42,
+                "dry_run": True,
+            },
+        )
+        rejected = client.post(
+            "/v1/deliveries/reconcile",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={
+                "change_set_id": str(uuid4()),
+                "candidate_build_run_id": 0,
+                "dry_run": True,
+                "repository": "attacker/repo",
+            },
+        )
+    assert response.status_code == 202
+    assert response.json()["workflow_id"] == "reconcile-test"
+    assert rejected.status_code == 422
 
 
 def test_synthetic_validation_endpoint_is_disabled_by_default() -> None:

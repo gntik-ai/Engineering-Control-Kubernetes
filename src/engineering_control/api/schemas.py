@@ -42,6 +42,12 @@ class DeliveryStart(APIModel):
     dry_run: bool = True
 
 
+class DeliveryReconcile(APIModel):
+    change_set_id: UUID
+    candidate_build_run_id: int | None = Field(default=None, ge=1)
+    dry_run: bool = True
+
+
 class ApprovalRecord(APIModel):
     change_set_id: UUID
     artifact_binding_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")

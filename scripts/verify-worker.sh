@@ -28,6 +28,9 @@ sudo -u delivery-runner /usr/local/bin/gh --version >/dev/null
 sudo -u delivery-runner test -s /etc/engineering-control/env/delivery/github.token
 [[ $(stat -c '%a:%U:%G' /etc/engineering-control/env/delivery/github.token) == \
   640:root:delivery-runner ]]
+sudo -u delivery-runner test -s /etc/engineering-control/env/delivery/registry/config.json
+[[ $(stat -c '%a:%U:%G' /etc/engineering-control/env/delivery/registry/config.json) == \
+  640:root:delivery-runner ]]
 for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
   own_token="/etc/engineering-control/env/evidence-${identity}.token"
   sudo -u "${identity}" test -r "${own_token}"
@@ -56,6 +59,11 @@ for identity in codex-runner claude-runner browser-runner scan-runner release-ru
   if sudo -u "${identity}" test -r \
     /etc/engineering-control/env/delivery/github.token 2>/dev/null; then
     echo "FAIL ${identity} can read GitHub delivery credentials" >&2
+    exit 1
+  fi
+  if sudo -u "${identity}" test -r \
+    /etc/engineering-control/env/delivery/registry/config.json 2>/dev/null; then
+    echo "FAIL ${identity} can read GitHub registry credentials" >&2
     exit 1
   fi
 done

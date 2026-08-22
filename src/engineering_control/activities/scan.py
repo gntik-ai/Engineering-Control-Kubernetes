@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from temporalio.exceptions import ApplicationError
 
@@ -19,6 +20,7 @@ from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.models.enums import Project, Provider, RedactionStatus
+from engineering_control.models.reconciliation import PromotionPlan
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
@@ -104,6 +106,7 @@ class ScanActivityHandler:
             "runtime.deterministic_checks",
             "cleanup.protect_active",
             "cleanup.execute",
+            "reconcile.apply_promotion",
         }
     )
     _repositories = {
@@ -118,6 +121,7 @@ class ScanActivityHandler:
         scanner: DeterministicScanner | None = None,
         publisher: EvidencePublisher | None = None,
         observer_runner: SafeCommandRunner | None = None,
+        promotion_runner: SafeCommandRunner | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager or GitWorktreeManager(
@@ -141,6 +145,9 @@ class ScanActivityHandler:
         self.observer_runner = observer_runner or SafeCommandRunner(
             {"kubectl": settings.kubectl_executable}
         )
+        self.promotion_runner = promotion_runner or SafeCommandRunner(
+            {"git": settings.git_executable, "helm": settings.helm_executable}
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -160,6 +167,8 @@ class ScanActivityHandler:
                 return self._protect_cleanup_candidates(payload)
             if step == "cleanup.execute":
                 return self._execute_cleanup(payload)
+            if step == "reconcile.apply_promotion":
+                return self._apply_promotion(payload)
             if step == "delivery.validate_changeset":
                 return self._validate_changeset(payload)
         except PermissionError as error:
@@ -181,6 +190,217 @@ class ScanActivityHandler:
             f"{step} has no configured deterministic scan handler",
             type="NotConfigured",
             non_retryable=True,
+        )
+
+    def _apply_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = PromotionPlan.model_validate(payload.get("promotion_plan"))
+        try:
+            worktree = self._promotion_worktree(plan)
+            git_arguments = ["-c", f"safe.directory={worktree}"]
+            branch = self.promotion_runner.run(
+                "git", [*git_arguments, "branch", "--show-current"], cwd=worktree
+            ).stdout.strip()
+            head = self.promotion_runner.run(
+                "git", [*git_arguments, "rev-parse", "HEAD"], cwd=worktree
+            ).stdout.strip()
+            status = self.promotion_runner.run(
+                "git", [*git_arguments, "status", "--porcelain=v1"], cwd=worktree
+            ).stdout
+            if branch != plan.branch or head != plan.expected_head_sha or status:
+                raise ValueError("promotion worktree identity, head, or cleanliness changed")
+            deployment_file = self._promotion_file(worktree, plan.deployment_file)
+            original = deployment_file.read_text(encoding="utf-8")
+            updated = self._replace_yaml_digests(original, plan.digest_paths, plan.image_digests)
+            self._atomic_text(deployment_file, updated)
+            loaded = yaml.safe_load(deployment_file.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("promoted values file is not a YAML object")
+            for component, dotted in plan.digest_paths.items():
+                value: Any = loaded
+                for key in dotted.split("."):
+                    if not isinstance(value, dict) or key not in value:
+                        raise ValueError("promoted digest path disappeared after the edit")
+                    value = value[key]
+                if value != plan.image_digests[component]:
+                    raise ValueError("promoted digest does not match the candidate manifest")
+            changed = self.promotion_runner.run(
+                "git", [*git_arguments, "diff", "--name-only"], cwd=worktree
+            ).stdout.splitlines()
+            if changed != [plan.deployment_file]:
+                raise ValueError("promotion changed files outside the allowlisted values file")
+            self.promotion_runner.run("git", [*git_arguments, "diff", "--check"], cwd=worktree)
+            lint_sha, rendered_sha, manifest_count, chart_version = self._validate_promoted_chart(
+                plan, worktree
+            )
+            diff = self.promotion_runner.run(
+                "git",
+                [*git_arguments, "diff", "--unified=0", "--", plan.deployment_file],
+                cwd=worktree,
+            ).stdout
+            self.promotion_runner.run(
+                "git", [*git_arguments, "add", "--", plan.deployment_file], cwd=worktree
+            )
+            self.promotion_runner.run(
+                "git",
+                [
+                    *git_arguments,
+                    "-c",
+                    "user.name=Engineering Control",
+                    "-c",
+                    "user.email=engineering-control@local.invalid",
+                    "commit",
+                    "-m",
+                    f"promote immutable candidate for {plan.change_set_id}",
+                ],
+                cwd=worktree,
+            )
+            promoted_head = self.promotion_runner.run(
+                "git", [*git_arguments, "rev-parse", "HEAD"], cwd=worktree
+            ).stdout.strip()
+            final_status = self.promotion_runner.run(
+                "git", [*git_arguments, "status", "--porcelain=v1"], cwd=worktree
+            ).stdout
+            if not re.fullmatch(r"[a-f0-9]{40}", promoted_head) or final_status:
+                raise ValueError("promotion commit is not an exact clean Git head")
+            evidence = {
+                "change_set_id": str(plan.change_set_id),
+                "base_sha": plan.expected_head_sha,
+                "promoted_sha": promoted_head,
+                "deployment_file": plan.deployment_file,
+                "image_digests": plan.image_digests,
+                "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
+                "helm_lint_sha256": lint_sha,
+                "rendered_manifest_sha256": rendered_sha,
+                "rendered_manifest_count": manifest_count,
+                "chart_version": chart_version,
+            }
+            evidence_root = (
+                self.settings.evidence_root / "scan" / str(plan.change_set_id) / "promotion"
+            )
+            evidence_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+            evidence_path = evidence_root / "immutable-promotion.json"
+            self._atomic_text(
+                evidence_path, json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            receipts = self._publish_reports(
+                payload, [evidence_path], filename_prefix="immutable-promotion"
+            )
+            return {
+                **payload,
+                "status": "PROMOTION_COMMITTED",
+                "promoted_head_sha": promoted_head,
+                "promotion_evidence": evidence,
+                "promotion_artifacts": receipts,
+            }
+        except (CommandFailure, OSError, ValueError, WorktreeError) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "IMMUTABLE_PROMOTION_VALIDATION_FAILED",
+                "error_type": type(error).__name__,
+                "worktree_preserved": True,
+            }
+
+    def _promotion_worktree(self, plan: PromotionPlan) -> Path:
+        root = self.settings.worktree_root.resolve()
+        resolved = plan.working_directory.resolve()
+        expected = root / plan.repository_slug / str(plan.change_set_id)
+        if not resolved.is_dir() or resolved != expected:
+            raise ValueError("promotion escaped its exact ChangeSet worktree")
+        return resolved
+
+    @staticmethod
+    def _promotion_file(worktree: Path, relative: str) -> Path:
+        path = (worktree / relative).resolve()
+        if not path.is_file() or not path.is_relative_to(worktree):
+            raise ValueError("promotion file escaped its bounded worktree")
+        return path
+
+    @staticmethod
+    def _replace_yaml_digests(
+        original: str, digest_paths: dict[str, str], image_digests: dict[str, str]
+    ) -> str:
+        targets = {path: image_digests[component] for component, path in digest_paths.items()}
+        replaced: set[str] = set()
+        stack: list[tuple[int, str]] = []
+        output: list[str] = []
+        key_line = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_-]+):(?P<tail>.*)$")
+        for line in original.splitlines(keepends=True):
+            match = key_line.match(line.rstrip("\r\n"))
+            if match is None:
+                output.append(line)
+                continue
+            indent = len(match.group("indent"))
+            while stack and indent <= stack[-1][0]:
+                stack.pop()
+            key = match.group("key")
+            dotted = ".".join([entry[1] for entry in stack] + [key])
+            tail = match.group("tail")
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            if dotted in targets:
+                if dotted in replaced or not tail.strip() or tail.lstrip().startswith("#"):
+                    raise ValueError("promotion digest path is ambiguous or not a scalar")
+                comment = ""
+                if " #" in tail:
+                    comment = " #" + tail.split(" #", 1)[1]
+                output.append(f"{match.group('indent')}{key}: {targets[dotted]}{comment}{ending}")
+                replaced.add(dotted)
+                continue
+            if not tail.strip() or tail.lstrip().startswith("#"):
+                stack.append((indent, key))
+            output.append(line)
+        if replaced != set(targets):
+            raise ValueError("promotion values file is missing an allowlisted digest path")
+        return "".join(output)
+
+    def _validate_promoted_chart(
+        self, plan: PromotionPlan, worktree: Path
+    ) -> tuple[str, str, int, str]:
+        chart = (worktree / plan.chart_directory).resolve()
+        if not chart.is_dir() or not chart.is_relative_to(worktree):
+            raise ValueError("promotion chart directory escaped the worktree")
+        values: list[Path] = []
+        for relative in plan.values_files:
+            path = (worktree / relative).resolve()
+            if not path.is_file() or not path.is_relative_to(worktree):
+                raise ValueError("promotion values file escaped the worktree")
+            values.append(path)
+        chart_metadata = yaml.safe_load((chart / "Chart.yaml").read_text(encoding="utf-8"))
+        if not isinstance(chart_metadata, dict):
+            raise ValueError("promotion chart metadata is invalid")
+        chart_version = str(chart_metadata.get("version") or "")
+        if not chart_version or (
+            plan.chart_version is not None and chart_version != plan.chart_version
+        ):
+            raise ValueError("promotion chart version changed after planning")
+        lint_arguments = ["lint", str(chart)]
+        template_arguments = [
+            "template",
+            "engineering-candidate",
+            str(chart),
+            "--namespace",
+            "falcone-preview",
+        ]
+        for value in values:
+            lint_arguments.extend(("--values", str(value)))
+            template_arguments.extend(("--values", str(value)))
+        lint = self.promotion_runner.run("helm", lint_arguments, cwd=worktree, timeout_seconds=900)
+        rendered = self.promotion_runner.run(
+            "helm", template_arguments, cwd=worktree, timeout_seconds=900
+        )
+        missing = [
+            digest for digest in plan.image_digests.values() if digest not in rendered.stdout
+        ]
+        if missing:
+            raise ValueError("rendered chart omits candidate image digests")
+        documents = [document for document in yaml.safe_load_all(rendered.stdout) if document]
+        if not documents:
+            raise ValueError("promotion chart rendered no Kubernetes manifests")
+        return (
+            hashlib.sha256(lint.stdout.encode()).hexdigest(),
+            hashlib.sha256(rendered.stdout.encode()).hexdigest(),
+            len(documents),
+            chart_version,
         )
 
     def _protect_cleanup_candidates(self, payload: dict[str, Any]) -> dict[str, Any]:

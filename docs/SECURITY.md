@@ -73,3 +73,11 @@ Draft PR publication requires a second fine-grained token at
 configured repositories, with
 no administration, Actions-secret, environment, or merge-bypass permission. Do not reuse the
 controller token or an interactive user credential.
+
+Candidate provenance verification additionally requires registry authentication at
+`/etc/engineering-control/env/delivery/registry/config.json`, owned by
+`root:delivery-runner` and mode `0640`. It must be scoped to read only the configured GHCR images.
+The adapter requires the file to remain beneath the delivery credential root, passes only its
+parent as `DOCKER_CONFIG`, and uses `gh attestation verify` with exact repository, signer-workflow,
+and source-digest constraints. Missing registry auth produces
+`MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED`; it never falls back to an unsigned image.

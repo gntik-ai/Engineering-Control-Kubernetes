@@ -4,6 +4,9 @@ from pathlib import Path
 import yaml
 from jsonschema.validators import Draft202012Validator
 
+from engineering_control.models.enums import Project
+from engineering_control.models.reconciliation import DeliveryControlPolicy
+
 ROOT = Path(__file__).parents[1]
 
 
@@ -24,6 +27,23 @@ def test_configuration_contains_no_inline_secret_values() -> None:
         assert "BEGIN PRIVATE KEY" not in text
         assert "github_pat_" not in text
         assert "ghp_" not in text
+
+
+def test_project_delivery_controls_are_strict_and_match_discovered_reality() -> None:
+    policies = {}
+    for project in Project:
+        value = yaml.safe_load(
+            (ROOT / "config" / "projects" / f"{project.value}.yaml").read_text(encoding="utf-8")
+        )
+        assert value["project"] == project.value
+        policies[project] = DeliveryControlPolicy.model_validate(value["delivery_control"])
+    assert policies[Project.FALCONE].source_ci_workflow == "ci"
+    assert policies[Project.FALCONE].candidate_build.enabled is False
+    assert policies[Project.FALCONE].immutable_promotion.enabled is True
+    assert policies[Project.MUSEMATIC].candidate_build.enabled is False
+    assert policies[Project.MUSEMATIC].immutable_promotion.blocker == (
+        "MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED"
+    )
 
 
 def test_deployment_target_templates_match_the_strict_schema() -> None:

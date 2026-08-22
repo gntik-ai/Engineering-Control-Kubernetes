@@ -38,6 +38,24 @@ Use a fine-grained token limited to contents and pull-request write access on th
 repositories. It must not have merge-bypass, repository administration, Actions-secret, or
 deployment credentials access.
 
+Authenticate `delivery-runner` to GHCR interactively; do not paste a token into a command line or
+copy an interactive Docker config from another account:
+
+```bash
+ssh -t worker 'sudo install -d -o delivery-runner -g delivery-runner -m 0700 \
+  /etc/engineering-control/env/delivery/registry && \
+  sudo -u delivery-runner env DOCKER_CONFIG=/etc/engineering-control/env/delivery/registry \
+  docker login ghcr.io --username <github-account> && \
+  sudo chown root:delivery-runner \
+  /etc/engineering-control/env/delivery/registry \
+  /etc/engineering-control/env/delivery/registry/config.json && \
+  sudo chmod 0750 /etc/engineering-control/env/delivery/registry && \
+  sudo chmod 0640 /etc/engineering-control/env/delivery/registry/config.json'
+```
+
+Use a package-read-only credential. The current project build contracts are disabled, so this
+credential alone does not enable promotion.
+
 ## Verify
 
 ```bash
@@ -59,6 +77,8 @@ engineering-ctl cancel <workflow-id>
 engineering-ctl usage
 engineering-ctl evidence <artifact-id>
 engineering-ctl delivery <finding-uuid> --risk R1
+engineering-ctl reconcile <change-set-uuid>
+engineering-ctl reconcile <change-set-uuid> --candidate-build-run-id <github-run-id>
 engineering-ctl deployment <change-set-uuid> --environment preview
 engineering-ctl deployment <change-set-uuid> --environment staging
 engineering-ctl approval-candidate <change-set-uuid>

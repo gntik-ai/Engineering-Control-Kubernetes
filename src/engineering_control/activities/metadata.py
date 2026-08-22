@@ -50,6 +50,13 @@ from engineering_control.models.enums import (
     Provider,
     RiskClass,
 )
+from engineering_control.models.reconciliation import (
+    CandidateArtifactManifest,
+    CIReconciliationPlan,
+    DeliveryControlPolicy,
+    PromotionPlan,
+    PromotionPublication,
+)
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
@@ -218,6 +225,11 @@ class MetadataActivityHandler:
             "delivery.persist_handoff",
             "delivery.prepare_publication",
             "delivery.persist_publication",
+            "reconcile.prepare",
+            "reconcile.persist_ci",
+            "reconcile.prepare_promotion",
+            "reconcile.persist_promotion",
+            "reconcile.persist_promotion_publication",
             "preview.prepare",
             "preview.record_candidate",
             "preview.validate_approval",
@@ -309,6 +321,23 @@ class MetadataActivityHandler:
                 return self._prepare_publication(payload)
             if step == "delivery.persist_publication":
                 return await asyncio.to_thread(self._persist_publication, payload)
+            if step == "reconcile.prepare":
+                return await asyncio.to_thread(self._prepare_reconciliation, payload)
+            if step == "reconcile.persist_ci":
+                return await asyncio.to_thread(self._persist_reconciled_ci, payload)
+            if step == "reconcile.prepare_promotion":
+                try:
+                    return await asyncio.to_thread(self._prepare_promotion, payload)
+                except ComponentLeaseConflict:
+                    return await asyncio.to_thread(
+                        self._block_reconciliation,
+                        payload,
+                        "PROMOTION_COMPONENT_LEASE_CONFLICT",
+                    )
+            if step == "reconcile.persist_promotion":
+                return await asyncio.to_thread(self._persist_promotion, payload)
+            if step == "reconcile.persist_promotion_publication":
+                return await asyncio.to_thread(self._persist_promotion_publication, payload)
             if step == "preview.prepare":
                 return await asyncio.to_thread(self._prepare_deployment, payload, "preview")
             if step == "preview.record_candidate":
@@ -1517,6 +1546,28 @@ class MetadataActivityHandler:
             change_set.deployment_pr_url = (
                 str(deployment["pr_url"]) if deployment is not None else None
             )
+            checker = payload.get("agent_result")
+            if isinstance(checker, dict) and isinstance(checker.get("structured_result"), dict):
+                structured = checker["structured_result"]
+                if structured.get("decision") == "PASS":
+                    recovery = dict(change_set.recovery_json)
+                    recovery["provider_chain"] = {
+                        "maker": str(payload.get("maker_provider", "")),
+                        "checker": str(payload.get("checker_provider", "")),
+                    }
+                    recovery["independent_review"] = {
+                        "decision": "PASS",
+                        "provider": str(payload.get("checker_provider", "")),
+                        "sha256": hashlib.sha256(
+                            json.dumps(
+                                structured,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                default=str,
+                            ).encode()
+                        ).hexdigest(),
+                    }
+                    change_set.recovery_json = recovery
             change_set.state = ChangeSetState.SOURCE_PR.value
             change_set.version += 1
             run.status = "SUCCESS"
@@ -1534,6 +1585,504 @@ class MetadataActivityHandler:
             "deployment_pr": deployment["pr_url"] if deployment is not None else None,
             "deployment_deferred": deployment is None,
         }
+
+    def _prepare_reconciliation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        orchestration = self._object(payload.get("orchestration"), "orchestration")
+        workflow_id = str(orchestration.get("workflow_id", ""))
+        candidate_build_run_id = payload.get("candidate_build_run_id")
+        policy: DeliveryControlPolicy
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(Run).where(
+                    Run.workflow_id == workflow_id,
+                    Run.change_set_id == change_set_id,
+                    Run.run_type == "delivery-reconciliation",
+                )
+            )
+            change_set = session.get(ChangeSet, change_set_id)
+            if run is None or change_set is None:
+                raise ValueError("delivery reconciliation metadata binding is missing")
+            if change_set.state not in {
+                ChangeSetState.SOURCE_PR.value,
+                ChangeSetState.CI_VALIDATED.value,
+                ChangeSetState.CANDIDATE_BUILT.value,
+            }:
+                raise ValueError("ChangeSet is not in a reconcilable state")
+            if not change_set.source_pr_url or not change_set.source_head_sha:
+                raise ValueError("reconciliation requires an exact published source PR")
+            if not change_set.source_branch:
+                raise ValueError("reconciliation requires the bounded source branch")
+            match = re.fullmatch(
+                rf"https://github\.com/gntik-ai/{re.escape(change_set.source_repository)}/pull/([1-9][0-9]*)",
+                change_set.source_pr_url,
+            )
+            if match is None:
+                raise ValueError("source PR URL does not match its authoritative repository")
+            recovery = dict(change_set.recovery_json)
+            provider_chain_value = recovery.get("provider_chain")
+            review_value = recovery.get("independent_review")
+            provider_chain = provider_chain_value if isinstance(provider_chain_value, dict) else {}
+            review = review_value if isinstance(review_value, dict) else {}
+            maker = str(provider_chain.get("maker", ""))
+            checker = str(provider_chain.get("checker", ""))
+            if (
+                maker not in {"codex", "claude"}
+                or checker not in {"codex", "claude"}
+                or maker == checker
+                or review.get("decision") != "PASS"
+                or review.get("provider") != checker
+                or not re.fullmatch(r"[a-f0-9]{64}", str(review.get("sha256", "")))
+            ):
+                run.status = "BLOCKED"
+                run.error_code = "INDEPENDENT_REVIEW_EVIDENCE_MISSING"
+                run.summary = "source PR lacks a persisted cross-provider review binding"
+                run.finished_at = datetime.now(UTC)
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "INDEPENDENT_REVIEW_EVIDENCE_MISSING",
+                }
+            project = Project(change_set.project)
+            policy = self._delivery_control_policy(project)
+            run.status = "RUNNING"
+            run.started_at = run.started_at or datetime.now(UTC)
+            plan = CIReconciliationPlan(
+                change_set_id=change_set.id,
+                run_id=run.id,
+                workflow_id=workflow_id,
+                project=project,
+                repository=f"gntik-ai/{change_set.source_repository}",
+                source_pr_number=int(match.group(1)),
+                source_pr_url=change_set.source_pr_url,
+                source_branch=change_set.source_branch,
+                source_head_sha=change_set.source_head_sha,
+                candidate_build_run_id=(
+                    int(candidate_build_run_id) if candidate_build_run_id is not None else None
+                ),
+                policy=policy,
+                independent_review_sha256=str(review["sha256"]),
+                independent_review_provider=checker,
+                maker_provider=maker,
+            )
+        return {
+            **payload,
+            "status": "RECONCILIATION_READY",
+            "run_id": str(plan.run_id),
+            "project": plan.project.value,
+            "reconciliation_plan": plan.model_dump(mode="json"),
+        }
+
+    def _persist_reconciled_ci(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = CIReconciliationPlan.model_validate(payload.get("reconciliation_plan"))
+        status = str(payload.get("status", ""))
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            if run is None or change_set is None or run.change_set_id != change_set.id:
+                raise ValueError("reconciliation persistence binding is missing")
+            if (
+                run.workflow_id != plan.workflow_id
+                or change_set.project != plan.project.value
+                or change_set.source_pr_url != plan.source_pr_url
+                or change_set.source_branch != plan.source_branch
+                or change_set.source_head_sha != plan.source_head_sha
+                or plan.policy != self._delivery_control_policy(plan.project)
+            ):
+                raise ValueError("source SHA changed during CI reconciliation")
+            if status not in {"CI_VALIDATED", "CANDIDATE_VERIFIED"}:
+                blocker = str(payload.get("blocker", status or "CI_RECONCILIATION_FAILED"))
+                run.status = "BLOCKED"
+                run.error_code = blocker[:120]
+                run.summary = "source PR CI could not be authoritatively reconciled"
+                run.finished_at = now
+                return {**payload, "status": "BLOCKED", "blocker": blocker}
+            evidence = self._object(payload.get("ci_evidence"), "ci_evidence")
+            if (
+                evidence.get("source_head_sha") != plan.source_head_sha
+                or not re.fullmatch(r"[a-f0-9]{64}", str(evidence.get("checks_sha256", "")))
+                or evidence.get("independent_review_sha256") != plan.independent_review_sha256
+            ):
+                raise ValueError("CI evidence is not bound to immutable source and review evidence")
+            verification_id = uuid5(
+                NAMESPACE_URL, f"ci-reconciliation:{plan.change_set_id}:{plan.source_head_sha}"
+            )
+            verification = session.get(VerificationResult, verification_id)
+            verification_evidence = {
+                "source_pr_url": plan.source_pr_url,
+                "source_head_sha": plan.source_head_sha,
+                "checks_sha256": evidence["checks_sha256"],
+                "check_count": evidence.get("check_count"),
+                "independent_review_sha256": plan.independent_review_sha256,
+            }
+            if verification is None:
+                session.add(
+                    VerificationResult(
+                        id=verification_id,
+                        change_set_id=change_set.id,
+                        deployment_id=None,
+                        run_id=run.id,
+                        verification_type="source-pr-ci",
+                        verifier_provider=None,
+                        status="PASS",
+                        evidence_json=verification_evidence,
+                    )
+                )
+            elif verification.evidence_json != verification_evidence:
+                raise ValueError("CI reconciliation evidence changed for the same source SHA")
+            recovery = dict(change_set.recovery_json)
+            recovery["ci"] = {
+                **verification_evidence,
+                "artifact": payload.get("ci_evidence_artifact"),
+            }
+            change_set.recovery_json = recovery
+            if change_set.state == ChangeSetState.SOURCE_PR.value:
+                change_set.state = ChangeSetState.CI_VALIDATED.value
+                change_set.version += 1
+            if status == "CANDIDATE_VERIFIED":
+                if not plan.policy.candidate_build.enabled:
+                    raise ValueError("candidate build policy is not enabled")
+                manifest = CandidateArtifactManifest.model_validate(
+                    payload.get("candidate_manifest")
+                )
+                expected_repositories = plan.policy.immutable_promotion.image_repositories
+                repositories = {image.component: image.repository for image in manifest.images}
+                digests = {image.component: image.digest for image in manifest.images}
+                if (
+                    manifest.source_sha != plan.source_head_sha
+                    or manifest.workflow_run_id != plan.candidate_build_run_id
+                    or repositories != expected_repositories
+                ):
+                    raise ValueError("candidate manifest changed after delivery verification")
+                if change_set.image_digests and change_set.image_digests != digests:
+                    raise ValueError("candidate image digests changed after persistence")
+                change_set.image_digests = digests
+                candidate_evidence = self._object(evidence.get("candidate"), "candidate evidence")
+                attestations = candidate_evidence.get("attestation_sha256")
+                if (
+                    candidate_evidence.get("workflow_run_id") != manifest.workflow_run_id
+                    or candidate_evidence.get("source_sha") != manifest.source_sha
+                    or not re.fullmatch(
+                        r"[a-f0-9]{64}",
+                        str(candidate_evidence.get("manifest_sha256", "")),
+                    )
+                    or not isinstance(attestations, dict)
+                    or set(attestations) != set(digests)
+                    or any(
+                        not re.fullmatch(r"[a-f0-9]{64}", str(value))
+                        for value in attestations.values()
+                    )
+                ):
+                    raise ValueError("candidate provenance evidence is incomplete")
+                candidate_verification_id = uuid5(
+                    NAMESPACE_URL,
+                    (
+                        f"candidate-artifact:{plan.change_set_id}:"
+                        f"{manifest.workflow_run_id}:{manifest.source_sha}"
+                    ),
+                )
+                candidate_record = {
+                    "workflow_run_id": manifest.workflow_run_id,
+                    "source_sha": manifest.source_sha,
+                    "manifest_sha256": candidate_evidence.get("manifest_sha256"),
+                    "attestation_sha256": candidate_evidence.get("attestation_sha256"),
+                    "image_digests": digests,
+                    "artifact": payload.get("ci_evidence_artifact"),
+                }
+                existing_candidate = session.get(VerificationResult, candidate_verification_id)
+                if existing_candidate is None:
+                    session.add(
+                        VerificationResult(
+                            id=candidate_verification_id,
+                            change_set_id=change_set.id,
+                            deployment_id=None,
+                            run_id=run.id,
+                            verification_type="candidate-artifact-provenance",
+                            verifier_provider=None,
+                            status="PASS",
+                            evidence_json=candidate_record,
+                        )
+                    )
+                elif existing_candidate.evidence_json != candidate_record:
+                    raise ValueError("candidate provenance changed for the same workflow run")
+                recovery["candidate"] = candidate_record
+                change_set.recovery_json = recovery
+                if change_set.state == ChangeSetState.CI_VALIDATED.value:
+                    change_set.state = ChangeSetState.CANDIDATE_BUILT.value
+                    change_set.version += 1
+                run.status = "RUNNING"
+                run.error_code = None
+                run.summary = "exact-SHA CI and signed immutable candidate images verified"
+                return {**payload, "status": "CANDIDATE_BUILT"}
+            blocker = str(payload.get("candidate_status") or "AWAITING_IMMUTABLE_ARTIFACT")
+            run.status = "BLOCKED"
+            run.error_code = blocker[:120]
+            run.summary = "source PR CI passed; immutable candidate artifact remains unavailable"
+            run.finished_at = now
+        return {**payload, "status": "CI_VALIDATED", "blocker": blocker}
+
+    def _prepare_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = CIReconciliationPlan.model_validate(payload.get("reconciliation_plan"))
+        dry_run = bool(payload.get("dry_run", True))
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            if run is None or change_set is None or run.change_set_id != change_set.id:
+                raise ValueError("promotion metadata binding is missing")
+            if change_set.state != ChangeSetState.CANDIDATE_BUILT.value:
+                raise ValueError("immutable promotion requires a verified candidate build")
+            if dry_run:
+                run.status = "SUCCESS"
+                run.summary = (
+                    "CI and signed candidate verified; promotion dry-run stopped "
+                    "before Git mutation"
+                )
+                run.finished_at = now
+                return {
+                    **payload,
+                    "status": "DRY_RUN",
+                    "next_state": ChangeSetState.CANDIDATE_BUILT.value,
+                }
+            promotion_policy = plan.policy.immutable_promotion
+            if not promotion_policy.enabled:
+                blocker = str(promotion_policy.blocker)
+                run.status = "BLOCKED"
+                run.error_code = blocker
+                run.summary = "immutable deployment rendering is not enabled for this project"
+                run.finished_at = now
+                return {**payload, "status": "BLOCKED", "blocker": blocker}
+            recovery = dict(change_set.recovery_json)
+            existing_promotion = recovery.get("promotion")
+            if isinstance(existing_promotion, dict) and (
+                existing_promotion.get("promoted_head_sha") == change_set.deployment_head_sha
+                and re.fullmatch(
+                    r"[a-f0-9]{40}", str(existing_promotion.get("promoted_head_sha", ""))
+                )
+            ):
+                publication = self._promotion_publication(
+                    change_set, str(existing_promotion["promoted_head_sha"])
+                )
+                return {
+                    **payload,
+                    "status": "PROMOTION_PUBLICATION_READY",
+                    "promotion_publication": publication.model_dump(mode="json"),
+                }
+            lease = session.scalar(
+                select(WorktreeLease).where(
+                    WorktreeLease.change_set_id == change_set.id,
+                    WorktreeLease.repository == change_set.deployment_repository,
+                )
+            )
+            if (
+                lease is None
+                or not change_set.deployment_branch
+                or not change_set.deployment_head_sha
+            ):
+                raise ValueError("promotion requires the original bounded deployment worktree")
+            expected_path = (
+                self.settings.worktree_root / change_set.deployment_repository / str(change_set.id)
+            ).as_posix()
+            if lease.worktree_path != expected_path or lease.branch != change_set.deployment_branch:
+                raise ValueError("promotion worktree lease identity changed")
+            prior_run = session.get(Run, lease.owner_run_id)
+            if (
+                prior_run is not None
+                and prior_run.id != run.id
+                and prior_run.status
+                in {
+                    "QUEUED",
+                    "RUNNING",
+                    "AWAITING_APPROVAL",
+                }
+            ):
+                raise ComponentLeaseConflict("prior worktree owner remains active")
+            lease.owner_run_id = run.id
+            lease.expires_at = now + timedelta(hours=4)
+            lease.released_at = None
+            component = ComponentLeaseManager().acquire(
+                session,
+                component_key=promotion_policy.component_lease,
+                owner_run_id=run.id,
+                mode="implementation",
+                ttl=timedelta(hours=4),
+            )
+            recovery["promotion_component_lease"] = component.component_key
+            change_set.recovery_json = recovery
+            promotion = PromotionPlan(
+                change_set_id=change_set.id,
+                run_id=run.id,
+                workflow_id=plan.workflow_id,
+                project=Project.FALCONE,
+                repository="gntik-ai/falcone-charts",
+                repository_slug="falcone-charts",
+                working_directory=Path(lease.worktree_path),
+                branch=change_set.deployment_branch,
+                expected_head_sha=change_set.deployment_head_sha,
+                deployment_file=promotion_policy.deployment_file,
+                chart_directory=str(promotion_policy.chart_directory),
+                values_files=promotion_policy.values_files,
+                digest_paths=promotion_policy.digest_paths,
+                image_digests={
+                    str(key): str(value) for key, value in change_set.image_digests.items()
+                },
+                chart_version=change_set.chart_version,
+            )
+        return {
+            **payload,
+            "status": "PROMOTION_READY",
+            "promotion_plan": promotion.model_dump(mode="json"),
+        }
+
+    def _persist_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = PromotionPlan.model_validate(payload.get("promotion_plan"))
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            if run is None or change_set is None:
+                raise ValueError("promotion persistence binding is missing")
+            if payload.get("status") != "PROMOTION_COMMITTED":
+                blocker = str(payload.get("blocker", "IMMUTABLE_PROMOTION_VALIDATION_FAILED"))
+                run.status = "BLOCKED"
+                run.error_code = blocker[:120]
+                run.summary = "deployment worktree was preserved after promotion failure"
+                run.finished_at = datetime.now(UTC)
+                self._release_reconciliation_component(session, change_set, run)
+                return {**payload, "status": "BLOCKED", "blocker": blocker}
+            promoted_head = str(payload.get("promoted_head_sha", ""))
+            evidence = self._object(payload.get("promotion_evidence"), "promotion_evidence")
+            if (
+                not re.fullmatch(r"[a-f0-9]{40}", promoted_head)
+                or evidence.get("base_sha") != plan.expected_head_sha
+                or evidence.get("promoted_sha") != promoted_head
+                or evidence.get("image_digests") != plan.image_digests
+            ):
+                raise ValueError("promotion evidence is not bound to its exact Git transaction")
+            change_set.deployment_head_sha = promoted_head
+            change_set.chart_version = str(evidence.get("chart_version") or "") or None
+            recovery = dict(change_set.recovery_json)
+            recovery["promotion"] = {
+                "base_sha": plan.expected_head_sha,
+                "promoted_head_sha": promoted_head,
+                "diff_sha256": evidence.get("diff_sha256"),
+                "rendered_manifest_sha256": evidence.get("rendered_manifest_sha256"),
+                "artifacts": payload.get("promotion_artifacts"),
+            }
+            change_set.recovery_json = recovery
+            change_set.version += 1
+            publication = self._promotion_publication(change_set, promoted_head)
+        return {
+            **payload,
+            "status": "PROMOTION_PUBLICATION_READY",
+            "promotion_publication": publication.model_dump(mode="json"),
+        }
+
+    def _persist_promotion_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
+        publication = PromotionPublication.model_validate(payload.get("promotion_publication"))
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(Run).where(
+                    Run.change_set_id == publication.change_set_id,
+                    Run.run_type == "delivery-reconciliation",
+                    Run.status == "RUNNING",
+                )
+            )
+            change_set = session.get(ChangeSet, publication.change_set_id)
+            if run is None or change_set is None:
+                raise ValueError("promotion publication metadata binding is missing")
+            if payload.get("status") != "DEPLOYMENT_PR_CREATED":
+                blocker = str(payload.get("blocker", "GITHUB_PROMOTION_PUBLICATION_FAILED"))
+                run.status = "BLOCKED"
+                run.error_code = blocker[:120]
+                run.summary = "immutable promotion commit preserved pending scoped publication"
+                run.finished_at = datetime.now(UTC)
+                self._release_reconciliation_component(session, change_set, run)
+                return {**payload, "status": "BLOCKED", "blocker": blocker}
+            result = self._object(payload.get("promotion_result"), "promotion_result")
+            if (
+                result.get("repository_slug") != change_set.deployment_repository
+                or result.get("head_sha") != change_set.deployment_head_sha
+                or result.get("pr_state") != "OPEN"
+                or not re.fullmatch(
+                    r"https://github\.com/gntik-ai/falcone-charts/pull/[1-9][0-9]*",
+                    str(result.get("pr_url", "")),
+                )
+            ):
+                raise ValueError("deployment PR does not bind to the promoted Git head")
+            change_set.deployment_pr_url = str(result["pr_url"])
+            change_set.state = ChangeSetState.DEPLOY_PR.value
+            change_set.version += 1
+            run.status = "SUCCESS"
+            run.error_code = None
+            run.summary = "signed candidate digests published through a protected deployment PR"
+            run.finished_at = datetime.now(UTC)
+            self._release_reconciliation_component(session, change_set, run)
+        return {
+            **payload,
+            "status": "DEPLOY_PR",
+            "deployment_pr": result["pr_url"],
+            "deployment_sha": result["head_sha"],
+        }
+
+    def _promotion_publication(
+        self, change_set: ChangeSet, promoted_head: str
+    ) -> PromotionPublication:
+        if not change_set.deployment_branch or not change_set.source_pr_url:
+            raise ValueError("promotion publication requires authoritative branches and source PR")
+        worktree = (
+            self.settings.worktree_root / change_set.deployment_repository / str(change_set.id)
+        )
+        body = (
+            "## Engineering Control immutable promotion\n\n"
+            f"ChangeSet: `{change_set.id}`\n\n"
+            f"Source PR: {change_set.source_pr_url}\n\n"
+            f"Source SHA: `{change_set.source_head_sha}`\n\n"
+            f"Deployment SHA: `{promoted_head}`\n\n"
+            "Every first-party image is bound by an exact sha256 digest and verified "
+            "GitHub artifact attestation. Merge and deployment remain protected.\n"
+        )
+        return PromotionPublication(
+            change_set_id=change_set.id,
+            repository="gntik-ai/falcone-charts",
+            repository_slug="falcone-charts",
+            working_directory=worktree,
+            branch=change_set.deployment_branch,
+            head_sha=promoted_head,
+            title=f"changeset {str(change_set.id)[:8]}: promote immutable candidate",
+            body=body,
+        )
+
+    def _block_reconciliation(self, payload: dict[str, Any], blocker: str) -> dict[str, Any]:
+        plan = CIReconciliationPlan.model_validate(payload.get("reconciliation_plan"))
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            if run is None or change_set is None:
+                raise ValueError("blocked reconciliation metadata binding is missing")
+            run.status = "BLOCKED"
+            run.error_code = blocker
+            run.summary = "immutable promotion is waiting for its bounded component lease"
+            run.finished_at = datetime.now(UTC)
+            self._release_reconciliation_component(session, change_set, run)
+        return {**payload, "status": "BLOCKED", "blocker": blocker}
+
+    def _delivery_control_policy(self, project: Project) -> DeliveryControlPolicy:
+        root = self.settings.project_config_root.resolve()
+        path = (root / f"{project.value}.yaml").resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            raise ValueError("project delivery-control policy is missing")
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or value.get("project") != project.value:
+            raise ValueError("project delivery-control policy identity is invalid")
+        return DeliveryControlPolicy.model_validate(value.get("delivery_control"))
+
+    @staticmethod
+    def _release_reconciliation_component(session: Any, change_set: ChangeSet, run: Run) -> None:
+        recovery = dict(change_set.recovery_json)
+        component = recovery.get("promotion_component_lease")
+        if isinstance(component, str):
+            ComponentLeaseManager().release(session, component_key=component, owner_run_id=run.id)
 
     def _persist_delivery_handoff(self, payload: dict[str, Any]) -> dict[str, Any]:
         evidence = self._object(payload.get("change_evidence"), "change_evidence")

@@ -54,7 +54,8 @@ install -d -o root -g root -m 0711 "${CONFIG_ROOT}/env"
 install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/journeys"
 install -d -o browser-runner -g browser-runner -m 0700 "${CONFIG_ROOT}/env/browser"
 install -d -o scan-runner -g scan-runner -m 0700 "${CONFIG_ROOT}/env/observer"
-install -d -o root -g delivery-runner -m 0750 "${CONFIG_ROOT}/env/delivery"
+install -d -o root -g delivery-runner -m 0750 \
+  "${CONFIG_ROOT}/env/delivery" "${CONFIG_ROOT}/env/delivery/registry"
 install -d -o release-runner -g release-runner -m 0700 "${CONFIG_ROOT}/env/release"
 install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
 install -d -o root -g root -m 0711 \
@@ -144,11 +145,18 @@ done
 if [[ ! -f "${CONFIG_ROOT}/env/delivery-worker.env" ]]; then
   {
     printf 'ENGINEERING_GITHUB_TOKEN_FILE=%s/env/delivery/github.token\n' "${CONFIG_ROOT}"
+    printf 'ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=%s/env/delivery/registry/config.json\n' \
+      "${CONFIG_ROOT}"
     printf 'ENGINEERING_DELIVERY_CREDENTIAL_ROOT=%s/env/delivery\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_GITHUB_EXECUTABLE=/usr/local/bin/gh\n'
   } >"${CONFIG_ROOT}/env/delivery-worker.env"
   chown root:delivery-runner "${CONFIG_ROOT}/env/delivery-worker.env"
   chmod 0640 "${CONFIG_ROOT}/env/delivery-worker.env"
+fi
+if ! grep -q '^ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=' \
+  "${CONFIG_ROOT}/env/delivery-worker.env"; then
+  printf 'ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=%s/env/delivery/registry/config.json\n' \
+    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
 fi
 if [[ ! -f "${CONFIG_ROOT}/env/delivery/github.token" ]]; then
   touch "${STATE_ROOT}/MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
@@ -156,6 +164,13 @@ else
   chown root:delivery-runner "${CONFIG_ROOT}/env/delivery/github.token"
   chmod 0640 "${CONFIG_ROOT}/env/delivery/github.token"
   rm -f -- "${STATE_ROOT}/MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
+fi
+if [[ ! -f "${CONFIG_ROOT}/env/delivery/registry/config.json" ]]; then
+  touch "${STATE_ROOT}/MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED"
+else
+  chown root:delivery-runner "${CONFIG_ROOT}/env/delivery/registry/config.json"
+  chmod 0640 "${CONFIG_ROOT}/env/delivery/registry/config.json"
+  rm -f -- "${STATE_ROOT}/MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED"
 fi
 if [[ ${evidence_tokens_ready} == true ]]; then
   if [[ -f "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED" ]]; then

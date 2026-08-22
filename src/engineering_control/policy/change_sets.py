@@ -70,6 +70,7 @@ class ChangeSetPolicy:
         ChangeSetState.CANDIDATE_BUILT: {
             ChangeSetState.PREVIEW_DEPLOYED,
             ChangeSetState.SOURCE_MERGED,
+            ChangeSetState.DEPLOY_PR,
             ChangeSetState.REQUEST_CHANGES,
         },
         ChangeSetState.PREVIEW_DEPLOYED: {

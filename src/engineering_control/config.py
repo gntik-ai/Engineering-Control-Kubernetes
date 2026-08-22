@@ -56,10 +56,12 @@ class Settings(BaseSettings):
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")
+    project_config_root: Path = Path("/etc/engineering-control/projects.d")
     browser_credential_root: Path = Path("/etc/engineering-control/env/browser")
     browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
     github_executable: Path = Path("/usr/bin/gh")
     github_token_file: Path | None = None
+    github_registry_auth_file: Path | None = None
     git_executable: Path = Path("/usr/bin/git")
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
     git_askpass_executable: Path = Path("/opt/engineering-control/source/scripts/git-askpass.sh")

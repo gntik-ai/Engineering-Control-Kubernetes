@@ -5,6 +5,7 @@ class WorkflowName(StrEnum):
     AUDIT_CAMPAIGN = "AuditCampaignWorkflow"
     FINDING_VERIFICATION = "FindingVerificationWorkflow"
     ISSUE_DELIVERY = "IssueDeliveryWorkflow"
+    DELIVERY_RECONCILIATION = "DeliveryReconciliationWorkflow"
     PREVIEW_DEPLOYMENT = "PreviewDeploymentWorkflow"
     STAGING_DEPLOYMENT = "StagingDeploymentWorkflow"
     RUNTIME_VERIFICATION = "RuntimeVerificationWorkflow"
