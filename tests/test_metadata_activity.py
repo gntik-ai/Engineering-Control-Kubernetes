@@ -567,6 +567,140 @@ async def test_cancelled_deployment_run_is_persisted_as_terminal(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_failed_approved_staging_mutation_releases_lease_and_opens_incident(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'deployment-failed.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    deployment_id = uuid4()
+    run_id = uuid4()
+    workflow_id = "deploy-staging-failed"
+    binding = "f" * 64
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="falcone",
+                risk_class="R2",
+                state="STAGING_APPROVED",
+                version=3,
+                source_repository="falcone",
+                source_branch="agent/falcone/1/test",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url="https://github.com/gntik-ai/falcone/pull/1",
+                deployment_repository="falcone-charts",
+                deployment_branch="agent/falcone/1/test",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url="https://github.com/gntik-ai/falcone-charts/pull/1",
+                image_digests={"api": f"sha256:{'e' * 64}"},
+                chart_version="1.2.3",
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id=workflow_id,
+                run_type="staging-deployment",
+                status="RUNNING",
+                project="falcone",
+            )
+        )
+        session.add(
+            Deployment(
+                id=deployment_id,
+                change_set_id=change_set_id,
+                project="falcone",
+                environment="staging",
+                strategy="helm",
+                target_context="falcone-staging-releaser",
+                target_namespace="falcone-staging",
+                desired_sha="d" * 40,
+                status="STAGING_APPROVED",
+                transaction_id=None,
+                started_at=datetime.now(UTC),
+                finished_at=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            ComponentLease(
+                component_key="falcone:deploy:staging",
+                owner_run_id=run_id,
+                mode="deployment",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                released_at=None,
+            )
+        )
+        session.add(
+            ApprovalCandidate(
+                change_set_id=change_set_id,
+                workflow_id=workflow_id,
+                risk_class="R2",
+                artifact_binding_sha256=binding,
+                payload_json={"artifact_binding_sha256": binding},
+                invalidated_at=None,
+            )
+        )
+
+    result = await handler.handle(
+        "deployment.record_terminal",
+        {
+            "project": "falcone",
+            "environment": "staging",
+            "change_set_id": str(change_set_id),
+            "deployment_id": str(deployment_id),
+            "artifact_binding_sha256": binding,
+            "terminal_status": "DEPLOYMENT_FAILED",
+            "blocker": "DEPLOYMENT_ACTIVITY_FAILED",
+            "approval_validation": {"current": True},
+            "release_plan": {"strategy": "helm"},
+            "release_preflight": {
+                "previous_revision": 7,
+                "previous_manifest_sha256": "9" * 64,
+            },
+            "release_evidence": {
+                "migration": False,
+                "rollback_plan_sha256": "1" * 64,
+                "ci_result_sha256": "2" * 64,
+                "independent_review_sha256": "3" * 64,
+            },
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+
+    assert result["status"] == "DEPLOYMENT_FAILED"
+    with handler.sessions() as session:
+        run = session.get(Run, run_id)
+        deployment = session.get(Deployment, deployment_id)
+        change_set = session.get(ChangeSet, change_set_id)
+        incident = session.scalar(select(Incident).where(Incident.deployment_id == deployment_id))
+        active_lease_count = session.scalar(
+            select(func.count())
+            .select_from(ComponentLease)
+            .where(ComponentLease.released_at.is_(None))
+        )
+        candidate = session.scalar(
+            select(ApprovalCandidate).where(ApprovalCandidate.workflow_id == workflow_id)
+        )
+        assert run is not None and run.status == "FAILED"
+        assert deployment is not None and deployment.status == "DEPLOYMENT_FAILED"
+        assert deployment.recovery_json["deployed_artifact_binding_sha256"] == binding
+        assert change_set is not None and change_set.state == "DEPLOYMENT_FAILED"
+        assert incident is not None and incident.recovery_state == "DEPLOYMENT_FAILED"
+        assert active_lease_count == 0
+        assert candidate is not None and candidate.invalidated_at is not None
+
+
+@pytest.mark.asyncio
 async def test_staging_candidate_binds_preflight_and_both_repository_heads(
     tmp_path: Path,
 ) -> None:

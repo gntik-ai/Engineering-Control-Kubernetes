@@ -59,6 +59,11 @@ The controller creates a deployment Run only for an authoritative ChangeSet in a
 Disabled or malformed targets, incomplete source/deployment evidence, or a missing deployment
 worktree lease end in a structured blocker without invoking a release mutation.
 
+Workflow activity failures are compensated into terminal metadata. A preflight failure ends its
+Run without claiming a product incident. A failure after current staging approval invalidates the
+candidate, releases the environment singleton lease, persists the captured recovery baseline,
+sets `DEPLOYMENT_FAILED`, and opens an incident; it cannot remain silently `RUNNING`.
+
 ## Runtime verification
 
 Runtime verification is a separate durable workflow started after staging reaches the exact

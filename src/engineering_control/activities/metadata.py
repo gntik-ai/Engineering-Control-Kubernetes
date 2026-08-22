@@ -1720,6 +1720,7 @@ class MetadataActivityHandler:
             "STAGING_PREFLIGHT_VALIDATED": "SUCCESS",
             "BLOCKED": "BLOCKED",
             "CANCELLED": "CANCELLED",
+            "DEPLOYMENT_FAILED": "FAILED",
         }.get(terminal)
         if run_status is None:
             raise ValueError("deployment terminal status is not allowlisted")
@@ -1740,10 +1741,14 @@ class MetadataActivityHandler:
                 if deployment is None or deployment.change_set_id != change_set_id:
                     raise ValueError("deployment terminal metadata binding is missing")
                 deployment.status = (
-                    "PREFLIGHT_VALIDATED" if run_status == "SUCCESS" else run_status
+                    "PREFLIGHT_VALIDATED"
+                    if run_status == "SUCCESS"
+                    else "DEPLOYMENT_FAILED"
+                    if terminal == "DEPLOYMENT_FAILED"
+                    else run_status
                 )
                 deployment.finished_at = now
-            if terminal in {"BLOCKED", "CANCELLED"}:
+            if terminal in {"BLOCKED", "CANCELLED", "DEPLOYMENT_FAILED"}:
                 candidate = session.scalar(
                     select(ApprovalCandidate).where(
                         ApprovalCandidate.change_set_id == change_set_id,
@@ -1755,6 +1760,45 @@ class MetadataActivityHandler:
                 change_set = session.get(ChangeSet, change_set_id)
                 if change_set is not None:
                     self._release_deployment_lease(session, change_set, run)
+                    mutation_attempted = (
+                        terminal == "DEPLOYMENT_FAILED"
+                        and payload.get("environment") == "staging"
+                        and isinstance(payload.get("approval_validation"), dict)
+                        and payload["approval_validation"].get("current") is True
+                    )
+                    if mutation_attempted:
+                        change_set.state = ChangeSetState.DEPLOYMENT_FAILED.value
+                        change_set.version += 1
+                        if deployment_id:
+                            deployment = session.get(Deployment, UUID(str(deployment_id)))
+                            if deployment is not None:
+                                recovery = dict(deployment.recovery_json)
+                                recovery.update(
+                                    {
+                                        "deployed_artifact_binding_sha256": str(
+                                            payload.get("artifact_binding_sha256", "")
+                                        ),
+                                        "release_plan": self._object(
+                                            payload.get("release_plan"), "release_plan"
+                                        ),
+                                        "release_preflight": self._object(
+                                            payload.get("release_preflight"),
+                                            "release_preflight",
+                                        ),
+                                        "release_evidence": self._object(
+                                            payload.get("release_evidence"),
+                                            "release_evidence",
+                                        ),
+                                        "previous_deployment_sha": (
+                                            change_set.deployment_base_sha
+                                        ),
+                                    }
+                                )
+                                deployment.recovery_json = recovery
+                                incident = self._ensure_recovery_incident(
+                                    session, change_set, deployment
+                                )
+                                incident.recovery_state = "DEPLOYMENT_FAILED"
         return {**payload, "status": terminal}
 
     def _runtime_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:

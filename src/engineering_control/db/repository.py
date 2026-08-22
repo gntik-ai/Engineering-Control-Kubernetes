@@ -242,6 +242,7 @@ class SQLMetadataRepository:
                 "STAGING_DEPLOYED",
                 "RUNTIME_VERIFIED",
                 "VERIFICATION_FAILED",
+                "DEPLOYMENT_FAILED",
                 "RECOVERY_FAILED",
             }:
                 raise ValueError("deployment has not reached a recoverable state")
