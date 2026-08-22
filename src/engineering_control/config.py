@@ -30,6 +30,16 @@ class Settings(BaseSettings):
         "postgresql+psycopg://engineering_control@127.0.0.1/engineering_control"
     )
     evidence_root: Path = Path("/srv/engineering/evidence")
+    evidence_ingest_host: str = "10.10.0.2"
+    evidence_ingest_port: int = Field(default=8750, ge=1024, le=65535)
+    evidence_ingest_url: str | None = None
+    evidence_ingest_token_file: Path = Path(
+        "/etc/engineering-control/env/evidence-ingest.token"
+    )
+    evidence_ingest_token_directory: Path = Path(
+        "/etc/engineering-control/env/evidence-uploaders"
+    )
+    evidence_max_bytes: int = Field(default=33_554_432, ge=1024, le=134_217_728)
     mirror_root: Path = Path("/srv/engineering/mirrors")
     worktree_root: Path = Path("/srv/engineering/worktrees")
     run_root: Path = Path("/srv/engineering/runs")
@@ -69,16 +79,48 @@ class Settings(BaseSettings):
             raise ValueError("the Engineering Control API cannot bind to every interface")
         return value
 
+    @field_validator("evidence_ingest_host")
+    @classmethod
+    def private_evidence_ingest_only(cls, value: str) -> str:
+        if value in {"0.0.0.0", "::"}:  # noqa: S104 - these values are explicitly rejected
+            raise ValueError("the evidence ingest service cannot bind to every interface")
+        return value
+
     def read_api_token(self) -> str:
-        path = self.api_token_file
+        return self._read_service_token(self.api_token_file, "API")
+
+    def read_evidence_ingest_token(self) -> str:
+        return self._read_service_token(self.evidence_ingest_token_file, "evidence ingest")
+
+    def read_evidence_ingest_tokens(self) -> dict[str, str]:
+        identities = (
+            "codex-runner",
+            "claude-runner",
+            "browser-runner",
+            "scan-runner",
+            "release-runner",
+        )
+        return {
+            identity: self._read_service_token(
+                self.evidence_ingest_token_directory / f"{identity}.token",
+                f"{identity} evidence ingest",
+            )
+            for identity in identities
+        }
+
+    @staticmethod
+    def _read_service_token(path: Path, label: str) -> str:
         metadata = path.stat()
         if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError("API token path must be a regular file")
-        if metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            raise PermissionError("API token file must not grant group or other access")
+            raise ValueError(f"{label} token path must be a regular file")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IXGRP | stat.S_IRWXO):
+            raise PermissionError(
+                f"{label} token file may grant group read but not group write/execute "
+                "or other access"
+            )
         token = path.read_text(encoding="utf-8").strip()
         if len(token) < 32:
-            raise ValueError("API token must contain at least 32 characters")
+            raise ValueError(f"{label} token must contain at least 32 characters")
         return token
 
 

@@ -10,6 +10,7 @@ Components:
 - Temporal 1.31.2 on loopback and private `10.10.0.2:7233`;
 - Temporal UI 2.53.3 on loopback port 8741;
 - Engineering API on loopback port 8740;
+- upload-only evidence ingest on private `10.10.0.2:8750`;
 - orchestration worker, scheduler, notifier, and migrations under systemd;
 - Hermes user plugin and gateway hook under `/home/hermes/.hermes`.
 
@@ -24,7 +25,9 @@ sudo ./scripts/bootstrap-controller.sh
 Configuration lives under `/etc/engineering-control`; PostgreSQL state under
 `/var/lib/engineering-control/postgresql`; evidence and mirrors under `/srv/engineering`. The API
 token is group-readable only by `engineering-api-clients`. The database password is not readable by
-Hermes. Compose ports are never published on all interfaces.
+Hermes. Evidence ingest uses identity-bound tokens under
+`/etc/engineering-control/env/evidence-uploaders/`; possessing one grants no control API access.
+Compose ports are never published on all interfaces.
 
 The bootstrap installs a commit-addressed release under `/opt/engineering-control/releases` and
 updates a symlink. It does not touch product repositories, Kubernetes, or existing Hermes service

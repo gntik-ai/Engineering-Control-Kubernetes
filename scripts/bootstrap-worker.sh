@@ -108,6 +108,28 @@ if [[ ! -f "${CONFIG_ROOT}/env/worker-common.env" ]]; then
   } >"${CONFIG_ROOT}/env/worker-common.env"
   chmod 0644 "${CONFIG_ROOT}/env/worker-common.env"
 fi
+{
+  printf 'ENGINEERING_EVIDENCE_INGEST_URL=http://10.10.0.2:8750/v1/evidence\n'
+  printf 'ENGINEERING_EVIDENCE_MAX_BYTES=33554432\n'
+} >"${CONFIG_ROOT}/env/evidence-upload.env"
+chmod 0644 "${CONFIG_ROOT}/env/evidence-upload.env"
+evidence_tokens_ready=true
+for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+  token_path="${CONFIG_ROOT}/env/evidence-${identity}.token"
+  if [[ -f "${token_path}" ]]; then
+    chown root:"${identity}" "${token_path}"
+    chmod 0640 "${token_path}"
+  else
+    evidence_tokens_ready=false
+  fi
+done
+if [[ ${evidence_tokens_ready} == true ]]; then
+  if [[ -f "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED" ]]; then
+    rm -- "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED"
+  fi
+else
+  touch "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED"
+fi
 
 install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/engineering-worker@.service" \
   /etc/systemd/system/engineering-worker@.service

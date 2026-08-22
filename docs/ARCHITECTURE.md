@@ -11,6 +11,7 @@ Telegram user (allowlist)
   -> Temporal frontend 127.0.0.1/10.10.0.2:7233
   -> control workflow worker
        -> engineering-scan / codex / claude / browser / release task queues on worker
+       -> evidence ingest 10.10.0.2:8750 (identity-bound upload tokens, 32 MiB/artifact)
   -> PostgreSQL 127.0.0.1:55432
   -> evidence metadata + /srv/engineering/evidence
 ```
@@ -27,6 +28,9 @@ Trust boundaries:
 - `scan-runner` owns canonical mirrors and deterministic scanners.
 - `release-runner` receives only scoped release plans and release credentials. It has no model
   home or prompt-driven execution.
+- Each worker identity receives its own upload-scoped evidence token; producer impersonation is
+  rejected. These tokens cannot call the Engineering API, signal workflows, approve, or deploy.
+  The ingest listener has no workflow-control routes.
 - Kubernetes observer access excludes Secrets and mutation. Release identities are namespaced and
   are never made available to model workers.
 
@@ -38,3 +42,5 @@ continue-as-new rather than one permanent model session.
 Current fail-closed controls are intentional: production activity steps without a configured
 handler raise `NotConfigured`; missing native authentication is a manual blocker; deployment
 mutation needs a deterministic adapter, current artifact binding, and scoped credentials.
+Text and JSON evidence is rejected in memory if central redaction would make any replacement;
+unredacted bytes are never written. Binary evidence requires a producer `REDACTED` assertion.

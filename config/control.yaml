@@ -17,6 +17,9 @@ postgresql:
   credentials_from: /etc/engineering-control/env/database.env
 evidence:
   root: /srv/engineering/evidence
+  ingest: http://10.10.0.2:8750/v1/evidence
+  ingest_authentication: identity-bound-bearer-token-files
+  max_artifact_bytes: 33554432
   retention_policy: standard
   redact_before_persist: true
 repositories:

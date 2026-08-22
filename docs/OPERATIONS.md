@@ -4,8 +4,10 @@ Check controller:
 
 ```bash
 sudo systemctl status engineering-infrastructure engineering-migrate engineering-api \
-  engineering-temporal-worker engineering-scheduler engineering-notifier
+  engineering-evidence-ingest engineering-temporal-worker engineering-scheduler \
+  engineering-notifier
 sudo journalctl -u engineering-api -n 100 --no-pager
+sudo journalctl -u engineering-evidence-ingest -n 100 --no-pager
 docker compose --env-file /etc/engineering-control/env/infrastructure.env \
   -f /opt/engineering-control/infrastructure/compose.yaml ps
 ```

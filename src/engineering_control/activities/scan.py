@@ -14,7 +14,8 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.adapters.command import SafeCommandRunner
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
-from engineering_control.models.enums import Project, Provider
+from engineering_control.evidence.transfer import EvidencePublisher
+from engineering_control.models.enums import Project, Provider, RedactionStatus
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
@@ -61,6 +62,7 @@ class ScanActivityHandler:
         settings: Settings,
         manager: GitWorktreeManager | None = None,
         scanner: DeterministicScanner | None = None,
+        publisher: EvidencePublisher | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager or GitWorktreeManager(
@@ -79,6 +81,7 @@ class ScanActivityHandler:
                 }
             )
         )
+        self.publisher = publisher or EvidencePublisher(settings, settings.evidence_root)
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -263,16 +266,11 @@ class ScanActivityHandler:
             severe_vulnerabilities = self._severe_vulnerability_count(trivy)
             if secret.get("status") == "FINDINGS" or semgrep_findings or severe_vulnerabilities:
                 blocked = True
-            artifacts = [
-                {
-                    "path": str(report),
-                    "sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
-                    "size_bytes": report.stat().st_size,
-                    "redaction_status": "REDACTED",
-                }
-                for report in sorted(output.iterdir())
-                if report.is_file()
-            ]
+            artifacts = self._publish_reports(
+                payload,
+                sorted(report for report in output.iterdir() if report.is_file()),
+                filename_prefix=f"prechecks-{name}",
+            )
             summaries[name] = {
                 "secret_status": secret.get("status"),
                 "semgrep_findings": semgrep_findings,
@@ -324,7 +322,6 @@ class ScanActivityHandler:
                 blocked = True
             diff_path = evidence_root / f"{name}.patch"
             safe_diff = str(SecretRedactor().redact_text(diff).value)
-            self._atomic_text(diff_path, safe_diff)
             output = evidence_root / f"{name}-postchecks"
             secret = self.scanner.secret_scan(worktree, output)
             trivy = self.scanner.vulnerability_scan(worktree, output)
@@ -334,13 +331,39 @@ class ScanActivityHandler:
             severe = self._severe_vulnerability_count(trivy)
             if secret.get("status") == "FINDINGS" or semgrep_findings or severe:
                 blocked = True
+            artifacts = self._publish_reports(
+                payload,
+                sorted(report for report in output.iterdir() if report.is_file()),
+                filename_prefix=f"postchecks-{name}",
+            )
+            if secret.get("status") == "FINDINGS":
+                artifacts.append(
+                    {
+                        "status": "WITHHELD_SECRET_FINDINGS",
+                        "filename": diff_path.name,
+                        "sha256": hashlib.sha256(safe_diff.encode()).hexdigest(),
+                    }
+                )
+            else:
+                self._atomic_text(diff_path, safe_diff)
+                artifacts.extend(
+                    self._publish_reports(
+                        payload,
+                        [diff_path],
+                        filename_prefix=f"postchecks-{name}",
+                    )
+                )
             changes[name] = {
                 **summary,
-                "diff_path": str(diff_path),
+                "diff_path": (
+                    None if secret.get("status") == "FINDINGS" else str(diff_path)
+                ),
+                "diff_withheld": secret.get("status") == "FINDINGS",
                 "diff_redacted_sha256": hashlib.sha256(safe_diff.encode()).hexdigest(),
                 "secret_status": secret.get("status"),
                 "semgrep_findings": semgrep_findings,
                 "high_or_critical_vulnerabilities": severe,
+                "artifacts": artifacts,
             }
         return {
             **payload,
@@ -379,6 +402,45 @@ class ScanActivityHandler:
             temporary = Path(handle.name)
         os.chmod(temporary, 0o640)
         os.replace(temporary, path)
+
+    def _publish_reports(
+        self,
+        payload: dict[str, Any],
+        reports: list[Path],
+        *,
+        filename_prefix: str,
+    ) -> list[dict[str, Any]]:
+        orchestration = payload.get("orchestration")
+        if not isinstance(orchestration, dict) or not isinstance(
+            orchestration.get("workflow_id"), str
+        ):
+            if self.settings.environment == "production":
+                raise ValueError("production evidence requires its Temporal workflow identity")
+            workflow_id = "development-local"
+        else:
+            workflow_id = str(orchestration["workflow_id"])
+        project = Project(str(payload["project"]))
+        campaign_id = UUID(str(payload["campaign_id"])) if payload.get("campaign_id") else None
+        change_set_id = (
+            UUID(str(payload["change_set_id"])) if payload.get("change_set_id") else None
+        )
+        receipts: list[dict[str, Any]] = []
+        for report in reports:
+            content_type = "application/json" if report.suffix == ".json" else "text/plain"
+            receipt = self.publisher.publish(
+                report,
+                project=project,
+                workflow_id=workflow_id,
+                campaign_id=campaign_id,
+                change_set_id=change_set_id,
+                category="changes",
+                filename=f"{filename_prefix}-{report.name}",
+                producer="scan-runner",
+                content_type=content_type,
+                redaction_status=RedactionStatus.REDACTED,
+            )
+            receipts.append(receipt)
+        return receipts
 
     @staticmethod
     def _sha(value: Any, name: str) -> str:

@@ -42,6 +42,7 @@ engineering-worker = "engineering_control.workflows.worker:run"
 engineering-role-worker = "engineering_control.workflows.role_worker:run"
 engineering-scheduler = "engineering_control.scheduler:run"
 engineering-notifier = "engineering_control.notifier:run"
+engineering-evidence-ingest = "engineering_control.evidence.ingest:run"
 engineering-ctl = "engineering_control.cli:main"
 
 [tool.hatch.build.targets.wheel]

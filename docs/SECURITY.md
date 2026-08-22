@@ -4,6 +4,13 @@ Central redaction runs before logs, evidence, agent events, scanner reports, han
 and Telegram responses are persisted. Never place OAuth, kubeconfig tokens, Secret values, PATs,
 bot tokens, SSH keys, passwords, or API keys in prompts or reports.
 
+Worker evidence crosses the private host network through a dedicated service on
+`10.10.0.2:8750`. Each worker has a distinct upload-only bearer token; the authenticated identity
+must equal the evidence producer and is not an Engineering API identity. Uploads are bound to an
+existing Temporal workflow/run, project, campaign or ChangeSet, content hash, producer, and
+deterministic artifact ID. Text/JSON that still needs central redaction is rejected before any
+filesystem write. Binary artifacts are withheld until their producer marks them redacted.
+
 Host identities are separated by Unix ownership, systemd sandboxing, distinct homes, role-specific
 directories, and per-worktree ACLs. Model processes inherit neither paid API keys nor third-party
 provider routing variables. Release workers cannot read provider homes; model workers cannot read

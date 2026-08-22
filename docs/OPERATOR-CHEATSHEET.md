@@ -57,8 +57,8 @@ approval, and credential gates are satisfied.
 ## Service control
 
 ```bash
-sudo systemctl status engineering-api engineering-temporal-worker
-sudo systemctl restart engineering-api
+sudo systemctl status engineering-api engineering-evidence-ingest engineering-temporal-worker
+sudo systemctl restart engineering-api engineering-evidence-ingest
 sudo journalctl -u engineering-api -f
 ssh worker 'sudo systemctl restart engineering-worker@codex'
 ```

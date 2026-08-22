@@ -11,6 +11,18 @@ done
 sudo -u codex-runner -H codex --version >/dev/null
 sudo -u claude-runner -H claude --version >/dev/null
 sudo -u browser-runner test -r /opt/engineering-browser/node_modules/@playwright/test/package.json
+for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+  own_token="/etc/engineering-control/env/evidence-${identity}.token"
+  sudo -u "${identity}" test -r "${own_token}"
+  for other_identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+    if [[ ${other_identity} != "${identity}" ]] && \
+      sudo -u "${identity}" test -r \
+        "/etc/engineering-control/env/evidence-${other_identity}.token" 2>/dev/null; then
+      echo "FAIL ${identity} can impersonate ${other_identity} evidence" >&2
+      exit 1
+    fi
+  done
+done
 sudo -u release-runner test ! -r \
   /var/lib/engineering-control/identities/codex-runner/.codex/auth.json
 sudo -u release-runner test ! -r \

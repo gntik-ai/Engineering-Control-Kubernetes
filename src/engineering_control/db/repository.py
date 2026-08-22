@@ -20,6 +20,8 @@ from engineering_control.db.models import (
     QuotaSnapshot,
     Run,
 )
+from engineering_control.models.core import ArtifactMetadata
+from engineering_control.models.enums import Project
 
 
 def serialize_row(row: Any) -> dict[str, Any]:
@@ -51,6 +53,15 @@ class MetadataRepository(Protocol):
     async def workflow_for_change_set(self, change_set_id: UUID) -> str | None: ...
     async def current_approval_candidate(self, change_set_id: UUID) -> dict[str, Any] | None: ...
     async def persist_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
+    async def resolve_evidence_binding(
+        self,
+        workflow_id: str,
+        project: Project,
+        campaign_id: UUID | None,
+        change_set_id: UUID | None,
+    ) -> dict[str, UUID | None]: ...
+
+    async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]: ...
 
 
 class SQLMetadataRepository:
@@ -60,7 +71,7 @@ class SQLMetadataRepository:
             pool_pre_ping=True,
             pool_size=5,
             max_overflow=5,
-            connect_args={"connect_timeout": 5},
+            connect_args={"connect_timeout": 5} if database_url.startswith("postgresql") else {},
         )
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
 
@@ -150,6 +161,90 @@ class SQLMetadataRepository:
         with self.sessions() as session:
             row = session.get(Artifact, artifact_id)
             return serialize_row(row) if row else None
+
+    async def resolve_evidence_binding(
+        self,
+        workflow_id: str,
+        project: Project,
+        campaign_id: UUID | None,
+        change_set_id: UUID | None,
+    ) -> dict[str, UUID | None]:
+        return await asyncio.to_thread(
+            self._resolve_evidence_binding,
+            workflow_id,
+            project,
+            campaign_id,
+            change_set_id,
+        )
+
+    def _resolve_evidence_binding(
+        self,
+        workflow_id: str,
+        project: Project,
+        campaign_id: UUID | None,
+        change_set_id: UUID | None,
+    ) -> dict[str, UUID | None]:
+        with self.sessions() as session:
+            run = session.scalar(
+                select(Run)
+                .where(Run.workflow_id == workflow_id)
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if run is None or run.project != project.value:
+                raise ValueError("evidence workflow binding does not exist for this project")
+            if campaign_id is not None and run.campaign_id != campaign_id:
+                raise ValueError("evidence campaign does not match its authoritative run")
+            if change_set_id is not None and run.change_set_id != change_set_id:
+                raise ValueError("evidence ChangeSet does not match its authoritative run")
+            return {
+                "run_id": run.id,
+                "campaign_id": run.campaign_id,
+                "change_set_id": run.change_set_id,
+            }
+
+    async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]:
+        return await asyncio.to_thread(self._persist_artifact, metadata)
+
+    def _persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            existing = session.get(Artifact, metadata.artifact_id)
+            expected = metadata.model_dump(mode="json")
+            if existing is not None:
+                serialized = serialize_row(existing)
+                comparable = {
+                    "id": expected["artifact_id"],
+                    "project": expected["project"],
+                    "campaign_id": expected["campaign_id"],
+                    "change_set_id": expected["change_set_id"],
+                    "run_id": expected["run_id"],
+                    "relative_path": expected["relative_path"],
+                    "sha256": expected["sha256"],
+                    "content_type": expected["content_type"],
+                    "producer": expected["producer"],
+                    "redaction_status": expected["redaction_status"],
+                    "size_bytes": expected["size_bytes"],
+                }
+                if any(serialized.get(key) != value for key, value in comparable.items()):
+                    raise ValueError("artifact idempotency key conflicts with stored evidence")
+                return serialized
+            row = Artifact(
+                id=metadata.artifact_id,
+                project=metadata.project.value,
+                campaign_id=metadata.campaign_id,
+                change_set_id=metadata.change_set_id,
+                run_id=metadata.run_id,
+                relative_path=metadata.relative_path,
+                sha256=metadata.sha256,
+                content_type=metadata.content_type,
+                producer=metadata.producer,
+                redaction_status=metadata.redaction_status.value,
+                size_bytes=metadata.size_bytes,
+                retention_class="standard",
+            )
+            session.add(row)
+            session.flush()
+            return serialize_row(row)
 
     async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._get_deployment, deployment_id)
@@ -271,3 +366,15 @@ class EmptyMetadataRepository:
 
     async def persist_approval(self, request: ApprovalRecord, approver_subject: str) -> None:
         raise ValueError("approval metadata store is unavailable")
+
+    async def resolve_evidence_binding(
+        self,
+        workflow_id: str,
+        project: Project,
+        campaign_id: UUID | None,
+        change_set_id: UUID | None,
+    ) -> dict[str, UUID | None]:
+        raise ValueError("evidence metadata store is unavailable")
+
+    async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]:
+        raise ValueError("evidence metadata store is unavailable")

@@ -31,3 +31,31 @@ restrictions supplement normal Unix permissions.
 Bootstrap does not provision GitHub or Kubernetes credentials. Provide read-only mirror access to
 `scan-runner`, separate provider OAuth to model identities, and namespaced kubeconfigs only to the
 identities documented in `SECURITY.md`.
+
+The controller generates one upload-only evidence token per worker identity. Provision each token
+on the worker as `/etc/engineering-control/env/evidence-<identity>.token`, owned by
+`root:<identity>` and mode `0640`. An identity cannot read another identity's token, and none can
+access campaigns, approvals, or deployments. If any token is missing, bootstrap records
+`MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED` and production evidence publication fails closed.
+
+Use a protected temporary transfer only after both bootstraps have created the groups. The commands
+do not print the token:
+
+```bash
+token_transfer_root=$(mktemp -d /home/hermes/evidence-token-transfer.XXXXXX)
+for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+  sudo install -o hermes -g hermes -m 0600 \
+    "/etc/engineering-control/env/evidence-uploaders/${identity}.token" \
+    "${token_transfer_root}/${identity}.token"
+done
+scp -r "${token_transfer_root}" worker:/home/hermes/evidence-token-transfer
+find "${token_transfer_root}" -type f -exec shred --remove {} +
+rmdir "${token_transfer_root}"
+ssh -t worker 'for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+  sudo install -o root -g "${identity}" -m 0640 \
+    "/home/hermes/evidence-token-transfer/${identity}.token" \
+    "/etc/engineering-control/env/evidence-${identity}.token" || exit 1
+done
+find /home/hermes/evidence-token-transfer -type f -exec shred --remove {} + &&
+rmdir /home/hermes/evidence-token-transfer'
+```

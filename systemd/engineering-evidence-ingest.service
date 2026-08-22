@@ -1,0 +1,34 @@
+[Unit]
+Description=Engineering Control private evidence ingest
+After=engineering-migrate.service network-online.target
+Requires=engineering-migrate.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=engineering-control
+Group=engineering-control
+WorkingDirectory=/var/lib/engineering-control
+EnvironmentFile=/etc/engineering-control/env/control.env
+EnvironmentFile=/etc/engineering-control/env/evidence-ingest.env
+ExecStart=/opt/engineering-control/venv/bin/engineering-evidence-ingest
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/engineering-control /srv/engineering/evidence
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

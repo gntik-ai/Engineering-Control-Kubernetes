@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from engineering_control.adapters.command import SafeCommandRunner
-from engineering_control.security.redaction import SecretRedactor
+from engineering_control.security.redaction import REDACTED, SecretRedactor
 
 
 class DeterministicScanner:
@@ -18,7 +18,7 @@ class DeterministicScanner:
     def secret_scan(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
         existing = evidence_directory / "gitleaks.json"
         if existing.is_file():
-            payload = self._sanitize_json(existing)
+            payload = self._sanitize_gitleaks(existing)
             return {"status": "FINDINGS" if payload else "PASS", "findings": payload}
         report = self._report_path(evidence_directory, "gitleaks.json")
         result = self.runner.run(
@@ -40,13 +40,13 @@ class DeterministicScanner:
         )
         if result.return_code not in {0, 2}:
             raise RuntimeError("gitleaks execution failed")
-        payload = self._sanitize_json(report)
+        payload = self._sanitize_gitleaks(report)
         return {"status": "FINDINGS" if payload else "PASS", "findings": payload}
 
     def vulnerability_scan(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
         existing = evidence_directory / "trivy.json"
         if existing.is_file():
-            return self._sanitize_object(existing)
+            return self._sanitize_trivy(existing)
         report = self._report_path(evidence_directory, "trivy.json")
         result = self.runner.run(
             "trivy",
@@ -68,12 +68,12 @@ class DeterministicScanner:
         )
         if result.return_code:
             raise RuntimeError("Trivy execution failed")
-        return self._sanitize_object(report)
+        return self._sanitize_trivy(report)
 
     def semgrep(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
         existing = evidence_directory / "semgrep.json"
         if existing.is_file():
-            return self._sanitize_object(existing)
+            return self._sanitize_semgrep(existing)
         report = self._report_path(evidence_directory, "semgrep.json")
         result = self.runner.run(
             "semgrep",
@@ -94,7 +94,7 @@ class DeterministicScanner:
         )
         if result.return_code not in {0, 1}:
             raise RuntimeError("Semgrep execution failed")
-        return self._sanitize_object(report)
+        return self._sanitize_semgrep(report)
 
     def sbom(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
         existing = evidence_directory / "sbom.cyclonedx.json"
@@ -154,3 +154,133 @@ class DeterministicScanner:
         if not isinstance(payload, dict):
             raise ValueError(f"scanner report must contain a JSON object: {report.name}")
         return payload
+
+    def _sanitize_gitleaks(self, report: Path) -> list[dict[str, Any]]:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("Gitleaks report must contain a JSON array")
+        safe: list[dict[str, Any]] = []
+        allowed = {
+            "RuleID",
+            "Description",
+            "File",
+            "StartLine",
+            "EndLine",
+            "Commit",
+            "Entropy",
+            "Fingerprint",
+        }
+        for finding in payload:
+            if not isinstance(finding, dict):
+                continue
+            item = {key: finding[key] for key in allowed if key in finding}
+            item["Secret"] = REDACTED
+            safe.append(item)
+        self._atomic_json(report, safe)
+        return safe
+
+    def _sanitize_trivy(self, report: Path) -> dict[str, Any]:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Trivy report must contain a JSON object")
+        results: list[dict[str, Any]] = []
+        for raw_result in payload.get("Results", []):
+            if not isinstance(raw_result, dict):
+                continue
+            result: dict[str, Any] = {
+                key: raw_result[key]
+                for key in ("Target", "Class", "Type")
+                if key in raw_result
+            }
+            selections = {
+                "Vulnerabilities": (
+                    "VulnerabilityID",
+                    "PkgName",
+                    "InstalledVersion",
+                    "FixedVersion",
+                    "Severity",
+                    "Title",
+                    "PrimaryURL",
+                ),
+                "Misconfigurations": (
+                    "ID",
+                    "AVDID",
+                    "Type",
+                    "Title",
+                    "Message",
+                    "Resolution",
+                    "Severity",
+                    "PrimaryURL",
+                ),
+                "Secrets": (
+                    "RuleID",
+                    "Category",
+                    "Severity",
+                    "Title",
+                    "StartLine",
+                    "EndLine",
+                ),
+                "Licenses": ("PkgName", "Name", "Category", "Severity", "Status"),
+            }
+            for category, fields in selections.items():
+                findings = raw_result.get(category)
+                if not isinstance(findings, list):
+                    continue
+                result[category] = [
+                    {key: finding[key] for key in fields if key in finding}
+                    for finding in findings
+                    if isinstance(finding, dict)
+                ]
+            results.append(result)
+        safe = {
+            "SchemaVersion": payload.get("SchemaVersion"),
+            "ArtifactName": payload.get("ArtifactName"),
+            "ArtifactType": payload.get("ArtifactType"),
+            "Results": results,
+        }
+        redacted = self.redactor.redact(safe).value
+        if not isinstance(redacted, dict):
+            raise TypeError("redacted Trivy report must remain an object")
+        self._atomic_json(report, redacted)
+        return redacted
+
+    def _sanitize_semgrep(self, report: Path) -> dict[str, Any]:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Semgrep report must contain a JSON object")
+        results: list[dict[str, Any]] = []
+        for finding in payload.get("results", []):
+            if not isinstance(finding, dict):
+                continue
+            raw_extra = finding.get("extra")
+            extra: dict[str, Any] = raw_extra if isinstance(raw_extra, dict) else {}
+            results.append(
+                {
+                    "check_id": finding.get("check_id"),
+                    "path": finding.get("path"),
+                    "start": finding.get("start"),
+                    "end": finding.get("end"),
+                    "extra": {
+                        "message": extra.get("message"),
+                        "severity": extra.get("severity"),
+                    },
+                }
+            )
+        safe = {
+            "version": payload.get("version"),
+            "errors": self.redactor.redact(payload.get("errors", [])).value,
+            "results": results,
+        }
+        self._atomic_json(report, safe)
+        return safe
+
+    @staticmethod
+    def _atomic_json(report: Path, value: Any) -> None:
+        payload = json.dumps(value, indent=2, sort_keys=True).encode() + b"\n"
+        with tempfile.NamedTemporaryFile(dir=report.parent, delete=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, report)

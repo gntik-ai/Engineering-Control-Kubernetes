@@ -85,6 +85,26 @@ fi
 chown root:engineering-api-clients "${CONFIG_ROOT}/env/api.token"
 chmod 0640 "${CONFIG_ROOT}/env/api.token"
 
+install -d -o root -g engineering-control -m 0750 \
+  "${CONFIG_ROOT}/env/evidence-uploaders"
+for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+  token_path="${CONFIG_ROOT}/env/evidence-uploaders/${identity}.token"
+  if [[ ! -f "${token_path}" ]]; then
+    openssl rand -hex 48 >"${token_path}"
+  fi
+  chown root:engineering-control "${token_path}"
+  chmod 0640 "${token_path}"
+done
+{
+  printf 'ENGINEERING_EVIDENCE_INGEST_HOST=10.10.0.2\n'
+  printf 'ENGINEERING_EVIDENCE_INGEST_PORT=8750\n'
+  printf 'ENGINEERING_EVIDENCE_INGEST_TOKEN_DIRECTORY=%s/env/evidence-uploaders\n' \
+    "${CONFIG_ROOT}"
+  printf 'ENGINEERING_EVIDENCE_MAX_BYTES=33554432\n'
+} >"${CONFIG_ROOT}/env/evidence-ingest.env"
+chown root:engineering-control "${CONFIG_ROOT}/env/evidence-ingest.env"
+chmod 0640 "${CONFIG_ROOT}/env/evidence-ingest.env"
+
 if [[ ! -f "${CONFIG_ROOT}/env/telegram-allowlist" ]]; then
   printf '# One authorized numeric Telegram user ID per line.\n' \
     >"${CONFIG_ROOT}/env/telegram-allowlist"
@@ -131,7 +151,8 @@ if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
 fi
 
 for unit in engineering-infrastructure.service engineering-migrate.service \
-  engineering-api.service engineering-temporal-worker.service engineering-scheduler.service \
+  engineering-api.service engineering-evidence-ingest.service \
+  engineering-temporal-worker.service engineering-scheduler.service \
   engineering-notifier.service; do
   install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
 done
@@ -142,13 +163,14 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-infrastructure.service \
   /etc/systemd/system/engineering-migrate.service \
   /etc/systemd/system/engineering-api.service \
+  /etc/systemd/system/engineering-evidence-ingest.service \
   /etc/systemd/system/engineering-temporal-worker.service \
   /etc/systemd/system/engineering-scheduler.service \
   /etc/systemd/system/engineering-notifier.service
 systemctl daemon-reload
 systemctl enable --now engineering-infrastructure.service
 systemctl restart engineering-migrate.service
-systemctl enable --now engineering-api.service engineering-temporal-worker.service \
-  engineering-scheduler.service engineering-notifier.service
+systemctl enable --now engineering-api.service engineering-evidence-ingest.service \
+  engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service
 
 echo "Controller bootstrap completed without altering Hermes, product repositories, or Kubernetes."

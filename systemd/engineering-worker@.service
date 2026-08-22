@@ -9,8 +9,10 @@ User=%i-runner
 Group=%i-runner
 WorkingDirectory=/var/lib/engineering-control/workers/%i
 EnvironmentFile=/etc/engineering-control/env/worker-common.env
+EnvironmentFile=-/etc/engineering-control/env/evidence-upload.env
 EnvironmentFile=-/etc/engineering-control/env/%i-worker.env
 Environment=ENGINEERING_WORKER_KIND=%i
+Environment=ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE=/etc/engineering-control/env/evidence-%i-runner.token
 ExecStart=/opt/engineering-control/venv/bin/engineering-role-worker
 Restart=on-failure
 RestartSec=8

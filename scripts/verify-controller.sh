@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-services=(engineering-infrastructure engineering-migrate engineering-api engineering-temporal-worker engineering-scheduler engineering-notifier)
+services=(engineering-infrastructure engineering-migrate engineering-api engineering-evidence-ingest engineering-temporal-worker engineering-scheduler engineering-notifier)
 for service in "${services[@]}"; do
   systemctl is-active --quiet "${service}.service" || {
     echo "FAIL service ${service}" >&2
@@ -19,7 +19,18 @@ with urllib.request.urlopen("http://127.0.0.1:8740/health/ready", timeout=5) as 
     value = json.load(response)
 if value.get("status") != "ready":
     raise SystemExit("Engineering API not ready")
+with urllib.request.urlopen("http://10.10.0.2:8750/health/live", timeout=5) as response:
+    value = json.load(response)
+if value.get("status") != "ok":
+    raise SystemExit("Evidence ingest not ready")
 PY
-ss -ltn | grep -Eq '127\.0\.0\.1:55432|10\.10\.0\.2:7233'
+listeners=$(ss -ltn)
+grep -q '127\.0\.0\.1:55432' <<<"${listeners}"
+grep -q '10\.10\.0\.2:7233' <<<"${listeners}"
+grep -q '10\.10\.0\.2:8750' <<<"${listeners}"
+if grep -Eq '(0\.0\.0\.0|\*|\[::\]):(55432|7233|8740|8741|8750)' <<<"${listeners}"; then
+  echo "FAIL control-plane service exposed on every interface" >&2
+  exit 1
+fi
 ssh -o BatchMode=yes -o ConnectTimeout=5 worker true
 echo "PASS controller verification"
