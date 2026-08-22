@@ -144,6 +144,37 @@ class FalconeHelmAdapter:
             timeout_seconds=(plan.timeout_minutes + 5) * 60,
         )
 
+    def verify(self, plan: FalconeReleasePlan) -> dict[str, Any]:
+        current = self._current_release(plan)
+        if current["status"] != "deployed" or current["revision"] is None:
+            raise ValueError("Helm preview release is not deployed")
+        manifest = self.runner.run(
+            "helm",
+            [
+                "get",
+                "manifest",
+                plan.release_name,
+                "--namespace",
+                plan.namespace,
+                "--kube-context",
+                plan.kube_context,
+                "--kubeconfig",
+                str(plan.kubeconfig_path),
+                "--revision",
+                str(current["revision"]),
+            ],
+            cwd=plan.chart_directory,
+        ).stdout
+        missing = sorted(digest for digest in plan.image_digests.values() if digest not in manifest)
+        if missing:
+            raise ValueError("Helm preview manifest is missing approved immutable image digests")
+        return {
+            "status": "PREVIEW_VERIFIED",
+            "revision": current["revision"],
+            "manifest_sha256": hashlib.sha256(manifest.encode()).hexdigest(),
+            "immutable_image_count": len(plan.image_digests),
+        }
+
     def rollback(self, plan: FalconeRecoveryPlan, *, approval_is_current: bool) -> dict[str, Any]:
         if not approval_is_current:
             raise ValueError("recovery approval is absent, invalid, or bound to changed artifacts")

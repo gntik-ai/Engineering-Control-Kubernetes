@@ -1,6 +1,6 @@
 # Agents and skills
 
-`/home/hermes/engineering/engineering-agent-pack` is the provider-neutral source. Thirteen roles
+`/home/hermes/engineering/engineering-agent-pack` is the provider-neutral source. Fourteen roles
 cover planning, cartography, domain/persona/journey/security audits, finding verification,
 OpenSpec, implementation, code review, runtime/release verification, and incidents. Twenty-three
 skills cover the requested audit, delivery, browser, staging, runtime, and recovery operations.

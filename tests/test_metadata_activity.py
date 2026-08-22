@@ -803,9 +803,9 @@ configuration:
 
     assert prepared["release_plan"]["target_revision"] == "d" * 40
     assert candidate["status"] == "AWAITING_STAGING_APPROVAL"
-    assert candidate["release_plan"]["approval_binding_sha256"] == candidate[
-        "artifact_binding_sha256"
-    ]
+    assert (
+        candidate["release_plan"]["approval_binding_sha256"] == candidate["artifact_binding_sha256"]
+    )
     assert candidate["approval_candidate"]["source_sha"] == "b" * 40
     assert candidate["approval_candidate"]["deployment_sha"] == "d" * 40
     assert len(candidate["approval_candidate"]["release_preflight_sha256"]) == 64
@@ -873,6 +873,89 @@ configuration:
             .where(ComponentLease.released_at.is_(None))
         )
         assert active_lease_count == 0
+
+
+@pytest.mark.asyncio
+async def test_low_risk_staging_approval_is_persisted_and_revalidated(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'low-risk-approval.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    run_id = uuid4()
+    workflow_id = "deploy-low-risk"
+    deployment_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="falcone",
+                risk_class="R1",
+                state="DEPLOY_PR",
+                version=1,
+                source_repository="falcone",
+                source_branch=f"agent/falcone/1/{change_set_id}",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url="https://github.com/gntik-ai/falcone/pull/1",
+                deployment_repository="falcone-charts",
+                deployment_branch=f"agent/falcone/1/{change_set_id}",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url="https://github.com/gntik-ai/falcone-charts/pull/1",
+                image_digests={"api": f"sha256:{'e' * 64}"},
+                chart_version="1.2.3",
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id=workflow_id,
+                run_type="staging-deployment",
+                status="RUNNING",
+                project="falcone",
+            )
+        )
+
+    candidate = await handler.handle(
+        "staging.record_candidate",
+        {
+            "change_set_id": str(change_set_id),
+            "deployment_id": str(deployment_id),
+            "orchestration": {"workflow_id": workflow_id},
+            "target_context": "scoped-staging",
+            "target_namespace": "falcone-staging",
+            "release_preflight": {"status": "PREFLIGHT_PASS", "manifest_sha256": "f" * 64},
+            "release_evidence": {
+                "rollback_plan_sha256": "1" * 64,
+                "ci_result_sha256": "2" * 64,
+                "independent_review_sha256": "3" * 64,
+                "backup_requirement": "not-required",
+                "migration": False,
+            },
+            "release_plan": {"approval_binding_sha256": "0" * 64},
+        },
+    )
+
+    assert candidate["requires_human_approval"] is False
+    assert candidate["automatic_approval"]["approver_subject"] == ("policy:low-risk-staging")
+    approved = await handler.handle(
+        "staging.validate_approval",
+        {"context": candidate, "approval": candidate["automatic_approval"]},
+    )
+    assert approved["status"] == "STAGING_APPROVED"
+    assert approved["approval_validation"]["current"] is True
+    with handler.sessions() as session:
+        approval = session.scalar(select(Approval).where(Approval.change_set_id == change_set_id))
+        assert approval is not None
+        assert approval.approver_subject == "policy:low-risk-staging"
+        assert approval.metadata_json["automatic"] is True
 
 
 @pytest.mark.asyncio
@@ -1038,7 +1121,7 @@ configuration:
                 "observed_image_digests": [f"sha256:{'e' * 64}"],
             },
             "result": {"status": "PASS", "error": None},
-        }
+        },
     )
     assert prepared["runtime_review_requests"][0]["provider"] == "claude"
     finalized = await handler.handle(
@@ -1350,14 +1433,10 @@ async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(tmp_path
             "orchestration": {"workflow_id": workflow_id},
         },
     )
-    assert [value["lease_id"] for value in discovered["cleanup_candidates"]] == [
-        str(lease_id)
-    ]
+    assert [value["lease_id"] for value in discovered["cleanup_candidates"]] == [str(lease_id)]
     inspected = {
         **discovered,
-        "eligible_candidates": [
-            {**discovered["cleanup_candidates"][0], "inspection": "ABSENT"}
-        ],
+        "eligible_candidates": [{**discovered["cleanup_candidates"][0], "inspection": "ABSENT"}],
         "protected_candidates": [],
     }
     authorized = await handler.handle("cleanup.authorize", inspected)

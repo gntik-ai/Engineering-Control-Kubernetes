@@ -26,11 +26,23 @@ ssh -t worker 'sudo -u codex-runner -H /usr/local/bin/codex login'
 ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
 ```
 
+Provision the independent delivery token without exposing it in shell history or terminal output:
+
+```bash
+ssh -t worker 'sudoedit /etc/engineering-control/env/delivery/github.token && \
+  sudo chown root:delivery-runner /etc/engineering-control/env/delivery/github.token && \
+  sudo chmod 0640 /etc/engineering-control/env/delivery/github.token'
+```
+
+Use a fine-grained token limited to contents and pull-request write access on the four configured
+repositories. It must not have merge-bypass, repository administration, Actions-secret, or
+deployment credentials access.
+
 ## Verify
 
 ```bash
 ./scripts/verify-controller.sh
-ssh worker '/opt/engineering-control/source/scripts/verify-worker.sh'
+ssh -t worker 'sudo /opt/engineering-control/source/scripts/verify-worker.sh'
 ./scripts/verify-end-to-end.sh
 ./scripts/validate-temporal-lifecycle.py
 ```

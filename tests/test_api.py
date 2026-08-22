@@ -81,6 +81,21 @@ def test_api_requires_bearer_auth() -> None:
         assert response.status_code == 200
 
 
+def test_internal_metrics_expose_named_control_plane_families() -> None:
+    app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
+    with TestClient(app) as client:
+        unauthorized = client.get("/internal/metrics")
+        response = client.get(
+            "/internal/metrics",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+        )
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert "engineering_active_campaigns" in response.text
+    assert "engineering_worker_health" in response.text
+    assert "engineering_evidence_storage_bytes" in response.text
+
+
 def test_api_rejects_extra_fields() -> None:
     app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
     body = {

@@ -46,6 +46,8 @@ class ReleaseActivityHandler:
             return self._recover(payload)
         if step in {"preview.preflight", "staging.preflight"}:
             return self._preflight(payload)
+        if step == "preview.verify":
+            return self._verify_preview(payload)
         if step not in {"preview.deploy", "staging.deploy"}:
             raise ApplicationError("unsupported release activity", non_retryable=True)
         raw_plan = payload.get("release_plan")
@@ -84,6 +86,62 @@ class ReleaseActivityHandler:
         safe = self.redactor.redact({**payload, **result}).value
         if not isinstance(safe, dict):
             raise TypeError("redacted release result must remain an object")
+        return safe
+
+    def _verify_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_plan = payload.get("release_plan")
+        approval = payload.get("approval_validation")
+        if not isinstance(raw_plan, dict) or not isinstance(approval, dict):
+            raise ApplicationError(
+                "preview verification requires its approved typed plan",
+                type="ApprovalMismatch",
+                non_retryable=True,
+            )
+        if approval.get("current") is not True:
+            raise ApplicationError(
+                "preview approval is absent, invalidated, or stale",
+                type="ApprovalMismatch",
+                non_retryable=True,
+            )
+        strategy = raw_plan.get("strategy")
+        value = {key: item for key, item in raw_plan.items() if key != "strategy"}
+        try:
+            if strategy == "helm":
+                helm_plan = FalconeReleasePlan.model_validate(value)
+                self._bounded_worktree(helm_plan.chart_directory)
+                self._scoped_credential(helm_plan.kubeconfig_path)
+                self._matching_binding(helm_plan.approval_binding_sha256, approval)
+                result = self.helm.verify(helm_plan)
+            elif strategy == "argocd-gitops":
+                gitops_plan = MusematicPromotion.model_validate(value)
+                self._bounded_worktree(gitops_plan.deployment_repository)
+                self._matching_binding(gitops_plan.approval_binding_sha256, approval)
+                result = self.gitops.observe_reconciliation(gitops_plan)
+                if (
+                    result.get("revision_matches") is not True
+                    or result.get("sync_status") != "Synced"
+                    or result.get("health_status") != "Healthy"
+                ):
+                    raise ApplicationError(
+                        "preview Git revision has not reconciled healthy",
+                        type="ReconciliationPending",
+                    )
+            else:
+                raise ApplicationError(
+                    "preview strategy is not allowlisted",
+                    type="PolicyViolation",
+                    non_retryable=True,
+                )
+        except ValidationError as error:
+            raise ApplicationError(
+                "preview verification plan failed strict schema validation",
+                type="PolicyViolation",
+                non_retryable=True,
+            ) from error
+        safe = self.redactor.redact({**payload, "preview_verification": result}).value
+        if not isinstance(safe, dict):
+            raise TypeError("redacted preview verification must remain an object")
+        safe["status"] = "PREVIEW_VERIFIED"
         return safe
 
     def _recover(self, payload: dict[str, Any]) -> dict[str, Any]:

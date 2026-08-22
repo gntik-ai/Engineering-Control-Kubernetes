@@ -103,6 +103,18 @@ def test_falcone_deploy_requires_current_artifact_binding(tmp_path: Path) -> Non
     assert not any(arguments[0] == "upgrade" for _, arguments in runner.calls)
 
 
+def test_falcone_preview_verification_requires_every_approved_digest(tmp_path: Path) -> None:
+    manifest = f"image: example.invalid/api@sha256:{DIGEST}\n"
+    runner = FakeRunner(rendered=manifest)
+    result = FalconeHelmAdapter(runner).verify(falcone_plan(tmp_path))
+    assert result["status"] == "PREVIEW_VERIFIED"
+    assert result["immutable_image_count"] == 1
+
+    missing_runner = FakeRunner(rendered="image: example.invalid/api@sha256:" + "f" * 64)
+    with pytest.raises(ValueError, match="missing approved immutable"):
+        FalconeHelmAdapter(missing_runner).verify(falcone_plan(tmp_path))
+
+
 def test_falcone_preflight_fails_when_recovery_baseline_cannot_be_inspected(
     tmp_path: Path,
 ) -> None:

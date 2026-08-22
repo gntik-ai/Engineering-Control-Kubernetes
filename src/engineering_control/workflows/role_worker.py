@@ -8,6 +8,7 @@ from temporalio.worker import Worker
 from engineering_control.activities.core import ControlActivities
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
+from engineering_control.observability.heartbeat import WorkerHeartbeatPublisher
 
 QUEUES = {
     "codex": "engineering-codex",
@@ -15,6 +16,7 @@ QUEUES = {
     "browser": "engineering-browser",
     "scan": "engineering-scan",
     "release": "engineering-release",
+    "delivery": "engineering-delivery",
 }
 
 
@@ -32,7 +34,13 @@ async def serve() -> None:
         activities=[activities.execute_control_step],
         max_concurrent_activities=2 if settings.worker_kind in {"codex", "claude"} else 4,
     )
-    await worker.run()
+    heartbeat = WorkerHeartbeatPublisher(settings, f"{settings.worker_kind}-runner")
+    heartbeat_task = asyncio.create_task(heartbeat.serve())
+    try:
+        await worker.run()
+    finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
 def run() -> None:

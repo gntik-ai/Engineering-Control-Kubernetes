@@ -3,28 +3,31 @@
 This file distinguishes source-level validation from activation validation. It does not claim that
 services, provider identities, or Kubernetes release credentials are active.
 
-Validated on 2026-08-22 at engineering-control commit
-`1291dfc9dc3077930d98e2e41c4596f529bc2c8d` and engineering-agent-pack commit
+Validated on 2026-08-22 at engineering-control functional commit
+`ENGINEERING_CONTROL_VALIDATED_COMMIT` and engineering-agent-pack commit
 `47a6353dafbf0c1ecea649d434db5dd555e6249e`.
 
 ## Passed before activation
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | Ruff; strict mypy across 68 source files; 98 pytest tests |
+| Control-plane Python | PASS | Ruff; strict mypy across 72 source files; 114 pytest tests |
 | Agent pack | PASS | deterministic generation changed 0 files; validator passed; Ruff; 2 tests |
-| Database | PASS | fresh SQLite migrations `0001 -> 0002 -> 0003` reached head |
+| Database | PASS | fresh SQLite migrations `0001 -> 0002 -> 0003 -> 0004` reached head |
 | Infrastructure definition | PASS | pinned Docker Compose renders with required variables |
 | Scripts/browser | PASS | Bash syntax for bootstrap/docker scripts; Node syntax for Playwright runner |
 | Schemas | PASS | every JSON Schema is valid Draft 2020-12; disabled target templates validate |
 | Secret persistence scan | PASS | redacted Gitleaks worktree scan returned zero findings |
-| Worktrees | PASS | allocation, retry, dirty protection, branch-bound cleanup, lease conflict tests |
+| Worktrees | PASS | per-ChangeSet shadow Git metadata, read-only canonical alternates, allocation/retry, dirty protection, branch-bound cleanup, leases and ACL bounds |
 | Maker/checker lifecycle | PASS | bounded real-Git synthetic activity chain reaches `AWAITING_STAGING_APPROVAL` |
+| Draft PR publication | PASS | exact clean heads, scoped askpass, no force/merge, idempotent draft lookup, structured missing-credential handoff |
 | Approval drift | PASS | source, deployment, preflight, runtime, and recovery drift tests fail closed |
+| Preview deployment | PASS | dry-run preflight and enabled-target deterministic mutation/verification path; R0/R1 policy approval and R2/R3 human gate |
 | Deployment failure | PASS | terminal Run, lease release, candidate invalidation, recovery baseline, incident |
 | Runtime verification | PASS | reduced read-only observation, browser redaction, opposite provider, incident gate |
 | Recovery | PASS | new approval, exact Helm baseline hash, migration/GitOps forward-recovery gates |
 | Retention cleanup | PASS | dry-run schedule, terminal metadata, dirty protection, double authorization, off switch |
+| Observability | PASS | authenticated database-backed metrics and identity-bound heartbeat/impersonation tests for all six workers |
 
 Systemd unit definitions parse, but local `systemd-analyze verify` correctly reports their
 `/opt/engineering-control` executables absent before bootstrap installation. That is an activation
@@ -51,6 +54,7 @@ completed:
 - full Temporal worker-restart acceptance run;
 - worker Codex and Claude native structured smoke tasks;
 - both cross-provider maker/checker directions using real subscriptions;
+- scoped `delivery-runner` GitHub credential and exact-head draft PR smoke test;
 - Playwright browser binaries under `browser-runner`;
 - scanner binaries under `scan-runner`;
 - release/provider/observer credential filesystem isolation on the installed worker;

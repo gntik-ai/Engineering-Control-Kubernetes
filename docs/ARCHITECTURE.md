@@ -10,7 +10,7 @@ Telegram user (allowlist)
   -> Engineering API 127.0.0.1:8740
   -> Temporal frontend 127.0.0.1/10.10.0.2:7233
   -> control workflow worker
-       -> engineering-scan / codex / claude / browser / release task queues on worker
+       -> engineering-scan / codex / claude / browser / delivery / release task queues on worker
        -> evidence ingest 10.10.0.2:8750 (identity-bound upload tokens, 32 MiB/artifact)
   -> PostgreSQL 127.0.0.1:55432
   -> evidence metadata + /srv/engineering/evidence
@@ -27,6 +27,8 @@ Trust boundaries:
 - `browser-runner` receives journey credentials by protected file handle, never prompt text.
 - `scan-runner` owns canonical mirrors, deterministic scanners, and a separate read-only observer
   kubeconfig that is programmatically rejected if it can read Secrets or mutate workloads.
+- `delivery-runner` may push only exact validated ChangeSet heads and create draft PRs for the
+  configured repository pair. It cannot merge, deploy, or read either model provider home.
 - `release-runner` receives only scoped release plans and release credentials. It has no model
   home or prompt-driven execution.
 - Each worker identity receives its own upload-scoped evidence token; producer impersonation is
@@ -35,10 +37,12 @@ Trust boundaries:
 - Kubernetes observer access excludes Secrets and mutation. Release identities are namespaced and
   are never made available to model workers.
 
-Every delivery is one ChangeSet spanning source and deployment repositories. Deterministic policy
-code validates evidence before state transitions. Maker and checker contexts differ; R3 requires
-both providers and typed human approval. Large campaigns use coverage cells and Temporal
-continue-as-new rather than one permanent model session.
+Every delivery is one ChangeSet spanning source and deployment repositories. An unchanged
+deployment repository is recorded as deferred until a real immutable artifact exists; the control
+plane never creates a no-diff PR or invents a digest. Deterministic policy code validates evidence
+before state transitions. Maker and checker contexts differ; R3 requires both providers and typed
+human approval. Large campaigns use coverage cells and Temporal continue-as-new rather than one
+permanent model session.
 
 Current fail-closed controls are intentional: production activity steps without a configured
 handler raise `NotConfigured`; missing native authentication is a manual blocker; deployment

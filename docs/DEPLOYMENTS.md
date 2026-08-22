@@ -19,8 +19,10 @@ that digest. Artifact drift, a changed preflight, or either changed repository h
 approval. R3 approval requires the displayed typed confirmation.
 
 No real staging mutation is part of bootstrap validation. Dry-run/preflight may render Helm and
-GitOps plans. Production credentials and bindings are intentionally absent. Preview mutation is
-also fail-closed until a separate preview policy is enabled.
+GitOps plans. Production credentials and bindings are intentionally absent. Preview and staging
+mutation both fail closed unless the exact target record is enabled and all credentials, leases,
+immutable artifacts, and approval evidence validate. R0/R1 receive an auditable deterministic
+policy approval; R2/R3 pause for human approval, and R3 also requires its typed confirmation.
 
 ## Target activation
 

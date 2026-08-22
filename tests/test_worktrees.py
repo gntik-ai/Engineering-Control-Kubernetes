@@ -91,6 +91,49 @@ def test_allocation_retry_reuses_only_same_clean_changeset(tmp_path: Path) -> No
     assert second == first
 
 
+def test_changeset_git_metadata_isolated_from_canonical_mirror(tmp_path: Path) -> None:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    change_set_id = uuid4()
+    allocation = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="isolated",
+        change_set_id=change_set_id,
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    metadata = manager.metadata_path("falcone", change_set_id)
+    canonical = mirror_root / "falcone.git"
+    alternates = metadata / "objects" / "info" / "alternates"
+    assert metadata.is_dir()
+    assert alternates.is_file()
+    assert (
+        Path(alternates.read_text(encoding="utf-8").strip()).resolve()
+        == (canonical / "objects").resolve()
+    )
+
+    git(["config", "user.name", "Bounded Maker"], allocation.path)
+    git(["config", "user.email", "maker@invalid"], allocation.path)
+    (allocation.path / "bounded.txt").write_text("isolated\n", encoding="utf-8")
+    git(["add", "bounded.txt"], allocation.path)
+    git(["commit", "-m", "bounded change"], allocation.path)
+    head = git(["rev-parse", "HEAD"], allocation.path)
+
+    assert git(["rev-parse", allocation.branch], metadata) == head
+    canonical_ref = subprocess.run(  # noqa: S603 - fixed test command
+        [GIT, "show-ref", "--verify", f"refs/heads/{allocation.branch}"],
+        cwd=canonical,
+        check=False,
+        capture_output=True,
+    )
+    assert canonical_ref.returncode != 0
+
+
 def test_dirty_worktree_is_protected(tmp_path: Path) -> None:
     mirror_root, sha = create_mirror(tmp_path)
     manager = GitWorktreeManager(
@@ -153,3 +196,93 @@ def test_maker_and_checker_must_be_independent() -> None:
 def test_only_model_worker_identities_receive_worktree_access() -> None:
     with pytest.raises(ValueError, match="allowed model worker"):
         WorktreeAccess("release-runner", "claude-runner")
+
+
+def test_maker_acl_covers_worktree_traversal_and_isolated_git_metadata(
+    tmp_path: Path,
+) -> None:
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "falcone" / str(uuid4())
+    target.mkdir(parents=True)
+    metadata_root = tmp_path / "cache" / "scan" / "worktree-git"
+    metadata = metadata_root / "falcone" / f"{target.name}.git"
+    metadata.mkdir(parents=True)
+    mirror_root = tmp_path / "mirrors"
+    canonical = mirror_root / "falcone.git"
+    canonical.mkdir(parents=True)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+    )
+    commands: list[list[str]] = []
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        commands.append(args)
+        return ""
+
+    manager._run = record  # type: ignore[method-assign]
+    manager._grant_access(
+        target,
+        metadata,
+        canonical,
+        WorktreeAccess("codex-runner", "claude-runner"),
+    )
+
+    assert any(
+        command[-1] == str(target.parent)
+        and any("u:codex-runner:--x" in argument for argument in command)
+        for command in commands
+    )
+    assert any(
+        command[-1] == str(metadata)
+        and any("u:codex-runner:rwX" in argument for argument in command)
+        for command in commands
+    )
+    assert any(
+        command[-1] == str(canonical)
+        and any("u:codex-runner:r-X" in argument for argument in command)
+        for command in commands
+    )
+
+
+def test_release_read_is_limited_to_exact_deployment_worktree(tmp_path: Path) -> None:
+    mirror_root, sha = create_mirror(tmp_path)
+    source_mirror = mirror_root / "falcone.git"
+    deployment_mirror = mirror_root / "falcone-charts.git"
+    subprocess.run(  # noqa: S603 - fixed executable and test-controlled arguments
+        [GIT, "clone", "--mirror", str(source_mirror), str(deployment_mirror)],
+        check=True,
+        capture_output=True,
+    )
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    allocation = manager.allocate(
+        repository="falcone-charts",
+        project="falcone",
+        issue="127",
+        change_set_id=uuid4(),
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    commands: list[list[str]] = []
+    original = manager._run
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        if args[0] == "setfacl":
+            commands.append(args)
+            return ""
+        return original(args, cwd, timeout=timeout)
+
+    manager._run = record  # type: ignore[method-assign]
+    manager.grant_release_read("falcone-charts", allocation.path)
+    assert any(str(allocation.path) in command for command in commands)
+    assert any(str(deployment_mirror) in command for command in commands)
+    with pytest.raises(WorktreeError, match="deployment repositories"):
+        manager.grant_release_read("falcone", allocation.path)
+    with pytest.raises(WorktreeError, match="exact deployment worktree"):
+        manager.grant_release_read("falcone-charts", tmp_path)

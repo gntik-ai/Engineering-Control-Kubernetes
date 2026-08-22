@@ -27,6 +27,7 @@ from engineering_control.db.models import (
     ApprovalCandidate,
     Campaign,
     ChangeSet,
+    ComponentLease,
     CoverageCell,
     Deployment,
     Finding,
@@ -215,7 +216,12 @@ class MetadataActivityHandler:
             "delivery.prepare_deployment_maker",
             "delivery.prepare_checker",
             "delivery.persist_handoff",
+            "delivery.prepare_publication",
+            "delivery.persist_publication",
             "preview.prepare",
+            "preview.record_candidate",
+            "preview.validate_approval",
+            "preview.finalize",
             "staging.prepare",
             "staging.record_candidate",
             "staging.validate_approval",
@@ -299,8 +305,18 @@ class MetadataActivityHandler:
                 return self._prepare_checker(payload)
             if step == "delivery.persist_handoff":
                 return await asyncio.to_thread(self._persist_delivery_handoff, payload)
+            if step == "delivery.prepare_publication":
+                return self._prepare_publication(payload)
+            if step == "delivery.persist_publication":
+                return await asyncio.to_thread(self._persist_publication, payload)
             if step == "preview.prepare":
                 return await asyncio.to_thread(self._prepare_deployment, payload, "preview")
+            if step == "preview.record_candidate":
+                return await asyncio.to_thread(self._record_preview_candidate, payload)
+            if step == "preview.validate_approval":
+                return await asyncio.to_thread(self._validate_preview_approval, payload)
+            if step == "preview.finalize":
+                return await asyncio.to_thread(self._finalize_preview, payload)
             if step == "staging.prepare":
                 return await asyncio.to_thread(self._prepare_deployment, payload, "staging")
             if step == "staging.record_candidate":
@@ -1334,6 +1350,191 @@ class MetadataActivityHandler:
             "checker_request": request.model_dump(mode="json"),
         }
 
+    def _prepare_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
+        evidence = self._object(payload.get("change_evidence"), "change_evidence")
+        source = self._object(evidence.get("source"), "source change evidence")
+        deployment = self._object(evidence.get("deployment"), "deployment change evidence")
+        change_set_id = UUID(str(payload["change_set_id"]))
+        source_head = str(source.get("head_sha", ""))
+        deployment_head = str(deployment.get("head_sha", ""))
+        if not self._is_git_sha(source_head) or not self._is_git_sha(deployment_head):
+            raise ValueError("publication requires exact committed repository heads")
+        if source_head == payload.get("source_base_sha"):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "SOURCE_CHANGES_NOT_COMMITTED",
+            }
+        if int(deployment.get("changed_file_count", 0)) > 0 and deployment_head == payload.get(
+            "deployment_base_sha"
+        ):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "DEPLOYMENT_CHANGES_NOT_COMMITTED",
+            }
+        source_repository = str(payload["source_repository"])
+        deployment_repository = str(payload["deployment_repository"])
+        repositories = {
+            "falcone": "gntik-ai/falcone",
+            "falcone-charts": "gntik-ai/falcone-charts",
+            "musematic": "gntik-ai/musematic",
+            "musematic-deploy": "gntik-ai/musematic-deploy",
+        }
+        if source_repository not in repositories or deployment_repository not in repositories:
+            raise ValueError("publication repository is not configured")
+        issue = str(payload["issue_url"])
+        body = (
+            "## Engineering Control ChangeSet\n\n"
+            f"Issue: {issue}\n\n"
+            f"ChangeSet: `{change_set_id}`\n\n"
+            f"OpenSpec: `{payload['openspec_identifier']}`\n\n"
+            f"Risk: `{payload['risk_class']}`\n\n"
+            "This draft was implemented in one bounded worktree and independently reviewed "
+            "by the opposite provider. Merge remains governed by repository protection.\n"
+        )
+        title = f"changeset {str(change_set_id)[:8]}: {payload['domain']} finding"
+        publications = [
+            {
+                "repository": repositories[source_repository],
+                "repository_slug": source_repository,
+                "working_directory": str(payload["source_worktree"]),
+                "branch": str(payload["source_branch"]),
+                "head_sha": source_head,
+                "base_branch": "main",
+                "title": title,
+                "body": body + "\nRepository role: source\n",
+            }
+        ]
+        deferred_deployment: dict[str, Any] | None = None
+        if int(deployment.get("changed_file_count", 0)) > 0:
+            publications.append(
+                {
+                    "repository": repositories[deployment_repository],
+                    "repository_slug": deployment_repository,
+                    "working_directory": str(payload["deployment_worktree"]),
+                    "branch": str(payload["deployment_branch"]),
+                    "head_sha": deployment_head,
+                    "base_branch": "main",
+                    "title": title + " (deployment)",
+                    "body": body + "\nRepository role: deployment\n",
+                }
+            )
+        else:
+            deferred_deployment = {
+                "repository_slug": deployment_repository,
+                "branch": str(payload["deployment_branch"]),
+                "head_sha": deployment_head,
+                "base_sha": str(payload["deployment_base_sha"]),
+                "reason": "AWAITING_IMMUTABLE_ARTIFACT",
+            }
+        return {
+            **payload,
+            "status": "PUBLICATION_READY",
+            "publication_plan": {
+                "change_set_id": str(change_set_id),
+                "publications": publications,
+                "deferred_deployment": deferred_deployment,
+            },
+        }
+
+    def _persist_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        run_id = UUID(str(payload["run_id"]))
+        status = str(payload.get("status", ""))
+        plan = self._object(payload.get("publication_plan"), "publication_plan")
+        raw_publications = plan.get("publications")
+        if not isinstance(raw_publications, list) or len(raw_publications) not in {1, 2}:
+            raise ValueError("publication plan metadata is incomplete")
+        planned = {
+            str(item.get("repository_slug")): item
+            for item in raw_publications
+            if isinstance(item, dict)
+        }
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            run = session.get(Run, run_id)
+            if change_set is None or run is None or run.change_set_id != change_set_id:
+                raise ValueError("publication metadata binding is missing")
+            source_plan = self._object(
+                planned.get(change_set.source_repository), "source publication plan"
+            )
+            raw_deployment_plan = planned.get(change_set.deployment_repository)
+            deferred = plan.get("deferred_deployment")
+            deployment_plan = (
+                self._object(raw_deployment_plan, "deployment publication plan")
+                if raw_deployment_plan is not None
+                else self._object(deferred, "deferred deployment plan")
+            )
+            if deployment_plan.get("repository_slug") != change_set.deployment_repository:
+                raise ValueError("publication deployment binding is invalid")
+            for record in (source_plan, deployment_plan):
+                if not self._is_git_sha(record.get("head_sha")):
+                    raise ValueError("publication plan head is invalid")
+            change_set.source_branch = str(source_plan["branch"])
+            change_set.source_head_sha = str(source_plan["head_sha"])
+            change_set.deployment_branch = str(deployment_plan["branch"])
+            change_set.deployment_head_sha = str(deployment_plan["head_sha"])
+            if status != "SOURCE_PRS_CREATED":
+                blocker = str(payload.get("blocker", "GITHUB_PUBLICATION_FAILED"))
+                change_set.state = ChangeSetState.IMPLEMENTING.value
+                change_set.version += 1
+                run.status = "BLOCKED"
+                run.error_code = blocker
+                run.summary = "validated local commits preserved pending scoped publication"
+                run.finished_at = datetime.now(UTC)
+                self._release_implementation_leases(session, run)
+                return {**payload, "status": "BLOCKED", "blocker": blocker}
+            raw_results = payload.get("publication_results")
+            if not isinstance(raw_results, list) or len(raw_results) != len(raw_publications):
+                raise ValueError("publication result count changed after planning")
+            results = {
+                str(item.get("repository_slug")): item
+                for item in raw_results
+                if isinstance(item, dict)
+            }
+            source = self._object(results.get(change_set.source_repository), "source PR result")
+            raw_deployment = results.get(change_set.deployment_repository)
+            deployment = (
+                self._object(raw_deployment, "deployment PR result")
+                if raw_deployment is not None
+                else None
+            )
+            expected_results: list[tuple[dict[str, Any], str]] = [
+                (source, str(change_set.source_head_sha or ""))
+            ]
+            if deployment is not None:
+                expected_results.append((deployment, str(change_set.deployment_head_sha or "")))
+            for record, expected_sha in expected_results:
+                if record.get("head_sha") != expected_sha or record.get("pr_state") != "OPEN":
+                    raise ValueError("published PR is not open at the validated head")
+                if not re.fullmatch(
+                    r"https://github\.com/gntik-ai/[a-z0-9-]+/pull/[1-9][0-9]*",
+                    str(record.get("pr_url", "")),
+                ):
+                    raise ValueError("published PR URL is invalid")
+            change_set.source_pr_url = str(source["pr_url"])
+            change_set.deployment_pr_url = (
+                str(deployment["pr_url"]) if deployment is not None else None
+            )
+            change_set.state = ChangeSetState.SOURCE_PR.value
+            change_set.version += 1
+            run.status = "SUCCESS"
+            run.summary = (
+                "source and deployment draft PRs published at validated commits"
+                if deployment is not None
+                else "source draft PR published; deployment waits for immutable artifact"
+            )
+            run.finished_at = datetime.now(UTC)
+            self._release_implementation_leases(session, run)
+        return {
+            **payload,
+            "status": "SOURCE_PR",
+            "source_pr": source["pr_url"],
+            "deployment_pr": deployment["pr_url"] if deployment is not None else None,
+            "deployment_deferred": deployment is None,
+        }
+
     def _persist_delivery_handoff(self, payload: dict[str, Any]) -> dict[str, Any]:
         evidence = self._object(payload.get("change_evidence"), "change_evidence")
         source = self._object(evidence.get("source"), "source change evidence")
@@ -1489,7 +1690,17 @@ class MetadataActivityHandler:
                 "release_plan": release_plan,
             }
 
+    def _record_preview_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._record_deployment_candidate(payload, "preview")
+
     def _record_staging_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._record_deployment_candidate(payload, "staging")
+
+    def _record_deployment_candidate(
+        self,
+        payload: dict[str, Any],
+        environment: Literal["preview", "staging"],
+    ) -> dict[str, Any]:
         change_set_id = UUID(str(payload["change_set_id"]))
         preflight = self._object(payload.get("release_preflight"), "release_preflight")
         preflight_hash = hashlib.sha256(
@@ -1499,14 +1710,14 @@ class MetadataActivityHandler:
         with self.sessions.begin() as session:
             change_set = session.get(ChangeSet, change_set_id)
             if change_set is None:
-                raise ValueError("staging candidate ChangeSet is missing")
+                raise ValueError(f"{environment} candidate ChangeSet is missing")
             workflow_id = str(payload["orchestration"]["workflow_id"])
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None or run.change_set_id != change_set_id:
-                raise ValueError("staging candidate Run binding is missing")
+                raise ValueError(f"{environment} candidate Run binding is missing")
             deployment_lease = ComponentLeaseManager().acquire(
                 session,
-                component_key=f"{change_set.project}:deploy:staging",
+                component_key=f"{change_set.project}:deploy:{environment}",
                 owner_run_id=run.id,
                 mode="deployment",
                 ttl=timedelta(hours=8),
@@ -1517,14 +1728,10 @@ class MetadataActivityHandler:
                 target_context=str(payload["target_context"]),
                 target_namespace=str(payload["target_namespace"]),
                 migration=bool(release_evidence.get("migration", False)),
-                backup_requirement=str(
-                    release_evidence.get("backup_requirement", "not-required")
-                ),
+                backup_requirement=str(release_evidence.get("backup_requirement", "not-required")),
                 rollback_plan_sha256=str(release_evidence["rollback_plan_sha256"]),
                 ci_result_sha256=str(release_evidence["ci_result_sha256"]),
-                independent_review_sha256=str(
-                    release_evidence["independent_review_sha256"]
-                ),
+                independent_review_sha256=str(release_evidence["independent_review_sha256"]),
                 release_preflight_sha256=preflight_hash,
             )
             binding = ApprovalService.digest(approval_payload)
@@ -1542,6 +1749,7 @@ class MetadataActivityHandler:
             candidate_id = uuid5(NAMESPACE_URL, f"approval-candidate:{change_set_id}:{binding}")
             candidate_payload = {
                 **approval_payload,
+                "approval_type": environment,
                 "artifact_binding_sha256": binding,
                 "release_preflight": preflight,
                 "deployment_id": payload["deployment_id"],
@@ -1558,34 +1766,83 @@ class MetadataActivityHandler:
                         invalidated_at=None,
                     )
                 )
+            automatic_approval: dict[str, Any] | None = None
+            if change_set.risk_class in {RiskClass.R0.value, RiskClass.R1.value}:
+                approval_id = uuid5(
+                    NAMESPACE_URL,
+                    f"policy-{environment}-approval:{change_set_id}:{binding}",
+                )
+                persisted = session.get(Approval, approval_id)
+                if persisted is None:
+                    persisted = Approval(
+                        id=approval_id,
+                        change_set_id=change_set_id,
+                        approval_type=environment,
+                        decision="approve",
+                        artifact_binding_sha256=binding,
+                        approver_subject=f"policy:low-risk-{environment}",
+                        approved_at=datetime.now(UTC),
+                        invalidated_at=None,
+                        metadata_json={
+                            "candidate_id": str(candidate_id),
+                            "automatic": True,
+                            "risk_class": change_set.risk_class,
+                        },
+                    )
+                    session.add(persisted)
+                automatic_approval = {
+                    "change_set_id": str(change_set_id),
+                    "artifact_binding_sha256": binding,
+                    "decision": "approve",
+                    "typed_confirmation": None,
+                    "approver_subject": persisted.approver_subject,
+                }
             plan = self._object(payload.get("release_plan"), "release_plan")
             plan["approval_binding_sha256"] = binding
-            change_set.state = ChangeSetState.AWAITING_STAGING_APPROVAL.value
-            change_set.version += 1
+            if environment == "staging":
+                change_set.state = ChangeSetState.AWAITING_STAGING_APPROVAL.value
+                change_set.version += 1
             deployment = session.get(Deployment, UUID(str(payload["deployment_id"])))
             if deployment is not None:
-                deployment.status = "AWAITING_STAGING_APPROVAL"
+                deployment.status = f"AWAITING_{environment.upper()}_APPROVAL"
             run.status = "AWAITING_APPROVAL"
             return {
                 **payload,
-                "status": "AWAITING_STAGING_APPROVAL",
+                "status": f"AWAITING_{environment.upper()}_APPROVAL",
                 "deployment_lease_id": str(deployment_lease.id),
                 "deployment_component_key": deployment_lease.component_key,
                 "artifact_binding_sha256": binding,
                 "approval_candidate": candidate_payload,
+                "requires_human_approval": automatic_approval is None,
+                "automatic_approval": automatic_approval,
                 "release_plan": plan,
             }
 
+    def _validate_preview_approval(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._validate_deployment_approval(payload, "preview")
+
     def _validate_staging_approval(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._validate_deployment_approval(payload, "staging")
+
+    def _validate_deployment_approval(
+        self,
+        payload: dict[str, Any],
+        environment: Literal["preview", "staging"],
+    ) -> dict[str, Any]:
         context = self._object(payload.get("context"), "context")
         approval = self._object(payload.get("approval"), "approval")
         change_set_id = UUID(str(context["change_set_id"]))
         binding = str(context["artifact_binding_sha256"])
         decision = str(approval.get("decision", ""))
-        if decision not in {"approve", "reject"} or approval.get(
-            "artifact_binding_sha256"
-        ) != binding:
-            return {**context, "status": "BLOCKED", "blocker": "STAGING_APPROVAL_REJECTED"}
+        if (
+            decision not in {"approve", "reject"}
+            or approval.get("artifact_binding_sha256") != binding
+        ):
+            return {
+                **context,
+                "status": "BLOCKED",
+                "blocker": f"{environment.upper()}_APPROVAL_REJECTED",
+            }
         with self.sessions.begin() as session:
             candidate = session.scalar(
                 select(ApprovalCandidate).where(
@@ -1603,7 +1860,7 @@ class MetadataActivityHandler:
                 )
             )
             if candidate is None or persisted is None:
-                raise ValueError("staging approval is not current authoritative metadata")
+                raise ValueError(f"{environment} approval is not current authoritative metadata")
             change_set = session.get(ChangeSet, change_set_id)
             if change_set is None:
                 raise ValueError("approved ChangeSet is missing")
@@ -1622,13 +1879,13 @@ class MetadataActivityHandler:
                 run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
                 if run is not None:
                     run.status = "BLOCKED"
-                    run.error_code = "STAGING_APPROVAL_REJECTED"
+                    run.error_code = f"{environment.upper()}_APPROVAL_REJECTED"
                     run.finished_at = now
                     self._release_deployment_lease(session, change_set, run)
                 return {
                     **context,
                     "status": "BLOCKED",
-                    "blocker": "STAGING_APPROVAL_REJECTED",
+                    "blocker": f"{environment.upper()}_APPROVAL_REJECTED",
                 }
             candidate_payload = self._object(candidate.payload_json, "approval candidate")
             current_payload = ApprovalService.artifact_payload(
@@ -1639,12 +1896,8 @@ class MetadataActivityHandler:
                 backup_requirement=str(candidate_payload["backup_requirement"]),
                 rollback_plan_sha256=str(candidate_payload["rollback_plan_sha256"]),
                 ci_result_sha256=str(candidate_payload["ci_result_sha256"]),
-                independent_review_sha256=str(
-                    candidate_payload["independent_review_sha256"]
-                ),
-                release_preflight_sha256=str(
-                    candidate_payload["release_preflight_sha256"]
-                ),
+                independent_review_sha256=str(candidate_payload["independent_review_sha256"]),
+                release_preflight_sha256=str(candidate_payload["release_preflight_sha256"]),
             )
             if ApprovalService.digest(current_payload) != binding:
                 invalidated_at = datetime.now(UTC)
@@ -1667,14 +1920,15 @@ class MetadataActivityHandler:
                     "status": "BLOCKED",
                     "blocker": "APPROVAL_ARTIFACT_DRIFT",
                 }
-            change_set.state = ChangeSetState.STAGING_APPROVED.value
-            change_set.version += 1
+            if environment == "staging":
+                change_set.state = ChangeSetState.STAGING_APPROVED.value
+                change_set.version += 1
             deployment = session.get(Deployment, UUID(str(context["deployment_id"])))
             if deployment is not None:
-                deployment.status = "STAGING_APPROVED"
+                deployment.status = f"{environment.upper()}_APPROVED"
             return {
                 **context,
-                "status": "STAGING_APPROVED",
+                "status": f"{environment.upper()}_APPROVED",
                 "approval_validation": {
                     "current": True,
                     "artifact_binding_sha256": binding,
@@ -1682,6 +1936,39 @@ class MetadataActivityHandler:
                     "approver_subject": persisted.approver_subject,
                 },
             }
+
+    def _finalize_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("status") != "PREVIEW_VERIFIED":
+            raise ValueError("preview finalization requires deterministic verification success")
+        change_set_id = UUID(str(payload["change_set_id"]))
+        deployment_id = UUID(str(payload["deployment_id"]))
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            deployment = session.get(Deployment, deployment_id)
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if change_set is None or deployment is None or run is None:
+                raise ValueError("preview finalization metadata is incomplete")
+            change_set.state = ChangeSetState.PREVIEW_VERIFIED.value
+            change_set.version += 1
+            deployment.status = "PREVIEW_VERIFIED"
+            deployment.transaction_id = str(payload.get("transaction_id", "")) or None
+            deployment.finished_at = datetime.now(UTC)
+            deployment.recovery_json = {
+                **dict(deployment.recovery_json),
+                "deployed_artifact_binding_sha256": str(payload["artifact_binding_sha256"]),
+                "release_plan": self._object(payload.get("release_plan"), "release_plan"),
+                "release_preflight": self._object(
+                    payload.get("release_preflight"), "release_preflight"
+                ),
+                "preview_verification": self._object(
+                    payload.get("preview_verification"), "preview_verification"
+                ),
+            }
+            run.status = "SUCCESS"
+            run.finished_at = datetime.now(UTC)
+            self._release_deployment_lease(session, change_set, run)
+        return {**payload, "status": "PREVIEW_VERIFIED"}
 
     def _finalize_staging(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("status") != "DEPLOYED":
@@ -1703,9 +1990,7 @@ class MetadataActivityHandler:
             existing_recovery = dict(deployment.recovery_json)
             existing_recovery.update(
                 {
-                    "deployed_artifact_binding_sha256": str(
-                        payload["artifact_binding_sha256"]
-                    ),
+                    "deployed_artifact_binding_sha256": str(payload["artifact_binding_sha256"]),
                     "release_plan": self._object(payload.get("release_plan"), "release_plan"),
                     "release_preflight": self._object(
                         payload.get("release_preflight"), "release_preflight"
@@ -1798,9 +2083,7 @@ class MetadataActivityHandler:
                                             payload.get("release_evidence"),
                                             "release_evidence",
                                         ),
-                                        "previous_deployment_sha": (
-                                            change_set.deployment_base_sha
-                                        ),
+                                        "previous_deployment_sha": (change_set.deployment_base_sha),
                                     }
                                 )
                                 deployment.recovery_json = recovery
@@ -1894,8 +2177,7 @@ class MetadataActivityHandler:
                 session.scalar(
                     select(Approval).where(
                         Approval.change_set_id == change_set.id,
-                        Approval.artifact_binding_sha256
-                        == candidate.artifact_binding_sha256,
+                        Approval.artifact_binding_sha256 == candidate.artifact_binding_sha256,
                         Approval.decision == "approve",
                         Approval.invalidated_at.is_(None),
                     )
@@ -1941,11 +2223,16 @@ class MetadataActivityHandler:
                 if lease.owner_run_id == run.id:
                     continue
                 owner = session.get(Run, lease.owner_run_id)
-                if owner is not None and owner.finished_at is None and owner.status in {
-                    "QUEUED",
-                    "RUNNING",
-                    "AWAITING_APPROVAL",
-                }:
+                if (
+                    owner is not None
+                    and owner.finished_at is None
+                    and owner.status
+                    in {
+                        "QUEUED",
+                        "RUNNING",
+                        "AWAITING_APPROVAL",
+                    }
+                ):
                     return self._runtime_block(
                         payload,
                         run,
@@ -2020,11 +2307,7 @@ class MetadataActivityHandler:
         with self.sessions.begin() as session:
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             deployment = session.get(Deployment, deployment_id)
-            if (
-                run is None
-                or deployment is None
-                or run.change_set_id != deployment.change_set_id
-            ):
+            if run is None or deployment is None or run.change_set_id != deployment.change_set_id:
                 raise ValueError("runtime failure deployment/Run binding is missing")
             if run.finished_at is None:
                 run.status = (
@@ -2115,8 +2398,7 @@ class MetadataActivityHandler:
                 and isinstance(checks, list)
                 and bool(checks)
                 and all(
-                    isinstance(check, dict) and check.get("status") == "PASS"
-                    for check in checks
+                    isinstance(check, dict) and check.get("status") == "PASS" for check in checks
                 )
                 and structured.get("incident_required") is False
             )
@@ -2281,12 +2563,8 @@ class MetadataActivityHandler:
                     change_set=change_set,
                 )
             release_plan = self._object(recovery.get("release_plan"), "stored release plan")
-            preflight = self._object(
-                recovery.get("release_preflight"), "stored release preflight"
-            )
-            evidence = self._object(
-                recovery.get("release_evidence"), "stored release evidence"
-            )
+            preflight = self._object(recovery.get("release_preflight"), "stored release preflight")
+            evidence = self._object(recovery.get("release_evidence"), "stored release evidence")
             plan: dict[str, Any]
             action: str
             blocker: str | None = None
@@ -2304,8 +2582,10 @@ class MetadataActivityHandler:
                 else:
                     revision = preflight.get("previous_revision")
                     manifest_sha = preflight.get("previous_manifest_sha256")
-                    if not isinstance(revision, int) or revision < 1 or not self._is_digest(
-                        manifest_sha
+                    if (
+                        not isinstance(revision, int)
+                        or revision < 1
+                        or not self._is_digest(manifest_sha)
                     ):
                         return self._recovery_block(
                             payload,
@@ -2361,9 +2641,7 @@ class MetadataActivityHandler:
         workflow_id = str(payload["orchestration"]["workflow_id"])
         plan = self._object(payload.get("recovery_plan"), "recovery plan")
         canonical_plan = {
-            key: value
-            for key, value in plan.items()
-            if key != "recovery_approval_binding_sha256"
+            key: value for key, value in plan.items() if key != "recovery_approval_binding_sha256"
         }
         plan_sha = hashlib.sha256(
             json.dumps(canonical_plan, separators=(",", ":"), sort_keys=True).encode()
@@ -2455,9 +2733,7 @@ class MetadataActivityHandler:
             binding = ApprovalService.digest(approval_payload)
             bound_plan = dict(plan)
             bound_plan["recovery_approval_binding_sha256"] = binding
-            candidate_id = uuid5(
-                NAMESPACE_URL, f"recovery-approval:{deployment.id}:{binding}"
-            )
+            candidate_id = uuid5(NAMESPACE_URL, f"recovery-approval:{deployment.id}:{binding}")
             session.add(
                 ApprovalCandidate(
                     id=candidate_id,
@@ -2519,9 +2795,7 @@ class MetadataActivityHandler:
                 for key, value in candidate_payload.items()
                 if key != "artifact_binding_sha256"
             }
-            recovery = self._object(
-                deployment.recovery_json, "deployment recovery metadata"
-            )
+            recovery = self._object(deployment.recovery_json, "deployment recovery metadata")
             recovery_plan = self._object(context.get("recovery_plan"), "recovery plan")
             canonical_plan = {
                 key: value
@@ -2529,13 +2803,9 @@ class MetadataActivityHandler:
                 if key != "recovery_approval_binding_sha256"
             }
             current_plan_sha = hashlib.sha256(
-                json.dumps(
-                    canonical_plan, separators=(",", ":"), sort_keys=True
-                ).encode()
+                json.dumps(canonical_plan, separators=(",", ":"), sort_keys=True).encode()
             ).hexdigest()
-            original_binding = str(
-                candidate_payload.get("original_artifact_binding_sha256", "")
-            )
+            original_binding = str(candidate_payload.get("original_artifact_binding_sha256", ""))
             artifacts_current = (
                 recovery.get("deployed_artifact_binding_sha256") == original_binding
                 and candidate_payload.get("recovery_plan_sha256") == current_plan_sha
@@ -2968,9 +3238,7 @@ class MetadataActivityHandler:
         owner_finished_at = self._as_utc(owner.finished_at)
         if released_at is not None and released_at <= retention_cutoff:
             return "RELEASED_RETENTION_EXPIRED"
-        abandonment_cutoff = now - timedelta(
-            hours=self.settings.cleanup_expiry_grace_hours
-        )
+        abandonment_cutoff = now - timedelta(hours=self.settings.cleanup_expiry_grace_hours)
         if (
             lease.released_at is None
             and expires_at <= abandonment_cutoff
@@ -3050,9 +3318,7 @@ class MetadataActivityHandler:
         }
 
     @staticmethod
-    def _release_deployment_lease(
-        session: Any, change_set: ChangeSet, run: Run
-    ) -> None:
+    def _release_deployment_lease(session: Any, change_set: ChangeSet, run: Run) -> None:
         environment, separator, suffix = run.run_type.partition("-")
         if not separator or suffix != "deployment" or environment not in {"preview", "staging"}:
             return
@@ -3061,6 +3327,18 @@ class MetadataActivityHandler:
             component_key=f"{change_set.project}:deploy:{environment}",
             owner_run_id=run.id,
         )
+
+    @staticmethod
+    def _release_implementation_leases(session: Any, run: Run) -> None:
+        now = datetime.now(UTC)
+        leases = session.scalars(
+            select(ComponentLease).where(
+                ComponentLease.owner_run_id == run.id,
+                ComponentLease.released_at.is_(None),
+            )
+        ).all()
+        for lease in leases:
+            lease.released_at = now
 
     def _deployment_target(
         self, project: Project, environment: Literal["preview", "staging"]
@@ -3147,8 +3425,18 @@ class MetadataActivityHandler:
 
     @staticmethod
     def _is_digest(value: Any) -> bool:
-        return isinstance(value, str) and len(value) == 64 and all(
-            character in "0123456789abcdef" for character in value
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    @staticmethod
+    def _is_git_sha(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 40
+            and all(character in "0123456789abcdef" for character in value)
         )
 
     @staticmethod

@@ -55,6 +55,12 @@ class FakeWorktreeManager:
     def inspect_snapshot(self, path: Path, *, expected_sha: str) -> dict[str, str]:
         return {"path": str(path), "sha": expected_sha, "status": "clean"}
 
+    def grant_release_read(self, repository: str, target: Path) -> None:
+        return None
+
+    def grant_delivery_read(self, repository: str, target: Path) -> None:
+        return None
+
 
 class FakeObserverRunner:
     def run(self, executable: str, arguments: Any, **kwargs: Any) -> CommandResult:
@@ -70,9 +76,7 @@ class FakeObserverRunner:
                     {
                         "metadata": {
                             "name": "api",
-                            "annotations": {
-                                "engineering.gntik.ai/deployment-sha": revision
-                            },
+                            "annotations": {"engineering.gntik.ai/deployment-sha": revision},
                         },
                         "spec": {
                             "replicas": 1,
@@ -94,9 +98,7 @@ class FakeObserverRunner:
                     {
                         "metadata": {
                             "name": "api-pod",
-                            "annotations": {
-                                "engineering.gntik.ai/deployment-sha": revision
-                            },
+                            "annotations": {"engineering.gntik.ai/deployment-sha": revision},
                         },
                         "spec": {"containers": [{"name": "api", "image": "example.invalid/api"}]},
                         "status": {
@@ -135,6 +137,7 @@ class FakeCleanupManager:
     def cleanup(self, allocation: Any, *, evidence_captured: bool) -> None:
         assert evidence_captured is False
         self.cleaned.append(str(allocation.path))
+
 
 @pytest.mark.asyncio
 async def test_project_snapshot_maps_both_transaction_repositories(tmp_path: Path) -> None:
@@ -327,9 +330,7 @@ async def test_cleanup_protects_dirty_and_executes_only_controller_authorization
         Settings(worktree_root=worktree_root, cleanup_execution_enabled=True),
         manager,  # type: ignore[arg-type]
     )
-    inspected = await handler.handle(
-        "cleanup.protect_active", {"cleanup_candidates": [candidate]}
-    )
+    inspected = await handler.handle("cleanup.protect_active", {"cleanup_candidates": [candidate]})
     assert inspected["eligible_candidates"][0]["inspection"] == "CLEAN"
     workflow_id = "cleanup-test"
     canonical = json.dumps(

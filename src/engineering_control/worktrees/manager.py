@@ -50,15 +50,22 @@ class WorktreeAccess:
 
 
 class GitWorktreeManager:
+    _repositories = frozenset({"falcone", "falcone-charts", "musematic", "musematic-deploy"})
+    _deployment_repositories = frozenset({"falcone-charts", "musematic-deploy"})
+
     def __init__(
         self,
         mirror_root: Path = Path("/srv/engineering/mirrors"),
         worktree_root: Path = Path("/srv/engineering/worktrees"),
         lease_root: Path = Path("/var/lib/engineering-control/leases/worktrees"),
+        metadata_root: Path | None = None,
     ) -> None:
         self.mirror_root = mirror_root
         self.worktree_root = worktree_root
         self.lease_root = lease_root
+        self.metadata_root = metadata_root or (
+            worktree_root.parent / "cache" / "scan" / "worktree-git"
+        )
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -92,6 +99,43 @@ class GitWorktreeManager:
         if self._run(["git", "rev-parse", "--is-bare-repository"], mirror) != "true":
             raise WorktreeError(f"canonical mirror is not bare: {mirror}")
         return mirror
+
+    def metadata_path(self, repository: str, identity: UUID) -> Path:
+        return self.metadata_root / self._slug(repository) / f"{identity}.git"
+
+    def _ensure_metadata_mirror(
+        self,
+        repository: str,
+        identity: UUID,
+        canonical_mirror: Path,
+    ) -> Path:
+        metadata = self.metadata_path(repository, identity)
+        expected_parent = self.metadata_root.resolve() / self._slug(repository)
+        if metadata.is_symlink() or metadata.resolve().parent != expected_parent:
+            raise WorktreeError("ChangeSet Git metadata path escaped its cache root")
+        if not metadata.exists():
+            metadata.parent.mkdir(parents=True, exist_ok=True, mode=0o710)
+            self._run(
+                [
+                    "git",
+                    "clone",
+                    "--bare",
+                    "--shared",
+                    str(canonical_mirror),
+                    str(metadata),
+                ],
+                canonical_mirror,
+                timeout=900,
+            )
+        if (
+            not metadata.is_dir()
+            or self._run(["git", "rev-parse", "--is-bare-repository"], metadata) != "true"
+        ):
+            raise WorktreeError("ChangeSet Git metadata repository is not bare")
+        origin = Path(self._run(["git", "remote", "get-url", "origin"], metadata)).resolve()
+        if origin != canonical_mirror.resolve():
+            raise WorktreeError("ChangeSet Git metadata origin changed after allocation")
+        return metadata
 
     def fetch(self, repository: str) -> None:
         mirror = self.verify_mirror(repository)
@@ -160,6 +204,7 @@ class GitWorktreeManager:
                     f"base SHA mismatch for {repository}: expected {expected_base_sha}, "
                     f"got {actual}"
                 )
+            metadata = self._ensure_metadata_mirror(repository, change_set_id, mirror)
             repo_slug = self._slug(repository)
             target = self.worktree_root / repo_slug / str(change_set_id)
             branch = f"agent/{self._slug(project)}/{self._slug(issue)}/{str(change_set_id)}"
@@ -178,16 +223,16 @@ class GitWorktreeManager:
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
             self._run(
                 ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha],
-                mirror,
+                metadata,
                 timeout=900,
             )
             if self.is_dirty(target):
                 raise WorktreeError("newly allocated worktree is unexpectedly dirty")
             if access is not None:
                 try:
-                    self._grant_access(target, access)
+                    self._grant_access(target, metadata, mirror, access)
                 except Exception:
-                    self._run(["git", "worktree", "remove", str(target)], mirror)
+                    self._run(["git", "worktree", "remove", str(target)], metadata)
                     raise
             return WorktreeAllocation(repository, target, branch, actual, change_set_id)
 
@@ -220,6 +265,7 @@ class GitWorktreeManager:
                     f"audit base SHA mismatch for {repository}: expected {expected_base_sha}, "
                     f"got {actual}"
                 )
+            metadata = self._ensure_metadata_mirror(repository, campaign_id, mirror)
             target = self.worktree_root / self._slug(repository) / str(campaign_id)
             if target.exists():
                 if self._run(["git", "rev-parse", "HEAD"], target) != expected_base_sha:
@@ -232,19 +278,30 @@ class GitWorktreeManager:
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
             self._run(
                 ["git", "worktree", "add", "--detach", str(target), expected_base_sha],
-                mirror,
+                metadata,
                 timeout=900,
             )
             if self.is_dirty(target):
                 raise WorktreeError("new audit snapshot is unexpectedly dirty")
             try:
-                self._grant_read_access(target, ("codex-runner", "claude-runner"))
+                self._grant_read_access(
+                    target,
+                    metadata,
+                    mirror,
+                    ("codex-runner", "claude-runner"),
+                )
             except Exception:
-                self._run(["git", "worktree", "remove", str(target)], mirror)
+                self._run(["git", "worktree", "remove", str(target)], metadata)
                 raise
             return AuditSnapshotAllocation(repository, target, actual, campaign_id)
 
-    def _grant_access(self, target: Path, access: WorktreeAccess) -> None:
+    def _grant_access(
+        self,
+        target: Path,
+        metadata: Path,
+        canonical_mirror: Path,
+        access: WorktreeAccess,
+    ) -> None:
         """Grant the maker write and checker read access to exactly one worktree."""
         resolved_root = self.worktree_root.resolve()
         resolved_target = target.resolve()
@@ -252,24 +309,144 @@ class GitWorktreeManager:
             raise WorktreeError("refusing to grant access outside a bounded worktree")
         access_acl = f"u:{access.maker_identity}:rwX,u:{access.checker_identity}:r-X,m::rwX"
         default_acl = f"d:u:{access.maker_identity}:rwx,d:u:{access.checker_identity}:r-x,d:m::rwx"
+        traverse_acl = f"u:{access.maker_identity}:--x,u:{access.checker_identity}:--x"
+        self._run(
+            ["setfacl", "--modify", traverse_acl, str(resolved_target.parent)],
+            resolved_target,
+        )
         self._run(["setfacl", "--recursive", "--modify", access_acl, str(target)], target)
         for directory in (target, *(item for item in target.rglob("*") if item.is_dir())):
             self._run(["setfacl", "--modify", default_acl, str(directory)], target)
 
-    def _grant_read_access(self, target: Path, identities: tuple[str, ...]) -> None:
+        identities = (access.maker_identity, access.checker_identity)
+        self._grant_metadata_traverse(metadata, identities)
+        metadata_acl = f"u:{access.maker_identity}:rwX,u:{access.checker_identity}:r-X,m::rwX"
+        metadata_default_acl = (
+            f"d:u:{access.maker_identity}:rwx,d:u:{access.checker_identity}:r-x,d:m::rwx"
+        )
+        self._run(["setfacl", "--recursive", "--modify", metadata_acl, str(metadata)], metadata)
+        for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
+            self._run(["setfacl", "--modify", metadata_default_acl, str(directory)], metadata)
+        self._grant_canonical_read(canonical_mirror, identities)
+
+    def _grant_read_access(
+        self,
+        target: Path,
+        metadata: Path,
+        canonical_mirror: Path,
+        identities: tuple[str, ...],
+    ) -> None:
         if any(identity not in WorktreeAccess._allowed_identities for identity in identities):
             raise WorktreeError("audit snapshot reader is not an allowed model worker")
+        self._grant_bounded_read_access(target, identities)
+        self._grant_metadata_traverse(metadata, identities)
+        self._grant_tree_read_access(metadata, identities, cwd=metadata)
+        self._grant_canonical_read(canonical_mirror, identities)
+
+    def grant_release_read(self, repository: str, target: Path) -> None:
+        """Grant release-runner read-only access to one validated deployment worktree.
+
+        A linked worktree's Git metadata and objects live in the canonical bare mirror, so
+        release preflight needs read access to both the exact deployment worktree and that
+        deployment repository's mirror. Source mirrors are never eligible.
+        """
+        if repository not in self._deployment_repositories:
+            raise WorktreeError("release access is limited to deployment repositories")
+        resolved_root = self.worktree_root.resolve()
+        resolved_target = target.resolve()
+        expected_parent = resolved_root / self._slug(repository)
+        if (
+            not resolved_target.is_dir()
+            or resolved_target.parent != expected_parent
+            or resolved_target == resolved_root
+        ):
+            raise WorktreeError("release access target is not an exact deployment worktree")
+        mirror = self.verify_mirror(repository)
+        metadata = self._metadata_for_target(repository, resolved_target)
+        self._grant_bounded_read_access(resolved_target, ("release-runner",))
+        self._grant_metadata_traverse(metadata, ("release-runner",))
+        self._grant_tree_read_access(metadata, ("release-runner",), cwd=metadata)
+        self._grant_canonical_read(mirror, ("release-runner",))
+
+    def grant_delivery_read(self, repository: str, target: Path) -> None:
+        """Grant the non-LLM delivery identity read access for exact branch publication."""
+        if repository not in self._repositories:
+            raise WorktreeError("delivery access is limited to configured repositories")
+        resolved_root = self.worktree_root.resolve()
+        resolved_target = target.resolve()
+        expected_parent = resolved_root / self._slug(repository)
+        if (
+            not resolved_target.is_dir()
+            or resolved_target.parent != expected_parent
+            or resolved_target == resolved_root
+        ):
+            raise WorktreeError("delivery access target is not an exact ChangeSet worktree")
+        mirror = self.verify_mirror(repository)
+        metadata = self._metadata_for_target(repository, resolved_target)
+        self._grant_bounded_read_access(resolved_target, ("delivery-runner",))
+        self._grant_metadata_traverse(metadata, ("delivery-runner",))
+        self._grant_tree_read_access(metadata, ("delivery-runner",), cwd=metadata)
+        self._grant_canonical_read(mirror, ("delivery-runner",))
+
+    def _metadata_for_target(self, repository: str, target: Path) -> Path:
+        try:
+            identity = UUID(target.name)
+        except ValueError as error:
+            raise WorktreeError("worktree path has no ChangeSet identity") from error
+        configured = self.metadata_path(repository, identity)
+        metadata = configured.resolve()
+        expected_parent = self.metadata_root.resolve() / self._slug(repository)
+        if configured.is_symlink() or metadata.parent != expected_parent:
+            raise WorktreeError("ChangeSet Git metadata path escaped its cache root")
+        if not metadata.is_dir():
+            raise WorktreeError("ChangeSet Git metadata repository is missing")
+        return metadata
+
+    def _grant_metadata_traverse(self, metadata: Path, identities: tuple[str, ...]) -> None:
+        root = self.metadata_root.resolve()
+        resolved = metadata.resolve()
+        if not resolved.is_relative_to(root) or resolved == root:
+            raise WorktreeError("Git metadata access escaped its bounded cache root")
+        traverse_acl = ",".join(f"u:{identity}:--x" for identity in identities)
+        for directory in (root.parent, root, resolved.parent):
+            self._run(["setfacl", "--modify", traverse_acl, str(directory)], resolved)
+
+    def _grant_canonical_read(self, mirror: Path, identities: tuple[str, ...]) -> None:
+        root = self.mirror_root.resolve()
+        resolved = mirror.resolve()
+        if resolved.parent != root:
+            raise WorktreeError("canonical mirror access escaped its root")
+        traverse_acl = ",".join(f"u:{identity}:--x" for identity in identities)
+        self._run(["setfacl", "--modify", traverse_acl, str(root)], resolved)
+        self._grant_tree_read_access(resolved, identities, cwd=resolved)
+
+    def _grant_bounded_read_access(self, target: Path, identities: tuple[str, ...]) -> None:
         resolved_root = self.worktree_root.resolve()
         resolved_target = target.resolve()
         if not resolved_target.is_relative_to(resolved_root) or resolved_target == resolved_root:
             raise WorktreeError("refusing to grant access outside a bounded audit snapshot")
-        reader_acl = ",".join(f"u:{identity}:r-X" for identity in identities)
+        self._grant_tree_read_access(resolved_target, identities, cwd=resolved_target)
         default_acl = ",".join(f"d:u:{identity}:r-x" for identity in identities)
         traverse_acl = ",".join(f"u:{identity}:--x" for identity in identities)
-        self._run(["setfacl", "--modify", traverse_acl, str(target.parent)], target)
-        self._run(["setfacl", "--recursive", "--modify", reader_acl, str(target)], target)
-        for directory in (target, *(item for item in target.rglob("*") if item.is_dir())):
-            self._run(["setfacl", "--modify", default_acl, str(directory)], target)
+        self._run(
+            ["setfacl", "--modify", traverse_acl, str(resolved_target.parent)],
+            resolved_target,
+        )
+        for directory in (
+            resolved_target,
+            *(item for item in resolved_target.rglob("*") if item.is_dir()),
+        ):
+            self._run(["setfacl", "--modify", default_acl, str(directory)], resolved_target)
+
+    def _grant_tree_read_access(
+        self,
+        target: Path,
+        identities: tuple[str, ...],
+        *,
+        cwd: Path,
+    ) -> None:
+        reader_acl = ",".join(f"u:{identity}:r-X" for identity in identities)
+        self._run(["setfacl", "--recursive", "--modify", reader_acl, str(target)], cwd)
 
     def is_dirty(self, path: Path) -> bool:
         return bool(self._run(["git", "status", "--porcelain=v1"], path))
@@ -349,7 +526,7 @@ class GitWorktreeManager:
         return summary, diff
 
     def cleanup(self, allocation: WorktreeAllocation, *, evidence_captured: bool) -> None:
-        mirror = self.verify_mirror(allocation.repository)
+        self.verify_mirror(allocation.repository)
         if not allocation.path.exists():
             return
         expected = (
@@ -369,4 +546,5 @@ class GitWorktreeManager:
             raise WorktreeError(
                 "dirty worktree cleanup requires the abandoned-run cleanup workflow"
             )
-        self._run(["git", "worktree", "remove", str(allocation.path)], mirror)
+        metadata = self._metadata_for_target(allocation.repository, resolved)
+        self._run(["git", "worktree", "remove", str(allocation.path)], metadata)

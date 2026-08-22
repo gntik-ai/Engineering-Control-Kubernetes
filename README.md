@@ -25,4 +25,5 @@ repository creation, or credential copy is performed by this repository's bootst
 - native CLI rate limits produce a durable `RATE_LIMITED` handoff, never paid API fallback;
 - all persisted output passes through central secret redaction.
 
-See `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`, and `docs/OPERATOR-CHEATSHEET.md`.
+See `docs/ARCHITECTURE.md`, `docs/REQUIREMENTS-MATRIX.md`, `docs/VALIDATION.md`, and
+`docs/OPERATOR-CHEATSHEET.md`.

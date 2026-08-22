@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import cast
@@ -73,6 +74,25 @@ def create_evidence_ingest_app(
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return result
+
+    @app.post("/v1/workers/heartbeat", status_code=202)
+    async def heartbeat(
+        request: Request,
+        subject: str = Depends(authenticated),
+    ) -> dict[str, object]:
+        hostname = str(request.headers.get("x-worker-hostname", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}", hostname):
+            raise HTTPException(status_code=422, detail="invalid worker hostname")
+        repository_value = cast(MetadataRepository, request.app.state.metadata_repository)
+        try:
+            stored = await repository_value.persist_worker_heartbeat(subject, hostname)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {
+            "status": "ACCEPTED",
+            "identity": stored["identity"],
+            "observed_at": stored["observed_at"],
+        }
 
     return app
 

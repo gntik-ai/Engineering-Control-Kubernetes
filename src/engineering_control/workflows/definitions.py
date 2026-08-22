@@ -144,10 +144,13 @@ class ControlledWorkflow:
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step == "runtime.independent_review":
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+        if step == "delivery.publish":
+            return "engineering-delivery"
         if step in {"runtime.browser_checks"}:
             return "engineering-browser"
         if step in {
             "preview.preflight",
+            "preview.verify",
             "staging.preflight",
             "preview.deploy",
             "staging.deploy",
@@ -320,7 +323,9 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             "delivery.prepare_checker",
             "delivery.invoke_checker",
             "delivery.validate_changeset",
-            "delivery.persist_handoff",
+            "delivery.prepare_publication",
+            "delivery.publish",
+            "delivery.persist_publication",
         )
         for step in ordered_steps:
             if not await self._checkpoint(step.upper().replace(".", "_")):
@@ -330,15 +335,21 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                 {**context, "delivery_request": asdict(request)},
                 timeout_minutes=120 if "invoke" in step else 30,
             )
-            if context.get("status") in {
-                "RATE_LIMITED",
-                "BLOCKED",
-                "FAILED",
-                "TIMED_OUT",
-                "CANCELLED",
-                "REQUEST_CHANGES",
-                "DRY_RUN",
-            }:
+            if (
+                context.get("status")
+                in {
+                    "RATE_LIMITED",
+                    "BLOCKED",
+                    "FAILED",
+                    "TIMED_OUT",
+                    "CANCELLED",
+                    "REQUEST_CHANGES",
+                    "DRY_RUN",
+                }
+                and step != "delivery.publish"
+            ):
+                if step == "delivery.prepare_publication":
+                    context = await self._step("delivery.persist_handoff", context)
                 return {"status": context["status"], "context": context}
         return {"status": context.get("status", "SOURCE_PR"), "context": context}
 
@@ -365,18 +376,35 @@ class PreviewDeploymentWorkflow(ControlledWorkflow):
                     {**context, "terminal_status": "PREVIEW_PREFLIGHT_VALIDATED"},
                 )
                 return {"status": "PREVIEW_PREFLIGHT_VALIDATED", "context": context}
+            context = await self._step("preview.record_candidate", context)
+            if context.get("status") == "BLOCKED":
+                return {"status": "BLOCKED", "context": context}
+            automatic_approval = context.get("automatic_approval")
+            if isinstance(automatic_approval, dict):
+                self._approval = automatic_approval
+            else:
+                self._phase = "AWAITING_PREVIEW_APPROVAL"
+                await workflow.wait_condition(lambda: self._approval is not None or self._cancelled)
+                if self._cancelled:
+                    context = await self._step(
+                        "deployment.record_terminal",
+                        {**context, "terminal_status": "CANCELLED"},
+                    )
+                    return {"status": "CANCELLED", "context": context}
             context = await self._step(
-                "deployment.record_terminal",
-                {
-                    **context,
-                    "terminal_status": "BLOCKED",
-                    "blocker": "PREVIEW_POLICY_AUTHORIZATION_NOT_ENABLED",
-                },
+                "preview.validate_approval",
+                {"context": context, "approval": self._approval},
             )
-            return {"status": "BLOCKED", "context": context}
+            if context.get("status") != "PREVIEW_APPROVED":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
+            context = await self._step("preview.deploy", context, timeout_minutes=60)
+            context = await self._step("preview.verify", context, timeout_minutes=60)
+            context = await self._step("preview.finalize", context)
+            return {"status": context.get("status", "PREVIEW_VERIFIED"), "context": context}
         except ActivityError as error:
             context = await self._deployment_failure(context, error)
             return {"status": "DEPLOYMENT_FAILED", "context": context}
+
 
 @workflow.defn(name="StagingDeploymentWorkflow")
 class StagingDeploymentWorkflow(ControlledWorkflow):
@@ -417,13 +445,18 @@ class StagingDeploymentWorkflow(ControlledWorkflow):
                     },
                 )
                 return {"status": "BLOCKED", "context": context}
-            self._phase = "AWAITING_STAGING_APPROVAL"
-            await workflow.wait_condition(lambda: self._approval is not None or self._cancelled)
-            if self._cancelled:
-                context = await self._step(
-                    "deployment.record_terminal", {**context, "terminal_status": "CANCELLED"}
-                )
-                return {"status": "CANCELLED", "context": context}
+            automatic_approval = context.get("automatic_approval")
+            if isinstance(automatic_approval, dict):
+                self._approval = automatic_approval
+            else:
+                self._phase = "AWAITING_STAGING_APPROVAL"
+                await workflow.wait_condition(lambda: self._approval is not None or self._cancelled)
+                if self._cancelled:
+                    context = await self._step(
+                        "deployment.record_terminal",
+                        {**context, "terminal_status": "CANCELLED"},
+                    )
+                    return {"status": "CANCELLED", "context": context}
             context = await self._step(
                 "staging.validate_approval", {"context": context, "approval": self._approval}
             )
@@ -581,9 +614,7 @@ class RecoveryWorkflow(ControlledWorkflow):
                 and cause.type in self._reported_recovery_errors
                 else "RECOVERY_ACTIVITY_FAILED"
             )
-            context = await self._step(
-                "recovery.record_failure", {**context, "blocker": blocker}
-            )
+            context = await self._step("recovery.record_failure", {**context, "blocker": blocker})
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
 
@@ -617,9 +648,7 @@ class CleanupWorkflow(ControlledWorkflow):
                     "cleanup.finalize", {**context, "terminal_status": "BLOCKED"}
                 )
                 return {"status": "BLOCKED", "context": context}
-            context = await self._step(
-                "cleanup.execute", {**context, "dry_run": False}
-            )
+            context = await self._step("cleanup.execute", {**context, "dry_run": False})
             context = await self._step(
                 "cleanup.finalize", {**context, "terminal_status": "COMPLETE"}
             )

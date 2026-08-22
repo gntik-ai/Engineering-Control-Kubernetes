@@ -25,6 +25,7 @@ evidence:
 repositories:
   mirrors: /srv/engineering/mirrors
   worktrees: /srv/engineering/worktrees
+  worktree_metadata: /srv/engineering/cache/scan/worktree-git
 runtime:
   runs: /srv/engineering/runs
   cache: /srv/engineering/cache
@@ -34,7 +35,8 @@ runtime:
 deployments:
   targets: /etc/engineering-control/targets
   default_enabled: false
-  preview_mutation_enabled: false
+  mutation_requires_enabled_target: true
+  immutable_approval_required: true
   production_enabled: false
 runtime_verification:
   targets: /etc/engineering-control/runtime

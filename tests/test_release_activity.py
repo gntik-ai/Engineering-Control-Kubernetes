@@ -24,6 +24,14 @@ class FakeHelm:
         assert approval_is_current
         return CommandResult(0, "bounded helm transaction", "")
 
+    def verify(self, plan: Any) -> dict[str, Any]:
+        return {
+            "status": "PREVIEW_VERIFIED",
+            "revision": 4,
+            "manifest_sha256": "e" * 64,
+            "immutable_image_count": len(plan.image_digests),
+        }
+
     def rollback(self, plan: Any, *, approval_is_current: bool) -> dict[str, Any]:
         assert approval_is_current
         return {
@@ -129,6 +137,28 @@ async def test_release_preflight_is_bounded_and_does_not_require_approval(tmp_pa
 
     assert result["status"] == "PREFLIGHT_PASS"
     assert result["release_preflight"]["chart_sha"] == "a" * 40
+
+
+@pytest.mark.asyncio
+async def test_preview_verification_observes_approved_immutable_release(tmp_path: Path) -> None:
+    worktree_root = tmp_path / "worktrees"
+    chart = worktree_root / "falcone-charts" / "change-set"
+    chart.mkdir(parents=True)
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    kubeconfig = credential_root / "preview.kubeconfig"
+    kubeconfig.write_text("scoped test configuration", encoding="utf-8")
+    os.chmod(kubeconfig, 0o600)
+    handler = ReleaseActivityHandler(
+        Settings(worktree_root=worktree_root, release_credential_root=credential_root),
+        helm=FakeHelm(),  # type: ignore[arg-type]
+        gitops=FakeGitOps(),  # type: ignore[arg-type]
+    )
+
+    result = await handler.handle("preview.verify", helm_payload(chart, kubeconfig))
+
+    assert result["status"] == "PREVIEW_VERIFIED"
+    assert result["preview_verification"]["immutable_image_count"] == 1
 
 
 @pytest.mark.asyncio

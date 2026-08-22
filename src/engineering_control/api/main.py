@@ -7,8 +7,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from prometheus_client import make_asgi_app
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from temporalio.client import Client
 
 from engineering_control.api.auth import bearer_auth
@@ -31,6 +30,7 @@ from engineering_control.db.repository import (
     SQLMetadataRepository,
 )
 from engineering_control.logging import configure_logging
+from engineering_control.observability.metrics import ControlPlaneMetrics
 
 
 def create_app(
@@ -83,6 +83,7 @@ def create_app(
 
     control_dependency = Depends(control)
     metadata_dependency = Depends(metadata)
+    control_metrics = ControlPlaneMetrics()
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
@@ -288,8 +289,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="synthetic validation is disabled")
         return await service.start_acceptance(body, str(resolved.acceptance_root))
 
-    metrics = make_asgi_app()
-    app.mount("/internal/metrics", metrics)
+    @app.get("/internal/metrics", include_in_schema=False)
+    async def internal_metrics(
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> Response:
+        payload, content_type = control_metrics.render(
+            await repository.metrics_snapshot(),
+            heartbeat_ttl_seconds=resolved.worker_heartbeat_seconds * 3,
+        )
+        return Response(content=payload, media_type=content_type)
+
     return app
 
 

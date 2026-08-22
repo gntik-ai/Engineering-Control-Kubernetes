@@ -11,6 +11,8 @@ import httpx
 from fastapi.testclient import TestClient
 
 from engineering_control.config import Settings
+from engineering_control.db.base import Base
+from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.evidence.ingest import create_evidence_ingest_app
 from engineering_control.evidence.transfer import EvidenceEnvelope, EvidencePublisher
 from engineering_control.models.core import ArtifactMetadata
@@ -23,6 +25,7 @@ class FakeEvidenceRepository:
         self.run_id = run_id
         self.campaign_id = campaign_id
         self.persisted: list[ArtifactMetadata] = []
+        self.heartbeats: list[tuple[str, str]] = []
 
     async def resolve_evidence_binding(
         self,
@@ -44,6 +47,14 @@ class FakeEvidenceRepository:
     async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]:
         self.persisted.append(metadata)
         return {"id": str(metadata.artifact_id), **metadata.model_dump(mode="json")}
+
+    async def persist_worker_heartbeat(self, identity: str, hostname: str) -> dict[str, Any]:
+        self.heartbeats.append((identity, hostname))
+        return {
+            "identity": identity,
+            "hostname": hostname,
+            "observed_at": "2026-08-22T00:00:00+00:00",
+        }
 
 
 def envelope_headers(
@@ -157,6 +168,56 @@ def test_ingest_rejects_worker_producer_impersonation(tmp_path: Path) -> None:
 
     assert response.status_code == 403
     assert not repository.persisted
+
+
+def test_worker_heartbeat_identity_comes_from_its_bearer_token(tmp_path: Path) -> None:
+    repository = FakeEvidenceRepository("unused", uuid4(), uuid4())
+    app = create_evidence_ingest_app(
+        settings=Settings(evidence_root=tmp_path / "evidence"),
+        repository=repository,  # type: ignore[arg-type]
+        tokens={"scan-runner": "s" * 48},
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/workers/heartbeat",
+            headers={
+                "Authorization": f"Bearer {'s' * 48}",
+                "X-Engineering-Actor": "scan-runner",
+                "X-Worker-Hostname": "hermes-worker",
+            },
+        )
+        spoofed = client.post(
+            "/v1/workers/heartbeat",
+            headers={
+                "Authorization": f"Bearer {'s' * 48}",
+                "X-Engineering-Actor": "release-runner",
+                "X-Worker-Hostname": "hermes-worker",
+            },
+        )
+    assert response.status_code == 202
+    assert repository.heartbeats == [("scan-runner", "hermes-worker")]
+    assert spoofed.status_code == 403
+
+
+def test_delivery_worker_heartbeat_is_allowlisted(tmp_path: Path) -> None:
+    repository = SQLMetadataRepository(f"sqlite:///{tmp_path / 'heartbeat.sqlite'}")
+    Base.metadata.create_all(repository.engine)
+    app = create_evidence_ingest_app(
+        settings=Settings(evidence_root=tmp_path / "evidence"),
+        repository=repository,
+        tokens={"delivery-runner": "d" * 48},
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/workers/heartbeat",
+            headers={
+                "Authorization": f"Bearer {'d' * 48}",
+                "X-Engineering-Actor": "delivery-runner",
+                "X-Worker-Hostname": "worker-test",
+            },
+        )
+    assert response.status_code == 202
+    assert response.json()["identity"] == "delivery-runner"
 
 
 def test_publisher_uses_private_origin_and_restricted_token_file(tmp_path: Path) -> None:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, or_, select
 from sqlalchemy.orm import sessionmaker
 
 from engineering_control.api.schemas import (
@@ -17,6 +18,7 @@ from engineering_control.api.schemas import (
     RuntimeVerificationStart,
 )
 from engineering_control.db.models import (
+    AgentInvocation,
     Approval,
     ApprovalCandidate,
     Artifact,
@@ -26,6 +28,8 @@ from engineering_control.db.models import (
     Finding,
     QuotaSnapshot,
     Run,
+    VerificationResult,
+    WorkerHeartbeat,
 )
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
@@ -56,9 +60,7 @@ class MetadataRepository(Protocol):
     async def create_runtime_verification_run(
         self, workflow_id: str, request: RuntimeVerificationStart
     ) -> Project: ...
-    async def create_recovery_run(
-        self, workflow_id: str, request: RollbackRequest
-    ) -> Project: ...
+    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project: ...
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
@@ -78,6 +80,8 @@ class MetadataRepository(Protocol):
     ) -> dict[str, UUID | None]: ...
 
     async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]: ...
+    async def persist_worker_heartbeat(self, identity: str, hostname: str) -> dict[str, Any]: ...
+    async def metrics_snapshot(self) -> dict[str, Any]: ...
 
 
 class SQLMetadataRepository:
@@ -142,9 +146,7 @@ class SQLMetadataRepository:
                 )
             )
 
-    async def create_deployment_run(
-        self, workflow_id: str, request: DeploymentPrepare
-    ) -> Project:
+    async def create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
         return await asyncio.to_thread(self._create_deployment_run, workflow_id, request)
 
     def _create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
@@ -193,9 +195,7 @@ class SQLMetadataRepository:
     async def create_runtime_verification_run(
         self, workflow_id: str, request: RuntimeVerificationStart
     ) -> Project:
-        return await asyncio.to_thread(
-            self._create_runtime_verification_run, workflow_id, request
-        )
+        return await asyncio.to_thread(self._create_runtime_verification_run, workflow_id, request)
 
     def _create_runtime_verification_run(
         self, workflow_id: str, request: RuntimeVerificationStart
@@ -228,9 +228,7 @@ class SQLMetadataRepository:
             )
             return project
 
-    async def create_recovery_run(
-        self, workflow_id: str, request: RollbackRequest
-    ) -> Project:
+    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
         return await asyncio.to_thread(self._create_recovery_run, workflow_id, request)
 
     def _create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
@@ -388,6 +386,145 @@ class SQLMetadataRepository:
             session.flush()
             return serialize_row(row)
 
+    async def persist_worker_heartbeat(self, identity: str, hostname: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._persist_worker_heartbeat, identity, hostname)
+
+    def _persist_worker_heartbeat(self, identity: str, hostname: str) -> dict[str, Any]:
+        allowed = {
+            "codex-runner": "codex",
+            "claude-runner": "claude",
+            "browser-runner": "browser",
+            "scan-runner": "scan",
+            "delivery-runner": "delivery",
+            "release-runner": "release",
+        }
+        worker_kind = allowed.get(identity)
+        if worker_kind is None:
+            raise ValueError("worker heartbeat identity is not allowlisted")
+        if not hostname or len(hostname) > 253:
+            raise ValueError("worker heartbeat hostname is invalid")
+        heartbeat_id = UUID(bytes=hashlib.sha256(f"worker:{identity}".encode()).digest()[:16])
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            row = session.get(WorkerHeartbeat, heartbeat_id)
+            if row is None:
+                row = WorkerHeartbeat(
+                    id=heartbeat_id,
+                    identity=identity,
+                    hostname=hostname,
+                    worker_kind=worker_kind,
+                    observed_at=now,
+                )
+                session.add(row)
+            else:
+                row.hostname = hostname
+                row.worker_kind = worker_kind
+                row.observed_at = now
+            session.flush()
+            return serialize_row(row)
+
+    async def metrics_snapshot(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._metrics_snapshot)
+
+    def _metrics_snapshot(self) -> dict[str, Any]:
+        active_run_statuses = {"QUEUED", "RUNNING", "AWAITING_APPROVAL", "RATE_LIMITED"}
+        active_change_states = {
+            "PLANNED",
+            "IMPLEMENTING",
+            "SOURCE_PR",
+            "CI_VALIDATED",
+            "CANDIDATE_BUILT",
+            "PREVIEW_DEPLOYED",
+            "PREVIEW_VERIFIED",
+            "SOURCE_MERGED",
+            "FINAL_ARTIFACT_BUILT",
+            "DEPLOY_PR",
+            "AWAITING_STAGING_APPROVAL",
+            "STAGING_APPROVED",
+            "STAGING_DEPLOYED",
+        }
+        with self.sessions() as session:
+            active_campaigns = session.execute(
+                select(Campaign.project, func.count())
+                .where(Campaign.status.in_({"QUEUED", "RUNNING", "IN_PROGRESS", "PAUSED"}))
+                .group_by(Campaign.project)
+            ).all()
+            queued_findings = session.execute(
+                select(Finding.project, Finding.disposition, func.count())
+                .where(Finding.disposition.in_({"CANDIDATE", "CONFIRMED", "BLOCKED"}))
+                .group_by(Finding.project, Finding.disposition)
+            ).all()
+            active_implementations = session.execute(
+                select(ChangeSet.project, ChangeSet.state, func.count())
+                .where(ChangeSet.state.in_(active_change_states))
+                .group_by(ChangeSet.project, ChangeSet.state)
+            ).all()
+            runs = session.execute(
+                select(Run.project, Run.status, func.count()).group_by(Run.project, Run.status)
+            ).all()
+            active_runs = session.execute(
+                select(Run.project, func.count())
+                .where(Run.status.in_(active_run_statuses))
+                .group_by(Run.project)
+            ).all()
+            rate_limits = session.execute(
+                select(AgentInvocation.provider, func.count())
+                .where(
+                    or_(
+                        AgentInvocation.status == "RATE_LIMITED",
+                        AgentInvocation.error_code == "RATE_LIMITED",
+                    )
+                )
+                .group_by(AgentInvocation.provider)
+            ).all()
+            heartbeats = session.scalars(select(WorkerHeartbeat)).all()
+            deployments = session.scalars(select(Deployment)).all()
+            verification_failures = session.execute(
+                select(
+                    ChangeSet.project,
+                    VerificationResult.verification_type,
+                    func.count(),
+                )
+                .join(ChangeSet, ChangeSet.id == VerificationResult.change_set_id)
+                .where(VerificationResult.status.not_in({"PASS", "SUCCESS", "VERIFIED"}))
+                .group_by(ChangeSet.project, VerificationResult.verification_type)
+            ).all()
+            evidence = session.execute(
+                select(
+                    Artifact.project, Artifact.retention_class, func.sum(Artifact.size_bytes)
+                ).group_by(Artifact.project, Artifact.retention_class)
+            ).all()
+        deployment_durations: dict[tuple[str, str], list[float]] = {}
+        deployment_failures: dict[tuple[str, str], int] = {}
+        for deployment in deployments:
+            key = (deployment.project, deployment.environment)
+            if deployment.started_at is not None and deployment.finished_at is not None:
+                duration = (deployment.finished_at - deployment.started_at).total_seconds()
+                deployment_durations.setdefault(key, []).append(max(0.0, duration))
+            if deployment.status in {"DEPLOYMENT_FAILED", "VERIFICATION_FAILED", "RECOVERY_FAILED"}:
+                deployment_failures[key] = deployment_failures.get(key, 0) + 1
+        return {
+            "active_campaigns": [list(row) for row in active_campaigns],
+            "queued_findings": [list(row) for row in queued_findings],
+            "active_implementations": [list(row) for row in active_implementations],
+            "runs": [list(row) for row in runs],
+            "active_runs": [list(row) for row in active_runs],
+            "provider_rate_limits": [list(row) for row in rate_limits],
+            "worker_heartbeats": [serialize_row(row) for row in heartbeats],
+            "deployment_durations": [
+                [project, environment, sum(values) / len(values)]
+                for (project, environment), values in sorted(deployment_durations.items())
+            ],
+            "deployment_failures": [
+                [project, environment, count]
+                for (project, environment), count in sorted(deployment_failures.items())
+            ],
+            "verification_failures": [list(row) for row in verification_failures],
+            "evidence_storage": [
+                [project, retention, int(size or 0)] for project, retention, size in evidence
+            ],
+        }
+
     async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._get_deployment, deployment_id)
 
@@ -461,7 +598,7 @@ class SQLMetadataRepository:
                 candidate.payload_json if isinstance(candidate.payload_json, dict) else {}
             )
             approval_type = str(candidate_payload.get("approval_type", "staging"))
-            if approval_type not in {"staging", "recovery"}:
+            if approval_type not in {"preview", "staging", "recovery"}:
                 raise ValueError("approval candidate type is not allowlisted")
             session.add(
                 Approval(
@@ -488,9 +625,7 @@ class EmptyMetadataRepository:
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         return None
 
-    async def create_deployment_run(
-        self, workflow_id: str, request: DeploymentPrepare
-    ) -> Project:
+    async def create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
         raise ValueError("deployment metadata store is unavailable")
 
     async def create_runtime_verification_run(
@@ -498,9 +633,7 @@ class EmptyMetadataRepository:
     ) -> Project:
         raise ValueError("runtime verification metadata store is unavailable")
 
-    async def create_recovery_run(
-        self, workflow_id: str, request: RollbackRequest
-    ) -> Project:
+    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
         raise ValueError("recovery metadata store is unavailable")
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
@@ -541,3 +674,9 @@ class EmptyMetadataRepository:
 
     async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]:
         raise ValueError("evidence metadata store is unavailable")
+
+    async def persist_worker_heartbeat(self, identity: str, hostname: str) -> dict[str, Any]:
+        raise ValueError("worker heartbeat metadata store is unavailable")
+
+    async def metrics_snapshot(self) -> dict[str, Any]:
+        return {}

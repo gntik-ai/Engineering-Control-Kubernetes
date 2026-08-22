@@ -13,6 +13,7 @@ from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
 
 from .browser import BrowserActivityHandler
+from .delivery import DeliveryActivityHandler
 from .metadata import MetadataActivityHandler
 from .provider import ProviderActivityHandler
 from .release import ReleaseActivityHandler
@@ -55,10 +56,16 @@ class ControlActivities:
         "delivery.invoke_checker",
         "delivery.validate_changeset",
         "delivery.persist_handoff",
+        "delivery.prepare_publication",
+        "delivery.publish",
+        "delivery.persist_publication",
         "preview.preflight",
         "preview.prepare",
+        "preview.record_candidate",
+        "preview.validate_approval",
         "preview.deploy",
         "preview.verify",
+        "preview.finalize",
         "staging.prepare",
         "staging.preflight",
         "staging.record_candidate",
@@ -113,10 +120,12 @@ class ControlActivities:
             "delivery.invoke_maker",
             "delivery.invoke_deployment_maker",
             "delivery.invoke_checker",
+            "delivery.publish",
             "quota.refresh",
             "runtime.browser_checks",
             "staging.preflight",
             "preview.deploy",
+            "preview.verify",
             "staging.deploy",
             "recovery.execute",
         },
@@ -152,10 +161,12 @@ class ControlActivities:
             "runtime.independent_review",
         },
         "browser": {"runtime.browser_checks"},
+        "delivery": {"delivery.publish"},
         "release": {
             "preview.preflight",
             "staging.preflight",
             "preview.deploy",
+            "preview.verify",
             "staging.deploy",
             "recovery.execute",
         },
@@ -181,6 +192,9 @@ class ControlActivities:
         )
         self.browser_handler = (
             BrowserActivityHandler(settings) if self.worker_kind == "browser" else None
+        )
+        self.delivery_handler = (
+            DeliveryActivityHandler(settings) if self.worker_kind == "delivery" else None
         )
         self.scan_handler = ScanActivityHandler(settings) if self.worker_kind == "scan" else None
 
@@ -220,6 +234,8 @@ class ControlActivities:
             return await self.metadata_handler.handle(step, safe_payload)
         if self.browser_handler is not None:
             return await self.browser_handler.handle(step, safe_payload)
+        if self.delivery_handler is not None:
+            return await self.delivery_handler.handle(step, safe_payload)
         if self.scan_handler is not None:
             return await self.scan_handler.handle(step, safe_payload)
         raise ApplicationError(

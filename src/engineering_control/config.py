@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     browser_task_queue: str = "engineering-browser"
     scan_task_queue: str = "engineering-scan"
     release_task_queue: str = "engineering-release"
+    delivery_task_queue: str = "engineering-delivery"
     database_url: SecretStr = SecretStr(
         "postgresql+psycopg://engineering_control@127.0.0.1/engineering_control"
     )
@@ -33,15 +34,12 @@ class Settings(BaseSettings):
     evidence_ingest_host: str = "10.10.0.2"
     evidence_ingest_port: int = Field(default=8750, ge=1024, le=65535)
     evidence_ingest_url: str | None = None
-    evidence_ingest_token_file: Path = Path(
-        "/etc/engineering-control/env/evidence-ingest.token"
-    )
-    evidence_ingest_token_directory: Path = Path(
-        "/etc/engineering-control/env/evidence-uploaders"
-    )
+    evidence_ingest_token_file: Path = Path("/etc/engineering-control/env/evidence-ingest.token")
+    evidence_ingest_token_directory: Path = Path("/etc/engineering-control/env/evidence-uploaders")
     evidence_max_bytes: int = Field(default=33_554_432, ge=1024, le=134_217_728)
     mirror_root: Path = Path("/srv/engineering/mirrors")
     worktree_root: Path = Path("/srv/engineering/worktrees")
+    worktree_metadata_root: Path = Path("/srv/engineering/cache/scan/worktree-git")
     run_root: Path = Path("/srv/engineering/runs")
     state_root: Path = Path("/var/lib/engineering-control")
     deployment_target_root: Path = Path("/etc/engineering-control/targets")
@@ -62,6 +60,9 @@ class Settings(BaseSettings):
     browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
     github_executable: Path = Path("/usr/bin/gh")
     github_token_file: Path | None = None
+    git_executable: Path = Path("/usr/bin/git")
+    delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
+    git_askpass_executable: Path = Path("/opt/engineering-control/source/scripts/git-askpass.sh")
     gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")
     trivy_executable: Path = Path("/usr/local/bin/trivy")
     semgrep_executable: Path = Path("/usr/local/bin/semgrep")
@@ -78,6 +79,7 @@ class Settings(BaseSettings):
     cleanup_execution_enabled: bool = False
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
     cleanup_expiry_grace_hours: int = Field(default=24, ge=1, le=720)
+    worker_heartbeat_seconds: int = Field(default=30, ge=10, le=300)
 
     @field_validator("api_host")
     @classmethod
@@ -105,6 +107,7 @@ class Settings(BaseSettings):
             "claude-runner",
             "browser-runner",
             "scan-runner",
+            "delivery-runner",
             "release-runner",
         )
         return {

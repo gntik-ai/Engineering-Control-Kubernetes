@@ -16,14 +16,18 @@ Check worker:
 
 ```bash
 ssh worker 'systemctl status engineering-worker@codex engineering-worker@claude \
-  engineering-worker@browser engineering-worker@scan engineering-release-worker'
+  engineering-worker@browser engineering-worker@scan engineering-worker@delivery \
+  engineering-release-worker'
 ssh worker 'journalctl -u engineering-worker@codex -n 100 --no-pager'
 ```
 
 All logs are structured and redacted. Run context fields are campaign ID, ChangeSet ID, run ID,
-project, role, provider, and worker. Metrics are available only on the private API listener under
-`/internal/metrics` and cover campaign/run counts, provider limits, workers, deployments,
-verification, and evidence storage as implementation handlers publish them.
+project, role, provider, and worker. Metrics are available only on the authenticated loopback API
+listener at `/internal/metrics`. They are derived from PostgreSQL and include active campaigns,
+queued and active runs, successful/failed runs, provider rate-limit events, per-identity heartbeat
+health, deployment duration/failures, verification failures, and indexed evidence bytes. Every
+role worker publishes a signed identity-bound heartbeat through the upload-only ingest listener;
+a claimed identity that differs from the token owner is rejected.
 
 Back up PostgreSQL and `/etc/engineering-control` before upgrades. Do not back up provider OAuth or
 SSH private keys into general platform archives. Temporal and PostgreSQL must be healthy before

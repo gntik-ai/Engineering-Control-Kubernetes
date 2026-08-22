@@ -26,6 +26,7 @@ def test_metadata_contains_required_tables() -> None:
         "deployments",
         "verification_results",
         "incidents",
+        "worker_heartbeats",
     }
     assert required.issubset(Base.metadata.tables)
     engine = create_engine("sqlite+pysqlite:///:memory:")

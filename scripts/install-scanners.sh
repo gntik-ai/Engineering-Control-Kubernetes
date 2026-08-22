@@ -96,6 +96,10 @@ install_release_file \
   https://github.com/argoproj/argo-cd/releases/download/v3.5.1/argocd-linux-amd64 \
   https://github.com/argoproj/argo-cd/releases/download/v3.5.1/cli_checksums.txt \
   argocd-linux-amd64 argocd
+install_release_binary \
+  https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz \
+  https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_checksums.txt \
+  gh_2.98.0_linux_amd64.tar.gz gh gh_2.98.0_linux_amd64/bin/gh
 
 python3 -m venv /opt/engineering-scanners/semgrep
 /opt/engineering-scanners/semgrep/bin/pip install --disable-pip-version-check semgrep==1.174.0

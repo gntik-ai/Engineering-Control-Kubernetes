@@ -311,6 +311,14 @@ class NotificationOutbox(UUIDPrimaryKey, Timestamps, Base):
     last_error_code: Mapped[str | None] = mapped_column(String(120))
 
 
+class WorkerHeartbeat(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "worker_heartbeats"
+    identity: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    hostname: Mapped[str] = mapped_column(String(253))
+    worker_kind: Mapped[str] = mapped_column(String(32), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 Index("ix_runs_active", Run.status, Run.project)
 Index("ix_change_sets_project_state", ChangeSet.project, ChangeSet.state)
 Index("ix_findings_project_disposition", Finding.project, Finding.disposition)

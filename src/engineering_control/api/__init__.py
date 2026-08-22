@@ -9,4 +9,5 @@ def create_app(**kwargs: Any) -> FastAPI:
 
     return create_control_app(**kwargs)
 
+
 __all__ = ["create_app"]

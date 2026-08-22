@@ -76,11 +76,14 @@ class KubernetesObserver:
             "rolebindings.rbac.authorization.k8s.io",
         }
         forbidden = {
-            *(verb_resource for verb_resource in (
-                ("get", "secrets"),
-                ("list", "secrets"),
-                ("watch", "secrets"),
-            )),
+            *(
+                verb_resource
+                for verb_resource in (
+                    ("get", "secrets"),
+                    ("list", "secrets"),
+                    ("watch", "secrets"),
+                )
+            ),
             *(
                 (verb, resource)
                 for verb in ("create", "update", "patch", "delete", "deletecollection")

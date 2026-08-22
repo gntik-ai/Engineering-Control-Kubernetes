@@ -124,6 +124,7 @@ class ScanActivityHandler:
             mirror_root=settings.mirror_root,
             worktree_root=settings.worktree_root,
             lease_root=settings.lease_root / "worktrees",
+            metadata_root=settings.worktree_metadata_root,
         )
         self.scanner = scanner or DeterministicScanner(
             SafeCommandRunner(
@@ -341,12 +342,7 @@ class ScanActivityHandler:
             "deployment_snapshot": deployment_snapshot,
             "failures": failures,
         }
-        evidence_root = (
-            self.settings.evidence_root
-            / "scan"
-            / str(plan.change_set_id)
-            / "runtime"
-        )
+        evidence_root = self.settings.evidence_root / "scan" / str(plan.change_set_id) / "runtime"
         evidence_root.mkdir(parents=True, exist_ok=True, mode=0o750)
         report = evidence_root / f"{plan.deployment_id}-observation.json"
         safe = SecretRedactor().redact(observation).value
@@ -701,9 +697,7 @@ class ScanActivityHandler:
                 )
             changes[name] = {
                 **summary,
-                "diff_path": (
-                    None if secret.get("status") == "FINDINGS" else str(diff_path)
-                ),
+                "diff_path": (None if secret.get("status") == "FINDINGS" else str(diff_path)),
                 "diff_withheld": secret.get("status") == "FINDINGS",
                 "diff_redacted_sha256": hashlib.sha256(safe_diff.encode()).hexdigest(),
                 "secret_status": secret.get("status"),
@@ -711,6 +705,19 @@ class ScanActivityHandler:
                 "high_or_critical_vulnerabilities": severe,
                 "artifacts": artifacts,
             }
+        if not blocked:
+            for repository_key, worktree_key in (
+                ("source_repository", "source_worktree"),
+                ("deployment_repository", "deployment_worktree"),
+            ):
+                self.manager.grant_delivery_read(
+                    str(payload[repository_key]),
+                    Path(str(payload[worktree_key])),
+                )
+            self.manager.grant_release_read(
+                str(payload["deployment_repository"]),
+                Path(str(payload["deployment_worktree"])),
+            )
         return {
             **payload,
             "status": "BLOCKED" if blocked else "LOCAL_VALIDATION_PASS",

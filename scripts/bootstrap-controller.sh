@@ -102,7 +102,7 @@ chmod 0640 "${CONFIG_ROOT}/env/api.token"
 
 install -d -o root -g engineering-control -m 0750 \
   "${CONFIG_ROOT}/env/evidence-uploaders"
-for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
+for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
   token_path="${CONFIG_ROOT}/env/evidence-uploaders/${identity}.token"
   if [[ ! -f "${token_path}" ]]; then
     openssl rand -hex 48 >"${token_path}"

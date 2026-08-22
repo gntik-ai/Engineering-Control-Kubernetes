@@ -16,6 +16,19 @@ directories, and per-worktree ACLs. Model processes inherit neither paid API key
 provider routing variables. Release workers cannot read provider homes; model workers cannot read
 release environment files. Telegram offers fixed API commands only.
 
+Canonical mirrors are scan-owned and read-only to model identities. A maker's commit objects,
+branch refs and linked-worktree metadata live in a per-ChangeSet shadow bare repository under the
+scan cache. ACLs grant write only to that ChangeSet's maker and read only to its checker; canonical
+objects are exposed only through a read-only alternate. No model receives write access to shared
+repository refs.
+
+GitHub write publication uses a separate `delivery-runner` identity and token. It receives read
+access only to an exact validated ChangeSet repository pair, may push only the bound branch head,
+and may create or reuse draft PRs. The adapter forbids force-push and merge operations, validates
+the clean branch/head immediately before push, and supplies credentials through a protected
+askpass helper rather than command arguments. `delivery-runner` cannot read model or release
+credentials. The controller's issue-search token remains a separate read-only credential.
+
 Kubernetes definitions under `config/kubernetes` create no binding by themselves. Observer access
 can get/list/watch selected resources and logs but has no Secret or mutation permission. Preview
 and Falcone staging roles must be bound per approved namespace. Musematic normally promotes by Git,
@@ -53,3 +66,10 @@ GitHub duplicate search uses a controller-only fine-grained token file at
 `0640`, with read-only issue metadata permission for the in-scope repositories. Until that file
 exists and works, independent finding verification terminates `BLOCKED`; it does not confirm or
 file an issue. Never reuse or copy the interactive `hermes` GitHub credential file.
+
+Draft PR publication requires a second fine-grained token at
+`/etc/engineering-control/env/delivery/github.token` on the worker, owned by
+`root:delivery-runner` and mode `0640`. Scope it only to contents/PR write access for the four
+configured repositories, with
+no administration, Actions-secret, environment, or merge-bypass permission. Do not reuse the
+controller token or an interactive user credential.

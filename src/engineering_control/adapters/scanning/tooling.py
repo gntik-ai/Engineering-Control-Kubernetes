@@ -188,9 +188,7 @@ class DeterministicScanner:
             if not isinstance(raw_result, dict):
                 continue
             result: dict[str, Any] = {
-                key: raw_result[key]
-                for key in ("Target", "Class", "Type")
-                if key in raw_result
+                key: raw_result[key] for key in ("Target", "Class", "Type") if key in raw_result
             }
             selections = {
                 "Vulnerabilities": (
