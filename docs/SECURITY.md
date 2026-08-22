@@ -23,3 +23,9 @@ Active security blockers:
 
 Do not print findings. Record only type, file/location, history presence, and remediation. Security
 evidence and incidents are excluded from automatic cleanup.
+
+GitHub duplicate search uses a controller-only fine-grained token file at
+`/etc/engineering-control/env/github.token`. Provision it as `root:engineering-control` mode
+`0640`, with read-only issue metadata permission for the in-scope repositories. Until that file
+exists and works, independent finding verification terminates `BLOCKED`; it does not confirm or
+file an issue. Never reuse or copy the interactive `hermes` GitHub credential file.

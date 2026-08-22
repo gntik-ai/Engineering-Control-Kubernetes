@@ -36,6 +36,7 @@ class ProviderActivityHandler:
 
     _request_keys = {
         "audit.agent_cell": "agent_request",
+        "finding.reproduce": "verifier_request",
         "delivery.invoke_maker": "maker_request",
         "delivery.invoke_checker": "checker_request",
     }

@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")
     browser_credential_root: Path = Path("/etc/engineering-control/env/browser")
     browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
+    github_executable: Path = Path("/usr/bin/gh")
+    github_token_file: Path | None = None
     acceptance_root: Path = Path("/srv/engineering/tmp/acceptance")
     lease_root: Path = Path("/var/lib/engineering-control/leases")
     log_level: str = "INFO"

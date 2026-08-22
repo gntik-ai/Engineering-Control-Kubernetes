@@ -203,3 +203,62 @@ async def test_failed_audit_cell_creates_candidate_not_confirmed_finding(tmp_pat
     assert finding is not None and finding.disposition == "CANDIDATE"
     assert result["finding_id"] == str(finding.id)
     assert final["status"] == "VERIFICATION_REQUIRED"
+
+    loaded = await handler.handle(
+        "finding.load_candidate",
+        {"finding_id": str(finding.id), "project": "falcone"},
+    )
+    snapshot = {
+        **loaded,
+        "source_sha": "a" * 40,
+        "deployment_sha": "b" * 40,
+        "source_worktree": str(tmp_path / "fresh-source"),
+        "deployment_worktree": str(tmp_path / "fresh-deployment"),
+        "snapshot_evidence_sha256": "e" * 64,
+    }
+    prepared = await handler.handle(
+        "finding.prepare_verifier",
+        {"finding": loaded, "snapshot": snapshot, "ordinal": 1},
+    )
+    assert prepared["provider"] == "codex"
+    attempt = {
+        "agent_result": {
+            "provider": "codex",
+            "structured_result": {
+                "summary": "independently reproduced",
+                "reproduced": True,
+                "positive_control": True,
+                "negative_control": True,
+                "environment_valid": True,
+                "evidence": [
+                    {
+                        "kind": "fresh-snapshot",
+                        "reference": "verification",
+                        "sha256": "e" * 64,
+                    }
+                ],
+                "open_questions": [],
+            },
+        }
+    }
+    controls = await handler.handle(
+        "finding.controls",
+        {"finding": loaded, "snapshot": snapshot, "attempts": [attempt, attempt]},
+    )
+    duplicate = await handler.handle(
+        "finding.dedupe",
+        {"finding": loaded, "attempts": [attempt, attempt], "controls": controls},
+    )
+    verified = await handler.handle(
+        "finding.finalize",
+        {
+            "finding": loaded,
+            "attempts": [attempt, attempt],
+            "controls": controls,
+            "duplicate": duplicate,
+        },
+    )
+
+    assert controls["disposition"] == "CONFIRMED"
+    assert duplicate["blocker"] == "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED"
+    assert verified["disposition"] == "BLOCKED"

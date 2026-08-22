@@ -198,6 +198,7 @@ class GitWorktreeManager:
         campaign_id: UUID,
         base_ref: str,
         expected_base_sha: str,
+        require_base_ref_match: bool = True,
     ) -> AuditSnapshotAllocation:
         if not re.fullmatch(r"[a-f0-9]{40}", expected_base_sha):
             raise ValueError("expected base must be a full 40-character SHA")
@@ -209,8 +210,11 @@ class GitWorktreeManager:
         )
         with lease:
             self.fetch(repository)
-            fetched_ref = self._fetched_ref(base_ref)
-            actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
+            if require_base_ref_match:
+                fetched_ref = self._fetched_ref(base_ref)
+                actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
+            else:
+                actual = self._run(["git", "rev-parse", f"{expected_base_sha}^{{commit}}"], mirror)
             if actual != expected_base_sha:
                 raise WorktreeError(
                     f"audit base SHA mismatch for {repository}: expected {expected_base_sha}, "

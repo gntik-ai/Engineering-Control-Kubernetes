@@ -38,7 +38,12 @@ class ScanActivityHandler:
     """Bounded mirror and worktree operations owned only by scan-runner."""
 
     supported_steps = frozenset(
-        {"project.snapshot", "audit.deterministic_cell", "delivery.allocate_worktrees"}
+        {
+            "project.snapshot",
+            "audit.deterministic_cell",
+            "finding.fresh_snapshot",
+            "delivery.allocate_worktrees",
+        }
     )
     _repositories = {
         Project.FALCONE: ("falcone", "falcone-charts"),
@@ -59,6 +64,8 @@ class ScanActivityHandler:
                 return self._snapshot(payload)
             if step == "audit.deterministic_cell":
                 return self._deterministic_cell(payload)
+            if step == "finding.fresh_snapshot":
+                return self._fresh_finding_snapshot(payload)
             if step == "delivery.allocate_worktrees":
                 return self._allocate(payload)
         except (ValueError, ValidationError, WorktreeError) as error:
@@ -94,6 +101,43 @@ class ScanActivityHandler:
             "status": "DETERMINISTIC_PASS",
             "evidence": evidence,
             "evidence_sha256": hashlib.sha256(canonical).hexdigest(),
+        }
+
+    def _fresh_finding_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        finding_id = UUID(str(payload["finding_id"]))
+        project = Project(str(payload["project"]))
+        source_sha = self._sha(payload.get("affected_source_sha"), "affected_source_sha")
+        deployment_sha = self._sha(
+            payload.get("affected_deployment_sha"), "affected_deployment_sha"
+        )
+        source_repository, deployment_repository = self._repositories[project]
+        source = self.manager.allocate_audit_snapshot(
+            repository=source_repository,
+            campaign_id=finding_id,
+            base_ref="refs/heads/main",
+            expected_base_sha=source_sha,
+            require_base_ref_match=False,
+        )
+        deployment = self.manager.allocate_audit_snapshot(
+            repository=deployment_repository,
+            campaign_id=finding_id,
+            base_ref="refs/heads/main",
+            expected_base_sha=deployment_sha,
+            require_base_ref_match=False,
+        )
+        evidence = {
+            "finding_id": str(finding_id),
+            "source_sha": source.base_sha,
+            "deployment_sha": deployment.base_sha,
+            "source_worktree": str(source.path),
+            "deployment_worktree": str(deployment.path),
+        }
+        canonical = json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode()
+        return {
+            **payload,
+            **evidence,
+            "status": "FRESH_SNAPSHOT",
+            "snapshot_evidence_sha256": hashlib.sha256(canonical).hexdigest(),
         }
 
     def _snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:

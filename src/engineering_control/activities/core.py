@@ -31,6 +31,8 @@ class ControlActivities:
         "campaign.persist_cell_result",
         "campaign.finalize",
         "finding.fresh_snapshot",
+        "finding.load_candidate",
+        "finding.prepare_verifier",
         "finding.reproduce",
         "finding.controls",
         "finding.dedupe",
@@ -80,8 +82,6 @@ class ControlActivities:
         - {
             "project.snapshot",
             "finding.fresh_snapshot",
-            "finding.reproduce",
-            "finding.controls",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "audit.deterministic_cell",
@@ -98,8 +98,6 @@ class ControlActivities:
         "scan": {
             "project.snapshot",
             "finding.fresh_snapshot",
-            "finding.reproduce",
-            "finding.controls",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "audit.deterministic_cell",
@@ -107,12 +105,14 @@ class ControlActivities:
         },
         "codex": {
             "audit.agent_cell",
+            "finding.reproduce",
             "delivery.invoke_maker",
             "delivery.invoke_checker",
             "quota.refresh",
         },
         "claude": {
             "audit.agent_cell",
+            "finding.reproduce",
             "delivery.invoke_maker",
             "delivery.invoke_checker",
             "quota.refresh",

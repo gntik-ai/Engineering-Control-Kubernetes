@@ -99,14 +99,14 @@ class ControlledWorkflow:
         if step in {
             "project.snapshot",
             "finding.fresh_snapshot",
-            "finding.reproduce",
-            "finding.controls",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "audit.deterministic_cell",
             "preview.preflight",
         }:
             return "engineering-scan"
+        if step == "finding.reproduce":
+            return f"engineering-{cls._nested_value(payload, 'provider', 'claude')}"
         if step == "audit.agent_cell":
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step == "delivery.invoke_maker":
@@ -232,29 +232,34 @@ class AuditCampaignWorkflow(ControlledWorkflow):
 class FindingVerificationWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: FindingVerificationInput) -> dict[str, Any]:
-        fresh = await self._step("finding.fresh_snapshot", asdict(request))
+        candidate = await self._step("finding.load_candidate", asdict(request))
+        fresh = await self._step("finding.fresh_snapshot", candidate)
         attempts: list[dict[str, Any]] = []
         for ordinal in (1, 2):
             if not await self._checkpoint(f"REPRODUCTION_{ordinal}"):
                 return {"status": "CANCELLED"}
-            attempts.append(
-                await self._step(
-                    "finding.reproduce",
-                    {"finding_id": request.finding_id, "snapshot": fresh, "ordinal": ordinal},
-                    timeout_minutes=60,
-                )
+            prepared = await self._step(
+                "finding.prepare_verifier",
+                {"finding": candidate, "snapshot": fresh, "ordinal": ordinal},
             )
+            if prepared.get("status") in {"RATE_LIMITED", "BLOCKED"}:
+                return {"status": prepared["status"], "context": prepared}
+            reproduced = await self._step("finding.reproduce", prepared, timeout_minutes=60)
+            if reproduced.get("status") != "SUCCESS":
+                return {"status": reproduced.get("status", "FAILED"), "context": reproduced}
+            attempts.append(reproduced)
         controls = await self._step(
             "finding.controls",
-            {"finding_id": request.finding_id, "snapshot": fresh, "attempts": attempts},
+            {"finding": candidate, "snapshot": fresh, "attempts": attempts},
         )
         duplicate = await self._step(
-            "finding.dedupe", {"finding_id": request.finding_id, "attempts": attempts}
+            "finding.dedupe",
+            {"finding": candidate, "attempts": attempts, "controls": controls},
         )
         return await self._step(
             "finding.finalize",
             {
-                "finding_id": request.finding_id,
+                "finding": candidate,
                 "attempts": attempts,
                 "controls": controls,
                 "duplicate": duplicate,

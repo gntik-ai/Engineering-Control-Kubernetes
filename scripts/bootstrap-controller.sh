@@ -123,6 +123,7 @@ if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
     printf 'ENGINEERING_DATABASE_URL=postgresql+psycopg://engineering_control:%s@127.0.0.1:55432/engineering_control\n' \
       "${ENGINEERING_DB_PASSWORD}"
     printf 'ENGINEERING_EVIDENCE_ROOT=%s/evidence\n' "${PLATFORM_ROOT}"
+    printf 'ENGINEERING_GITHUB_TOKEN_FILE=%s/env/github.token\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
   } >"${CONFIG_ROOT}/env/control.env"
   chown root:engineering-control "${CONFIG_ROOT}/env/control.env"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import stat
 from datetime import UTC, datetime
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -13,8 +14,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.config import Settings
-from engineering_control.db.models import Campaign, CoverageCell, Finding, QuotaSnapshot
+from engineering_control.db.models import (
+    Campaign,
+    CoverageCell,
+    Finding,
+    FindingVerification,
+    QuotaSnapshot,
+)
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import AuditLens, ModelClass, Project, Provider, RiskClass
 from engineering_control.quota.broker import QuotaBroker
@@ -66,11 +74,17 @@ class MetadataActivityHandler:
             "campaign.persist_coverage",
             "campaign.persist_cell_result",
             "campaign.finalize",
+            "finding.load_candidate",
+            "finding.prepare_verifier",
+            "finding.controls",
+            "finding.dedupe",
+            "finding.finalize",
             "quota.persist",
         }
     )
 
     def __init__(self, settings: Settings) -> None:
+        self.settings = settings
         database_url = settings.database_url.get_secret_value()
         self.engine = create_engine(
             database_url,
@@ -91,6 +105,16 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._persist_cell_result, payload)
             if step == "campaign.finalize":
                 return await asyncio.to_thread(self._finalize_campaign, payload)
+            if step == "finding.load_candidate":
+                return await asyncio.to_thread(self._load_candidate, payload)
+            if step == "finding.prepare_verifier":
+                return await asyncio.to_thread(self._prepare_verifier, payload)
+            if step == "finding.controls":
+                return await asyncio.to_thread(self._evaluate_controls, payload)
+            if step == "finding.dedupe":
+                return await asyncio.to_thread(self._dedupe_finding, payload)
+            if step == "finding.finalize":
+                return await asyncio.to_thread(self._finalize_finding, payload)
             if step == "quota.persist":
                 return await self._quota(payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
@@ -340,6 +364,265 @@ class MetadataActivityHandler:
             status = campaign.status
         return {**payload, "status": status, "completed_cells": len(cells)}
 
+    def _load_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        finding_id = UUID(str(payload["finding_id"]))
+        with self.sessions() as session:
+            finding = session.get(Finding, finding_id)
+            if finding is None or finding.disposition != "CANDIDATE":
+                raise ValueError("verification requires a CANDIDATE finding")
+            coverage = session.get(CoverageCell, finding.coverage_cell_id)
+            if coverage is None:
+                raise ValueError("finding coverage metadata is missing")
+            discoverer = coverage.result_json.get("provider")
+            if discoverer not in {Provider.CODEX.value, Provider.CLAUDE.value}:
+                raise ValueError("finding discoverer provider is missing")
+            return {
+                **payload,
+                "status": "CANDIDATE_LOADED",
+                "finding_id": str(finding.id),
+                "campaign_id": str(finding.campaign_id),
+                "coverage_cell_id": str(finding.coverage_cell_id),
+                "fingerprint": finding.fingerprint,
+                "project": finding.project,
+                "domain": finding.domain,
+                "persona": finding.persona,
+                "severity": finding.severity,
+                "confidence": finding.confidence,
+                "risk_class": finding.risk_class,
+                "expected_behavior": finding.expected_behavior,
+                "actual_behavior": finding.actual_behavior,
+                "minimal_reproduction": finding.minimal_reproduction,
+                "affected_source_sha": finding.affected_source_sha,
+                "affected_deployment_sha": finding.affected_deployment_sha,
+                "affected_component": finding.affected_component,
+                "discoverer_provider": discoverer,
+            }
+
+    def _prepare_verifier(self, payload: dict[str, Any]) -> dict[str, Any]:
+        finding = self._object(payload.get("finding"), "finding")
+        snapshot = self._object(payload.get("snapshot"), "snapshot")
+        ordinal = int(payload["ordinal"])
+        if ordinal not in {1, 2}:
+            raise ValueError("verification ordinal must be one or two")
+        maker = Provider(str(finding["discoverer_provider"]))
+        risk = RiskClass(str(finding["risk_class"]))
+        routing = self._quota_broker().route(
+            role="finding-verifier",
+            model_class=ModelClass.JUDGE,
+            risk_class=risk,
+            maker=maker,
+        )
+        if routing.primary is None:
+            return {**payload, "status": routing.status, "routing_reason": routing.reason}
+        run_id = uuid5(
+            NAMESPACE_URL,
+            f"finding-verifier:{finding['finding_id']}:{snapshot['source_sha']}:{ordinal}",
+        )
+        prompt = (
+            "Independently verify one candidate finding from a fresh immutable snapshot. "
+            "Do not modify files. Reproduce only the supplied minimal steps, establish a "
+            "positive and a negative control, and reject environment failures. Do not file an "
+            "issue.\n\n"
+            f"Finding fingerprint: {finding['fingerprint']}\n"
+            f"Expected: {finding['expected_behavior']}\n"
+            f"Actual: {finding['actual_behavior']}\n"
+            f"Minimal reproduction: {json.dumps(finding['minimal_reproduction'])}\n"
+            f"Affected component: {finding['affected_component']}\n"
+            f"Source SHA: {snapshot['source_sha']}\n"
+            f"Deployment SHA: {snapshot['deployment_sha']}\n"
+            f"Deployment worktree: {snapshot['deployment_worktree']}\n"
+            f"Fresh snapshot evidence SHA256: {snapshot['snapshot_evidence_sha256']}\n"
+            f"Independent reproduction ordinal: {ordinal}\n"
+        )
+        request = AgentRequest(
+            run_id=run_id,
+            project=Project(str(finding["project"])),
+            role="finding-verifier",
+            provider=routing.primary,
+            model_class=ModelClass.JUDGE,
+            prompt=prompt,
+            working_directory=str(snapshot["source_worktree"]),
+            output_schema=self._verification_output_schema(),
+            timeout_seconds=3600,
+            effort="high",
+            writable=False,
+            campaign_id=UUID(str(finding["campaign_id"])),
+        )
+        return {
+            **payload,
+            "provider": routing.primary.value,
+            "routing_reason": routing.reason,
+            "verifier_request": request.model_dump(mode="json"),
+            "status": "READY",
+        }
+
+    def _evaluate_controls(self, payload: dict[str, Any]) -> dict[str, Any]:
+        attempts = payload.get("attempts")
+        snapshot = self._object(payload.get("snapshot"), "snapshot")
+        if not isinstance(attempts, list) or len(attempts) != 2:
+            raise ValueError("finding verification requires exactly two attempts")
+        results: list[dict[str, Any]] = []
+        anchor = str(snapshot["snapshot_evidence_sha256"])
+        for attempt in attempts:
+            outer = self._object(attempt, "attempt")
+            agent = self._object(outer.get("agent_result"), "agent_result")
+            structured = self._object(agent.get("structured_result"), "structured_result")
+            evidence = structured.get("evidence")
+            if not isinstance(evidence, list) or not any(
+                isinstance(item, dict) and item.get("sha256") == anchor for item in evidence
+            ):
+                raise ValueError("verification attempt is not bound to fresh snapshot evidence")
+            results.append(structured)
+        environment_valid = all(bool(item.get("environment_valid")) for item in results)
+        reproduced = [bool(item.get("reproduced")) for item in results]
+        positive = all(bool(item.get("positive_control")) for item in results)
+        negative = all(bool(item.get("negative_control")) for item in results)
+        if not environment_valid:
+            disposition = "BLOCKED"
+        elif reproduced == [True, True] and positive and negative:
+            disposition = "CONFIRMED"
+        elif reproduced == [False, False]:
+            disposition = "REJECTED"
+        else:
+            disposition = "FLAKY"
+        return {
+            **payload,
+            "status": disposition,
+            "disposition": disposition,
+            "reproduction_count": sum(reproduced),
+            "positive_control": positive,
+            "negative_control": negative,
+            "environment_valid": environment_valid,
+        }
+
+    def _dedupe_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
+        controls = self._object(payload.get("controls"), "controls")
+        finding = self._object(payload.get("finding"), "finding")
+        if controls.get("disposition") != "CONFIRMED":
+            return {**payload, "status": "SKIPPED", "duplicate_issue_url": None}
+        token_path = self.settings.github_token_file
+        if token_path is None or not token_path.is_file():
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED",
+                "duplicate_issue_url": None,
+            }
+        metadata = token_path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
+            raise ValueError("GitHub token file permissions are too broad")
+        token = token_path.read_text(encoding="utf-8").strip()
+        if len(token) < 20:
+            raise ValueError("GitHub token file is not provisioned")
+        repository = {
+            Project.FALCONE.value: "gntik-ai/falcone",
+            Project.MUSEMATIC.value: "gntik-ai/musematic",
+        }[str(finding["project"])]
+        runner = SafeCommandRunner({"gh": self.settings.github_executable})
+        try:
+            result = runner.run(
+                "gh",
+                [
+                    "issue",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--state",
+                    "all",
+                    "--search",
+                    f'"{finding["fingerprint"]}"',
+                    "--json",
+                    "number,title,url,state",
+                    "--limit",
+                    "100",
+                ],
+                cwd=self.settings.run_root,
+                environment={"GH_TOKEN": token},
+            )
+        except CommandFailure:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_DUPLICATE_SEARCH_FAILED",
+                "duplicate_issue_url": None,
+            }
+        matches = json.loads(result.stdout)
+        if not isinstance(matches, list):
+            raise ValueError("GitHub duplicate search returned invalid data")
+        duplicate = matches[0].get("url") if matches and isinstance(matches[0], dict) else None
+        return {
+            **payload,
+            "status": "DUPLICATE" if duplicate else "CLEAR",
+            "duplicate_issue_url": duplicate,
+        }
+
+    def _finalize_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
+        finding_payload = self._object(payload.get("finding"), "finding")
+        controls = self._object(payload.get("controls"), "controls")
+        duplicate = self._object(payload.get("duplicate"), "duplicate")
+        attempts = payload.get("attempts")
+        if not isinstance(attempts, list) or len(attempts) != 2:
+            raise ValueError("finding finalization requires two attempts")
+        disposition = str(controls["disposition"])
+        if duplicate.get("status") == "BLOCKED":
+            disposition = "BLOCKED"
+        elif duplicate.get("status") == "DUPLICATE":
+            disposition = "DUPLICATE"
+        finding_id = UUID(str(finding_payload["finding_id"]))
+        evidence: list[Any] = []
+        verifier_provider: str | None = None
+        for attempt in attempts:
+            agent = self._object(self._object(attempt, "attempt").get("agent_result"), "agent")
+            verifier_provider = verifier_provider or str(agent.get("provider"))
+            structured = self._object(agent.get("structured_result"), "structured_result")
+            attempt_evidence = structured.get("evidence")
+            if isinstance(attempt_evidence, list):
+                evidence.extend(attempt_evidence)
+        with self.sessions.begin() as session:
+            finding = session.get(Finding, finding_id)
+            if finding is None or finding.disposition != "CANDIDATE":
+                raise ValueError("finding is no longer a candidate")
+            finding.disposition = disposition
+            finding.evidence_json = [*finding.evidence_json, *evidence]
+            coverage = session.get(CoverageCell, finding.coverage_cell_id)
+            if coverage is None:
+                raise ValueError("finding coverage metadata is missing")
+            coverage.status = {
+                "CONFIRMED": "CONFIRMED_FINDING",
+                "REJECTED": "NO_FINDING",
+                "DUPLICATE": "NO_FINDING",
+                "FLAKY": "RETEST_REQUIRED",
+                "BLOCKED": "BLOCKED",
+            }[disposition]
+            if disposition == "BLOCKED":
+                coverage.blocker = str(duplicate.get("blocker") or "FINDING_VERIFICATION_BLOCKED")
+            verification_id = uuid5(
+                NAMESPACE_URL,
+                f"finding-verification:{finding_id}:{verifier_provider}:{disposition}",
+            )
+            if session.get(FindingVerification, verification_id) is None:
+                session.add(
+                    FindingVerification(
+                        id=verification_id,
+                        finding_id=finding_id,
+                        run_id=None,
+                        verifier_provider=verifier_provider or "unknown",
+                        disposition=disposition,
+                        reproduction_count=int(controls.get("reproduction_count", 0)),
+                        positive_control=bool(controls.get("positive_control")),
+                        negative_control=bool(controls.get("negative_control")),
+                        duplicate_issue_url=duplicate.get("duplicate_issue_url"),
+                        summary=f"independent verification result: {disposition}",
+                    )
+                )
+        return {
+            **payload,
+            "status": disposition,
+            "disposition": disposition,
+            "finding_id": str(finding_id),
+            "duplicate_issue_url": duplicate.get("duplicate_issue_url"),
+        }
+
     def _persist_quota(self, snapshots: list[QuotaSnapshotRecord]) -> None:
         for snapshot in snapshots:
             try:
@@ -501,4 +784,47 @@ class MetadataActivityHandler:
                     "then": {"properties": {"finding": finding}},
                 }
             ],
+        }
+
+    @staticmethod
+    def _verification_output_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "summary",
+                "reproduced",
+                "positive_control",
+                "negative_control",
+                "environment_valid",
+                "evidence",
+                "open_questions",
+            ],
+            "properties": {
+                "summary": {"type": "string", "minLength": 1, "maxLength": 20000},
+                "reproduced": {"type": "boolean"},
+                "positive_control": {"type": "boolean"},
+                "negative_control": {"type": "boolean"},
+                "environment_valid": {"type": "boolean"},
+                "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 500,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["kind", "reference", "sha256"],
+                        "properties": {
+                            "kind": {"type": "string", "minLength": 1, "maxLength": 100},
+                            "reference": {"type": "string", "minLength": 1, "maxLength": 2000},
+                            "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                        },
+                    },
+                },
+                "open_questions": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 4000},
+                },
+            },
         }
