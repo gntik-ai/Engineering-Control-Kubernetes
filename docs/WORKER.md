@@ -19,7 +19,7 @@ sudo ./scripts/bootstrap-worker.sh
 ./scripts/verify-worker.sh
 ```
 
-The bootstrap installs Codex 0.149.0, Claude Code 2.1.239, Playwright 1.62.1, Gitleaks 8.30.1,
+The bootstrap installs Codex 0.149.0, Claude Code 2.1.239, Playwright 1.62.1, Gitleaks 8.30.0,
 Trivy 0.74.0, Semgrep 1.174.0, kubeconform 0.8.0, and Syft 1.51.0. Release archives are checked
 against upstream checksum manifests.
 

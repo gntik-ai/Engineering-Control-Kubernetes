@@ -16,13 +16,15 @@ class DeterministicScanner:
         self.redactor = SecretRedactor()
 
     def secret_scan(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
+        existing = evidence_directory / "gitleaks.json"
+        if existing.is_file():
+            payload = self._sanitize_json(existing)
+            return {"status": "FINDINGS" if payload else "PASS", "findings": payload}
         report = self._report_path(evidence_directory, "gitleaks.json")
         result = self.runner.run(
             "gitleaks",
             [
-                "detect",
-                "--source",
-                str(worktree),
+                "dir",
                 "--redact=100",
                 "--report-format",
                 "json",
@@ -31,6 +33,7 @@ class DeterministicScanner:
                 "--no-banner",
                 "--exit-code",
                 "2",
+                str(worktree),
             ],
             cwd=worktree,
             check=False,
@@ -41,6 +44,9 @@ class DeterministicScanner:
         return {"status": "FINDINGS" if payload else "PASS", "findings": payload}
 
     def vulnerability_scan(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
+        existing = evidence_directory / "trivy.json"
+        if existing.is_file():
+            return self._sanitize_object(existing)
         report = self._report_path(evidence_directory, "trivy.json")
         result = self.runner.run(
             "trivy",
@@ -65,6 +71,9 @@ class DeterministicScanner:
         return self._sanitize_object(report)
 
     def semgrep(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
+        existing = evidence_directory / "semgrep.json"
+        if existing.is_file():
+            return self._sanitize_object(existing)
         report = self._report_path(evidence_directory, "semgrep.json")
         result = self.runner.run(
             "semgrep",
@@ -88,6 +97,9 @@ class DeterministicScanner:
         return self._sanitize_object(report)
 
     def sbom(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
+        existing = evidence_directory / "sbom.cyclonedx.json"
+        if existing.is_file():
+            return self._sanitize_object(existing)
         report = self._report_path(evidence_directory, "sbom.cyclonedx.json")
         result = self.runner.run(
             "syft",

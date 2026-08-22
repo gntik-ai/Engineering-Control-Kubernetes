@@ -6,7 +6,7 @@ if [[ ${EUID} -ne 0 ]]; then
   echo "Run with sudo: sudo $0" >&2
   exit 1
 fi
-for command_name in curl sha256sum tar python3; do
+for command_name in curl sha256sum tar python3 openssl; do
   command -v "${command_name}" >/dev/null || {
     echo "Required command missing: ${command_name}" >&2
     exit 1
@@ -41,9 +41,9 @@ install_release_binary() {
 }
 
 install_release_binary \
-  https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-  https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt \
-  gitleaks_8.30.1_linux_x64.tar.gz gitleaks
+  https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz \
+  https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_checksums.txt \
+  gitleaks_8.30.0_linux_x64.tar.gz gitleaks
 install_release_binary \
   https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz \
   https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_checksums.txt \
@@ -60,3 +60,18 @@ install_release_binary \
 python3 -m venv /opt/engineering-scanners/semgrep
 /opt/engineering-scanners/semgrep/bin/pip install --disable-pip-version-check semgrep==1.174.0
 ln -sfn /opt/engineering-scanners/semgrep/bin/semgrep /usr/local/bin/semgrep
+
+# A scanner that exits successfully while missing a canonical synthetic canary is unsafe.
+CANARY_ROOT=$(mktemp -d)
+trap 'rm -rf -- "${TEMP_ROOT}" "${CANARY_ROOT}"' EXIT
+canary_suffix=$(openssl rand -hex 18)
+printf 'token = "ghp_%s"\n' "${canary_suffix}" >"${CANARY_ROOT}/canary.txt"
+set +e
+/usr/local/bin/gitleaks dir --no-banner --redact=100 --exit-code 23 \
+  "${CANARY_ROOT}" >/dev/null 2>&1
+canary_status=$?
+set -e
+if [[ ${canary_status} -ne 23 ]]; then
+  echo "Gitleaks canary detection failed; refusing scanner installation" >&2
+  exit 1
+fi

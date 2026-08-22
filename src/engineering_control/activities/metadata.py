@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import stat
-from datetime import UTC, datetime
+import tempfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -18,11 +21,16 @@ from engineering_control.adapters.command import CommandFailure, SafeCommandRunn
 from engineering_control.config import Settings
 from engineering_control.db.models import (
     Campaign,
+    ChangeSet,
     CoverageCell,
     Finding,
     FindingVerification,
+    Issue,
     QuotaSnapshot,
+    Run,
+    WorktreeLease,
 )
+from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import AuditLens, ModelClass, Project, Provider, RiskClass
 from engineering_control.quota.broker import QuotaBroker
@@ -79,6 +87,17 @@ class MetadataActivityHandler:
             "finding.controls",
             "finding.dedupe",
             "finding.finalize",
+            "delivery.load_confirmed_finding",
+            "delivery.ensure_issue",
+            "delivery.acquire_leases",
+            "delivery.route_providers",
+            "delivery.persist_worktree_leases",
+            "delivery.prepare_spec",
+            "delivery.create_openspec",
+            "delivery.prepare_maker",
+            "delivery.prepare_deployment_maker",
+            "delivery.prepare_checker",
+            "delivery.persist_handoff",
             "quota.persist",
         }
     )
@@ -115,6 +134,35 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._dedupe_finding, payload)
             if step == "finding.finalize":
                 return await asyncio.to_thread(self._finalize_finding, payload)
+            if step == "delivery.load_confirmed_finding":
+                return await asyncio.to_thread(self._load_confirmed_finding, payload)
+            if step == "delivery.ensure_issue":
+                return await asyncio.to_thread(self._ensure_issue, payload)
+            if step == "delivery.acquire_leases":
+                try:
+                    return await asyncio.to_thread(self._acquire_delivery_leases, payload)
+                except ComponentLeaseConflict:
+                    return {
+                        **payload,
+                        "status": "BLOCKED",
+                        "blocker": "COMPONENT_LEASE_CONFLICT",
+                    }
+            if step == "delivery.route_providers":
+                return await asyncio.to_thread(self._route_delivery, payload)
+            if step == "delivery.persist_worktree_leases":
+                return await asyncio.to_thread(self._persist_worktree_leases, payload)
+            if step == "delivery.prepare_spec":
+                return self._prepare_spec(payload)
+            if step == "delivery.create_openspec":
+                return self._create_openspec(payload)
+            if step == "delivery.prepare_maker":
+                return self._prepare_maker(payload, deployment=False)
+            if step == "delivery.prepare_deployment_maker":
+                return self._prepare_maker(payload, deployment=True)
+            if step == "delivery.prepare_checker":
+                return self._prepare_checker(payload)
+            if step == "delivery.persist_handoff":
+                return await asyncio.to_thread(self._persist_delivery_handoff, payload)
             if step == "quota.persist":
                 return await self._quota(payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
@@ -500,20 +548,14 @@ class MetadataActivityHandler:
         finding = self._object(payload.get("finding"), "finding")
         if controls.get("disposition") != "CONFIRMED":
             return {**payload, "status": "SKIPPED", "duplicate_issue_url": None}
-        token_path = self.settings.github_token_file
-        if token_path is None or not token_path.is_file():
+        token = self._github_token()
+        if token is None:
             return {
                 **payload,
                 "status": "BLOCKED",
                 "blocker": "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED",
                 "duplicate_issue_url": None,
             }
-        metadata = token_path.stat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
-            raise ValueError("GitHub token file permissions are too broad")
-        token = token_path.read_text(encoding="utf-8").strip()
-        if len(token) < 20:
-            raise ValueError("GitHub token file is not provisioned")
         repository = {
             Project.FALCONE.value: "gntik-ai/falcone",
             Project.MUSEMATIC.value: "gntik-ai/musematic",
@@ -621,6 +663,530 @@ class MetadataActivityHandler:
             "disposition": disposition,
             "finding_id": str(finding_id),
             "duplicate_issue_url": duplicate.get("duplicate_issue_url"),
+        }
+
+    def _load_confirmed_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
+        finding_id = UUID(str(payload["finding_id"]))
+        requested_risk = RiskClass(str(payload["risk_class"]))
+        orchestration = self._object(payload.get("orchestration"), "orchestration")
+        workflow_id = str(orchestration.get("workflow_id", ""))
+        if not workflow_id:
+            raise ValueError("delivery workflow identity is missing")
+        with self.sessions.begin() as session:
+            finding = session.get(Finding, finding_id)
+            if finding is None or finding.disposition != "CONFIRMED":
+                raise ValueError("delivery requires a CONFIRMED finding")
+            if requested_risk.value != finding.risk_class:
+                raise ValueError("delivery risk class must match authoritative finding risk")
+            if not finding.affected_deployment_sha:
+                raise ValueError("delivery requires an immutable deployment repository SHA")
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None:
+                raise ValueError("delivery run metadata is missing")
+            project = Project(finding.project)
+            source_repository, deployment_repository = {
+                Project.FALCONE: ("falcone", "falcone-charts"),
+                Project.MUSEMATIC: ("musematic", "musematic-deploy"),
+            }[project]
+            change_set_id = uuid5(NAMESPACE_URL, f"changeset:{finding.id}")
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                change_set = ChangeSet(
+                    id=change_set_id,
+                    finding_id=finding.id,
+                    issue_id=None,
+                    project=project.value,
+                    risk_class=finding.risk_class,
+                    state="CONFIRMED",
+                    version=1,
+                    source_repository=source_repository,
+                    source_branch=None,
+                    source_base_sha=finding.affected_source_sha,
+                    source_head_sha=None,
+                    source_pr_url=None,
+                    deployment_repository=deployment_repository,
+                    deployment_branch=None,
+                    deployment_base_sha=finding.affected_deployment_sha,
+                    deployment_head_sha=None,
+                    deployment_pr_url=None,
+                    image_digests={},
+                    chart_version=None,
+                    recovery_json={},
+                )
+                session.add(change_set)
+            run.change_set_id = change_set_id
+            run.status = "RUNNING"
+            run.project = project.value
+            issue = session.scalar(select(Issue).where(Issue.finding_id == finding.id))
+            return {
+                **payload,
+                "status": "CONFIRMED_LOADED",
+                "run_id": str(run.id),
+                "change_set_id": str(change_set_id),
+                "project": project.value,
+                "risk_class": finding.risk_class,
+                "finding_id": str(finding.id),
+                "fingerprint": finding.fingerprint,
+                "domain": finding.domain,
+                "persona": finding.persona,
+                "expected_behavior": finding.expected_behavior,
+                "actual_behavior": finding.actual_behavior,
+                "minimal_reproduction": finding.minimal_reproduction,
+                "affected_component": finding.affected_component,
+                "source_repository": source_repository,
+                "source_base_sha": finding.affected_source_sha,
+                "source_base_ref": "refs/heads/main",
+                "deployment_repository": deployment_repository,
+                "deployment_base_sha": finding.affected_deployment_sha,
+                "deployment_base_ref": "refs/heads/main",
+                "issue_number": issue.number if issue else None,
+                "issue_url": issue.url if issue else None,
+            }
+
+    def _ensure_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("dry_run") is not False:
+            return {
+                **payload,
+                "status": "DRY_RUN",
+                "dry_run_summary": (
+                    "confirmed finding and ChangeSet loaded; GitHub issue creation, leases, "
+                    "worktrees, and writable provider execution were not started"
+                ),
+            }
+        if payload.get("issue_number") and payload.get("issue_url"):
+            return {**payload, "status": "ISSUE_READY"}
+        if payload.get("risk_class") == RiskClass.R3.value:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "R3_GITHUB_ISSUE_REQUIRES_HUMAN_APPROVAL",
+            }
+        token = self._github_token()
+        if token is None:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_CREATE_NOT_CONFIGURED",
+            }
+        project = Project(str(payload["project"]))
+        repository = {
+            Project.FALCONE: "gntik-ai/falcone",
+            Project.MUSEMATIC: "gntik-ai/musematic",
+        }[project]
+        change_set_id = UUID(str(payload["change_set_id"]))
+        body_directory = self.settings.state_root / "github"
+        body_directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        body_path = body_directory / f"{change_set_id}-issue.md"
+        body = (
+            "## Confirmed finding\n\n"
+            f"Fingerprint: `{payload['fingerprint']}`\n\n"
+            f"Expected: {payload['expected_behavior']}\n\n"
+            f"Actual: {payload['actual_behavior']}\n\n"
+            "Minimal reproduction:\n"
+            + "\n".join(f"1. {step}" for step in payload["minimal_reproduction"])
+            + "\n\nThis issue was independently verified twice by the Engineering Control Plane.\n"
+        )
+        self._atomic_text(body_path, body)
+        title = (
+            f"[{payload['domain']}] confirmed behavior mismatch "
+            f"({str(payload['fingerprint'])[:12]})"
+        )
+        runner = SafeCommandRunner({"gh": self.settings.github_executable})
+        try:
+            search = runner.run(
+                "gh",
+                [
+                    "issue",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--state",
+                    "all",
+                    "--search",
+                    f'"{payload["fingerprint"]}"',
+                    "--json",
+                    "number,title,url,state",
+                    "--limit",
+                    "100",
+                ],
+                cwd=self.settings.state_root,
+                environment={"GH_TOKEN": token},
+            )
+            matches = json.loads(search.stdout)
+            if not isinstance(matches, list):
+                raise ValueError("GitHub issue idempotency search returned invalid data")
+            if matches and isinstance(matches[0], dict):
+                issue_url = str(matches[0].get("url", ""))
+            else:
+                created = runner.run(
+                    "gh",
+                    [
+                        "issue",
+                        "create",
+                        "--repo",
+                        repository,
+                        "--title",
+                        title,
+                        "--body-file",
+                        str(body_path),
+                    ],
+                    cwd=self.settings.state_root,
+                    environment={"GH_TOKEN": token},
+                )
+                issue_url = created.stdout.strip()
+        except CommandFailure:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_CREATE_FAILED",
+            }
+        issue_number_text = issue_url.rstrip("/").rsplit("/", 1)[-1]
+        if not issue_url.startswith("https://github.com/") or not issue_number_text.isdigit():
+            raise ValueError("GitHub issue creation returned an invalid URL")
+        issue_number = int(issue_number_text)
+        with self.sessions.begin() as session:
+            finding_id = UUID(str(payload["finding_id"]))
+            issue = session.scalar(select(Issue).where(Issue.finding_id == finding_id))
+            if issue is None:
+                issue = Issue(
+                    finding_id=finding_id,
+                    repository=repository,
+                    number=issue_number,
+                    url=issue_url,
+                    state="OPEN",
+                    openspec_change=None,
+                )
+                session.add(issue)
+                session.flush()
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                raise ValueError("ChangeSet disappeared during issue creation")
+            change_set.issue_id = issue.id
+        return {
+            **payload,
+            "status": "ISSUE_READY",
+            "issue_number": issue_number,
+            "issue_url": issue_url,
+        }
+
+    def _acquire_delivery_leases(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project = Project(str(payload["project"]))
+        component = self._component_key(project, str(payload["affected_component"]))
+        run_id = UUID(str(payload["run_id"]))
+        manager = ComponentLeaseManager()
+        with self.sessions.begin() as session:
+            lease = manager.acquire(
+                session,
+                component_key=component,
+                owner_run_id=run_id,
+                mode="implementation",
+                ttl=timedelta(hours=4),
+            )
+        return {
+            **payload,
+            "status": "LEASES_ACQUIRED",
+            "component_key": component,
+            "component_lease_id": str(lease.id),
+        }
+
+    def _route_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        risk = RiskClass(str(payload["risk_class"]))
+        broker = self._quota_broker()
+        maker = broker.route(role="implementer", model_class=ModelClass.WORKER, risk_class=risk)
+        spec = broker.route(
+            role="product-spec-architect",
+            model_class=ModelClass.JUDGE,
+            risk_class=risk,
+        )
+        if maker.primary is None or maker.checker is None or spec.primary is None:
+            return {
+                **payload,
+                "status": "RATE_LIMITED" if maker.status == "RATE_LIMITED" else "BLOCKED",
+                "routing_reason": f"maker={maker.reason};spec={spec.reason}",
+            }
+        issue = str(payload.get("issue_number") or f"finding-{str(payload['fingerprint'])[:12]}")
+        allocation = {
+            "change_set_id": payload["change_set_id"],
+            "project": payload["project"],
+            "issue": issue,
+            "source_repository": payload["source_repository"],
+            "source_base_sha": payload["source_base_sha"],
+            "source_base_ref": payload["source_base_ref"],
+            "deployment_repository": payload["deployment_repository"],
+            "deployment_base_sha": payload["deployment_base_sha"],
+            "deployment_base_ref": payload["deployment_base_ref"],
+            "maker_provider": maker.primary.value,
+            "checker_provider": maker.checker.value,
+        }
+        return {
+            **payload,
+            "status": "ROUTED",
+            "spec_provider": spec.primary.value,
+            "maker_provider": maker.primary.value,
+            "checker_provider": maker.checker.value,
+            "routing_reason": f"maker={maker.reason};spec={spec.reason}",
+            "allocation_request": allocation,
+        }
+
+    def _persist_worktree_leases(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        owner_run_id = UUID(str(payload["run_id"]))
+        expected_root = PurePosixPath(self.settings.worktree_root.as_posix())
+        records = (
+            (
+                str(payload["source_repository"]),
+                str(payload["source_worktree"]),
+                str(payload["source_branch"]),
+                str(payload["source_base_sha"]),
+            ),
+            (
+                str(payload["deployment_repository"]),
+                str(payload["deployment_worktree"]),
+                str(payload["deployment_branch"]),
+                str(payload["deployment_base_sha"]),
+            ),
+        )
+        expires_at = datetime.now(UTC) + timedelta(hours=8)
+        lease_ids: list[str] = []
+        with self.sessions.begin() as session:
+            for repository, worktree_path, branch, base_sha in records:
+                expected_path = expected_root / repository / str(change_set_id)
+                if PurePosixPath(worktree_path) != expected_path:
+                    raise ValueError("worktree lease path does not match its ChangeSet allocation")
+                existing = session.scalar(
+                    select(WorktreeLease).where(
+                        WorktreeLease.change_set_id == change_set_id,
+                        WorktreeLease.repository == repository,
+                        WorktreeLease.released_at.is_(None),
+                    )
+                )
+                if existing is not None:
+                    if (
+                        existing.owner_run_id != owner_run_id
+                        or existing.worktree_path != worktree_path
+                        or existing.branch != branch
+                        or existing.base_sha != base_sha
+                    ):
+                        raise ValueError("active worktree lease conflicts with this delivery run")
+                    lease_ids.append(str(existing.id))
+                    continue
+                identity = uuid5(NAMESPACE_URL, f"worktree-lease:{change_set_id}:{repository}")
+                lease = WorktreeLease(
+                    id=identity,
+                    change_set_id=change_set_id,
+                    repository=repository,
+                    worktree_path=worktree_path,
+                    branch=branch,
+                    owner_run_id=owner_run_id,
+                    base_sha=base_sha,
+                    expires_at=expires_at,
+                    released_at=None,
+                )
+                session.add(lease)
+                lease_ids.append(str(identity))
+        return {**payload, "status": "WORKTREE_LEASES_PERSISTED", "worktree_lease_ids": lease_ids}
+
+    def _prepare_spec(self, payload: dict[str, Any]) -> dict[str, Any]:
+        provider = Provider(str(payload["spec_provider"]))
+        change_set_id = UUID(str(payload["change_set_id"]))
+        prompt = (
+            "Produce a bounded provider-neutral OpenSpec for exactly one confirmed GitHub issue. "
+            "Do not modify files and do not propose deployment execution. The source and "
+            "deployment repositories belong to one ChangeSet.\n\n"
+            f"Issue: {payload['issue_url']}\nFingerprint: {payload['fingerprint']}\n"
+            f"Expected: {payload['expected_behavior']}\nActual: {payload['actual_behavior']}\n"
+            f"Minimal reproduction: {json.dumps(payload['minimal_reproduction'])}\n"
+            f"Risk class: {payload['risk_class']}\n"
+            f"Source SHA: {payload['source_base_sha']}\n"
+            f"Deployment SHA: {payload['deployment_base_sha']}\n"
+            f"Deployment worktree: {payload['deployment_worktree']}\n"
+        )
+        request = AgentRequest(
+            run_id=uuid5(NAMESPACE_URL, f"delivery-spec:{change_set_id}"),
+            project=Project(str(payload["project"])),
+            role="product-spec-architect",
+            provider=provider,
+            model_class=ModelClass.JUDGE,
+            prompt=prompt,
+            working_directory=str(payload["source_worktree"]),
+            output_schema=self._spec_output_schema(),
+            timeout_seconds=3600,
+            effort="high",
+            writable=False,
+            change_set_id=change_set_id,
+        )
+        return {
+            **payload,
+            "status": "SPEC_READY",
+            "spec_request": request.model_dump(mode="json"),
+        }
+
+    def _create_openspec(self, payload: dict[str, Any]) -> dict[str, Any]:
+        result = self._object(payload.get("agent_result"), "agent_result")
+        structured = self._object(result.get("structured_result"), "structured_result")
+        if structured.get("decision") == "BLOCKED":
+            return {**payload, "status": "BLOCKED", "blocker": "SPEC_ARCHITECT_BLOCKED"}
+        if structured.get("decision") != "READY":
+            raise ValueError("spec architect returned an unknown decision")
+        change_set_id = UUID(str(payload["change_set_id"]))
+        identifier = f"engineering/{change_set_id}"
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None or change_set.issue_id is None:
+                raise ValueError("OpenSpec requires a ChangeSet with a GitHub issue")
+            issue = session.get(Issue, change_set.issue_id)
+            if issue is None:
+                raise ValueError("OpenSpec issue metadata is missing")
+            issue.openspec_change = identifier
+            change_set.state = "PLANNED"
+            change_set.version += 1
+        return {
+            **payload,
+            "status": "OPENSPEC_READY",
+            "spec_agent_result": result,
+            "openspec_identifier": identifier,
+            "openspec_document": structured,
+        }
+
+    def _prepare_maker(self, payload: dict[str, Any], *, deployment: bool) -> dict[str, Any]:
+        provider = Provider(str(payload["maker_provider"]))
+        change_set_id = UUID(str(payload["change_set_id"]))
+        target = "deployment" if deployment else "source"
+        worktree_key = "deployment_worktree" if deployment else "source_worktree"
+        request_key = "deployment_maker_request" if deployment else "maker_request"
+        prior = payload.get("agent_result") if deployment else None
+        if deployment:
+            prior_result = self._object(prior, "source maker result")
+            prior_structured = self._object(
+                prior_result.get("structured_result"), "source maker structured result"
+            )
+            if prior_structured.get("decision") != "COMPLETE":
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "SOURCE_MAKER_DID_NOT_COMPLETE",
+                }
+        prompt = (
+            f"Implement only the {target} repository portion of one bounded ChangeSet. "
+            "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
+            "repository tests, then create one local commit on the assigned branch. Preserve all "
+            "existing safety gates.\n\n"
+            f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
+            f"OpenSpec: {json.dumps(payload['openspec_document'], sort_keys=True)}\n"
+            f"Source worktree: {payload['source_worktree']}\n"
+            f"Deployment worktree: {payload['deployment_worktree']}\n"
+            f"Prior source maker result: {json.dumps(prior, sort_keys=True, default=str)}\n"
+        )
+        request = AgentRequest(
+            run_id=uuid5(NAMESPACE_URL, f"delivery-{target}-maker:{change_set_id}"),
+            project=Project(str(payload["project"])),
+            role="implementer",
+            provider=provider,
+            model_class=ModelClass.WORKER,
+            prompt=prompt,
+            working_directory=str(payload[worktree_key]),
+            output_schema=self._maker_output_schema(),
+            timeout_seconds=7200,
+            effort="high",
+            writable=True,
+            change_set_id=change_set_id,
+        )
+        response = {
+            **payload,
+            "status": f"{target.upper()}_MAKER_READY",
+            request_key: request.model_dump(mode="json"),
+        }
+        if deployment:
+            response["source_maker_result"] = prior
+        return response
+
+    def _prepare_checker(self, payload: dict[str, Any]) -> dict[str, Any]:
+        provider = Provider(str(payload["checker_provider"]))
+        change_set_id = UUID(str(payload["change_set_id"]))
+        source_result = self._object(payload.get("agent_result"), "agent_result")
+        source_maker = self._object(payload.get("source_maker_result"), "source_maker_result")
+        for label, result in (
+            ("source", source_maker),
+            ("deployment", source_result),
+        ):
+            structured = self._object(result.get("structured_result"), f"{label}_maker_result")
+            if structured.get("decision") != "COMPLETE":
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": f"{label.upper()}_MAKER_DID_NOT_COMPLETE",
+                }
+        prompt = (
+            "Independently review both bounded worktrees for one ChangeSet. Do not modify files. "
+            "Validate the OpenSpec, source and deployment diffs, tests, immutable image policy, "
+            "and risk gates. Request changes on any uncertainty.\n\n"
+            f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
+            f"OpenSpec: {json.dumps(payload['openspec_document'], sort_keys=True)}\n"
+            f"Source worktree: {payload['source_worktree']}\n"
+            f"Deployment worktree: {payload['deployment_worktree']}\n"
+            f"Latest maker result: {json.dumps(source_result, sort_keys=True, default=str)}\n"
+        )
+        request = AgentRequest(
+            run_id=uuid5(NAMESPACE_URL, f"delivery-checker:{change_set_id}"),
+            project=Project(str(payload["project"])),
+            role="code-reviewer",
+            provider=provider,
+            model_class=ModelClass.JUDGE,
+            prompt=prompt,
+            working_directory=str(payload["source_worktree"]),
+            output_schema=self._checker_output_schema(),
+            timeout_seconds=5400,
+            effort="high",
+            writable=False,
+            change_set_id=change_set_id,
+        )
+        return {
+            **payload,
+            "status": "CHECKER_READY",
+            "deployment_maker_result": source_result,
+            "checker_request": request.model_dump(mode="json"),
+        }
+
+    def _persist_delivery_handoff(self, payload: dict[str, Any]) -> dict[str, Any]:
+        evidence = self._object(payload.get("change_evidence"), "change_evidence")
+        source = self._object(evidence.get("source"), "source change evidence")
+        deployment = self._object(evidence.get("deployment"), "deployment change evidence")
+        if source.get("head_sha") == payload.get("source_base_sha"):
+            blocker = "SOURCE_CHANGES_NOT_COMMITTED"
+        elif int(deployment.get("changed_file_count", 0)) > 0 and deployment.get(
+            "head_sha"
+        ) == payload.get("deployment_base_sha"):
+            blocker = "DEPLOYMENT_CHANGES_NOT_COMMITTED"
+        else:
+            blocker = "GIT_PUSH_IDENTITY_NOT_CONFIGURED"
+        change_set_id = UUID(str(payload["change_set_id"]))
+        run_id = UUID(str(payload["run_id"]))
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            run = session.get(Run, run_id)
+            if change_set is None or run is None:
+                raise ValueError("delivery handoff metadata is missing")
+            change_set.source_branch = str(payload["source_branch"])
+            change_set.deployment_branch = str(payload["deployment_branch"])
+            change_set.source_head_sha = str(source["head_sha"])
+            change_set.deployment_head_sha = str(deployment["head_sha"])
+            change_set.state = "IMPLEMENTING"
+            change_set.version += 1
+            run.status = "BLOCKED"
+            run.error_code = blocker
+            run.summary = "bounded local changes are preserved pending scoped Git push identity"
+        return {
+            **payload,
+            "status": "BLOCKED",
+            "blocker": blocker,
+            "handoff": {
+                "change_set_id": str(change_set_id),
+                "source_branch": payload["source_branch"],
+                "source_head_sha": source["head_sha"],
+                "deployment_branch": payload["deployment_branch"],
+                "deployment_head_sha": deployment["head_sha"],
+                "change_evidence": evidence,
+            },
         }
 
     def _persist_quota(self, snapshots: list[QuotaSnapshotRecord]) -> None:
@@ -806,6 +1372,171 @@ class MetadataActivityHandler:
                 "positive_control": {"type": "boolean"},
                 "negative_control": {"type": "boolean"},
                 "environment_valid": {"type": "boolean"},
+                "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 500,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["kind", "reference", "sha256"],
+                        "properties": {
+                            "kind": {"type": "string", "minLength": 1, "maxLength": 100},
+                            "reference": {"type": "string", "minLength": 1, "maxLength": 2000},
+                            "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                        },
+                    },
+                },
+                "open_questions": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 4000},
+                },
+            },
+        }
+
+    def _github_token(self) -> str | None:
+        path = self.settings.github_token_file
+        if path is None or not path.is_file():
+            return None
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
+            raise ValueError("GitHub token file permissions are too broad")
+        token = path.read_text(encoding="utf-8").strip()
+        if len(token) < 20:
+            raise ValueError("GitHub token file is not provisioned")
+        return token
+
+    @staticmethod
+    def _atomic_text(path: Path, value: str) -> None:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            handle.write(value.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _component_key(project: Project, value: str) -> str:
+        lowered = value.lower()
+        if project is Project.FALCONE:
+            component = (
+                "gateway"
+                if any(marker in lowered for marker in ("gateway", "apisix"))
+                else "web-console"
+                if any(marker in lowered for marker in ("web", "console", "ui"))
+                else "control-plane"
+            )
+        else:
+            component = (
+                "runtime-controller"
+                if any(marker in lowered for marker in ("runtime", "sandbox"))
+                else "web"
+                if any(marker in lowered for marker in ("web", "ui"))
+                else "control-plane"
+            )
+        return f"{project.value}:{component}"
+
+    @staticmethod
+    def _spec_output_schema() -> dict[str, Any]:
+        string_list = {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {"type": "string", "minLength": 1, "maxLength": 4000},
+        }
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "decision",
+                "title",
+                "problem",
+                "scope",
+                "non_scope",
+                "acceptance_criteria",
+                "implementation_constraints",
+                "test_plan",
+                "risk_notes",
+                "open_questions",
+            ],
+            "properties": {
+                "decision": {"type": "string", "enum": ["READY", "BLOCKED"]},
+                "title": {"type": "string", "minLength": 1, "maxLength": 300},
+                "problem": {"type": "string", "minLength": 1, "maxLength": 20000},
+                "scope": string_list,
+                "non_scope": string_list,
+                "acceptance_criteria": string_list,
+                "implementation_constraints": string_list,
+                "test_plan": string_list,
+                "risk_notes": string_list,
+                "open_questions": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 4000},
+                },
+            },
+        }
+
+    @staticmethod
+    def _maker_output_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "decision",
+                "summary",
+                "changed_files",
+                "tests",
+                "open_questions",
+            ],
+            "properties": {
+                "decision": {"type": "string", "enum": ["COMPLETE", "BLOCKED"]},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 20000},
+                "changed_files": {
+                    "type": "array",
+                    "maxItems": 1000,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+                },
+                "tests": {
+                    "type": "array",
+                    "maxItems": 500,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["command", "status"],
+                        "properties": {
+                            "command": {"type": "string", "maxLength": 4000},
+                            "status": {"type": "string", "enum": ["PASS", "FAIL", "SKIPPED"]},
+                        },
+                    },
+                },
+                "open_questions": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 4000},
+                },
+            },
+        }
+
+    @staticmethod
+    def _checker_output_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision", "summary", "findings", "evidence", "open_questions"],
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["PASS", "REQUEST_CHANGES", "BLOCKED"],
+                },
+                "summary": {"type": "string", "minLength": 1, "maxLength": 20000},
+                "findings": {
+                    "type": "array",
+                    "maxItems": 500,
+                    "items": {"type": "string", "maxLength": 4000},
+                },
                 "evidence": {
                     "type": "array",
                     "minItems": 1,

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     mirror_root: Path = Path("/srv/engineering/mirrors")
     worktree_root: Path = Path("/srv/engineering/worktrees")
     run_root: Path = Path("/srv/engineering/runs")
+    state_root: Path = Path("/var/lib/engineering-control")
     temporary_root: Path = Path("/srv/engineering/tmp")
     codex_executable: Path = Path("/usr/local/bin/codex")
     claude_executable: Path = Path("/usr/local/bin/claude")
@@ -47,6 +48,11 @@ class Settings(BaseSettings):
     browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
     github_executable: Path = Path("/usr/bin/gh")
     github_token_file: Path | None = None
+    gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")
+    trivy_executable: Path = Path("/usr/local/bin/trivy")
+    semgrep_executable: Path = Path("/usr/local/bin/semgrep")
+    syft_executable: Path = Path("/usr/local/bin/syft")
+    kubeconform_executable: Path = Path("/usr/local/bin/kubeconform")
     acceptance_root: Path = Path("/srv/engineering/tmp/acceptance")
     lease_root: Path = Path("/var/lib/engineering-control/leases")
     log_level: str = "INFO"

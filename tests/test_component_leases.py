@@ -117,3 +117,25 @@ def test_deployment_environment_and_migration_locks_are_global(session: Session)
             mode="migration-secret",
             ttl=timedelta(hours=1),
         )
+
+
+def test_same_run_can_retry_same_component_lease(session: Session) -> None:
+    manager = ComponentLeaseManager()
+    owner = uuid4()
+    with session.begin():
+        first = manager.acquire(
+            session,
+            component_key="falcone:gateway",
+            owner_run_id=owner,
+            mode="implementation",
+            ttl=timedelta(minutes=10),
+        )
+    with session.begin():
+        second = manager.acquire(
+            session,
+            component_key="falcone:gateway",
+            owner_run_id=owner,
+            mode="implementation",
+            ttl=timedelta(minutes=10),
+        )
+    assert second.id == first.id

@@ -37,7 +37,9 @@ class ProviderActivityHandler:
     _request_keys = {
         "audit.agent_cell": "agent_request",
         "finding.reproduce": "verifier_request",
+        "delivery.invoke_spec": "spec_request",
         "delivery.invoke_maker": "maker_request",
+        "delivery.invoke_deployment_maker": "deployment_maker_request",
         "delivery.invoke_checker": "checker_request",
     }
 
@@ -186,13 +188,19 @@ class ProviderActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
-        if step == "delivery.invoke_maker" and not request.writable:
+        if (
+            step in {"delivery.invoke_maker", "delivery.invoke_deployment_maker"}
+            and not request.writable
+        ):
             raise ApplicationError(
                 "implementation maker must receive its explicitly writable worktree",
                 type="PolicyViolation",
                 non_retryable=True,
             )
-        if step != "delivery.invoke_maker" and request.writable:
+        if (
+            step not in {"delivery.invoke_maker", "delivery.invoke_deployment_maker"}
+            and request.writable
+        ):
             raise ApplicationError(
                 "audit and checker invocations must be read-only",
                 type="PolicyViolation",

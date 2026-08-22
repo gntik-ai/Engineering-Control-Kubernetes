@@ -101,6 +101,7 @@ class ControlledWorkflow:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "delivery.validate_changeset",
             "audit.deterministic_cell",
             "preview.preflight",
         }:
@@ -109,7 +110,11 @@ class ControlledWorkflow:
             return f"engineering-{cls._nested_value(payload, 'provider', 'claude')}"
         if step == "audit.agent_cell":
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+        if step == "delivery.invoke_spec":
+            return f"engineering-{cls._nested_value(payload, 'spec_provider', 'claude')}"
         if step == "delivery.invoke_maker":
+            return f"engineering-{cls._nested_value(payload, 'maker_provider', 'codex')}"
+        if step == "delivery.invoke_deployment_maker":
             return f"engineering-{cls._nested_value(payload, 'maker_provider', 'codex')}"
         if step == "delivery.invoke_checker":
             return f"engineering-{cls._nested_value(payload, 'checker_provider', 'claude')}"
@@ -273,12 +278,20 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
         context = await self._step("delivery.load_confirmed_finding", asdict(request))
         ordered_steps = (
-            "delivery.create_openspec",
+            "delivery.ensure_issue",
             "delivery.acquire_leases",
-            "delivery.allocate_worktrees",
-            "delivery.deterministic_prechecks",
             "delivery.route_providers",
+            "delivery.allocate_worktrees",
+            "delivery.persist_worktree_leases",
+            "delivery.deterministic_prechecks",
+            "delivery.prepare_spec",
+            "delivery.invoke_spec",
+            "delivery.create_openspec",
+            "delivery.prepare_maker",
             "delivery.invoke_maker",
+            "delivery.prepare_deployment_maker",
+            "delivery.invoke_deployment_maker",
+            "delivery.prepare_checker",
             "delivery.invoke_checker",
             "delivery.validate_changeset",
             "delivery.persist_handoff",
@@ -288,15 +301,17 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                 return {"status": "CANCELLED", "context": context}
             context = await self._step(
                 step,
-                {"request": asdict(request), "context": context},
+                {**context, "delivery_request": asdict(request)},
                 timeout_minutes=120 if "invoke" in step else 30,
             )
-            if "invoke" in step and context.get("status") in {
+            if context.get("status") in {
                 "RATE_LIMITED",
                 "BLOCKED",
                 "FAILED",
                 "TIMED_OUT",
                 "CANCELLED",
+                "REQUEST_CHANGES",
+                "DRY_RUN",
             }:
                 return {"status": context["status"], "context": context}
         return {"status": context.get("status", "SOURCE_PR"), "context": context}

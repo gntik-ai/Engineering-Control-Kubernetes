@@ -63,6 +63,8 @@ class ComponentLeaseManager:
             )
         )
         if existing is not None:
+            if existing.owner_run_id == owner_run_id and existing.mode == mode:
+                return existing
             raise ComponentLeaseConflict(f"component already has an active writer: {component_key}")
         if mode == "implementation":
             active = session.scalar(

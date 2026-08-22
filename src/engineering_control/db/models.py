@@ -172,14 +172,18 @@ class AgentInvocation(UUIDPrimaryKey, Timestamps, Base):
 
 class WorktreeLease(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "worktree_leases"
-    change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), unique=True)
+    change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), index=True)
     repository: Mapped[str] = mapped_column(String(200))
     worktree_path: Mapped[str] = mapped_column(Text, unique=True)
-    branch: Mapped[str] = mapped_column(String(240), unique=True)
+    branch: Mapped[str] = mapped_column(String(240))
     owner_run_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("runs.id"))
     base_sha: Mapped[str] = mapped_column(String(40))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("change_set_id", "repository", name="uq_worktree_changeset_repository"),
+        UniqueConstraint("repository", "branch", name="uq_worktree_repository_branch"),
+    )
 
 
 class ComponentLease(UUIDPrimaryKey, Timestamps, Base):

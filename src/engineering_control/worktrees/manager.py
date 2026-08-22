@@ -295,6 +295,59 @@ class GitWorktreeManager:
             "tracked_files_sha256": hashlib.sha256(canonical).hexdigest(),
         }
 
+    def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, object], str]:
+        root = self.worktree_root.resolve()
+        resolved = path.resolve()
+        if resolved == root or not resolved.is_dir() or not resolved.is_relative_to(root):
+            raise WorktreeError("change evidence escaped the bounded worktree root")
+        if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
+            raise ValueError("change evidence base must be a full Git SHA")
+        self._run(["git", "cat-file", "-e", f"{base_sha}^{{commit}}"], resolved)
+        self._run(["git", "diff", "--check", base_sha, "--"], resolved)
+        status = self._run(["git", "status", "--porcelain=v1"], resolved)
+        diff = self._run(["git", "diff", "--binary", base_sha, "--"], resolved)
+        committed_or_tracked = {
+            item
+            for item in self._run(
+                ["git", "diff", "--name-only", base_sha, "--"], resolved
+            ).splitlines()
+            if item
+        }
+        untracked: list[dict[str, object]] = []
+        for line in status.splitlines():
+            if not line.startswith("?? "):
+                continue
+            candidate = (resolved / line[3:]).resolve()
+            candidates = (
+                [candidate]
+                if candidate.is_file()
+                else sorted(item for item in candidate.rglob("*") if item.is_file())
+                if candidate.is_dir()
+                else []
+            )
+            for untracked_file in candidates:
+                if not untracked_file.is_relative_to(resolved):
+                    continue
+                untracked.append(
+                    {
+                        "path": untracked_file.relative_to(resolved).as_posix(),
+                        "sha256": hashlib.sha256(untracked_file.read_bytes()).hexdigest(),
+                        "size_bytes": untracked_file.stat().st_size,
+                    }
+                )
+        summary: dict[str, object] = {
+            "base_sha": base_sha,
+            "head_sha": self._run(["git", "rev-parse", "HEAD"], resolved),
+            "changed_entries": len(status.splitlines()),
+            "changed_file_count": len(
+                committed_or_tracked.union(str(item["path"]) for item in untracked)
+            ),
+            "status_sha256": hashlib.sha256(status.encode()).hexdigest(),
+            "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
+            "untracked": untracked,
+        }
+        return summary, diff
+
     def cleanup(self, allocation: WorktreeAllocation, *, evidence_captured: bool) -> None:
         mirror = self.verify_mirror(allocation.repository)
         if not allocation.path.exists():

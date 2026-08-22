@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -9,8 +11,11 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.adapters.command import SafeCommandRunner
+from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
 from engineering_control.models.enums import Project, Provider
+from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -43,6 +48,7 @@ class ScanActivityHandler:
             "audit.deterministic_cell",
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
+            "delivery.deterministic_prechecks",
         }
     )
     _repositories = {
@@ -50,12 +56,28 @@ class ScanActivityHandler:
         Project.MUSEMATIC: ("musematic", "musematic-deploy"),
     }
 
-    def __init__(self, settings: Settings, manager: GitWorktreeManager | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        manager: GitWorktreeManager | None = None,
+        scanner: DeterministicScanner | None = None,
+    ) -> None:
         self.settings = settings
         self.manager = manager or GitWorktreeManager(
             mirror_root=settings.mirror_root,
             worktree_root=settings.worktree_root,
             lease_root=settings.lease_root / "worktrees",
+        )
+        self.scanner = scanner or DeterministicScanner(
+            SafeCommandRunner(
+                {
+                    "gitleaks": settings.gitleaks_executable,
+                    "trivy": settings.trivy_executable,
+                    "semgrep": settings.semgrep_executable,
+                    "syft": settings.syft_executable,
+                    "kubeconform": settings.kubeconform_executable,
+                }
+            )
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -68,6 +90,10 @@ class ScanActivityHandler:
                 return self._fresh_finding_snapshot(payload)
             if step == "delivery.allocate_worktrees":
                 return self._allocate(payload)
+            if step == "delivery.deterministic_prechecks":
+                return self._delivery_prechecks(payload)
+            if step == "delivery.validate_changeset":
+                return self._validate_changeset(payload)
         except (ValueError, ValidationError, WorktreeError) as error:
             message = str(error)
             error_type = "DirtyWorktree" if "dirty" in message.lower() else "PolicyViolation"
@@ -214,6 +240,145 @@ class ScanActivityHandler:
             "deployment_worktree": str(deployment.path),
             "deployment_branch": deployment.branch,
         }
+
+    def _delivery_prechecks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        evidence_root = self.settings.evidence_root / "scan" / str(change_set_id) / "prechecks"
+        summaries: dict[str, Any] = {}
+        blocked = False
+        for name, path_value in (
+            ("source", payload["source_worktree"]),
+            ("deployment", payload["deployment_worktree"]),
+        ):
+            worktree = Path(str(path_value)).resolve()
+            root = self.settings.worktree_root.resolve()
+            if not worktree.is_dir() or not worktree.is_relative_to(root):
+                raise ValueError("precheck worktree escaped its bounded root")
+            output = evidence_root / name
+            secret = self.scanner.secret_scan(worktree, output)
+            trivy = self.scanner.vulnerability_scan(worktree, output)
+            semgrep = self.scanner.semgrep(worktree, output)
+            self.scanner.sbom(worktree, output)
+            semgrep_findings = len(semgrep.get("results", []))
+            severe_vulnerabilities = self._severe_vulnerability_count(trivy)
+            if secret.get("status") == "FINDINGS" or semgrep_findings or severe_vulnerabilities:
+                blocked = True
+            artifacts = [
+                {
+                    "path": str(report),
+                    "sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+                    "size_bytes": report.stat().st_size,
+                    "redaction_status": "REDACTED",
+                }
+                for report in sorted(output.iterdir())
+                if report.is_file()
+            ]
+            summaries[name] = {
+                "secret_status": secret.get("status"),
+                "semgrep_findings": semgrep_findings,
+                "high_or_critical_vulnerabilities": severe_vulnerabilities,
+                "artifacts": artifacts,
+            }
+        return {
+            **payload,
+            "status": "BLOCKED" if blocked else "PRECHECKS_PASS",
+            "blocker": "DETERMINISTIC_PRECHECK_FINDINGS" if blocked else None,
+            "prechecks": summaries,
+        }
+
+    def _validate_changeset(self, payload: dict[str, Any]) -> dict[str, Any]:
+        checker = payload.get("agent_result")
+        if not isinstance(checker, dict) or not isinstance(checker.get("structured_result"), dict):
+            raise ValueError("ChangeSet validation requires the independent checker result")
+        if checker["structured_result"].get("decision") != "PASS":
+            return {
+                **payload,
+                "status": "REQUEST_CHANGES",
+                "blocker": "INDEPENDENT_CHECKER_DID_NOT_PASS",
+            }
+        for key in ("source_maker_result", "deployment_maker_result"):
+            maker = payload.get(key)
+            if not isinstance(maker, dict) or not isinstance(maker.get("structured_result"), dict):
+                raise ValueError(f"ChangeSet validation requires {key}")
+            tests = maker["structured_result"].get("tests")
+            if not isinstance(tests, list) or any(
+                isinstance(test, dict) and test.get("status") == "FAIL" for test in tests
+            ):
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "MAKER_TEST_FAILURE",
+                }
+        change_set_id = UUID(str(payload["change_set_id"]))
+        evidence_root = self.settings.evidence_root / "scan" / str(change_set_id) / "changes"
+        evidence_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        changes: dict[str, Any] = {}
+        blocked = False
+        for name, path_key, base_key in (
+            ("source", "source_worktree", "source_base_sha"),
+            ("deployment", "deployment_worktree", "deployment_base_sha"),
+        ):
+            worktree = Path(str(payload[path_key]))
+            summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
+            if name == "source" and summary["changed_file_count"] == 0:
+                blocked = True
+            diff_path = evidence_root / f"{name}.patch"
+            safe_diff = str(SecretRedactor().redact_text(diff).value)
+            self._atomic_text(diff_path, safe_diff)
+            output = evidence_root / f"{name}-postchecks"
+            secret = self.scanner.secret_scan(worktree, output)
+            trivy = self.scanner.vulnerability_scan(worktree, output)
+            semgrep = self.scanner.semgrep(worktree, output)
+            self.scanner.sbom(worktree, output)
+            semgrep_findings = len(semgrep.get("results", []))
+            severe = self._severe_vulnerability_count(trivy)
+            if secret.get("status") == "FINDINGS" or semgrep_findings or severe:
+                blocked = True
+            changes[name] = {
+                **summary,
+                "diff_path": str(diff_path),
+                "diff_redacted_sha256": hashlib.sha256(safe_diff.encode()).hexdigest(),
+                "secret_status": secret.get("status"),
+                "semgrep_findings": semgrep_findings,
+                "high_or_critical_vulnerabilities": severe,
+            }
+        return {
+            **payload,
+            "status": "BLOCKED" if blocked else "LOCAL_VALIDATION_PASS",
+            "blocker": "CHANGESET_VALIDATION_FINDINGS" if blocked else None,
+            "change_evidence": changes,
+        }
+
+    @staticmethod
+    def _severe_vulnerability_count(report: dict[str, Any]) -> int:
+        count = 0
+        results = report.get("Results")
+        if not isinstance(results, list):
+            return 0
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            for key in ("Vulnerabilities", "Misconfigurations", "Secrets"):
+                findings = result.get(key)
+                if not isinstance(findings, list):
+                    continue
+                count += sum(
+                    1
+                    for finding in findings
+                    if isinstance(finding, dict)
+                    and str(finding.get("Severity", "")).upper() in {"HIGH", "CRITICAL"}
+                )
+        return count
+
+    @staticmethod
+    def _atomic_text(path: Path, value: str) -> None:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            handle.write(value.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, path)
 
     @staticmethod
     def _sha(value: Any, name: str) -> str:

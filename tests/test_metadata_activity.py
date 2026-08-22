@@ -10,7 +10,14 @@ from sqlalchemy import func, select
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import Campaign, Finding, QuotaSnapshot
+from engineering_control.db.models import (
+    Campaign,
+    CoverageCell,
+    Finding,
+    QuotaSnapshot,
+    Run,
+    WorktreeLease,
+)
 
 
 @pytest.mark.asyncio
@@ -262,3 +269,152 @@ async def test_failed_audit_cell_creates_candidate_not_confirmed_finding(tmp_pat
     assert controls["disposition"] == "CONFIRMED"
     assert duplicate["blocker"] == "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED"
     assert verified["disposition"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_delivery_transaction_routes_and_leases_both_worktrees(tmp_path: Path) -> None:
+    worktree_root = tmp_path / "worktrees"
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'delivery.sqlite'}",
+            worktree_root=worktree_root,
+            state_root=tmp_path / "state",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    coverage = CoverageCell(
+        id=uuid4(),
+        campaign_id=campaign.id,
+        domain="gateway",
+        persona="tenant-admin",
+        lens="correctness",
+        environment="snapshot",
+        status="CONFIRMED_FINDING",
+        blocker=None,
+        exclusion_approval_id=None,
+        evidence_json=[{"sha256": "c" * 64}],
+        result_json={"provider": "claude"},
+    )
+    finding = Finding(
+        id=uuid4(),
+        campaign_id=campaign.id,
+        coverage_cell_id=coverage.id,
+        fingerprint="f" * 64,
+        project="falcone",
+        domain="gateway",
+        persona="tenant-admin",
+        severity="medium",
+        confidence=0.9,
+        risk_class="R2",
+        disposition="CONFIRMED",
+        expected_behavior="bounded contract",
+        actual_behavior="bounded mismatch",
+        evidence_json=[{"sha256": "c" * 64}],
+        minimal_reproduction=["inspect the bounded contract"],
+        affected_source_sha="a" * 40,
+        affected_deployment_sha="b" * 40,
+        affected_image_digest=None,
+        affected_component="gateway",
+        impact_json={},
+        recommended_action="implement the bounded fix",
+    )
+    workflow_id = f"delivery-{finding.id}"
+    run = Run(
+        id=uuid4(),
+        campaign_id=None,
+        change_set_id=None,
+        workflow_id=workflow_id,
+        run_type="issue-delivery",
+        status="QUEUED",
+        project="falcone",
+    )
+    with handler.sessions.begin() as session:
+        session.add_all([coverage, finding, run])
+
+    loaded = await handler.handle(
+        "delivery.load_confirmed_finding",
+        {
+            "finding_id": str(finding.id),
+            "risk_class": "R2",
+            "dry_run": True,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    issue_gate = await handler.handle("delivery.ensure_issue", loaded)
+    live_issue_gate = await handler.handle("delivery.ensure_issue", {**loaded, "dry_run": False})
+    leased = await handler.handle("delivery.acquire_leases", loaded)
+    routed = await handler.handle("delivery.route_providers", leased)
+    change_set_id = routed["change_set_id"]
+    allocation = {
+        **routed,
+        "source_worktree": str(worktree_root / "falcone" / change_set_id),
+        "deployment_worktree": str(worktree_root / "falcone-charts" / change_set_id),
+        "source_branch": f"agent/falcone/123/{change_set_id}",
+        "deployment_branch": f"agent/falcone/123/{change_set_id}",
+    }
+    persisted = await handler.handle("delivery.persist_worktree_leases", allocation)
+
+    assert issue_gate["status"] == "DRY_RUN"
+    assert "issue creation" in issue_gate["dry_run_summary"]
+    assert live_issue_gate["blocker"] == "GITHUB_ISSUE_CREATE_NOT_CONFIGURED"
+    assert routed["maker_provider"] == "codex"
+    assert routed["checker_provider"] == "claude"
+    assert len(persisted["worktree_lease_ids"]) == 2
+    with handler.sessions() as session:
+        lease_count = session.scalar(select(func.count()).select_from(WorktreeLease))
+    assert lease_count == 2
+
+
+@pytest.mark.asyncio
+async def test_delivery_component_lease_conflict_is_structured(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'lease-conflict.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    first_run = Run(
+        id=uuid4(),
+        campaign_id=None,
+        change_set_id=None,
+        workflow_id="delivery-first",
+        run_type="issue-delivery",
+        status="RUNNING",
+        project="falcone",
+    )
+    second_run = Run(
+        id=uuid4(),
+        campaign_id=None,
+        change_set_id=None,
+        workflow_id="delivery-second",
+        run_type="issue-delivery",
+        status="RUNNING",
+        project="falcone",
+    )
+    with handler.sessions.begin() as session:
+        session.add_all([first_run, second_run])
+
+    first = await handler.handle(
+        "delivery.acquire_leases",
+        {
+            "project": "falcone",
+            "affected_component": "gateway",
+            "run_id": str(first_run.id),
+        },
+    )
+    conflict = await handler.handle(
+        "delivery.acquire_leases",
+        {
+            "project": "falcone",
+            "affected_component": "gateway",
+            "run_id": str(second_run.id),
+        },
+    )
+
+    assert first["status"] == "LEASES_ACQUIRED"
+    assert conflict == {
+        "project": "falcone",
+        "affected_component": "gateway",
+        "run_id": str(second_run.id),
+        "status": "BLOCKED",
+        "blocker": "COMPONENT_LEASE_CONFLICT",
+    }

@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import subprocess
 from pathlib import Path
@@ -109,6 +110,39 @@ def test_dirty_worktree_is_protected(tmp_path: Path) -> None:
     with pytest.raises(WorktreeError, match="protected"):
         manager.cleanup(allocation, evidence_captured=False)
     assert allocation.path.exists()
+
+
+def test_change_evidence_includes_tracked_and_untracked_files(tmp_path: Path) -> None:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    allocation = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="126",
+        change_set_id=uuid4(),
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    (allocation.path / "README.md").write_text("changed\n", encoding="utf-8")
+    generated = allocation.path / "generated"
+    generated.mkdir()
+    (generated / "evidence.txt").write_text("new\n", encoding="utf-8")
+
+    evidence, diff = manager.change_evidence(allocation.path, base_sha=sha)
+
+    assert evidence["changed_file_count"] == 2
+    assert evidence["diff_sha256"] == hashlib.sha256(diff.encode()).hexdigest()
+    assert evidence["untracked"] == [
+        {
+            "path": "generated/evidence.txt",
+            "sha256": hashlib.sha256(b"new\n").hexdigest(),
+            "size_bytes": 4,
+        }
+    ]
 
 
 def test_maker_and_checker_must_be_independent() -> None:
