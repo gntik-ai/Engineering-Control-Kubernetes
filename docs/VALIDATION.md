@@ -4,7 +4,7 @@ This file distinguishes source-level validation from activation validation. It d
 services, provider identities, or Kubernetes release credentials are active.
 
 Validated on 2026-08-22 at engineering-control functional commit
-`ENGINEERING_CONTROL_VALIDATED_COMMIT` and engineering-agent-pack commit
+`3adacfa1b7a27fb47075c0585557174f9b68dd20` and engineering-agent-pack commit
 `47a6353dafbf0c1ecea649d434db5dd555e6249e`.
 
 ## Passed before activation
