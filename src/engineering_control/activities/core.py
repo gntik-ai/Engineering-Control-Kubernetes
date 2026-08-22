@@ -12,6 +12,8 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
 
+from .provider import ProviderActivityHandler
+
 
 class ControlActivities:
     """Narrow activity dispatcher; mutating handlers are separate deterministic adapters."""
@@ -120,6 +122,11 @@ class ControlActivities:
         if self.worker_kind not in self._worker_steps:
             raise ValueError(f"unknown worker kind: {self.worker_kind}")
         self.redactor = SecretRedactor()
+        self.provider_handler = (
+            ProviderActivityHandler(settings, self.worker_kind)
+            if self.worker_kind in {"codex", "claude"}
+            else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -144,6 +151,8 @@ class ControlActivities:
                 type="SecurityBlocker",
                 non_retryable=True,
             )
+        if self.provider_handler is not None:
+            return await self.provider_handler.handle(step, safe_payload)
         if self.settings.synthetic_mode or self.worker_kind == "synthetic":
             return self._synthetic_step(step, safe_payload)
         raise ApplicationError(

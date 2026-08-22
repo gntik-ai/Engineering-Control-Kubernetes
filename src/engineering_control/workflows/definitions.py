@@ -31,6 +31,11 @@ ACTIVITY_RETRY = RetryPolicy(
         "ApprovalMismatch",
         "DirtyWorktree",
         "NotConfigured",
+        "SchemaViolation",
+        "MANUAL_AUTH_REQUIRED_CODEX",
+        "MANUAL_AUTH_REQUIRED_CLAUDE",
+        "PROVIDER_CLI_MISSING_CODEX",
+        "PROVIDER_CLI_MISSING_CLAUDE",
     ],
 )
 
@@ -165,7 +170,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 "audit.deterministic_cell",
                 {"campaign_id": campaign_id, "cell": cell, "snapshot": snapshot},
             )
-            await self._step(
+            agent_result = await self._step(
                 "audit.agent_cell",
                 {
                     "campaign_id": campaign_id,
@@ -175,6 +180,19 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 },
                 timeout_minutes=120,
             )
+            if agent_result.get("status") in {
+                "RATE_LIMITED",
+                "BLOCKED",
+                "FAILED",
+                "TIMED_OUT",
+                "CANCELLED",
+            }:
+                return {
+                    "status": agent_result["status"],
+                    "campaign_id": campaign_id,
+                    "next_cell_offset": index,
+                    "context": agent_result,
+                }
         next_offset = request.cell_offset + len(batch)
         if next_offset < len(cells):
             workflow.continue_as_new(
@@ -244,6 +262,14 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                 {"request": asdict(request), "context": context},
                 timeout_minutes=120 if "invoke" in step else 30,
             )
+            if "invoke" in step and context.get("status") in {
+                "RATE_LIMITED",
+                "BLOCKED",
+                "FAILED",
+                "TIMED_OUT",
+                "CANCELLED",
+            }:
+                return {"status": context["status"], "context": context}
         return {"status": context.get("status", "SOURCE_PR"), "context": context}
 
 
