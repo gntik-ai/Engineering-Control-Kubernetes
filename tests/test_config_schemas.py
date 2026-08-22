@@ -57,3 +57,40 @@ def test_runtime_target_templates_match_the_strict_schema() -> None:
         validator.validate(value)
         assert path.stem == f"{value['project']}-{value['environment']}"
         assert value["enabled"] is False
+
+
+def test_recovery_schema_accepts_only_typed_project_paths() -> None:
+    schema = json.loads(
+        (ROOT / "schemas" / "recovery-plan.schema.json").read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema)
+    validator.validate(
+        {
+            "strategy": "helm",
+            "deployment_id": "deployment",
+            "change_set_id": "change-set",
+            "release_name": "falcone",
+            "namespace": "falcone-staging",
+            "kube_context": "falcone-staging-releaser",
+            "kubeconfig_path": "/etc/engineering-control/env/release/falcone.kubeconfig",
+            "previous_revision": 7,
+            "previous_manifest_sha256": "a" * 64,
+            "original_artifact_binding_sha256": "b" * 64,
+            "recovery_approval_binding_sha256": "c" * 64,
+            "timeout_minutes": 30,
+        }
+    )
+    validator.validate(
+        {
+            "strategy": "argocd-gitops",
+            "deployment_id": "deployment",
+            "change_set_id": "change-set",
+            "deployment_repository": "musematic-deploy",
+            "failed_revision": "d" * 40,
+            "revert_target_revision": "e" * 40,
+            "target_context": "musematic-staging",
+            "target_namespace": "musematic-staging",
+            "original_artifact_binding_sha256": "f" * 64,
+            "required_path": "protected-deployment-repository-pr",
+        }
+    )

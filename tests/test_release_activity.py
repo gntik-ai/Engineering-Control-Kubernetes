@@ -24,6 +24,17 @@ class FakeHelm:
         assert approval_is_current
         return CommandResult(0, "bounded helm transaction", "")
 
+    def rollback(self, plan: Any, *, approval_is_current: bool) -> dict[str, Any]:
+        assert approval_is_current
+        return {
+            "status": "ROLLBACK_APPLIED",
+            "strategy": "helm",
+            "target_revision": plan.previous_revision,
+            "result_revision": plan.previous_revision + 1,
+            "manifest_sha256": plan.previous_manifest_sha256,
+            "transaction_sha256": "f" * 64,
+        }
+
 
 class FakeGitOps:
     def preflight(self, plan: Any) -> dict[str, Any]:
@@ -149,5 +160,47 @@ async def test_release_recovery_remains_fail_closed(tmp_path: Path) -> None:
         helm=FakeHelm(),  # type: ignore[arg-type]
         gitops=FakeGitOps(),  # type: ignore[arg-type]
     )
-    with pytest.raises(ApplicationError, match="typed project-specific recovery"):
+    with pytest.raises(ApplicationError, match="typed plan and immutable recovery approval"):
         await handler.handle("recovery.execute", {"dry_run": False})
+
+
+@pytest.mark.asyncio
+async def test_release_recovery_requires_exact_recovery_binding(tmp_path: Path) -> None:
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    kubeconfig = credential_root / "staging.kubeconfig"
+    kubeconfig.write_text("scoped test configuration", encoding="utf-8")
+    os.chmod(kubeconfig, 0o600)
+    binding = "b" * 64
+    handler = ReleaseActivityHandler(
+        Settings(worktree_root=tmp_path, release_credential_root=credential_root),
+        helm=FakeHelm(),  # type: ignore[arg-type]
+        gitops=FakeGitOps(),  # type: ignore[arg-type]
+    )
+
+    result = await handler.handle(
+        "recovery.execute",
+        {
+            "recovery_plan": {
+                "strategy": "helm",
+                "deployment_id": "deployment",
+                "change_set_id": "change-set",
+                "release_name": "falcone",
+                "namespace": "falcone-staging",
+                "kube_context": "falcone-staging-releaser",
+                "kubeconfig_path": str(kubeconfig),
+                "previous_revision": 3,
+                "previous_manifest_sha256": "c" * 64,
+                "original_artifact_binding_sha256": "d" * 64,
+                "recovery_approval_binding_sha256": binding,
+                "timeout_minutes": 5,
+            },
+            "approval_validation": {
+                "current": True,
+                "artifact_binding_sha256": binding,
+            },
+        },
+    )
+
+    assert result["status"] == "ROLLBACK_APPLIED"
+    assert result["manifest_sha256"] == "c" * 64

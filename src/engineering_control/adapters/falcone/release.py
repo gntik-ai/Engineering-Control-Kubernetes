@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,22 @@ class FalconeReleasePlan(BaseModel):
         return self
 
 
+class FalconeRecoveryPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    deployment_id: str
+    change_set_id: str
+    release_name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,52}$")
+    namespace: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    kube_context: str
+    kubeconfig_path: Path
+    previous_revision: int = Field(ge=1)
+    previous_manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    original_artifact_binding_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    recovery_approval_binding_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    timeout_minutes: int = Field(default=30, ge=5, le=120)
+
+
 class FalconeHelmAdapter:
     def __init__(self, runner: SafeCommandRunner) -> None:
         self.runner = runner
@@ -79,6 +96,7 @@ class FalconeHelmAdapter:
         for component, digest in sorted(plan.image_digests.items()):
             template_arguments.extend(("--set-string", f"images.{component}.digest={digest}"))
         rendered = self.runner.run("helm", template_arguments, cwd=plan.chart_directory)
+        previous = self._current_release(plan)
         documents = [item for item in yaml.safe_load_all(rendered.stdout) if item]
         return {
             "chart_sha": revision,
@@ -89,6 +107,9 @@ class FalconeHelmAdapter:
             "migration": plan.migration,
             "backup_evidence_sha256": plan.backup_evidence_sha256,
             "parity_evidence_sha256": plan.parity_evidence_sha256,
+            "previous_revision": previous["revision"],
+            "previous_status": previous["status"],
+            "previous_manifest_sha256": previous["manifest_sha256"],
             "status": "PREFLIGHT_PASS",
         }
 
@@ -122,6 +143,115 @@ class FalconeHelmAdapter:
             cwd=plan.chart_directory,
             timeout_seconds=(plan.timeout_minutes + 5) * 60,
         )
+
+    def rollback(self, plan: FalconeRecoveryPlan, *, approval_is_current: bool) -> dict[str, Any]:
+        if not approval_is_current:
+            raise ValueError("recovery approval is absent, invalid, or bound to changed artifacts")
+        if not plan.kubeconfig_path.is_file():
+            raise ValueError("scoped release kubeconfig does not exist")
+        arguments = [
+            "rollback",
+            plan.release_name,
+            str(plan.previous_revision),
+            "--namespace",
+            plan.namespace,
+            "--kube-context",
+            plan.kube_context,
+            "--kubeconfig",
+            str(plan.kubeconfig_path),
+            "--cleanup-on-fail",
+            "--wait",
+            "--timeout",
+            f"{plan.timeout_minutes}m",
+        ]
+        command = self.runner.run(
+            "helm",
+            arguments,
+            cwd=plan.kubeconfig_path.parent,
+            timeout_seconds=(plan.timeout_minutes + 5) * 60,
+        )
+        current = self._current_release_from_scope(
+            release_name=plan.release_name,
+            namespace=plan.namespace,
+            kube_context=plan.kube_context,
+            kubeconfig_path=plan.kubeconfig_path,
+            cwd=plan.kubeconfig_path.parent,
+        )
+        if (
+            current["status"] != "deployed"
+            or current["manifest_sha256"] != plan.previous_manifest_sha256
+        ):
+            raise ValueError("Helm rollback did not restore the exact captured manifest")
+        return {
+            "status": "ROLLBACK_APPLIED",
+            "strategy": "helm",
+            "target_revision": plan.previous_revision,
+            "result_revision": current["revision"],
+            "manifest_sha256": current["manifest_sha256"],
+            "transaction_sha256": hashlib.sha256(command.stdout.encode()).hexdigest(),
+        }
+
+    def _current_release(self, plan: FalconeReleasePlan) -> dict[str, Any]:
+        return self._current_release_from_scope(
+            release_name=plan.release_name,
+            namespace=plan.namespace,
+            kube_context=plan.kube_context,
+            kubeconfig_path=plan.kubeconfig_path,
+            cwd=plan.chart_directory,
+        )
+
+    def _current_release_from_scope(
+        self,
+        *,
+        release_name: str,
+        namespace: str,
+        kube_context: str,
+        kubeconfig_path: Path,
+        cwd: Path,
+    ) -> dict[str, Any]:
+        scope = [
+            "--namespace",
+            namespace,
+            "--kube-context",
+            kube_context,
+            "--kubeconfig",
+            str(kubeconfig_path),
+        ]
+        history = self.runner.run(
+            "helm",
+            ["history", release_name, *scope, "--max", "1", "--output", "json"],
+            cwd=cwd,
+            check=False,
+        )
+        if history.return_code != 0:
+            if "release: not found" in history.stderr.lower():
+                return {"revision": None, "status": None, "manifest_sha256": None}
+            raise ValueError("Helm recovery baseline inspection failed")
+        try:
+            records = json.loads(history.stdout)
+            record = (
+                max(records, key=lambda item: int(item["revision"]))
+                if isinstance(records, list)
+                and records
+                and all(isinstance(item, dict) for item in records)
+                else None
+            )
+            revision = int(record["revision"]) if isinstance(record, dict) else None
+            status = str(record["status"]).lower() if isinstance(record, dict) else None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("Helm history returned invalid recovery metadata") from error
+        if revision is None:
+            return {"revision": None, "status": status, "manifest_sha256": None}
+        manifest = self.runner.run(
+            "helm",
+            ["get", "manifest", release_name, *scope, "--revision", str(revision)],
+            cwd=cwd,
+        )
+        return {
+            "revision": revision,
+            "status": status,
+            "manifest_sha256": hashlib.sha256(manifest.stdout.encode()).hexdigest(),
+        }
 
     @staticmethod
     def _validate_files(plan: FalconeReleasePlan) -> None:

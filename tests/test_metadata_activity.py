@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -19,6 +21,7 @@ from engineering_control.db.models import (
     CoverageCell,
     Deployment,
     Finding,
+    Incident,
     QuotaSnapshot,
     Run,
     WorktreeLease,
@@ -942,3 +945,194 @@ configuration:
         assert stored_change_set is not None and stored_change_set.state == "RUNTIME_VERIFIED"
         assert stored_deployment is not None and stored_deployment.status == "RUNTIME_VERIFIED"
         assert stored_run is not None and stored_run.status == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_recovery_requires_new_bound_approval_and_preserves_open_incident(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'recovery.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    deployment_id = uuid4()
+    run_id = uuid4()
+    workflow_id = f"recovery-{deployment_id}"
+    preflight = {
+        "status": "PREFLIGHT_PASS",
+        "previous_revision": 7,
+        "previous_status": "deployed",
+        "previous_manifest_sha256": "9" * 64,
+    }
+    release_evidence = {
+        "migration": False,
+        "backup_requirement": "not-required",
+        "rollback_plan_sha256": "1" * 64,
+        "ci_result_sha256": "2" * 64,
+        "independent_review_sha256": "3" * 64,
+    }
+    approval_payload = {
+        "change_set_id": str(change_set_id),
+        "project": "falcone",
+        "risk_class": "R2",
+        "source_pr": "https://github.com/gntik-ai/falcone/pull/1",
+        "source_sha": "b" * 40,
+        "deployment_pr": "https://github.com/gntik-ai/falcone-charts/pull/1",
+        "deployment_sha": "d" * 40,
+        "image_digests": {"api": f"sha256:{'e' * 64}"},
+        "target_context": "falcone-staging-releaser",
+        "target_namespace": "falcone-staging",
+        "migration": False,
+        "backup_requirement": "not-required",
+        "rollback_plan_sha256": "1" * 64,
+        "ci_result_sha256": "2" * 64,
+        "independent_review_sha256": "3" * 64,
+        "release_preflight_sha256": hashlib.sha256(
+            json.dumps(preflight, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest(),
+    }
+    original_binding = ApprovalService.digest(approval_payload)
+    change_set = ChangeSet(
+        id=change_set_id,
+        finding_id=uuid4(),
+        issue_id=None,
+        project="falcone",
+        risk_class="R2",
+        state="INCIDENT_OPEN",
+        version=2,
+        source_repository="falcone",
+        source_branch="agent/falcone/1/test",
+        source_base_sha="a" * 40,
+        source_head_sha="b" * 40,
+        source_pr_url="https://github.com/gntik-ai/falcone/pull/1",
+        deployment_repository="falcone-charts",
+        deployment_branch="agent/falcone/1/test",
+        deployment_base_sha="c" * 40,
+        deployment_head_sha="d" * 40,
+        deployment_pr_url="https://github.com/gntik-ai/falcone-charts/pull/1",
+        image_digests={"api": f"sha256:{'e' * 64}"},
+        chart_version="1.2.3",
+        recovery_json={},
+    )
+    deployment = Deployment(
+        id=deployment_id,
+        change_set_id=change_set_id,
+        project="falcone",
+        environment="staging",
+        strategy="helm",
+        target_context="falcone-staging-releaser",
+        target_namespace="falcone-staging",
+        desired_sha="d" * 40,
+        status="VERIFICATION_FAILED",
+        transaction_id="failed-transaction",
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        recovery_json={
+            "deployed_artifact_binding_sha256": original_binding,
+            "release_plan": {
+                "strategy": "helm",
+                "release_name": "falcone",
+                "kube_context": "falcone-staging-releaser",
+                "kubeconfig_path": "/etc/engineering-control/env/release/falcone.kubeconfig",
+                "timeout_minutes": 30,
+            },
+            "release_preflight": preflight,
+            "release_evidence": release_evidence,
+            "previous_deployment_sha": "c" * 40,
+        },
+    )
+    run = Run(
+        id=run_id,
+        change_set_id=change_set_id,
+        workflow_id=workflow_id,
+        run_type="recovery",
+        status="QUEUED",
+        project="falcone",
+        summary=str(deployment_id),
+    )
+    with handler.sessions.begin() as session:
+        session.add_all(
+            [
+                change_set,
+                deployment,
+                run,
+                Approval(
+                    change_set_id=change_set_id,
+                    approval_type="staging",
+                    decision="approve",
+                    artifact_binding_sha256=original_binding,
+                    approver_subject="operator:staging",
+                    approved_at=datetime.now(UTC),
+                    invalidated_at=None,
+                    metadata_json={},
+                ),
+            ]
+        )
+
+    inspected = await handler.handle(
+        "recovery.inspect",
+        {
+            "deployment_id": str(deployment_id),
+            "expected_artifact_binding_sha256": original_binding,
+            "dry_run": False,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    validated = await handler.handle("recovery.validate_binding", inspected)
+    candidate = await handler.handle("recovery.prepare_candidate", validated)
+
+    assert candidate["status"] == "AWAITING_RECOVERY_APPROVAL"
+    assert candidate["recovery_plan"]["previous_revision"] == 7
+    recovery_binding = candidate["artifact_binding_sha256"]
+    with handler.sessions.begin() as session:
+        session.add(
+            Approval(
+                change_set_id=change_set_id,
+                approval_type="recovery",
+                decision="approve",
+                artifact_binding_sha256=recovery_binding,
+                approver_subject="operator:recovery",
+                approved_at=datetime.now(UTC),
+                invalidated_at=None,
+                metadata_json={},
+            )
+        )
+    approved = await handler.handle(
+        "recovery.validate_approval",
+        {
+            "context": candidate,
+            "approval": {
+                "decision": "approve",
+                "artifact_binding_sha256": recovery_binding,
+            },
+        },
+    )
+    assert approved["status"] == "RECOVERY_APPROVED"
+    recovered = await handler.handle(
+        "recovery.verify",
+        {
+            **approved,
+            "status": "ROLLBACK_APPLIED",
+            "manifest_sha256": "9" * 64,
+            "transaction_sha256": "8" * 64,
+        },
+    )
+
+    assert recovered["status"] == "ROLLED_BACK"
+    assert recovered["runtime_retest_required"] is True
+    with handler.sessions() as session:
+        stored_change_set = session.get(ChangeSet, change_set_id)
+        stored_deployment = session.get(Deployment, deployment_id)
+        stored_run = session.get(Run, run_id)
+        incident = session.scalar(select(Incident).where(Incident.deployment_id == deployment_id))
+        active_leases = session.scalar(
+            select(func.count())
+            .select_from(ComponentLease)
+            .where(ComponentLease.released_at.is_(None))
+        )
+        assert stored_change_set is not None and stored_change_set.state == "ROLLED_BACK"
+        assert stored_deployment is not None and stored_deployment.status == "ROLLBACK_APPLIED"
+        assert stored_run is not None and stored_run.status == "SUCCESS"
+        assert incident is not None and incident.recovery_state == "RUNTIME_RETEST_REQUIRED"
+        assert active_leases == 0

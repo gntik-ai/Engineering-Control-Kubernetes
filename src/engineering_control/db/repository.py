@@ -13,6 +13,7 @@ from engineering_control.api.schemas import (
     CampaignStart,
     DeliveryStart,
     DeploymentPrepare,
+    RollbackRequest,
     RuntimeVerificationStart,
 )
 from engineering_control.db.models import (
@@ -54,6 +55,9 @@ class MetadataRepository(Protocol):
     ) -> Project: ...
     async def create_runtime_verification_run(
         self, workflow_id: str, request: RuntimeVerificationStart
+    ) -> Project: ...
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest
     ) -> Project: ...
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
@@ -217,6 +221,45 @@ class SQLMetadataRepository:
                     change_set_id=deployment.change_set_id,
                     workflow_id=workflow_id,
                     run_type="runtime-verification",
+                    status="QUEUED",
+                    project=project.value,
+                    summary=str(deployment.id),
+                )
+            )
+            return project
+
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest
+    ) -> Project:
+        return await asyncio.to_thread(self._create_recovery_run, workflow_id, request)
+
+    def _create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, request.deployment_id)
+            if deployment is None:
+                raise ValueError("recovery requires an existing deployment")
+            if deployment.status not in {
+                "STAGING_DEPLOYED",
+                "RUNTIME_VERIFIED",
+                "VERIFICATION_FAILED",
+                "RECOVERY_FAILED",
+            }:
+                raise ValueError("deployment has not reached a recoverable state")
+            active = session.scalar(
+                select(Run).where(
+                    Run.change_set_id == deployment.change_set_id,
+                    Run.run_type == "recovery",
+                    Run.status.in_({"QUEUED", "RUNNING", "AWAITING_APPROVAL"}),
+                )
+            )
+            if active is not None:
+                raise ValueError("an active recovery already owns this deployment")
+            project = Project(deployment.project)
+            session.add(
+                Run(
+                    change_set_id=deployment.change_set_id,
+                    workflow_id=workflow_id,
+                    run_type="recovery",
                     status="QUEUED",
                     project=project.value,
                     summary=str(deployment.id),
@@ -413,10 +456,16 @@ class SQLMetadataRepository:
                 raise ValueError("approval candidate is missing or invalidated")
             if candidate.artifact_binding_sha256 != request.artifact_binding_sha256:
                 raise ValueError("approval artifact binding changed")
+            candidate_payload = (
+                candidate.payload_json if isinstance(candidate.payload_json, dict) else {}
+            )
+            approval_type = str(candidate_payload.get("approval_type", "staging"))
+            if approval_type not in {"staging", "recovery"}:
+                raise ValueError("approval candidate type is not allowlisted")
             session.add(
                 Approval(
                     change_set_id=request.change_set_id,
-                    approval_type="staging",
+                    approval_type=approval_type,
                     decision=request.decision,
                     artifact_binding_sha256=request.artifact_binding_sha256,
                     approver_subject=approver_subject,
@@ -447,6 +496,11 @@ class EmptyMetadataRepository:
         self, workflow_id: str, request: RuntimeVerificationStart
     ) -> Project:
         raise ValueError("runtime verification metadata store is unavailable")
+
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest
+    ) -> Project:
+        raise ValueError("recovery metadata store is unavailable")
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
         return []

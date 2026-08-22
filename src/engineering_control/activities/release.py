@@ -9,7 +9,11 @@ from pydantic import ValidationError
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import SafeCommandRunner
-from engineering_control.adapters.falcone.release import FalconeHelmAdapter, FalconeReleasePlan
+from engineering_control.adapters.falcone.release import (
+    FalconeHelmAdapter,
+    FalconeRecoveryPlan,
+    FalconeReleasePlan,
+)
 from engineering_control.adapters.musematic.gitops import MusematicGitOpsAdapter, MusematicPromotion
 from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
@@ -39,11 +43,7 @@ class ReleaseActivityHandler:
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         if step == "recovery.execute":
-            raise ApplicationError(
-                "recovery execution requires a typed project-specific recovery adapter",
-                type="NotConfigured",
-                non_retryable=True,
-            )
+            return self._recover(payload)
         if step in {"preview.preflight", "staging.preflight"}:
             return self._preflight(payload)
         if step not in {"preview.deploy", "staging.deploy"}:
@@ -84,6 +84,45 @@ class ReleaseActivityHandler:
         safe = self.redactor.redact({**payload, **result}).value
         if not isinstance(safe, dict):
             raise TypeError("redacted release result must remain an object")
+        return safe
+
+    def _recover(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_plan = payload.get("recovery_plan")
+        approval = payload.get("approval_validation")
+        if not isinstance(raw_plan, dict) or not isinstance(approval, dict):
+            raise ApplicationError(
+                "recovery requires a typed plan and immutable recovery approval",
+                type="ApprovalMismatch",
+                non_retryable=True,
+            )
+        if approval.get("current") is not True:
+            raise ApplicationError(
+                "recovery approval is absent, invalidated, or stale",
+                type="ApprovalMismatch",
+                non_retryable=True,
+            )
+        strategy = raw_plan.get("strategy")
+        value = {key: item for key, item in raw_plan.items() if key != "strategy"}
+        try:
+            if strategy != "helm":
+                raise ApplicationError(
+                    "GitOps recovery requires a protected deployment-repository PR",
+                    type="ProtectedRecoveryPRRequired",
+                    non_retryable=True,
+                )
+            plan = FalconeRecoveryPlan.model_validate(value)
+            self._scoped_credential(plan.kubeconfig_path)
+            self._matching_binding(plan.recovery_approval_binding_sha256, approval)
+            result = self.helm.rollback(plan, approval_is_current=True)
+        except ValidationError as error:
+            raise ApplicationError(
+                "recovery plan failed strict schema validation",
+                type="PolicyViolation",
+                non_retryable=True,
+            ) from error
+        safe = self.redactor.redact({**payload, **result}).value
+        if not isinstance(safe, dict):
+            raise TypeError("redacted recovery result must remain an object")
         return safe
 
     def _preflight(self, payload: dict[str, Any]) -> dict[str, Any]:

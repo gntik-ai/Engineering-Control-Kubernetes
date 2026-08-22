@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -6,7 +7,11 @@ import pytest
 from pydantic import ValidationError
 
 from engineering_control.adapters.command import CommandResult
-from engineering_control.adapters.falcone.release import FalconeHelmAdapter, FalconeReleasePlan
+from engineering_control.adapters.falcone.release import (
+    FalconeHelmAdapter,
+    FalconeRecoveryPlan,
+    FalconeReleasePlan,
+)
 from engineering_control.adapters.kubernetes.observer import KubernetesObserver
 from engineering_control.adapters.musematic.gitops import (
     MusematicGitOpsAdapter,
@@ -19,10 +24,17 @@ DIGEST = "b" * 64
 
 class FakeRunner:
     def __init__(
-        self, *, sha: str = SHA, rendered: str = "apiVersion: v1\nkind: Service\n"
+        self,
+        *,
+        sha: str = SHA,
+        rendered: str = "apiVersion: v1\nkind: Service\n",
+        history_return_code: int = 0,
+        history_stderr: str = "",
     ) -> None:
         self.sha = sha
         self.rendered = rendered
+        self.history_return_code = history_return_code
+        self.history_stderr = history_stderr
         self.calls: list[tuple[str, list[str]]] = []
 
     def run(self, executable: str, arguments: list[str], **kwargs: Any) -> CommandResult:
@@ -32,6 +44,14 @@ class FakeRunner:
         if executable == "git" and arguments[:2] == ["status", "--porcelain=v1"]:
             return CommandResult(0, "", "")
         if executable == "helm" and arguments[0] == "template":
+            return CommandResult(0, self.rendered, "")
+        if executable == "helm" and arguments[0] == "history":
+            return CommandResult(
+                self.history_return_code,
+                '[{"revision":3,"status":"deployed"}]\n',
+                self.history_stderr,
+            )
+        if executable == "helm" and arguments[:2] == ["get", "manifest"]:
             return CommandResult(0, self.rendered, "")
         return CommandResult(0, "ok\n", "")
 
@@ -71,6 +91,8 @@ def test_falcone_preflight_renders_but_does_not_deploy(tmp_path: Path) -> None:
     result = FalconeHelmAdapter(runner).preflight(falcone_plan(tmp_path))
     assert result["status"] == "PREFLIGHT_PASS"
     assert result["manifest_count"] == 1
+    assert result["previous_revision"] == 3
+    assert result["previous_manifest_sha256"]
     assert not any(arguments[0] == "upgrade" for _, arguments in runner.calls)
 
 
@@ -79,6 +101,51 @@ def test_falcone_deploy_requires_current_artifact_binding(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="approval"):
         FalconeHelmAdapter(runner).deploy(falcone_plan(tmp_path), approval_is_current=False)
     assert not any(arguments[0] == "upgrade" for _, arguments in runner.calls)
+
+
+def test_falcone_preflight_fails_when_recovery_baseline_cannot_be_inspected(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(history_return_code=1, history_stderr="forbidden")
+    with pytest.raises(ValueError, match="baseline inspection failed"):
+        FalconeHelmAdapter(runner).preflight(falcone_plan(tmp_path))
+    assert not any(arguments[0] == "upgrade" for _, arguments in runner.calls)
+
+
+def test_falcone_initial_install_records_absent_recovery_baseline(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        history_return_code=1,
+        history_stderr="Error: release: not found",
+    )
+    result = FalconeHelmAdapter(runner).preflight(falcone_plan(tmp_path))
+    assert result["previous_revision"] is None
+    assert result["previous_manifest_sha256"] is None
+
+
+def test_falcone_rollback_restores_exact_captured_manifest(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    kubeconfig = tmp_path / "release.kubeconfig"
+    kubeconfig.write_text("fixture\n", encoding="utf-8")
+    manifest_sha = hashlib.sha256(runner.rendered.encode()).hexdigest()
+    plan = FalconeRecoveryPlan(
+        deployment_id="deployment",
+        change_set_id="change-set",
+        release_name="falcone",
+        namespace="falcone-staging",
+        kube_context="falcone-staging-releaser",
+        kubeconfig_path=kubeconfig,
+        previous_revision=3,
+        previous_manifest_sha256=manifest_sha,
+        original_artifact_binding_sha256="c" * 64,
+        recovery_approval_binding_sha256="d" * 64,
+        timeout_minutes=5,
+    )
+
+    result = FalconeHelmAdapter(runner).rollback(plan, approval_is_current=True)
+
+    assert result["status"] == "ROLLBACK_APPLIED"
+    assert result["manifest_sha256"] == manifest_sha
+    assert any(arguments[0] == "rollback" for _, arguments in runner.calls)
 
 
 def create_deployment_repo(tmp_path: Path, yaml_text: str) -> Path:

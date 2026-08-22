@@ -49,6 +49,7 @@ engineering-ctl evidence <artifact-id>
 engineering-ctl delivery <finding-uuid> --risk R1
 engineering-ctl deployment <change-set-uuid> --environment preview
 engineering-ctl deployment <change-set-uuid> --environment staging
+engineering-ctl approval-candidate <change-set-uuid>
 engineering-ctl approve <change-set-uuid> <binding-sha256>
 engineering-ctl verify-runtime <deployment-uuid>
 engineering-ctl rollback <deployment-uuid> <binding-sha256>
@@ -56,6 +57,9 @@ engineering-ctl rollback <deployment-uuid> <binding-sha256>
 
 Commands default to dry-run where applicable. Use `--execute` only after all corresponding write,
 approval, and credential gates are satisfied.
+
+`rollback --execute` pauses at `AWAITING_RECOVERY_APPROVAL`. Fetch the new recovery candidate and
+approve its binding; do not reuse the original staging binding as the recovery approval.
 
 ## Service control
 

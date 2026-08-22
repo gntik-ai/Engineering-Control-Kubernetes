@@ -9,7 +9,7 @@ import stat
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -225,6 +225,12 @@ class MetadataActivityHandler:
             "runtime.prepare_review",
             "runtime.finalize",
             "runtime.record_failure",
+            "recovery.inspect",
+            "recovery.validate_binding",
+            "recovery.prepare_candidate",
+            "recovery.validate_approval",
+            "recovery.verify",
+            "recovery.record_failure",
             "quota.persist",
         }
     )
@@ -317,6 +323,24 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._finalize_runtime, payload)
             if step == "runtime.record_failure":
                 return await asyncio.to_thread(self._record_runtime_failure, payload)
+            if step == "recovery.inspect":
+                return await asyncio.to_thread(self._inspect_recovery, payload)
+            if step == "recovery.validate_binding":
+                return await asyncio.to_thread(self._validate_recovery_binding, payload)
+            if step == "recovery.prepare_candidate":
+                try:
+                    return await asyncio.to_thread(self._prepare_recovery_candidate, payload)
+                except ComponentLeaseConflict:
+                    return await asyncio.to_thread(
+                        self._record_recovery_failure,
+                        {**payload, "blocker": "RECOVERY_DEPLOYMENT_LEASE_CONFLICT"},
+                    )
+            if step == "recovery.validate_approval":
+                return await asyncio.to_thread(self._validate_recovery_approval, payload)
+            if step == "recovery.verify":
+                return await asyncio.to_thread(self._verify_recovery, payload)
+            if step == "recovery.record_failure":
+                return await asyncio.to_thread(self._record_recovery_failure, payload)
             if step == "quota.persist":
                 return await self._quota(payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
@@ -1667,6 +1691,23 @@ class MetadataActivityHandler:
             deployment.status = "STAGING_DEPLOYED"
             deployment.transaction_id = str(payload.get("transaction_id", "")) or None
             deployment.finished_at = datetime.now(UTC)
+            existing_recovery = dict(deployment.recovery_json)
+            existing_recovery.update(
+                {
+                    "deployed_artifact_binding_sha256": str(
+                        payload["artifact_binding_sha256"]
+                    ),
+                    "release_plan": self._object(payload.get("release_plan"), "release_plan"),
+                    "release_preflight": self._object(
+                        payload.get("release_preflight"), "release_preflight"
+                    ),
+                    "release_evidence": self._object(
+                        payload.get("release_evidence"), "release_evidence"
+                    ),
+                    "previous_deployment_sha": change_set.deployment_base_sha,
+                }
+            )
+            deployment.recovery_json = existing_recovery
             run.status = "SUCCESS"
             run.finished_at = datetime.now(UTC)
             self._release_deployment_lease(session, change_set, run)
@@ -2139,6 +2180,528 @@ class MetadataActivityHandler:
                     )
                 )
             return {**payload, "status": "INCIDENT_OPEN"}
+
+    def _inspect_recovery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        deployment_id = UUID(str(payload["deployment_id"]))
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        expected_binding = str(payload["expected_artifact_binding_sha256"])
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, deployment_id)
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if (
+                deployment is None
+                or run is None
+                or run.change_set_id != deployment.change_set_id
+                or run.summary != str(deployment_id)
+            ):
+                raise ValueError("recovery deployment/Run binding is missing")
+            change_set = session.get(ChangeSet, deployment.change_set_id)
+            if change_set is None or change_set.project != deployment.project:
+                raise ValueError("recovery ChangeSet binding is missing")
+            recovery = self._object(deployment.recovery_json, "deployment recovery metadata")
+            stored_binding = recovery.get("deployed_artifact_binding_sha256")
+            if not isinstance(stored_binding, str) or stored_binding != expected_binding:
+                return self._recovery_block(
+                    payload,
+                    run,
+                    "RECOVERY_ARTIFACT_BINDING_MISMATCH",
+                    deployment=deployment,
+                    change_set=change_set,
+                )
+            approval = session.scalar(
+                select(Approval).where(
+                    Approval.change_set_id == change_set.id,
+                    Approval.approval_type == "staging",
+                    Approval.artifact_binding_sha256 == expected_binding,
+                    Approval.decision == "approve",
+                    Approval.invalidated_at.is_(None),
+                )
+            )
+            if approval is None or not self._stored_staging_binding_is_current(
+                session, change_set, deployment, recovery, expected_binding
+            ):
+                return self._recovery_block(
+                    payload,
+                    run,
+                    "RECOVERY_ORIGINAL_APPROVAL_INVALID",
+                    deployment=deployment,
+                    change_set=change_set,
+                )
+            release_plan = self._object(recovery.get("release_plan"), "stored release plan")
+            preflight = self._object(
+                recovery.get("release_preflight"), "stored release preflight"
+            )
+            evidence = self._object(
+                recovery.get("release_evidence"), "stored release evidence"
+            )
+            plan: dict[str, Any]
+            action: str
+            blocker: str | None = None
+            if deployment.project == Project.FALCONE.value:
+                if bool(evidence.get("migration", False)):
+                    action = "forward-recovery"
+                    blocker = "MIGRATION_FORWARD_RECOVERY_REQUIRED"
+                    plan = {
+                        "strategy": "helm-forward-recovery",
+                        "deployment_id": str(deployment.id),
+                        "change_set_id": str(change_set.id),
+                        "reason": blocker,
+                        "original_artifact_binding_sha256": expected_binding,
+                    }
+                else:
+                    revision = preflight.get("previous_revision")
+                    manifest_sha = preflight.get("previous_manifest_sha256")
+                    if not isinstance(revision, int) or revision < 1 or not self._is_digest(
+                        manifest_sha
+                    ):
+                        return self._recovery_block(
+                            payload,
+                            run,
+                            "RECOVERY_BASELINE_MISSING",
+                            deployment=deployment,
+                            change_set=change_set,
+                        )
+                    action = "helm-rollback"
+                    plan = {
+                        "strategy": "helm",
+                        "deployment_id": str(deployment.id),
+                        "change_set_id": str(change_set.id),
+                        "release_name": str(release_plan["release_name"]),
+                        "namespace": deployment.target_namespace,
+                        "kube_context": str(release_plan["kube_context"]),
+                        "kubeconfig_path": str(release_plan["kubeconfig_path"]),
+                        "previous_revision": revision,
+                        "previous_manifest_sha256": str(manifest_sha),
+                        "original_artifact_binding_sha256": expected_binding,
+                        "recovery_approval_binding_sha256": "0" * 64,
+                        "timeout_minutes": int(release_plan.get("timeout_minutes", 30)),
+                    }
+            else:
+                action = "gitops-revert-pr"
+                blocker = "PROTECTED_RECOVERY_PR_REQUIRED"
+                plan = {
+                    "strategy": "argocd-gitops",
+                    "deployment_id": str(deployment.id),
+                    "change_set_id": str(change_set.id),
+                    "deployment_repository": change_set.deployment_repository,
+                    "failed_revision": deployment.desired_sha,
+                    "revert_target_revision": change_set.deployment_base_sha,
+                    "target_context": deployment.target_context,
+                    "target_namespace": deployment.target_namespace,
+                    "original_artifact_binding_sha256": expected_binding,
+                    "required_path": "protected-deployment-repository-pr",
+                }
+            run.status = "RUNNING"
+            run.started_at = run.started_at or datetime.now(UTC)
+            return {
+                **payload,
+                "project": deployment.project,
+                "change_set_id": str(change_set.id),
+                "risk_class": change_set.risk_class,
+                "action": action,
+                "status": "RECOVERY_INSPECTED",
+                "recovery_plan": plan,
+                "recovery_blocker": blocker,
+            }
+
+    def _validate_recovery_binding(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        plan = self._object(payload.get("recovery_plan"), "recovery plan")
+        canonical_plan = {
+            key: value
+            for key, value in plan.items()
+            if key != "recovery_approval_binding_sha256"
+        }
+        plan_sha = hashlib.sha256(
+            json.dumps(canonical_plan, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None:
+                raise ValueError("recovery Run binding is missing")
+            blocker = payload.get("recovery_blocker")
+            if isinstance(blocker, str):
+                deployment = session.get(Deployment, UUID(str(payload["deployment_id"])))
+                change_set = session.get(ChangeSet, run.change_set_id)
+                if deployment is None or change_set is None:
+                    raise ValueError("forward recovery metadata is missing")
+                run.status = "BLOCKED"
+                run.error_code = blocker
+                run.finished_at = datetime.now(UTC)
+                change_set.state = ChangeSetState.FORWARD_RECOVERY_REQUIRED.value
+                change_set.version += 1
+                incident = self._ensure_recovery_incident(session, change_set, deployment)
+                incident.recovery_state = blocker
+                return {
+                    **payload,
+                    "status": "FORWARD_RECOVERY_REQUIRED",
+                    "recovery_plan_sha256": plan_sha,
+                    "blocker": blocker,
+                }
+            if bool(payload.get("dry_run", True)):
+                run.status = "SUCCESS"
+                run.summary = "immutable recovery plan validated without mutation"
+                run.finished_at = datetime.now(UTC)
+                return {
+                    **payload,
+                    "status": "RECOVERY_PLAN_VALIDATED",
+                    "recovery_plan_sha256": plan_sha,
+                }
+            return {
+                **payload,
+                "status": "RECOVERY_BINDING_VALIDATED",
+                "recovery_plan_sha256": plan_sha,
+            }
+
+    def _prepare_recovery_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        change_set_id = UUID(str(payload["change_set_id"]))
+        deployment_id = UUID(str(payload["deployment_id"]))
+        plan = self._object(payload.get("recovery_plan"), "recovery plan")
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            change_set = session.get(ChangeSet, change_set_id)
+            deployment = session.get(Deployment, deployment_id)
+            if (
+                run is None
+                or change_set is None
+                or deployment is None
+                or run.change_set_id != change_set_id
+                or deployment.change_set_id != change_set_id
+            ):
+                raise ValueError("recovery candidate metadata binding is missing")
+            lease = ComponentLeaseManager().acquire(
+                session,
+                component_key=f"{change_set.project}:deploy:{deployment.environment}",
+                owner_run_id=run.id,
+                mode="deployment",
+                ttl=timedelta(hours=4),
+            )
+            current = session.scalar(
+                select(ApprovalCandidate).where(
+                    ApprovalCandidate.change_set_id == change_set_id,
+                    ApprovalCandidate.invalidated_at.is_(None),
+                )
+            )
+            if current is not None:
+                current.invalidated_at = datetime.now(UTC)
+            approval_payload = {
+                "approval_type": "recovery",
+                "project": change_set.project,
+                "change_set_id": str(change_set.id),
+                "deployment_id": str(deployment.id),
+                "risk_class": change_set.risk_class,
+                "recovery_action": str(payload["action"]),
+                "recovery_plan_sha256": str(payload["recovery_plan_sha256"]),
+                "original_artifact_binding_sha256": str(
+                    payload["expected_artifact_binding_sha256"]
+                ),
+                "target_context": deployment.target_context,
+                "target_namespace": deployment.target_namespace,
+            }
+            binding = ApprovalService.digest(approval_payload)
+            bound_plan = dict(plan)
+            bound_plan["recovery_approval_binding_sha256"] = binding
+            candidate_id = uuid5(
+                NAMESPACE_URL, f"recovery-approval:{deployment.id}:{binding}"
+            )
+            session.add(
+                ApprovalCandidate(
+                    id=candidate_id,
+                    change_set_id=change_set.id,
+                    workflow_id=workflow_id,
+                    risk_class=change_set.risk_class,
+                    artifact_binding_sha256=binding,
+                    payload_json={
+                        **approval_payload,
+                        "artifact_binding_sha256": binding,
+                    },
+                    invalidated_at=None,
+                )
+            )
+            run.status = "AWAITING_APPROVAL"
+            return {
+                **payload,
+                "status": "AWAITING_RECOVERY_APPROVAL",
+                "artifact_binding_sha256": binding,
+                "recovery_plan": bound_plan,
+                "approval_candidate": {
+                    **approval_payload,
+                    "artifact_binding_sha256": binding,
+                },
+                "deployment_lease_id": str(lease.id),
+            }
+
+    def _validate_recovery_approval(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = self._object(payload.get("context"), "recovery context")
+        approval_signal = self._object(payload.get("approval"), "recovery approval")
+        workflow_id = str(context["orchestration"]["workflow_id"])
+        binding = str(context["artifact_binding_sha256"])
+        decision = str(approval_signal.get("decision", ""))
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            change_set = session.get(ChangeSet, UUID(str(context["change_set_id"])))
+            deployment = session.get(Deployment, UUID(str(context["deployment_id"])))
+            candidate = session.scalar(
+                select(ApprovalCandidate).where(
+                    ApprovalCandidate.workflow_id == workflow_id,
+                    ApprovalCandidate.artifact_binding_sha256 == binding,
+                    ApprovalCandidate.invalidated_at.is_(None),
+                )
+            )
+            if run is None or change_set is None or deployment is None or candidate is None:
+                raise ValueError("recovery approval metadata binding is missing")
+            persisted = session.scalar(
+                select(Approval).where(
+                    Approval.change_set_id == change_set.id,
+                    Approval.approval_type == "recovery",
+                    Approval.artifact_binding_sha256 == binding,
+                    Approval.decision == decision,
+                    Approval.invalidated_at.is_(None),
+                )
+            )
+            candidate_payload = self._object(candidate.payload_json, "recovery candidate")
+            digest_payload = {
+                key: value
+                for key, value in candidate_payload.items()
+                if key != "artifact_binding_sha256"
+            }
+            recovery = self._object(
+                deployment.recovery_json, "deployment recovery metadata"
+            )
+            recovery_plan = self._object(context.get("recovery_plan"), "recovery plan")
+            canonical_plan = {
+                key: value
+                for key, value in recovery_plan.items()
+                if key != "recovery_approval_binding_sha256"
+            }
+            current_plan_sha = hashlib.sha256(
+                json.dumps(
+                    canonical_plan, separators=(",", ":"), sort_keys=True
+                ).encode()
+            ).hexdigest()
+            original_binding = str(
+                candidate_payload.get("original_artifact_binding_sha256", "")
+            )
+            artifacts_current = (
+                recovery.get("deployed_artifact_binding_sha256") == original_binding
+                and candidate_payload.get("recovery_plan_sha256") == current_plan_sha
+                and candidate_payload.get("target_context") == deployment.target_context
+                and candidate_payload.get("target_namespace") == deployment.target_namespace
+                and self._stored_staging_binding_is_current(
+                    session,
+                    change_set,
+                    deployment,
+                    recovery,
+                    original_binding,
+                )
+            )
+            current = (
+                decision in {"approve", "reject"}
+                and approval_signal.get("artifact_binding_sha256") == binding
+                and ApprovalService.digest(digest_payload) == binding
+                and artifacts_current
+            )
+            if persisted is None or not current or decision == "reject":
+                invalidated_at = datetime.now(UTC)
+                candidate.invalidated_at = invalidated_at
+                if persisted is not None and not artifacts_current:
+                    persisted.invalidated_at = invalidated_at
+                blocker = (
+                    "RECOVERY_APPROVAL_REJECTED"
+                    if decision == "reject"
+                    else "RECOVERY_APPROVAL_ARTIFACT_DRIFT"
+                    if not artifacts_current
+                    else "RECOVERY_APPROVAL_INVALID"
+                )
+                run.status = "BLOCKED"
+                run.error_code = blocker
+                run.finished_at = invalidated_at
+                self._release_recovery_lease(session, change_set, deployment, run)
+                return {
+                    **context,
+                    "status": "BLOCKED",
+                    "blocker": blocker,
+                }
+            assert persisted is not None
+            return {
+                **context,
+                "status": "RECOVERY_APPROVED",
+                "approval_validation": {
+                    "current": True,
+                    "artifact_binding_sha256": binding,
+                    "approval_id": str(persisted.id),
+                    "approver_subject": persisted.approver_subject,
+                },
+            }
+
+    def _verify_recovery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("status") != "ROLLBACK_APPLIED":
+            raise ValueError("recovery verification requires deterministic rollback success")
+        plan = self._object(payload.get("recovery_plan"), "recovery plan")
+        if payload.get("manifest_sha256") != plan.get("previous_manifest_sha256"):
+            raise ValueError("recovery manifest does not match its captured baseline")
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        deployment_id = UUID(str(payload["deployment_id"]))
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            deployment = session.get(Deployment, deployment_id)
+            change_set = session.get(ChangeSet, deployment.change_set_id) if deployment else None
+            if run is None or deployment is None or change_set is None:
+                raise ValueError("recovery verification metadata binding is missing")
+            run.status = "SUCCESS"
+            run.summary = "exact captured Helm manifest restored; runtime retest required"
+            run.finished_at = now
+            deployment.status = "ROLLBACK_APPLIED"
+            deployment.finished_at = now
+            recovery = dict(deployment.recovery_json)
+            recovery["last_recovery_result"] = {
+                "recovery_plan_sha256": str(payload["recovery_plan_sha256"]),
+                "manifest_sha256": str(payload["manifest_sha256"]),
+                "transaction_sha256": str(payload["transaction_sha256"]),
+                "verified_at": now.isoformat(),
+            }
+            deployment.recovery_json = recovery
+            change_set.state = ChangeSetState.ROLLED_BACK.value
+            change_set.version += 1
+            candidate = session.scalar(
+                select(ApprovalCandidate).where(
+                    ApprovalCandidate.workflow_id == workflow_id,
+                    ApprovalCandidate.invalidated_at.is_(None),
+                )
+            )
+            if candidate is not None:
+                candidate.invalidated_at = now
+            incident = self._ensure_recovery_incident(session, change_set, deployment)
+            incident.recovery_state = "RUNTIME_RETEST_REQUIRED"
+            self._release_recovery_lease(session, change_set, deployment, run)
+        return {**payload, "status": "ROLLED_BACK", "runtime_retest_required": True}
+
+    def _record_recovery_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        deployment_id = UUID(str(payload["deployment_id"]))
+        blocker = str(payload.get("blocker", "RECOVERY_ACTIVITY_FAILED"))
+        allowed = {
+            "CANCELLED",
+            "ApprovalMismatch",
+            "PolicyViolation",
+            "ProtectedRecoveryPRRequired",
+            "RECOVERY_APPROVAL_REJECTED",
+            "RECOVERY_ACTIVITY_FAILED",
+            "RECOVERY_DEPLOYMENT_LEASE_CONFLICT",
+        }
+        if blocker not in allowed:
+            blocker = "RECOVERY_ACTIVITY_FAILED"
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            deployment = session.get(Deployment, deployment_id)
+            change_set = session.get(ChangeSet, deployment.change_set_id) if deployment else None
+            if run is None or deployment is None or change_set is None:
+                raise ValueError("recovery failure metadata binding is missing")
+            if run.finished_at is None:
+                now = datetime.now(UTC)
+                run.status = "CANCELLED" if blocker == "CANCELLED" else "BLOCKED"
+                run.error_code = blocker
+                run.finished_at = now
+                if blocker not in {"CANCELLED", "RECOVERY_DEPLOYMENT_LEASE_CONFLICT"}:
+                    deployment.status = "RECOVERY_FAILED"
+                    change_set.state = ChangeSetState.INCIDENT_OPEN.value
+                    change_set.version += 1
+                    incident = self._ensure_recovery_incident(session, change_set, deployment)
+                    incident.recovery_state = blocker
+                candidate = session.scalar(
+                    select(ApprovalCandidate).where(
+                        ApprovalCandidate.workflow_id == workflow_id,
+                        ApprovalCandidate.invalidated_at.is_(None),
+                    )
+                )
+                if candidate is not None:
+                    candidate.invalidated_at = now
+                self._release_recovery_lease(session, change_set, deployment, run)
+        return {**payload, "status": run.status, "blocker": blocker}
+
+    def _stored_staging_binding_is_current(
+        self,
+        session: Any,
+        change_set: ChangeSet,
+        deployment: Deployment,
+        recovery: dict[str, Any],
+        expected_binding: str,
+    ) -> bool:
+        evidence = self._object(recovery.get("release_evidence"), "stored release evidence")
+        preflight = self._object(recovery.get("release_preflight"), "stored release preflight")
+        preflight_sha = hashlib.sha256(
+            json.dumps(preflight, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        current = ApprovalService.artifact_payload(
+            self._changeset_model(session, change_set),
+            target_context=deployment.target_context,
+            target_namespace=deployment.target_namespace,
+            migration=bool(evidence.get("migration", False)),
+            backup_requirement=str(evidence.get("backup_requirement", "not-required")),
+            rollback_plan_sha256=str(evidence["rollback_plan_sha256"]),
+            ci_result_sha256=str(evidence["ci_result_sha256"]),
+            independent_review_sha256=str(evidence["independent_review_sha256"]),
+            release_preflight_sha256=preflight_sha,
+        )
+        return ApprovalService.digest(current) == expected_binding
+
+    def _recovery_block(
+        self,
+        payload: dict[str, Any],
+        run: Run,
+        blocker: str,
+        *,
+        deployment: Deployment,
+        change_set: ChangeSet,
+    ) -> dict[str, Any]:
+        run.status = "BLOCKED"
+        run.error_code = blocker
+        run.finished_at = datetime.now(UTC)
+        return {
+            **payload,
+            "project": deployment.project,
+            "change_set_id": str(change_set.id),
+            "status": "BLOCKED",
+            "blocker": blocker,
+        }
+
+    @staticmethod
+    def _ensure_recovery_incident(
+        session: Any, change_set: ChangeSet, deployment: Deployment
+    ) -> Incident:
+        incident = session.scalar(
+            select(Incident).where(
+                Incident.deployment_id == deployment.id,
+                Incident.status == "OPEN",
+            )
+        )
+        if incident is None:
+            incident = Incident(
+                id=uuid5(NAMESPACE_URL, f"recovery-incident:{deployment.id}"),
+                change_set_id=change_set.id,
+                deployment_id=deployment.id,
+                project=change_set.project,
+                severity="high" if change_set.risk_class in {"R2", "R3"} else "medium",
+                status="OPEN",
+                summary="deployment recovery requires operator attention",
+                recovery_state="AWAITING_RECOVERY_DECISION",
+                opened_at=datetime.now(UTC),
+                closed_at=None,
+            )
+            session.add(incident)
+        return cast(Incident, incident)
+
+    @staticmethod
+    def _release_recovery_lease(
+        session: Any, change_set: ChangeSet, deployment: Deployment, run: Run
+    ) -> None:
+        ComponentLeaseManager().release(
+            session,
+            component_key=f"{change_set.project}:deploy:{deployment.environment}",
+            owner_run_id=run.id,
+        )
 
     def _runtime_target(self, project: Project, environment: str) -> RuntimeTargetRecord:
         if environment != "staging":

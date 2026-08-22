@@ -3,7 +3,11 @@ from uuid import uuid4
 
 import pytest
 
-from engineering_control.api.schemas import DeploymentPrepare, RuntimeVerificationStart
+from engineering_control.api.schemas import (
+    DeploymentPrepare,
+    RollbackRequest,
+    RuntimeVerificationStart,
+)
 from engineering_control.db.base import Base
 from engineering_control.db.models import Campaign, ChangeSet, Deployment, Run
 from engineering_control.db.repository import SQLMetadataRepository
@@ -179,5 +183,73 @@ async def test_runtime_verification_run_is_bound_to_deployed_artifact(tmp_path: 
     assert project is Project.FALCONE
     with repository.sessions() as session:
         run = session.query(Run).filter_by(workflow_id="runtime-verify-test").one()
+        assert run.change_set_id == change_set_id
+        assert run.summary == str(deployment_id)
+
+
+@pytest.mark.asyncio
+async def test_recovery_run_is_authoritatively_bound_before_workflow_start(
+    tmp_path: Path,
+) -> None:
+    repository = SQLMetadataRepository(f"sqlite:///{tmp_path / 'recovery.sqlite'}")
+    Base.metadata.create_all(repository.engine)
+    change_set_id = uuid4()
+    deployment_id = uuid4()
+    with repository.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="musematic",
+                risk_class="R3",
+                state="INCIDENT_OPEN",
+                version=1,
+                source_repository="musematic",
+                source_branch="agent/musematic/1/test",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url=None,
+                deployment_repository="musematic-deploy",
+                deployment_branch="agent/musematic/1/test",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url=None,
+                image_digests={"api": f"sha256:{'e' * 64}"},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Deployment(
+                id=deployment_id,
+                change_set_id=change_set_id,
+                project="musematic",
+                environment="staging",
+                strategy="argocd-gitops",
+                target_context="musematic-staging",
+                target_namespace="musematic-staging",
+                desired_sha="d" * 40,
+                status="VERIFICATION_FAILED",
+                transaction_id="test",
+                started_at=None,
+                finished_at=None,
+                recovery_json={},
+            )
+        )
+
+    project = await repository.create_recovery_run(
+        "recovery-test",
+        RollbackRequest(
+            deployment_id=deployment_id,
+            expected_artifact_binding_sha256="f" * 64,
+            dry_run=True,
+        ),
+    )
+
+    assert project is Project.MUSEMATIC
+    with repository.sessions() as session:
+        run = session.query(Run).filter_by(workflow_id="recovery-test").one()
+        assert run.run_type == "recovery"
         assert run.change_set_id == change_set_id
         assert run.summary == str(deployment_id)

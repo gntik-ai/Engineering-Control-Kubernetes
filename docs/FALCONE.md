@@ -10,6 +10,10 @@ real backup evidence and parity evidence. The adapter refuses fake backup flags 
 uses an exact context, namespace, release name, values set, timeout, current approval binding,
 `--atomic`, and `--wait`.
 
+Staging preflight also captures the prior Helm revision and only a SHA256 of its rendered manifest.
+A non-migration rollback needs a new artifact-bound approval, restores that exact revision, and
+verifies the post-rollback manifest hash. Migration-bearing releases require forward recovery.
+
 Falcone domain coverage includes tenant lifecycle/isolation, Keycloak/IAM, APISIX/gateway,
 PostgreSQL, DocumentDB/FerretDB, storage, Kafka, realtime, functions/Knative, Temporal flows, MCP
 hosting, plans/billing/quotas, backup/purge, audit/observability, console, Helm, External

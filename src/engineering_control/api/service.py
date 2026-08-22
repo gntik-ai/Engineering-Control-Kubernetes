@@ -134,6 +134,7 @@ class TemporalControlService:
 
     async def rollback(self, request: RollbackRequest) -> OperationAccepted:
         workflow_id = f"recovery-{request.deployment_id}-{uuid4()}"
+        await self.repository.create_recovery_run(workflow_id, request)
         handle = await self.client.start_workflow(
             WorkflowName.RECOVERY.value,
             RecoveryInput(**request.model_dump()),

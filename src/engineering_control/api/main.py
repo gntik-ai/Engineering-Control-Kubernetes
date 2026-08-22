@@ -214,7 +214,10 @@ def create_app(
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
-        return await service.rollback(body)
+        try:
+            return await service.rollback(body)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post(
         "/v1/deployments/verify-runtime",

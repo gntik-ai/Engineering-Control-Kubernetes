@@ -74,6 +74,7 @@ def parser() -> argparse.ArgumentParser:
     deployment.add_argument("--environment", choices=("preview", "staging"), required=True)
     deployment.add_argument("--execute", action="store_true")
     commands.add_parser("verify-runtime").add_argument("deployment_id")
+    commands.add_parser("approval-candidate").add_argument("change_set_id")
     for decision in ("approve", "reject"):
         approval = commands.add_parser(decision)
         approval.add_argument("change_set_id")
@@ -144,6 +145,8 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             "/v1/deployments/verify-runtime",
             {"deployment_id": arguments.deployment_id},
         )
+    if command == "approval-candidate":
+        return client.request("GET", f"/v1/approvals/{arguments.change_set_id}/candidate")
     if command in {"approve", "reject"}:
         return client.request(
             "POST",

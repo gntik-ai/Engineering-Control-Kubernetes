@@ -32,14 +32,20 @@ Falcone targets require a chart-relative values list, release name, exact kube c
 absolute mode-`0600` kubeconfig under `/etc/engineering-control/env/release/`. The release worker
 verifies its chart worktree and exact chart SHA, runs `helm lint` and `helm template`, and captures
 hashes before an approval candidate can exist. A migration additionally requires real backup and
-environment-parity evidence hashes. The approved adapter uses `helm upgrade --install --atomic
---wait`; arbitrary Helm arguments are not accepted.
+environment-parity evidence hashes. The approved adapter uses
+`helm upgrade --install --atomic --wait`; arbitrary Helm arguments are not accepted. Before
+mutation it also captures the existing
+Helm revision and hashes its manifest as a recovery baseline. Recovery requires a second immutable
+approval and accepts only an exact manifest-hash restoration. Missing baseline metadata and
+migration-bearing releases fail closed.
 
 Musematic targets require an Argo CD application name. Preflight demands a clean bounded
 `musematic-deploy` worktree at the exact deployment SHA, immutable image digests, and no known
 mutable-image updater pattern. Desired-state change still occurs only through the protected
 deployment PR. After approval, the release adapter observes Argo CD and accepts only the exact
-approved revision when both sync and health are good; it does not patch Kubernetes.
+approved revision when both sync and health are good; it does not patch Kubernetes. Recovery
+similarly refuses live mutation and produces a protected deployment-repository revert plan
+targeting the prior immutable base SHA.
 
 The activation sequence is:
 

@@ -497,15 +497,58 @@ class RuntimeVerificationWorkflow(ControlledWorkflow):
 
 @workflow.defn(name="RecoveryWorkflow")
 class RecoveryWorkflow(ControlledWorkflow):
+    _reported_recovery_errors = frozenset(
+        {
+            "ApprovalMismatch",
+            "PolicyViolation",
+            "ProtectedRecoveryPRRequired",
+        }
+    )
+
     @workflow.run
     async def run(self, request: RecoveryInput) -> dict[str, Any]:
-        context = await self._step("recovery.inspect", asdict(request))
-        context = await self._step("recovery.validate_binding", context)
-        if request.dry_run:
-            return {"status": "RECOVERY_PLAN_VALIDATED", "context": context}
-        context = await self._step("recovery.execute", context, timeout_minutes=60)
-        verified = await self._step("recovery.verify", context, timeout_minutes=60)
-        return {"status": verified.get("status", "RECOVERED"), "context": verified}
+        context: dict[str, Any] = asdict(request)
+        try:
+            context = await self._step("recovery.inspect", context)
+            if context.get("status") == "BLOCKED":
+                return {"status": "BLOCKED", "context": context}
+            context = await self._step("recovery.validate_binding", context)
+            if request.dry_run or context.get("status") == "FORWARD_RECOVERY_REQUIRED":
+                return {
+                    "status": context.get("status", "RECOVERY_PLAN_VALIDATED"),
+                    "context": context,
+                }
+            context = await self._step("recovery.prepare_candidate", context)
+            if context.get("status") == "BLOCKED":
+                return {"status": "BLOCKED", "context": context}
+            self._phase = "AWAITING_RECOVERY_APPROVAL"
+            await workflow.wait_condition(lambda: self._approval is not None or self._cancelled)
+            if self._cancelled:
+                context = await self._step(
+                    "recovery.record_failure", {**context, "blocker": "CANCELLED"}
+                )
+                return {"status": "CANCELLED", "context": context}
+            context = await self._step(
+                "recovery.validate_approval",
+                {"context": context, "approval": self._approval or {}},
+            )
+            if context.get("status") != "RECOVERY_APPROVED":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
+            context = await self._step("recovery.execute", context, timeout_minutes=60)
+            verified = await self._step("recovery.verify", context, timeout_minutes=60)
+            return {"status": verified.get("status", "RECOVERED"), "context": verified}
+        except ActivityError as error:
+            cause = error.cause
+            blocker = (
+                cause.type
+                if isinstance(cause, ApplicationError)
+                and cause.type in self._reported_recovery_errors
+                else "RECOVERY_ACTIVITY_FAILED"
+            )
+            context = await self._step(
+                "recovery.record_failure", {**context, "blocker": blocker}
+            )
+            return {"status": context.get("status", "BLOCKED"), "context": context}
 
 
 @workflow.defn(name="QuotaRefreshWorkflow")
