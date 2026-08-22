@@ -36,5 +36,9 @@ deployments:
   default_enabled: false
   preview_mutation_enabled: false
   production_enabled: false
+runtime_verification:
+  targets: /etc/engineering-control/runtime
+  default_enabled: false
+  observer_credentials: /etc/engineering-control/env/observer
 paid_api_fallback:
   enabled: false

@@ -12,14 +12,18 @@ from engineering_control.config import Settings
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
     Approval,
+    ApprovalCandidate,
     Campaign,
     ChangeSet,
+    ComponentLease,
     CoverageCell,
+    Deployment,
     Finding,
     QuotaSnapshot,
     Run,
     WorktreeLease,
 )
+from engineering_control.policy.approvals import ApprovalService
 
 
 @pytest.mark.asyncio
@@ -668,6 +672,12 @@ configuration:
     assert candidate["approval_candidate"]["source_sha"] == "b" * 40
     assert candidate["approval_candidate"]["deployment_sha"] == "d" * 40
     assert len(candidate["approval_candidate"]["release_preflight_sha256"]) == 64
+    with handler.sessions() as session:
+        deployment_lease = session.scalar(
+            select(ComponentLease).where(ComponentLease.released_at.is_(None))
+        )
+        assert deployment_lease is not None
+        assert deployment_lease.component_key == "musematic:deploy:staging"
 
     with handler.sessions.begin() as session:
         session.add(
@@ -720,3 +730,215 @@ configuration:
         assert stored_run is not None
         assert stored_run.status == "BLOCKED"
         assert stored_run.error_code == "APPROVAL_ARTIFACT_DRIFT"
+        active_lease_count = session.scalar(
+            select(func.count())
+            .select_from(ComponentLease)
+            .where(ComponentLease.released_at.is_(None))
+        )
+        assert active_lease_count == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_verification_routes_opposite_maker_and_finalizes(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    (runtime_root / "falcone-staging.yaml").write_text(
+        """version: 1
+enabled: true
+project: falcone
+environment: staging
+target_context: falcone-staging-observer
+target_namespace: falcone-staging
+configuration:
+  observer_kubeconfig_path: /etc/engineering-control/env/observer/falcone.kubeconfig
+  observed_resources: [deployments, pods]
+  revision_annotation: engineering.gntik.ai/deployment-sha
+  journey_plan_path: /etc/engineering-control/journeys/falcone-staging.json
+  browser_credential_file: null
+""",
+        encoding="utf-8",
+    )
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'runtime.sqlite'}",
+            runtime_target_root=runtime_root,
+            browser_evidence_root=tmp_path / "browser-evidence",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    deployment_id = uuid4()
+    run_id = uuid4()
+    workflow_id = f"runtime-verify-{deployment_id}"
+    source_worktree = tmp_path / "worktrees" / "falcone" / str(change_set_id)
+    deployment_worktree = tmp_path / "worktrees" / "falcone-charts" / str(change_set_id)
+    source_worktree.mkdir(parents=True)
+    deployment_worktree.mkdir(parents=True)
+    change_set = ChangeSet(
+        id=change_set_id,
+        finding_id=uuid4(),
+        issue_id=None,
+        project="falcone",
+        risk_class="R2",
+        state="STAGING_DEPLOYED",
+        version=1,
+        source_repository="falcone",
+        source_branch="agent/falcone/1/test",
+        source_base_sha="a" * 40,
+        source_head_sha="b" * 40,
+        source_pr_url="https://github.com/gntik-ai/falcone/pull/1",
+        deployment_repository="falcone-charts",
+        deployment_branch="agent/falcone/1/test",
+        deployment_base_sha="c" * 40,
+        deployment_head_sha="d" * 40,
+        deployment_pr_url="https://github.com/gntik-ai/falcone-charts/pull/1",
+        image_digests={"api": f"sha256:{'e' * 64}"},
+        chart_version="1.2.3",
+        recovery_json={"provider_chain": {"maker": "codex", "checker": "claude"}},
+    )
+    approval_payload = {
+        "change_set_id": str(change_set_id),
+        "project": "falcone",
+        "risk_class": "R2",
+        "source_pr": "https://github.com/gntik-ai/falcone/pull/1",
+        "source_sha": "b" * 40,
+        "deployment_pr": "https://github.com/gntik-ai/falcone-charts/pull/1",
+        "deployment_sha": "d" * 40,
+        "image_digests": {"api": f"sha256:{'e' * 64}"},
+        "target_context": "falcone-staging-releaser",
+        "target_namespace": "falcone-staging",
+        "migration": False,
+        "backup_requirement": "not-required",
+        "rollback_plan_sha256": "1" * 64,
+        "ci_result_sha256": "2" * 64,
+        "independent_review_sha256": "3" * 64,
+        "release_preflight_sha256": "4" * 64,
+    }
+    binding = ApprovalService.digest(approval_payload)
+    deployment = Deployment(
+        id=deployment_id,
+        change_set_id=change_set_id,
+        project="falcone",
+        environment="staging",
+        strategy="helm",
+        target_context="falcone-staging-releaser",
+        target_namespace="falcone-staging",
+        desired_sha="d" * 40,
+        status="STAGING_DEPLOYED",
+        transaction_id="transaction",
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        recovery_json={},
+    )
+    run = Run(
+        id=run_id,
+        campaign_id=None,
+        change_set_id=change_set_id,
+        workflow_id=workflow_id,
+        run_type="runtime-verification",
+        status="QUEUED",
+        project="falcone",
+        summary=str(deployment_id),
+    )
+    candidate = ApprovalCandidate(
+        id=uuid4(),
+        change_set_id=change_set_id,
+        workflow_id="deploy-staging-source",
+        risk_class="R2",
+        artifact_binding_sha256=binding,
+        payload_json={**approval_payload, "artifact_binding_sha256": binding},
+        invalidated_at=None,
+    )
+    approval = Approval(
+        id=uuid4(),
+        change_set_id=change_set_id,
+        approval_type="staging",
+        decision="approve",
+        artifact_binding_sha256=binding,
+        approver_subject="operator:test",
+        approved_at=datetime.now(UTC),
+        invalidated_at=None,
+        metadata_json={},
+    )
+    leases = [
+        WorktreeLease(
+            id=uuid4(),
+            change_set_id=change_set_id,
+            repository=repository,
+            worktree_path=str(path),
+            branch=f"agent/falcone/1/{change_set_id}",
+            owner_run_id=run_id,
+            base_sha=base_sha,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            released_at=None,
+        )
+        for repository, path, base_sha in (
+            ("falcone", source_worktree, "a" * 40),
+            ("falcone-charts", deployment_worktree, "c" * 40),
+        )
+    ]
+    with handler.sessions.begin() as session:
+        session.add_all([change_set, deployment, run, candidate, approval, *leases])
+
+    snapshot = await handler.handle(
+        "runtime.snapshot",
+        {
+            "deployment_id": str(deployment_id),
+            "project": "falcone",
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+
+    assert snapshot["status"] == "RUNTIME_SNAPSHOT_READY"
+    assert snapshot["review_providers"] == ["claude"]
+    prepared = await handler.handle(
+        "runtime.prepare_review",
+        {
+            **snapshot,
+            "runtime_observation": {
+                "status": "RUNTIME_OBSERVATION_PASS",
+                "observed_revisions": ["d" * 40],
+                "observed_image_digests": [f"sha256:{'e' * 64}"],
+            },
+            "result": {"status": "PASS", "error": None},
+        }
+    )
+    assert prepared["runtime_review_requests"][0]["provider"] == "claude"
+    finalized = await handler.handle(
+        "runtime.finalize",
+        {
+            **prepared,
+            "runtime_review_results": [
+                {
+                    "status": "SUCCESS",
+                    "agent_result": {
+                        "provider": "claude",
+                        "structured_result": {
+                            "decision": "RUNTIME_VERIFIED",
+                            "observed_revision": "d" * 40,
+                            "observed_digests": {"api": f"sha256:{'e' * 64}"},
+                            "checks": [
+                                {
+                                    "name": "approved-artifacts",
+                                    "status": "PASS",
+                                    "summary": "revision and digests match",
+                                }
+                            ],
+                            "evidence": [binding],
+                            "incident_required": False,
+                        },
+                    },
+                }
+            ],
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+
+    assert finalized["status"] == "RUNTIME_VERIFIED"
+    with handler.sessions() as session:
+        stored_change_set = session.get(ChangeSet, change_set_id)
+        stored_deployment = session.get(Deployment, deployment_id)
+        stored_run = session.get(Run, run_id)
+        assert stored_change_set is not None and stored_change_set.state == "RUNTIME_VERIFIED"
+        assert stored_deployment is not None and stored_deployment.status == "RUNTIME_VERIFIED"
+        assert stored_run is not None and stored_run.status == "SUCCESS"

@@ -52,3 +52,29 @@ The activation sequence is:
 The controller creates a deployment Run only for an authoritative ChangeSet in a deployable state.
 Disabled or malformed targets, incomplete source/deployment evidence, or a missing deployment
 worktree lease end in a structured blocker without invoking a release mutation.
+
+## Runtime verification
+
+Runtime verification is a separate durable workflow started after staging reaches the exact
+approved revision. Its two target templates under `config/runtime/` install disabled. Activation
+requires a mode-`0600` observer kubeconfig under `/etc/engineering-control/env/observer`, a fixed
+context/namespace, an allowlisted resource list, an exact revision source (Falcone annotation or
+Musematic Argo application), and a schema-validated Playwright journey.
+
+The `scan-runner` first proves its observer cannot read Secrets or mutate representative resources.
+It then reduces Kubernetes responses to names, readiness, observed revision, and immutable image
+digests; raw object payloads are not persisted or sent to a model. `browser-runner` executes the
+fixed journey with credentials from a protected file, centrally redacts its JSON result, and
+publishes that result through identity-bound evidence ingest. Credentialed traces/screenshots are
+withheld rather than asserted safe without review.
+
+An opposite-provider `runtime-verifier` judges only the reduced evidence from a read-only source
+worktree. R3 invokes both providers. Deterministic finalization independently rechecks revision,
+digests, every reviewer check, provider identity, the original staging approval, and browser result.
+Success transitions the ChangeSet and Deployment to `RUNTIME_VERIFIED`; failure opens an incident
+and stops at a recovery decision. A model cannot make either transition itself.
+
+```bash
+engineering-ctl deployment <change-set-uuid> --environment staging
+engineering-ctl verify-runtime <deployment-uuid>
+```

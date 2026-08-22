@@ -25,7 +25,8 @@ Trust boundaries:
 - `codex-runner` and `claude-runner` use separately authenticated native CLIs and write only an
   assigned worktree through POSIX ACLs.
 - `browser-runner` receives journey credentials by protected file handle, never prompt text.
-- `scan-runner` owns canonical mirrors and deterministic scanners.
+- `scan-runner` owns canonical mirrors, deterministic scanners, and a separate read-only observer
+  kubeconfig that is programmatically rejected if it can read Secrets or mutate workloads.
 - `release-runner` receives only scoped release plans and release credentials. It has no model
   home or prompt-driven execution.
 - Each worker identity receives its own upload-scoped evidence token; producer impersonation is
@@ -44,3 +45,8 @@ handler raise `NotConfigured`; missing native authentication is a manual blocker
 mutation needs a deterministic adapter, current artifact binding, and scoped credentials.
 Text and JSON evidence is rejected in memory if central redaction would make any replacement;
 unredacted bytes are never written. Binary evidence requires a producer `REDACTED` assertion.
+
+Post-staging verification is another durable transaction: controller metadata snapshot, reduced
+read-only Kubernetes observation, isolated Playwright journey, opposite-provider review (both
+providers for R3), deterministic artifact comparison, evidence indexing, and either
+`RUNTIME_VERIFIED` or `INCIDENT_OPEN`.

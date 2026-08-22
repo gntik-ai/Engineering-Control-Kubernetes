@@ -3,15 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from temporalio.exceptions import ApplicationError
 
-from engineering_control.adapters.command import SafeCommandRunner
+from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
+from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
 from engineering_control.evidence.transfer import EvidencePublisher
@@ -40,6 +43,41 @@ class WorktreeAllocationRequest(BaseModel):
     checker_provider: Provider
 
 
+class RuntimeObservationPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project: Project
+    deployment_id: UUID
+    change_set_id: UUID
+    kubeconfig_path: Path
+    kube_context: str = Field(min_length=1, max_length=253)
+    namespace: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    resources: tuple[str, ...] = Field(min_length=1, max_length=10)
+    source_worktree: Path
+    deployment_worktree: Path
+    expected_source_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
+    expected_deployment_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
+    expected_image_digests: dict[str, str]
+    revision_annotation: str | None = None
+    argo_application: str | None = None
+
+    @model_validator(mode="after")
+    def bounded_observation(self) -> RuntimeObservationPlan:
+        allowed = KubernetesObserver._resources - {"services", "ingresses", "cronjobs", "events"}
+        if len(set(self.resources)) != len(self.resources) or set(self.resources) - allowed:
+            raise ValueError("runtime observation resources are not allowlisted and unique")
+        if not self.expected_image_digests or any(
+            not re.fullmatch(r"sha256:[a-f0-9]{64}", value)
+            for value in self.expected_image_digests.values()
+        ):
+            raise ValueError("runtime observation requires immutable expected image digests")
+        if self.project is Project.FALCONE and not self.revision_annotation:
+            raise ValueError("Falcone runtime observation requires a revision annotation")
+        if self.project is Project.MUSEMATIC and not self.argo_application:
+            raise ValueError("Musematic runtime observation requires an Argo application")
+        return self
+
+
 class ScanActivityHandler:
     """Bounded mirror and worktree operations owned only by scan-runner."""
 
@@ -50,6 +88,7 @@ class ScanActivityHandler:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "runtime.deterministic_checks",
         }
     )
     _repositories = {
@@ -63,6 +102,7 @@ class ScanActivityHandler:
         manager: GitWorktreeManager | None = None,
         scanner: DeterministicScanner | None = None,
         publisher: EvidencePublisher | None = None,
+        observer_runner: SafeCommandRunner | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager or GitWorktreeManager(
@@ -82,6 +122,9 @@ class ScanActivityHandler:
             )
         )
         self.publisher = publisher or EvidencePublisher(settings, settings.evidence_root)
+        self.observer_runner = observer_runner or SafeCommandRunner(
+            {"kubectl": settings.kubectl_executable}
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -95,8 +138,21 @@ class ScanActivityHandler:
                 return self._allocate(payload)
             if step == "delivery.deterministic_prechecks":
                 return self._delivery_prechecks(payload)
+            if step == "runtime.deterministic_checks":
+                return self._runtime_deterministic_checks(payload)
             if step == "delivery.validate_changeset":
                 return self._validate_changeset(payload)
+        except PermissionError as error:
+            raise ApplicationError(
+                "runtime observer credential violates least-privilege policy",
+                type="SecurityBlocker",
+                non_retryable=True,
+            ) from error
+        except CommandFailure as error:
+            raise ApplicationError(
+                "runtime observation command failed",
+                type="RuntimeObservationUnavailable",
+            ) from error
         except (ValueError, ValidationError, WorktreeError) as error:
             message = str(error)
             error_type = "DirtyWorktree" if "dirty" in message.lower() else "PolicyViolation"
@@ -106,6 +162,175 @@ class ScanActivityHandler:
             type="NotConfigured",
             non_retryable=True,
         )
+
+    def _runtime_deterministic_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_plan = self._find_mapping(payload, "runtime_observation_plan")
+        if raw_plan is None:
+            raise ValueError("runtime observation requires a typed plan")
+        plan = RuntimeObservationPlan.model_validate(raw_plan)
+        source_snapshot = self.manager.inspect_snapshot(
+            plan.source_worktree,
+            expected_sha=plan.expected_source_sha,
+        )
+        deployment_snapshot = self.manager.inspect_snapshot(
+            plan.deployment_worktree,
+            expected_sha=plan.expected_deployment_sha,
+        )
+        kubeconfig = self._observer_credential(plan.kubeconfig_path)
+        observer = KubernetesObserver(
+            self.observer_runner,
+            kubeconfig=kubeconfig,
+            context=plan.kube_context,
+            working_directory=self.settings.run_root / "scan",
+        )
+        observer.verify_permissions((plan.namespace,), plan.resources)
+        summaries: dict[str, Any] = {}
+        revisions: set[str] = set()
+        observed_digests: set[str] = set()
+        failures: list[str] = []
+        for resource in plan.resources:
+            name = plan.argo_application if resource == "applications.argoproj.io" else None
+            result = observer.get(resource, namespace=plan.namespace, name=name)
+            summary = self._summarize_runtime_resource(
+                resource,
+                json.loads(result.stdout),
+                revision_annotation=plan.revision_annotation,
+            )
+            summaries[resource] = summary
+            revisions.update(summary["revisions"])
+            observed_digests.update(summary["image_digests"])
+            failures.extend(summary["failures"])
+        revision_matches = revisions == {plan.expected_deployment_sha}
+        expected_digests = set(plan.expected_image_digests.values())
+        digests_match = expected_digests.issubset(observed_digests)
+        if not revision_matches:
+            failures.append("approved deployment revision was not observed exactly")
+        if not digests_match:
+            failures.append("one or more approved immutable image digests were not observed")
+        observation = {
+            "status": "RUNTIME_OBSERVATION_PASS" if not failures else "FAIL",
+            "expected_revision": plan.expected_deployment_sha,
+            "observed_revisions": sorted(revisions),
+            "expected_image_digests": dict(sorted(plan.expected_image_digests.items())),
+            "observed_image_digests": sorted(observed_digests),
+            "revision_matches": revision_matches,
+            "digests_match": digests_match,
+            "resources": summaries,
+            "source_snapshot": source_snapshot,
+            "deployment_snapshot": deployment_snapshot,
+            "failures": failures,
+        }
+        evidence_root = (
+            self.settings.evidence_root
+            / "scan"
+            / str(plan.change_set_id)
+            / "runtime"
+        )
+        evidence_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        report = evidence_root / f"{plan.deployment_id}-observation.json"
+        safe = SecretRedactor().redact(observation).value
+        if not isinstance(safe, dict):
+            raise TypeError("redacted runtime observation must remain an object")
+        self._atomic_text(report, json.dumps(safe, indent=2, sort_keys=True) + "\n")
+        receipts = self._publish_reports(
+            payload,
+            [report],
+            filename_prefix=f"runtime-{plan.deployment_id}",
+        )
+        return {
+            **payload,
+            "status": safe["status"],
+            "runtime_observation": {**safe, "artifacts": receipts},
+        }
+
+    def _observer_credential(self, path: Path) -> Path:
+        root = self.settings.observer_credential_root.resolve()
+        resolved = path.resolve()
+        if not resolved.is_file() or not resolved.is_relative_to(root):
+            raise ValueError("observer kubeconfig escaped its credential root")
+        mode = resolved.stat().st_mode
+        if not stat.S_ISREG(mode) or mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ValueError("observer kubeconfig permissions are too broad")
+        return resolved
+
+    @staticmethod
+    def _summarize_runtime_resource(
+        resource: str,
+        value: Any,
+        *,
+        revision_annotation: str | None,
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("Kubernetes observation returned a non-object")
+        items_value = value.get("items")
+        raw_items = items_value if isinstance(items_value, list) else [value]
+        items: list[dict[str, Any]] = [item for item in raw_items if isinstance(item, dict)]
+        revisions: set[str] = set()
+        digests: set[str] = set()
+        names: list[str] = []
+        failures: list[str] = []
+        digest_pattern = re.compile(r"sha256:[a-f0-9]{64}")
+        for item in items:
+            metadata = ScanActivityHandler._mapping_value(item, "metadata")
+            spec = ScanActivityHandler._mapping_value(item, "spec")
+            status = ScanActivityHandler._mapping_value(item, "status")
+            name = str(metadata.get("name", "unknown"))
+            names.append(name)
+            annotations = ScanActivityHandler._mapping_value(metadata, "annotations")
+            if revision_annotation and isinstance(annotations.get(revision_annotation), str):
+                revisions.add(str(annotations[revision_annotation]))
+            if resource == "applications.argoproj.io":
+                sync = ScanActivityHandler._mapping_value(status, "sync")
+                health = ScanActivityHandler._mapping_value(status, "health")
+                if isinstance(sync.get("revision"), str):
+                    revisions.add(str(sync["revision"]))
+                if sync.get("status") != "Synced" or health.get("status") != "Healthy":
+                    failures.append(f"{resource}/{name} is not Synced and Healthy")
+            template = ScanActivityHandler._mapping_value(spec, "template")
+            template_spec = ScanActivityHandler._mapping_value(template, "spec")
+            pod_spec = template_spec or spec
+            containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else []
+            if isinstance(containers, list):
+                for container in containers:
+                    if isinstance(container, dict) and isinstance(container.get("image"), str):
+                        digests.update(digest_pattern.findall(str(container["image"])))
+            container_statuses = status.get("containerStatuses")
+            if isinstance(container_statuses, list):
+                for container in container_statuses:
+                    if isinstance(container, dict) and isinstance(container.get("imageID"), str):
+                        digests.update(digest_pattern.findall(str(container["imageID"])))
+            if resource == "deployments":
+                desired = int(spec.get("replicas", 1))
+                if int(status.get("availableReplicas", 0)) < desired:
+                    failures.append(f"deployment/{name} is not fully available")
+            elif resource == "statefulsets":
+                desired = int(spec.get("replicas", 1))
+                if int(status.get("readyReplicas", 0)) < desired:
+                    failures.append(f"statefulset/{name} is not fully ready")
+            elif resource == "daemonsets":
+                desired = int(status.get("desiredNumberScheduled", 0))
+                if desired < 1 or int(status.get("numberReady", 0)) < desired:
+                    failures.append(f"daemonset/{name} is not fully ready")
+            elif resource == "pods" and status.get("phase") not in {"Running", "Succeeded"}:
+                failures.append(f"pod/{name} is not running or succeeded")
+            elif resource == "jobs":
+                desired = int(spec.get("completions", 1))
+                if int(status.get("succeeded", 0)) < desired:
+                    failures.append(f"job/{name} is incomplete")
+        if not items:
+            failures.append(f"{resource} returned no objects")
+        return {
+            "count": len(items),
+            "names": sorted(names),
+            "revisions": sorted(revisions),
+            "image_digests": sorted(digests),
+            "failures": failures,
+        }
+
+    @staticmethod
+    def _mapping_value(value: dict[str, Any], key: str) -> dict[str, Any]:
+        candidate = value.get(key)
+        return candidate if isinstance(candidate, dict) else {}
 
     def _deterministic_cell(self, payload: dict[str, Any]) -> dict[str, Any]:
         snapshot = self._find_mapping(payload, "snapshot")

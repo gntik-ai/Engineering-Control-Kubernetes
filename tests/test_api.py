@@ -25,6 +25,9 @@ class FakeService:
     async def rollback(self, request: Any) -> OperationAccepted:
         return OperationAccepted(workflow_id="recovery-test", run_id="run-test")
 
+    async def start_runtime_verification(self, request: Any) -> OperationAccepted:
+        return OperationAccepted(workflow_id="runtime-test", run_id="run-test")
+
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         return {"workflow_id": workflow_id, "status": "RUNNING"}
 
@@ -144,6 +147,14 @@ def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:
         deployment = client.get(f"/v1/deployments/{repository.deployment_id}", headers=headers)
         assert deployment.status_code == 200
         assert deployment.json()["strategy"] == "helm"
+
+        verification = client.post(
+            "/v1/deployments/verify-runtime",
+            headers=headers,
+            json={"deployment_id": str(repository.deployment_id)},
+        )
+        assert verification.status_code == 202
+        assert verification.json()["workflow_id"] == "runtime-test"
 
         usage = client.get("/v1/usage", headers=headers)
         assert usage.status_code == 200

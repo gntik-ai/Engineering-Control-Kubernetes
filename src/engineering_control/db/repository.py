@@ -13,6 +13,7 @@ from engineering_control.api.schemas import (
     CampaignStart,
     DeliveryStart,
     DeploymentPrepare,
+    RuntimeVerificationStart,
 )
 from engineering_control.db.models import (
     Approval,
@@ -50,6 +51,9 @@ class MetadataRepository(Protocol):
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
     async def create_deployment_run(
         self, workflow_id: str, request: DeploymentPrepare
+    ) -> Project: ...
+    async def create_runtime_verification_run(
+        self, workflow_id: str, request: RuntimeVerificationStart
     ) -> Project: ...
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
@@ -178,6 +182,44 @@ class SQLMetadataRepository:
                     run_type=f"{request.environment}-deployment",
                     status="QUEUED",
                     project=project.value,
+                )
+            )
+            return project
+
+    async def create_runtime_verification_run(
+        self, workflow_id: str, request: RuntimeVerificationStart
+    ) -> Project:
+        return await asyncio.to_thread(
+            self._create_runtime_verification_run, workflow_id, request
+        )
+
+    def _create_runtime_verification_run(
+        self, workflow_id: str, request: RuntimeVerificationStart
+    ) -> Project:
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, request.deployment_id)
+            if deployment is None:
+                raise ValueError("runtime verification requires an existing deployment")
+            if deployment.status not in {"STAGING_DEPLOYED", "VERIFICATION_FAILED"}:
+                raise ValueError("deployment has not reached runtime-verifiable state")
+            active = session.scalar(
+                select(Run).where(
+                    Run.change_set_id == deployment.change_set_id,
+                    Run.run_type == "runtime-verification",
+                    Run.status.in_({"QUEUED", "RUNNING"}),
+                )
+            )
+            if active is not None:
+                raise ValueError("an active runtime verification already owns this deployment")
+            project = Project(deployment.project)
+            session.add(
+                Run(
+                    change_set_id=deployment.change_set_id,
+                    workflow_id=workflow_id,
+                    run_type="runtime-verification",
+                    status="QUEUED",
+                    project=project.value,
+                    summary=str(deployment.id),
                 )
             )
             return project
@@ -400,6 +442,11 @@ class EmptyMetadataRepository:
         self, workflow_id: str, request: DeploymentPrepare
     ) -> Project:
         raise ValueError("deployment metadata store is unavailable")
+
+    async def create_runtime_verification_run(
+        self, workflow_id: str, request: RuntimeVerificationStart
+    ) -> Project:
+        raise ValueError("runtime verification metadata store is unavailable")
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
         return []

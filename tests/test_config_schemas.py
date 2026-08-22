@@ -43,3 +43,17 @@ def test_deployment_target_templates_match_the_strict_schema() -> None:
         validator.validate(value)
         assert path.stem == f"{value['project']}-{value['environment']}"
         assert value["enabled"] is False
+
+
+def test_runtime_target_templates_match_the_strict_schema() -> None:
+    schema = json.loads(
+        (ROOT / "schemas" / "runtime-target.schema.json").read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema)
+    targets = sorted((ROOT / "config" / "runtime").glob("*.yaml"))
+    assert {path.stem for path in targets} == {"falcone-staging", "musematic-staging"}
+    for path in targets:
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+        validator.validate(value)
+        assert path.stem == f"{value['project']}-{value['environment']}"
+        assert value["enabled"] is False

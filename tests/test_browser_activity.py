@@ -36,6 +36,12 @@ class FakeBrowserRunner:
         return CommandResult(0, "", "")
 
 
+class FailingBrowserRunner:
+    def run(self, executable: str, arguments: Any, **kwargs: Any) -> CommandResult:
+        assert executable == "node"
+        return CommandResult(1, "", "synthetic runner failure")
+
+
 def write_schema(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -140,3 +146,42 @@ async def test_browser_activity_rejects_output_escape(tmp_path: Path) -> None:
                 "output_directory": str(tmp_path / "outside"),
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_browser_activity_never_reuses_stale_retry_artifacts(tmp_path: Path) -> None:
+    plan_root = tmp_path / "plans"
+    plan_root.mkdir()
+    plan = plan_root / "journey.json"
+    write_plan(plan)
+    evidence_root = tmp_path / "evidence"
+    output = evidence_root / "run-id"
+    output.mkdir(parents=True)
+    (output / "result.json").write_text('{"status":"PASS"}', encoding="utf-8")
+    (output / "trace.zip").write_bytes(b"stale")
+    script_root = tmp_path / "browser"
+    script_root.mkdir()
+    script = script_root / "run-journey.mjs"
+    script.write_text("// fake", encoding="utf-8")
+    schema = tmp_path / "journey.schema.json"
+    write_schema(schema)
+    handler = BrowserActivityHandler(
+        Settings(
+            journey_plan_root=plan_root,
+            browser_evidence_root=evidence_root,
+            browser_script=script,
+            journey_schema=schema,
+        ),
+        FailingBrowserRunner(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ApplicationError, match="failed without a result"):
+        await handler.handle(
+            "runtime.browser_checks",
+            {
+                "journey_plan_path": str(plan),
+                "output_directory": str(output),
+            },
+        )
+    assert not (output / "result.json").exists()
+    assert not (output / "trace.zip").exists()

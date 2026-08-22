@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://engineering.gntik.ai/schemas/runtime-verification.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "observed_revision",
+    "observed_digests",
+    "checks",
+    "evidence",
+    "incident_required"
+  ],
+  "properties": {
+    "decision": {"enum": ["RUNTIME_VERIFIED", "FAIL", "BLOCKED"]},
+    "observed_revision": {"type": "string", "maxLength": 200},
+    "observed_digests": {
+      "type": "object",
+      "maxProperties": 500,
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^sha256:[a-f0-9]{64}$"
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "summary"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "maxLength": 200},
+          "status": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+          "summary": {"type": "string", "minLength": 1, "maxLength": 4000}
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "items": {"type": "string", "minLength": 1, "maxLength": 2000}
+    },
+    "incident_required": {"type": "boolean"}
+  }
+}

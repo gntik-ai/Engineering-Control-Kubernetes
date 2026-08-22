@@ -3,9 +3,9 @@ from uuid import uuid4
 
 import pytest
 
-from engineering_control.api.schemas import DeploymentPrepare
+from engineering_control.api.schemas import DeploymentPrepare, RuntimeVerificationStart
 from engineering_control.db.base import Base
-from engineering_control.db.models import Campaign, ChangeSet, Run
+from engineering_control.db.models import Campaign, ChangeSet, Deployment, Run
 from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project, RedactionStatus
@@ -120,3 +120,64 @@ async def test_deployment_run_requires_a_deployable_changeset(tmp_path: Path) ->
             "deploy-preview-conflict",
             DeploymentPrepare(change_set_id=change_set_id, environment="preview", dry_run=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_verification_run_is_bound_to_deployed_artifact(tmp_path: Path) -> None:
+    repository = SQLMetadataRepository(f"sqlite:///{tmp_path / 'runtime.sqlite'}")
+    Base.metadata.create_all(repository.engine)
+    change_set_id = uuid4()
+    deployment_id = uuid4()
+    with repository.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="falcone",
+                risk_class="R2",
+                state="STAGING_DEPLOYED",
+                version=1,
+                source_repository="falcone",
+                source_branch="agent/falcone/1/test",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url=None,
+                deployment_repository="falcone-charts",
+                deployment_branch="agent/falcone/1/test",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url=None,
+                image_digests={"api": f"sha256:{'e' * 64}"},
+                chart_version="1.2.3",
+                recovery_json={},
+            )
+        )
+        session.add(
+            Deployment(
+                id=deployment_id,
+                change_set_id=change_set_id,
+                project="falcone",
+                environment="staging",
+                strategy="helm",
+                target_context="staging",
+                target_namespace="falcone-staging",
+                desired_sha="d" * 40,
+                status="STAGING_DEPLOYED",
+                transaction_id="test",
+                started_at=None,
+                finished_at=None,
+                recovery_json={},
+            )
+        )
+
+    project = await repository.create_runtime_verification_run(
+        "runtime-verify-test",
+        RuntimeVerificationStart(deployment_id=deployment_id),
+    )
+
+    assert project is Project.FALCONE
+    with repository.sessions() as session:
+        run = session.query(Run).filter_by(workflow_id="runtime-verify-test").one()
+        assert run.change_set_id == change_set_id
+        assert run.summary == str(deployment_id)

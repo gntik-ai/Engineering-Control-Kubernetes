@@ -8,6 +8,7 @@ import stat
 import tempfile
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -15,6 +16,8 @@ from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import SafeCommandRunner
 from engineering_control.config import Settings
+from engineering_control.evidence.transfer import EvidencePublisher
+from engineering_control.models.enums import Project, RedactionStatus
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -23,10 +26,16 @@ class BrowserActivityHandler:
 
     _credential_name = re.compile(r"^JOURNEY_[A-Z0-9_]+$")
 
-    def __init__(self, settings: Settings, runner: SafeCommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        runner: SafeCommandRunner | None = None,
+        publisher: EvidencePublisher | None = None,
+    ) -> None:
         self.settings = settings
         self.runner = runner or SafeCommandRunner({"node": settings.node_executable})
         self.redactor = SecretRedactor()
+        self.publisher = publisher or EvidencePublisher(settings, settings.browser_evidence_root)
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         if step != "runtime.browser_checks":
@@ -34,6 +43,7 @@ class BrowserActivityHandler:
         plan = self._bounded_file(payload.get("journey_plan_path"), self.settings.journey_plan_root)
         self._validate_plan(plan)
         output = self._bounded_output(payload.get("output_directory"))
+        self._clear_previous_attempt(output)
         credentials, credential_path = self._credentials(payload.get("credential_file"))
         environment = {
             "ENGINEERING_JOURNEY_PLAN": str(plan),
@@ -80,12 +90,44 @@ class BrowserActivityHandler:
                 type="SecurityBlocker",
                 non_retryable=True,
             )
+        receipts = self._publish_result(payload, result_path)
         return {
             **payload,
             "status": safe.get("status", "FAILED") if isinstance(safe, dict) else "FAILED",
             "result": safe,
             "artifacts": artifacts,
+            "evidence_receipts": receipts,
         }
+
+    def _publish_result(self, payload: dict[str, Any], result_path: Path) -> list[dict[str, Any]]:
+        orchestration = payload.get("orchestration")
+        project = payload.get("project")
+        change_set_id = payload.get("change_set_id")
+        if (
+            not isinstance(orchestration, dict)
+            or not isinstance(orchestration.get("workflow_id"), str)
+            or not isinstance(project, str)
+            or not isinstance(change_set_id, str)
+        ):
+            if self.settings.environment == "production":
+                raise ApplicationError(
+                    "production browser evidence requires authoritative workflow metadata",
+                    type="SecurityBlocker",
+                    non_retryable=True,
+                )
+            return []
+        receipt = self.publisher.publish(
+            result_path,
+            project=Project(project),
+            workflow_id=str(orchestration["workflow_id"]),
+            change_set_id=UUID(change_set_id),
+            category="changes",
+            filename=f"runtime-browser-{payload['deployment_id']}.json",
+            producer="browser-runner",
+            content_type="application/json",
+            redaction_status=RedactionStatus.REDACTED,
+        )
+        return [receipt]
 
     def _validate_plan(self, path: Path) -> None:
         try:
@@ -128,6 +170,13 @@ class BrowserActivityHandler:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path, 0o700)
         return path
+
+    @staticmethod
+    def _clear_previous_attempt(output: Path) -> None:
+        for filename in ("result.json", "trace.zip", "final.png", "failure.png"):
+            candidate = output / filename
+            if candidate.is_file() or candidate.is_symlink():
+                candidate.unlink()
 
     def _credentials(self, value: Any) -> tuple[dict[str, str], Path | None]:
         if value is None:

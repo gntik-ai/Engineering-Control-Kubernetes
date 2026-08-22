@@ -35,4 +35,14 @@ if sudo -u claude-runner test -r /etc/engineering-control/env/release-worker.env
   echo "FAIL claude runner can read release environment" >&2
   exit 1
 fi
+for identity in codex-runner claude-runner browser-runner release-runner; do
+  if sudo -u "${identity}" test -r /etc/engineering-control/env/observer 2>/dev/null; then
+    echo "FAIL ${identity} can read the observer credential directory" >&2
+    exit 1
+  fi
+done
+if sudo -u scan-runner test -r /etc/engineering-control/env/release 2>/dev/null; then
+  echo "FAIL scan runner can read the release credential directory" >&2
+  exit 1
+fi
 echo "PASS worker verification"

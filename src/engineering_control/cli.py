@@ -16,7 +16,7 @@ from engineering_control.security.redaction import SecretRedactor
 class APIClient:
     def __init__(self, base_url: str, token_file: Path) -> None:
         metadata = token_file.stat()
-        if metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IXGRP | stat.S_IRWXO):
             raise PermissionError("API token file permissions are too broad")
         token = token_file.read_text(encoding="utf-8").strip()
         self.client = httpx.Client(
@@ -69,6 +69,11 @@ def parser() -> argparse.ArgumentParser:
     delivery.add_argument("finding_id")
     delivery.add_argument("--risk", choices=("R0", "R1", "R2", "R3"), required=True)
     delivery.add_argument("--execute", action="store_true")
+    deployment = commands.add_parser("deployment")
+    deployment.add_argument("change_set_id")
+    deployment.add_argument("--environment", choices=("preview", "staging"), required=True)
+    deployment.add_argument("--execute", action="store_true")
+    commands.add_parser("verify-runtime").add_argument("deployment_id")
     for decision in ("approve", "reject"):
         approval = commands.add_parser(decision)
         approval.add_argument("change_set_id")
@@ -122,6 +127,22 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "risk_class": arguments.risk,
                 "dry_run": not arguments.execute,
             },
+        )
+    if command == "deployment":
+        return client.request(
+            "POST",
+            "/v1/deployments/prepare",
+            {
+                "change_set_id": arguments.change_set_id,
+                "environment": arguments.environment,
+                "dry_run": not arguments.execute,
+            },
+        )
+    if command == "verify-runtime":
+        return client.request(
+            "POST",
+            "/v1/deployments/verify-runtime",
+            {"deployment_id": arguments.deployment_id},
         )
     if command in {"approve", "reject"}:
         return client.request(

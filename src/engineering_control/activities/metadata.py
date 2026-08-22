@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,7 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.config import Settings
 from engineering_control.db.models import (
+    AgentInvocation,
     Approval,
     ApprovalCandidate,
     Campaign,
@@ -29,9 +31,11 @@ from engineering_control.db.models import (
     Deployment,
     Finding,
     FindingVerification,
+    Incident,
     Issue,
     QuotaSnapshot,
     Run,
+    VerificationResult,
     WorktreeLease,
 )
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
@@ -138,6 +142,54 @@ class DeploymentTargetRecord(BaseModel):
         return self
 
 
+class RuntimeTargetRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal[1]
+    enabled: bool
+    project: Project
+    environment: Literal["staging"]
+    target_context: str = Field(min_length=1, max_length=160)
+    target_namespace: str = Field(min_length=1, max_length=160)
+    blocker: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,119}$")
+    configuration: dict[str, Any]
+
+    @model_validator(mode="after")
+    def strict_runtime_configuration(self) -> RuntimeTargetRecord:
+        allowed = {
+            "observer_kubeconfig_path",
+            "observed_resources",
+            "revision_annotation",
+            "argo_application",
+            "journey_plan_path",
+            "browser_credential_file",
+        }
+        if set(self.configuration) - allowed:
+            raise ValueError("runtime target contains non-allowlisted configuration fields")
+        if not self.enabled:
+            if self.blocker is None or self.configuration:
+                raise ValueError("disabled runtime target requires only an explicit blocker")
+            return self
+        if self.target_context == "UNCONFIGURED" or self.target_namespace == "UNCONFIGURED":
+            raise ValueError("enabled runtime target cannot use placeholder identity")
+        if len(self.target_namespace) > 63 or not re.fullmatch(
+            r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", self.target_namespace
+        ):
+            raise ValueError("enabled runtime target requires a DNS-label namespace")
+        required = {
+            "observer_kubeconfig_path",
+            "observed_resources",
+            "journey_plan_path",
+            "revision_annotation" if self.project is Project.FALCONE else "argo_application",
+        }
+        if required - set(self.configuration):
+            raise ValueError("enabled runtime target configuration is incomplete")
+        resources = self.configuration.get("observed_resources")
+        if not isinstance(resources, list) or not resources:
+            raise ValueError("runtime target requires observed resources")
+        return self
+
+
 class MetadataActivityHandler:
     """Controller-side authoritative metadata writes for idempotent activity results."""
 
@@ -169,6 +221,10 @@ class MetadataActivityHandler:
             "staging.validate_approval",
             "staging.finalize",
             "deployment.record_terminal",
+            "runtime.snapshot",
+            "runtime.prepare_review",
+            "runtime.finalize",
+            "runtime.record_failure",
             "quota.persist",
         }
     )
@@ -239,13 +295,28 @@ class MetadataActivityHandler:
             if step == "staging.prepare":
                 return await asyncio.to_thread(self._prepare_deployment, payload, "staging")
             if step == "staging.record_candidate":
-                return await asyncio.to_thread(self._record_staging_candidate, payload)
+                try:
+                    return await asyncio.to_thread(self._record_staging_candidate, payload)
+                except ComponentLeaseConflict:
+                    return {
+                        **payload,
+                        "status": "BLOCKED",
+                        "blocker": "STAGING_DEPLOYMENT_LEASE_CONFLICT",
+                    }
             if step == "staging.validate_approval":
                 return await asyncio.to_thread(self._validate_staging_approval, payload)
             if step == "staging.finalize":
                 return await asyncio.to_thread(self._finalize_staging, payload)
             if step == "deployment.record_terminal":
                 return await asyncio.to_thread(self._record_deployment_terminal, payload)
+            if step == "runtime.snapshot":
+                return await asyncio.to_thread(self._runtime_snapshot, payload)
+            if step == "runtime.prepare_review":
+                return self._prepare_runtime_review(payload)
+            if step == "runtime.finalize":
+                return await asyncio.to_thread(self._finalize_runtime, payload)
+            if step == "runtime.record_failure":
+                return await asyncio.to_thread(self._record_runtime_failure, payload)
             if step == "quota.persist":
                 return await self._quota(payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
@@ -1253,6 +1324,12 @@ class MetadataActivityHandler:
             change_set.deployment_branch = str(payload["deployment_branch"])
             change_set.source_head_sha = str(source["head_sha"])
             change_set.deployment_head_sha = str(deployment["head_sha"])
+            recovery = dict(change_set.recovery_json)
+            recovery["provider_chain"] = {
+                "maker": str(payload["maker_provider"]),
+                "checker": str(payload["checker_provider"]),
+            }
+            change_set.recovery_json = recovery
             change_set.state = "IMPLEMENTING"
             change_set.version += 1
             run.status = "BLOCKED"
@@ -1390,6 +1467,17 @@ class MetadataActivityHandler:
             change_set = session.get(ChangeSet, change_set_id)
             if change_set is None:
                 raise ValueError("staging candidate ChangeSet is missing")
+            workflow_id = str(payload["orchestration"]["workflow_id"])
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None or run.change_set_id != change_set_id:
+                raise ValueError("staging candidate Run binding is missing")
+            deployment_lease = ComponentLeaseManager().acquire(
+                session,
+                component_key=f"{change_set.project}:deploy:staging",
+                owner_run_id=run.id,
+                mode="deployment",
+                ttl=timedelta(hours=8),
+            )
             model = self._changeset_model(session, change_set)
             approval_payload = ApprovalService.artifact_payload(
                 model,
@@ -1407,7 +1495,6 @@ class MetadataActivityHandler:
                 release_preflight_sha256=preflight_hash,
             )
             binding = ApprovalService.digest(approval_payload)
-            workflow_id = str(payload["orchestration"]["workflow_id"])
             existing = session.scalar(
                 select(ApprovalCandidate).where(
                     ApprovalCandidate.change_set_id == change_set_id,
@@ -1445,12 +1532,12 @@ class MetadataActivityHandler:
             deployment = session.get(Deployment, UUID(str(payload["deployment_id"])))
             if deployment is not None:
                 deployment.status = "AWAITING_STAGING_APPROVAL"
-            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
-            if run is not None:
-                run.status = "AWAITING_APPROVAL"
+            run.status = "AWAITING_APPROVAL"
             return {
                 **payload,
                 "status": "AWAITING_STAGING_APPROVAL",
+                "deployment_lease_id": str(deployment_lease.id),
+                "deployment_component_key": deployment_lease.component_key,
                 "artifact_binding_sha256": binding,
                 "approval_candidate": candidate_payload,
                 "release_plan": plan,
@@ -1504,6 +1591,7 @@ class MetadataActivityHandler:
                     run.status = "BLOCKED"
                     run.error_code = "STAGING_APPROVAL_REJECTED"
                     run.finished_at = now
+                    self._release_deployment_lease(session, change_set, run)
                 return {
                     **context,
                     "status": "BLOCKED",
@@ -1540,6 +1628,7 @@ class MetadataActivityHandler:
                     run.status = "BLOCKED"
                     run.error_code = "APPROVAL_ARTIFACT_DRIFT"
                     run.finished_at = invalidated_at
+                    self._release_deployment_lease(session, change_set, run)
                 return {
                     **context,
                     "status": "BLOCKED",
@@ -1580,6 +1669,7 @@ class MetadataActivityHandler:
             deployment.finished_at = datetime.now(UTC)
             run.status = "SUCCESS"
             run.finished_at = datetime.now(UTC)
+            self._release_deployment_lease(session, change_set, run)
         return {**payload, "status": "STAGING_DEPLOYED"}
 
     def _record_deployment_terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1621,7 +1711,513 @@ class MetadataActivityHandler:
                 )
                 if candidate is not None and candidate.workflow_id == workflow_id:
                     candidate.invalidated_at = now
+                change_set = session.get(ChangeSet, change_set_id)
+                if change_set is not None:
+                    self._release_deployment_lease(session, change_set, run)
         return {**payload, "status": terminal}
+
+    def _runtime_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        deployment_id = UUID(str(payload["deployment_id"]))
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, deployment_id)
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if (
+                deployment is None
+                or run is None
+                or run.change_set_id != deployment.change_set_id
+                or run.summary != str(deployment_id)
+            ):
+                raise ValueError("runtime verification deployment/Run binding is missing")
+            change_set = session.get(ChangeSet, deployment.change_set_id)
+            if change_set is None or change_set.project != deployment.project:
+                raise ValueError("runtime verification ChangeSet binding is missing")
+            target = self._runtime_target(Project(deployment.project), deployment.environment)
+            if not target.enabled:
+                return self._runtime_block(
+                    payload,
+                    run,
+                    target.blocker or "RUNTIME_TARGET_DISABLED",
+                    project=deployment.project,
+                    change_set_id=change_set.id,
+                )
+            if (
+                deployment.status not in {"STAGING_DEPLOYED", "VERIFICATION_FAILED"}
+                or change_set.deployment_head_sha != deployment.desired_sha
+            ):
+                return self._runtime_block(
+                    payload,
+                    run,
+                    "RUNTIME_ARTIFACT_IDENTITY_MISMATCH",
+                    project=deployment.project,
+                    change_set_id=change_set.id,
+                )
+            provider_chain = self._object(
+                change_set.recovery_json.get("provider_chain"), "provider_chain"
+            )
+            maker_value = provider_chain.get("maker")
+            if maker_value not in {Provider.CODEX.value, Provider.CLAUDE.value}:
+                return self._runtime_block(
+                    payload,
+                    run,
+                    "IMPLEMENTATION_PROVIDER_PROVENANCE_MISSING",
+                    project=deployment.project,
+                    change_set_id=change_set.id,
+                )
+            maker = Provider(str(maker_value))
+            routing = self._quota_broker().route(
+                role="runtime-verifier",
+                model_class=ModelClass.JUDGE,
+                risk_class=RiskClass(change_set.risk_class),
+                maker=maker,
+            )
+            if routing.primary is None:
+                return self._runtime_block(
+                    payload,
+                    run,
+                    routing.status,
+                    project=deployment.project,
+                    change_set_id=change_set.id,
+                )
+            reviewers = [routing.primary]
+            if change_set.risk_class == RiskClass.R3.value:
+                if routing.checker is None:
+                    return self._runtime_block(
+                        payload,
+                        run,
+                        "R3_RUNTIME_CROSS_PROVIDER_REQUIRED",
+                        project=deployment.project,
+                        change_set_id=change_set.id,
+                    )
+                reviewers.append(routing.checker)
+            candidate = session.scalar(
+                select(ApprovalCandidate).where(
+                    ApprovalCandidate.change_set_id == change_set.id,
+                    ApprovalCandidate.invalidated_at.is_(None),
+                )
+            )
+            approval = (
+                session.scalar(
+                    select(Approval).where(
+                        Approval.change_set_id == change_set.id,
+                        Approval.artifact_binding_sha256
+                        == candidate.artifact_binding_sha256,
+                        Approval.decision == "approve",
+                        Approval.invalidated_at.is_(None),
+                    )
+                )
+                if candidate is not None
+                else None
+            )
+            if candidate is None or approval is None:
+                return self._runtime_block(
+                    payload,
+                    run,
+                    "CURRENT_STAGING_APPROVAL_MISSING",
+                    project=deployment.project,
+                    change_set_id=change_set.id,
+                )
+            if not self._candidate_binding_is_current(session, change_set, candidate):
+                return self._runtime_block(
+                    payload,
+                    run,
+                    "RUNTIME_APPROVAL_ARTIFACT_DRIFT",
+                    project=deployment.project,
+                    change_set_id=change_set.id,
+                )
+            leases = session.scalars(
+                select(WorktreeLease).where(
+                    WorktreeLease.change_set_id == change_set.id,
+                    WorktreeLease.released_at.is_(None),
+                )
+            ).all()
+            paths = {lease.repository: lease.worktree_path for lease in leases}
+            if (
+                change_set.source_repository not in paths
+                or change_set.deployment_repository not in paths
+            ):
+                return self._runtime_block(
+                    payload,
+                    run,
+                    "RUNTIME_WORKTREE_LEASES_MISSING",
+                    project=deployment.project,
+                    change_set_id=change_set.id,
+                )
+            for lease in leases:
+                if lease.owner_run_id == run.id:
+                    continue
+                owner = session.get(Run, lease.owner_run_id)
+                if owner is not None and owner.finished_at is None and owner.status in {
+                    "QUEUED",
+                    "RUNNING",
+                    "AWAITING_APPROVAL",
+                }:
+                    return self._runtime_block(
+                        payload,
+                        run,
+                        "RUNTIME_WORKTREE_LEASE_CONFLICT",
+                        project=deployment.project,
+                        change_set_id=change_set.id,
+                    )
+            for lease in leases:
+                lease.owner_run_id = run.id
+                lease.expires_at = datetime.now(UTC) + timedelta(hours=8)
+            configuration = target.configuration
+            run.status = "RUNNING"
+            run.started_at = run.started_at or datetime.now(UTC)
+            output_directory = (
+                self.settings.browser_evidence_root / str(deployment_id) / str(run.id)
+            )
+            return {
+                **payload,
+                "status": "RUNTIME_SNAPSHOT_READY",
+                "project": deployment.project,
+                "change_set_id": str(change_set.id),
+                "risk_class": change_set.risk_class,
+                "source_worktree": paths[change_set.source_repository],
+                "deployment_worktree": paths[change_set.deployment_repository],
+                "expected_source_sha": change_set.source_head_sha,
+                "expected_deployment_sha": deployment.desired_sha,
+                "expected_image_digests": change_set.image_digests,
+                "artifact_binding_sha256": candidate.artifact_binding_sha256,
+                "review_providers": [provider.value for provider in reviewers],
+                "runtime_observation_plan": {
+                    "project": deployment.project,
+                    "deployment_id": str(deployment.id),
+                    "change_set_id": str(change_set.id),
+                    "kubeconfig_path": configuration["observer_kubeconfig_path"],
+                    "kube_context": target.target_context,
+                    "namespace": target.target_namespace,
+                    "resources": configuration["observed_resources"],
+                    "source_worktree": paths[change_set.source_repository],
+                    "deployment_worktree": paths[change_set.deployment_repository],
+                    "expected_source_sha": change_set.source_head_sha,
+                    "expected_deployment_sha": deployment.desired_sha,
+                    "expected_image_digests": change_set.image_digests,
+                    "revision_annotation": configuration.get("revision_annotation"),
+                    "argo_application": configuration.get("argo_application"),
+                },
+                "journey_plan_path": configuration["journey_plan_path"],
+                "credential_file": configuration.get("browser_credential_file"),
+                "output_directory": str(output_directory),
+            }
+
+    def _record_runtime_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        deployment_id = UUID(str(payload["deployment_id"]))
+        blocker = str(payload.get("blocker", "RUNTIME_ACTIVITY_FAILED"))
+        allowed = {
+            "MANUAL_AUTH_REQUIRED_CODEX",
+            "MANUAL_AUTH_REQUIRED_CLAUDE",
+            "PROVIDER_CLI_MISSING_CODEX",
+            "PROVIDER_CLI_MISSING_CLAUDE",
+            "RATE_LIMITED",
+            "RuntimeObservationUnavailable",
+            "BrowserRunnerFailure",
+            "SecurityBlocker",
+            "PolicyViolation",
+            "SchemaViolation",
+            "RUNTIME_REVIEW_FAILED",
+            "RUNTIME_ACTIVITY_FAILED",
+            "CANCELLED",
+        }
+        if blocker not in allowed:
+            blocker = "RUNTIME_ACTIVITY_FAILED"
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            deployment = session.get(Deployment, deployment_id)
+            if (
+                run is None
+                or deployment is None
+                or run.change_set_id != deployment.change_set_id
+            ):
+                raise ValueError("runtime failure deployment/Run binding is missing")
+            if run.finished_at is None:
+                run.status = (
+                    "RATE_LIMITED"
+                    if blocker == "RATE_LIMITED"
+                    else "CANCELLED"
+                    if blocker == "CANCELLED"
+                    else "BLOCKED"
+                )
+                run.error_code = blocker
+                run.finished_at = datetime.now(UTC)
+        return {**payload, "status": run.status, "blocker": blocker}
+
+    def _prepare_runtime_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        observation = self._object(payload.get("runtime_observation"), "runtime_observation")
+        browser_result = self._object(payload.get("result"), "browser result")
+        providers = payload.get("review_providers")
+        if not isinstance(providers, list) or not providers:
+            raise ValueError("runtime review providers are missing")
+        requests: list[dict[str, Any]] = []
+        for provider_value in providers:
+            provider = Provider(str(provider_value))
+            prompt = (
+                "Independently judge one deployed ChangeSet using only the supplied redacted "
+                "observer and browser summaries. Do not modify files, access Kubernetes, read "
+                "credentials, deploy, merge, or approve. Require exact approved revision and "
+                "immutable image digests; recommend an incident on any failed invariant.\n\n"
+                f"Artifact binding: {payload['artifact_binding_sha256']}\n"
+                f"Expected deployment SHA: {payload['expected_deployment_sha']}\n"
+                "Expected image digests: "
+                f"{json.dumps(payload['expected_image_digests'], sort_keys=True)}\n"
+                f"Observer summary: {json.dumps(observation, sort_keys=True)}\n"
+                f"Browser summary: {json.dumps(browser_result, sort_keys=True)}\n"
+            )
+            request = AgentRequest(
+                run_id=uuid5(
+                    NAMESPACE_URL,
+                    f"runtime-verifier:{payload['deployment_id']}:{provider.value}",
+                ),
+                project=Project(str(payload["project"])),
+                role="runtime-verifier",
+                provider=provider,
+                model_class=ModelClass.JUDGE,
+                prompt=prompt,
+                working_directory=str(payload["source_worktree"]),
+                output_schema=self._runtime_verification_output_schema(),
+                timeout_seconds=3600,
+                effort="high",
+                writable=False,
+                change_set_id=UUID(str(payload["change_set_id"])),
+            )
+            requests.append(request.model_dump(mode="json"))
+        return {
+            **payload,
+            "status": "RUNTIME_REVIEW_READY",
+            "runtime_review_requests": requests,
+        }
+
+    def _finalize_runtime(self, payload: dict[str, Any]) -> dict[str, Any]:
+        deployment_id = UUID(str(payload["deployment_id"]))
+        change_set_id = UUID(str(payload["change_set_id"]))
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        observation = self._object(payload.get("runtime_observation"), "runtime_observation")
+        browser_result = self._object(payload.get("result"), "browser result")
+        reviews = payload.get("runtime_review_results")
+        if not isinstance(reviews, list) or not reviews:
+            raise ValueError("runtime verification requires independent review results")
+        structured_reviews: list[dict[str, Any]] = []
+        providers: list[str] = []
+        reviews_pass = True
+        expected_revision = str(payload["expected_deployment_sha"])
+        expected_digests = set(
+            self._object(payload.get("expected_image_digests"), "expected image digests").values()
+        )
+        for review in reviews:
+            outer = self._object(review, "runtime review")
+            agent = self._object(outer.get("agent_result"), "runtime agent result")
+            structured = self._object(agent.get("structured_result"), "runtime structured result")
+            providers.append(str(agent.get("provider", "unknown")))
+            structured_reviews.append(structured)
+            observed_digests = self._object(
+                structured.get("observed_digests"), "runtime observed digests"
+            )
+            checks = structured.get("checks")
+            claims_match = (
+                structured.get("observed_revision") == expected_revision
+                and expected_digests.issubset(set(observed_digests.values()))
+                and isinstance(checks, list)
+                and bool(checks)
+                and all(
+                    isinstance(check, dict) and check.get("status") == "PASS"
+                    for check in checks
+                )
+                and structured.get("incident_required") is False
+            )
+            if (
+                outer.get("status") != "SUCCESS"
+                or structured.get("decision") != "RUNTIME_VERIFIED"
+                or not claims_match
+            ):
+                reviews_pass = False
+        expected_reviewers = payload.get("review_providers")
+        if (
+            not isinstance(expected_reviewers, list)
+            or providers != expected_reviewers
+            or len(set(providers)) != len(providers)
+            or (payload.get("risk_class") == RiskClass.R3.value and len(providers) != 2)
+        ):
+            reviews_pass = False
+        passed = (
+            observation.get("status") == "RUNTIME_OBSERVATION_PASS"
+            and browser_result.get("status") == "PASS"
+            and reviews_pass
+        )
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, deployment_id)
+            change_set = session.get(ChangeSet, change_set_id)
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if (
+                deployment is None
+                or change_set is None
+                or run is None
+                or deployment.change_set_id != change_set_id
+                or run.change_set_id != change_set_id
+            ):
+                raise ValueError("runtime finalization metadata binding is incomplete")
+            if run.finished_at is not None:
+                return {
+                    **payload,
+                    "status": "RUNTIME_VERIFIED" if run.status == "SUCCESS" else run.status,
+                }
+            for provider, structured in zip(providers, structured_reviews, strict=True):
+                invocation_id = uuid5(
+                    NAMESPACE_URL,
+                    f"runtime-invocation:{run.id}:{provider}",
+                )
+                if session.get(AgentInvocation, invocation_id) is None:
+                    session.add(
+                        AgentInvocation(
+                            id=invocation_id,
+                            run_id=run.id,
+                            provider=provider,
+                            role="runtime-verifier",
+                            model_class=ModelClass.JUDGE.value,
+                            provider_session_id=None,
+                            status=str(structured.get("decision", "BLOCKED")),
+                            summary=str(structured.get("summary", "runtime verification")),
+                            structured_result=structured,
+                            error_code=None,
+                            started_at=run.started_at or now,
+                            finished_at=now,
+                        )
+                    )
+            verification_id = uuid5(
+                NAMESPACE_URL,
+                f"runtime-verification:{deployment_id}:{workflow_id}",
+            )
+            if session.get(VerificationResult, verification_id) is None:
+                session.add(
+                    VerificationResult(
+                        id=verification_id,
+                        change_set_id=change_set_id,
+                        deployment_id=deployment_id,
+                        run_id=run.id,
+                        verification_type="post-staging-runtime",
+                        verifier_provider=",".join(providers),
+                        status="RUNTIME_VERIFIED" if passed else "FAIL",
+                        evidence_json={
+                            "observation": observation,
+                            "browser": browser_result,
+                            "reviews": structured_reviews,
+                        },
+                    )
+                )
+            run.finished_at = now
+            if passed:
+                run.status = "SUCCESS"
+                run.summary = "deterministic, browser, and independent runtime checks passed"
+                deployment.status = "RUNTIME_VERIFIED"
+                deployment.finished_at = now
+                if change_set.state != ChangeSetState.RUNTIME_VERIFIED.value:
+                    change_set.state = ChangeSetState.RUNTIME_VERIFIED.value
+                    change_set.version += 1
+                return {**payload, "status": "RUNTIME_VERIFIED"}
+            run.status = "FAILED"
+            run.error_code = "RUNTIME_VERIFICATION_FAILED"
+            deployment.status = "VERIFICATION_FAILED"
+            if change_set.state != ChangeSetState.INCIDENT_OPEN.value:
+                change_set.state = ChangeSetState.INCIDENT_OPEN.value
+                change_set.version += 1
+            incident_id = uuid5(NAMESPACE_URL, f"runtime-incident:{deployment_id}:{workflow_id}")
+            if session.get(Incident, incident_id) is None:
+                session.add(
+                    Incident(
+                        id=incident_id,
+                        change_set_id=change_set_id,
+                        deployment_id=deployment_id,
+                        project=change_set.project,
+                        severity="high" if change_set.risk_class in {"R2", "R3"} else "medium",
+                        status="OPEN",
+                        summary="post-staging runtime verification failed",
+                        recovery_state="AWAITING_RECOVERY_DECISION",
+                        opened_at=now,
+                        closed_at=None,
+                    )
+                )
+            return {**payload, "status": "INCIDENT_OPEN"}
+
+    def _runtime_target(self, project: Project, environment: str) -> RuntimeTargetRecord:
+        if environment != "staging":
+            raise ValueError("runtime verification target must be staging")
+        root = self.settings.runtime_target_root.resolve()
+        path = (root / f"{project.value}-staging.yaml").resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            raise ValueError("runtime target configuration is missing")
+        target = RuntimeTargetRecord.model_validate(
+            yaml.safe_load(path.read_text(encoding="utf-8"))
+        )
+        if target.project is not project or target.environment != environment:
+            raise ValueError("runtime target identity does not match its filename")
+        return target
+
+    def _candidate_binding_is_current(
+        self,
+        session: Any,
+        change_set: ChangeSet,
+        candidate: ApprovalCandidate,
+    ) -> bool:
+        value = self._object(candidate.payload_json, "approval candidate")
+        required = {
+            "target_context",
+            "target_namespace",
+            "migration",
+            "backup_requirement",
+            "rollback_plan_sha256",
+            "ci_result_sha256",
+            "independent_review_sha256",
+            "release_preflight_sha256",
+        }
+        if required - set(value):
+            return False
+        current = ApprovalService.artifact_payload(
+            self._changeset_model(session, change_set),
+            target_context=str(value["target_context"]),
+            target_namespace=str(value["target_namespace"]),
+            migration=bool(value["migration"]),
+            backup_requirement=str(value["backup_requirement"]),
+            rollback_plan_sha256=str(value["rollback_plan_sha256"]),
+            ci_result_sha256=str(value["ci_result_sha256"]),
+            independent_review_sha256=str(value["independent_review_sha256"]),
+            release_preflight_sha256=str(value["release_preflight_sha256"]),
+        )
+        return ApprovalService.digest(current) == candidate.artifact_binding_sha256
+
+    @staticmethod
+    def _runtime_block(
+        payload: dict[str, Any],
+        run: Run,
+        blocker: str,
+        *,
+        project: str,
+        change_set_id: UUID,
+    ) -> dict[str, Any]:
+        run.status = "RATE_LIMITED" if blocker == "RATE_LIMITED" else "BLOCKED"
+        run.error_code = blocker
+        run.finished_at = datetime.now(UTC)
+        return {
+            **payload,
+            "project": project,
+            "change_set_id": str(change_set_id),
+            "status": run.status,
+            "blocker": blocker,
+        }
+
+    @staticmethod
+    def _release_deployment_lease(
+        session: Any, change_set: ChangeSet, run: Run
+    ) -> None:
+        environment, separator, suffix = run.run_type.partition("-")
+        if not separator or suffix != "deployment" or environment not in {"preview", "staging"}:
+            return
+        ComponentLeaseManager().release(
+            session,
+            component_key=f"{change_set.project}:deploy:{environment}",
+            owner_run_id=run.id,
+        )
 
     def _deployment_target(
         self, project: Project, environment: Literal["preview", "staging"]
@@ -1959,6 +2555,61 @@ class MetadataActivityHandler:
                     "maxItems": 100,
                     "items": {"type": "string", "maxLength": 4000},
                 },
+            },
+        }
+
+    @staticmethod
+    def _runtime_verification_output_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "decision",
+                "observed_revision",
+                "observed_digests",
+                "checks",
+                "evidence",
+                "incident_required",
+            ],
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["RUNTIME_VERIFIED", "FAIL", "BLOCKED"],
+                },
+                "observed_revision": {"type": "string", "maxLength": 200},
+                "observed_digests": {
+                    "type": "object",
+                    "maxProperties": 500,
+                    "additionalProperties": {
+                        "type": "string",
+                        "pattern": "^sha256:[a-f0-9]{64}$",
+                    },
+                },
+                "checks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 500,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["name", "status", "summary"],
+                        "properties": {
+                            "name": {"type": "string", "minLength": 1, "maxLength": 200},
+                            "status": {
+                                "type": "string",
+                                "enum": ["PASS", "FAIL", "BLOCKED"],
+                            },
+                            "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
+                        },
+                    },
+                },
+                "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 500,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+                },
+                "incident_required": {"type": "boolean"},
             },
         }
 

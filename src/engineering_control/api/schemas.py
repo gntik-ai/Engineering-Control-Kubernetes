@@ -61,6 +61,10 @@ class RollbackRequest(APIModel):
     dry_run: bool = True
 
 
+class RuntimeVerificationStart(APIModel):
+    deployment_id: UUID
+
+
 class OperationAccepted(APIModel):
     workflow_id: str
     run_id: str

@@ -69,8 +69,10 @@ class ControlActivities:
         "runtime.snapshot",
         "runtime.deterministic_checks",
         "runtime.browser_checks",
+        "runtime.prepare_review",
         "runtime.independent_review",
         "runtime.finalize",
+        "runtime.record_failure",
         "recovery.inspect",
         "recovery.validate_binding",
         "recovery.execute",
@@ -97,6 +99,7 @@ class ControlActivities:
             "delivery.deterministic_prechecks",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
+            "runtime.deterministic_checks",
             "preview.preflight",
             "audit.agent_cell",
             "delivery.invoke_spec",
@@ -117,6 +120,7 @@ class ControlActivities:
             "delivery.deterministic_prechecks",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
+            "runtime.deterministic_checks",
         },
         "codex": {
             "audit.agent_cell",
@@ -126,6 +130,7 @@ class ControlActivities:
             "delivery.invoke_deployment_maker",
             "delivery.invoke_checker",
             "quota.refresh",
+            "runtime.independent_review",
         },
         "claude": {
             "audit.agent_cell",
@@ -135,6 +140,7 @@ class ControlActivities:
             "delivery.invoke_deployment_maker",
             "delivery.invoke_checker",
             "quota.refresh",
+            "runtime.independent_review",
         },
         "browser": {"runtime.browser_checks"},
         "release": {

@@ -14,6 +14,7 @@ from engineering_control.api.schemas import (
     DeploymentPrepare,
     OperationAccepted,
     RollbackRequest,
+    RuntimeVerificationStart,
 )
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.policy.approvals import ApprovalService
@@ -23,6 +24,7 @@ from engineering_control.workflows.inputs import (
     IssueDeliveryInput,
     PreviewDeploymentInput,
     RecoveryInput,
+    RuntimeVerificationInput,
     StagingDeploymentInput,
 )
 from engineering_control.workflows.names import WorkflowName
@@ -34,6 +36,9 @@ class ControlService(Protocol):
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
+    async def start_runtime_verification(
+        self, request: RuntimeVerificationStart
+    ) -> OperationAccepted: ...
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]: ...
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
     async def start_acceptance(
@@ -132,6 +137,24 @@ class TemporalControlService:
         handle = await self.client.start_workflow(
             WorkflowName.RECOVERY.value,
             RecoveryInput(**request.model_dump()),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_runtime_verification(
+        self, request: RuntimeVerificationStart
+    ) -> OperationAccepted:
+        workflow_id = f"runtime-verify-{request.deployment_id}-{uuid4()}"
+        project = await self.repository.create_runtime_verification_run(workflow_id, request)
+        handle = await self.client.start_workflow(
+            WorkflowName.RUNTIME_VERIFICATION.value,
+            RuntimeVerificationInput(
+                deployment_id=str(request.deployment_id),
+                project=project.value,
+            ),
             id=workflow_id,
             task_queue=self.task_queue,
         )

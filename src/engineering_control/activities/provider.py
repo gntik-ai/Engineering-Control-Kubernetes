@@ -41,6 +41,7 @@ class ProviderActivityHandler:
         "delivery.invoke_maker": "maker_request",
         "delivery.invoke_deployment_maker": "deployment_maker_request",
         "delivery.invoke_checker": "checker_request",
+        "runtime.independent_review": "runtime_review_request",
     }
 
     def __init__(

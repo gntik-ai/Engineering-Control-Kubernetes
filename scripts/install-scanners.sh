@@ -21,6 +21,7 @@ install_release_binary() {
   local checksum_url=$2
   local archive_name=$3
   local binary_name=$4
+  local extracted_path=${5:-${binary_name}}
   curl --fail --silent --show-error --location --output "${TEMP_ROOT}/${archive_name}" \
     "${archive_url}"
   curl --fail --silent --show-error --location --output "${TEMP_ROOT}/checksums.txt" \
@@ -36,7 +37,34 @@ install_release_binary() {
   local extraction="${TEMP_ROOT}/extract-${binary_name}"
   install -d -m 0755 "${extraction}"
   tar -xzf "${TEMP_ROOT}/${archive_name}" -C "${extraction}"
-  install -o root -g root -m 0755 "${extraction}/${binary_name}" "/usr/local/bin/${binary_name}"
+  install -o root -g root -m 0755 \
+    "${extraction}/${extracted_path}" "/usr/local/bin/${binary_name}"
+  rm -f "${TEMP_ROOT}/checksums.txt"
+}
+
+install_release_file() {
+  local binary_url=$1
+  local checksum_url=$2
+  local asset_name=$3
+  local binary_name=$4
+  curl --fail --silent --show-error --location --output "${TEMP_ROOT}/${asset_name}" \
+    "${binary_url}"
+  curl --fail --silent --show-error --location --output "${TEMP_ROOT}/checksums.txt" \
+    "${checksum_url}"
+  local expected
+  expected=$(awk -v name="${asset_name}" '$2 == name || $2 == "*" name {print $1}' \
+    "${TEMP_ROOT}/checksums.txt" | head -n 1)
+  if [[ ! ${expected} =~ ^[a-f0-9]{64}$ ]]; then
+    expected=$(tr -d '[:space:]' <"${TEMP_ROOT}/checksums.txt")
+  fi
+  [[ ${expected} =~ ^[a-f0-9]{64}$ ]] || {
+    echo "No valid checksum found for ${asset_name}" >&2
+    exit 1
+  }
+  printf '%s  %s\n' "${expected}" "${TEMP_ROOT}/${asset_name}" | \
+    sha256sum --check --status
+  install -o root -g root -m 0755 "${TEMP_ROOT}/${asset_name}" \
+    "/usr/local/bin/${binary_name}"
   rm -f "${TEMP_ROOT}/checksums.txt"
 }
 
@@ -56,6 +84,18 @@ install_release_binary \
   https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz \
   https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_checksums.txt \
   syft_1.51.0_linux_amd64.tar.gz syft
+install_release_file \
+  https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl \
+  https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl.sha256 \
+  kubectl kubectl
+install_release_binary \
+  https://get.helm.sh/helm-v4.2.3-linux-amd64.tar.gz \
+  https://get.helm.sh/helm-v4.2.3-linux-amd64.tar.gz.sha256sum \
+  helm-v4.2.3-linux-amd64.tar.gz helm linux-amd64/helm
+install_release_file \
+  https://github.com/argoproj/argo-cd/releases/download/v3.5.1/argocd-linux-amd64 \
+  https://github.com/argoproj/argo-cd/releases/download/v3.5.1/cli_checksums.txt \
+  argocd-linux-amd64 argocd
 
 python3 -m venv /opt/engineering-scanners/semgrep
 /opt/engineering-scanners/semgrep/bin/pip install --disable-pip-version-check semgrep==1.174.0

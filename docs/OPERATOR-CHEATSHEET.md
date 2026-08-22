@@ -47,7 +47,10 @@ engineering-ctl cancel <workflow-id>
 engineering-ctl usage
 engineering-ctl evidence <artifact-id>
 engineering-ctl delivery <finding-uuid> --risk R1
+engineering-ctl deployment <change-set-uuid> --environment preview
+engineering-ctl deployment <change-set-uuid> --environment staging
 engineering-ctl approve <change-set-uuid> <binding-sha256>
+engineering-ctl verify-runtime <deployment-uuid>
 engineering-ctl rollback <deployment-uuid> <binding-sha256>
 ```
 

@@ -27,6 +27,12 @@ Falcone kubeconfig paths must remain beneath `/etc/engineering-control/env/relea
 only by the release identity, and are checked immediately before preflight and deployment. The
 release worker has no model provider homes; model workers have no release target credentials.
 
+The deterministic runtime observer is a separate `scan-runner` identity. Its kubeconfig lives under
+`/etc/engineering-control/env/observer`, never the release directory. Before reading workload
+metadata, the adapter verifies that Secret reads and representative create/patch/delete/impersonate
+operations return `no`. Only reduced names, readiness, revisions, and image digests leave the scan
+worker. Raw Kubernetes objects and browser credentials are never placed in provider prompts.
+
 Active security blockers:
 
 - `SECURITY_BLOCKER_MUSEMATIC_GIT_SECRETS`: rotate affected credentials, invalidate sessions,

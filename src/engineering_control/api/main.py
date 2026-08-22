@@ -21,6 +21,7 @@ from engineering_control.api.schemas import (
     OperationAccepted,
     RecordList,
     RollbackRequest,
+    RuntimeVerificationStart,
 )
 from engineering_control.api.service import ControlService, TemporalControlService
 from engineering_control.config import Settings, get_settings
@@ -214,6 +215,21 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
         return await service.rollback(body)
+
+    @app.post(
+        "/v1/deployments/verify-runtime",
+        response_model=OperationAccepted,
+        status_code=202,
+    )
+    async def runtime_verification_start(
+        body: RuntimeVerificationStart,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        try:
+            return await service.start_runtime_verification(body)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/v1/deployments/{deployment_id}")
     async def deployment_get(

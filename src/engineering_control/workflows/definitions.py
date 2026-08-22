@@ -6,6 +6,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
@@ -103,6 +104,7 @@ class ControlledWorkflow:
             "delivery.deterministic_prechecks",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
+            "runtime.deterministic_checks",
         }:
             return "engineering-scan"
         if step == "finding.reproduce":
@@ -118,6 +120,8 @@ class ControlledWorkflow:
         if step == "delivery.invoke_checker":
             return f"engineering-{cls._nested_value(payload, 'checker_provider', 'claude')}"
         if step == "quota.refresh":
+            return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+        if step == "runtime.independent_review":
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step in {"runtime.browser_checks"}:
             return "engineering-browser"
@@ -378,6 +382,8 @@ class StagingDeploymentWorkflow(ControlledWorkflow):
             )
             return {"status": "STAGING_PREFLIGHT_VALIDATED", "context": context}
         context = await self._step("staging.record_candidate", context)
+        if context.get("status") == "BLOCKED":
+            return {"status": "BLOCKED", "context": context}
         self._phase = "AWAITING_STAGING_APPROVAL"
         await workflow.wait_condition(lambda: self._approval is not None or self._cancelled)
         if self._cancelled:
@@ -397,20 +403,96 @@ class StagingDeploymentWorkflow(ControlledWorkflow):
 
 @workflow.defn(name="RuntimeVerificationWorkflow")
 class RuntimeVerificationWorkflow(ControlledWorkflow):
+    _reported_runtime_errors = frozenset(
+        {
+            "MANUAL_AUTH_REQUIRED_CODEX",
+            "MANUAL_AUTH_REQUIRED_CLAUDE",
+            "PROVIDER_CLI_MISSING_CODEX",
+            "PROVIDER_CLI_MISSING_CLAUDE",
+            "RATE_LIMITED",
+            "RuntimeObservationUnavailable",
+            "BrowserRunnerFailure",
+            "SecurityBlocker",
+            "PolicyViolation",
+            "SchemaViolation",
+        }
+    )
+
     @workflow.run
     async def run(self, request: RuntimeVerificationInput) -> dict[str, Any]:
         context: dict[str, Any] = asdict(request)
-        for step in (
-            "runtime.snapshot",
-            "runtime.deterministic_checks",
-            "runtime.browser_checks",
-            "runtime.independent_review",
-            "runtime.finalize",
-        ):
-            if not await self._checkpoint(step.upper().replace(".", "_")):
-                return {"status": "CANCELLED"}
-            context = await self._step(step, context, timeout_minutes=60)
-        return {"status": "RUNTIME_VERIFIED", "context": context}
+        try:
+            for step in (
+                "runtime.snapshot",
+                "runtime.deterministic_checks",
+                "runtime.browser_checks",
+            ):
+                if not await self._checkpoint(step.upper().replace(".", "_")):
+                    context = await self._step(
+                        "runtime.record_failure",
+                        {**context, "blocker": "CANCELLED"},
+                    )
+                    return {"status": "CANCELLED", "context": context}
+                context = await self._step(step, context, timeout_minutes=60)
+                if step == "runtime.snapshot" and context.get("status") in {
+                    "BLOCKED",
+                    "RATE_LIMITED",
+                }:
+                    return {"status": context["status"], "context": context}
+            context = await self._step("runtime.prepare_review", context)
+            requests = context.get("runtime_review_requests")
+            if not isinstance(requests, list) or not requests:
+                raise ValueError("runtime review preparation returned no requests")
+            review_results: list[dict[str, Any]] = []
+            for request_value in requests:
+                if not isinstance(request_value, dict):
+                    raise TypeError("runtime review request must be an object")
+                if not await self._checkpoint("RUNTIME_INDEPENDENT_REVIEW"):
+                    context = await self._step(
+                        "runtime.record_failure",
+                        {**context, "blocker": "CANCELLED"},
+                    )
+                    return {"status": "CANCELLED", "context": context}
+                reviewed = await self._step(
+                    "runtime.independent_review",
+                    {
+                        **context,
+                        "provider": request_value.get("provider"),
+                        "runtime_review_request": request_value,
+                    },
+                    timeout_minutes=60,
+                )
+                review_status = reviewed.get("status")
+                if review_status != "SUCCESS":
+                    blocker = (
+                        "RATE_LIMITED"
+                        if review_status == "RATE_LIMITED"
+                        else "RUNTIME_REVIEW_FAILED"
+                    )
+                    context = await self._step(
+                        "runtime.record_failure",
+                        {**context, "blocker": blocker},
+                    )
+                    return {"status": context.get("status", "BLOCKED"), "context": context}
+                review_results.append(reviewed)
+            context = await self._step(
+                "runtime.finalize",
+                {**context, "runtime_review_results": review_results},
+            )
+            return {"status": context.get("status", "FAILED"), "context": context}
+        except ActivityError as error:
+            cause = error.cause
+            blocker = (
+                cause.type
+                if isinstance(cause, ApplicationError)
+                and cause.type in self._reported_runtime_errors
+                else "RUNTIME_ACTIVITY_FAILED"
+            )
+            context = await self._step(
+                "runtime.record_failure",
+                {**context, "blocker": blocker},
+            )
+            return {"status": context.get("status", "BLOCKED"), "context": context}
 
 
 @workflow.defn(name="RecoveryWorkflow")

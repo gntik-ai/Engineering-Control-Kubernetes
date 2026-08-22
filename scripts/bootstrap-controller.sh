@@ -31,7 +31,8 @@ usermod -a -G engineering-api-clients hermes
 
 install -d -o root -g root -m 0755 "${INSTALL_ROOT}/releases"
 install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}" \
-  "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/targets"
+  "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/targets" \
+  "${CONFIG_ROOT}/runtime"
 install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/env"
 install -d -o engineering-control -g engineering-control -m 0750 "${STATE_ROOT}" \
   "${STATE_ROOT}/leases"
@@ -72,6 +73,13 @@ for target in "${SOURCE_ROOT}"/config/targets/*.yaml; do
   if [[ ! -f "${CONFIG_ROOT}/targets/${target_name}" ]]; then
     install -o root -g engineering-control -m 0640 \
       "${target}" "${CONFIG_ROOT}/targets/${target_name}"
+  fi
+done
+for runtime_target in "${SOURCE_ROOT}"/config/runtime/*.yaml; do
+  runtime_name=$(basename "${runtime_target}")
+  if [[ ! -f "${CONFIG_ROOT}/runtime/${runtime_name}" ]]; then
+    install -o root -g engineering-control -m 0640 \
+      "${runtime_target}" "${CONFIG_ROOT}/runtime/${runtime_name}"
   fi
 done
 
