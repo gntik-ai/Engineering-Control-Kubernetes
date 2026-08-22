@@ -59,6 +59,7 @@ class SecretRedactor:
     _sensitive_keys = re.compile(
         r"(?i)(password|passwd|secret|token|api.?key|access.?key|client.?secret|private.?key|encryption.?key|credential|kubeconfig)"
     )
+    _safe_reference_keys = re.compile(r"(?i)(?:_path|_file|_filename|_ref|_reference|_id|_sha256)$")
 
     def redact_text(self, value: str) -> RedactionReport:
         replacements = 0
@@ -77,7 +78,11 @@ class SecretRedactor:
 
         def walk(item: Any, key: str | None = None) -> Any:
             nonlocal replacements
-            if key is not None and self._sensitive_keys.search(key):
+            if (
+                key is not None
+                and self._sensitive_keys.search(key)
+                and not self._safe_reference_keys.search(key)
+            ):
                 if item not in (None, "", REDACTED):
                     replacements += 1
                     categories.add("sensitive_key")

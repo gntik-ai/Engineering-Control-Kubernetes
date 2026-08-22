@@ -53,7 +53,7 @@ def falcone_plan(tmp_path: Path, **overrides: Any) -> FalconeReleasePlan:
         "image_digests": {"api": f"sha256:{DIGEST}"},
         "kube_context": "falcone-staging-releaser",
         "namespace": "falcone-staging",
-        "kubeconfig": kubeconfig,
+        "kubeconfig_path": kubeconfig,
         "rollback_plan_sha256": "c" * 64,
         "approval_binding_sha256": "d" * 64,
     }

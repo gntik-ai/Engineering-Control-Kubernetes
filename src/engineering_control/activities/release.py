@@ -87,7 +87,7 @@ class ReleaseActivityHandler:
     def _helm_release(self, value: dict[str, Any], approval: dict[str, Any]) -> dict[str, Any]:
         plan = FalconeReleasePlan.model_validate(value)
         self._bounded_worktree(plan.chart_directory)
-        self._scoped_credential(plan.kubeconfig)
+        self._scoped_credential(plan.kubeconfig_path)
         self._matching_binding(plan.approval_binding_sha256, approval)
         command = self.helm.deploy(plan, approval_is_current=True)
         transaction = hashlib.sha256(command.stdout.encode()).hexdigest()

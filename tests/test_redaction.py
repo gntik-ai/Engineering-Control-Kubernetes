@@ -26,3 +26,18 @@ def test_redacts_private_key_multiline() -> None:
     report = SecretRedactor().redact_text(fake_key)
     assert report.value == REDACTED
     assert "private_key" in report.categories
+
+
+def test_preserves_secret_reference_paths_but_not_values() -> None:
+    report = SecretRedactor().redact(
+        {
+            "credential_file": "/protected/persona.env",
+            "kubeconfig_path": "/protected/release.kubeconfig",
+            "credential": "value-that-must-not-persist",
+            "kubeconfig": "embedded-content-that-must-not-persist",
+        }
+    )
+    assert report.value["credential_file"] == "/protected/persona.env"
+    assert report.value["kubeconfig_path"] == "/protected/release.kubeconfig"
+    assert report.value["credential"] == REDACTED
+    assert report.value["kubeconfig"] == REDACTED

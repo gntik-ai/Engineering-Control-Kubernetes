@@ -22,7 +22,7 @@ class FalconeReleasePlan(BaseModel):
     image_digests: dict[str, str]
     kube_context: str
     namespace: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
-    kubeconfig: Path
+    kubeconfig_path: Path
     migration: bool = False
     backup_evidence_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     parity_evidence_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
@@ -106,7 +106,7 @@ class FalconeHelmAdapter:
             "--kube-context",
             plan.kube_context,
             "--kubeconfig",
-            str(plan.kubeconfig),
+            str(plan.kubeconfig_path),
             "--atomic",
             "--wait",
             "--timeout",
@@ -132,5 +132,5 @@ class FalconeHelmAdapter:
             resolved = values.resolve()
             if not resolved.is_file() or not resolved.is_relative_to(resolved_chart):
                 raise ValueError("values files must exist within the bounded chart worktree")
-        if not plan.kubeconfig.is_file():
+        if not plan.kubeconfig_path.is_file():
             raise ValueError("scoped release kubeconfig does not exist")

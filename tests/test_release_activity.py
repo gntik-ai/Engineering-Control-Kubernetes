@@ -43,7 +43,7 @@ def helm_payload(worktree: Path, kubeconfig: Path) -> dict[str, Any]:
             "image_digests": {"api": f"sha256:{'c' * 64}"},
             "kube_context": "scoped-preview",
             "namespace": "falcone-preview",
-            "kubeconfig": str(kubeconfig),
+            "kubeconfig_path": str(kubeconfig),
             "migration": False,
             "rollback_plan_sha256": "d" * 64,
             "approval_binding_sha256": binding,
