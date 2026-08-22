@@ -20,6 +20,7 @@ class ApprovalService:
         rollback_plan_sha256: str,
         ci_result_sha256: str,
         independent_review_sha256: str,
+        release_preflight_sha256: str,
     ) -> dict[str, Any]:
         if not change_set.source_head_sha or not change_set.deployment_head_sha:
             raise ValueError("source and deployment heads are required before approval")
@@ -39,6 +40,7 @@ class ApprovalService:
             "rollback_plan_sha256": rollback_plan_sha256,
             "ci_result_sha256": ci_result_sha256,
             "independent_review_sha256": independent_review_sha256,
+            "release_preflight_sha256": release_preflight_sha256,
         }
 
     @staticmethod
@@ -83,5 +85,6 @@ class ApprovalService:
             rollback_plan_sha256=approval.rollback_plan_sha256,
             ci_result_sha256=approval.ci_result_sha256,
             independent_review_sha256=approval.independent_review_sha256,
+            release_preflight_sha256=approval.release_preflight_sha256,
         )
         return cls.digest(current) == approval.artifact_binding_sha256

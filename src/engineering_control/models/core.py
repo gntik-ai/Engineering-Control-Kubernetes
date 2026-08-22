@@ -219,6 +219,7 @@ class ApprovalBinding(StrictModel):
     rollback_plan_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     ci_result_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     independent_review_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    release_preflight_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     artifact_binding_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     approver_subject: str
     typed_confirmation: str | None = None

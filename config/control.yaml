@@ -31,5 +31,10 @@ runtime:
   temporary: /srv/engineering/tmp
   state: /var/lib/engineering-control
   logs: journald
+deployments:
+  targets: /etc/engineering-control/targets
+  default_enabled: false
+  preview_mutation_enabled: false
+  production_enabled: false
 paid_api_fallback:
   enabled: false

@@ -8,7 +8,12 @@ from uuid import UUID
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from engineering_control.api.schemas import ApprovalRecord, CampaignStart, DeliveryStart
+from engineering_control.api.schemas import (
+    ApprovalRecord,
+    CampaignStart,
+    DeliveryStart,
+    DeploymentPrepare,
+)
 from engineering_control.db.models import (
     Approval,
     ApprovalCandidate,
@@ -43,6 +48,9 @@ class MetadataRepository(Protocol):
     ) -> None: ...
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
+    async def create_deployment_run(
+        self, workflow_id: str, request: DeploymentPrepare
+    ) -> Project: ...
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
@@ -125,6 +133,54 @@ class SQLMetadataRepository:
                     project=finding.project,
                 )
             )
+
+    async def create_deployment_run(
+        self, workflow_id: str, request: DeploymentPrepare
+    ) -> Project:
+        return await asyncio.to_thread(self._create_deployment_run, workflow_id, request)
+
+    def _create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
+        deployable_states = {
+            "preview": {
+                "CANDIDATE_BUILT",
+                "DEPLOY_PR",
+                "PREVIEW_VERIFIED",
+            },
+            "staging": {
+                "DEPLOY_PR",
+                "PREVIEW_VERIFIED",
+                "SOURCE_MERGED",
+                "FINAL_ARTIFACT_BUILT",
+            },
+        }
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, request.change_set_id)
+            if change_set is None:
+                raise ValueError("deployment requires an existing ChangeSet")
+            if change_set.state not in deployable_states[request.environment]:
+                raise ValueError(
+                    f"ChangeSet has not reached a deployable {request.environment} state"
+                )
+            active = session.scalar(
+                select(Run).where(
+                    Run.change_set_id == change_set.id,
+                    Run.run_type == f"{request.environment}-deployment",
+                    Run.status.in_({"QUEUED", "RUNNING", "AWAITING_APPROVAL"}),
+                )
+            )
+            if active is not None:
+                raise ValueError("an active deployment workflow already owns this ChangeSet target")
+            project = Project(change_set.project)
+            session.add(
+                Run(
+                    change_set_id=change_set.id,
+                    workflow_id=workflow_id,
+                    run_type=f"{request.environment}-deployment",
+                    status="QUEUED",
+                    project=project.value,
+                )
+            )
+            return project
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_campaigns, limit)
@@ -339,6 +395,11 @@ class EmptyMetadataRepository:
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         return None
+
+    async def create_deployment_run(
+        self, workflow_id: str, request: DeploymentPrepare
+    ) -> Project:
+        raise ValueError("deployment metadata store is unavailable")
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
         return []

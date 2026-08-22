@@ -44,6 +44,8 @@ class ReleaseActivityHandler:
                 type="NotConfigured",
                 non_retryable=True,
             )
+        if step in {"preview.preflight", "staging.preflight"}:
+            return self._preflight(payload)
         if step not in {"preview.deploy", "staging.deploy"}:
             raise ApplicationError("unsupported release activity", non_retryable=True)
         raw_plan = payload.get("release_plan")
@@ -82,6 +84,45 @@ class ReleaseActivityHandler:
         safe = self.redactor.redact({**payload, **result}).value
         if not isinstance(safe, dict):
             raise TypeError("redacted release result must remain an object")
+        return safe
+
+    def _preflight(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_plan = payload.get("release_plan")
+        if not isinstance(raw_plan, dict):
+            raise ApplicationError(
+                "release preflight requires a typed plan",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        strategy = raw_plan.get("strategy")
+        value = {key: item for key, item in raw_plan.items() if key != "strategy"}
+        try:
+            if strategy == "helm":
+                helm_plan = FalconeReleasePlan.model_validate(value)
+                self._bounded_worktree(helm_plan.chart_directory)
+                self._scoped_credential(helm_plan.kubeconfig_path)
+                result = self.helm.preflight(helm_plan)
+            elif strategy == "argocd-gitops":
+                gitops_plan = MusematicPromotion.model_validate(value)
+                self._bounded_worktree(gitops_plan.deployment_repository)
+                result = self.gitops.preflight(gitops_plan)
+            else:
+                raise ApplicationError(
+                    "release strategy is not allowlisted",
+                    type="PolicyViolation",
+                    non_retryable=True,
+                )
+        except ValidationError as error:
+            raise ApplicationError(
+                "release preflight plan failed strict schema validation",
+                type="PolicyViolation",
+                non_retryable=True,
+            ) from error
+        safe = self.redactor.redact(
+            {**payload, "status": "PREFLIGHT_PASS", "release_preflight": result}
+        ).value
+        if not isinstance(safe, dict):
+            raise TypeError("redacted release preflight must remain an object")
         return safe
 
     def _helm_release(self, value: dict[str, Any], approval: dict[str, Any]) -> dict[str, Any]:

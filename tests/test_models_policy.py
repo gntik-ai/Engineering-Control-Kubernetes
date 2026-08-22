@@ -46,6 +46,7 @@ def approval_values() -> dict[str, object]:
         "rollback_plan_sha256": DIGEST_A,
         "ci_result_sha256": DIGEST_B,
         "independent_review_sha256": "c" * 64,
+        "release_preflight_sha256": "d" * 64,
     }
 
 

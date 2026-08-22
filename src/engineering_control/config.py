@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     worktree_root: Path = Path("/srv/engineering/worktrees")
     run_root: Path = Path("/srv/engineering/runs")
     state_root: Path = Path("/var/lib/engineering-control")
+    deployment_target_root: Path = Path("/etc/engineering-control/targets")
     temporary_root: Path = Path("/srv/engineering/tmp")
     codex_executable: Path = Path("/usr/local/bin/codex")
     claude_executable: Path = Path("/usr/local/bin/claude")

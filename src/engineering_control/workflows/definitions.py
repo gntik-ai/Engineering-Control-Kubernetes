@@ -103,7 +103,6 @@ class ControlledWorkflow:
             "delivery.deterministic_prechecks",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
-            "preview.preflight",
         }:
             return "engineering-scan"
         if step == "finding.reproduce":
@@ -123,6 +122,8 @@ class ControlledWorkflow:
         if step in {"runtime.browser_checks"}:
             return "engineering-browser"
         if step in {
+            "preview.preflight",
+            "staging.preflight",
             "preview.deploy",
             "staging.deploy",
             "recovery.execute",
@@ -322,35 +323,76 @@ class PreviewDeploymentWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: PreviewDeploymentInput) -> dict[str, Any]:
         context: dict[str, Any] = asdict(request)
-        for step in (
-            "preview.preflight",
-            "preview.prepare",
-            "preview.deploy",
-            "preview.verify",
-        ):
+        for step in ("preview.prepare", "preview.preflight"):
             if not await self._checkpoint(step.upper().replace(".", "_")):
-                return {"status": "CANCELLED"}
+                context = await self._step(
+                    "deployment.record_terminal",
+                    {**context, "terminal_status": "CANCELLED"},
+                )
+                return {"status": "CANCELLED", "context": context}
             context = await self._step(step, context, timeout_minutes=60)
-        return {"status": "PREVIEW_VERIFIED", "context": context}
+            if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
+                return {"status": context["status"], "context": context}
+        if request.dry_run:
+            context = await self._step(
+                "deployment.record_terminal",
+                {**context, "terminal_status": "PREVIEW_PREFLIGHT_VALIDATED"},
+            )
+            return {"status": "PREVIEW_PREFLIGHT_VALIDATED", "context": context}
+        context = await self._step(
+            "deployment.record_terminal",
+            {
+                **context,
+                "terminal_status": "BLOCKED",
+                "blocker": "PREVIEW_POLICY_AUTHORIZATION_NOT_ENABLED",
+            },
+        )
+        return {"status": "BLOCKED", "context": context}
 
 
 @workflow.defn(name="StagingDeploymentWorkflow")
 class StagingDeploymentWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: StagingDeploymentInput) -> dict[str, Any]:
-        context = await self._step("staging.prepare", asdict(request))
+        context: dict[str, Any] = asdict(request)
+        if not await self._checkpoint("STAGING_PREPARE"):
+            context = await self._step(
+                "deployment.record_terminal", {**context, "terminal_status": "CANCELLED"}
+            )
+            return {"status": "CANCELLED", "context": context}
+        context = await self._step("staging.prepare", context)
+        if context.get("status") == "BLOCKED":
+            return {"status": "BLOCKED", "context": context}
+        if not await self._checkpoint("STAGING_PREFLIGHT"):
+            context = await self._step(
+                "deployment.record_terminal", {**context, "terminal_status": "CANCELLED"}
+            )
+            return {"status": "CANCELLED", "context": context}
+        context = await self._step("staging.preflight", context, timeout_minutes=60)
+        if context.get("status") in {"BLOCKED", "FAILED"}:
+            return {"status": context["status"], "context": context}
         if request.dry_run:
-            preflight = await self._step("staging.preflight", context)
-            return {"status": "AWAITING_STAGING_APPROVAL", "preflight": preflight}
+            context = await self._step(
+                "deployment.record_terminal",
+                {**context, "terminal_status": "STAGING_PREFLIGHT_VALIDATED"},
+            )
+            return {"status": "STAGING_PREFLIGHT_VALIDATED", "context": context}
+        context = await self._step("staging.record_candidate", context)
         self._phase = "AWAITING_STAGING_APPROVAL"
         await workflow.wait_condition(lambda: self._approval is not None or self._cancelled)
         if self._cancelled:
-            return {"status": "CANCELLED"}
+            context = await self._step(
+                "deployment.record_terminal", {**context, "terminal_status": "CANCELLED"}
+            )
+            return {"status": "CANCELLED", "context": context}
         context = await self._step(
             "staging.validate_approval", {"context": context, "approval": self._approval}
         )
+        if context.get("status") != "STAGING_APPROVED":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
         context = await self._step("staging.deploy", context, timeout_minutes=60)
-        return {"status": "STAGING_DEPLOYED", "context": context}
+        context = await self._step("staging.finalize", context)
+        return {"status": context.get("status", "STAGING_DEPLOYED"), "context": context}
 
 
 @workflow.defn(name="RuntimeVerificationWorkflow")

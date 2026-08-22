@@ -1,0 +1,9 @@
+version: 1
+enabled: false
+project: musematic
+environment: staging
+strategy: argocd-gitops
+target_context: UNCONFIGURED
+target_namespace: UNCONFIGURED
+blocker: MUSEMATIC_SECURITY_AND_IMAGE_UPDATER_BLOCKERS_REMAIN
+configuration: {}

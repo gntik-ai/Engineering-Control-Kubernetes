@@ -61,8 +61,11 @@ class ControlActivities:
         "preview.verify",
         "staging.prepare",
         "staging.preflight",
+        "staging.record_candidate",
         "staging.validate_approval",
         "staging.deploy",
+        "staging.finalize",
+        "deployment.record_terminal",
         "runtime.snapshot",
         "runtime.deterministic_checks",
         "runtime.browser_checks",
@@ -102,6 +105,7 @@ class ControlActivities:
             "delivery.invoke_checker",
             "quota.refresh",
             "runtime.browser_checks",
+            "staging.preflight",
             "preview.deploy",
             "staging.deploy",
             "recovery.execute",
@@ -113,7 +117,6 @@ class ControlActivities:
             "delivery.deterministic_prechecks",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
-            "preview.preflight",
         },
         "codex": {
             "audit.agent_cell",
@@ -134,7 +137,13 @@ class ControlActivities:
             "quota.refresh",
         },
         "browser": {"runtime.browser_checks"},
-        "release": {"preview.deploy", "staging.deploy", "recovery.execute"},
+        "release": {
+            "preview.preflight",
+            "staging.preflight",
+            "preview.deploy",
+            "staging.deploy",
+            "recovery.execute",
+        },
         "synthetic": _allowed_steps,
     }
 

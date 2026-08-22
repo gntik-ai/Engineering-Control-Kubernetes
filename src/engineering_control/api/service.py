@@ -21,6 +21,7 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     IssueDeliveryInput,
+    PreviewDeploymentInput,
     RecoveryInput,
     StagingDeploymentInput,
 )
@@ -103,12 +104,25 @@ class TemporalControlService:
 
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted:
         workflow_id = f"deploy-{request.environment}-{request.change_set_id}-{uuid4()}"
-        handle = await self.client.start_workflow(
-            WorkflowName.STAGING_DEPLOYMENT.value,
-            StagingDeploymentInput(**request.model_dump()),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
+        project = await self.repository.create_deployment_run(workflow_id, request)
+        if request.environment == "preview":
+            handle = await self.client.start_workflow(
+                WorkflowName.PREVIEW_DEPLOYMENT.value,
+                PreviewDeploymentInput(
+                    change_set_id=str(request.change_set_id),
+                    project=project.value,
+                    dry_run=request.dry_run,
+                ),
+                id=workflow_id,
+                task_queue=self.task_queue,
+            )
+        else:
+            handle = await self.client.start_workflow(
+                WorkflowName.STAGING_DEPLOYMENT.value,
+                StagingDeploymentInput(**request.model_dump()),
+                id=workflow_id,
+                task_queue=self.task_queue,
+            )
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )

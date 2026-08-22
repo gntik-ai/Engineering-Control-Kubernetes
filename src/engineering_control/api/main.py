@@ -202,7 +202,10 @@ def create_app(
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
-        return await service.prepare_deployment(body)
+        try:
+            return await service.prepare_deployment(body)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/v1/deployments/rollback", response_model=OperationAccepted, status_code=202)
     async def deployment_rollback(

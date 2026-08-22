@@ -8,10 +8,11 @@ import stat
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
@@ -20,9 +21,12 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.config import Settings
 from engineering_control.db.models import (
+    Approval,
+    ApprovalCandidate,
     Campaign,
     ChangeSet,
     CoverageCell,
+    Deployment,
     Finding,
     FindingVerification,
     Issue,
@@ -32,7 +36,16 @@ from engineering_control.db.models import (
 )
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
 from engineering_control.models.core import AgentRequest
-from engineering_control.models.enums import AuditLens, ModelClass, Project, Provider, RiskClass
+from engineering_control.models.core import ChangeSet as ChangeSetModel
+from engineering_control.models.enums import (
+    AuditLens,
+    ChangeSetState,
+    ModelClass,
+    Project,
+    Provider,
+    RiskClass,
+)
+from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
 
@@ -73,6 +86,58 @@ class FindingCandidateRecord(BaseModel):
     recommended_action: str = Field(min_length=1, max_length=20_000)
 
 
+class DeploymentTargetRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal[1]
+    enabled: bool
+    project: Project
+    environment: Literal["preview", "staging"]
+    strategy: Literal["helm", "argocd-gitops"]
+    target_context: str = Field(min_length=1, max_length=160)
+    target_namespace: str = Field(min_length=1, max_length=160)
+    blocker: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,119}$")
+    configuration: dict[str, Any]
+
+    @model_validator(mode="after")
+    def strict_project_strategy_configuration(self) -> DeploymentTargetRecord:
+        expected_strategy = "helm" if self.project is Project.FALCONE else "argocd-gitops"
+        if self.strategy != expected_strategy:
+            raise ValueError("deployment target strategy does not match project policy")
+        if not self.enabled:
+            if self.blocker is None:
+                raise ValueError("disabled deployment target requires an explicit blocker")
+            if self.configuration:
+                raise ValueError("disabled deployment target must not contain active configuration")
+            return self
+        if self.target_context == "UNCONFIGURED" or self.target_namespace == "UNCONFIGURED":
+            raise ValueError("enabled deployment target cannot use placeholder identity")
+        allowed = (
+            {
+                "chart_subdirectory",
+                "values_files",
+                "chart_version",
+                "release_name",
+                "kube_context",
+                "kubeconfig_path",
+                "timeout_minutes",
+            }
+            if self.strategy == "helm"
+            else {"argo_application"}
+        )
+        unknown = set(self.configuration) - allowed
+        if unknown:
+            raise ValueError("deployment target contains non-allowlisted configuration fields")
+        required = (
+            {"values_files", "release_name", "kube_context", "kubeconfig_path"}
+            if self.strategy == "helm"
+            else {"argo_application"}
+        )
+        if required - set(self.configuration):
+            raise ValueError("enabled deployment target configuration is incomplete")
+        return self
+
+
 class MetadataActivityHandler:
     """Controller-side authoritative metadata writes for idempotent activity results."""
 
@@ -98,6 +163,12 @@ class MetadataActivityHandler:
             "delivery.prepare_deployment_maker",
             "delivery.prepare_checker",
             "delivery.persist_handoff",
+            "preview.prepare",
+            "staging.prepare",
+            "staging.record_candidate",
+            "staging.validate_approval",
+            "staging.finalize",
+            "deployment.record_terminal",
             "quota.persist",
         }
     )
@@ -163,6 +234,18 @@ class MetadataActivityHandler:
                 return self._prepare_checker(payload)
             if step == "delivery.persist_handoff":
                 return await asyncio.to_thread(self._persist_delivery_handoff, payload)
+            if step == "preview.prepare":
+                return await asyncio.to_thread(self._prepare_deployment, payload, "preview")
+            if step == "staging.prepare":
+                return await asyncio.to_thread(self._prepare_deployment, payload, "staging")
+            if step == "staging.record_candidate":
+                return await asyncio.to_thread(self._record_staging_candidate, payload)
+            if step == "staging.validate_approval":
+                return await asyncio.to_thread(self._validate_staging_approval, payload)
+            if step == "staging.finalize":
+                return await asyncio.to_thread(self._finalize_staging, payload)
+            if step == "deployment.record_terminal":
+                return await asyncio.to_thread(self._record_deployment_terminal, payload)
             if step == "quota.persist":
                 return await self._quota(payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
@@ -1188,6 +1271,490 @@ class MetadataActivityHandler:
                 "change_evidence": evidence,
             },
         }
+
+    def _prepare_deployment(
+        self,
+        payload: dict[str, Any],
+        environment: Literal["preview", "staging"],
+    ) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        orchestration = self._object(payload.get("orchestration"), "orchestration")
+        workflow_id = str(orchestration.get("workflow_id", ""))
+        if not workflow_id:
+            raise ValueError("deployment workflow identity is missing")
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if change_set is None or run is None or run.change_set_id != change_set_id:
+                raise ValueError("deployment ChangeSet/run binding is missing")
+            project = Project(change_set.project)
+            target = self._deployment_target(project, environment)
+            if not target.enabled:
+                run.status = "BLOCKED"
+                run.error_code = target.blocker or "DEPLOYMENT_TARGET_DISABLED"
+                return {
+                    **payload,
+                    "project": project.value,
+                    "environment": environment,
+                    "status": "BLOCKED",
+                    "blocker": target.blocker or "DEPLOYMENT_TARGET_DISABLED",
+                    "target_context": target.target_context,
+                    "target_namespace": target.target_namespace,
+                }
+            missing = self._release_missing(change_set)
+            release_evidence = self._object(
+                change_set.recovery_json.get("release_evidence", {}), "release_evidence"
+            )
+            for key in (
+                "rollback_plan_sha256",
+                "ci_result_sha256",
+                "independent_review_sha256",
+            ):
+                if not self._is_digest(release_evidence.get(key)):
+                    missing.append(key)
+            if missing:
+                run.status = "BLOCKED"
+                run.error_code = "RELEASE_EVIDENCE_INCOMPLETE"
+                return {
+                    **payload,
+                    "project": project.value,
+                    "environment": environment,
+                    "status": "BLOCKED",
+                    "blocker": "RELEASE_EVIDENCE_INCOMPLETE",
+                    "missing_requirements": sorted(set(missing)),
+                }
+            lease = session.scalar(
+                select(WorktreeLease).where(
+                    WorktreeLease.change_set_id == change_set_id,
+                    WorktreeLease.repository == change_set.deployment_repository,
+                    WorktreeLease.released_at.is_(None),
+                )
+            )
+            if lease is None:
+                run.status = "BLOCKED"
+                run.error_code = "DEPLOYMENT_WORKTREE_LEASE_MISSING"
+                return {
+                    **payload,
+                    "project": project.value,
+                    "environment": environment,
+                    "status": "BLOCKED",
+                    "blocker": "DEPLOYMENT_WORKTREE_LEASE_MISSING",
+                }
+            release_plan = self._release_plan(change_set, lease, target, release_evidence)
+            deployment_id = uuid5(
+                NAMESPACE_URL,
+                f"deployment:{change_set_id}:{environment}:{change_set.deployment_head_sha}",
+            )
+            deployment = session.get(Deployment, deployment_id)
+            if deployment is None:
+                deployment = Deployment(
+                    id=deployment_id,
+                    change_set_id=change_set_id,
+                    project=project.value,
+                    environment=environment,
+                    strategy=target.strategy,
+                    target_context=target.target_context,
+                    target_namespace=target.target_namespace,
+                    desired_sha=str(change_set.deployment_head_sha),
+                    status="PREPARING",
+                    transaction_id=None,
+                    started_at=None,
+                    finished_at=None,
+                    recovery_json={
+                        "rollback_plan_sha256": release_evidence["rollback_plan_sha256"]
+                    },
+                )
+                session.add(deployment)
+            run.status = "RUNNING"
+            return {
+                **payload,
+                "project": project.value,
+                "risk_class": change_set.risk_class,
+                "environment": environment,
+                "deployment_id": str(deployment_id),
+                "status": "DEPLOYMENT_PLAN_PREPARED",
+                "target_context": target.target_context,
+                "target_namespace": target.target_namespace,
+                "release_evidence": release_evidence,
+                "release_plan": release_plan,
+            }
+
+    def _record_staging_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        preflight = self._object(payload.get("release_preflight"), "release_preflight")
+        preflight_hash = hashlib.sha256(
+            json.dumps(preflight, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        release_evidence = self._object(payload.get("release_evidence"), "release_evidence")
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                raise ValueError("staging candidate ChangeSet is missing")
+            model = self._changeset_model(session, change_set)
+            approval_payload = ApprovalService.artifact_payload(
+                model,
+                target_context=str(payload["target_context"]),
+                target_namespace=str(payload["target_namespace"]),
+                migration=bool(release_evidence.get("migration", False)),
+                backup_requirement=str(
+                    release_evidence.get("backup_requirement", "not-required")
+                ),
+                rollback_plan_sha256=str(release_evidence["rollback_plan_sha256"]),
+                ci_result_sha256=str(release_evidence["ci_result_sha256"]),
+                independent_review_sha256=str(
+                    release_evidence["independent_review_sha256"]
+                ),
+                release_preflight_sha256=preflight_hash,
+            )
+            binding = ApprovalService.digest(approval_payload)
+            workflow_id = str(payload["orchestration"]["workflow_id"])
+            existing = session.scalar(
+                select(ApprovalCandidate).where(
+                    ApprovalCandidate.change_set_id == change_set_id,
+                    ApprovalCandidate.invalidated_at.is_(None),
+                )
+            )
+            if existing is not None and existing.artifact_binding_sha256 != binding:
+                existing.invalidated_at = datetime.now(UTC)
+                existing = None
+            if existing is not None and existing.workflow_id != workflow_id:
+                raise ValueError("approval candidate belongs to another active deployment workflow")
+            candidate_id = uuid5(NAMESPACE_URL, f"approval-candidate:{change_set_id}:{binding}")
+            candidate_payload = {
+                **approval_payload,
+                "artifact_binding_sha256": binding,
+                "release_preflight": preflight,
+                "deployment_id": payload["deployment_id"],
+            }
+            if existing is None:
+                session.add(
+                    ApprovalCandidate(
+                        id=candidate_id,
+                        change_set_id=change_set_id,
+                        workflow_id=workflow_id,
+                        risk_class=change_set.risk_class,
+                        artifact_binding_sha256=binding,
+                        payload_json=candidate_payload,
+                        invalidated_at=None,
+                    )
+                )
+            plan = self._object(payload.get("release_plan"), "release_plan")
+            plan["approval_binding_sha256"] = binding
+            change_set.state = ChangeSetState.AWAITING_STAGING_APPROVAL.value
+            change_set.version += 1
+            deployment = session.get(Deployment, UUID(str(payload["deployment_id"])))
+            if deployment is not None:
+                deployment.status = "AWAITING_STAGING_APPROVAL"
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is not None:
+                run.status = "AWAITING_APPROVAL"
+            return {
+                **payload,
+                "status": "AWAITING_STAGING_APPROVAL",
+                "artifact_binding_sha256": binding,
+                "approval_candidate": candidate_payload,
+                "release_plan": plan,
+            }
+
+    def _validate_staging_approval(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = self._object(payload.get("context"), "context")
+        approval = self._object(payload.get("approval"), "approval")
+        change_set_id = UUID(str(context["change_set_id"]))
+        binding = str(context["artifact_binding_sha256"])
+        decision = str(approval.get("decision", ""))
+        if decision not in {"approve", "reject"} or approval.get(
+            "artifact_binding_sha256"
+        ) != binding:
+            return {**context, "status": "BLOCKED", "blocker": "STAGING_APPROVAL_REJECTED"}
+        with self.sessions.begin() as session:
+            candidate = session.scalar(
+                select(ApprovalCandidate).where(
+                    ApprovalCandidate.change_set_id == change_set_id,
+                    ApprovalCandidate.artifact_binding_sha256 == binding,
+                    ApprovalCandidate.invalidated_at.is_(None),
+                )
+            )
+            persisted = session.scalar(
+                select(Approval).where(
+                    Approval.change_set_id == change_set_id,
+                    Approval.artifact_binding_sha256 == binding,
+                    Approval.decision == decision,
+                    Approval.invalidated_at.is_(None),
+                )
+            )
+            if candidate is None or persisted is None:
+                raise ValueError("staging approval is not current authoritative metadata")
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                raise ValueError("approved ChangeSet is missing")
+            workflow_id = str(context["orchestration"]["workflow_id"])
+            if candidate.workflow_id != workflow_id:
+                raise ValueError("approval candidate belongs to another deployment workflow")
+            if decision == "reject":
+                now = datetime.now(UTC)
+                candidate.invalidated_at = now
+                change_set.state = ChangeSetState.REQUEST_CHANGES.value
+                change_set.version += 1
+                deployment = session.get(Deployment, UUID(str(context["deployment_id"])))
+                if deployment is not None:
+                    deployment.status = "REJECTED"
+                    deployment.finished_at = now
+                run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+                if run is not None:
+                    run.status = "BLOCKED"
+                    run.error_code = "STAGING_APPROVAL_REJECTED"
+                    run.finished_at = now
+                return {
+                    **context,
+                    "status": "BLOCKED",
+                    "blocker": "STAGING_APPROVAL_REJECTED",
+                }
+            candidate_payload = self._object(candidate.payload_json, "approval candidate")
+            current_payload = ApprovalService.artifact_payload(
+                self._changeset_model(session, change_set),
+                target_context=str(candidate_payload["target_context"]),
+                target_namespace=str(candidate_payload["target_namespace"]),
+                migration=bool(candidate_payload["migration"]),
+                backup_requirement=str(candidate_payload["backup_requirement"]),
+                rollback_plan_sha256=str(candidate_payload["rollback_plan_sha256"]),
+                ci_result_sha256=str(candidate_payload["ci_result_sha256"]),
+                independent_review_sha256=str(
+                    candidate_payload["independent_review_sha256"]
+                ),
+                release_preflight_sha256=str(
+                    candidate_payload["release_preflight_sha256"]
+                ),
+            )
+            if ApprovalService.digest(current_payload) != binding:
+                invalidated_at = datetime.now(UTC)
+                candidate.invalidated_at = invalidated_at
+                persisted.invalidated_at = invalidated_at
+                change_set.state = ChangeSetState.REQUEST_CHANGES.value
+                change_set.version += 1
+                deployment = session.get(Deployment, UUID(str(context["deployment_id"])))
+                if deployment is not None:
+                    deployment.status = "APPROVAL_INVALIDATED"
+                    deployment.finished_at = invalidated_at
+                run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+                if run is not None:
+                    run.status = "BLOCKED"
+                    run.error_code = "APPROVAL_ARTIFACT_DRIFT"
+                    run.finished_at = invalidated_at
+                return {
+                    **context,
+                    "status": "BLOCKED",
+                    "blocker": "APPROVAL_ARTIFACT_DRIFT",
+                }
+            change_set.state = ChangeSetState.STAGING_APPROVED.value
+            change_set.version += 1
+            deployment = session.get(Deployment, UUID(str(context["deployment_id"])))
+            if deployment is not None:
+                deployment.status = "STAGING_APPROVED"
+            return {
+                **context,
+                "status": "STAGING_APPROVED",
+                "approval_validation": {
+                    "current": True,
+                    "artifact_binding_sha256": binding,
+                    "approval_id": str(persisted.id),
+                    "approver_subject": persisted.approver_subject,
+                },
+            }
+
+    def _finalize_staging(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("status") != "DEPLOYED":
+            raise ValueError("staging finalization requires deterministic deployment success")
+        change_set_id = UUID(str(payload["change_set_id"]))
+        deployment_id = UUID(str(payload["deployment_id"]))
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            deployment = session.get(Deployment, deployment_id)
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if change_set is None or deployment is None or run is None:
+                raise ValueError("staging finalization metadata is incomplete")
+            change_set.state = ChangeSetState.STAGING_DEPLOYED.value
+            change_set.version += 1
+            deployment.status = "STAGING_DEPLOYED"
+            deployment.transaction_id = str(payload.get("transaction_id", "")) or None
+            deployment.finished_at = datetime.now(UTC)
+            run.status = "SUCCESS"
+            run.finished_at = datetime.now(UTC)
+        return {**payload, "status": "STAGING_DEPLOYED"}
+
+    def _record_deployment_terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        terminal = str(payload.get("terminal_status", ""))
+        run_status = {
+            "PREVIEW_PREFLIGHT_VALIDATED": "SUCCESS",
+            "STAGING_PREFLIGHT_VALIDATED": "SUCCESS",
+            "BLOCKED": "BLOCKED",
+            "CANCELLED": "CANCELLED",
+        }.get(terminal)
+        if run_status is None:
+            raise ValueError("deployment terminal status is not allowlisted")
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        change_set_id = UUID(str(payload["change_set_id"]))
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None or run.change_set_id != change_set_id:
+                raise ValueError("deployment terminal Run binding is missing")
+            run.status = run_status
+            run.finished_at = now
+            blocker = payload.get("blocker")
+            run.error_code = str(blocker) if blocker else None
+            deployment_id = payload.get("deployment_id")
+            if deployment_id:
+                deployment = session.get(Deployment, UUID(str(deployment_id)))
+                if deployment is None or deployment.change_set_id != change_set_id:
+                    raise ValueError("deployment terminal metadata binding is missing")
+                deployment.status = (
+                    "PREFLIGHT_VALIDATED" if run_status == "SUCCESS" else run_status
+                )
+                deployment.finished_at = now
+            if terminal in {"BLOCKED", "CANCELLED"}:
+                candidate = session.scalar(
+                    select(ApprovalCandidate).where(
+                        ApprovalCandidate.change_set_id == change_set_id,
+                        ApprovalCandidate.invalidated_at.is_(None),
+                    )
+                )
+                if candidate is not None and candidate.workflow_id == workflow_id:
+                    candidate.invalidated_at = now
+        return {**payload, "status": terminal}
+
+    def _deployment_target(
+        self, project: Project, environment: Literal["preview", "staging"]
+    ) -> DeploymentTargetRecord:
+        root = self.settings.deployment_target_root.resolve()
+        path = (root / f"{project.value}-{environment}.yaml").resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            raise ValueError("deployment target configuration is missing")
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+        target = DeploymentTargetRecord.model_validate(value)
+        if target.project is not project or target.environment != environment:
+            raise ValueError("deployment target identity does not match its filename")
+        if project is Project.FALCONE and target.strategy != "helm":
+            raise ValueError("Falcone target must use Helm")
+        if project is Project.MUSEMATIC and target.strategy != "argocd-gitops":
+            raise ValueError("Musematic target must use Argo CD GitOps")
+        return target
+
+    def _release_plan(
+        self,
+        change_set: ChangeSet,
+        lease: WorktreeLease,
+        target: DeploymentTargetRecord,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        configuration = target.configuration
+        if target.strategy == "helm":
+            chart_subdirectory = self._relative_path(
+                configuration.get("chart_subdirectory", "."), "chart_subdirectory"
+            )
+            chart_directory = Path(lease.worktree_path) / chart_subdirectory
+            raw_values = configuration.get("values_files")
+            if not isinstance(raw_values, list) or not raw_values:
+                raise ValueError("Falcone target requires values_files")
+            values_files = [
+                str(chart_directory / self._relative_path(value, "values_file"))
+                for value in raw_values
+            ]
+            migration = bool(evidence.get("migration", False))
+            return {
+                "strategy": "helm",
+                "change_set_id": str(change_set.id),
+                "chart_repository_sha": str(change_set.deployment_head_sha),
+                "chart_version": str(
+                    change_set.chart_version or self._config_string(configuration, "chart_version")
+                ),
+                "release_name": self._config_string(configuration, "release_name"),
+                "chart_directory": str(chart_directory),
+                "values_files": values_files,
+                "image_digests": change_set.image_digests,
+                "kube_context": self._config_string(configuration, "kube_context"),
+                "namespace": target.target_namespace,
+                "kubeconfig_path": self._config_string(configuration, "kubeconfig_path"),
+                "migration": migration,
+                "backup_evidence_sha256": evidence.get("backup_evidence_sha256"),
+                "parity_evidence_sha256": evidence.get("parity_evidence_sha256"),
+                "rollback_plan_sha256": evidence["rollback_plan_sha256"],
+                "approval_binding_sha256": "0" * 64,
+                "timeout_minutes": int(configuration.get("timeout_minutes", 30)),
+            }
+        return {
+            "strategy": "argocd-gitops",
+            "change_set_id": str(change_set.id),
+            "deployment_repository_sha": str(change_set.deployment_head_sha),
+            "deployment_repository": lease.worktree_path,
+            "deployment_pr_url": str(change_set.deployment_pr_url),
+            "image_digests": change_set.image_digests,
+            "argo_application": self._config_string(configuration, "argo_application"),
+            "target_revision": str(change_set.deployment_head_sha),
+            "target_namespace": target.target_namespace,
+            "approval_binding_sha256": "0" * 64,
+        }
+
+    @staticmethod
+    def _release_missing(change_set: ChangeSet) -> list[str]:
+        values = {
+            "source_head_sha": change_set.source_head_sha,
+            "source_pr_url": change_set.source_pr_url,
+            "deployment_head_sha": change_set.deployment_head_sha,
+            "deployment_pr_url": change_set.deployment_pr_url,
+            "image_digests": change_set.image_digests,
+        }
+        return [name for name, value in values.items() if not value]
+
+    @staticmethod
+    def _is_digest(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    @staticmethod
+    def _relative_path(value: Any, label: str) -> PurePosixPath:
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be a relative path")
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"{label} escaped its deployment worktree")
+        return path
+
+    @staticmethod
+    def _config_string(configuration: dict[str, Any], key: str) -> str:
+        value = configuration.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"deployment target requires {key}")
+        return value
+
+    @staticmethod
+    def _changeset_model(session: Any, change_set: ChangeSet) -> ChangeSetModel:
+        issue = session.get(Issue, change_set.issue_id) if change_set.issue_id else None
+        return ChangeSetModel.model_validate(
+            {
+                "change_set_id": change_set.id,
+                "project": change_set.project,
+                "finding_id": change_set.finding_id,
+                "github_issue": issue.url if issue and issue.url else None,
+                "openspec_change": issue.openspec_change if issue else None,
+                "risk_class": change_set.risk_class,
+                "state": change_set.state,
+                "source_repository": change_set.source_repository,
+                "source_branch": change_set.source_branch,
+                "source_base_sha": change_set.source_base_sha,
+                "source_head_sha": change_set.source_head_sha,
+                "source_pr": change_set.source_pr_url,
+                "deployment_repository": change_set.deployment_repository,
+                "deployment_branch": change_set.deployment_branch,
+                "deployment_base_sha": change_set.deployment_base_sha,
+                "deployment_head_sha": change_set.deployment_head_sha,
+                "deployment_pr": change_set.deployment_pr_url,
+                "image_digests": change_set.image_digests,
+                "chart_version": change_set.chart_version,
+                "version": change_set.version,
+            }
+        )
 
     def _persist_quota(self, snapshots: list[QuotaSnapshotRecord]) -> None:
         for snapshot in snapshots:

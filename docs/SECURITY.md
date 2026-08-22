@@ -21,6 +21,12 @@ can get/list/watch selected resources and logs but has no Secret or mutation per
 and Falcone staging roles must be bound per approved namespace. Musematic normally promotes by Git,
 not direct cluster mutation. No production binding is bootstrapped and cluster-admin is forbidden.
 
+Deployment targets are separate non-secret records under `/etc/engineering-control/targets` and
+install disabled. A target name is bound to project and environment, with a project-fixed strategy.
+Falcone kubeconfig paths must remain beneath `/etc/engineering-control/env/release`, be readable
+only by the release identity, and are checked immediately before preflight and deployment. The
+release worker has no model provider homes; model workers have no release target credentials.
+
 Active security blockers:
 
 - `SECURITY_BLOCKER_MUSEMATIC_GIT_SECRETS`: rotate affected credentials, invalidate sessions,

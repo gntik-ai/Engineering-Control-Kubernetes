@@ -13,12 +13,25 @@ from engineering_control.config import Settings
 
 
 class FakeHelm:
+    def preflight(self, plan: Any) -> dict[str, Any]:
+        return {
+            "status": "PREFLIGHT_PASS",
+            "chart_sha": plan.chart_repository_sha,
+            "rendered_sha256": "f" * 64,
+        }
+
     def deploy(self, plan: Any, *, approval_is_current: bool) -> CommandResult:
         assert approval_is_current
         return CommandResult(0, "bounded helm transaction", "")
 
 
 class FakeGitOps:
+    def preflight(self, plan: Any) -> dict[str, Any]:
+        return {
+            "status": "PREFLIGHT_PASS",
+            "deployment_sha": plan.target_revision,
+        }
+
     def observe_reconciliation(self, plan: Any) -> dict[str, Any]:
         return {
             "sync_status": "Synced",
@@ -81,6 +94,30 @@ async def test_release_activity_requires_typed_current_bound_plan(tmp_path: Path
     assert result["status"] == "DEPLOYED"
     assert result["strategy"] == "helm"
     assert len(result["transaction_id"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_release_preflight_is_bounded_and_does_not_require_approval(tmp_path: Path) -> None:
+    worktree_root = tmp_path / "worktrees"
+    chart = worktree_root / "falcone-charts" / "change-set"
+    chart.mkdir(parents=True)
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    kubeconfig = credential_root / "preview.kubeconfig"
+    kubeconfig.write_text("scoped test configuration", encoding="utf-8")
+    os.chmod(kubeconfig, 0o600)
+    handler = ReleaseActivityHandler(
+        Settings(worktree_root=worktree_root, release_credential_root=credential_root),
+        helm=FakeHelm(),  # type: ignore[arg-type]
+        gitops=FakeGitOps(),  # type: ignore[arg-type]
+    )
+    payload = helm_payload(chart, kubeconfig)
+    payload.pop("approval_validation")
+
+    result = await handler.handle("staging.preflight", payload)
+
+    assert result["status"] == "PREFLIGHT_PASS"
+    assert result["release_preflight"]["chart_sha"] == "a" * 40
 
 
 @pytest.mark.asyncio

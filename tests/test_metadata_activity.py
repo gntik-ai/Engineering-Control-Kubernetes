@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,7 +11,9 @@ from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
+    Approval,
     Campaign,
+    ChangeSet,
     CoverageCell,
     Finding,
     QuotaSnapshot,
@@ -418,3 +420,303 @@ async def test_delivery_component_lease_conflict_is_structured(tmp_path: Path) -
         "status": "BLOCKED",
         "blocker": "COMPONENT_LEASE_CONFLICT",
     }
+
+
+@pytest.mark.asyncio
+async def test_disabled_deployment_target_is_a_structured_blocker(tmp_path: Path) -> None:
+    target_root = tmp_path / "targets"
+    target_root.mkdir()
+    (target_root / "falcone-staging.yaml").write_text(
+        """version: 1
+enabled: false
+project: falcone
+environment: staging
+strategy: helm
+target_context: UNCONFIGURED
+target_namespace: UNCONFIGURED
+blocker: SCOPED_FALCONE_STAGING_TARGET_REQUIRED
+configuration: {}
+""",
+        encoding="utf-8",
+    )
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'deployment-blocked.sqlite'}",
+            deployment_target_root=target_root,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    workflow_id = "deploy-staging-blocked"
+    change_set = ChangeSet(
+        id=change_set_id,
+        finding_id=uuid4(),
+        issue_id=None,
+        project="falcone",
+        risk_class="R2",
+        state="DEPLOY_PR",
+        version=1,
+        source_repository="falcone",
+        source_branch="agent/falcone/1/test",
+        source_base_sha="a" * 40,
+        source_head_sha="b" * 40,
+        source_pr_url="https://github.com/gntik-ai/falcone/pull/1",
+        deployment_repository="falcone-charts",
+        deployment_branch="agent/falcone/1/test",
+        deployment_base_sha="c" * 40,
+        deployment_head_sha="d" * 40,
+        deployment_pr_url="https://github.com/gntik-ai/falcone-charts/pull/1",
+        image_digests={"api": f"sha256:{'e' * 64}"},
+        chart_version="1.2.3",
+        recovery_json={},
+    )
+    run = Run(
+        id=uuid4(),
+        campaign_id=None,
+        change_set_id=change_set_id,
+        workflow_id=workflow_id,
+        run_type="staging-deployment",
+        status="QUEUED",
+        project="falcone",
+    )
+    with handler.sessions.begin() as session:
+        session.add_all([change_set, run])
+
+    result = await handler.handle(
+        "staging.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "environment": "staging",
+            "dry_run": True,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "SCOPED_FALCONE_STAGING_TARGET_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_deployment_run_is_persisted_as_terminal(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'deployment-cancelled.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    run_id = uuid4()
+    workflow_id = "deploy-preview-cancelled"
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="falcone",
+                risk_class="R1",
+                state="CANDIDATE_BUILT",
+                version=1,
+                source_repository="falcone",
+                source_branch="agent/falcone/1/test",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url=None,
+                deployment_repository="falcone-charts",
+                deployment_branch="agent/falcone/1/test",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                campaign_id=None,
+                change_set_id=change_set_id,
+                workflow_id=workflow_id,
+                run_type="preview-deployment",
+                status="QUEUED",
+                project="falcone",
+            )
+        )
+
+    result = await handler.handle(
+        "deployment.record_terminal",
+        {
+            "change_set_id": str(change_set_id),
+            "terminal_status": "CANCELLED",
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+
+    assert result["status"] == "CANCELLED"
+    with handler.sessions() as session:
+        run = session.get(Run, run_id)
+        assert run is not None
+        assert run.status == "CANCELLED"
+        assert run.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_staging_candidate_binds_preflight_and_both_repository_heads(
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "targets"
+    target_root.mkdir()
+    (target_root / "musematic-staging.yaml").write_text(
+        """version: 1
+enabled: true
+project: musematic
+environment: staging
+strategy: argocd-gitops
+target_context: musematic-staging-observer
+target_namespace: musematic-staging
+configuration:
+  argo_application: musematic-staging
+""",
+        encoding="utf-8",
+    )
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'deployment-ready.sqlite'}",
+            deployment_target_root=target_root,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    run_id = uuid4()
+    workflow_id = "deploy-staging-ready"
+    deployment_worktree = tmp_path / "worktrees" / "musematic-deploy" / str(change_set_id)
+    recovery = {
+        "release_evidence": {
+            "rollback_plan_sha256": "1" * 64,
+            "ci_result_sha256": "2" * 64,
+            "independent_review_sha256": "3" * 64,
+            "backup_requirement": "not-required",
+            "migration": False,
+        }
+    }
+    change_set = ChangeSet(
+        id=change_set_id,
+        finding_id=uuid4(),
+        issue_id=None,
+        project="musematic",
+        risk_class="R2",
+        state="DEPLOY_PR",
+        version=1,
+        source_repository="musematic",
+        source_branch="agent/musematic/1/test",
+        source_base_sha="a" * 40,
+        source_head_sha="b" * 40,
+        source_pr_url="https://github.com/gntik-ai/musematic/pull/1",
+        deployment_repository="musematic-deploy",
+        deployment_branch="agent/musematic/1/test",
+        deployment_base_sha="c" * 40,
+        deployment_head_sha="d" * 40,
+        deployment_pr_url="https://github.com/gntik-ai/musematic-deploy/pull/1",
+        image_digests={"api": f"sha256:{'e' * 64}"},
+        chart_version=None,
+        recovery_json=recovery,
+    )
+    run = Run(
+        id=run_id,
+        campaign_id=None,
+        change_set_id=change_set_id,
+        workflow_id=workflow_id,
+        run_type="staging-deployment",
+        status="QUEUED",
+        project="musematic",
+    )
+    lease = WorktreeLease(
+        id=uuid4(),
+        change_set_id=change_set_id,
+        repository="musematic-deploy",
+        worktree_path=str(deployment_worktree),
+        branch=f"agent/musematic/1/{change_set_id}",
+        owner_run_id=run_id,
+        base_sha="c" * 40,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        released_at=None,
+    )
+    with handler.sessions.begin() as session:
+        session.add_all([change_set, run, lease])
+
+    prepared = await handler.handle(
+        "staging.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "environment": "staging",
+            "dry_run": False,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    candidate = await handler.handle(
+        "staging.record_candidate",
+        {
+            **prepared,
+            "release_preflight": {"status": "PREFLIGHT_PASS", "deployment_sha": "d" * 40},
+        },
+    )
+
+    assert prepared["release_plan"]["target_revision"] == "d" * 40
+    assert candidate["status"] == "AWAITING_STAGING_APPROVAL"
+    assert candidate["release_plan"]["approval_binding_sha256"] == candidate[
+        "artifact_binding_sha256"
+    ]
+    assert candidate["approval_candidate"]["source_sha"] == "b" * 40
+    assert candidate["approval_candidate"]["deployment_sha"] == "d" * 40
+    assert len(candidate["approval_candidate"]["release_preflight_sha256"]) == 64
+
+    with handler.sessions.begin() as session:
+        session.add(
+            Approval(
+                change_set_id=change_set_id,
+                approval_type="staging",
+                decision="approve",
+                artifact_binding_sha256=candidate["artifact_binding_sha256"],
+                approver_subject="operator:test",
+                approved_at=datetime.now(UTC),
+                invalidated_at=None,
+                metadata_json={},
+            )
+        )
+
+    approved = await handler.handle(
+        "staging.validate_approval",
+        {
+            "context": candidate,
+            "approval": {
+                "decision": "approve",
+                "artifact_binding_sha256": candidate["artifact_binding_sha256"],
+            },
+        },
+    )
+
+    assert approved["status"] == "STAGING_APPROVED"
+    assert approved["approval_validation"]["current"] is True
+
+    with handler.sessions.begin() as session:
+        stored = session.get(ChangeSet, change_set_id)
+        assert stored is not None
+        stored.deployment_head_sha = "f" * 40
+
+    invalidated = await handler.handle(
+        "staging.validate_approval",
+        {
+            "context": candidate,
+            "approval": {
+                "decision": "approve",
+                "artifact_binding_sha256": candidate["artifact_binding_sha256"],
+            },
+        },
+    )
+
+    assert invalidated["status"] == "BLOCKED"
+    assert invalidated["blocker"] == "APPROVAL_ARTIFACT_DRIFT"
+    with handler.sessions() as session:
+        stored_run = session.get(Run, run_id)
+        assert stored_run is not None
+        assert stored_run.status == "BLOCKED"
+        assert stored_run.error_code == "APPROVAL_ARTIFACT_DRIFT"
