@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     temporary_root: Path = Path("/srv/engineering/tmp")
     codex_executable: Path = Path("/usr/local/bin/codex")
     claude_executable: Path = Path("/usr/local/bin/claude")
+    helm_executable: Path = Path("/usr/local/bin/helm")
+    argocd_executable: Path = Path("/usr/local/bin/argocd")
+    release_credential_root: Path = Path("/etc/engineering-control/env/release")
     acceptance_root: Path = Path("/srv/engineering/tmp/acceptance")
     lease_root: Path = Path("/var/lib/engineering-control/leases")
     log_level: str = "INFO"

@@ -12,7 +12,9 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
 
+from .metadata import MetadataActivityHandler
 from .provider import ProviderActivityHandler
+from .release import ReleaseActivityHandler
 
 
 class ControlActivities:
@@ -127,6 +129,12 @@ class ControlActivities:
             if self.worker_kind in {"codex", "claude"}
             else None
         )
+        self.release_handler = (
+            ReleaseActivityHandler(settings) if self.worker_kind == "release" else None
+        )
+        self.metadata_handler = (
+            MetadataActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -141,11 +149,14 @@ class ControlActivities:
                 non_retryable=True,
             )
         safe_payload = self.redactor.redact(payload).value
+        safe_payload = self._attach_orchestration_context(safe_payload)
         activity.heartbeat({"step": step, "phase": "validated"})
         if step in self._mutation_steps:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:
                 return self._envelope(step, safe_payload, "DRY_RUN")
+            if self.release_handler is not None:
+                return await self.release_handler.handle(step, safe_payload)
             raise ApplicationError(
                 f"{step} requires a configured deterministic release adapter",
                 type="SecurityBlocker",
@@ -153,6 +164,8 @@ class ControlActivities:
             )
         if self.provider_handler is not None:
             return await self.provider_handler.handle(step, safe_payload)
+        if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:
+            return await self.metadata_handler.handle(step, safe_payload)
         if self.settings.synthetic_mode or self.worker_kind == "synthetic":
             return self._synthetic_step(step, safe_payload)
         raise ApplicationError(
@@ -160,6 +173,24 @@ class ControlActivities:
             type="NotConfigured",
             non_retryable=True,
         )
+
+    @staticmethod
+    def _attach_orchestration_context(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            info = activity.info()
+        except RuntimeError:
+            return payload
+        return {
+            **payload,
+            "orchestration": {
+                "workflow_id": info.workflow_id,
+                "workflow_run_id": info.workflow_run_id,
+                "activity_run_id": info.activity_run_id,
+                "activity_id": info.activity_id,
+                "attempt": info.attempt,
+                "task_queue": info.task_queue,
+            },
+        }
 
     @staticmethod
     def _find_value(value: Any, key: str, *, default: Any = None) -> Any:

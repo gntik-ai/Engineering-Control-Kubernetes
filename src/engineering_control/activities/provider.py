@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -131,6 +132,7 @@ class ProviderActivityHandler:
             cli_present = False
         return {
             "provider": self.provider.value,
+            "captured_at": datetime.now(UTC).isoformat(),
             "remaining_capacity": None,
             "total_capacity": None,
             "reset_at": None,
