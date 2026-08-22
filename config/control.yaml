@@ -40,5 +40,9 @@ runtime_verification:
   targets: /etc/engineering-control/runtime
   default_enabled: false
   observer_credentials: /etc/engineering-control/env/observer
+cleanup:
+  execution_enabled: false
+  retention_days: 14
+  expiry_grace_hours: 24
 paid_api_fallback:
   enabled: false

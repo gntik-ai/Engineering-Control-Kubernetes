@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -113,6 +114,27 @@ class IndeterminateObserverRunner(FakeObserverRunner):
         if "auth" in arguments:
             return CommandResult(1, "", "authorization endpoint unavailable")
         return super().run(executable, arguments, **kwargs)
+
+
+class FakeCleanupManager:
+    def __init__(self, branch: str, *, dirty: bool = False) -> None:
+        self.branch = branch
+        self.dirty = dirty
+        self.cleaned: list[str] = []
+
+    def _run(self, arguments: list[str], path: Path) -> str:
+        if arguments[:2] == ["git", "branch"]:
+            return self.branch
+        if arguments[:2] == ["git", "rev-parse"]:
+            return "b" * 40
+        raise AssertionError(arguments)
+
+    def is_dirty(self, path: Path) -> bool:
+        return self.dirty
+
+    def cleanup(self, allocation: Any, *, evidence_captured: bool) -> None:
+        assert evidence_captured is False
+        self.cleaned.append(str(allocation.path))
 
 @pytest.mark.asyncio
 async def test_project_snapshot_maps_both_transaction_repositories(tmp_path: Path) -> None:
@@ -269,3 +291,72 @@ async def test_runtime_observation_rejects_indeterminate_authorization(tmp_path:
                 }
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_protects_dirty_and_executes_only_controller_authorization(
+    tmp_path: Path,
+) -> None:
+    worktree_root = tmp_path / "worktrees"
+    change_set_id = uuid4()
+    lease_id = uuid4()
+    path = worktree_root / "falcone" / str(change_set_id)
+    path.mkdir(parents=True)
+    branch = f"agent/falcone/123/{change_set_id}"
+    candidate = {
+        "lease_id": str(lease_id),
+        "change_set_id": str(change_set_id),
+        "repository": "falcone",
+        "worktree_path": str(path),
+        "branch": branch,
+        "base_sha": "a" * 40,
+        "reason": "RELEASED_RETENTION_EXPIRED",
+    }
+    dirty_handler = ScanActivityHandler(
+        Settings(worktree_root=worktree_root),
+        FakeCleanupManager(branch, dirty=True),  # type: ignore[arg-type]
+    )
+    protected = await dirty_handler.handle(
+        "cleanup.protect_active", {"cleanup_candidates": [candidate]}
+    )
+    assert protected["eligible_candidates"] == []
+    assert protected["protected_candidates"][0]["protection"] == "DIRTY_WORKTREE"
+
+    manager = FakeCleanupManager(branch)
+    handler = ScanActivityHandler(
+        Settings(worktree_root=worktree_root, cleanup_execution_enabled=True),
+        manager,  # type: ignore[arg-type]
+    )
+    inspected = await handler.handle(
+        "cleanup.protect_active", {"cleanup_candidates": [candidate]}
+    )
+    assert inspected["eligible_candidates"][0]["inspection"] == "CLEAN"
+    workflow_id = "cleanup-test"
+    canonical = json.dumps(
+        {"workflow_id": workflow_id, "candidates": [candidate]},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    disabled_handler = ScanActivityHandler(
+        Settings(worktree_root=worktree_root),
+        manager,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ApplicationError, match="disabled by policy"):
+        await disabled_handler.handle(
+            "cleanup.execute",
+            {
+                "authorized_candidates": [candidate],
+                "cleanup_authorization_sha256": hashlib.sha256(canonical).hexdigest(),
+                "orchestration": {"workflow_id": workflow_id},
+            },
+        )
+    result = await handler.handle(
+        "cleanup.execute",
+        {
+            "authorized_candidates": [candidate],
+            "cleanup_authorization_sha256": hashlib.sha256(canonical).hexdigest(),
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    assert result["removed_lease_ids"] == [str(lease_id)]
+    assert manager.cleaned == [str(path)]

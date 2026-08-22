@@ -84,7 +84,9 @@ class ControlActivities:
         "quota.persist",
         "cleanup.discover",
         "cleanup.protect_active",
+        "cleanup.authorize",
         "cleanup.execute",
+        "cleanup.finalize",
     }
     _mutation_steps = {
         "preview.deploy",
@@ -103,6 +105,8 @@ class ControlActivities:
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
+            "cleanup.protect_active",
+            "cleanup.execute",
             "preview.preflight",
             "audit.agent_cell",
             "delivery.invoke_spec",
@@ -124,6 +128,8 @@ class ControlActivities:
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
+            "cleanup.protect_active",
+            "cleanup.execute",
         },
         "codex": {
             "audit.agent_cell",
@@ -199,6 +205,8 @@ class ControlActivities:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:
                 return self._envelope(step, safe_payload, "DRY_RUN")
+            if step == "cleanup.execute" and self.scan_handler is not None:
+                return await self.scan_handler.handle(step, safe_payload)
             if self.release_handler is not None:
                 return await self.release_handler.handle(step, safe_payload)
             raise ApplicationError(

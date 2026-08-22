@@ -29,6 +29,15 @@ Back up PostgreSQL and `/etc/engineering-control` before upgrades. Do not back u
 SSH private keys into general platform archives. Temporal and PostgreSQL must be healthy before
 starting API/workers. The notifier uses an outbox so an unavailable sink does not lose state.
 
-Cleanup remains dry-run until expiry policy, active leases, dirty-tree evidence, incidents, and
-retention holds are all checked. Never delete active/dirty worktrees or incident/security/release
-evidence.
+The daily cleanup schedule is permanently created in dry-run mode. Discovery considers only
+worktree leases whose owner Run is terminal, whose ChangeSet is `ISSUE_CLOSED`, `CANCELLED`,
+`SUPERSEDED`, or `REJECTED`, whose retention/grace period expired, and which have no open incident.
+The scan worker then proves the exact repository/ChangeSet path, branch identity, and clean Git
+state. The controller reauthorizes every lease against current PostgreSQL state immediately before
+execution.
+
+Execution has a second fail-closed switch, `ENGINEERING_CLEANUP_EXECUTION_ENABLED=false`, on both
+controller and scan worker. Even when explicitly enabled for a separately started non-dry-run
+workflow, deletion uses `git worktree remove`; arbitrary paths, dirty worktrees, active leases,
+incident evidence, security evidence, and release evidence are never candidates. This retention
+workflow is distinct from the bootstrap software cleanup plan gated by `APPROVE CLEANUP`.

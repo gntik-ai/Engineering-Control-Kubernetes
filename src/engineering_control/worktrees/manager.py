@@ -352,6 +352,17 @@ class GitWorktreeManager:
         mirror = self.verify_mirror(allocation.repository)
         if not allocation.path.exists():
             return
+        expected = (
+            self.worktree_root.resolve()
+            / self._slug(allocation.repository)
+            / str(allocation.change_set_id)
+        )
+        resolved = allocation.path.resolve()
+        if resolved != expected or not resolved.is_dir():
+            raise WorktreeError("cleanup target does not match its bounded ChangeSet path")
+        actual_branch = self._run(["git", "branch", "--show-current"], resolved)
+        if actual_branch != allocation.branch:
+            raise WorktreeError("cleanup target branch changed after authorization")
         if self.is_dirty(allocation.path):
             if not evidence_captured:
                 raise WorktreeError("dirty worktree is protected until evidence is captured")

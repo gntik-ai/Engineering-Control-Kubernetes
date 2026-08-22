@@ -23,6 +23,7 @@ from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
+    WorktreeAllocation,
     WorktreeError,
 )
 
@@ -78,6 +79,18 @@ class RuntimeObservationPlan(BaseModel):
         return self
 
 
+class CleanupCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    lease_id: UUID
+    change_set_id: UUID
+    repository: str = Field(pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy)$")
+    worktree_path: Path
+    branch: str = Field(pattern=r"^agent/(falcone|musematic)/[a-zA-Z0-9._-]+/[a-f0-9-]{36}$")
+    base_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
+    reason: str = Field(pattern=r"^(RELEASED_RETENTION_EXPIRED|ABANDONED_LEASE_EXPIRED)$")
+
+
 class ScanActivityHandler:
     """Bounded mirror and worktree operations owned only by scan-runner."""
 
@@ -89,6 +102,8 @@ class ScanActivityHandler:
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "runtime.deterministic_checks",
+            "cleanup.protect_active",
+            "cleanup.execute",
         }
     )
     _repositories = {
@@ -140,6 +155,10 @@ class ScanActivityHandler:
                 return self._delivery_prechecks(payload)
             if step == "runtime.deterministic_checks":
                 return self._runtime_deterministic_checks(payload)
+            if step == "cleanup.protect_active":
+                return self._protect_cleanup_candidates(payload)
+            if step == "cleanup.execute":
+                return self._execute_cleanup(payload)
             if step == "delivery.validate_changeset":
                 return self._validate_changeset(payload)
         except PermissionError as error:
@@ -162,6 +181,108 @@ class ScanActivityHandler:
             type="NotConfigured",
             non_retryable=True,
         )
+
+    def _protect_cleanup_candidates(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_candidates = payload.get("cleanup_candidates")
+        if not isinstance(raw_candidates, list):
+            raise ValueError("cleanup protection requires candidate records")
+        candidates = [CleanupCandidate.model_validate(value) for value in raw_candidates]
+        eligible: list[dict[str, Any]] = []
+        protected: list[dict[str, Any]] = []
+        for candidate in candidates:
+            expected = (
+                self.settings.worktree_root.resolve()
+                / candidate.repository
+                / str(candidate.change_set_id)
+            )
+            path = candidate.worktree_path.resolve()
+            record = candidate.model_dump(mode="json")
+            if path != expected:
+                protected.append({**record, "protection": "PATH_IDENTITY_MISMATCH"})
+                continue
+            if not path.exists():
+                eligible.append({**record, "inspection": "ABSENT"})
+                continue
+            if not path.is_dir():
+                protected.append({**record, "protection": "NOT_A_DIRECTORY"})
+                continue
+            try:
+                branch = self.manager._run(["git", "branch", "--show-current"], path)
+                head = self.manager._run(["git", "rev-parse", "HEAD"], path)
+                dirty = self.manager.is_dirty(path)
+            except WorktreeError:
+                protected.append({**record, "protection": "GIT_IDENTITY_UNPROVEN"})
+                continue
+            if branch != candidate.branch:
+                protected.append({**record, "protection": "BRANCH_IDENTITY_MISMATCH"})
+                continue
+            if dirty:
+                protected.append({**record, "protection": "DIRTY_WORKTREE"})
+                continue
+            eligible.append(
+                {
+                    **record,
+                    "inspection": "CLEAN",
+                    "observed_branch": branch,
+                    "observed_head_sha": head,
+                }
+            )
+        return {
+            **payload,
+            "status": "CLEANUP_PROTECTED",
+            "eligible_candidates": eligible,
+            "protected_candidates": protected,
+        }
+
+    def _execute_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.settings.cleanup_execution_enabled:
+            raise ApplicationError(
+                "worktree cleanup execution is disabled by policy",
+                type="SecurityBlocker",
+                non_retryable=True,
+            )
+        raw_authorized = payload.get("authorized_candidates")
+        authorization_sha = payload.get("cleanup_authorization_sha256")
+        orchestration = self._find_mapping(payload, "orchestration")
+        if (
+            not isinstance(raw_authorized, list)
+            or not isinstance(authorization_sha, str)
+            or orchestration is None
+            or not isinstance(orchestration.get("workflow_id"), str)
+        ):
+            raise ValueError("cleanup execution requires controller authorization")
+        canonical = json.dumps(
+            {
+                "workflow_id": orchestration["workflow_id"],
+                "candidates": raw_authorized,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        if hashlib.sha256(canonical).hexdigest() != authorization_sha:
+            raise ValueError("cleanup authorization changed after controller validation")
+        removed: list[str] = []
+        absent: list[str] = []
+        for raw in raw_authorized:
+            candidate = CleanupCandidate.model_validate(raw)
+            allocation = WorktreeAllocation(
+                repository=candidate.repository,
+                path=candidate.worktree_path,
+                branch=candidate.branch,
+                base_sha=candidate.base_sha,
+                change_set_id=candidate.change_set_id,
+            )
+            if not allocation.path.exists():
+                absent.append(str(candidate.lease_id))
+                continue
+            self.manager.cleanup(allocation, evidence_captured=False)
+            removed.append(str(candidate.lease_id))
+        return {
+            **payload,
+            "status": "CLEANUP_EXECUTED",
+            "removed_lease_ids": removed,
+            "already_absent_lease_ids": absent,
+        }
 
     def _runtime_deterministic_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw_plan = self._find_mapping(payload, "runtime_observation_plan")

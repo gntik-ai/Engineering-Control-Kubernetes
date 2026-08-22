@@ -124,6 +124,8 @@ class ControlledWorkflow:
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
+            "cleanup.protect_active",
+            "cleanup.execute",
         }:
             return "engineering-scan"
         if step == "finding.reproduce":
@@ -600,12 +602,38 @@ class QuotaRefreshWorkflow(ControlledWorkflow):
 class CleanupWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: CleanupInput) -> dict[str, Any]:
-        candidates = await self._step("cleanup.discover", asdict(request))
-        protected = await self._step("cleanup.protect_active", candidates)
-        if request.dry_run:
-            return {"status": "DRY_RUN", "candidates": protected}
-        result = await self._step("cleanup.execute", {**protected, "dry_run": request.dry_run})
-        return {"status": "COMPLETE", "result": result}
+        context: dict[str, Any] = asdict(request)
+        try:
+            context = await self._step("cleanup.discover", context)
+            context = await self._step("cleanup.protect_active", context)
+            if request.dry_run:
+                context = await self._step(
+                    "cleanup.finalize", {**context, "terminal_status": "DRY_RUN"}
+                )
+                return {"status": "DRY_RUN", "context": context}
+            context = await self._step("cleanup.authorize", context)
+            if context.get("status") == "BLOCKED":
+                context = await self._step(
+                    "cleanup.finalize", {**context, "terminal_status": "BLOCKED"}
+                )
+                return {"status": "BLOCKED", "context": context}
+            context = await self._step(
+                "cleanup.execute", {**context, "dry_run": False}
+            )
+            context = await self._step(
+                "cleanup.finalize", {**context, "terminal_status": "COMPLETE"}
+            )
+            return {"status": "COMPLETE", "context": context}
+        except ActivityError:
+            context = await self._step(
+                "cleanup.finalize",
+                {
+                    **context,
+                    "terminal_status": "BLOCKED",
+                    "blocker": "CLEANUP_ACTIVITY_FAILED",
+                },
+            )
+            return {"status": "BLOCKED", "context": context}
 
 
 @workflow.defn(name="AcceptanceLifecycleWorkflow")

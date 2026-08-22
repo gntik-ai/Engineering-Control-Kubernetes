@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     notification_sink_url: str | None = None
     notification_token_file: Path | None = None
     notification_poll_seconds: int = Field(default=10, ge=2, le=300)
+    cleanup_execution_enabled: bool = False
+    cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
+    cleanup_expiry_grace_hours: int = Field(default=24, ge=1, le=720)
 
     @field_validator("api_host")
     @classmethod

@@ -33,6 +33,11 @@ metadata, the adapter verifies that Secret reads and representative create/patch
 operations return `no`. Only reduced names, readiness, revisions, and image digests leave the scan
 worker. Raw Kubernetes objects and browser credentials are never placed in provider prompts.
 
+Retention cleanup is disabled for mutation by default and cannot accept arbitrary paths.
+PostgreSQL eligibility, worker Git cleanliness and branch identity, a second controller
+authorization hash, and the scan worker policy switch must all agree. Dirty worktrees and
+open-incident ChangeSets remain protected without an override path.
+
 Active security blockers:
 
 - `SECURITY_BLOCKER_MUSEMATIC_GIT_SECRETS`: rotate affected credentials, invalidate sessions,

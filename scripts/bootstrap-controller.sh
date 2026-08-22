@@ -160,6 +160,7 @@ if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
     printf 'ENGINEERING_EVIDENCE_ROOT=%s/evidence\n' "${PLATFORM_ROOT}"
     printf 'ENGINEERING_GITHUB_TOKEN_FILE=%s/env/github.token\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
+    printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
   } >"${CONFIG_ROOT}/env/control.env"
   chown root:engineering-control "${CONFIG_ROOT}/env/control.env"
   chmod 0640 "${CONFIG_ROOT}/env/control.env"

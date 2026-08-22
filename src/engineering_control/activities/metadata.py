@@ -231,6 +231,9 @@ class MetadataActivityHandler:
             "recovery.validate_approval",
             "recovery.verify",
             "recovery.record_failure",
+            "cleanup.discover",
+            "cleanup.authorize",
+            "cleanup.finalize",
             "quota.persist",
         }
     )
@@ -341,6 +344,12 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._verify_recovery, payload)
             if step == "recovery.record_failure":
                 return await asyncio.to_thread(self._record_recovery_failure, payload)
+            if step == "cleanup.discover":
+                return await asyncio.to_thread(self._discover_cleanup, payload)
+            if step == "cleanup.authorize":
+                return await asyncio.to_thread(self._authorize_cleanup, payload)
+            if step == "cleanup.finalize":
+                return await asyncio.to_thread(self._finalize_cleanup, payload)
             if step == "quota.persist":
                 return await self._quota(payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
@@ -2746,6 +2755,233 @@ class MetadataActivityHandler:
             component_key=f"{change_set.project}:deploy:{deployment.environment}",
             owner_run_id=run.id,
         )
+
+    def _discover_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("retention_policy") != "standard":
+            raise ValueError("cleanup retention policy is not allowlisted")
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        now = datetime.now(UTC)
+        candidates: list[dict[str, Any]] = []
+        protected_count = 0
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None:
+                run = Run(
+                    id=uuid5(NAMESPACE_URL, f"cleanup-run:{workflow_id}"),
+                    campaign_id=None,
+                    change_set_id=None,
+                    workflow_id=workflow_id,
+                    run_type="cleanup",
+                    status="RUNNING",
+                    project="platform",
+                    started_at=now,
+                    summary="safe worktree retention cleanup",
+                )
+                session.add(run)
+            elif run.finished_at is not None:
+                return {
+                    **payload,
+                    "status": run.status,
+                    "cleanup_candidates": [],
+                    "protected_count": 0,
+                }
+            else:
+                run.status = "RUNNING"
+                run.started_at = run.started_at or now
+            leases = session.scalars(select(WorktreeLease)).all()
+            for lease in leases:
+                reason = self._cleanup_lease_eligibility(session, lease, now)
+                if reason is None:
+                    protected_count += 1
+                    continue
+                change_set = session.get(ChangeSet, lease.change_set_id)
+                if change_set is None:
+                    protected_count += 1
+                    continue
+                expected = (
+                    PurePosixPath(self.settings.worktree_root.as_posix())
+                    / lease.repository
+                    / str(lease.change_set_id)
+                )
+                if PurePosixPath(lease.worktree_path) != expected:
+                    protected_count += 1
+                    continue
+                candidates.append(
+                    {
+                        "lease_id": str(lease.id),
+                        "change_set_id": str(lease.change_set_id),
+                        "repository": lease.repository,
+                        "worktree_path": lease.worktree_path,
+                        "branch": lease.branch,
+                        "base_sha": lease.base_sha,
+                        "reason": reason,
+                    }
+                )
+        return {
+            **payload,
+            "status": "CLEANUP_CANDIDATES_DISCOVERED",
+            "cleanup_candidates": sorted(candidates, key=lambda value: value["lease_id"]),
+            "protected_count": protected_count,
+        }
+
+    def _authorize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_candidates = payload.get("eligible_candidates")
+        if not isinstance(raw_candidates, list):
+            raise ValueError("cleanup authorization requires inspected candidates")
+        if not self.settings.cleanup_execution_enabled:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "CLEANUP_EXECUTION_DISABLED",
+            }
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        now = datetime.now(UTC)
+        authorized: list[dict[str, Any]] = []
+        fields = {
+            "lease_id",
+            "change_set_id",
+            "repository",
+            "worktree_path",
+            "branch",
+            "base_sha",
+            "reason",
+        }
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None or run.finished_at is not None:
+                raise ValueError("cleanup Run is missing or terminal")
+            for raw in raw_candidates:
+                if not isinstance(raw, dict):
+                    raise ValueError("cleanup candidate must be an object")
+                candidate = {key: raw[key] for key in fields if key in raw}
+                if set(candidate) != fields:
+                    raise ValueError("cleanup candidate identity is incomplete")
+                lease = session.get(WorktreeLease, UUID(str(candidate["lease_id"])))
+                reason = (
+                    self._cleanup_lease_eligibility(session, lease, now)
+                    if lease is not None
+                    else None
+                )
+                if (
+                    lease is None
+                    or reason is None
+                    or reason != candidate["reason"]
+                    or str(lease.change_set_id) != candidate["change_set_id"]
+                    or lease.repository != candidate["repository"]
+                    or lease.worktree_path != candidate["worktree_path"]
+                    or lease.branch != candidate["branch"]
+                    or lease.base_sha != candidate["base_sha"]
+                ):
+                    raise ValueError("cleanup candidate changed after worker inspection")
+                authorized.append(candidate)
+        authorized.sort(key=lambda value: str(value["lease_id"]))
+        canonical = json.dumps(
+            {"workflow_id": workflow_id, "candidates": authorized},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return {
+            **payload,
+            "status": "CLEANUP_AUTHORIZED",
+            "authorized_candidates": authorized,
+            "cleanup_authorization_sha256": hashlib.sha256(canonical).hexdigest(),
+        }
+
+    def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        terminal = str(payload.get("terminal_status", ""))
+        if terminal not in {"DRY_RUN", "COMPLETE", "BLOCKED"}:
+            raise ValueError("cleanup terminal status is not allowlisted")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None:
+                raise ValueError("cleanup finalization Run is missing")
+            if run.finished_at is not None:
+                return {**payload, "status": terminal}
+            if terminal == "COMPLETE":
+                raw_authorized = payload.get("authorized_candidates")
+                removed = payload.get("removed_lease_ids")
+                absent = payload.get("already_absent_lease_ids")
+                if (
+                    not isinstance(raw_authorized, list)
+                    or not isinstance(removed, list)
+                    or not isinstance(absent, list)
+                ):
+                    raise ValueError("cleanup completion evidence is incomplete")
+                authorized_ids = {
+                    str(value["lease_id"])
+                    for value in raw_authorized
+                    if isinstance(value, dict) and "lease_id" in value
+                }
+                completed_ids = {str(value) for value in [*removed, *absent]}
+                if completed_ids != authorized_ids:
+                    raise ValueError("cleanup completion does not match its authorization")
+                for lease_id in completed_ids:
+                    lease = session.get(WorktreeLease, UUID(lease_id))
+                    if lease is None:
+                        raise ValueError("cleanup completion lease disappeared")
+                    lease.released_at = lease.released_at or now
+                run.status = "SUCCESS"
+                run.summary = f"removed or confirmed absent {len(completed_ids)} worktrees"
+            elif terminal == "DRY_RUN":
+                run.status = "SUCCESS"
+                run.summary = "cleanup dry run completed without mutation"
+            else:
+                run.status = "BLOCKED"
+                run.error_code = str(payload.get("blocker", "CLEANUP_BLOCKED"))
+                run.summary = "cleanup blocked without mutation"
+            run.finished_at = now
+        return {**payload, "status": terminal}
+
+    def _cleanup_lease_eligibility(
+        self, session: Any, lease: WorktreeLease, now: datetime
+    ) -> str | None:
+        change_set = session.get(ChangeSet, lease.change_set_id)
+        owner = session.get(Run, lease.owner_run_id)
+        if change_set is None or owner is None:
+            return None
+        if change_set.state not in {
+            ChangeSetState.ISSUE_CLOSED.value,
+            ChangeSetState.CANCELLED.value,
+            ChangeSetState.SUPERSEDED.value,
+            ChangeSetState.REJECTED.value,
+        }:
+            return None
+        if owner.finished_at is None or owner.status in {
+            "QUEUED",
+            "RUNNING",
+            "AWAITING_APPROVAL",
+        }:
+            return None
+        incident = session.scalar(
+            select(Incident).where(
+                Incident.change_set_id == change_set.id,
+                Incident.status == "OPEN",
+            )
+        )
+        if incident is not None:
+            return None
+        retention_cutoff = now - timedelta(days=self.settings.cleanup_retention_days)
+        released_at = self._as_utc(lease.released_at) if lease.released_at else None
+        expires_at = self._as_utc(lease.expires_at)
+        owner_finished_at = self._as_utc(owner.finished_at)
+        if released_at is not None and released_at <= retention_cutoff:
+            return "RELEASED_RETENTION_EXPIRED"
+        abandonment_cutoff = now - timedelta(
+            hours=self.settings.cleanup_expiry_grace_hours
+        )
+        if (
+            lease.released_at is None
+            and expires_at <= abandonment_cutoff
+            and owner_finished_at <= retention_cutoff
+        ):
+            return "ABANDONED_LEASE_EXPIRED"
+        return None
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
     def _runtime_target(self, project: Project, environment: str) -> RuntimeTargetRecord:
         if environment != "staging":

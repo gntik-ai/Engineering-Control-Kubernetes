@@ -105,6 +105,7 @@ if [[ ! -f "${CONFIG_ROOT}/env/worker-common.env" ]]; then
     printf 'ENGINEERING_TEMPORAL_NAMESPACE=engineering-control\n'
     printf 'ENGINEERING_TEMPORAL_TASK_QUEUE=engineering-control\n'
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
+    printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
     printf 'PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers\n'
   } >"${CONFIG_ROOT}/env/worker-common.env"
   chmod 0644 "${CONFIG_ROOT}/env/worker-common.env"

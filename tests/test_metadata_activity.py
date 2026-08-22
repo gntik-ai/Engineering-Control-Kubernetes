@@ -1270,3 +1270,108 @@ async def test_recovery_requires_new_bound_approval_and_preserves_open_incident(
         assert stored_run is not None and stored_run.status == "SUCCESS"
         assert incident is not None and incident.recovery_state == "RUNTIME_RETEST_REQUIRED"
         assert active_leases == 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(tmp_path: Path) -> None:
+    worktree_root = tmp_path / "worktrees"
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'cleanup.sqlite'}",
+            worktree_root=worktree_root,
+            cleanup_execution_enabled=True,
+            cleanup_retention_days=1,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    owner_run_id = uuid4()
+    lease_id = uuid4()
+    workflow_id = "cleanup-test"
+    branch = f"agent/falcone/123/{change_set_id}"
+    path = worktree_root / "falcone" / str(change_set_id)
+    old = datetime.now(UTC) - timedelta(days=2)
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="falcone",
+                risk_class="R1",
+                state="ISSUE_CLOSED",
+                version=1,
+                source_repository="falcone",
+                source_branch=branch,
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url=None,
+                deployment_repository="falcone-charts",
+                deployment_branch=f"agent/falcone-charts/123/{change_set_id}",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=owner_run_id,
+                change_set_id=change_set_id,
+                workflow_id="delivery-terminal",
+                run_type="issue-delivery",
+                status="SUCCESS",
+                project="falcone",
+                started_at=old,
+                finished_at=old,
+            )
+        )
+        session.add(
+            WorktreeLease(
+                id=lease_id,
+                change_set_id=change_set_id,
+                repository="falcone",
+                worktree_path=str(path),
+                branch=branch,
+                owner_run_id=owner_run_id,
+                base_sha="a" * 40,
+                expires_at=old,
+                released_at=old,
+            )
+        )
+
+    discovered = await handler.handle(
+        "cleanup.discover",
+        {
+            "dry_run": False,
+            "retention_policy": "standard",
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    assert [value["lease_id"] for value in discovered["cleanup_candidates"]] == [
+        str(lease_id)
+    ]
+    inspected = {
+        **discovered,
+        "eligible_candidates": [
+            {**discovered["cleanup_candidates"][0], "inspection": "ABSENT"}
+        ],
+        "protected_candidates": [],
+    }
+    authorized = await handler.handle("cleanup.authorize", inspected)
+    assert authorized["status"] == "CLEANUP_AUTHORIZED"
+    finalized = await handler.handle(
+        "cleanup.finalize",
+        {
+            **authorized,
+            "removed_lease_ids": [],
+            "already_absent_lease_ids": [str(lease_id)],
+            "terminal_status": "COMPLETE",
+        },
+    )
+    assert finalized["status"] == "COMPLETE"
+    with handler.sessions() as session:
+        cleanup_run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+        assert cleanup_run is not None and cleanup_run.status == "SUCCESS"
