@@ -101,6 +101,7 @@ def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> No
     assert 'if [[ ! -e "${target}" ]]; then' in script
     assert "clone --mirror" in script
     assert "remote get-url origin" in script
+    assert "ENGINEERING_GITHUB_TOKEN_FILE" in script
     assert "rm -" not in script
 
 
@@ -136,3 +137,4 @@ def test_worker_bootstrap_clears_satisfied_auth_markers() -> None:
 
     assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"' in bootstrap
     assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"' in bootstrap
+    assert "MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED" in bootstrap

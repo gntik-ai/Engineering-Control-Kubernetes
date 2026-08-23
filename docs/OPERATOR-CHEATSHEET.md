@@ -26,6 +26,18 @@ ssh -t worker 'sudo -u codex-runner -H /usr/local/bin/codex login'
 ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
 ```
 
+Provision a separate read-only token for private canonical mirrors:
+
+```bash
+ssh -t worker 'sudoedit /etc/engineering-control/env/scan/github-read.token && \
+  sudo chown root:scan-runner /etc/engineering-control/env/scan/github-read.token && \
+  sudo chmod 0640 /etc/engineering-control/env/scan/github-read.token && \
+  sudo /opt/engineering-control/source/scripts/bootstrap-mirrors.sh'
+```
+
+Limit it to contents-read access on the four configured repositories. Do not reuse the delivery
+token.
+
 Provision the independent delivery token without exposing it in shell history or terminal output:
 
 ```bash

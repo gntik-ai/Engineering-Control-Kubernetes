@@ -62,7 +62,9 @@ class Settings(BaseSettings):
     github_executable: Path = Path("/usr/bin/gh")
     github_token_file: Path | None = None
     github_registry_auth_file: Path | None = None
+    git_read_token_file: Path | None = None
     git_executable: Path = Path("/usr/bin/git")
+    git_read_credential_root: Path = Path("/etc/engineering-control/env/scan")
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
     git_askpass_executable: Path = Path("/opt/engineering-control/source/scripts/git-askpass.sh")
     gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")

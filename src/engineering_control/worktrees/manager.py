@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +61,12 @@ class GitWorktreeManager:
         worktree_root: Path = Path("/srv/engineering/worktrees"),
         lease_root: Path = Path("/var/lib/engineering-control/leases/worktrees"),
         metadata_root: Path | None = None,
+        git_read_token_file: Path | None = None,
+        git_read_credential_root: Path = Path("/etc/engineering-control/env/scan"),
+        git_askpass_executable: Path = Path(
+            "/opt/engineering-control/source/scripts/git-askpass.sh"
+        ),
+        production_credentials: bool = False,
     ) -> None:
         self.mirror_root = mirror_root
         self.worktree_root = worktree_root
@@ -66,6 +74,10 @@ class GitWorktreeManager:
         self.metadata_root = metadata_root or (
             worktree_root.parent / "cache" / "scan" / "worktree-git"
         )
+        self.git_read_token_file = git_read_token_file
+        self.git_read_credential_root = git_read_credential_root
+        self.git_askpass_executable = git_askpass_executable
+        self.production_credentials = production_credentials
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -74,8 +86,17 @@ class GitWorktreeManager:
             raise ValueError("invalid Git identifier")
         return slug
 
-    @staticmethod
-    def _run(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+    def _run(
+        self,
+        args: list[str],
+        cwd: Path,
+        *,
+        timeout: int = 300,
+        environment: dict[str, str] | None = None,
+    ) -> str:
+        process_environment = os.environ.copy()
+        if environment:
+            process_environment.update(environment)
         result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
             args,
             cwd=cwd,
@@ -83,11 +104,41 @@ class GitWorktreeManager:
             text=True,
             capture_output=True,
             timeout=timeout,
+            env=process_environment,
         )
         output = str(SecretRedactor().redact_text(result.stdout + result.stderr).value)
         if result.returncode:
             raise WorktreeError(f"Git command failed ({result.returncode}): {output[-4000:]}")
         return result.stdout.strip()
+
+    def _fetch_environment(self) -> dict[str, str]:
+        environment = {"GIT_TERMINAL_PROMPT": "0"}
+        token_path = self.git_read_token_file
+        if token_path is None:
+            return environment
+        resolved = token_path.resolve()
+        root = self.git_read_credential_root.resolve()
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            raise WorktreeError("Git read credential is outside its bounded root")
+        metadata = resolved.stat()
+        permissions = stat.S_IMODE(metadata.st_mode)
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
+            raise WorktreeError("Git read credential permissions are too broad")
+        if self.production_credentials and (
+            metadata.st_uid != 0
+            or metadata.st_gid != os.getegid()
+            or permissions != 0o640
+        ):
+            raise WorktreeError("production Git read credential ownership is invalid")
+        if not self.git_askpass_executable.resolve().is_file():
+            raise WorktreeError("Git askpass executable is unavailable")
+        environment.update(
+            {
+                "GIT_ASKPASS": str(self.git_askpass_executable),
+                "ENGINEERING_GITHUB_TOKEN_FILE": str(resolved),
+            }
+        )
+        return environment
 
     def mirror_path(self, repository: str) -> Path:
         return self.mirror_root / f"{self._slug(repository)}.git"
@@ -152,6 +203,7 @@ class GitWorktreeManager:
             ],
             mirror,
             timeout=900,
+            environment=self._fetch_environment(),
         )
 
     @staticmethod

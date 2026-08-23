@@ -60,6 +60,7 @@ install -d -o browser-runner -g browser-runner -m 0700 "${CONFIG_ROOT}/env/brows
 install -d -o scan-runner -g scan-runner -m 0700 "${CONFIG_ROOT}/env/observer"
 install -d -o root -g delivery-runner -m 0750 \
   "${CONFIG_ROOT}/env/delivery" "${CONFIG_ROOT}/env/delivery/registry"
+install -d -o root -g scan-runner -m 0750 "${CONFIG_ROOT}/env/scan"
 install -d -o release-runner -g release-runner -m 0700 "${CONFIG_ROOT}/env/release"
 install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
 install -d -o root -g root -m 0711 \
@@ -159,6 +160,22 @@ if [[ ! -f "${CONFIG_ROOT}/env/delivery-worker.env" ]]; then
   } >"${CONFIG_ROOT}/env/delivery-worker.env"
   chown root:delivery-runner "${CONFIG_ROOT}/env/delivery-worker.env"
   chmod 0640 "${CONFIG_ROOT}/env/delivery-worker.env"
+fi
+{
+  printf 'ENGINEERING_GIT_READ_TOKEN_FILE=%s/env/scan/github-read.token\n' \
+    "${CONFIG_ROOT}"
+  printf 'ENGINEERING_GIT_READ_CREDENTIAL_ROOT=%s/env/scan\n' "${CONFIG_ROOT}"
+  printf 'ENGINEERING_GIT_ASKPASS_EXECUTABLE=%s/source/scripts/git-askpass.sh\n' \
+    "${INSTALL_ROOT}"
+} >"${CONFIG_ROOT}/env/scan-worker.env"
+chown root:scan-runner "${CONFIG_ROOT}/env/scan-worker.env"
+chmod 0640 "${CONFIG_ROOT}/env/scan-worker.env"
+if [[ ! -f "${CONFIG_ROOT}/env/scan/github-read.token" ]]; then
+  touch "${STATE_ROOT}/MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED"
+else
+  chown root:scan-runner "${CONFIG_ROOT}/env/scan/github-read.token"
+  chmod 0640 "${CONFIG_ROOT}/env/scan/github-read.token"
+  rm -f -- "${STATE_ROOT}/MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED"
 fi
 if ! grep -q '^ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=' \
   "${CONFIG_ROOT}/env/delivery-worker.env"; then

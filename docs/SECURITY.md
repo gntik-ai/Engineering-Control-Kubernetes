@@ -22,6 +22,12 @@ scan cache. ACLs grant write only to that ChangeSet's maker and read only to its
 objects are exposed only through a read-only alternate. No model receives write access to shared
 repository refs.
 
+Private mirror fetches use a dedicated contents-read credential at
+`/etc/engineering-control/env/scan/github-read.token`, owned by `root:scan-runner` and mode `0640`.
+The fixed askpass helper reads that file only when Git requests a password. Model, browser,
+delivery, and release identities are denied access. This credential has no publication or package
+permissions and is never shared with the write-capable delivery identity.
+
 GitHub write publication uses a separate `delivery-runner` identity and token. It receives read
 access only to an exact validated ChangeSet repository pair, may push only the bound branch head,
 and may create or reuse draft PRs. The adapter forbids force-push and merge operations, validates

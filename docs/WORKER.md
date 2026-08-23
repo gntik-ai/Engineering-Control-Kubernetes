@@ -21,10 +21,25 @@ sudo ./scripts/bootstrap-mirrors.sh
 sudo ./scripts/verify-worker.sh
 ```
 
-The mirror bootstrap uses only anonymous read access to the four approved `gntik-ai` repositories,
-verifies exact origins and bare-repository structure, stages new clones outside the canonical path,
-and never replaces an existing mirror. If a repository later becomes private, provision a
-read-only Git credential for `scan-runner`; do not reuse the delivery credential.
+The mirror bootstrap verifies exact origins and bare-repository structure, stages new clones
+outside the canonical path, and never replaces an existing mirror. Public repositories can use
+anonymous access. Private repositories use a distinct read-only token at
+`/etc/engineering-control/env/scan/github-read.token`, owned by `root:scan-runner` and mode `0640`.
+Git receives only the token file path through the fixed askpass adapter; the value is not placed in
+service configuration, command arguments, or logs. Never reuse the delivery credential.
+
+Provision private-mirror access interactively, without printing the token:
+
+```bash
+ssh -t worker 'sudoedit /etc/engineering-control/env/scan/github-read.token && \
+  sudo chown root:scan-runner /etc/engineering-control/env/scan/github-read.token && \
+  sudo chmod 0640 /etc/engineering-control/env/scan/github-read.token && \
+  sudo /opt/engineering-control/source/scripts/bootstrap-mirrors.sh'
+```
+
+Use a fine-grained credential limited to repository contents read access for the four configured
+repositories. It must not grant pull-request write, Actions, administration, package write,
+deployment, or organization-management access.
 
 The bootstrap installs Codex 0.149.0, Claude Code 2.1.239, Playwright 1.62.1, GitHub CLI 2.98.0,
 Gitleaks 8.30.0,
@@ -46,8 +61,8 @@ ACLs only. This prevents one ChangeSet from rewriting another ChangeSet's refs o
 Each role owns separate run, evidence, cache, temp, and state directories. Systemd filesystem
 restrictions supplement normal Unix permissions.
 
-Bootstrap does not provision GitHub or Kubernetes credentials. Provide read-only mirror access to
-`scan-runner`, separate provider OAuth to model identities, a scoped GitHub token only to
+Bootstrap does not provision GitHub or Kubernetes credentials. Provide the read-only mirror token
+only to `scan-runner`, separate provider OAuth to model identities, a scoped GitHub token only to
 `delivery-runner`, and namespaced kubeconfigs only to the identities documented in `SECURITY.md`.
 The delivery token is root-owned, group-readable by `delivery-runner`, and mode `0640`; the service
 can use it but cannot replace it.

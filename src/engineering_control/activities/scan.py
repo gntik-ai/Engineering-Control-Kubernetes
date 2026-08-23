@@ -129,6 +129,10 @@ class ScanActivityHandler:
             worktree_root=settings.worktree_root,
             lease_root=settings.lease_root / "worktrees",
             metadata_root=settings.worktree_metadata_root,
+            git_read_token_file=settings.git_read_token_file,
+            git_read_credential_root=settings.git_read_credential_root,
+            git_askpass_executable=settings.git_askpass_executable,
+            production_credentials=settings.environment == "production",
         )
         self.scanner = scanner or DeterministicScanner(
             SafeCommandRunner(

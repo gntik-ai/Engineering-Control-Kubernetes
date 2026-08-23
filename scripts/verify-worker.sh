@@ -34,6 +34,13 @@ sudo -u release-runner /usr/local/bin/helm version --short >/dev/null
 sudo -u release-runner /usr/local/bin/kubectl version --client >/dev/null
 sudo -u release-runner /usr/local/bin/argocd version --client >/dev/null
 sudo -u delivery-runner /usr/local/bin/gh --version >/dev/null
+if sudo -u scan-runner test -s /etc/engineering-control/env/scan/github-read.token; then
+  [[ $(stat -c '%a:%U:%G' /etc/engineering-control/env/scan/github-read.token) == \
+    640:root:scan-runner ]]
+else
+  echo "BLOCKED MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED"
+  blocked=1
+fi
 if sudo -u delivery-runner test -s /etc/engineering-control/env/delivery/github.token; then
   [[ $(stat -c '%a:%U:%G' /etc/engineering-control/env/delivery/github.token) == \
     640:root:delivery-runner ]]
@@ -83,6 +90,13 @@ for identity in codex-runner claude-runner browser-runner scan-runner release-ru
   if sudo -u "${identity}" test -r \
     /etc/engineering-control/env/delivery/registry/config.json 2>/dev/null; then
     echo "FAIL ${identity} can read GitHub registry credentials" >&2
+    exit 1
+  fi
+done
+for identity in codex-runner claude-runner browser-runner delivery-runner release-runner; do
+  if sudo -u "${identity}" test -r \
+    /etc/engineering-control/env/scan/github-read.token 2>/dev/null; then
+    echo "FAIL ${identity} can read the GitHub mirror credential" >&2
     exit 1
   fi
 done

@@ -198,6 +198,46 @@ def test_only_model_worker_identities_receive_worktree_access() -> None:
         WorktreeAccess("release-runner", "claude-runner")
 
 
+def test_git_read_credential_is_passed_by_bounded_file_reference(tmp_path: Path) -> None:
+    credential_root = tmp_path / "scan"
+    credential_root.mkdir()
+    token_file = credential_root / "github-read.token"
+    token_file.write_text("synthetic-read-token-value\n", encoding="utf-8")
+    token_file.chmod(0o640)
+    askpass = tmp_path / "git-askpass.sh"
+    askpass.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    askpass.chmod(0o755)
+    manager = GitWorktreeManager(
+        git_read_token_file=token_file,
+        git_read_credential_root=credential_root,
+        git_askpass_executable=askpass,
+    )
+
+    environment = manager._fetch_environment()
+
+    assert environment == {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": str(askpass),
+        "ENGINEERING_GITHUB_TOKEN_FILE": str(token_file),
+    }
+    assert "synthetic-read-token-value" not in environment.values()
+
+
+def test_git_read_credential_rejects_broad_permissions(tmp_path: Path) -> None:
+    credential_root = tmp_path / "scan"
+    credential_root.mkdir()
+    token_file = credential_root / "github-read.token"
+    token_file.write_text("synthetic-read-token-value\n", encoding="utf-8")
+    token_file.chmod(0o644)
+    manager = GitWorktreeManager(
+        git_read_token_file=token_file,
+        git_read_credential_root=credential_root,
+    )
+
+    with pytest.raises(WorktreeError, match="permissions are too broad"):
+        manager._fetch_environment()
+
+
 def test_maker_acl_covers_worktree_traversal_and_isolated_git_metadata(
     tmp_path: Path,
 ) -> None:
