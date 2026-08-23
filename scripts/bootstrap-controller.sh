@@ -14,7 +14,7 @@ CONFIG_ROOT=/etc/engineering-control
 STATE_ROOT=/var/lib/engineering-control
 PLATFORM_ROOT=/srv/engineering
 
-for command_name in python3 docker openssl systemctl install; do
+for command_name in python3 docker openssl systemctl install setfacl; do
   command -v "${command_name}" >/dev/null || {
     echo "Required command missing: ${command_name}" >&2
     exit 1
@@ -103,6 +103,10 @@ if [[ ! -f "${CONFIG_ROOT}/env/api.token" ]]; then
 fi
 chown root:engineering-api-clients "${CONFIG_ROOT}/env/api.token"
 chmod 0640 "${CONFIG_ROOT}/env/api.token"
+# The existing Hermes user manager may predate engineering-api-clients group
+# enrollment. A named read-only ACL makes the narrow API credential available
+# immediately without weakening mode bits or requiring a disruptive re-login.
+setfacl -m u:hermes:r-- "${CONFIG_ROOT}/env/api.token"
 
 install -d -o root -g engineering-control -m 0750 \
   "${CONFIG_ROOT}/env/evidence-uploaders"
