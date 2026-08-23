@@ -36,6 +36,15 @@ def test_role_worker_namespace_allows_scan_owned_mirror_updates() -> None:
     writable = next(line for line in unit.splitlines() if line.startswith("ReadWritePaths="))
     assert "/srv/engineering/mirrors" in writable.split()
     assert "/var/lib/engineering-control/leases" in writable.split()
+    assert "/var/lib/engineering-control/identities/%i-runner" in writable.split()
+
+
+def test_release_worker_cannot_write_provider_identity_homes() -> None:
+    unit = (REPOSITORY_ROOT / "systemd" / "engineering-release-worker.service").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/var/lib/engineering-control/identities" not in unit
 
 
 def test_controller_bootstrap_uses_numeric_chown_for_postgres() -> None:

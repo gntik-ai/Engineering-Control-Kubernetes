@@ -63,6 +63,11 @@ ACLs only. This prevents one ChangeSet from rewriting another ChangeSet's refs o
 Each role owns separate run, evidence, cache, temp, and state directories. Systemd filesystem
 restrictions supplement normal Unix permissions.
 
+Each bounded non-release worker may write only its own identity home so native subscription CLIs
+can refresh their local session and initialize structured clients. The template expands
+`/var/lib/engineering-control/identities/%i-runner`; the deterministic release unit intentionally
+has no writable identity-home path and cannot read Codex or Claude homes.
+
 Bootstrap does not provision GitHub or Kubernetes credentials. Provide the read-only mirror token
 only to `scan-runner`, separate provider OAuth to model identities, a scoped GitHub token only to
 `delivery-runner`, and namespaced kubeconfigs only to the identities documented in `SECURITY.md`.
