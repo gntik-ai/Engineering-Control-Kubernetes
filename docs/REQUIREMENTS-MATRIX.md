@@ -28,7 +28,7 @@ platform fails closed rather than bypassing.
 | 18 Agent pack | IMPLEMENTED | Fourteen provider-neutral roles, including every requested role; deterministic release remains code, not an agent |
 | 19 Skills | IMPLEMENTED | Twenty-three canonical skills generated for Claude, Codex and generic `.agents`, with validation CI |
 | 20 Domain packs | IMPLEMENTED | Common plus Falcone/Musematic domain catalogs covering all requested systems |
-| 21 Audit campaigns | IMPLEMENTED | Domain/persona/lens/environment cells, complete coverage statuses and evidence/blocker/exclusion gates |
+| 21 Audit campaigns | IMPLEMENTED | Domain/persona/lens/environment cells, complete coverage statuses and evidence/blocker/exclusion gates; snapshot failures become batched deterministic cell blockers instead of crashed workflows |
 | 22 Evidence | ACTIVE | Content-addressed metadata/store, identity-bound private upload, live redaction and reject-before-persistence canaries pass |
 | 23 Playwright | ACTIVE | Chromium/Firefox runtime and fixed journey harness installed under `browser-runner`; target credentials remain unprovisioned |
 | 24 Deterministic security | ACTIVE | Pinned Gitleaks, Trivy, Semgrep, Syft, Helm, kubeconform and manifest checks installed; CodeQL remains repository-owned |

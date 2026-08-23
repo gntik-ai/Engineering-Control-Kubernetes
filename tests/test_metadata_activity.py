@@ -182,6 +182,66 @@ async def test_campaign_provider_blocker_is_bound_to_deterministic_evidence(
 
 
 @pytest.mark.asyncio
+async def test_campaign_snapshot_failure_persists_every_blocked_cell_and_finishes_run(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'snapshot-blocked.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler, project="musematic")
+    campaign.required_cells = 2
+    workflow_id = f"audit-musematic-{campaign.id}"
+    with handler.sessions.begin() as session:
+        stored = session.get(Campaign, campaign.id)
+        assert stored is not None
+        stored.required_cells = 2
+        session.add(
+            Run(
+                id=uuid4(),
+                campaign_id=campaign.id,
+                workflow_id=workflow_id,
+                run_type="audit-campaign",
+                status="QUEUED",
+                project="musematic",
+            )
+        )
+    cells = [
+        audit_cell(),
+        {**audit_cell(), "lens": "security"},
+    ]
+    for cell in cells:
+        persisted = await handler.handle(
+            "campaign.persist_snapshot_blockers",
+            {
+                "campaign_id": str(campaign.id),
+                "cells": [cell],
+                "total": 2,
+                "blocker": "PROJECT_SNAPSHOT_UNAVAILABLE",
+            },
+        )
+        assert persisted["status"] == "BLOCKED_COVERAGE_PERSISTED"
+    final = await handler.handle(
+        "campaign.finalize",
+        {"campaign_id": str(campaign.id), "expected_cells": 2},
+    )
+
+    with handler.sessions() as session:
+        coverage = session.scalars(select(CoverageCell).order_by(CoverageCell.lens)).all()
+        stored_campaign = session.get(Campaign, campaign.id)
+        run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+    assert len(coverage) == 2
+    assert all(cell.status == "BLOCKED" for cell in coverage)
+    assert all(cell.blocker == "PROJECT_SNAPSHOT_UNAVAILABLE" for cell in coverage)
+    assert all(cell.evidence_json[0]["kind"] == "snapshot-blocker" for cell in coverage)
+    assert all(len(cell.evidence_json[0]["sha256"]) == 64 for cell in coverage)
+    assert len({cell.evidence_json[0]["sha256"] for cell in coverage}) == 2
+    assert stored_campaign is not None and stored_campaign.status == "COMPLETE"
+    assert run is not None and run.status == "SUCCESS" and run.finished_at is not None
+    assert final["status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
 async def test_audit_cell_preparation_is_bounded_and_schema_driven(tmp_path: Path) -> None:
     handler = MetadataActivityHandler(
         Settings(database_url=f"sqlite:///{tmp_path / 'prepare.sqlite'}")

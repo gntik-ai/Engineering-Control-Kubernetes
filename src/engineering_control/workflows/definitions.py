@@ -226,8 +226,6 @@ class AuditCampaignWorkflow(ControlledWorkflow):
     async def run(self, request: AuditCampaignInput) -> dict[str, Any]:
         if not await self._checkpoint("SNAPSHOT"):
             return {"status": "CANCELLED"}
-        snapshot = await self._step("project.snapshot", asdict(request))
-        campaign_id = request.campaign_id or snapshot["campaign_id"]
         cells = [
             {
                 "domain": domain,
@@ -241,6 +239,47 @@ class AuditCampaignWorkflow(ControlledWorkflow):
             for environment in request.environments
         ]
         batch = cells[request.cell_offset : request.cell_offset + 50]
+        snapshot: dict[str, Any] | None = None
+        snapshot_blocker = request.snapshot_blocker
+        if snapshot_blocker is None:
+            try:
+                snapshot = await self._step("project.snapshot", asdict(request))
+            except ActivityError:
+                snapshot_blocker = "PROJECT_SNAPSHOT_UNAVAILABLE"
+        campaign_id = request.campaign_id or (snapshot or {}).get("campaign_id")
+        if not campaign_id:
+            return {"status": "BLOCKED", "blocker": "PROJECT_SNAPSHOT_UNAVAILABLE"}
+        if snapshot_blocker is not None:
+            await self._step(
+                "campaign.persist_snapshot_blockers",
+                {
+                    "campaign_id": campaign_id,
+                    "cells": batch,
+                    "total": len(cells),
+                    "blocker": snapshot_blocker,
+                },
+            )
+            next_offset = request.cell_offset + len(batch)
+            if next_offset < len(cells):
+                workflow.continue_as_new(
+                    replace(
+                        request,
+                        campaign_id=campaign_id,
+                        cell_offset=next_offset,
+                        snapshot_blocker=snapshot_blocker,
+                    )
+                )
+            summary = await self._step(
+                "campaign.finalize", {"campaign_id": campaign_id, "expected_cells": len(cells)}
+            )
+            return {
+                "status": summary.get("status", "INCOMPLETE"),
+                "campaign_id": campaign_id,
+                "blocker": snapshot_blocker,
+                "summary": summary,
+            }
+        if snapshot is None:
+            raise RuntimeError("project snapshot result is missing")
         await self._step(
             "campaign.persist_coverage",
             {"campaign_id": campaign_id, "cells": batch, "total": len(cells)},
@@ -321,7 +360,12 @@ class AuditCampaignWorkflow(ControlledWorkflow):
         next_offset = request.cell_offset + len(batch)
         if next_offset < len(cells):
             workflow.continue_as_new(
-                replace(request, campaign_id=campaign_id, cell_offset=next_offset)
+                replace(
+                    request,
+                    campaign_id=campaign_id,
+                    cell_offset=next_offset,
+                    snapshot_blocker=None,
+                )
             )
         summary = await self._step(
             "campaign.finalize", {"campaign_id": campaign_id, "expected_cells": len(cells)}

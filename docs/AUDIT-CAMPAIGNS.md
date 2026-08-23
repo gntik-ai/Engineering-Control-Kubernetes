@@ -12,6 +12,11 @@ and documentation. A campaign snapshots exact source/deployment SHAs, persists e
 runs deterministic checks first, then routes bounded agent work. Batches of 50 cells use Temporal
 continue-as-new so no permanent model context is required.
 
+If the exact-SHA project snapshot cannot be created, the campaign does not crash or leave queued
+metadata behind. It records a deterministic `PROJECT_SNAPSHOT_UNAVAILABLE` blocker and SHA256
+evidence for each cell in batches of 50, continues as new for large matrices, and terminally
+finalizes the campaign run. It never substitutes a stale SHA or an operator worktree.
+
 Cell states are `NOT_STARTED`, `IN_PROGRESS`, `CANDIDATE_FOUND`, `BLOCKED`, `NO_FINDING`,
 `CONFIRMED_FINDING`, `RETEST_REQUIRED`, and `VERIFIED_FIXED`. A terminal no-finding/finding/fixed
 state requires evidence. A blocker requires an explanation. An exclusion requires approval.

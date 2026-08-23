@@ -16,6 +16,7 @@ class AuditCampaignInput:
     dry_run: bool = True
     campaign_id: str | None = None
     cell_offset: int = 0
+    snapshot_blocker: str | None = None
 
 
 @dataclass

@@ -250,6 +250,7 @@ class MetadataActivityHandler:
         {
             "audit.prepare_agent_cell",
             "campaign.persist_coverage",
+            "campaign.persist_snapshot_blockers",
             "campaign.persist_cell_blocker",
             "campaign.persist_cell_result",
             "campaign.finalize",
@@ -324,6 +325,8 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._prepare_agent_cell, payload)
             if step == "campaign.persist_coverage":
                 return await asyncio.to_thread(self._persist_coverage, payload)
+            if step == "campaign.persist_snapshot_blockers":
+                return await asyncio.to_thread(self._persist_snapshot_blockers, payload)
             if step == "campaign.persist_cell_blocker":
                 return await asyncio.to_thread(self._persist_cell_blocker, payload)
             if step == "campaign.persist_cell_result":
@@ -780,6 +783,83 @@ class MetadataActivityHandler:
             "blocker_evidence": evidence,
         }
 
+    def _persist_snapshot_blockers(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["campaign_id"]))
+        raw_cells = payload.get("cells")
+        total = int(payload["total"])
+        blocker = str(payload.get("blocker", ""))
+        if (
+            not isinstance(raw_cells, list)
+            or not raw_cells
+            or total < len(raw_cells)
+            or blocker != "PROJECT_SNAPSHOT_UNAVAILABLE"
+        ):
+            raise ValueError("snapshot blocker batch is invalid")
+        cells = [CampaignCellRecord.model_validate(item) for item in raw_cells]
+        with self.sessions.begin() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                raise ValueError("campaign does not exist")
+            campaign.required_cells = total
+            campaign.status = "IN_PROGRESS"
+            for cell in cells:
+                identity = self._cell_id(campaign_id, cell)
+                canonical = json.dumps(
+                    {
+                        "blocker": blocker,
+                        "campaign_id": str(campaign_id),
+                        "cell": cell.model_dump(mode="json"),
+                        "deployment_sha": campaign.deployment_sha,
+                        "project": campaign.project,
+                        "source_sha": campaign.source_sha,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode()
+                evidence = [
+                    {
+                        "kind": "snapshot-blocker",
+                        "reference": f"project-snapshot:{campaign.project}",
+                        "sha256": hashlib.sha256(canonical).hexdigest(),
+                    }
+                ]
+                coverage = session.get(CoverageCell, identity)
+                if coverage is None:
+                    coverage = CoverageCell(
+                        id=identity,
+                        campaign_id=campaign_id,
+                        domain=cell.domain,
+                        persona=cell.persona,
+                        lens=cell.lens.value,
+                        environment=cell.environment,
+                        status="BLOCKED",
+                        blocker=blocker,
+                        exclusion_approval_id=None,
+                        evidence_json=evidence,
+                        result_json={"status": "BLOCKED", "blocker": blocker},
+                    )
+                    session.add(coverage)
+                else:
+                    coverage.status = "BLOCKED"
+                    coverage.blocker = blocker
+                    coverage.evidence_json = evidence
+                    coverage.result_json = {"status": "BLOCKED", "blocker": blocker}
+            run = session.scalar(
+                select(Run)
+                .where(Run.campaign_id == campaign_id, Run.run_type == "audit-campaign")
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if run is not None:
+                if run.started_at is None:
+                    run.started_at = datetime.now(UTC)
+                run.status = "RUNNING"
+        return {
+            **payload,
+            "status": "BLOCKED_COVERAGE_PERSISTED",
+            "persisted_cells": len(cells),
+        }
+
     def _prepare_agent_cell(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["campaign_id"]))
         cell = CampaignCellRecord.model_validate(payload["cell"])
@@ -966,6 +1046,19 @@ class MetadataActivityHandler:
             else:
                 campaign.status = "INCOMPLETE"
             status = campaign.status
+            run = session.scalar(
+                select(Run)
+                .where(Run.campaign_id == campaign_id, Run.run_type == "audit-campaign")
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if run is not None:
+                run.status = (
+                    "SUCCESS" if status in {"COMPLETE", "VERIFICATION_REQUIRED"} else "BLOCKED"
+                )
+                run.finished_at = datetime.now(UTC)
+                run.error_code = None if run.status == "SUCCESS" else status
+                run.summary = f"campaign={campaign_id};status={status};cells={len(cells)}"
         return {**payload, "status": status, "completed_cells": len(cells)}
 
     def _load_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
