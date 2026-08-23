@@ -78,3 +78,16 @@ def test_controller_config_parents_allow_token_file_group_traversal_only() -> No
         'install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"'
         in controller
     )
+
+
+def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> None:
+    script = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "set -euo pipefail" in script
+    assert "repositories=(falcone falcone-charts musematic musematic-deploy)" in script
+    assert 'if [[ ! -e "${target}" ]]; then' in script
+    assert "clone --mirror" in script
+    assert "remote get-url origin" in script
+    assert "rm -" not in script

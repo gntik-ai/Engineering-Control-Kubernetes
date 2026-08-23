@@ -17,8 +17,14 @@ Install:
 ssh worker
 cd /home/hermes/engineering/engineering-control
 sudo ./scripts/bootstrap-worker.sh
+sudo ./scripts/bootstrap-mirrors.sh
 sudo ./scripts/verify-worker.sh
 ```
+
+The mirror bootstrap uses only anonymous read access to the four approved `gntik-ai` repositories,
+verifies exact origins and bare-repository structure, stages new clones outside the canonical path,
+and never replaces an existing mirror. If a repository later becomes private, provision a
+read-only Git credential for `scan-runner`; do not reuse the delivery credential.
 
 The bootstrap installs Codex 0.149.0, Claude Code 2.1.239, Playwright 1.62.1, GitHub CLI 2.98.0,
 Gitleaks 8.30.0,
