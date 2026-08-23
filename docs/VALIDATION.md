@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 192 pytest tests; Ruff clean; strict mypy clean across 76 source files; Bash syntax clean |
+| Control-plane Python | PASS | 201 pytest tests; Ruff clean; strict mypy clean across 76 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -30,6 +30,8 @@ test is not represented as a pass, and no paid API fallback was used.
 | Workflow/acceptance workers, scheduler and notifier | PASS | all systemd services active; acceptance worker is write-bounded to its synthetic temporary root |
 | Retention schedule | PASS/DISABLED | installed Temporal schedule payload is `dry_run=true`; controller and worker mutation settings remain false |
 | Durable restart/resume | PASS | workflow worker replaced mid-run; workflow resumed and reached `AWAITING_STAGING_APPROVAL` |
+| Native activity heartbeat | PASS | a recovered Codex activity remained on one attempt beyond the two-minute Temporal heartbeat limit while 30-second keepalives continued |
+| Schedule registration | PASS | registrar has a 30-second RPC bound, a 45-second systemd start bound, and `on-failure` retry; installed schedules registered successfully |
 | Audit snapshot failure | PASS | missing exact-SHA mirror state becomes batched per-cell blocker evidence and a terminal campaign run rather than a failed workflow |
 | Quota broker | PASS/PARTIAL DATA | persists native CLI presence/authentication/status information; capacity/reset remain null when providers expose none |
 | Provider invocation history | PASS | controller records every provider start/result or bounded blocker plus seven-day role success/token/cost aggregates; prompts and invented values are excluded |
@@ -86,6 +88,9 @@ workflow worker was stopped and replaced while the run was active; the durable r
 maker `codex-synthetic`, checker `claude-synthetic`, and state `AWAITING_STAGING_APPROVAL`.
 A fresh post-release lifecycle started through the installed Hermes hook also completed with
 redaction status `SCANNED_CLEAN`, persisted evidence, and status retrieval through that hook.
+The standalone lifecycle verifier uses unique internal workflow and activity queues per run, so it
+cannot race the persistent production acceptance worker; its latest isolated restart/resume run
+also reached `AWAITING_STAGING_APPROVAL` with independent synthetic providers.
 
 The real native Codex structured maker call passes with the subscription-authenticated
 `codex-runner`. Its synthetic acceptance directory is a provider-owned Git repository, its output

@@ -52,10 +52,18 @@ class ControlService(Protocol):
 
 
 class TemporalControlService:
-    def __init__(self, client: Client, task_queue: str, repository: MetadataRepository) -> None:
+    def __init__(
+        self,
+        client: Client,
+        task_queue: str,
+        repository: MetadataRepository,
+        *,
+        acceptance_activity_task_queue: str = "engineering-acceptance",
+    ) -> None:
         self.client = client
         self.task_queue = task_queue
         self.repository = repository
+        self.acceptance_activity_task_queue = acceptance_activity_task_queue
 
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted:
         campaign_id = uuid4()
@@ -232,6 +240,7 @@ class TemporalControlService:
                 change_set_id=str(change_set_id),
                 validation_root=validation_root,
                 hold_seconds=request.hold_seconds,
+                activity_task_queue=self.acceptance_activity_task_queue,
             ),
             id=workflow_id,
             task_queue=self.task_queue,

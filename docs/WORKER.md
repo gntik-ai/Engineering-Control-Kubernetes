@@ -68,6 +68,10 @@ can refresh their local session and initialize structured clients. The template 
 `/var/lib/engineering-control/identities/%i-runner`; the deterministic release unit intentionally
 has no writable identity-home path and cannot read Codex or Claude homes.
 
+Provider activities heartbeat Temporal every 30 seconds independently of native JSONL events.
+This keeps a long, quiet test or code-mode command on its original durable activity attempt while
+preserving event-driven heartbeats and the provider timeout/cancellation boundary.
+
 Bootstrap does not provision GitHub or Kubernetes credentials. Provide the read-only mirror token
 only to `scan-runner`, separate provider OAuth to model identities, a scoped GitHub token only to
 `delivery-runner`, and namespaced kubeconfigs only to the identities documented in `SECURITY.md`.

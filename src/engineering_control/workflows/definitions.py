@@ -851,6 +851,11 @@ class AcceptanceLifecycleWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: AcceptanceLifecycleInput) -> dict[str, Any]:
+        if request.activity_task_queue != "engineering-acceptance" and not (
+            request.activity_task_queue.startswith("engineering-acceptance-validation-")
+            and len(request.activity_task_queue) <= 128
+        ):
+            raise ValueError("acceptance activity task queue is outside its bounded namespace")
         context: dict[str, Any] = {
             **asdict(request),
             "run_id": workflow.info().run_id,
@@ -869,7 +874,7 @@ class AcceptanceLifecycleWorkflow(ControlledWorkflow):
             context = await workflow.execute_activity(
                 step,
                 context,
-                task_queue="engineering-acceptance",
+                task_queue=request.activity_task_queue,
                 start_to_close_timeout=timedelta(minutes=timeout),
                 heartbeat_timeout=timedelta(seconds=10),
                 retry_policy=ACTIVITY_RETRY,

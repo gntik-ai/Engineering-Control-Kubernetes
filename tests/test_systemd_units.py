@@ -40,6 +40,17 @@ def test_acceptance_worker_is_bounded_to_synthetic_temporary_root() -> None:
     assert "ENGINEERING_ACCEPTANCE_ENABLED=true" in bootstrap
 
 
+def test_temporal_lifecycle_verifier_explicitly_enables_only_its_bounded_root() -> None:
+    script = (REPOSITORY_ROOT / "scripts" / "validate-temporal-lifecycle.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "acceptance_enabled=True" in script
+    assert "acceptance_root=run_root" in script
+    assert "engineering-acceptance-validation-" in script
+    assert "engineering-acceptance-control-validation-" in script
+
+
 def test_role_worker_namespace_allows_scan_owned_mirror_updates() -> None:
     unit = (REPOSITORY_ROOT / "systemd" / "engineering-worker@.service").read_text(encoding="utf-8")
 

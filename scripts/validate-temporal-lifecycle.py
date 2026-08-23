@@ -31,12 +31,15 @@ async def run(target: str, namespace: str, root: Path, hold_seconds: int) -> dic
     )
     run_root = root / str(uuid4())
     run_root.mkdir(mode=0o750)
+    validation_id = run_root.name
+    activity_task_queue = f"engineering-acceptance-validation-{validation_id}"
+    control_task_queue = f"engineering-acceptance-control-validation-{validation_id}"
     client = await Client.connect(target, namespace=namespace)
     acceptance = AcceptanceActivities(root)
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acceptance-activity")
     activity_worker = Worker(
         client,
-        task_queue="engineering-acceptance",
+        task_queue=activity_task_queue,
         workflows=[],
         activities=acceptance.activities,
         activity_executor=executor,
@@ -44,7 +47,7 @@ async def run(target: str, namespace: str, root: Path, hold_seconds: int) -> dic
     )
     workflow_worker = Worker(
         client,
-        task_queue="engineering-acceptance-control",
+        task_queue=control_task_queue,
         workflows=[AcceptanceLifecycleWorkflow],
         activities=[],
     )
@@ -53,12 +56,16 @@ async def run(target: str, namespace: str, root: Path, hold_seconds: int) -> dic
     token = secrets.token_hex(32)
     settings = Settings(
         synthetic_mode=True,
+        acceptance_enabled=True,
         temporal_target=target,
         temporal_namespace=namespace,
         acceptance_root=run_root,
     )
     service = TemporalControlService(
-        client, "engineering-acceptance-control", EmptyMetadataRepository()
+        client,
+        control_task_queue,
+        EmptyMetadataRepository(),
+        acceptance_activity_task_queue=activity_task_queue,
     )
     app = create_app(settings=settings, service=service, token=token)
     async with app.router.lifespan_context(app):
@@ -82,7 +89,7 @@ async def run(target: str, namespace: str, root: Path, hold_seconds: int) -> dic
     await workflow_task
     replacement = Worker(
         client,
-        task_queue="engineering-acceptance-control",
+        task_queue=control_task_queue,
         workflows=[AcceptanceLifecycleWorkflow],
         activities=[],
     )

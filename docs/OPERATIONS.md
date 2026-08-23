@@ -39,6 +39,9 @@ IDs.
 Back up PostgreSQL and `/etc/engineering-control` before upgrades. Do not back up provider OAuth or
 SSH private keys into general platform archives. Temporal and PostgreSQL must be healthy before
 starting API/workers. The notifier uses an outbox so an unavailable sink does not lose state.
+The one-shot schedule registrar bounds its complete Temporal RPC transaction to 30 seconds and its
+systemd start to 45 seconds; transient failures restart after 15 seconds instead of holding an
+install indefinitely.
 
 The daily cleanup schedule defaults to dry-run mode. It becomes a mutating schedule only when the
 operator explicitly sets `ENGINEERING_CLEANUP_EXECUTION_ENABLED=true` on the controller and every

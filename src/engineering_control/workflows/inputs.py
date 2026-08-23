@@ -83,3 +83,4 @@ class AcceptanceLifecycleInput:
     change_set_id: str
     validation_root: str
     hold_seconds: int = 5
+    activity_task_queue: str = "engineering-acceptance"

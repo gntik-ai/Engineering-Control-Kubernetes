@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 
+from engineering_control.api.schemas import AcceptanceLifecycleStart
 from engineering_control.api.service import TemporalControlService
 from engineering_control.db.repository import EmptyMetadataRepository
 
@@ -46,6 +47,23 @@ class _Client:
         return self.handle
 
 
+class _StartedHandle:
+    first_execution_run_id = "started-run-id"
+
+
+class _StartClient:
+    def __init__(self) -> None:
+        self.workflow_input: Any = None
+        self.task_queue = ""
+
+    async def start_workflow(
+        self, _workflow_type: str, workflow_input: Any, *, task_queue: str, **_kwargs: Any
+    ) -> _StartedHandle:
+        self.workflow_input = workflow_input
+        self.task_queue = task_queue
+        return _StartedHandle()
+
+
 @pytest.mark.asyncio
 async def test_acceptance_status_returns_only_normalized_evidence_metadata() -> None:
     handle = _Handle()
@@ -76,3 +94,24 @@ async def test_non_acceptance_status_never_reads_workflow_result() -> None:
     assert result["status"] == "COMPLETED"
     assert handle.result_called is False
     assert "validation" not in result
+
+
+@pytest.mark.asyncio
+async def test_acceptance_service_binds_private_activity_and_control_queues() -> None:
+    client = _StartClient()
+    activity_queue = "engineering-acceptance-validation-bounded"
+    service = TemporalControlService(
+        client,  # type: ignore[arg-type]
+        "engineering-acceptance-control-validation-bounded",
+        EmptyMetadataRepository(),
+        acceptance_activity_task_queue=activity_queue,
+    )
+
+    accepted = await service.start_acceptance(
+        AcceptanceLifecycleStart(hold_seconds=2),
+        "/home/hermes/engineering-bootstrap/acceptance-runs/bounded",
+    )
+
+    assert accepted.run_id == "started-run-id"
+    assert client.task_queue == "engineering-acceptance-control-validation-bounded"
+    assert client.workflow_input.activity_task_queue == activity_queue
