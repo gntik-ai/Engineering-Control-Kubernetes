@@ -83,6 +83,13 @@ From the allowlisted Telegram account, run `/usage`, `/validate 30`, then
 `/status <workflow-id-returned-by-validate>`. The validation worker operates only on its local
 synthetic fixture under `/srv/engineering/tmp/acceptance`.
 
+Check—but do not apply—the later C-01 Hermes provider cutover:
+
+```bash
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/prepare-hermes-c01-cutover.py --check
+```
+
 ## Operate
 
 ```bash

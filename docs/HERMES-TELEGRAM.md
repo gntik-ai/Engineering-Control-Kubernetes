@@ -44,6 +44,18 @@ floor). Validate this boundary with:
 ```
 
 At the C-01 cutover, add `--require-no-omniroute`; it must pass before OmniRoute is stopped.
+Prepare the exact provider/alias transformation without changing live state with:
+
+```bash
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/prepare-hermes-c01-cutover.py --check
+```
+
+The apply mode is backup-first, refuses direct YAML secrets, requires healthy Hermes
+`openai-codex` subscription authentication, and validates a mode-restricted canonical
+`C01-ACCEPTANCE.json` bound to the installed release and every required replacement gate. It also
+requires the exact confirmation printed by its help. It only updates Hermes configuration; it does
+not restart Hermes or stop/uninstall OmniRoute.
 
 Run `/approve <change-set-id>` first. It displays the current immutable candidate payload. Approve
 with the returned SHA256. R3 additionally requires exactly:

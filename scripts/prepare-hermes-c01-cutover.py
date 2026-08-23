@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+OMNI_DEPENDENCY = re.compile(
+    r"omniroute|omni\.musematic\.ai|(?:127\.0\.0\.1|localhost):201(?:28|31|32)",
+    re.IGNORECASE,
+)
+CONFIRMATION = "APPLY C01 HERMES CONFIG CUTOVER"
+ACTIVE_CONFIG = Path("/home/hermes/.hermes/config.yaml")
+BACKUP_ROOT = Path("/home/hermes/engineering-backups")
+GATE_MANIFEST = Path("/home/hermes/engineering-bootstrap/C01-ACCEPTANCE.json")
+REQUIRED_GATES = (
+    "engineering_api",
+    "temporal_restart_resume",
+    "postgresql",
+    "codex_structured_call",
+    "claude_structured_call",
+    "codex_maker_claude_checker",
+    "claude_maker_codex_checker",
+    "quota_broker",
+    "no_paid_fallback",
+    "hermes_api",
+    "telegram_usage_status_validate",
+    "persistence_evidence_redaction",
+)
+ALIAS_MODELS = {
+    "coding": "gpt-5.6-sol",
+    "cheap": "gpt-5.6-luna",
+    "smart": "gpt-5.6-terra",
+}
+
+
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        result: list[str] = []
+        for key, nested in value.items():
+            result.append(str(key))
+            result.extend(_strings(nested))
+        return result
+    if isinstance(value, list):
+        result = []
+        for nested in value:
+            result.extend(_strings(nested))
+        return result
+    return [str(value)]
+
+
+def _has_direct_secret(config: dict[str, Any]) -> bool:
+    sensitive = {
+        "api_key",
+        "apikey",
+        "password",
+        "secret",
+        "token",
+        "bot_token",
+        "access_token",
+        "refresh_token",
+    }
+
+    def visit(value: Any) -> bool:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if str(key).lower() in sensitive and isinstance(nested, str):
+                    candidate = nested.strip()
+                    if candidate and not re.fullmatch(r"[A-Z][A-Z0-9_]*", candidate):
+                        return True
+                if visit(nested):
+                    return True
+        if isinstance(value, list):
+            return any(visit(nested) for nested in value)
+        return False
+
+    return visit(config)
+
+
+def transform(config: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
+    candidate = copy.deepcopy(config)
+    changes: list[str] = []
+    model = candidate.setdefault("model", {})
+    if not isinstance(model, dict):
+        raise ValueError("Hermes model configuration must be a mapping")
+    for key in ("api_mode", "base_url", "api_key", "key_env"):
+        if key in model:
+            model.pop(key)
+            changes.append(f"model.{key}:removed")
+    if model.get("provider") != "openai-codex":
+        model["provider"] = "openai-codex"
+        changes.append("model.provider:openai-codex")
+    if model.get("default") != ALIAS_MODELS["smart"]:
+        model["default"] = ALIAS_MODELS["smart"]
+        changes.append("model.default:subscription-model")
+
+    providers = candidate.get("providers")
+    if isinstance(providers, dict):
+        for key in tuple(providers):
+            if str(key).lower() == "omniroute" or any(
+                OMNI_DEPENDENCY.search(item) for item in _strings(providers[key])
+            ):
+                providers.pop(key)
+                changes.append(f"providers.{key}:removed")
+        if not providers:
+            candidate.pop("providers")
+
+    custom = candidate.get("custom_providers")
+    if isinstance(custom, list):
+        retained = [
+            item
+            for item in custom
+            if not any(OMNI_DEPENDENCY.search(value) for value in _strings(item))
+        ]
+        if len(retained) != len(custom):
+            changes.append("custom_providers.omniroute:removed")
+        if retained:
+            candidate["custom_providers"] = retained
+        else:
+            candidate.pop("custom_providers")
+
+    aliases = candidate.setdefault("model_aliases", {})
+    if not isinstance(aliases, dict):
+        raise ValueError("Hermes model aliases must be a mapping")
+    for name, model_name in ALIAS_MODELS.items():
+        alias = aliases.setdefault(name, {})
+        if not isinstance(alias, dict):
+            raise ValueError(f"Hermes model alias {name} must be a mapping")
+        for key in ("api_mode", "base_url", "api_key", "key_env"):
+            alias.pop(key, None)
+        alias["provider"] = "openai-codex"
+        alias["model"] = model_name
+        changes.append(f"model_aliases.{name}:openai-codex")
+
+    delegation = candidate.get("delegation")
+    if isinstance(delegation, dict):
+        for key in ("api_mode", "base_url", "api_key", "key_env", "provider"):
+            delegation.pop(key, None)
+        delegation["model"] = ALIAS_MODELS["cheap"]
+        changes.append("delegation:subscription-model")
+
+    if any(OMNI_DEPENDENCY.search(value) for value in _strings(candidate)):
+        raise ValueError("transformed Hermes configuration still contains an OmniRoute dependency")
+    return candidate, tuple(changes)
+
+
+def _provider_ready() -> bool:
+    result = subprocess.run(  # noqa: S603 - fixed local executable and arguments
+        ["/home/hermes/.local/bin/hermes", "auth", "status", "openai-codex"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        env={"HOME": "/home/hermes", "PATH": "/home/hermes/.local/bin:/usr/bin:/bin"},
+    )
+    return result.returncode == 0
+
+
+def _validate_gate_manifest(path: Path) -> None:
+    if path.resolve() != GATE_MANIFEST.resolve():
+        raise ValueError("C-01 gate manifest must use the canonical bootstrap path")
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
+        raise PermissionError("C-01 gate manifest permissions are too broad")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("status") != "PASS":
+        raise ValueError("C-01 gate manifest is not a PASS")
+    release = Path("/opt/engineering-control/source").resolve().parent.name
+    if value.get("release_sha") != release:
+        raise ValueError("C-01 gate manifest does not bind to the installed release")
+    gates = value.get("gates")
+    if not isinstance(gates, dict) or any(gates.get(gate) != "PASS" for gate in REQUIRED_GATES):
+        raise ValueError("C-01 gate manifest does not pass every required replacement check")
+    for key in ("provider_evidence_sha256", "telegram_evidence_sha256"):
+        if not re.fullmatch(r"[a-f0-9]{64}", str(value.get(key, ""))):
+            raise ValueError(f"C-01 gate manifest {key} is missing or invalid")
+
+
+def apply(config_path: Path, backup_root: Path, gate_manifest: Path, confirmation: str) -> Path:
+    if confirmation != CONFIRMATION:
+        raise ValueError(f"exact confirmation required: {CONFIRMATION}")
+    if config_path.resolve() != ACTIVE_CONFIG.resolve():
+        raise ValueError("apply is restricted to the canonical Hermes configuration")
+    if backup_root.resolve() != BACKUP_ROOT.resolve():
+        raise ValueError("backup root is outside the canonical engineering backup root")
+    _validate_gate_manifest(gate_manifest)
+    if not _provider_ready():
+        raise RuntimeError("Hermes openai-codex subscription authentication is not healthy")
+    original = config_path.read_bytes()
+    parsed = yaml.safe_load(original)
+    if not isinstance(parsed, dict):
+        raise ValueError("Hermes configuration must be a mapping")
+    if _has_direct_secret(parsed):
+        raise ValueError("Hermes YAML contains a direct secret; automatic backup refused")
+    candidate, _ = transform(parsed)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup_directory = backup_root / f"hermes-c01-{stamp}"
+    backup_directory.mkdir(parents=True, mode=0o700)
+    backup = backup_directory / "config.pre-c01-cutover.yaml"
+    backup.write_bytes(original)
+    backup.chmod(0o600)
+    digest = hashlib.sha256(original).hexdigest()
+    manifest = backup_directory / "BACKUP-MANIFEST.md"
+    manifest.write_text(
+        "# Hermes C-01 configuration backup\n\n"
+        f"- Created: {datetime.now(UTC).isoformat()}\n"
+        f"- Source: `{config_path}`\n"
+        f"- SHA256: `{digest}`\n"
+        "- Direct secret values: none detected\n"
+        "- Restore: copy the protected YAML back, mode 0600, then restart "
+        "`hermes-gateway.service`.\n",
+        encoding="utf-8",
+    )
+    manifest.chmod(0o600)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=config_path.parent,
+        prefix=".config.c01-cutover.",
+        delete=False,
+    ) as handle:
+        yaml.safe_dump(candidate, handle, sort_keys=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.chmod(0o600)
+    os.replace(temporary, config_path)
+    return backup_directory
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=ACTIVE_CONFIG)
+    parser.add_argument("--backup-root", type=Path, default=BACKUP_ROOT)
+    parser.add_argument("--gate-manifest", type=Path, default=GATE_MANIFEST)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--confirmation", default="")
+    arguments = parser.parse_args()
+    if arguments.check == arguments.apply:
+        raise SystemExit("choose exactly one of --check or --apply")
+    parsed = yaml.safe_load(arguments.config.read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict):
+        raise SystemExit("Hermes configuration must be a mapping")
+    _, changes = transform(parsed)
+    if arguments.check:
+        print(
+            f"PASS Hermes C-01 candidate can remove OmniRoute dependencies; changes={len(changes)}"
+        )
+        return
+    backup = apply(
+        arguments.config,
+        arguments.backup_root,
+        arguments.gate_manifest,
+        arguments.confirmation,
+    )
+    print(f"PASS Hermes C-01 configuration applied; backup={backup}")
+
+
+if __name__ == "__main__":
+    main()
