@@ -63,3 +63,18 @@ def test_worker_parent_state_and_platform_roots_are_identity_traversable() -> No
         'install -d -o root -g root -m 0711 "${STATE_ROOT}/workers" '
         '"${PLATFORM_ROOT}"'
     ) in worker
+
+
+def test_controller_config_parents_allow_token_file_group_traversal_only() -> None:
+    controller = (REPOSITORY_ROOT / "scripts" / "bootstrap-controller.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}"'
+        in controller
+    )
+    assert (
+        'install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"'
+        in controller
+    )

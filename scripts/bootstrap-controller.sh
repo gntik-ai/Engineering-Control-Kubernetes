@@ -30,10 +30,10 @@ usermod -a -G engineering-api-clients engineering-control
 usermod -a -G engineering-api-clients hermes
 
 install -d -o root -g root -m 0755 "${INSTALL_ROOT}" "${INSTALL_ROOT}/releases"
-install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}" \
+install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}" \
   "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/targets" \
   "${CONFIG_ROOT}/runtime"
-install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/env"
+install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"
 install -d -o engineering-control -g engineering-control -m 0750 "${STATE_ROOT}" \
   "${STATE_ROOT}/leases"
 install -d -o root -g root -m 0700 "${STATE_ROOT}/postgresql"
