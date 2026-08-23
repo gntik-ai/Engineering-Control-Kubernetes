@@ -25,6 +25,8 @@ The mirror bootstrap verifies exact origins and bare-repository structure, stage
 outside the canonical path, and never replaces an existing mirror. Public repositories can use
 anonymous access. Private repositories use a distinct read-only token at
 `/etc/engineering-control/env/scan/github-read.token`, owned by `root:scan-runner` and mode `0640`.
+An absent file beneath that protected root means anonymous-only operation; an out-of-root path,
+symlink escape, non-regular file, or unsafe mode fails closed.
 Git receives only the token file path through the fixed askpass adapter; the value is not placed in
 service configuration, command arguments, or logs. Never reuse the delivery credential.
 

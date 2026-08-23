@@ -238,6 +238,29 @@ def test_git_read_credential_rejects_broad_permissions(tmp_path: Path) -> None:
         manager._fetch_environment()
 
 
+def test_absent_bounded_git_credential_allows_public_mirror_fetch(tmp_path: Path) -> None:
+    credential_root = tmp_path / "scan"
+    credential_root.mkdir()
+    manager = GitWorktreeManager(
+        git_read_token_file=credential_root / "github-read.token",
+        git_read_credential_root=credential_root,
+    )
+
+    assert manager._fetch_environment() == {"GIT_TERMINAL_PROMPT": "0"}
+
+
+def test_absent_git_credential_outside_bounded_root_is_rejected(tmp_path: Path) -> None:
+    credential_root = tmp_path / "scan"
+    credential_root.mkdir()
+    manager = GitWorktreeManager(
+        git_read_token_file=tmp_path / "outside" / "github-read.token",
+        git_read_credential_root=credential_root,
+    )
+
+    with pytest.raises(WorktreeError, match="outside its bounded root"):
+        manager._fetch_environment()
+
+
 def test_maker_acl_covers_worktree_traversal_and_isolated_git_metadata(
     tmp_path: Path,
 ) -> None:

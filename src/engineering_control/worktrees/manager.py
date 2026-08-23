@@ -118,9 +118,14 @@ class GitWorktreeManager:
             return environment
         resolved = token_path.resolve()
         root = self.git_read_credential_root.resolve()
-        if not resolved.is_relative_to(root) or not resolved.is_file():
+        if not resolved.is_relative_to(root):
             raise WorktreeError("Git read credential is outside its bounded root")
-        metadata = resolved.stat()
+        try:
+            metadata = resolved.stat()
+        except FileNotFoundError:
+            return environment
+        if not stat.S_ISREG(metadata.st_mode):
+            raise WorktreeError("Git read credential is not an ordinary file")
         permissions = stat.S_IMODE(metadata.st_mode)
         if metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
             raise WorktreeError("Git read credential permissions are too broad")
