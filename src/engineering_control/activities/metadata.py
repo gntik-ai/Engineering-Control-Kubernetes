@@ -85,6 +85,26 @@ class QuotaSnapshotRecord(BaseModel):
     source: str = Field(min_length=1, max_length=80)
 
 
+class InstructionBundleRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    revision: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+    sources: list[str] = Field(min_length=1, max_length=20)
+    allowed_tools: list[str] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def safe_sources_and_tools(self) -> InstructionBundleRecord:
+        for value in self.sources:
+            path = PurePosixPath(value)
+            if path.is_absolute() or ".." in path.parts or not value or len(value) > 240:
+                raise ValueError("instruction source path is unsafe")
+        allowed = {"Read", "Glob", "Grep", "Bash", "Edit", "Write"}
+        if not set(self.allowed_tools).issubset(allowed):
+            raise ValueError("instruction bundle contains a non-allowlisted tool")
+        return self
+
+
 class CampaignCellRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -482,6 +502,10 @@ class MetadataActivityHandler:
                     provider=request.provider.value,
                     role=request.role,
                     model_class=request.model_class.value,
+                    agent_pack_revision=request.agent_pack_revision,
+                    instruction_bundle_sha256=request.instruction_bundle_sha256,
+                    instruction_sources_json=list(request.instruction_bundle_sources),
+                    allowed_tools_json=list(request.allowed_tools),
                     provider_session_id=None,
                     status="RUNNING",
                     summary=None,
@@ -517,6 +541,27 @@ class MetadataActivityHandler:
             if invocation is None:
                 raise ValueError("provider result has no recorded invocation start")
             self._validate_invocation_binding(invocation, run, request)
+            bundle = self._instruction_bundle(payload)
+            expected_binding = (
+                bundle.revision if bundle else request.agent_pack_revision,
+                bundle.sha256 if bundle else request.instruction_bundle_sha256,
+                bundle.sources if bundle else list(request.instruction_bundle_sources),
+                bundle.allowed_tools if bundle else list(request.allowed_tools),
+            )
+            observed_binding = (
+                invocation.agent_pack_revision,
+                invocation.instruction_bundle_sha256,
+                invocation.instruction_sources_json or [],
+                invocation.allowed_tools_json or [],
+            )
+            if invocation.finished_at is not None and observed_binding != expected_binding:
+                raise ValueError("agent instruction provenance conflicts with stored invocation")
+            (
+                invocation.agent_pack_revision,
+                invocation.instruction_bundle_sha256,
+                invocation.instruction_sources_json,
+                invocation.allowed_tools_json,
+            ) = expected_binding
             if result is not None:
                 if (
                     result.run_id != request.run_id
@@ -589,6 +634,15 @@ class MetadataActivityHandler:
             "agent_invocation_id": str(request.run_id),
             "agent_invocation_status": result.status.value if result is not None else status,
         }
+
+    @staticmethod
+    def _instruction_bundle(payload: dict[str, Any]) -> InstructionBundleRecord | None:
+        raw = payload.get("instruction_bundle")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError("instruction bundle provenance must be an object")
+        return InstructionBundleRecord.model_validate(raw)
 
     def _agent_request(self, payload: dict[str, Any]) -> AgentRequest:
         provider_step = str(payload.get("provider_step", ""))

@@ -14,6 +14,7 @@ from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
+from engineering_control.agents.instructions import AgentInstructionPack, InstructionBundle
 from engineering_control.config import Settings
 from engineering_control.handoff.store import HandoffStore
 from engineering_control.models.core import AgentRequest, AgentResult
@@ -31,6 +32,12 @@ class ProviderAdapter(Protocol):
         request: AgentRequest,
         on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> AgentResult: ...
+
+
+class InstructionPack(Protocol):
+    def enrich(
+        self, request: AgentRequest, step: str
+    ) -> tuple[AgentRequest, InstructionBundle]: ...
 
 
 class ProviderActivityHandler:
@@ -53,6 +60,7 @@ class ProviderActivityHandler:
         settings: Settings,
         worker_kind: str,
         adapter: ProviderAdapter | None = None,
+        instruction_pack: InstructionPack | None = None,
     ) -> None:
         if worker_kind not in {Provider.CODEX.value, Provider.CLAUDE.value}:
             raise ValueError("provider handler requires a codex or claude worker")
@@ -62,6 +70,7 @@ class ProviderActivityHandler:
         self.adapter = adapter or self._default_adapter()
         if self.adapter.provider is not self.provider:
             raise ValueError("provider adapter does not match the worker identity")
+        self.instruction_pack = instruction_pack or AgentInstructionPack(settings.agent_pack_root)
         self.redactor = SecretRedactor()
 
     def _default_adapter(self) -> ProviderAdapter:
@@ -78,11 +87,32 @@ class ProviderActivityHandler:
         request = self._request(step, payload)
         self._validate_boundary(step, request)
         try:
+            request, bundle = self.instruction_pack.enrich(request, step)
+        except (OSError, ValueError) as error:
+            return self._blocked(
+                payload,
+                "AGENT_PACK_INVALID",
+                detail=type(error).__name__,
+            )
+        runtime_payload = {
+            **payload,
+            "instruction_bundle": {
+                "sha256": bundle.sha256,
+                "revision": bundle.revision,
+                "sources": list(bundle.sources),
+                "allowed_tools": list(bundle.allowed_tools),
+            },
+        }
+        try:
             authenticated = await self.adapter.authenticated()
         except FileNotFoundError:
-            return self._blocked(payload, f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}")
+            return self._blocked(
+                runtime_payload, f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}"
+            )
         if not authenticated:
-            return self._blocked(payload, f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}")
+            return self._blocked(
+                runtime_payload, f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}"
+            )
 
         sequence = 0
 
@@ -122,25 +152,28 @@ class ProviderActivityHandler:
             self._validate_result_schema(request, result)
 
         response = {
-            **payload,
+            **runtime_payload,
             "provider": self.provider.value,
             "status": result.status.value,
             "agent_result": result.model_dump(mode="json"),
         }
         if result.status is RunStatus.RATE_LIMITED:
-            response["handoff_hashes"] = self._persist_handoff(request, result, payload)
+            response["handoff_hashes"] = self._persist_handoff(request, result, runtime_payload)
         safe = self.redactor.redact(response).value
         if not isinstance(safe, dict):
             raise TypeError("redacted provider response must remain an object")
         return safe
 
-    def _blocked(self, payload: dict[str, Any], blocker: str) -> dict[str, Any]:
+    def _blocked(
+        self, payload: dict[str, Any], blocker: str, *, detail: str | None = None
+    ) -> dict[str, Any]:
         safe = self.redactor.redact(
             {
                 **payload,
                 "provider": self.provider.value,
                 "status": "BLOCKED",
                 "blocker": blocker,
+                **({"blocker_detail": detail} if detail else {}),
             }
         ).value
         if not isinstance(safe, dict):

@@ -1,12 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ${EUID} -ne 0 ]]; then
+  echo "Run on the controller with sudo: sudo $0" >&2
+  exit 1
+fi
+
+for path in /home/hermes/engineering/bootstrap /home/hermes/engineering/docs \
+  /home/hermes/engineering/project-config /etc/engineering-control/systemd \
+  /var/log/engineering-control /opt/engineering-agent-pack/source; do
+  test -d "${path}"
+done
+agent_pack_head=$(git -C /home/hermes/engineering/engineering-agent-pack rev-parse HEAD)
+agent_pack_release=$(basename \
+  "$(dirname "$(readlink -f /opt/engineering-agent-pack/source)")")
+[[ ${agent_pack_release} == "${agent_pack_head}" ]]
+runuser -u engineering-control -- test -r \
+  /opt/engineering-agent-pack/source/domain-packs/common/POLICIES.md
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-agent-pack/source/generators/generate.py --check
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-agent-pack/source/generators/validate.py
+grep -q '^ENGINEERING_AGENT_PACK_ROOT=/opt/engineering-agent-pack/source$' \
+  /etc/engineering-control/env/control.env
+
 services=(engineering-infrastructure engineering-migrate engineering-api engineering-evidence-ingest engineering-temporal-worker engineering-scheduler engineering-notifier engineering-acceptance-worker)
 for service in "${services[@]}"; do
   systemctl is-active --quiet "${service}.service" || {
     echo "FAIL service ${service}" >&2
     exit 1
   }
+done
+for service in "${services[@]}"; do
+  cmp -s "/etc/engineering-control/systemd/${service}.service" \
+    "/etc/systemd/system/${service}.service"
 done
 
 docker inspect --format '{{.State.Health.Status}}' engineering-postgresql | grep -qx healthy

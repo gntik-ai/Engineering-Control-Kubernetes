@@ -10,16 +10,56 @@ fi
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
 INSTALL_ROOT=/opt/engineering-control
+AGENT_PACK_INSTALL_ROOT=/opt/engineering-agent-pack
+AGENT_PACK_SOURCE_ROOT=${ENGINEERING_AGENT_PACK_SOURCE_ROOT:-/home/hermes/engineering/engineering-agent-pack}
 CONFIG_ROOT=/etc/engineering-control
 STATE_ROOT=/var/lib/engineering-control
 PLATFORM_ROOT=/srv/engineering
+LOG_ROOT=/var/log/engineering-control
+OPERATOR_ROOT=/home/hermes/engineering
 
-for command_name in python3 docker openssl systemctl install setfacl runuser; do
+for command_name in python3 docker git tar flock mktemp mv openssl systemctl install setfacl runuser; do
   command -v "${command_name}" >/dev/null || {
     echo "Required command missing: ${command_name}" >&2
     exit 1
   }
 done
+
+exec 9>/run/engineering-control-bootstrap.lock
+flock -n 9 || {
+  echo "Another Engineering Control bootstrap is active" >&2
+  exit 1
+}
+
+install_committed_release() {
+  local source_checkout=$1
+  local install_root=$2
+  local release_id=$3
+  local release_root="${install_root}/releases/${release_id}"
+  local marker="${release_root}/.release-complete"
+  if [[ -f "${marker}" ]]; then
+    [[ $(<"${marker}") == "${release_id}" && -d "${release_root}/source" ]] || {
+      echo "Release completion marker is inconsistent: ${release_root}" >&2
+      return 1
+    }
+    printf '%s\n' "${release_root}"
+    return
+  fi
+  if [[ -e "${release_root}" ]]; then
+    echo "Refusing incomplete or unmarked release: ${release_root}" >&2
+    return 1
+  fi
+  local staging
+  staging=$(mktemp -d "${install_root}/releases/.${release_id}.XXXXXX")
+  chmod 0755 "${staging}"
+  install -d -o root -g root -m 0755 "${staging}/source"
+  git -C "${source_checkout}" archive "${release_id}" | tar -C "${staging}/source" -xf -
+  printf '%s\n' "${release_id}" >"${staging}/.release-complete"
+  chmod 0644 "${staging}/.release-complete"
+  chown -R root:root "${staging}"
+  mv -T -- "${staging}" "${release_root}"
+  printf '%s\n' "${release_root}"
+}
 
 getent group engineering-control >/dev/null || groupadd --system engineering-control
 getent group engineering-api-clients >/dev/null || groupadd --system engineering-api-clients
@@ -29,11 +69,20 @@ id engineering-control >/dev/null 2>&1 || useradd \
 usermod -a -G engineering-api-clients engineering-control
 usermod -a -G engineering-api-clients hermes
 
-install -d -o root -g root -m 0755 "${INSTALL_ROOT}" "${INSTALL_ROOT}/releases"
+install -d -o root -g root -m 0755 \
+  "${INSTALL_ROOT}" "${INSTALL_ROOT}/releases" \
+  "${AGENT_PACK_INSTALL_ROOT}" "${AGENT_PACK_INSTALL_ROOT}/releases"
+if [[ ! -d "${OPERATOR_ROOT}" ]]; then
+  install -d -o hermes -g hermes -m 0750 "${OPERATOR_ROOT}"
+fi
+install -d -o hermes -g hermes -m 0755 \
+  "${OPERATOR_ROOT}/bootstrap" "${OPERATOR_ROOT}/docs" \
+  "${OPERATOR_ROOT}/project-config"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}" \
   "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/targets" \
-  "${CONFIG_ROOT}/runtime"
+  "${CONFIG_ROOT}/runtime" "${CONFIG_ROOT}/systemd"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"
+install -d -o root -g engineering-control -m 0750 "${LOG_ROOT}"
 install -d -o engineering-control -g engineering-control -m 0750 "${STATE_ROOT}" \
   "${STATE_ROOT}/leases"
 install -d -o root -g root -m 0700 "${STATE_ROOT}/postgresql"
@@ -45,43 +94,48 @@ install -d -o engineering-control -g engineering-control -m 0750 \
 install -d -o engineering-control -g engineering-control -m 0750 \
   "${PLATFORM_ROOT}/tmp/acceptance"
 
-if git -C "${SOURCE_ROOT}" rev-parse --verify HEAD >/dev/null 2>&1; then
-  RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse HEAD)
-else
-RELEASE_ID=uncommitted-bootstrap
-fi
-RELEASE_ROOT="${INSTALL_ROOT}/releases/${RELEASE_ID}"
-install -d -o root -g root -m 0755 "${RELEASE_ROOT}"
-if [[ ! -d "${RELEASE_ROOT}/source" ]]; then
-  install -d -o root -g root -m 0755 "${RELEASE_ROOT}/source"
-  tar --exclude=.git --exclude=.venv -C "${SOURCE_ROOT}" -cf - . | \
-    tar -C "${RELEASE_ROOT}/source" -xf -
-fi
+RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse --verify HEAD) || {
+  echo "Engineering Control bootstrap requires a version-controlled source checkout" >&2
+  exit 1
+}
+RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${RELEASE_ID}")
 ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
 ln -sfn "${INSTALL_ROOT}/source/docker" "${INSTALL_ROOT}/infrastructure"
+
+AGENT_PACK_RELEASE_ID=$(git -C "${AGENT_PACK_SOURCE_ROOT}" rev-parse --verify HEAD) || {
+  echo "Agent-pack bootstrap requires its independent version-controlled checkout" >&2
+  exit 1
+}
+AGENT_PACK_RELEASE_ROOT=$(install_committed_release \
+  "${AGENT_PACK_SOURCE_ROOT}" "${AGENT_PACK_INSTALL_ROOT}" "${AGENT_PACK_RELEASE_ID}")
+ln -sfn "${AGENT_PACK_RELEASE_ROOT}/source" "${AGENT_PACK_INSTALL_ROOT}/source"
 
 python3 -m venv "${INSTALL_ROOT}/venv"
 "${INSTALL_ROOT}/venv/bin/pip" install --disable-pip-version-check --upgrade \
   --constraint "${INSTALL_ROOT}/source/requirements.lock" "${INSTALL_ROOT}/source"
 chmod -R a+rX "${INSTALL_ROOT}/venv"
+"${INSTALL_ROOT}/venv/bin/python" \
+  "${AGENT_PACK_INSTALL_ROOT}/source/generators/generate.py" --check
+"${INSTALL_ROOT}/venv/bin/python" \
+  "${AGENT_PACK_INSTALL_ROOT}/source/generators/validate.py"
 
 install -o root -g engineering-control -m 0640 \
-  "${SOURCE_ROOT}/config/control.yaml" "${CONFIG_ROOT}/control.yaml"
+  "${RELEASE_ROOT}/source/config/control.yaml" "${CONFIG_ROOT}/control.yaml"
 install -o root -g engineering-control -m 0640 \
-  "${SOURCE_ROOT}/config/projects/falcone.yaml" "${CONFIG_ROOT}/projects.d/falcone.yaml"
+  "${RELEASE_ROOT}/source/config/projects/falcone.yaml" "${CONFIG_ROOT}/projects.d/falcone.yaml"
 install -o root -g engineering-control -m 0640 \
-  "${SOURCE_ROOT}/config/projects/musematic.yaml" "${CONFIG_ROOT}/projects.d/musematic.yaml"
-for policy in "${SOURCE_ROOT}"/config/policies/*.yaml; do
+  "${RELEASE_ROOT}/source/config/projects/musematic.yaml" "${CONFIG_ROOT}/projects.d/musematic.yaml"
+for policy in "${RELEASE_ROOT}"/source/config/policies/*.yaml; do
   install -o root -g engineering-control -m 0640 "${policy}" "${CONFIG_ROOT}/policies/"
 done
-for target in "${SOURCE_ROOT}"/config/targets/*.yaml; do
+for target in "${RELEASE_ROOT}"/source/config/targets/*.yaml; do
   target_name=$(basename "${target}")
   if [[ ! -f "${CONFIG_ROOT}/targets/${target_name}" ]]; then
     install -o root -g engineering-control -m 0640 \
       "${target}" "${CONFIG_ROOT}/targets/${target_name}"
   fi
 done
-for runtime_target in "${SOURCE_ROOT}"/config/runtime/*.yaml; do
+for runtime_target in "${RELEASE_ROOT}"/source/config/runtime/*.yaml; do
   runtime_name=$(basename "${runtime_target}")
   if [[ ! -f "${CONFIG_ROOT}/runtime/${runtime_name}" ]]; then
     install -o root -g engineering-control -m 0640 \
@@ -138,7 +192,7 @@ chown root:hermes "${CONFIG_ROOT}/env/telegram-allowlist"
 chmod 0640 "${CONFIG_ROOT}/env/telegram-allowlist"
 
 HERMES_HOME=/home/hermes/.hermes
-HERMES_INTEGRATION="${SOURCE_ROOT}/integrations/hermes-engineering-control"
+HERMES_INTEGRATION="${RELEASE_ROOT}/source/integrations/hermes-engineering-control"
 install -d -o root -g hermes -m 0750 "${HERMES_HOME}/plugins"
 install -d -o hermes -g hermes -m 0750 \
   "${HERMES_HOME}/plugins/engineering-control" "${HERMES_HOME}/hooks/engineering-control"
@@ -156,7 +210,7 @@ install -o hermes -g hermes -m 0640 \
   "${HERMES_HOME}/hooks/engineering-control/handler.py"
 if [[ -f "${HERMES_HOME}/config.yaml" ]]; then
   runuser -u hermes -- "${INSTALL_ROOT}/venv/bin/python" \
-    "${SOURCE_ROOT}/scripts/verify-hermes-policy.py" \
+    "${RELEASE_ROOT}/source/scripts/verify-hermes-policy.py" \
     --config "${HERMES_HOME}/config.yaml" \
     --hermes-home "${HERMES_HOME}" \
     --apply-telegram-lockdown \
@@ -177,6 +231,7 @@ if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
     printf 'ENGINEERING_DATABASE_URL=postgresql+psycopg://engineering_control:%s@127.0.0.1:55432/engineering_control\n' \
       "${ENGINEERING_DB_PASSWORD}"
     printf 'ENGINEERING_EVIDENCE_ROOT=%s/evidence\n' "${PLATFORM_ROOT}"
+    printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
     printf 'ENGINEERING_GITHUB_TOKEN_FILE=%s/env/github.token\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
     printf 'ENGINEERING_ACCEPTANCE_ENABLED=true\n'
@@ -188,12 +243,19 @@ fi
 if ! grep -q '^ENGINEERING_ACCEPTANCE_ENABLED=' "${CONFIG_ROOT}/env/control.env"; then
   printf 'ENGINEERING_ACCEPTANCE_ENABLED=true\n' >>"${CONFIG_ROOT}/env/control.env"
 fi
+if ! grep -q '^ENGINEERING_AGENT_PACK_ROOT=' "${CONFIG_ROOT}/env/control.env"; then
+  printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' \
+    "${AGENT_PACK_INSTALL_ROOT}" >>"${CONFIG_ROOT}/env/control.env"
+fi
 
 for unit in engineering-infrastructure.service engineering-migrate.service \
   engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service \
   engineering-notifier.service engineering-acceptance-worker.service; do
-  install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
+  install -o root -g root -m 0644 \
+    "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
+  install -o root -g root -m 0644 \
+    "${CONFIG_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
 done
 
 docker compose --env-file "${CONFIG_ROOT}/env/infrastructure.env" \

@@ -26,6 +26,11 @@ repositories:
   mirrors: /srv/engineering/mirrors
   worktrees: /srv/engineering/worktrees
   worktree_metadata: /srv/engineering/cache/scan/worktree-git
+agents:
+  pack_root: /opt/engineering-agent-pack/source
+  immutable_release_required: true
+  instruction_provenance_persisted: true
+  invalid_pack_policy: fail-closed
 runtime:
   runs: /srv/engineering/runs
   cache: /srv/engineering/cache

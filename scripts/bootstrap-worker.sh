@@ -10,10 +10,14 @@ fi
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
 INSTALL_ROOT=/opt/engineering-control
+AGENT_PACK_INSTALL_ROOT=/opt/engineering-agent-pack
+AGENT_PACK_SOURCE_ROOT=${ENGINEERING_AGENT_PACK_SOURCE_ROOT:-/home/hermes/engineering/engineering-agent-pack}
 CONFIG_ROOT=/etc/engineering-control
 STATE_ROOT=/var/lib/engineering-control
 PLATFORM_ROOT=/srv/engineering
 CLI_ROOT=/opt/engineering-cli
+LOG_ROOT=/var/log/engineering-control
+OPERATOR_ROOT=/home/hermes/engineering
 
 NODE_BIN=$(command -v node || true)
 NPM_BIN=$(command -v npm || true)
@@ -34,12 +38,48 @@ NPM_CLI=$(readlink -f -- "${NPM_BIN}")
   echo "Unable to resolve the npm CLI" >&2
   exit 1
 }
-for command_name in python3 git setfacl systemctl install; do
+for command_name in python3 git tar flock mktemp mv setfacl systemctl install; do
   command -v "${command_name}" >/dev/null || {
     echo "Required command missing: ${command_name}" >&2
     exit 1
   }
 done
+
+exec 9>/run/engineering-control-bootstrap.lock
+flock -n 9 || {
+  echo "Another Engineering Control bootstrap is active" >&2
+  exit 1
+}
+
+install_committed_release() {
+  local source_checkout=$1
+  local install_root=$2
+  local release_id=$3
+  local release_root="${install_root}/releases/${release_id}"
+  local marker="${release_root}/.release-complete"
+  if [[ -f "${marker}" ]]; then
+    [[ $(<"${marker}") == "${release_id}" && -d "${release_root}/source" ]] || {
+      echo "Release completion marker is inconsistent: ${release_root}" >&2
+      return 1
+    }
+    printf '%s\n' "${release_root}"
+    return
+  fi
+  if [[ -e "${release_root}" ]]; then
+    echo "Refusing incomplete or unmarked release: ${release_root}" >&2
+    return 1
+  fi
+  local staging
+  staging=$(mktemp -d "${install_root}/releases/.${release_id}.XXXXXX")
+  chmod 0755 "${staging}"
+  install -d -o root -g root -m 0755 "${staging}/source"
+  git -C "${source_checkout}" archive "${release_id}" | tar -C "${staging}/source" -xf -
+  printf '%s\n' "${release_id}" >"${staging}/.release-complete"
+  chmod 0644 "${staging}/.release-complete"
+  chown -R root:root "${staging}"
+  mv -T -- "${staging}" "${release_root}"
+  printf '%s\n' "${release_root}"
+}
 
 for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
   getent group "${identity}" >/dev/null || groupadd --system "${identity}"
@@ -49,11 +89,20 @@ for identity in codex-runner claude-runner browser-runner scan-runner delivery-r
 done
 
 install -d -o root -g root -m 0755 \
-  "${INSTALL_ROOT}" "${INSTALL_ROOT}/releases" "${CLI_ROOT}"
+  "${INSTALL_ROOT}" "${INSTALL_ROOT}/releases" "${CLI_ROOT}" \
+  "${AGENT_PACK_INSTALL_ROOT}" "${AGENT_PACK_INSTALL_ROOT}/releases"
+if [[ ! -d "${OPERATOR_ROOT}" ]]; then
+  install -d -o hermes -g hermes -m 0750 "${OPERATOR_ROOT}"
+fi
+install -d -o hermes -g hermes -m 0755 \
+  "${OPERATOR_ROOT}/bootstrap" "${OPERATOR_ROOT}/docs" \
+  "${OPERATOR_ROOT}/project-config"
 install -d -o root -g root -m 0755 "${STATE_ROOT}"
 install -d -o root -g root -m 0711 "${STATE_ROOT}/workers" "${PLATFORM_ROOT}"
 install -d -o scan-runner -g scan-runner -m 0700 "${STATE_ROOT}/leases"
 install -d -o root -g root -m 0755 "${CONFIG_ROOT}"
+install -d -o root -g root -m 0755 "${CONFIG_ROOT}/systemd"
+install -d -o root -g root -m 0750 "${LOG_ROOT}"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/env"
 install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/journeys"
 install -d -o browser-runner -g browser-runner -m 0700 "${CONFIG_ROOT}/env/browser"
@@ -84,23 +133,29 @@ for identity in codex-runner claude-runner browser-runner scan-runner delivery-r
   chown "${identity}:${identity}" "${STATE_ROOT}/identities/${identity}"
 done
 
-if git -C "${SOURCE_ROOT}" rev-parse --verify HEAD >/dev/null 2>&1; then
-  RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse HEAD)
-else
-RELEASE_ID=uncommitted-bootstrap
-fi
-RELEASE_ROOT="${INSTALL_ROOT}/releases/${RELEASE_ID}"
-install -d -o root -g root -m 0755 "${RELEASE_ROOT}"
-if [[ ! -d "${RELEASE_ROOT}/source" ]]; then
-  install -d -o root -g root -m 0755 "${RELEASE_ROOT}/source"
-  tar --exclude=.git --exclude=.venv -C "${SOURCE_ROOT}" -cf - . | \
-    tar -C "${RELEASE_ROOT}/source" -xf -
-fi
+RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse --verify HEAD) || {
+  echo "Engineering Control bootstrap requires a version-controlled source checkout" >&2
+  exit 1
+}
+RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${RELEASE_ID}")
 ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
+
+AGENT_PACK_RELEASE_ID=$(git -C "${AGENT_PACK_SOURCE_ROOT}" rev-parse --verify HEAD) || {
+  echo "Agent-pack bootstrap requires its independent version-controlled checkout" >&2
+  exit 1
+}
+AGENT_PACK_RELEASE_ROOT=$(install_committed_release \
+  "${AGENT_PACK_SOURCE_ROOT}" "${AGENT_PACK_INSTALL_ROOT}" "${AGENT_PACK_RELEASE_ID}")
+ln -sfn "${AGENT_PACK_RELEASE_ROOT}/source" "${AGENT_PACK_INSTALL_ROOT}/source"
+
 python3 -m venv "${INSTALL_ROOT}/venv"
 "${INSTALL_ROOT}/venv/bin/pip" install --disable-pip-version-check --upgrade \
   --constraint "${INSTALL_ROOT}/source/requirements.lock" "${INSTALL_ROOT}/source"
 chmod -R a+rX "${INSTALL_ROOT}/venv"
+"${INSTALL_ROOT}/venv/bin/python" \
+  "${AGENT_PACK_INSTALL_ROOT}/source/generators/generate.py" --check
+"${INSTALL_ROOT}/venv/bin/python" \
+  "${AGENT_PACK_INSTALL_ROOT}/source/generators/validate.py"
 "${INSTALL_ROOT}/source/scripts/install-scanners.sh"
 
 NODE_SOURCE=$(readlink -f -- "${NODE_BIN}")
@@ -115,7 +170,7 @@ ln -sfn "${CLI_ROOT}/node_modules/.bin/codex" /usr/local/bin/codex
 ln -sfn "${CLI_ROOT}/node_modules/.bin/claude" /usr/local/bin/claude
 
 install -d -o browser-runner -g browser-runner -m 0750 /opt/engineering-browser
-cp -a "${SOURCE_ROOT}/browser/." /opt/engineering-browser/
+cp -a "${RELEASE_ROOT}/source/browser/." /opt/engineering-browser/
 cd /opt/engineering-browser
 "/usr/local/bin/node" "${NPM_CLI}" install --omit=dev
 "${NODE_BIN}" node_modules/@playwright/test/cli.js install-deps chromium firefox
@@ -130,10 +185,15 @@ if [[ ! -f "${CONFIG_ROOT}/env/worker-common.env" ]]; then
     printf 'ENGINEERING_TEMPORAL_NAMESPACE=engineering-control\n'
     printf 'ENGINEERING_TEMPORAL_TASK_QUEUE=engineering-control\n'
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
+    printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
     printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
     printf 'PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers\n'
   } >"${CONFIG_ROOT}/env/worker-common.env"
   chmod 0644 "${CONFIG_ROOT}/env/worker-common.env"
+fi
+if ! grep -q '^ENGINEERING_AGENT_PACK_ROOT=' "${CONFIG_ROOT}/env/worker-common.env"; then
+  printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' \
+    "${AGENT_PACK_INSTALL_ROOT}" >>"${CONFIG_ROOT}/env/worker-common.env"
 fi
 {
   printf 'ENGINEERING_EVIDENCE_INGEST_URL=http://10.10.0.2:8750/v1/evidence\n'
@@ -204,10 +264,12 @@ else
   touch "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED"
 fi
 
-install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/engineering-worker@.service" \
-  /etc/systemd/system/engineering-worker@.service
-install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/engineering-release-worker.service" \
-  /etc/systemd/system/engineering-release-worker.service
+for unit in engineering-worker@.service engineering-release-worker.service; do
+  install -o root -g root -m 0644 \
+    "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
+  install -o root -g root -m 0644 \
+    "${CONFIG_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
+done
 systemd-analyze verify /etc/systemd/system/engineering-worker@.service \
   /etc/systemd/system/engineering-release-worker.service
 systemctl daemon-reload

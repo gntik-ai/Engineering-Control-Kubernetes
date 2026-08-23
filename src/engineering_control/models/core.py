@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -68,8 +69,20 @@ class AgentRequest(StrictModel):
     model: str | None = None
     writable: bool = False
     allowed_tools: tuple[str, ...] = ()
+    instruction_bundle_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    instruction_bundle_sources: tuple[str, ...] = Field(default=(), max_length=20)
+    agent_pack_revision: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
     change_set_id: UUID | None = None
     campaign_id: UUID | None = None
+
+    @field_validator("instruction_bundle_sources")
+    @classmethod
+    def safe_instruction_sources(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts or not value or len(value) > 240:
+                raise ValueError("instruction bundle sources must be bounded relative paths")
+        return values
 
 
 class AgentResult(StrictModel):

@@ -18,14 +18,14 @@ platform fails closed rather than bypassing.
 | 8 Controller role | ACTIVE | PostgreSQL, Temporal, API, workflow worker, scheduler, notifier and evidence ingest are healthy |
 | 9 Worker role | ACTIVE | Six isolated Unix identities and systemd queues are active; credential-independent verifier passes |
 | 10 Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 are installed; Codex identity auth and a real structured maker call pass; Claude identity OAuth remains manual |
-| 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction |
+| 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction, and immutable role/skill/domain instruction-bundle provenance |
 | 12 Quota broker | IMPLEMENTED | Provider-independent snapshots persist CLI presence/authentication/status, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff, and seven-day per-role invocation/success/token/cost history without invented values |
 | 13 Temporal | ACTIVE/PASS | All required workflows installed; live worker replacement during an active lifecycle resumed durably |
 | 14 PostgreSQL metadata | IMPLEMENTED | Alembic models/migrations for every required table plus approval candidates, notification outbox, worker heartbeats, and artifact-retention tombstones |
 | 15 ChangeSet | IMPLEMENTED | First-class model, strict state policy, exact PR/CI/provenance reconciliation, digest promotion, artifact-bound approvals and deterministic metadata transitions |
 | 16 Worktrees | IMPLEMENTED | Mirrors, exact-SHA fetch/allocation, branch naming, leases, dirty protection and ACL isolation |
 | 17 Component leases | IMPLEMENTED | Project/component/environment/global safety keys and configured concurrency/recursion limits |
-| 18 Agent pack | IMPLEMENTED | Fourteen provider-neutral roles, including every requested role; deterministic release remains code, not an agent |
+| 18 Agent pack | ACTIVE | Thirteen requested provider-neutral roles are installed as an independent immutable release and consumed by native activities with bundle hashes/tool boundaries; deterministic release remains code, not an agent |
 | 19 Skills | IMPLEMENTED | Twenty-three canonical skills generated for Claude, Codex and generic `.agents`, with validation CI |
 | 20 Domain packs | IMPLEMENTED | Common plus Falcone/Musematic domain catalogs covering all requested systems |
 | 21 Audit campaigns | IMPLEMENTED | Domain/persona/lens/environment cells, complete coverage statuses and evidence/blocker/exclusion gates; snapshot failures become batched deterministic cell blockers instead of crashed workflows |
@@ -51,7 +51,7 @@ platform fails closed rather than bypassing.
 | 41 Update procedure | IMPLEMENTED | `UPGRADE.md` covers backup, drain, pin, migration, validation and rollback by component |
 | 42 Validation | HOST PASS/CREDENTIAL BLOCKED | Source, services, browser/scanners, isolation, evidence and Temporal restart pass; OAuth/Git/Kubernetes credentials remain |
 | 43 Acceptance lifecycle | SYNTHETIC LIVE PASS/PROVIDERS BLOCKED | Authenticated API/Temporal/worktree/evidence chain passes with restart; real provider and inbound Telegram legs remain |
-| 44 Final report | PENDING | `FINAL-HANDOFF.md` must be generated from post-activation facts; it must not claim uninstalled services or unresolved security gates |
+| 44 Final report | COMPLETE | Version-controlled `FINAL-HANDOFF.md` records post-activation facts, exact blockers, cleanup state, recovery, verification, and next commands without claiming gated acceptance |
 
 ## Gates in required order
 

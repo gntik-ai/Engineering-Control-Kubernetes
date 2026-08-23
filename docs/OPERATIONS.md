@@ -8,7 +8,7 @@ sudo systemctl status engineering-infrastructure engineering-migrate engineering
   engineering-notifier engineering-acceptance-worker
 sudo journalctl -u engineering-api -n 100 --no-pager
 sudo journalctl -u engineering-evidence-ingest -n 100 --no-pager
-docker compose --env-file /etc/engineering-control/env/infrastructure.env \
+sudo docker compose --env-file /etc/engineering-control/env/infrastructure.env \
   -f /opt/engineering-control/infrastructure/compose.yaml ps
 ```
 
@@ -28,6 +28,8 @@ queued and active runs, successful/failed runs, provider rate-limit events, per-
 health, deployment duration/failures, verification failures, and indexed evidence bytes. Every
 role worker publishes a signed identity-bound heartbeat through the upload-only ingest listener;
 a claimed identity that differs from the token owner is rejected.
+The reserved `/var/log/engineering-control` directory intentionally remains empty during normal
+operation because systemd/journald is authoritative; unmanaged service log files are not used.
 
 `engineering-ctl usage` and Telegram `/usage` show each provider's latest native CLI snapshot plus
 a seven-day, PostgreSQL-derived history by role. Native CLI presence and authentication status are

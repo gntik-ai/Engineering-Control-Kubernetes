@@ -29,10 +29,11 @@ Controller:
 - Hermes 0.20.0 and the allowlisted Telegram Engineering Control hook;
 - authenticated FastAPI Engineering Control API;
 - Temporal 1.31.2 and Temporal UI 2.53.3;
-- PostgreSQL 17.11 metadata database at migration `0006 (head)`;
+- PostgreSQL 17.11 metadata database at migration `0007 (head)`;
 - Temporal workflow worker, scheduler, notifier, quota broker, evidence ingest, and synthetic
   acceptance worker;
-- commit-addressed Engineering Control releases and provider-neutral agent-pack source.
+- separately commit-addressed Engineering Control and validated provider-neutral agent-pack
+  releases; each invocation records the exact instruction bundle provenance.
 
 Worker:
 
@@ -146,10 +147,13 @@ git -C /home/hermes/engineering/engineering-agent-pack rev-parse HEAD
   policies/
   targets/
   runtime/
+  systemd/                     installed unit snapshots, checked against active units
   env/                          machine-local protected credentials; never committed
 
 /var/lib/engineering-control/   persistent service state and worker identity homes
+/var/log/engineering-control/   reserved; journald is the authoritative log store
 /opt/engineering-control/       commit-addressed installed releases and virtual environment
+/opt/engineering-agent-pack/    independently commit-addressed validated role/skill assets
 ```
 
 ## 8. Systemd services
@@ -387,7 +391,7 @@ Remote GitHub repository creation was not authorized or performed.
 | Controller API, PostgreSQL, Temporal, scheduler, notifier, evidence ingest | PASS |
 | Controller restart/resume lifecycle | PASS |
 | Worker service users, services, tools, filesystem/credential isolation | PASS |
-| Control-plane tests (204), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
+| Control-plane tests (212), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
 | Agent pack generation, validation, and tests | PASS |
 | Codex install/auth/structured native call | PASS |
 | Claude install | PASS |

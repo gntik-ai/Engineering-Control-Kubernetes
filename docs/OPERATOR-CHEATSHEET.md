@@ -72,7 +72,7 @@ credential alone does not enable promotion.
 ## Verify
 
 ```bash
-./scripts/verify-controller.sh
+sudo ./scripts/verify-controller.sh
 ssh -t worker 'sudo /opt/engineering-control/source/scripts/verify-worker.sh'
 ./scripts/verify-hermes-policy.py
 ./scripts/verify-end-to-end.sh

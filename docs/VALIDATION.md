@@ -2,7 +2,7 @@
 
 Validated on 2026-08-23 against the immutable engineering-control release selected by
 `/opt/engineering-control/source` on both hosts and engineering-agent-pack release
-`47a6353dafbf0c1ecea649d434db5dd555e6249e`. The verifier checks the installed release identity at
+`a279690ade98d7c968cb646ce9f87d8e083b0e1a`. The verifier checks the installed release identity at
 runtime so this document does not embed a self-referential commit identifier.
 
 This report distinguishes a pass from a credential or security blocker. A blocked native-provider
@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 204 pytest tests; Ruff clean; strict mypy clean across 76 source files; Bash syntax clean |
+| Control-plane Python | PASS | 212 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -23,6 +23,7 @@ test is not represented as a pass, and no paid API fallback was used.
 | Requirement | Result | Evidence |
 | --- | --- | --- |
 | Installed immutable release | PASS | `/opt/engineering-control/source` resolves beneath an immutable release directory |
+| Agent-pack runtime | PASS | exact committed pack installed under `/opt`; generated assets revalidated; 32 real role/skill/project/provider bindings load with content-addressed provenance |
 | PostgreSQL | PASS | pinned container healthy; loopback listener `127.0.0.1:55432`; persistent volume active |
 | Temporal | PASS | loopback/private listeners only; server and namespace healthy |
 | Engineering API | PASS | authenticated API healthy on `127.0.0.1:8740` |
@@ -48,7 +49,7 @@ container. They are not Engineering Control listeners and remain under cleanup g
 | Installed immutable release | PASS | worker and controller release identities are verified during deployment and host checks |
 | Six Unix/service identities | PASS | Codex, Claude, browser, scan, delivery and release services active |
 | Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 installed; Codex identity login and a real structured maker call pass; Claude identity login remains absent |
-| Browser runtime | PASS | Playwright 1.62.1 plus Chromium/Firefox dependencies installed under `browser-runner` |
+| Browser runtime | PASS | Playwright 1.62.1 launches Chromium and Firefox against an offline bounded journey and produces structured results, screenshots, and traces under `browser-runner` |
 | Scan tooling | PASS | Gitleaks, Trivy, Semgrep, Syft and kubeconform installed and identity-readable |
 | Release tooling | PASS | kubectl 1.36.3, Helm 4.2.3 and Argo CD CLI 3.5.1 installed under `release-runner` |
 | Credential separation | PASS | release cannot read model auth; model/browser/delivery cannot read release credentials; evidence impersonation denied |

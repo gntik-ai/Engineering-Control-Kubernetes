@@ -31,6 +31,17 @@ def test_configuration_contains_no_inline_secret_values() -> None:
         assert "ghp_" not in text
 
 
+def test_control_configuration_requires_immutable_agent_pack_provenance() -> None:
+    value = yaml.safe_load((ROOT / "config" / "control.yaml").read_text(encoding="utf-8"))
+
+    assert value["agents"] == {
+        "pack_root": "/opt/engineering-agent-pack/source",
+        "immutable_release_required": True,
+        "instruction_provenance_persisted": True,
+        "invalid_pack_policy": "fail-closed",
+    }
+
+
 def test_project_delivery_controls_are_strict_and_match_discovered_reality() -> None:
     policies = {}
     for project in Project:

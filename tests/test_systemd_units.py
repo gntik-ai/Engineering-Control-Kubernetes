@@ -80,8 +80,55 @@ def test_bootstraps_make_release_root_traversable_by_service_users() -> None:
         script = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")
         assert "install -d -o root -g root -m 0755" in script
         assert '"${INSTALL_ROOT}"' in script
-        assert 'install -d -o root -g root -m 0755 "${RELEASE_ROOT}"' in script
+        assert 'install -d -o root -g root -m 0755 "${staging}/source"' in script
+        assert 'chmod 0755 "${staging}"' in script
         assert 'chmod -R a+rX "${INSTALL_ROOT}/venv"' in script
+
+
+def test_bootstraps_install_only_committed_control_and_agent_pack_trees() -> None:
+    for name in ("bootstrap-controller.sh", "bootstrap-worker.sh"):
+        script = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert "AGENT_PACK_INSTALL_ROOT=/opt/engineering-agent-pack" in script
+        assert "AGENT_PACK_RELEASE_ID=$(git -C" in script
+        assert 'git -C "${source_checkout}" archive "${release_id}"' in script
+        assert 'RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}"' in script
+        assert "AGENT_PACK_RELEASE_ROOT=$(install_committed_release" in script
+        assert ".release-complete" in script
+        assert "Refusing incomplete or unmarked release" in script
+        assert "flock -n 9" in script
+        assert 'mv -T -- "${staging}" "${release_root}"' in script
+        assert '"${AGENT_PACK_INSTALL_ROOT}/source/generators/generate.py" --check' in script
+        assert '"${AGENT_PACK_INSTALL_ROOT}/source/generators/validate.py"' in script
+        assert "tar --exclude=.git" not in script
+
+    controller = (REPOSITORY_ROOT / "scripts" / "bootstrap-controller.sh").read_text(
+        encoding="utf-8"
+    )
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+    assert '"${RELEASE_ROOT}/source/config/control.yaml"' in controller
+    assert 'HERMES_INTEGRATION="${RELEASE_ROOT}/source/integrations/' in controller
+    assert '"${RELEASE_ROOT}/source/systemd/${unit}"' in controller
+    assert '"${RELEASE_ROOT}/source/browser/."' in worker
+    assert '"${RELEASE_ROOT}/source/systemd/${unit}"' in worker
+
+
+def test_bootstraps_normalize_operator_config_systemd_and_log_directories() -> None:
+    for name in ("bootstrap-controller.sh", "bootstrap-worker.sh"):
+        script = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert "OPERATOR_ROOT=/home/hermes/engineering" in script
+        assert "LOG_ROOT=/var/log/engineering-control" in script
+        assert '"${OPERATOR_ROOT}/bootstrap"' in script
+        assert '"${OPERATOR_ROOT}/docs"' in script
+        assert '"${OPERATOR_ROOT}/project-config"' in script
+        assert '"${CONFIG_ROOT}/systemd"' in script
+        assert '"${LOG_ROOT}"' in script
+        assert '"${CONFIG_ROOT}/systemd/${unit}"' in script
+
+    for name in ("verify-controller.sh", "verify-worker.sh"):
+        verification = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert "/var/log/engineering-control" in verification
+        assert "/etc/engineering-control/systemd" in verification
+        assert "cmp -s" in verification
 
 
 def test_worker_shared_tool_runtimes_are_traversable_but_not_made_writable() -> None:
@@ -148,6 +195,22 @@ def test_worker_verification_uses_a_neutral_non_home_directory() -> None:
 
     assert "cd /var/lib/engineering-control" in verification
     assert "all credential-independent checks passed" in verification
+    assert "/scripts/browser-runtime-smoke.py" in verification
+    assert "PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers" in verification
+    for version in (
+        "codex-cli 0.149.0",
+        "2.1.239 (Claude Code)",
+        "8.30.0",
+        "0.74.0",
+        "1.174.0",
+        "1.51.0",
+        "v0.8.0",
+        "v4\\.2\\.3",
+        "v1.36.3",
+        "v3\\.5\\.1",
+        "2\\.98\\.0",
+    ):
+        assert version in verification
 
 
 def test_controller_verification_uses_hermes_worker_ssh_identity() -> None:

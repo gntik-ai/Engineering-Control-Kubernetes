@@ -18,3 +18,8 @@ def test_service_token_allows_group_read_but_not_group_write(tmp_path: Path) -> 
     os.chmod(token, 0o660)
     with pytest.raises(PermissionError, match="group write"):
         settings.read_api_token()
+
+
+def test_agent_pack_root_must_be_absolute() -> None:
+    with pytest.raises(ValueError, match="absolute path"):
+        Settings(agent_pack_root=Path("relative-agent-pack"))

@@ -20,7 +20,7 @@ Install only after reviewing host inventory and the cleanup checkpoint:
 ```bash
 cd /home/hermes/engineering/engineering-control
 sudo ./scripts/bootstrap-controller.sh
-./scripts/verify-controller.sh
+sudo ./scripts/verify-controller.sh
 ```
 
 Configuration lives under `/etc/engineering-control`; PostgreSQL state under
@@ -30,6 +30,10 @@ long-lived Hermes user manager without widening the mode bits. The database pass
 readable by Hermes. Evidence ingest uses identity-bound tokens under
 `/etc/engineering-control/env/evidence-uploaders/`; possessing one grants no control API access.
 Compose ports are never published on all interfaces.
+
+Versioned unit snapshots are installed under `/etc/engineering-control/systemd` and must match the
+active copies under `/etc/systemd/system`. `/var/log/engineering-control` is reserved with
+restrictive permissions, while journald remains the authoritative log store.
 
 The bootstrap installs a commit-addressed release under `/opt/engineering-control/releases` and
 updates a symlink. It does not touch product repositories, Kubernetes, or existing Hermes service

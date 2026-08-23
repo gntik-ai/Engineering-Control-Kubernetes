@@ -60,6 +60,12 @@ async def test_provider_invocation_and_usage_are_durable_and_idempotent(tmp_path
     completed = {
         **started,
         "status": "SUCCESS",
+        "instruction_bundle": {
+            "sha256": "a" * 64,
+            "revision": "b" * 40,
+            "sources": ["roles/implementer.yaml", "skills/implement-issue/SKILL.md"],
+            "allowed_tools": ["Read", "Glob", "Grep", "Edit", "Write"],
+        },
         "agent_result": {
             "run_id": str(provider_run_id),
             "provider": "codex",
@@ -99,6 +105,13 @@ async def test_provider_invocation_and_usage_are_durable_and_idempotent(tmp_path
     assert invocation.role == "implementer"
     assert invocation.status == "SUCCESS"
     assert invocation.structured_result == {"decision": "COMPLETE"}
+    assert invocation.agent_pack_revision == "b" * 40
+    assert invocation.instruction_bundle_sha256 == "a" * 64
+    assert invocation.instruction_sources_json == [
+        "roles/implementer.yaml",
+        "skills/implement-issue/SKILL.md",
+    ]
+    assert invocation.allowed_tools_json == ["Read", "Glob", "Grep", "Edit", "Write"]
     assert usage is not None
     assert usage.run_id == control_run_id
     assert usage.input_tokens == 120

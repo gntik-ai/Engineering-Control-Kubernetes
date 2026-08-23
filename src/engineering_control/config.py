@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")
     project_config_root: Path = Path("/etc/engineering-control/projects.d")
+    agent_pack_root: Path = Path("/opt/engineering-agent-pack/source")
     browser_credential_root: Path = Path("/etc/engineering-control/env/browser")
     browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
     github_executable: Path = Path("/usr/bin/gh")
@@ -98,6 +99,13 @@ class Settings(BaseSettings):
     def private_evidence_ingest_only(cls, value: str) -> str:
         if value in {"0.0.0.0", "::"}:  # noqa: S104 - these values are explicitly rejected
             raise ValueError("the evidence ingest service cannot bind to every interface")
+        return value
+
+    @field_validator("agent_pack_root")
+    @classmethod
+    def absolute_agent_pack_root(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("agent pack root must be an absolute path")
         return value
 
     def read_api_token(self) -> str:

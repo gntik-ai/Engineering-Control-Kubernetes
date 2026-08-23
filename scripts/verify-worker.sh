@@ -9,6 +9,29 @@ fi
 cd /var/lib/engineering-control
 blocked=0
 
+for path in /home/hermes/engineering/bootstrap /home/hermes/engineering/docs \
+  /home/hermes/engineering/project-config /etc/engineering-control/systemd \
+  /var/log/engineering-control /opt/engineering-agent-pack/source; do
+  test -d "${path}"
+done
+agent_pack_head=$(git -C /home/hermes/engineering/engineering-agent-pack rev-parse HEAD)
+agent_pack_release=$(basename \
+  "$(dirname "$(readlink -f /opt/engineering-agent-pack/source)")")
+[[ ${agent_pack_release} == "${agent_pack_head}" ]]
+grep -q '^ENGINEERING_AGENT_PACK_ROOT=/opt/engineering-agent-pack/source$' \
+  /etc/engineering-control/env/worker-common.env
+for identity in codex-runner claude-runner; do
+  sudo -u "${identity}" test -r \
+    /opt/engineering-agent-pack/source/domain-packs/common/POLICIES.md
+done
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-agent-pack/source/generators/generate.py --check
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-agent-pack/source/generators/validate.py
+for unit in engineering-worker@.service engineering-release-worker.service; do
+  cmp -s "/etc/engineering-control/systemd/${unit}" "/etc/systemd/system/${unit}"
+done
+
 for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
   id "${identity}" >/dev/null
 done
@@ -16,8 +39,8 @@ for service in engineering-worker@codex engineering-worker@claude engineering-wo
   engineering-worker@scan engineering-worker@delivery engineering-release-worker; do
   systemctl is-active --quiet "${service}.service"
 done
-sudo -u codex-runner -H codex --version >/dev/null
-sudo -u claude-runner -H claude --version >/dev/null
+[[ $(sudo -u codex-runner -H codex --version) == "codex-cli 0.149.0" ]]
+[[ $(sudo -u claude-runner -H claude --version) == "2.1.239 (Claude Code)" ]]
 if ! sudo -u codex-runner -H env -i \
   HOME=/var/lib/engineering-control/identities/codex-runner \
   PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/codex login status >/dev/null 2>&1; then
@@ -31,13 +54,23 @@ if ! sudo -u claude-runner -H env -i \
   blocked=1
 fi
 sudo -u browser-runner test -r /opt/engineering-browser/node_modules/@playwright/test/package.json
-sudo -u scan-runner /usr/local/bin/gitleaks version >/dev/null
-sudo -u scan-runner /usr/local/bin/trivy --version >/dev/null
-sudo -u scan-runner /usr/local/bin/semgrep --version >/dev/null
-sudo -u release-runner /usr/local/bin/helm version --short >/dev/null
-sudo -u release-runner /usr/local/bin/kubectl version --client >/dev/null
-sudo -u release-runner /usr/local/bin/argocd version --client >/dev/null
-sudo -u delivery-runner /usr/local/bin/gh --version >/dev/null
+sudo -u browser-runner -H env -i \
+  HOME=/var/lib/engineering-control/identities/browser-runner \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers \
+  /usr/bin/python3 /opt/engineering-control/source/scripts/browser-runtime-smoke.py
+[[ $(sudo -u scan-runner /usr/local/bin/gitleaks version) == "8.30.0" ]]
+sudo -u scan-runner /usr/local/bin/trivy --version | grep -qx 'Version: 0.74.0'
+[[ $(sudo -u scan-runner /usr/local/bin/semgrep --version) == "1.174.0" ]]
+sudo -u scan-runner /usr/local/bin/syft version | grep -qx 'Version:       1.51.0'
+[[ $(sudo -u scan-runner /usr/local/bin/kubeconform -v) == "v0.8.0" ]]
+sudo -u release-runner /usr/local/bin/helm version --short | grep -q '^v4\.2\.3+'
+sudo -u release-runner /usr/local/bin/kubectl version --client=true -o json | \
+  grep -q '"gitVersion": "v1.36.3"'
+sudo -u release-runner /usr/local/bin/argocd version --client --short | \
+  grep -q '^argocd: v3\.5\.1+'
+sudo -u delivery-runner /usr/local/bin/gh --version | head -n 1 | \
+  grep -q '^gh version 2\.98\.0 '
 if sudo -u scan-runner test -s /etc/engineering-control/env/scan/github-read.token; then
   [[ $(stat -c '%a:%U:%G' /etc/engineering-control/env/scan/github-read.token) == \
     640:root:scan-runner ]]

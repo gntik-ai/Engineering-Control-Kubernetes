@@ -50,7 +50,10 @@ use coverage cells and Temporal continue-as-new rather than one permanent model 
 Every native provider activity is bracketed by controller-owned metadata activities. The start is
 recorded before dispatch and the normalized result (or a bounded authentication/failure code) is
 recorded afterward in `agent_invocations`; only usage fields actually exposed by the CLI are
-written to `provider_usage`. Prompts are never copied into either table. `/v1/usage` combines the
+written to `provider_usage`. Before native execution, the worker loads one immutable, validated
+role/skill/domain bundle from `/opt/engineering-agent-pack/source`, applies its exact Claude tool
+allowlist and Codex safety instructions, and records its SHA256, pack revision, sources, and tool
+boundary with the invocation. Prompts are never copied into either table. `/v1/usage` combines the
 latest non-invented quota snapshot—including native CLI presence/authentication status—with
 seven-day per-role invocation counts, success rates, running jobs, tokens, and estimated cost
 where known. Provider workers have no database access.

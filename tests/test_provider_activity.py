@@ -9,6 +9,7 @@ import pytest
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.provider import ProviderActivityHandler
+from engineering_control.agents.instructions import InstructionBundle
 from engineering_control.config import Settings
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import ModelClass, Project, Provider, RunStatus
@@ -39,6 +40,34 @@ class FakeAdapter:
             finished_at=now,
             error_code="PROVIDER_RATE_LIMIT" if self.status is RunStatus.RATE_LIMITED else None,
         )
+
+
+class FakeInstructionPack:
+    def enrich(self, request: AgentRequest, _step: str) -> tuple[AgentRequest, InstructionBundle]:
+        digest = "a" * 64
+        source = "roles/implementer.yaml"
+        tools = ("Read", "Glob", "Grep", "Edit", "Write")
+        enriched = AgentRequest.model_validate(
+            {
+                **request.model_dump(mode="python"),
+                "prompt": f"canonical instructions\n\n{request.prompt}",
+                "allowed_tools": tools,
+                "instruction_bundle_sha256": digest,
+                "instruction_bundle_sources": [source],
+            }
+        )
+        return enriched, InstructionBundle(
+            prompt_prefix="canonical instructions",
+            sha256=digest,
+            revision=None,
+            sources=(source,),
+            allowed_tools=tools,
+        )
+
+
+class InvalidInstructionPack:
+    def enrich(self, _request: AgentRequest, _step: str) -> tuple[AgentRequest, InstructionBundle]:
+        raise ValueError("unsafe agent pack")
 
 
 def request_for(worktree: Path, *, writable: bool = True) -> AgentRequest:
@@ -73,6 +102,7 @@ async def test_provider_activity_executes_only_in_bounded_worktree(
         Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
         "codex",
         FakeAdapter(),
+        FakeInstructionPack(),
     )
 
     result = await handler.handle(
@@ -83,6 +113,7 @@ async def test_provider_activity_executes_only_in_bounded_worktree(
     assert result["status"] == "SUCCESS"
     assert result["provider"] == "codex"
     assert result["agent_result"]["structured_result"] == {"summary": "ok"}
+    assert result["instruction_bundle"]["sha256"] == "a" * 64
 
 
 @pytest.mark.asyncio
@@ -116,6 +147,7 @@ async def test_provider_activity_heartbeats_while_cli_emits_no_events(
         Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
         "codex",
         QuietAdapter(),
+        FakeInstructionPack(),
     )
     handler._heartbeat_interval_seconds = 0.005
 
@@ -140,6 +172,7 @@ async def test_provider_activity_rejects_worktree_escape(tmp_path: Path) -> None
         Settings(worktree_root=allowed, run_root=tmp_path / "runs"),
         "codex",
         FakeAdapter(),
+        FakeInstructionPack(),
     )
 
     with pytest.raises(ApplicationError, match="bounded worktree"):
@@ -165,6 +198,7 @@ async def test_provider_activity_persists_rate_limit_handoff(
         Settings(worktree_root=worktree_root, run_root=run_root),
         "codex",
         FakeAdapter(RunStatus.RATE_LIMITED),
+        FakeInstructionPack(),
     )
 
     result = await handler.handle(
@@ -194,6 +228,7 @@ async def test_provider_activity_reports_manual_auth_requirement(tmp_path: Path)
         Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
         "codex",
         FakeAdapter(authenticated=False),
+        FakeInstructionPack(),
     )
 
     result = await handler.handle(
@@ -204,4 +239,28 @@ async def test_provider_activity_reports_manual_auth_requirement(tmp_path: Path)
     assert result["status"] == "BLOCKED"
     assert result["blocker"] == "MANUAL_AUTH_REQUIRED_CODEX"
     assert result["provider"] == "codex"
+    assert result["instruction_bundle"]["sha256"] == "a" * 64
+    assert "agent_result" not in result
+
+
+@pytest.mark.asyncio
+async def test_provider_activity_fails_closed_on_invalid_agent_pack(tmp_path: Path) -> None:
+    worktree_root = tmp_path / "worktrees"
+    worktree = worktree_root / "falcone" / "change-set"
+    worktree.mkdir(parents=True)
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
+        "codex",
+        FakeAdapter(),
+        InvalidInstructionPack(),
+    )
+
+    result = await handler.handle(
+        "delivery.invoke_maker",
+        {"maker_request": request_for(worktree).model_dump(mode="json")},
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "AGENT_PACK_INVALID"
+    assert result["blocker_detail"] == "ValueError"
     assert "agent_result" not in result
