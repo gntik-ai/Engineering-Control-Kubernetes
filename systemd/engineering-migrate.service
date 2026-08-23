@@ -5,6 +5,7 @@ Requires=engineering-infrastructure.service
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 User=engineering-control
 Group=engineering-control
 WorkingDirectory=/opt/engineering-control/source
