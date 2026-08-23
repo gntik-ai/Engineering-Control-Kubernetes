@@ -7,7 +7,7 @@ import ipaddress
 import json
 import re
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -35,6 +35,9 @@ class EvidenceEnvelope(BaseModel):
     producer: str = Field(pattern=r"^[a-z][a-z0-9-]{0,119}$")
     redaction_status: RedactionStatus
     source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    retention_class: Literal["standard", "ephemeral", "security", "release", "incident"] = (
+        "standard"
+    )
 
     @field_validator("redaction_status")
     @classmethod
@@ -53,6 +56,7 @@ class EvidenceEnvelope(BaseModel):
             "X-Evidence-Producer": self.producer,
             "X-Evidence-Redaction-Status": self.redaction_status.value,
             "X-Evidence-Source-Sha256": self.source_sha256,
+            "X-Evidence-Retention-Class": self.retention_class,
             "Content-Type": self.content_type,
         }
         if self.campaign_id is not None:
@@ -76,6 +80,7 @@ class EvidenceEnvelope(BaseModel):
                 "producer": headers.get("x-evidence-producer"),
                 "redaction_status": headers.get("x-evidence-redaction-status"),
                 "source_sha256": headers.get("x-evidence-source-sha256"),
+                "retention_class": headers.get("x-evidence-retention-class", "standard"),
             }
         )
 
@@ -135,6 +140,7 @@ class EvidenceIngestService:
             producer=envelope.producer,
             content_type=envelope.content_type,
             redaction_status=envelope.redaction_status,
+            retention_class=envelope.retention_class,
         )
         return await self.repository.persist_artifact(metadata)
 
@@ -200,6 +206,9 @@ class EvidencePublisher:
         producer: str,
         content_type: str,
         redaction_status: RedactionStatus,
+        retention_class: Literal[
+            "standard", "ephemeral", "security", "release", "incident"
+        ] = "standard",
         campaign_id: UUID | None = None,
         change_set_id: UUID | None = None,
     ) -> dict[str, Any]:
@@ -233,6 +242,7 @@ class EvidencePublisher:
             producer=producer,
             redaction_status=redaction_status,
             source_sha256=source_sha,
+            retention_class=retention_class,
         )
         token = self.settings.read_evidence_ingest_token()
         headers = {

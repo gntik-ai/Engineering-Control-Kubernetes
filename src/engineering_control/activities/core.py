@@ -15,8 +15,10 @@ from engineering_control.security.redaction import SecretRedactor
 from .browser import BrowserActivityHandler
 from .delivery import DeliveryActivityHandler
 from .metadata import MetadataActivityHandler
+from .preview_cleanup import PreviewCleanupActivityHandler
 from .provider import ProviderActivityHandler
 from .release import ReleaseActivityHandler
+from .retention import RetentionActivityHandler
 from .scan import ScanActivityHandler
 
 
@@ -102,6 +104,17 @@ class ControlActivities:
         "cleanup.protect_active",
         "cleanup.authorize",
         "cleanup.execute",
+        "cleanup.inspect_evidence_files",
+        "cleanup.inspect_delivery_files",
+        "cleanup.inspect_browser_files",
+        "cleanup.inspect_codex_files",
+        "cleanup.execute_evidence_files",
+        "cleanup.execute_delivery_files",
+        "cleanup.execute_browser_files",
+        "cleanup.execute_codex_files",
+        "cleanup.inspect_preview_namespaces",
+        "cleanup.execute_preview_namespaces",
+        "cleanup.execute_metadata",
         "cleanup.finalize",
     }
     _mutation_steps = {
@@ -109,6 +122,12 @@ class ControlActivities:
         "staging.deploy",
         "recovery.execute",
         "cleanup.execute",
+        "cleanup.execute_evidence_files",
+        "cleanup.execute_delivery_files",
+        "cleanup.execute_browser_files",
+        "cleanup.execute_codex_files",
+        "cleanup.execute_preview_namespaces",
+        "cleanup.execute_metadata",
         "reconcile.apply_promotion",
         "reconcile.publish_promotion",
     }
@@ -125,6 +144,14 @@ class ControlActivities:
             "runtime.deterministic_checks",
             "cleanup.protect_active",
             "cleanup.execute",
+            "cleanup.inspect_delivery_files",
+            "cleanup.execute_delivery_files",
+            "cleanup.inspect_browser_files",
+            "cleanup.execute_browser_files",
+            "cleanup.inspect_codex_files",
+            "cleanup.execute_codex_files",
+            "cleanup.inspect_preview_namespaces",
+            "cleanup.execute_preview_namespaces",
             "preview.preflight",
             "audit.agent_cell",
             "delivery.invoke_spec",
@@ -164,6 +191,8 @@ class ControlActivities:
             "delivery.invoke_checker",
             "quota.refresh",
             "runtime.independent_review",
+            "cleanup.inspect_codex_files",
+            "cleanup.execute_codex_files",
         },
         "claude": {
             "audit.agent_cell",
@@ -175,7 +204,11 @@ class ControlActivities:
             "quota.refresh",
             "runtime.independent_review",
         },
-        "browser": {"runtime.browser_checks"},
+        "browser": {
+            "runtime.browser_checks",
+            "cleanup.inspect_browser_files",
+            "cleanup.execute_browser_files",
+        },
         "delivery": {
             "delivery.publish",
             "reconcile.inspect_ci",
@@ -188,6 +221,8 @@ class ControlActivities:
             "preview.verify",
             "staging.deploy",
             "recovery.execute",
+            "cleanup.inspect_preview_namespaces",
+            "cleanup.execute_preview_namespaces",
         },
         "synthetic": _allowed_steps,
     }
@@ -216,6 +251,14 @@ class ControlActivities:
             DeliveryActivityHandler(settings) if self.worker_kind == "delivery" else None
         )
         self.scan_handler = ScanActivityHandler(settings) if self.worker_kind == "scan" else None
+        self.retention_handler = (
+            RetentionActivityHandler(settings, self.worker_kind)
+            if self.worker_kind in {"controller", "delivery", "browser", "codex"}
+            else None
+        )
+        self.preview_cleanup_handler = (
+            PreviewCleanupActivityHandler(settings) if self.worker_kind == "release" else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -238,6 +281,18 @@ class ControlActivities:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:
                 return self._envelope(step, safe_payload, "DRY_RUN")
+            if (
+                self.retention_handler is not None
+                and step in self.retention_handler.supported_steps
+            ):
+                return await self.retention_handler.handle(step, safe_payload)
+            if (
+                self.preview_cleanup_handler is not None
+                and step in self.preview_cleanup_handler.supported_steps
+            ):
+                return await self.preview_cleanup_handler.handle(step, safe_payload)
+            if step == "cleanup.execute_metadata" and self.metadata_handler is not None:
+                return await self.metadata_handler.handle(step, safe_payload)
             if step == "cleanup.execute" and self.scan_handler is not None:
                 return await self.scan_handler.handle(step, safe_payload)
             if step == "reconcile.apply_promotion" and self.scan_handler is not None:
@@ -251,6 +306,13 @@ class ControlActivities:
                 type="SecurityBlocker",
                 non_retryable=True,
             )
+        if self.retention_handler is not None and step in self.retention_handler.supported_steps:
+            return await self.retention_handler.handle(step, safe_payload)
+        if (
+            self.preview_cleanup_handler is not None
+            and step in self.preview_cleanup_handler.supported_steps
+        ):
+            return await self.preview_cleanup_handler.handle(step, safe_payload)
         if self.provider_handler is not None:
             return await self.provider_handler.handle(step, safe_payload)
         if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:

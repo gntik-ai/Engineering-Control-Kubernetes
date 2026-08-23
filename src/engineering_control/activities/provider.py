@@ -76,13 +76,9 @@ class ProviderActivityHandler:
         try:
             authenticated = await self.adapter.authenticated()
         except FileNotFoundError:
-            return self._blocked(
-                payload, f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}"
-            )
+            return self._blocked(payload, f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}")
         if not authenticated:
-            return self._blocked(
-                payload, f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}"
-            )
+            return self._blocked(payload, f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}")
 
         sequence = 0
 

@@ -5,7 +5,8 @@
 3. Build/test new `engineering-control` and agent-pack commits without changing active symlinks.
 4. Pull new pinned image digests and CLI/scanner checksums.
 5. Stop schedulers, drain role workers, and let in-flight activities heartbeat or cancel safely.
-6. Run database migrations once; never edit a released migration.
+6. Run database migrations once; never edit a released migration. Migration `0005` adds nullable
+   artifact purge tombstones and is backward-compatible with readers that ignore those columns.
 7. Switch `/opt/engineering-control/source`, restart services, and run verification.
 8. Roll back code/image symlinks on failure. Restore PostgreSQL only when a migration is not
    backward-compatible and after stopping all writers.

@@ -234,6 +234,8 @@ class Artifact(UUIDPrimaryKey, Timestamps, Base):
     redaction_status: Mapped[str] = mapped_column(String(32))
     size_bytes: Mapped[int] = mapped_column(BigInteger)
     retention_class: Mapped[str] = mapped_column(String(64), default="standard")
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purge_reason: Mapped[str | None] = mapped_column(String(120))
 
 
 class Approval(UUIDPrimaryKey, Timestamps, Base):

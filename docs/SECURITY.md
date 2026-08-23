@@ -52,10 +52,21 @@ metadata, the adapter verifies that Secret reads and representative create/patch
 operations return `no`. Only reduced names, readiness, revisions, and image digests leave the scan
 worker. Raw Kubernetes objects and browser credentials are never placed in provider prompts.
 
-Retention cleanup is disabled for mutation by default and cannot accept arbitrary paths.
-PostgreSQL eligibility, worker Git cleanliness and branch identity, a second controller
-authorization hash, and the scan worker policy switch must all agree. Dirty worktrees and
-open-incident ChangeSets remain protected without an override path.
+Retention cleanup is disabled for mutation by default and cannot accept arbitrary paths or generic
+Kubernetes commands. PostgreSQL eligibility, owner-worker inspection, and a single controller
+authorization hash over all exact resources must agree. File cleanup rejects root/interior
+symlinks, special files, size/hash drift, and post-inspection manifest changes. Preview cleanup is
+restricted to terminal ChangeSets, explicit preview-target opt-in, a scoped mode-`0600` release
+kubeconfig, a project namespace prefix, fixed management/deployment/ChangeSet labels, and unchanged
+Namespace UID/resourceVersion/label hash. Dirty worktrees, rate-limit handoffs, active work,
+open-incident ChangeSets, and standard/security/release/incident evidence remain protected without
+an override path. Purged ephemeral evidence is retained as a PostgreSQL tombstone and excluded from
+active evidence-byte metrics.
+
+Codex CLI scratch data is created beneath a mode-`0700`, UUID-named per-run parent. The attempt
+directory is removed normally by the adapter; a crash residue is cleanup-eligible only after the
+associated database Run and provider invocation are terminal, outside the retention window, and
+not rate-limited. The Codex identity can remove only that exact controller-authorized UUID path.
 
 Active security blockers:
 

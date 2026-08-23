@@ -46,7 +46,23 @@
           "maxLength": 500
         },
         "timeout_minutes": {"type": "integer", "minimum": 5, "maximum": 120},
-        "argo_application": {"type": "string", "minLength": 1, "maxLength": 253}
+        "argo_application": {"type": "string", "minLength": 1, "maxLength": 253},
+        "cleanup_enabled": {"type": "boolean"},
+        "cleanup_namespace_prefix": {
+          "type": "string",
+          "pattern": "^(falcone|musematic)-preview-$",
+          "maxLength": 64
+        },
+        "cleanup_kube_context": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "cleanup_kubeconfig_path": {
+          "type": "string",
+          "pattern": "^/etc/engineering-control/env/release/[^/]+$",
+          "maxLength": 500
+        }
       }
     }
   },
@@ -105,6 +121,29 @@
             "maxLength": 63
           },
           "configuration": {"required": ["argo_application"]}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "configuration": {
+            "properties": {"cleanup_enabled": {"const": true}},
+            "required": ["cleanup_enabled"]
+          }
+        },
+        "required": ["configuration"]
+      },
+      "then": {
+        "properties": {
+          "environment": {"const": "preview"},
+          "configuration": {
+            "required": [
+              "cleanup_namespace_prefix",
+              "cleanup_kube_context",
+              "cleanup_kubeconfig_path"
+            ]
+          }
         }
       }
     }

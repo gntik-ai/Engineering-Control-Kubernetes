@@ -36,6 +36,23 @@ The four templates in `config/targets/` install into `/etc/engineering-control/t
 strictly schema validated and default to `enabled: false`; bootstrap never overwrites an existing
 operator-edited target file. Enabling a target is an operator security decision, not a model task.
 
+Preview namespace cleanup is a separate opt-in within an enabled preview target. Set
+`cleanup_enabled: true`, a project-specific `cleanup_namespace_prefix`
+(`falcone-preview-` or `musematic-preview-`), an exact `cleanup_kube_context`, and an absolute
+`cleanup_kubeconfig_path` beneath `/etc/engineering-control/env/release/`. It is invalid on staging
+targets. The namespace must carry all three immutable management labels:
+
+```text
+engineering.gntik.ai/managed-by=engineering-control
+engineering.gntik.ai/deployment-id=<deployment UUID>
+engineering.gntik.ai/change-set-id=<ChangeSet UUID>
+```
+
+Missing or mismatched labels protect the namespace. Cleanup never deletes an Argo CD Application
+or changes desired Git state; operators must ensure an expired Musematic preview is no longer
+desired by its protected deployment repository before its ChangeSet is terminal and the namespace
+becomes eligible.
+
 Falcone targets require a chart-relative values list, release name, exact kube context, and an
 absolute mode-`0600` kubeconfig under `/etc/engineering-control/env/release/`. The release worker
 verifies its chart worktree and exact chart SHA, runs `helm lint` and `helm template`, and captures

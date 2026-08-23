@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
@@ -101,6 +101,9 @@ class ArtifactMetadata(StrictModel):
     created_at: datetime = Field(default_factory=utcnow)
     redaction_status: RedactionStatus
     size_bytes: int = Field(ge=0)
+    retention_class: Literal["standard", "ephemeral", "security", "release", "incident"] = (
+        "standard"
+    )
 
     @field_validator("relative_path")
     @classmethod

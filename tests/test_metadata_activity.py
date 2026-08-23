@@ -1479,13 +1479,25 @@ async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(tmp_path
         **discovered,
         "eligible_candidates": [{**discovered["cleanup_candidates"][0], "inspection": "ABSENT"}],
         "protected_candidates": [],
+        "inspected_file_candidates": [],
+        "inspected_preview_namespace_candidates": [],
     }
     authorized = await handler.handle("cleanup.authorize", inspected)
     assert authorized["status"] == "CLEANUP_AUTHORIZED"
+    metadata_executed = await handler.handle(
+        "cleanup.execute_metadata",
+        {
+            **authorized,
+            "removed_file_candidate_ids": [],
+            "absent_file_candidate_ids": [],
+            "removed_preview_namespace_candidate_ids": [],
+            "absent_preview_namespace_candidate_ids": [],
+        },
+    )
     finalized = await handler.handle(
         "cleanup.finalize",
         {
-            **authorized,
+            **metadata_executed,
             "removed_lease_ids": [],
             "already_absent_lease_ids": [str(lease_id)],
             "terminal_status": "COMPLETE",
@@ -1495,3 +1507,96 @@ async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(tmp_path
     with handler.sessions() as session:
         cleanup_run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
         assert cleanup_run is not None and cleanup_run.status == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_protects_all_resources_owned_by_rate_limited_run(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'cleanup-rate-limit.sqlite'}",
+            worktree_root=tmp_path / "worktrees",
+            cleanup_retention_days=1,
+            cleanup_expiry_grace_hours=1,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    owner_run_id = uuid4()
+    worktree_lease_id = uuid4()
+    component_lease_id = uuid4()
+    old = datetime.now(UTC) - timedelta(days=2)
+    branch = f"agent/falcone/123/{change_set_id}"
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="falcone",
+                risk_class="R1",
+                state="ISSUE_CLOSED",
+                version=1,
+                source_repository="falcone",
+                source_branch=branch,
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url=None,
+                deployment_repository="falcone-charts",
+                deployment_branch=f"agent/falcone-charts/123/{change_set_id}",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=owner_run_id,
+                change_set_id=change_set_id,
+                workflow_id="delivery-rate-limited",
+                run_type="issue-delivery",
+                status="RATE_LIMITED",
+                project="falcone",
+                started_at=old,
+                finished_at=old,
+                error_code="PROVIDER_RATE_LIMIT",
+            )
+        )
+        session.add(
+            WorktreeLease(
+                id=worktree_lease_id,
+                change_set_id=change_set_id,
+                repository="falcone",
+                worktree_path=str(tmp_path / "worktrees" / "falcone" / str(change_set_id)),
+                branch=branch,
+                owner_run_id=owner_run_id,
+                base_sha="a" * 40,
+                expires_at=old,
+                released_at=old,
+            )
+        )
+        session.add(
+            ComponentLease(
+                id=component_lease_id,
+                component_key="falcone:gateway",
+                owner_run_id=owner_run_id,
+                mode="write",
+                expires_at=old,
+                released_at=None,
+            )
+        )
+
+    discovered = await handler.handle(
+        "cleanup.discover",
+        {
+            "dry_run": True,
+            "retention_policy": "standard",
+            "orchestration": {"workflow_id": "cleanup-rate-limit-test"},
+        },
+    )
+
+    assert discovered["cleanup_candidates"] == []
+    assert discovered["component_lease_cleanup_candidates"] == []
+    assert discovered["file_cleanup_candidates"] == []

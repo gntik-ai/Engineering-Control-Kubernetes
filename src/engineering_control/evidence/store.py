@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from engineering_control.models.core import ArtifactMetadata
@@ -29,6 +29,9 @@ class LocalEvidenceStore:
         run_id: str,
         producer: str,
         change_set_id: str | None = None,
+        retention_class: Literal[
+            "standard", "ephemeral", "security", "release", "incident"
+        ] = "standard",
     ) -> ArtifactMetadata:
         if category not in {"snapshot", "findings", "changes"}:
             raise ValueError("invalid evidence category")
@@ -50,6 +53,7 @@ class LocalEvidenceStore:
             redaction_status=(
                 RedactionStatus.REDACTED if report.replacements else RedactionStatus.NOT_REQUIRED
             ),
+            retention_class=retention_class,
         )
 
     def put_bytes(
@@ -66,6 +70,9 @@ class LocalEvidenceStore:
         producer: str,
         content_type: str,
         redaction_status: RedactionStatus,
+        retention_class: Literal[
+            "standard", "ephemeral", "security", "release", "incident"
+        ] = "standard",
     ) -> ArtifactMetadata:
         if category not in {"snapshot", "findings", "changes"}:
             raise ValueError("invalid evidence category")
@@ -101,4 +108,5 @@ class LocalEvidenceStore:
             producer=producer,
             redaction_status=redaction_status,
             size_bytes=len(payload),
+            retention_class=retention_class,
         )

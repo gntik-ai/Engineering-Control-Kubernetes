@@ -117,6 +117,16 @@ class ControlledWorkflow:
 
     @classmethod
     def _activity_queue(cls, step: str, payload: dict[str, Any]) -> str:
+        if step in {"cleanup.inspect_evidence_files", "cleanup.execute_evidence_files"}:
+            return "engineering-control"
+        if step in {"cleanup.inspect_delivery_files", "cleanup.execute_delivery_files"}:
+            return "engineering-delivery"
+        if step in {"cleanup.inspect_browser_files", "cleanup.execute_browser_files"}:
+            return "engineering-browser"
+        if step in {"cleanup.inspect_codex_files", "cleanup.execute_codex_files"}:
+            return "engineering-codex"
+        if step in {"cleanup.inspect_preview_namespaces", "cleanup.execute_preview_namespaces"}:
+            return "engineering-release"
         if step in {
             "project.snapshot",
             "finding.fresh_snapshot",
@@ -698,6 +708,11 @@ class CleanupWorkflow(ControlledWorkflow):
         try:
             context = await self._step("cleanup.discover", context)
             context = await self._step("cleanup.protect_active", context)
+            context = await self._step("cleanup.inspect_evidence_files", context)
+            context = await self._step("cleanup.inspect_delivery_files", context)
+            context = await self._step("cleanup.inspect_browser_files", context)
+            context = await self._step("cleanup.inspect_codex_files", context)
+            context = await self._step("cleanup.inspect_preview_namespaces", context)
             if request.dry_run:
                 context = await self._step(
                     "cleanup.finalize", {**context, "terminal_status": "DRY_RUN"}
@@ -709,7 +724,21 @@ class CleanupWorkflow(ControlledWorkflow):
                     "cleanup.finalize", {**context, "terminal_status": "BLOCKED"}
                 )
                 return {"status": "BLOCKED", "context": context}
+            context = await self._step(
+                "cleanup.execute_evidence_files", {**context, "dry_run": False}
+            )
+            context = await self._step(
+                "cleanup.execute_delivery_files", {**context, "dry_run": False}
+            )
+            context = await self._step(
+                "cleanup.execute_browser_files", {**context, "dry_run": False}
+            )
+            context = await self._step("cleanup.execute_codex_files", {**context, "dry_run": False})
+            context = await self._step(
+                "cleanup.execute_preview_namespaces", {**context, "dry_run": False}
+            )
             context = await self._step("cleanup.execute", {**context, "dry_run": False})
+            context = await self._step("cleanup.execute_metadata", {**context, "dry_run": False})
             context = await self._step(
                 "cleanup.finalize", {**context, "terminal_status": "COMPLETE"}
             )

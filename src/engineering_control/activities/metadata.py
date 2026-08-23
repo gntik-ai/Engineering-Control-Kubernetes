@@ -19,12 +19,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.activities.retention import (
+    FileCleanupCandidate,
+    PreviewNamespaceCleanupCandidate,
+    cleanup_authorization_sha256,
+)
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.config import Settings
 from engineering_control.db.models import (
     AgentInvocation,
     Approval,
     ApprovalCandidate,
+    Artifact,
     Campaign,
     ChangeSet,
     ComponentLease,
@@ -133,9 +139,19 @@ class DeploymentTargetRecord(BaseModel):
                 "kube_context",
                 "kubeconfig_path",
                 "timeout_minutes",
+                "cleanup_enabled",
+                "cleanup_namespace_prefix",
+                "cleanup_kube_context",
+                "cleanup_kubeconfig_path",
             }
             if self.strategy == "helm"
-            else {"argo_application"}
+            else {
+                "argo_application",
+                "cleanup_enabled",
+                "cleanup_namespace_prefix",
+                "cleanup_kube_context",
+                "cleanup_kubeconfig_path",
+            }
         )
         unknown = set(self.configuration) - allowed
         if unknown:
@@ -147,6 +163,21 @@ class DeploymentTargetRecord(BaseModel):
         )
         if required - set(self.configuration):
             raise ValueError("enabled deployment target configuration is incomplete")
+        cleanup_fields = {
+            "cleanup_namespace_prefix",
+            "cleanup_kube_context",
+            "cleanup_kubeconfig_path",
+        }
+        cleanup_enabled = self.configuration.get("cleanup_enabled", False)
+        if not isinstance(cleanup_enabled, bool):
+            raise ValueError("preview cleanup enablement must be boolean")
+        if cleanup_enabled and self.environment != "preview":
+            raise ValueError("namespace cleanup is restricted to preview targets")
+        configured_cleanup = cleanup_fields.intersection(self.configuration)
+        if cleanup_enabled and configured_cleanup != cleanup_fields:
+            raise ValueError("enabled preview cleanup configuration is incomplete")
+        if not cleanup_enabled and configured_cleanup:
+            raise ValueError("disabled preview cleanup cannot retain active configuration")
         return self
 
 
@@ -252,6 +283,7 @@ class MetadataActivityHandler:
             "recovery.record_failure",
             "cleanup.discover",
             "cleanup.authorize",
+            "cleanup.execute_metadata",
             "cleanup.finalize",
             "quota.persist",
         }
@@ -396,6 +428,8 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._discover_cleanup, payload)
             if step == "cleanup.authorize":
                 return await asyncio.to_thread(self._authorize_cleanup, payload)
+            if step == "cleanup.execute_metadata":
+                return await asyncio.to_thread(self._execute_cleanup_metadata, payload)
             if step == "cleanup.finalize":
                 return await asyncio.to_thread(self._finalize_cleanup, payload)
             if step == "quota.persist":
@@ -474,8 +508,7 @@ class MetadataActivityHandler:
             {
                 "kind": "deterministic-snapshot",
                 "reference": (
-                    f"coverage:{cell.domain}:{cell.persona}:{cell.lens.value}:"
-                    f"{cell.environment}"
+                    f"coverage:{cell.domain}:{cell.persona}:{cell.lens.value}:{cell.environment}"
                 ),
                 "sha256": deterministic_sha,
             }
@@ -3623,6 +3656,9 @@ class MetadataActivityHandler:
         workflow_id = str(payload["orchestration"]["workflow_id"])
         now = datetime.now(UTC)
         candidates: list[dict[str, Any]] = []
+        component_candidates: list[dict[str, Any]] = []
+        file_candidates: list[dict[str, Any]] = []
+        preview_candidates: list[dict[str, Any]] = []
         protected_count = 0
         with self.sessions.begin() as session:
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
@@ -3678,16 +3714,30 @@ class MetadataActivityHandler:
                         "reason": reason,
                     }
                 )
+            component_candidates = self._component_cleanup_candidates(session, now)
+            file_candidates = self._file_cleanup_candidates(session, now)
+            preview_candidates = self._preview_namespace_cleanup_candidates(session, now)
         return {
             **payload,
             "status": "CLEANUP_CANDIDATES_DISCOVERED",
             "cleanup_candidates": sorted(candidates, key=lambda value: value["lease_id"]),
+            "component_lease_cleanup_candidates": component_candidates,
+            "file_cleanup_candidates": file_candidates,
+            "preview_namespace_cleanup_candidates": preview_candidates,
             "protected_count": protected_count,
         }
 
     def _authorize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw_candidates = payload.get("eligible_candidates")
-        if not isinstance(raw_candidates, list):
+        raw_file_candidates = payload.get("inspected_file_candidates")
+        raw_component_candidates = payload.get("component_lease_cleanup_candidates")
+        raw_preview_candidates = payload.get("inspected_preview_namespace_candidates")
+        if (
+            not isinstance(raw_candidates, list)
+            or not isinstance(raw_file_candidates, list)
+            or not isinstance(raw_component_candidates, list)
+            or not isinstance(raw_preview_candidates, list)
+        ):
             raise ValueError("cleanup authorization requires inspected candidates")
         if not self.settings.cleanup_execution_enabled:
             return {
@@ -3698,6 +3748,9 @@ class MetadataActivityHandler:
         workflow_id = str(payload["orchestration"]["workflow_id"])
         now = datetime.now(UTC)
         authorized: list[dict[str, Any]] = []
+        authorized_files: list[dict[str, Any]] = []
+        authorized_components: list[dict[str, Any]] = []
+        authorized_previews: list[dict[str, Any]] = []
         fields = {
             "lease_id",
             "change_set_id",
@@ -3714,10 +3767,10 @@ class MetadataActivityHandler:
             for raw in raw_candidates:
                 if not isinstance(raw, dict):
                     raise ValueError("cleanup candidate must be an object")
-                candidate = {key: raw[key] for key in fields if key in raw}
-                if set(candidate) != fields:
+                worktree_candidate = {key: raw[key] for key in fields if key in raw}
+                if set(worktree_candidate) != fields:
                     raise ValueError("cleanup candidate identity is incomplete")
-                lease = session.get(WorktreeLease, UUID(str(candidate["lease_id"])))
+                lease = session.get(WorktreeLease, UUID(str(worktree_candidate["lease_id"])))
                 reason = (
                     self._cleanup_lease_eligibility(session, lease, now)
                     if lease is not None
@@ -3726,26 +3779,302 @@ class MetadataActivityHandler:
                 if (
                     lease is None
                     or reason is None
-                    or reason != candidate["reason"]
-                    or str(lease.change_set_id) != candidate["change_set_id"]
-                    or lease.repository != candidate["repository"]
-                    or lease.worktree_path != candidate["worktree_path"]
-                    or lease.branch != candidate["branch"]
-                    or lease.base_sha != candidate["base_sha"]
+                    or reason != worktree_candidate["reason"]
+                    or str(lease.change_set_id) != worktree_candidate["change_set_id"]
+                    or lease.repository != worktree_candidate["repository"]
+                    or lease.worktree_path != worktree_candidate["worktree_path"]
+                    or lease.branch != worktree_candidate["branch"]
+                    or lease.base_sha != worktree_candidate["base_sha"]
                 ):
                     raise ValueError("cleanup candidate changed after worker inspection")
-                authorized.append(candidate)
+                authorized.append(worktree_candidate)
+            current_files = {
+                value["candidate_id"]: value
+                for value in self._file_cleanup_candidates(session, now)
+            }
+            candidate_fields = set(FileCleanupCandidate.model_fields)
+            seen_file_ids: set[str] = set()
+            for raw in raw_file_candidates:
+                if not isinstance(raw, dict):
+                    raise ValueError("inspected file cleanup candidate must be an object")
+                inspection = str(raw.get("inspection", ""))
+                if inspection == "MODIFIED_AFTER_CUTOFF":
+                    continue
+                if inspection not in {"CLEAN", "ABSENT"}:
+                    raise ValueError("file cleanup candidate was not inspected by its owner")
+                file_candidate = FileCleanupCandidate.model_validate(
+                    {key: value for key, value in raw.items() if key in candidate_fields}
+                )
+                if file_candidate.candidate_id in seen_file_ids:
+                    raise ValueError("file cleanup candidate inspection is duplicated")
+                seen_file_ids.add(file_candidate.candidate_id)
+                current = current_files.get(file_candidate.candidate_id)
+                if current is None:
+                    raise ValueError("file cleanup candidate is no longer metadata-eligible")
+                original = file_candidate.model_dump(mode="json")
+                if any(
+                    original[key] != current[key] for key in original if key != "not_modified_after"
+                ) or file_candidate.not_modified_after > datetime.fromisoformat(
+                    str(current["not_modified_after"])
+                ):
+                    raise ValueError("file cleanup candidate identity changed after inspection")
+                authorized_file = {**original, "inspection": inspection}
+                if inspection == "CLEAN":
+                    manifest = str(raw.get("manifest_sha256", ""))
+                    entry_count = raw.get("entry_count")
+                    newest_mtime_ns = raw.get("newest_mtime_ns")
+                    if (
+                        not re.fullmatch(r"[a-f0-9]{64}", manifest)
+                        or not isinstance(entry_count, int)
+                        or entry_count < 1
+                        or not isinstance(newest_mtime_ns, int)
+                        or newest_mtime_ns < 1
+                    ):
+                        raise ValueError("file cleanup inspection evidence is incomplete")
+                    authorized_file.update(
+                        {
+                            "manifest_sha256": manifest,
+                            "entry_count": entry_count,
+                            "newest_mtime_ns": newest_mtime_ns,
+                        }
+                    )
+                authorized_files.append(authorized_file)
+            current_components = {
+                value["lease_id"]: value
+                for value in self._component_cleanup_candidates(session, now)
+            }
+            for raw in raw_component_candidates:
+                if not isinstance(raw, dict) or not isinstance(raw.get("lease_id"), str):
+                    raise ValueError("component cleanup candidate must be an object")
+                current = current_components.get(raw["lease_id"])
+                if current is None or current != raw:
+                    raise ValueError("component cleanup candidate changed before authorization")
+                authorized_components.append(current)
+            current_previews = {
+                value["candidate_id"]: value
+                for value in self._preview_namespace_cleanup_candidates(session, now)
+            }
+            preview_fields = set(PreviewNamespaceCleanupCandidate.model_fields)
+            seen_preview_ids: set[str] = set()
+            for raw in raw_preview_candidates:
+                if not isinstance(raw, dict):
+                    raise ValueError("preview cleanup inspection must be an object")
+                inspection = str(raw.get("inspection", ""))
+                if inspection == "PROTECTED":
+                    continue
+                if inspection not in {"CLEAN", "ABSENT"}:
+                    raise ValueError("preview namespace was not inspected by release worker")
+                preview_candidate = PreviewNamespaceCleanupCandidate.model_validate(
+                    {key: value for key, value in raw.items() if key in preview_fields}
+                )
+                if preview_candidate.candidate_id in seen_preview_ids:
+                    raise ValueError("preview cleanup inspection is duplicated")
+                seen_preview_ids.add(preview_candidate.candidate_id)
+                original = preview_candidate.model_dump(mode="json")
+                if current_previews.get(preview_candidate.candidate_id) != original:
+                    raise ValueError("preview cleanup identity changed after inspection")
+                authorized_preview = {**original, "inspection": inspection}
+                if inspection == "CLEAN":
+                    uid = raw.get("uid")
+                    resource_version = raw.get("resource_version")
+                    labels_sha256 = raw.get("labels_sha256")
+                    if (
+                        not isinstance(uid, str)
+                        or not uid
+                        or not isinstance(resource_version, str)
+                        or not resource_version
+                        or not isinstance(labels_sha256, str)
+                        or not re.fullmatch(r"[a-f0-9]{64}", labels_sha256)
+                    ):
+                        raise ValueError("preview namespace inspection identity is incomplete")
+                    authorized_preview.update(
+                        {
+                            "uid": uid,
+                            "resource_version": resource_version,
+                            "labels_sha256": labels_sha256,
+                        }
+                    )
+                authorized_previews.append(authorized_preview)
+
         authorized.sort(key=lambda value: str(value["lease_id"]))
-        canonical = json.dumps(
-            {"workflow_id": workflow_id, "candidates": authorized},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
+        authorized_files.sort(key=lambda value: str(value["candidate_id"]))
+        authorized_components.sort(key=lambda value: str(value["lease_id"]))
+        authorized_previews.sort(key=lambda value: str(value["candidate_id"]))
+        authorization_sha256 = cleanup_authorization_sha256(
+            workflow_id=workflow_id,
+            worktrees=authorized,
+            files=authorized_files,
+            component_leases=authorized_components,
+            preview_namespaces=authorized_previews,
+        )
         return {
             **payload,
             "status": "CLEANUP_AUTHORIZED",
             "authorized_candidates": authorized,
-            "cleanup_authorization_sha256": hashlib.sha256(canonical).hexdigest(),
+            "authorized_file_candidates": authorized_files,
+            "authorized_component_lease_candidates": authorized_components,
+            "authorized_preview_namespace_candidates": authorized_previews,
+            "cleanup_authorization_sha256": authorization_sha256,
+        }
+
+    def _execute_cleanup_metadata(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.settings.cleanup_execution_enabled:
+            raise ApplicationError(
+                "metadata cleanup execution is disabled by policy",
+                type="SecurityBlocker",
+                non_retryable=True,
+            )
+        workflow_id = str(payload["orchestration"]["workflow_id"])
+        worktrees = payload.get("authorized_candidates")
+        files = payload.get("authorized_file_candidates")
+        components = payload.get("authorized_component_lease_candidates")
+        previews = payload.get("authorized_preview_namespace_candidates", [])
+        if (
+            not isinstance(worktrees, list)
+            or not isinstance(files, list)
+            or not isinstance(components, list)
+            or not isinstance(previews, list)
+        ):
+            raise ValueError("metadata cleanup authorization lists are incomplete")
+        if (
+            any(not isinstance(item, dict) for item in worktrees)
+            or any(not isinstance(item, dict) for item in files)
+            or any(not isinstance(item, dict) for item in components)
+            or any(not isinstance(item, dict) for item in previews)
+        ):
+            raise ValueError("metadata cleanup authorization records must be objects")
+        worktree_records = cast(list[dict[str, Any]], worktrees)
+        file_records = cast(list[dict[str, Any]], files)
+        component_records = cast(list[dict[str, Any]], components)
+        preview_records = cast(list[dict[str, Any]], previews)
+        expected = cleanup_authorization_sha256(
+            workflow_id=workflow_id,
+            worktrees=worktree_records,
+            files=file_records,
+            component_leases=component_records,
+            preview_namespaces=preview_records,
+        )
+        if payload.get("cleanup_authorization_sha256") != expected:
+            raise ValueError("metadata cleanup authorization changed after controller validation")
+        removed_files = payload.get("removed_file_candidate_ids")
+        absent_files = payload.get("absent_file_candidate_ids")
+        if not isinstance(removed_files, list) or not isinstance(absent_files, list):
+            raise ValueError("file cleanup completion evidence is incomplete")
+        completed_files = {str(value) for value in [*removed_files, *absent_files]}
+        authorized_file_ids = {
+            str(value["candidate_id"]) for value in file_records if "candidate_id" in value
+        }
+        if completed_files != authorized_file_ids:
+            raise ValueError("file cleanup completion does not match controller authorization")
+        removed_previews = payload.get("removed_preview_namespace_candidate_ids")
+        absent_previews = payload.get("absent_preview_namespace_candidate_ids")
+        if not isinstance(removed_previews, list) or not isinstance(absent_previews, list):
+            raise ValueError("preview cleanup completion evidence is incomplete")
+        completed_previews = {str(value) for value in [*removed_previews, *absent_previews]}
+        authorized_preview_ids = {
+            str(value["candidate_id"]) for value in preview_records if "candidate_id" in value
+        }
+        if completed_previews != authorized_preview_ids:
+            raise ValueError("preview cleanup completion does not match authorization")
+        now = datetime.now(UTC)
+        released: list[str] = []
+        purged: list[str] = []
+        cleaned_previews: list[str] = []
+        candidate_fields = set(FileCleanupCandidate.model_fields)
+        preview_fields = set(PreviewNamespaceCleanupCandidate.model_fields)
+        with self.sessions.begin() as session:
+            current_components = {
+                value["lease_id"]: value
+                for value in self._component_cleanup_candidates(session, now)
+            }
+            for raw in component_records:
+                if not isinstance(raw, dict):
+                    raise ValueError("component lease changed after cleanup authorization")
+                lease = session.get(ComponentLease, UUID(str(raw["lease_id"])))
+                if lease is None:
+                    raise ValueError("authorized component lease disappeared")
+                expected_component = {
+                    "lease_id": str(lease.id),
+                    "component_key": lease.component_key,
+                    "owner_run_id": str(lease.owner_run_id),
+                    "expires_at": self._as_utc(lease.expires_at).isoformat(),
+                    "reason": "TERMINAL_OWNER_LEASE_EXPIRED",
+                }
+                if expected_component != raw:
+                    raise ValueError("component lease identity changed after authorization")
+                if lease.released_at is None:
+                    if current_components.get(str(lease.id)) != raw:
+                        raise ValueError("component lease is no longer cleanup-eligible")
+                    lease.released_at = now
+                released.append(str(lease.id))
+            for raw in file_records:
+                if not isinstance(raw, dict):
+                    raise ValueError("authorized file cleanup candidate must be an object")
+                file_candidate = FileCleanupCandidate.model_validate(
+                    {key: value for key, value in raw.items() if key in candidate_fields}
+                )
+                if file_candidate.kind != "evidence-artifact":
+                    continue
+                artifact = session.get(Artifact, file_candidate.artifact_id)
+                if (
+                    artifact is None
+                    or artifact.run_id != file_candidate.run_id
+                    or artifact.relative_path != file_candidate.relative_path
+                    or artifact.sha256 != file_candidate.expected_sha256
+                    or artifact.size_bytes != file_candidate.expected_size_bytes
+                    or artifact.retention_class != "ephemeral"
+                    or artifact.producer == "release-runner"
+                ):
+                    raise ValueError("ephemeral evidence identity changed before tombstoning")
+                if artifact.purged_at is None:
+                    artifact.purged_at = now
+                    artifact.purge_reason = file_candidate.reason
+                purged.append(str(artifact.id))
+            current_previews = {
+                value["candidate_id"]: value
+                for value in self._preview_namespace_cleanup_candidates(session, now)
+            }
+            for raw in preview_records:
+                if not isinstance(raw, dict):
+                    raise ValueError("authorized preview cleanup candidate must be an object")
+                preview_candidate = PreviewNamespaceCleanupCandidate.model_validate(
+                    {key: value for key, value in raw.items() if key in preview_fields}
+                )
+                deployment = session.get(Deployment, preview_candidate.deployment_id)
+                if (
+                    deployment is None
+                    or deployment.change_set_id != preview_candidate.change_set_id
+                    or deployment.project != preview_candidate.project
+                    or deployment.environment != "preview"
+                    or deployment.target_context != preview_candidate.target_context
+                    or deployment.target_namespace != preview_candidate.namespace
+                    or deployment.finished_at is None
+                    or self._as_utc(deployment.finished_at) != preview_candidate.finished_at
+                ):
+                    raise ValueError("preview deployment identity changed before tombstoning")
+                recovery = dict(deployment.recovery_json)
+                if deployment.status == "PREVIEW_EXPIRED":
+                    if recovery.get("cleanup_candidate_id") != preview_candidate.candidate_id:
+                        raise ValueError("preview cleanup retry does not match its tombstone")
+                else:
+                    original = preview_candidate.model_dump(mode="json")
+                    if current_previews.get(preview_candidate.candidate_id) != original:
+                        raise ValueError("preview deployment is no longer cleanup-eligible")
+                    deployment.status = "PREVIEW_EXPIRED"
+                    deployment.recovery_json = {
+                        **recovery,
+                        "cleanup_candidate_id": preview_candidate.candidate_id,
+                        "cleanup_reason": preview_candidate.reason,
+                        "cleaned_at": now.isoformat(),
+                    }
+                cleaned_previews.append(str(deployment.id))
+
+        return {
+            **payload,
+            "status": "METADATA_CLEANUP_EXECUTED",
+            "released_component_lease_ids": sorted(released),
+            "purged_artifact_ids": sorted(purged),
+            "cleaned_preview_deployment_ids": sorted(cleaned_previews),
         }
 
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3762,12 +4091,32 @@ class MetadataActivityHandler:
                 return {**payload, "status": terminal}
             if terminal == "COMPLETE":
                 raw_authorized = payload.get("authorized_candidates")
+                raw_authorized_files = payload.get("authorized_file_candidates")
+                raw_authorized_components = payload.get("authorized_component_lease_candidates")
+                raw_authorized_previews = payload.get("authorized_preview_namespace_candidates")
                 removed = payload.get("removed_lease_ids")
                 absent = payload.get("already_absent_lease_ids")
+                removed_files = payload.get("removed_file_candidate_ids")
+                absent_files = payload.get("absent_file_candidate_ids")
+                released_components = payload.get("released_component_lease_ids")
+                purged_artifacts = payload.get("purged_artifact_ids")
+                removed_previews = payload.get("removed_preview_namespace_candidate_ids")
+                absent_previews = payload.get("absent_preview_namespace_candidate_ids")
+                cleaned_previews = payload.get("cleaned_preview_deployment_ids")
                 if (
                     not isinstance(raw_authorized, list)
+                    or not isinstance(raw_authorized_files, list)
+                    or not isinstance(raw_authorized_components, list)
+                    or not isinstance(raw_authorized_previews, list)
                     or not isinstance(removed, list)
                     or not isinstance(absent, list)
+                    or not isinstance(removed_files, list)
+                    or not isinstance(absent_files, list)
+                    or not isinstance(released_components, list)
+                    or not isinstance(purged_artifacts, list)
+                    or not isinstance(removed_previews, list)
+                    or not isinstance(absent_previews, list)
+                    or not isinstance(cleaned_previews, list)
                 ):
                     raise ValueError("cleanup completion evidence is incomplete")
                 authorized_ids = {
@@ -3783,8 +4132,55 @@ class MetadataActivityHandler:
                     if lease is None:
                         raise ValueError("cleanup completion lease disappeared")
                     lease.released_at = lease.released_at or now
+                authorized_file_ids = {
+                    str(value["candidate_id"])
+                    for value in raw_authorized_files
+                    if isinstance(value, dict) and "candidate_id" in value
+                }
+                completed_file_ids = {str(value) for value in [*removed_files, *absent_files]}
+                if completed_file_ids != authorized_file_ids:
+                    raise ValueError("file cleanup completion does not match authorization")
+                authorized_component_ids = {
+                    str(value["lease_id"])
+                    for value in raw_authorized_components
+                    if isinstance(value, dict) and "lease_id" in value
+                }
+                if {str(value) for value in released_components} != authorized_component_ids:
+                    raise ValueError("component cleanup completion does not match authorization")
+                expected_purged_ids = {
+                    str(value["artifact_id"])
+                    for value in raw_authorized_files
+                    if isinstance(value, dict)
+                    and value.get("kind") == "evidence-artifact"
+                    and value.get("artifact_id") is not None
+                }
+                if {str(value) for value in purged_artifacts} != expected_purged_ids:
+                    raise ValueError("evidence cleanup tombstones do not match authorization")
+                authorized_preview_ids = {
+                    str(value["candidate_id"])
+                    for value in raw_authorized_previews
+                    if isinstance(value, dict) and "candidate_id" in value
+                }
+                completed_preview_ids = {
+                    str(value) for value in [*removed_previews, *absent_previews]
+                }
+                if completed_preview_ids != authorized_preview_ids:
+                    raise ValueError("preview cleanup completion does not match authorization")
+                expected_preview_deployments = {
+                    str(value["deployment_id"])
+                    for value in raw_authorized_previews
+                    if isinstance(value, dict) and "deployment_id" in value
+                }
+                if {str(value) for value in cleaned_previews} != expected_preview_deployments:
+                    raise ValueError("preview cleanup tombstones do not match authorization")
+
                 run.status = "SUCCESS"
-                run.summary = f"removed or confirmed absent {len(completed_ids)} worktrees"
+                run.summary = (
+                    f"retained cleanup completed: {len(completed_ids)} worktrees, "
+                    f"{len(completed_file_ids)} bounded files, "
+                    f"{len(authorized_component_ids)} component leases, "
+                    f"{len(authorized_preview_ids)} preview namespaces"
+                )
             elif terminal == "DRY_RUN":
                 run.status = "SUCCESS"
                 run.summary = "cleanup dry run completed without mutation"
@@ -3809,11 +4205,7 @@ class MetadataActivityHandler:
             ChangeSetState.REJECTED.value,
         }:
             return None
-        if owner.finished_at is None or owner.status in {
-            "QUEUED",
-            "RUNNING",
-            "AWAITING_APPROVAL",
-        }:
+        if self._run_retention_protected(session, owner):
             return None
         incident = session.scalar(
             select(Incident).where(
@@ -3837,6 +4229,256 @@ class MetadataActivityHandler:
         ):
             return "ABANDONED_LEASE_EXPIRED"
         return None
+
+    def _component_cleanup_candidates(self, session: Any, now: datetime) -> list[dict[str, Any]]:
+        expiry_cutoff = now - timedelta(hours=self.settings.cleanup_expiry_grace_hours)
+        candidates: list[dict[str, Any]] = []
+        leases = session.scalars(
+            select(ComponentLease).where(ComponentLease.released_at.is_(None))
+        ).all()
+        for lease in leases:
+            owner = session.get(Run, lease.owner_run_id)
+            if (
+                owner is None
+                or self._run_retention_protected(session, owner)
+                or self._as_utc(lease.expires_at) > expiry_cutoff
+            ):
+                continue
+            if owner.change_set_id is not None:
+                incident = session.scalar(
+                    select(Incident).where(
+                        Incident.change_set_id == owner.change_set_id,
+                        Incident.status == "OPEN",
+                    )
+                )
+                if incident is not None:
+                    continue
+            candidates.append(
+                {
+                    "lease_id": str(lease.id),
+                    "component_key": lease.component_key,
+                    "owner_run_id": str(lease.owner_run_id),
+                    "expires_at": self._as_utc(lease.expires_at).isoformat(),
+                    "reason": "TERMINAL_OWNER_LEASE_EXPIRED",
+                }
+            )
+        return sorted(candidates, key=lambda value: value["lease_id"])
+
+    def _file_cleanup_candidates(self, session: Any, now: datetime) -> list[dict[str, Any]]:
+        retention_cutoff = now - timedelta(days=self.settings.cleanup_retention_days)
+        candidates: list[dict[str, Any]] = []
+        runs = session.scalars(select(Run).where(Run.finished_at.is_not(None))).all()
+        for run in runs:
+            if (
+                self._run_retention_protected(session, run)
+                or self._as_utc(run.finished_at) > retention_cutoff
+            ):
+                continue
+            invocations = session.scalars(
+                select(AgentInvocation).where(AgentInvocation.run_id == run.id)
+            ).all()
+            if any(
+                invocation.status == "RATE_LIMITED"
+                or "RATE_LIMIT" in str(invocation.error_code or "").upper()
+                for invocation in invocations
+            ):
+                continue
+            if run.change_set_id is not None:
+                incident = session.scalar(
+                    select(Incident).where(
+                        Incident.change_set_id == run.change_set_id,
+                        Incident.status == "OPEN",
+                    )
+                )
+                if incident is not None:
+                    continue
+            artifacts = session.scalars(select(Artifact).where(Artifact.run_id == run.id)).all()
+            if any(invocation.provider == Provider.CODEX.value for invocation in invocations):
+                candidates.append(
+                    FileCleanupCandidate(
+                        candidate_id=hashlib.sha256(
+                            f"cleanup-file:provider-temp:codex:{run.id}".encode()
+                        ).hexdigest(),
+                        kind="provider-temp",
+                        worker="codex",
+                        run_id=run.id,
+                        reason="PROVIDER_TEMP_RETENTION_EXPIRED",
+                        not_modified_after=retention_cutoff,
+                    ).model_dump(mode="json")
+                )
+            if any(artifact.producer == "delivery-runner" for artifact in artifacts):
+                candidates.append(
+                    FileCleanupCandidate(
+                        candidate_id=hashlib.sha256(
+                            f"cleanup-file:delivery-run:{run.id}".encode()
+                        ).hexdigest(),
+                        kind="delivery-run",
+                        worker="delivery",
+                        run_id=run.id,
+                        reason="TERMINAL_RUN_RETENTION_EXPIRED",
+                        not_modified_after=retention_cutoff,
+                    ).model_dump(mode="json")
+                )
+            verification = session.scalar(
+                select(VerificationResult)
+                .where(
+                    VerificationResult.run_id == run.id,
+                    VerificationResult.deployment_id.is_not(None),
+                    VerificationResult.status == "PASS",
+                )
+                .limit(1)
+            )
+            if verification is not None and any(
+                artifact.producer == "browser-runner" for artifact in artifacts
+            ):
+                candidates.append(
+                    FileCleanupCandidate(
+                        candidate_id=hashlib.sha256(
+                            (
+                                f"cleanup-file:browser-output:{verification.deployment_id}:{run.id}"
+                            ).encode()
+                        ).hexdigest(),
+                        kind="browser-output",
+                        worker="browser",
+                        run_id=run.id,
+                        deployment_id=verification.deployment_id,
+                        reason="BROWSER_OUTPUT_RETENTION_EXPIRED",
+                        not_modified_after=retention_cutoff,
+                    ).model_dump(mode="json")
+                )
+            for artifact in artifacts:
+                path_parts = set(PurePosixPath(artifact.relative_path).parts)
+                if (
+                    artifact.retention_class != "ephemeral"
+                    or artifact.purged_at is not None
+                    or self._as_utc(artifact.created_at) > retention_cutoff
+                    or artifact.producer == "release-runner"
+                    or path_parts.intersection(
+                        {"security", "release", "releases", "incident", "incidents"}
+                    )
+                ):
+                    continue
+                candidates.append(
+                    FileCleanupCandidate(
+                        candidate_id=hashlib.sha256(
+                            f"cleanup-file:evidence-artifact:{artifact.id}".encode()
+                        ).hexdigest(),
+                        kind="evidence-artifact",
+                        worker="controller",
+                        run_id=run.id,
+                        artifact_id=artifact.id,
+                        relative_path=artifact.relative_path,
+                        expected_sha256=artifact.sha256,
+                        expected_size_bytes=artifact.size_bytes,
+                        reason="EPHEMERAL_EVIDENCE_RETENTION_EXPIRED",
+                        not_modified_after=retention_cutoff,
+                    ).model_dump(mode="json")
+                )
+        return sorted(candidates, key=lambda value: value["candidate_id"])
+
+    @staticmethod
+    def _run_retention_protected(session: Any, run: Run) -> bool:
+        if (
+            run.finished_at is None
+            or run.status in {"QUEUED", "RUNNING", "AWAITING_APPROVAL", "RATE_LIMITED"}
+            or "RATE_LIMIT" in str(run.error_code or "").upper()
+        ):
+            return True
+        invocations = session.scalars(
+            select(AgentInvocation).where(AgentInvocation.run_id == run.id)
+        ).all()
+        return any(
+            invocation.status == "RATE_LIMITED"
+            or "RATE_LIMIT" in str(invocation.error_code or "").upper()
+            for invocation in invocations
+        )
+
+    def _preview_namespace_cleanup_candidates(
+        self, session: Any, now: datetime
+    ) -> list[dict[str, Any]]:
+        retention_cutoff = now - timedelta(days=self.settings.cleanup_retention_days)
+        terminal_change_set_states = {
+            ChangeSetState.ISSUE_CLOSED.value,
+            ChangeSetState.CANCELLED.value,
+            ChangeSetState.SUPERSEDED.value,
+            ChangeSetState.REJECTED.value,
+            ChangeSetState.ROLLED_BACK.value,
+        }
+        targets: dict[str, DeploymentTargetRecord] = {}
+        root = self.settings.deployment_target_root.resolve()
+        for project in Project:
+            target_path = (root / f"{project.value}-preview.yaml").resolve()
+            if (
+                not target_path.is_file()
+                or not target_path.is_relative_to(root)
+                or not os.access(target_path, os.R_OK)
+            ):
+                continue
+            target = self._deployment_target(project, "preview")
+            if target.enabled and target.configuration.get("cleanup_enabled") is True:
+                targets[project.value] = target
+        if not targets:
+            return []
+        candidates: list[dict[str, Any]] = []
+        deployments = session.scalars(
+            select(Deployment).where(
+                Deployment.environment == "preview",
+                Deployment.finished_at.is_not(None),
+                Deployment.status != "PREVIEW_EXPIRED",
+            )
+        ).all()
+        for deployment in deployments:
+            if (
+                deployment.finished_at is None
+                or self._as_utc(deployment.finished_at) > retention_cutoff
+            ):
+                continue
+            change_set = session.get(ChangeSet, deployment.change_set_id)
+            cleanup_target = targets.get(deployment.project)
+            if (
+                change_set is None
+                or change_set.state not in terminal_change_set_states
+                or cleanup_target is None
+                or deployment.target_context != cleanup_target.target_context
+                or deployment.target_namespace != cleanup_target.target_namespace
+            ):
+                continue
+            incident = session.scalar(
+                select(Incident).where(
+                    Incident.status == "OPEN",
+                    (
+                        (Incident.change_set_id == change_set.id)
+                        | (Incident.deployment_id == deployment.id)
+                    ),
+                )
+            )
+            if incident is not None:
+                continue
+            configuration = cleanup_target.configuration
+            namespace_prefix = self._config_string(configuration, "cleanup_namespace_prefix")
+            kube_context = self._config_string(configuration, "cleanup_kube_context")
+            kubeconfig_path = self._config_string(configuration, "cleanup_kubeconfig_path")
+            finished_at = self._as_utc(deployment.finished_at)
+            identity = (
+                f"cleanup-preview:{deployment.id}:{change_set.id}:"
+                f"{deployment.target_namespace}:{finished_at.isoformat()}"
+            )
+            candidates.append(
+                PreviewNamespaceCleanupCandidate(
+                    candidate_id=hashlib.sha256(identity.encode()).hexdigest(),
+                    deployment_id=deployment.id,
+                    change_set_id=change_set.id,
+                    project=deployment.project,
+                    namespace=deployment.target_namespace,
+                    namespace_prefix=namespace_prefix,
+                    target_context=deployment.target_context,
+                    kube_context=kube_context,
+                    kubeconfig_path=Path(kubeconfig_path),
+                    finished_at=finished_at,
+                    reason="TERMINAL_CHANGESET_PREVIEW_RETENTION_EXPIRED",
+                ).model_dump(mode="json")
+            )
+        return sorted(candidates, key=lambda value: value["candidate_id"])
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:

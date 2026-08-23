@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
+import pytest
 import yaml
+from jsonschema import ValidationError
 from jsonschema.validators import Draft202012Validator
 
 from engineering_control.models.enums import Project
@@ -63,6 +65,39 @@ def test_deployment_target_templates_match_the_strict_schema() -> None:
         validator.validate(value)
         assert path.stem == f"{value['project']}-{value['environment']}"
         assert value["enabled"] is False
+
+
+def test_deployment_target_schema_allows_only_complete_preview_cleanup() -> None:
+    schema = json.loads(
+        (ROOT / "schemas" / "deployment-target.schema.json").read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema)
+    target = {
+        "version": 1,
+        "enabled": True,
+        "project": "falcone",
+        "environment": "preview",
+        "strategy": "helm",
+        "target_context": "falcone-preview",
+        "target_namespace": "falcone-preview-deadbeef",
+        "configuration": {
+            "values_files": ["values-preview.yaml"],
+            "release_name": "falcone-preview-deadbeef",
+            "kube_context": "falcone-preview-releaser",
+            "kubeconfig_path": ("/etc/engineering-control/env/release/falcone-preview.kubeconfig"),
+            "cleanup_enabled": True,
+            "cleanup_namespace_prefix": "falcone-preview-",
+            "cleanup_kube_context": "falcone-preview-releaser",
+            "cleanup_kubeconfig_path": (
+                "/etc/engineering-control/env/release/falcone-preview.kubeconfig"
+            ),
+        },
+    }
+
+    validator.validate(target)
+    target["environment"] = "staging"
+    with pytest.raises(ValidationError):
+        validator.validate(target)
 
 
 def test_runtime_target_templates_match_the_strict_schema() -> None:

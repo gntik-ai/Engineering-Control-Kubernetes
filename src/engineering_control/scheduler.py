@@ -21,7 +21,7 @@ from engineering_control.workflows.inputs import CleanupInput, QuotaRefreshInput
 from engineering_control.workflows.names import WorkflowName
 
 
-def schedules(task_queue: str) -> dict[str, Schedule]:
+def schedules(task_queue: str, *, cleanup_execution_enabled: bool = False) -> dict[str, Schedule]:
     return {
         "engineering-quota-refresh": Schedule(
             action=ScheduleActionStartWorkflow(
@@ -36,7 +36,7 @@ def schedules(task_queue: str) -> dict[str, Schedule]:
         "engineering-safe-cleanup": Schedule(
             action=ScheduleActionStartWorkflow(
                 WorkflowName.CLEANUP.value,
-                CleanupInput(dry_run=True),
+                CleanupInput(dry_run=not cleanup_execution_enabled),
                 id="cleanup-scheduled",
                 task_queue=task_queue,
             ),
@@ -64,7 +64,10 @@ async def configure() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     client = await Client.connect(settings.temporal_target, namespace=settings.temporal_namespace)
-    for schedule_id, desired in schedules(settings.temporal_task_queue).items():
+    for schedule_id, desired in schedules(
+        settings.temporal_task_queue,
+        cleanup_execution_enabled=settings.cleanup_execution_enabled,
+    ).items():
         await ensure_schedule(client, schedule_id, desired)
 
 

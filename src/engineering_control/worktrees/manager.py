@@ -125,9 +125,7 @@ class GitWorktreeManager:
         if metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
             raise WorktreeError("Git read credential permissions are too broad")
         if self.production_credentials and (
-            metadata.st_uid != 0
-            or metadata.st_gid != os.getegid()
-            or permissions != 0o640
+            metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640
         ):
             raise WorktreeError("production Git read credential ownership is invalid")
         if not self.git_askpass_executable.resolve().is_file():

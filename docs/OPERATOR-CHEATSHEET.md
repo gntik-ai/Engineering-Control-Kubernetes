@@ -116,6 +116,14 @@ engineering-ctl validate-lifecycle --hold-seconds 30
 Commands default to dry-run where applicable. Use `--execute` only after all corresponding write,
 approval, and credential gates are satisfied.
 
+The `engineering-safe-cleanup` Temporal schedule is dry-run by default. Before enabling mutation,
+review at least one scheduled dry-run result and verify all protected-resource tests. Then set
+`ENGINEERING_CLEANUP_EXECUTION_ENABLED=true` with `sudoedit` in the controller `control.env` and the
+worker `worker-common.env`, restart the controller scheduler/workflow worker and the scan, delivery,
+browser, Codex, and release workers, and verify the updated schedule. Reverting either setting to
+`false` restores fail-closed behavior. Do not enable preview cleanup until its target and labels
+satisfy `docs/DEPLOYMENTS.md`.
+
 `rollback --execute` pauses at `AWAITING_RECOVERY_APPROVAL`. Fetch the new recovery candidate and
 approve its binding; do not reuse the original staging binding as the recovery approval.
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.activities.retention import cleanup_authorization_sha256
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandResult
 from engineering_control.config import Settings
@@ -333,11 +333,13 @@ async def test_cleanup_protects_dirty_and_executes_only_controller_authorization
     inspected = await handler.handle("cleanup.protect_active", {"cleanup_candidates": [candidate]})
     assert inspected["eligible_candidates"][0]["inspection"] == "CLEAN"
     workflow_id = "cleanup-test"
-    canonical = json.dumps(
-        {"workflow_id": workflow_id, "candidates": [candidate]},
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
+    authorization_sha = cleanup_authorization_sha256(
+        workflow_id=workflow_id,
+        worktrees=[candidate],
+        files=[],
+        component_leases=[],
+        preview_namespaces=[],
+    )
     disabled_handler = ScanActivityHandler(
         Settings(worktree_root=worktree_root),
         manager,  # type: ignore[arg-type]
@@ -347,7 +349,10 @@ async def test_cleanup_protects_dirty_and_executes_only_controller_authorization
             "cleanup.execute",
             {
                 "authorized_candidates": [candidate],
-                "cleanup_authorization_sha256": hashlib.sha256(canonical).hexdigest(),
+                "authorized_file_candidates": [],
+                "authorized_component_lease_candidates": [],
+                "authorized_preview_namespace_candidates": [],
+                "cleanup_authorization_sha256": authorization_sha,
                 "orchestration": {"workflow_id": workflow_id},
             },
         )
@@ -355,7 +360,10 @@ async def test_cleanup_protects_dirty_and_executes_only_controller_authorization
         "cleanup.execute",
         {
             "authorized_candidates": [candidate],
-            "cleanup_authorization_sha256": hashlib.sha256(canonical).hexdigest(),
+            "authorized_file_candidates": [],
+            "authorized_component_lease_candidates": [],
+            "authorized_preview_namespace_candidates": [],
+            "cleanup_authorization_sha256": authorization_sha,
             "orchestration": {"workflow_id": workflow_id},
         },
     )

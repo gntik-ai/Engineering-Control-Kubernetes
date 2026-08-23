@@ -21,7 +21,7 @@ platform fails closed rather than bypassing.
 | 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction |
 | 12 Quota broker | IMPLEMENTED | Provider-independent snapshots, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff |
 | 13 Temporal | ACTIVE/PASS | All required workflows installed; live worker replacement during an active lifecycle resumed durably |
-| 14 PostgreSQL metadata | IMPLEMENTED | Alembic models/migrations for every required table plus approval candidates, notification outbox and worker heartbeats |
+| 14 PostgreSQL metadata | IMPLEMENTED | Alembic models/migrations for every required table plus approval candidates, notification outbox, worker heartbeats, and artifact-retention tombstones |
 | 15 ChangeSet | IMPLEMENTED | First-class model, strict state policy, exact PR/CI/provenance reconciliation, digest promotion, artifact-bound approvals and deterministic metadata transitions |
 | 16 Worktrees | IMPLEMENTED | Mirrors, exact-SHA fetch/allocation, branch naming, leases, dirty protection and ACL isolation |
 | 17 Component leases | IMPLEMENTED | Project/component/environment/global safety keys and configured concurrency/recursion limits |
@@ -45,7 +45,7 @@ platform fails closed rather than bypassing.
 | 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
 | 36 Observability | IMPLEMENTED | Structured redacted context logs, PostgreSQL-backed Prometheus metrics, authenticated worker heartbeats |
 | 37 Failure/handoff | IMPLEMENTED | Required handoff bundle files and explicit `RATE_LIMITED`/cross-provider semantics |
-| 38 Cleanup automation | IMPLEMENTED/DISABLED | Dry-run retention workflow, terminal-state and incident/evidence protections, worker/controller double authorization |
+| 38 Cleanup automation | IMPLEMENTED/DISABLED | Daily schedule defaults dry-run and switches to typed mutation only under the explicit per-identity execution setting; it covers expired clean worktrees, bounded delivery/browser/Codex-temp directories, explicitly ephemeral evidence, stale terminal component leases, and opt-in managed preview namespaces; owner inspection, one immutable cross-resource authorization, symlink/drift checks, and protected evidence/incident/rate-limit gates are tested; host mutation remains disabled |
 | 39 Documentation | IMPLEMENTED | All requested manuals plus cheatsheet, validation status and this matrix |
 | 40 Bootstrap/reinstall | PASS | Both bootstraps rerun successfully and installed the same immutable release on controller and worker |
 | 41 Update procedure | IMPLEMENTED | `UPGRADE.md` covers backup, drain, pin, migration, validation and rollback by component |

@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.activities.retention import cleanup_authorization_sha256
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
@@ -467,24 +468,29 @@ class ScanActivityHandler:
                 non_retryable=True,
             )
         raw_authorized = payload.get("authorized_candidates")
+        raw_files = payload.get("authorized_file_candidates")
+        raw_components = payload.get("authorized_component_lease_candidates")
+        raw_previews = payload.get("authorized_preview_namespace_candidates", [])
         authorization_sha = payload.get("cleanup_authorization_sha256")
         orchestration = self._find_mapping(payload, "orchestration")
         if (
             not isinstance(raw_authorized, list)
+            or not isinstance(raw_files, list)
+            or not isinstance(raw_components, list)
+            or not isinstance(raw_previews, list)
             or not isinstance(authorization_sha, str)
             or orchestration is None
             or not isinstance(orchestration.get("workflow_id"), str)
         ):
             raise ValueError("cleanup execution requires controller authorization")
-        canonical = json.dumps(
-            {
-                "workflow_id": orchestration["workflow_id"],
-                "candidates": raw_authorized,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
-        if hashlib.sha256(canonical).hexdigest() != authorization_sha:
+        expected_authorization = cleanup_authorization_sha256(
+            workflow_id=orchestration["workflow_id"],
+            worktrees=raw_authorized,
+            files=raw_files,
+            component_leases=raw_components,
+            preview_namespaces=raw_previews,
+        )
+        if expected_authorization != authorization_sha:
             raise ValueError("cleanup authorization changed after controller validation")
         removed: list[str] = []
         absent: list[str] = []

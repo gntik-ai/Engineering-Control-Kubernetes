@@ -20,6 +20,11 @@ Never copy `.codex/auth.json` from controller. A missing login leaves
 `/var/lib/engineering-control/MANUAL_AUTH_REQUIRED_CODEX` and does not block scanner, browser,
 schema, API, or orchestration installation.
 
+Each native call uses `/srv/engineering/tmp/codex/<run-id>/` as its mode-`0700` bounded scratch
+parent and an ephemeral child for the individual attempt. The daily retention workflow may remove
+only that exact per-run parent after the Run is terminal and expired; active and rate-limited runs
+are always protected.
+
 Official structured CLI behavior is documented in the [Codex CLI command reference](https://developers.openai.com/codex/cli/reference/).
 
 After both provider logins, run the bounded two-direction acceptance on worker:

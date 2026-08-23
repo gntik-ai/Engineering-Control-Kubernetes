@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from engineering_control.adapters.process import (
     EventCallback,
@@ -45,8 +47,8 @@ class CodexCLIAdapter:
         if request.provider is not self.provider:
             raise ValueError("Codex adapter received a non-Codex request")
         started_at = datetime.now(UTC)
-        temp_parent = Path(self.temp_root) if self.temp_root else None
-        with tempfile.TemporaryDirectory(prefix=f"codex-{request.run_id}-", dir=temp_parent) as raw:
+        temp_parent = self._run_temp_parent(request.run_id) if self.temp_root else None
+        with tempfile.TemporaryDirectory(prefix="attempt-", dir=temp_parent) as raw:
             temp = Path(raw)
             os.chmod(temp, 0o700)
             schema_path = temp / "output-schema.json"
@@ -123,6 +125,24 @@ class CodexCLIAdapter:
                 exit_code=process_result.exit_code,
                 error_code=error_code,
             )
+
+    def _run_temp_parent(self, run_id: UUID) -> Path:
+        configured = Path(str(self.temp_root))
+        configured.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if configured.is_symlink() or not configured.is_dir():
+            raise ValueError("Codex temporary root must be a real directory")
+        root = configured.resolve(strict=True)
+        run_root = root / str(run_id)
+        if run_root.exists() or run_root.is_symlink():
+            if run_root.is_symlink() or not run_root.is_dir():
+                raise ValueError("Codex run temporary root must be a real directory")
+            if stat.S_IMODE(run_root.stat().st_mode) != 0o700:
+                raise ValueError("Codex run temporary root has unsafe permissions")
+        else:
+            run_root.mkdir(mode=0o700)
+        if run_root.resolve(strict=True).parent != root:
+            raise ValueError("Codex run temporary root escaped its provider root")
+        return run_root
 
     @staticmethod
     def _session_id(events: tuple[dict[str, Any], ...]) -> str | None:

@@ -33,15 +33,30 @@ Back up PostgreSQL and `/etc/engineering-control` before upgrades. Do not back u
 SSH private keys into general platform archives. Temporal and PostgreSQL must be healthy before
 starting API/workers. The notifier uses an outbox so an unavailable sink does not lose state.
 
-The daily cleanup schedule is permanently created in dry-run mode. Discovery considers only
-worktree leases whose owner Run is terminal, whose ChangeSet is `ISSUE_CLOSED`, `CANCELLED`,
-`SUPERSEDED`, or `REJECTED`, whose retention/grace period expired, and which have no open incident.
-The scan worker then proves the exact repository/ChangeSet path, branch identity, and clean Git
-state. The controller reauthorizes every lease against current PostgreSQL state immediately before
-execution.
+The daily cleanup schedule defaults to dry-run mode. It becomes a mutating schedule only when the
+operator explicitly sets `ENGINEERING_CLEANUP_EXECUTION_ENABLED=true` on the controller and every
+owning worker, restarts them, and lets the scheduler update the Temporal schedule. Discovery is
+controller-owned and covers only exact, retention-expired records: clean terminal worktrees,
+terminal delivery-run
+directories, old browser output directories, artifacts explicitly classified `ephemeral`, stale
+component leases owned by terminal Runs, deterministic Codex per-run temporary directories, and
+explicitly managed preview namespaces belonging to a terminal ChangeSet. Active Runs/leases,
+rate-limit handoffs, dirty worktrees, open incidents, and
+`standard`, `security`, `release`, or `incident` evidence are excluded.
 
-Execution has a second fail-closed switch, `ENGINEERING_CLEANUP_EXECUTION_ENABLED=false`, on both
-controller and scan worker. Even when explicitly enabled for a separately started non-dry-run
-workflow, deletion uses `git worktree remove`; arbitrary paths, dirty worktrees, active leases,
-incident evidence, security evidence, and release evidence are never candidates. This retention
-workflow is distinct from the bootstrap software cleanup plan gated by `APPROVE CLEANUP`.
+Each owning identity inspects its resource without following symlinks. The scan worker proves exact
+Git path/branch/cleanliness; controller, delivery, browser, and Codex workers hash exact file
+manifests; the release worker reads only an explicitly configured preview namespace and requires
+the fixed
+`engineering.gntik.ai/managed-by`, deployment-ID, and ChangeSet-ID labels. The controller then
+revalidates current PostgreSQL eligibility and binds every worktree, file, component lease, and
+namespace observation into one canonical SHA256 authorization. Any identity, path, file manifest,
+namespace UID/resourceVersion/labels, target configuration, or eligibility drift fails closed.
+
+Execution has a second switch, `ENGINEERING_CLEANUP_EXECUTION_ENABLED=false`, on every involved
+identity. A separately started non-dry-run workflow still uses only typed adapters: `git worktree
+remove`, bounded unlink/tree removal, exact namespace deletion with a mode-`0600` preview-releaser
+kubeconfig, then idempotent PostgreSQL lease release/evidence/deployment tombstones. Arbitrary paths,
+generic shell/kubectl arguments, active work, and protected evidence have no override path. Partial
+completion is safe to retry from fresh discovery. This retention workflow is distinct from the
+bootstrap software cleanup plan gated by `APPROVE CLEANUP`.

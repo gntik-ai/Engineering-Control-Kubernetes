@@ -46,5 +46,19 @@ cleanup:
   execution_enabled: false
   retention_days: 14
   expiry_grace_hours: 24
+  automatic_categories:
+    - expired-clean-worktrees
+    - expired-terminal-delivery-run-directories
+    - expired-browser-output-directories
+    - expired-codex-run-temporary-directories
+    - expired-ephemeral-evidence
+    - stale-terminal-component-leases
+    - explicitly-managed-expired-preview-namespaces
+  protected_evidence_classes:
+    - standard
+    - security
+    - release
+    - incident
+  preview_cleanup_requires_target_opt_in: true
 paid_api_fallback:
   enabled: false

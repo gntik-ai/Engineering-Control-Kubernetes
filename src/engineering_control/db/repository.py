@@ -407,6 +407,7 @@ class SQLMetadataRepository:
                     "producer": expected["producer"],
                     "redaction_status": expected["redaction_status"],
                     "size_bytes": expected["size_bytes"],
+                    "retention_class": expected["retention_class"],
                 }
                 if any(serialized.get(key) != value for key, value in comparable.items()):
                     raise ValueError("artifact idempotency key conflicts with stored evidence")
@@ -423,7 +424,9 @@ class SQLMetadataRepository:
                 producer=metadata.producer,
                 redaction_status=metadata.redaction_status.value,
                 size_bytes=metadata.size_bytes,
-                retention_class="standard",
+                retention_class=metadata.retention_class,
+                purged_at=None,
+                purge_reason=None,
             )
             session.add(row)
             session.flush()
@@ -533,9 +536,9 @@ class SQLMetadataRepository:
                 .group_by(ChangeSet.project, VerificationResult.verification_type)
             ).all()
             evidence = session.execute(
-                select(
-                    Artifact.project, Artifact.retention_class, func.sum(Artifact.size_bytes)
-                ).group_by(Artifact.project, Artifact.retention_class)
+                select(Artifact.project, Artifact.retention_class, func.sum(Artifact.size_bytes))
+                .where(Artifact.purged_at.is_(None))
+                .group_by(Artifact.project, Artifact.retention_class)
             ).all()
         deployment_durations: dict[tuple[str, str], list[float]] = {}
         deployment_failures: dict[tuple[str, str], int] = {}
