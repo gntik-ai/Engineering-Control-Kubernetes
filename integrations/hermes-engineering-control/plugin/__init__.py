@@ -19,6 +19,7 @@ COMMANDS = {
     "resume": "Resume a paused campaign.",
     "cancel": "Cancel a bounded workflow.",
     "usage": "Show provider capacity without invented values.",
+    "validate": "Start a bounded synthetic control-plane lifecycle canary.",
     "rollback": "Prepare or start deterministic recovery.",
 }
 

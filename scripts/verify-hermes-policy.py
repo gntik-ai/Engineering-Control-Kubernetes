@@ -26,6 +26,7 @@ ENGINEERING_COMMANDS = frozenset(
         "resume",
         "cancel",
         "usage",
+        "validate",
         "rollback",
     }
 )

@@ -79,6 +79,10 @@ ssh -t worker 'sudo /opt/engineering-control/source/scripts/verify-worker.sh'
 ./scripts/validate-temporal-lifecycle.py
 ```
 
+From the allowlisted Telegram account, run `/usage`, `/validate 30`, then
+`/status <workflow-id-returned-by-validate>`. The validation worker operates only on its local
+synthetic fixture under `/srv/engineering/tmp/acceptance`.
+
 ## Operate
 
 ```bash
@@ -99,6 +103,7 @@ engineering-ctl approval-candidate <change-set-uuid>
 engineering-ctl approve <change-set-uuid> <binding-sha256>
 engineering-ctl verify-runtime <deployment-uuid>
 engineering-ctl rollback <deployment-uuid> <binding-sha256>
+engineering-ctl validate-lifecycle --hold-seconds 30
 ```
 
 Commands default to dry-run where applicable. Use `--execute` only after all corresponding write,
@@ -110,7 +115,8 @@ approve its binding; do not reuse the original staging binding as the recovery a
 ## Service control
 
 ```bash
-sudo systemctl status engineering-api engineering-evidence-ingest engineering-temporal-worker
+sudo systemctl status engineering-api engineering-evidence-ingest engineering-temporal-worker \
+  engineering-acceptance-worker
 sudo systemctl restart engineering-api engineering-evidence-ingest
 sudo journalctl -u engineering-api -f
 ssh worker 'sudo systemctl restart engineering-worker@codex'

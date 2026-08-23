@@ -297,7 +297,7 @@ def create_app(
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
-        if not resolved.synthetic_mode:
+        if not resolved.acceptance_enabled:
             raise HTTPException(status_code=404, detail="synthetic validation is disabled")
         return await service.start_acceptance(body, str(resolved.acceptance_root))
 

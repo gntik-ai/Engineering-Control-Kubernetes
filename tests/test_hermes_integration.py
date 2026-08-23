@@ -52,3 +52,29 @@ def test_authorized_command_records_telegram_actor(monkeypatch: pytest.MonkeyPat
 
 def test_unknown_command_is_ignored() -> None:
     assert load_handler().handle("command:help", {}) is None
+
+
+def test_validate_command_starts_only_bounded_synthetic_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = load_handler()
+    observed: dict[str, Any] = {}
+    monkeypatch.setattr(handler, "_authorized", lambda user_id: user_id == "42")
+
+    def request(method: str, path: str, actor: str, payload: Any = None) -> dict[str, str]:
+        observed.update(method=method, path=path, actor=actor, payload=payload)
+        return {"status": "ACCEPTED"}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        "command:validate",
+        {"platform": "telegram", "user_id": "42", "raw_args": "5"},
+    )
+
+    assert observed == {
+        "method": "POST",
+        "path": "/v1/validation/lifecycle",
+        "actor": "telegram:42",
+        "payload": {"hold_seconds": 5},
+    }
+    assert result is not None and result["decision"] == "handled"

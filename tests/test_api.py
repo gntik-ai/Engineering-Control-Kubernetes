@@ -160,9 +160,26 @@ def test_synthetic_validation_endpoint_is_disabled_by_default() -> None:
         assert response.status_code == 404
 
 
-def test_synthetic_validation_endpoint_requires_explicit_mode(tmp_path: Any) -> None:
+def test_general_synthetic_mode_does_not_enable_acceptance_endpoint() -> None:
     app = create_app(
-        settings=Settings(synthetic_mode=True, acceptance_root=tmp_path),
+        settings=Settings(synthetic_mode=True),
+        service=FakeService(),
+        token="x" * 32,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/validation/lifecycle",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={"hold_seconds": 1},
+        )
+        assert response.status_code == 404
+
+
+def test_synthetic_validation_endpoint_requires_explicit_acceptance_enablement(
+    tmp_path: Any,
+) -> None:
+    app = create_app(
+        settings=Settings(acceptance_enabled=True, acceptance_root=tmp_path),
         service=FakeService(),
         token="x" * 32,
     )

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-services=(engineering-infrastructure engineering-migrate engineering-api engineering-evidence-ingest engineering-temporal-worker engineering-scheduler engineering-notifier)
+services=(engineering-infrastructure engineering-migrate engineering-api engineering-evidence-ingest engineering-temporal-worker engineering-scheduler engineering-notifier engineering-acceptance-worker)
 for service in "${services[@]}"; do
   systemctl is-active --quiet "${service}.service" || {
     echo "FAIL service ${service}" >&2

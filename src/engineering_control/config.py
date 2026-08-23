@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     syft_executable: Path = Path("/usr/local/bin/syft")
     kubeconform_executable: Path = Path("/usr/local/bin/kubeconform")
     acceptance_root: Path = Path("/srv/engineering/tmp/acceptance")
+    acceptance_enabled: bool = False
     lease_root: Path = Path("/var/lib/engineering-control/leases")
     log_level: str = "INFO"
     synthetic_mode: bool = False

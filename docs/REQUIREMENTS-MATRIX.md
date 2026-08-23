@@ -39,9 +39,9 @@ platform fails closed rather than bypassing.
 | 29 Falcone adapter | IMPLEMENTED/BLOCKED LIVE | Exact-SHA CI/provenance and digest-only chart promotion plus Helm lint/template/preflight, immutable plans, real backup/migration gates, atomic deploy, verification/recovery; current release workflow lacks the signed candidate contract, target is disabled, and scoped kubeconfig is absent |
 | 30 Musematic adapter | IMPLEMENTED/SECURITY BLOCKED | Exact-SHA CI gate, immutable GitOps validation, draft deployment PR, exact Argo revision observation and Git recovery plan; committed secrets, missing signed candidate contract, tag-only chart rendering and newest-build policy block promotion/write enablement |
 | 31 Kubernetes identity separation | IMPLEMENTED/BLOCKED CREDENTIALS | RBAC templates and negative checks exist; no scoped observer/release kubeconfigs are installed |
-| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0 and fixed allowlisted hook are active; inbound Telegram canary and later Omni alias cutover remain |
+| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0, fixed allowlisted hook and bounded `/validate` route are active; user-originated Telegram canary and later Omni alias cutover remain |
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |
-| 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API and outbound Telegram pass; user-originated `/usage`/`status` canary is pending |
+| 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API, bounded `/validate` and outbound Telegram pass; user-originated `/usage`/`validate`/`status` canary is pending |
 | 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
 | 36 Observability | IMPLEMENTED | Structured redacted context logs, PostgreSQL-backed Prometheus metrics, authenticated worker heartbeats |
 | 37 Failure/handoff | IMPLEMENTED | Required handoff bundle files and explicit `RATE_LIMITED`/cross-provider semantics |

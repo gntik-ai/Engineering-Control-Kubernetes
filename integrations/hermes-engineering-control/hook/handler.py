@@ -25,6 +25,7 @@ COMMANDS = {
     "resume",
     "cancel",
     "usage",
+    "validate",
     "rollback",
 }
 API_URL = os.getenv("ENGINEERING_API_URL", "http://127.0.0.1:8740").rstrip("/")
@@ -133,6 +134,18 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if len(args) != 1:
             raise ValueError("usage: /status <workflow-id>")
         return _request("GET", f"/v1/runs/{urllib.parse.quote(args[0], safe='')}", actor)
+    if command == "validate":
+        if len(args) > 1:
+            raise ValueError("usage: /validate [hold-seconds]")
+        hold_seconds = int(args[0]) if args else 5
+        if not 2 <= hold_seconds <= 30:
+            raise ValueError("hold-seconds must be between 2 and 30")
+        return _request(
+            "POST",
+            "/v1/validation/lifecycle",
+            actor,
+            {"hold_seconds": hold_seconds},
+        )
     if command == "evidence":
         if len(args) != 1:
             raise ValueError("usage: /evidence <artifact-id>")

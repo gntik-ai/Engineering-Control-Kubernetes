@@ -80,8 +80,16 @@ class AcceptanceActivities:
         mirror_sha = self._git(["rev-parse", "refs/heads/main^{commit}"], mirror)
         if source_sha != mirror_sha:
             raise ApplicationError("acceptance mirror snapshot mismatch", non_retryable=True)
-        await asyncio.sleep(max(1, min(int(payload.get("hold_seconds", 5)), 30)))
-        activity.heartbeat({"phase": "snapshot", "sha": source_sha})
+        hold_seconds = max(1, min(int(payload.get("hold_seconds", 5)), 30))
+        for elapsed in range(hold_seconds):
+            await asyncio.sleep(1)
+            activity.heartbeat(
+                {
+                    "phase": "snapshot-hold",
+                    "sha": source_sha,
+                    "seconds_remaining": hold_seconds - elapsed - 1,
+                }
+            )
         return {
             **payload,
             "project": "falcone",

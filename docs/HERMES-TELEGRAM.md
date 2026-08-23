@@ -5,8 +5,10 @@ systemd service is enabled and active. The control plane adds a user plugin for 
 and a gateway command hook for authenticated execution. Vendor source is not patched.
 
 Supported commands are `/audit`, `/campaigns`, `/findings`, `/run`, `/status`, `/evidence`,
-`/approve`, `/reject`, `/pause`, `/resume`, `/cancel`, `/usage`, and `/rollback`. The hook accepts
-only Telegram events, checks the numeric sender against
+`/approve`, `/reject`, `/pause`, `/resume`, `/cancel`, `/usage`, `/validate`, and `/rollback`.
+`/validate [hold-seconds]` starts only the bounded local synthetic lifecycle; it has no product,
+model, GitHub, or deployment access. The hook accepts only Telegram events, checks the numeric
+sender against
 `/etc/engineering-control/env/telegram-allowlist`, and calls only fixed Engineering API routes.
 There is no shell, SSH, kubectl, or Helm passthrough.
 
@@ -20,8 +22,9 @@ sudo chmod 0640 /etc/engineering-control/env/telegram-allowlist
 
 The service definition and plugin-parent metadata were backed up before activation under
 `engineering-backups/20260823T095538Z`. Direct hook authorization, hook-to-API `/usage`, and
-outbound Telegram delivery pass. The operator must still send `/usage` and `/status` from the
-allowlisted Telegram account to complete the user-originated round-trip check.
+outbound Telegram delivery pass. The operator must still send `/usage`, `/validate 30`, and then
+`/status <returned-workflow-id>` from the allowlisted Telegram account to complete the
+user-originated round-trip check.
 
 Hermes receives read-only access to the narrow API token through a named ACL while the file remains
 `root:engineering-api-clients` mode `0640`. It cannot invoke arbitrary shell, SSH, Helm, or

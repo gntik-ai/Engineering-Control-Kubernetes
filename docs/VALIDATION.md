@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 155 pytest tests; Ruff clean; strict mypy clean across 74 source files; Bash syntax clean |
+| Control-plane Python | PASS | 158 pytest tests; Ruff clean; strict mypy clean across 75 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -27,7 +27,7 @@ test is not represented as a pass, and no paid API fallback was used.
 | Temporal | PASS | loopback/private listeners only; server and namespace healthy |
 | Engineering API | PASS | authenticated API healthy on `127.0.0.1:8740` |
 | Evidence ingest | PASS | private listener `10.10.0.2:8750`; identity-bound upload and impersonation denial pass |
-| Workflow worker/scheduler/notifier | PASS | all systemd services active |
+| Workflow/acceptance workers, scheduler and notifier | PASS | all systemd services active; acceptance worker is write-bounded to its synthetic temporary root |
 | Durable restart/resume | PASS | workflow worker replaced mid-run; workflow resumed and reached `AWAITING_STAGING_APPROVAL` |
 | Quota broker | PASS/PARTIAL DATA | records native CLI auth/status information; capacity/reset remain null when providers expose none |
 | Paid fallback | PASS | provider environment strips API keys/base URLs; no implicit paid route exists |
@@ -70,7 +70,7 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Authorization | PASS | non-Telegram and unauthorized identities denied; protected numeric allowlist active |
 | Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata |
 | Telegram outbound | PASS | Bot API identity check and silent canary delivery succeeded |
-| Telegram inbound command | PENDING OPERATOR | bot cannot generate a user-originated command; operator must send `/usage` and one `/status` canary |
+| Telegram inbound command | PENDING OPERATOR | bot cannot generate a user-originated command; operator must send `/usage`, `/validate 30`, then `/status` for the returned workflow |
 | Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
 
 Hermes still has runtime OmniRoute provider aliases. C-01 explicitly requires those references to

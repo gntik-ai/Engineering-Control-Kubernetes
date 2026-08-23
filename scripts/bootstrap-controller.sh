@@ -42,6 +42,8 @@ install -d -o root -g root -m 0711 "${PLATFORM_ROOT}"
 install -d -o engineering-control -g engineering-control -m 0750 \
   "${PLATFORM_ROOT}/mirrors" "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
+install -d -o engineering-control -g engineering-control -m 0750 \
+  "${PLATFORM_ROOT}/tmp/acceptance"
 
 if git -C "${SOURCE_ROOT}" rev-parse --verify HEAD >/dev/null 2>&1; then
   RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse HEAD)
@@ -177,16 +179,20 @@ if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
     printf 'ENGINEERING_EVIDENCE_ROOT=%s/evidence\n' "${PLATFORM_ROOT}"
     printf 'ENGINEERING_GITHUB_TOKEN_FILE=%s/env/github.token\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
+    printf 'ENGINEERING_ACCEPTANCE_ENABLED=true\n'
     printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
   } >"${CONFIG_ROOT}/env/control.env"
   chown root:engineering-control "${CONFIG_ROOT}/env/control.env"
   chmod 0640 "${CONFIG_ROOT}/env/control.env"
 fi
+if ! grep -q '^ENGINEERING_ACCEPTANCE_ENABLED=' "${CONFIG_ROOT}/env/control.env"; then
+  printf 'ENGINEERING_ACCEPTANCE_ENABLED=true\n' >>"${CONFIG_ROOT}/env/control.env"
+fi
 
 for unit in engineering-infrastructure.service engineering-migrate.service \
   engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service \
-  engineering-notifier.service; do
+  engineering-notifier.service engineering-acceptance-worker.service; do
   install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
 done
 
@@ -199,14 +205,17 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-evidence-ingest.service \
   /etc/systemd/system/engineering-temporal-worker.service \
   /etc/systemd/system/engineering-scheduler.service \
-  /etc/systemd/system/engineering-notifier.service
+  /etc/systemd/system/engineering-notifier.service \
+  /etc/systemd/system/engineering-acceptance-worker.service
 systemctl daemon-reload
 systemctl enable engineering-infrastructure.service
 systemctl restart engineering-infrastructure.service
 systemctl restart engineering-migrate.service
 systemctl enable engineering-api.service engineering-evidence-ingest.service \
-  engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service
+  engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
+  engineering-acceptance-worker.service
 systemctl restart engineering-api.service engineering-evidence-ingest.service \
-  engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service
+  engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
+  engineering-acceptance-worker.service
 
 echo "Controller bootstrap completed without altering Hermes vendor source, product repositories, or Kubernetes."

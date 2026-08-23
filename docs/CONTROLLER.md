@@ -11,7 +11,8 @@ Components:
 - Temporal UI 2.53.3 on loopback port 8741;
 - Engineering API on loopback port 8740;
 - upload-only evidence ingest on private `10.10.0.2:8750`;
-- orchestration worker, scheduler, notifier, and migrations under systemd;
+- orchestration worker, bounded synthetic acceptance worker, scheduler, notifier, and migrations
+  under systemd;
 - Hermes user plugin and gateway hook under `/home/hermes/.hermes`.
 
 Install only after reviewing host inventory and the cleanup checkpoint:
