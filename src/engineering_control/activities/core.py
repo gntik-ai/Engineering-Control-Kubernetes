@@ -26,6 +26,7 @@ class ControlActivities:
     _allowed_steps = {
         "project.snapshot",
         "campaign.persist_coverage",
+        "campaign.persist_cell_blocker",
         "audit.prepare_agent_cell",
         "audit.deterministic_cell",
         "audit.agent_cell",

@@ -30,3 +30,9 @@ async def test_synthetic_activity_is_explicit(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert result["status"] == "PASS"
+
+
+def test_audit_blocker_persistence_is_controller_only() -> None:
+    assert "campaign.persist_cell_blocker" in ControlActivities._worker_steps["controller"]
+    for worker in ("scan", "codex", "claude", "browser", "delivery", "release"):
+        assert "campaign.persist_cell_blocker" not in ControlActivities._worker_steps[worker]
