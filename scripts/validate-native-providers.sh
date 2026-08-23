@@ -7,7 +7,7 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
-for command_name in python3 sudo install setfacl flock; do
+for command_name in python3 sudo install setfacl flock git; do
   command -v "${command_name}" >/dev/null || {
     echo "Required command missing: ${command_name}" >&2
     exit 1
@@ -50,6 +50,8 @@ install -d -o codex-runner -g codex-runner -m 0700 \
   "${WORK_ROOT}/codex-maker" "${TEMP_ROOT}/codex-maker" "${TEMP_ROOT}/codex-checker"
 install -d -o claude-runner -g claude-runner -m 0700 \
   "${WORK_ROOT}/claude-maker" "${TEMP_ROOT}/claude-maker" "${TEMP_ROOT}/claude-checker"
+sudo -u codex-runner -H git -C "${WORK_ROOT}/codex-maker" init --quiet
+sudo -u claude-runner -H git -C "${WORK_ROOT}/claude-maker" init --quiet
 
 sudo -u codex-runner -H "${PYTHON}" "${SCRIPT}" run \
   --provider codex --mode maker \

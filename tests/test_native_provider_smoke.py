@@ -13,6 +13,7 @@ from engineering_control.models.enums import Provider, RunStatus
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "native-provider-smoke.py"
+SUITE = ROOT / "scripts" / "validate-native-providers.sh"
 SPEC = importlib.util.spec_from_file_location("native_provider_smoke", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -30,6 +31,12 @@ def test_requests_enforce_maker_checker_boundaries(tmp_path: Path) -> None:
     assert checker.writable is False
     assert checker.role == "code-reviewer"
     assert checker.allowed_tools == ("Read", "Glob", "Grep")
+
+
+def test_acceptance_suite_uses_real_provider_owned_git_repositories() -> None:
+    suite = SUITE.read_text(encoding="utf-8")
+    assert 'git -C "${WORK_ROOT}/codex-maker" init --quiet' in suite
+    assert 'git -C "${WORK_ROOT}/claude-maker" init --quiet' in suite
 
 
 def test_bounded_path_rejects_escape(tmp_path: Path) -> None:
