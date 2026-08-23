@@ -29,7 +29,7 @@ id engineering-control >/dev/null 2>&1 || useradd \
 usermod -a -G engineering-api-clients engineering-control
 usermod -a -G engineering-api-clients hermes
 
-install -d -o root -g root -m 0755 "${INSTALL_ROOT}/releases"
+install -d -o root -g root -m 0755 "${INSTALL_ROOT}" "${INSTALL_ROOT}/releases"
 install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}" \
   "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/targets" \
   "${CONFIG_ROOT}/runtime"

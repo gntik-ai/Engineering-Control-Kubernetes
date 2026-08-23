@@ -28,3 +28,10 @@ def test_controller_bootstrap_uses_numeric_chown_for_postgres() -> None:
 
     assert 'install -d -o 70 -g 70 -m 0700 "${STATE_ROOT}/postgresql"' not in script
     assert 'chown 70:70 "${STATE_ROOT}/postgresql"' in script
+
+
+def test_bootstraps_make_release_root_traversable_by_service_users() -> None:
+    for name in ("bootstrap-controller.sh", "bootstrap-worker.sh"):
+        script = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert 'install -d -o root -g root -m 0755' in script
+        assert '"${INSTALL_ROOT}"' in script

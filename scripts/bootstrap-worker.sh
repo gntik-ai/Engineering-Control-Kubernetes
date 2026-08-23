@@ -48,7 +48,8 @@ for identity in codex-runner claude-runner browser-runner scan-runner delivery-r
     --shell /usr/sbin/nologin "${identity}"
 done
 
-install -d -o root -g root -m 0755 "${INSTALL_ROOT}/releases" "${CLI_ROOT}"
+install -d -o root -g root -m 0755 \
+  "${INSTALL_ROOT}" "${INSTALL_ROOT}/releases" "${CLI_ROOT}"
 install -d -o root -g root -m 0755 "${CONFIG_ROOT}"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/env"
 install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/journeys"
