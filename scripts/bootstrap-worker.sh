@@ -194,7 +194,11 @@ install -o root -g root -m 0644 "${SOURCE_ROOT}/systemd/engineering-release-work
 systemd-analyze verify /etc/systemd/system/engineering-worker@.service \
   /etc/systemd/system/engineering-release-worker.service
 systemctl daemon-reload
-systemctl enable --now engineering-worker@codex.service engineering-worker@claude.service \
+systemctl enable engineering-worker@codex.service engineering-worker@claude.service \
+  engineering-worker@browser.service engineering-worker@scan.service \
+  engineering-worker@delivery.service \
+  engineering-release-worker.service
+systemctl restart engineering-worker@codex.service engineering-worker@claude.service \
   engineering-worker@browser.service engineering-worker@scan.service \
   engineering-worker@delivery.service \
   engineering-release-worker.service

@@ -187,9 +187,12 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-scheduler.service \
   /etc/systemd/system/engineering-notifier.service
 systemctl daemon-reload
-systemctl enable --now engineering-infrastructure.service
+systemctl enable engineering-infrastructure.service
+systemctl restart engineering-infrastructure.service
 systemctl restart engineering-migrate.service
-systemctl enable --now engineering-api.service engineering-evidence-ingest.service \
+systemctl enable engineering-api.service engineering-evidence-ingest.service \
+  engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service
+systemctl restart engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service
 
 echo "Controller bootstrap completed without altering Hermes, product repositories, or Kubernetes."

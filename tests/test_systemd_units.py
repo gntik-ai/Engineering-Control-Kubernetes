@@ -96,3 +96,19 @@ def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> No
     assert "clone --mirror" in script
     assert "remote get-url origin" in script
     assert "rm -" not in script
+
+
+def test_bootstrap_reruns_restart_services_after_installing_new_code() -> None:
+    controller = (REPOSITORY_ROOT / "scripts" / "bootstrap-controller.sh").read_text(
+        encoding="utf-8"
+    )
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "systemctl restart engineering-api.service engineering-evidence-ingest.service"
+        in controller
+    )
+    assert "systemctl restart engineering-worker@codex.service" in worker
+    assert "systemctl enable --now engineering-worker@codex.service" not in worker
