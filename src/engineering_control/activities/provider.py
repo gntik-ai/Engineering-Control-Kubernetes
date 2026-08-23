@@ -75,17 +75,13 @@ class ProviderActivityHandler:
         self._validate_boundary(step, request)
         try:
             authenticated = await self.adapter.authenticated()
-        except FileNotFoundError as error:
-            raise ApplicationError(
-                f"native {self.provider.value} CLI is not installed for this worker",
-                type=f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}",
-                non_retryable=True,
-            ) from error
+        except FileNotFoundError:
+            return self._blocked(
+                payload, f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}"
+            )
         if not authenticated:
-            raise ApplicationError(
-                f"native {self.provider.value} authentication is required for this worker",
-                type=f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}",
-                non_retryable=True,
+            return self._blocked(
+                payload, f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}"
             )
 
         sequence = 0
@@ -118,6 +114,19 @@ class ProviderActivityHandler:
         safe = self.redactor.redact(response).value
         if not isinstance(safe, dict):
             raise TypeError("redacted provider response must remain an object")
+        return safe
+
+    def _blocked(self, payload: dict[str, Any], blocker: str) -> dict[str, Any]:
+        safe = self.redactor.redact(
+            {
+                **payload,
+                "provider": self.provider.value,
+                "status": "BLOCKED",
+                "blocker": blocker,
+            }
+        ).value
+        if not isinstance(safe, dict):
+            raise TypeError("redacted provider blocker must remain an object")
         return safe
 
     async def _quota_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:

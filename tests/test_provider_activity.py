@@ -150,8 +150,12 @@ async def test_provider_activity_reports_manual_auth_requirement(tmp_path: Path)
         FakeAdapter(authenticated=False),
     )
 
-    with pytest.raises(ApplicationError, match="authentication is required"):
-        await handler.handle(
-            "delivery.invoke_maker",
-            {"maker_request": request_for(worktree).model_dump(mode="json")},
-        )
+    result = await handler.handle(
+        "delivery.invoke_maker",
+        {"maker_request": request_for(worktree).model_dump(mode="json")},
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "MANUAL_AUTH_REQUIRED_CODEX"
+    assert result["provider"] == "codex"
+    assert "agent_result" not in result
