@@ -35,3 +35,4 @@ def test_bootstraps_make_release_root_traversable_by_service_users() -> None:
         script = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")
         assert 'install -d -o root -g root -m 0755' in script
         assert '"${INSTALL_ROOT}"' in script
+        assert 'install -d -o root -g root -m 0755 "${RELEASE_ROOT}"' in script

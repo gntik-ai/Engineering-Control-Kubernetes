@@ -83,9 +83,10 @@ done
 if git -C "${SOURCE_ROOT}" rev-parse --verify HEAD >/dev/null 2>&1; then
   RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse HEAD)
 else
-  RELEASE_ID=uncommitted-bootstrap
+RELEASE_ID=uncommitted-bootstrap
 fi
 RELEASE_ROOT="${INSTALL_ROOT}/releases/${RELEASE_ID}"
+install -d -o root -g root -m 0755 "${RELEASE_ROOT}"
 if [[ ! -d "${RELEASE_ROOT}/source" ]]; then
   install -d -o root -g root -m 0755 "${RELEASE_ROOT}/source"
   tar --exclude=.git --exclude=.venv -C "${SOURCE_ROOT}" -cf - . | \
