@@ -84,6 +84,10 @@ def test_controller_config_parents_allow_token_file_group_traversal_only() -> No
         in controller
     )
     assert 'install -d -o root -g root -m 0711 "${PLATFORM_ROOT}"' in controller
+    assert (
+        'install -d -o root -g hermes -m 0750 "${HERMES_HOME}/plugins"'
+        in controller
+    )
 
 
 def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> None:

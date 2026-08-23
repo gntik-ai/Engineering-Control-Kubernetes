@@ -133,6 +133,7 @@ chmod 0640 "${CONFIG_ROOT}/env/telegram-allowlist"
 
 HERMES_HOME=/home/hermes/.hermes
 HERMES_INTEGRATION="${SOURCE_ROOT}/integrations/hermes-engineering-control"
+install -d -o root -g hermes -m 0750 "${HERMES_HOME}/plugins"
 install -d -o hermes -g hermes -m 0750 \
   "${HERMES_HOME}/plugins/engineering-control" "${HERMES_HOME}/hooks/engineering-control"
 install -o hermes -g hermes -m 0640 \
