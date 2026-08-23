@@ -25,8 +25,9 @@ Trust boundaries:
 - `codex-runner` and `claude-runner` use separately authenticated native CLIs and write only an
   assigned worktree through POSIX ACLs.
 - `browser-runner` receives journey credentials by protected file handle, never prompt text.
-- `scan-runner` owns canonical mirrors, deterministic scanners, and a separate read-only observer
-  kubeconfig that is programmatically rejected if it can read Secrets or mutate workloads.
+- `scan-runner` owns canonical mirrors, deterministic scanners, a contents-read-only Git token for
+  private mirrors, and a separate read-only observer kubeconfig that is programmatically rejected
+  if it can read Secrets or mutate workloads.
 - `delivery-runner` may push only exact validated ChangeSet heads and create draft PRs for the
   configured repository pair. It cannot merge, deploy, or read either model provider home.
 - `release-runner` receives only scoped release plans and release credentials. It has no model

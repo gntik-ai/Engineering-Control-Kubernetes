@@ -14,7 +14,7 @@ CONFIG_ROOT=/etc/engineering-control
 STATE_ROOT=/var/lib/engineering-control
 PLATFORM_ROOT=/srv/engineering
 
-for command_name in python3 docker openssl systemctl install setfacl; do
+for command_name in python3 docker openssl systemctl install setfacl runuser; do
   command -v "${command_name}" >/dev/null || {
     echo "Required command missing: ${command_name}" >&2
     exit 1
@@ -152,6 +152,14 @@ install -o hermes -g hermes -m 0640 \
 install -o hermes -g hermes -m 0640 \
   "${HERMES_INTEGRATION}/hook/handler.py" \
   "${HERMES_HOME}/hooks/engineering-control/handler.py"
+if [[ -f "${HERMES_HOME}/config.yaml" ]]; then
+  runuser -u hermes -- "${INSTALL_ROOT}/venv/bin/python" \
+    "${SOURCE_ROOT}/scripts/verify-hermes-policy.py" \
+    --config "${HERMES_HOME}/config.yaml" \
+    --hermes-home "${HERMES_HOME}" \
+    --apply-telegram-lockdown \
+    --backup-root /home/hermes/engineering-backups
+fi
 
 if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
   ENGINEERING_DB_PASSWORD=$(sed -n 's/^ENGINEERING_DB_PASSWORD=//p' \

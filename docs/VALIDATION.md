@@ -1,68 +1,107 @@
 # Validation status
 
-This file distinguishes source-level validation from activation validation. It does not claim that
-services, provider identities, or Kubernetes release credentials are active.
-
-Validated on 2026-08-22 at engineering-control functional commit
-`89488e2` and engineering-agent-pack commit
+Validated on 2026-08-23 against engineering-control release
+`30a0e8615edc303ff96c2efcf718ed6a46d8c3ef` and engineering-agent-pack
 `47a6353dafbf0c1ecea649d434db5dd555e6249e`.
 
-## Passed before activation
+This report distinguishes a pass from a credential or security blocker. A blocked native-provider
+test is not represented as a pass, and no paid API fallback was used.
+
+## Source and generated assets
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | Ruff; strict mypy across 73 source files; 126 pytest tests; wheel build |
-| Agent pack | PASS | deterministic generation changed 0 files; validator passed; Ruff; 2 tests |
-| Database | PASS | fresh SQLite migrations `0001 -> 0002 -> 0003 -> 0004` reached head |
-| Infrastructure definition | PASS | pinned Docker Compose renders with required variables |
-| Scripts/browser | PASS | Bash syntax for bootstrap/docker scripts; Node syntax for Playwright runner |
-| Schemas | PASS | every JSON Schema is valid Draft 2020-12; disabled target templates validate |
-| Secret persistence scan | PASS | redacted Gitleaks worktree scan returned zero findings |
-| Worktrees | PASS | per-ChangeSet shadow Git metadata, read-only canonical alternates, allocation/retry, dirty protection, branch-bound cleanup, leases and ACL bounds |
-| Maker/checker lifecycle | PASS | bounded real-Git synthetic activity chain reaches `AWAITING_STAGING_APPROVAL` |
-| Draft PR publication | PASS | exact clean heads, scoped askpass, no force/merge, idempotent draft lookup, structured missing-credential handoff |
-| CI/artifact reconciliation | PASS/FAIL-CLOSED | exact source PR head and named checks, cross-provider review binding, exact-run manifest, per-image provenance, digest-only Falcone promotion and retryable draft PR; both candidate-build contracts and Musematic digest rendering remain intentionally disabled |
-| Falcone chart reality check | PASS | discovered staging values pass Helm 4.2.3 lint/template; 181 documents render and all six configured digests appear |
-| Approval drift | PASS | source, deployment, preflight, runtime, and recovery drift tests fail closed |
-| Preview deployment | PASS | dry-run preflight and enabled-target deterministic mutation/verification path; R0/R1 policy approval and R2/R3 human gate |
-| Deployment failure | PASS | terminal Run, lease release, candidate invalidation, recovery baseline, incident |
-| Runtime verification | PASS | reduced read-only observation, browser redaction, opposite provider, incident gate |
-| Recovery | PASS | new approval, exact Helm baseline hash, migration/GitOps forward-recovery gates |
-| Retention cleanup | PASS | dry-run schedule, terminal metadata, dirty protection, double authorization, off switch |
-| Observability | PASS | authenticated database-backed metrics and identity-bound heartbeat/impersonation tests for all six workers |
+| Control-plane Python | PASS | 148 pytest tests; Ruff clean; strict mypy clean across 73 source files; Bash syntax clean |
+| Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
+| Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
+| Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
+| Git safety | PASS | exact-SHA mirrors/worktrees, leases, dirty protection, bounded cleanup and credential-isolation tests pass |
 
-Systemd unit definitions parse, but local `systemd-analyze verify` correctly reports their
-`/opt/engineering-control` executables absent before bootstrap installation. That is an activation
-dependency rather than a unit syntax waiver.
+## Controller activation
 
-## Current host observations
+| Requirement | Result | Evidence |
+| --- | --- | --- |
+| Installed immutable release | PASS | `/opt/engineering-control/source` resolves beneath release `30a0e86...` |
+| PostgreSQL | PASS | pinned container healthy; loopback listener `127.0.0.1:55432`; persistent volume active |
+| Temporal | PASS | loopback/private listeners only; server and namespace healthy |
+| Engineering API | PASS | authenticated API healthy on `127.0.0.1:8740` |
+| Evidence ingest | PASS | private listener `10.10.0.2:8750`; identity-bound upload and impersonation denial pass |
+| Workflow worker/scheduler/notifier | PASS | all systemd services active |
+| Durable restart/resume | PASS | workflow worker replaced mid-run; workflow resumed and reached `AWAITING_STAGING_APPROVAL` |
+| Quota broker | PASS/PARTIAL DATA | records native CLI auth/status information; capacity/reset remain null when providers expose none |
+| Paid fallback | PASS | provider environment strips API keys/base URLs; no implicit paid route exists |
+| Network boundary | PASS | API/metrics/database bind loopback; Temporal/evidence bind loopback/private only |
 
-- No Engineering Control systemd services or infrastructure containers are active.
-- No Engineering API, evidence ingest, Temporal, or PostgreSQL engineering listener is active.
-- Controller public ports 80/443 belong to the retained pre-cleanup OmniRoute Caddy deployment.
-- Worker listeners are SSH and local DNS only.
-- Controller has Codex 0.149.0 and Claude Code 2.1.238; these are not worker service identities.
-- Worker has kubectl 1.36.3 and Helm 4.2.3, but Codex, Claude, and Argo CD CLI are absent.
-- Worker provider OAuth has not been established. Credentials were not copied from controller.
+The only public HTTP listeners are ports 80/443 on the retained, pre-cutover OmniRoute Caddy
+container. They are not Engineering Control listeners and remain under cleanup gate C-02.
 
-## Pending activation validation
+## Worker activation
 
-The following must not be marked PASS until the cleanup checkpoint and ordinary bootstrap are
-completed:
+| Requirement | Result | Evidence |
+| --- | --- | --- |
+| Installed immutable release | PASS | worker release matches controller `30a0e86...` |
+| Six Unix/service identities | PASS | Codex, Claude, browser, scan, delivery and release services active |
+| Native CLIs | INSTALLED/BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 installed; both identity-specific logins absent |
+| Browser runtime | PASS | Playwright 1.62.1 plus Chromium/Firefox dependencies installed under `browser-runner` |
+| Scan tooling | PASS | Gitleaks, Trivy, Semgrep, Syft and kubeconform installed and identity-readable |
+| Release tooling | PASS | kubectl 1.36.3, Helm 4.2.3 and Argo CD CLI 3.5.1 installed under `release-runner` |
+| Credential separation | PASS | release cannot read model auth; model/browser/delivery cannot read release credentials; evidence impersonation denied |
+| Canonical mirrors | PARTIAL/BLOCKED | Falcone mirrors pass; private Musematic mirrors require a distinct contents-read `scan-runner` credential |
+| GitHub delivery/provenance | BLOCKED | draft-PR token and GHCR read credential have not been provisioned |
+| Kubernetes identities | BLOCKED | no scoped observer or release kubeconfigs are provisioned; shared cluster-admin remains excluded |
 
-- systemd service health and restart behavior;
-- PostgreSQL and Temporal container health and durable volume restart;
-- authenticated API and identity-bound evidence ingest over the private network;
-- full Temporal worker-restart acceptance run;
-- worker Codex and Claude native structured smoke tasks;
-- both cross-provider maker/checker directions using real subscriptions;
-- scoped `delivery-runner` GitHub credential and exact-head draft PR smoke test;
-- Playwright browser binaries under `browser-runner`;
-- scanner binaries under `scan-runner`;
-- release/provider/observer credential filesystem isolation on the installed worker;
-- read-only Kubernetes observer authorization against newly scoped credentials;
-- Falcone Helm and Musematic GitOps target dry-run against operator-configured targets;
-- Hermes/Telegram allowlist and command-to-API integration;
-- confirmation that no Engineering Control port is bound to a public wildcard interface.
+`verify-worker.sh` completes every credential-independent check, then reports these exact blockers:
 
-Real staging mutation remains outside bootstrap validation and requires separate authorization.
+```text
+MANUAL_AUTH_REQUIRED_CODEX
+MANUAL_AUTH_REQUIRED_CLAUDE
+MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED
+MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED
+MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
+```
+
+## Hermes and Telegram
+
+| Requirement | Result | Evidence |
+| --- | --- | --- |
+| Canonical Hermes | PASS | 0.20.0 vendor install retained; no vendor source patch |
+| Engineering Control hook | PASS | native hook loaded for `command:*`; fixed route map only |
+| Authorization | PASS | non-Telegram and unauthorized identities denied; protected numeric allowlist active |
+| Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata |
+| Telegram outbound | PASS | Bot API identity check and silent canary delivery succeeded |
+| Telegram inbound command | PENDING OPERATOR | bot cannot generate a user-originated command; operator must send `/usage` and one `/status` canary |
+| Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
+
+Hermes still has runtime OmniRoute provider aliases. C-01 explicitly requires those references to
+be removed only after real native provider and cross-provider acceptance passes.
+
+## Lifecycle acceptance
+
+The current synthetic lifecycle passed through authenticated API -> Temporal -> snapshot ->
+bounded worktree -> independent synthetic maker/checker -> evidence -> ChangeSet transition. The
+workflow worker was stopped and replaced while the run was active; the durable result resumed with
+maker `codex-synthetic`, checker `claude-synthetic`, and state `AWAITING_STAGING_APPROVAL`.
+
+The following remain blocked and must not be inferred from the synthetic pass:
+
+- real Codex structured native call;
+- real Claude structured native call;
+- Codex maker -> Claude checker;
+- Claude maker -> Codex checker;
+- inbound Telegram `/usage`, `/status`, and safe synthetic run command;
+- Musematic snapshot through the private canonical mirrors;
+- scoped Kubernetes observer authorization and release dry-runs;
+- real draft-PR and registry-provenance validation.
+
+Real staging mutation is not authorized. Deployment workflows must stop at
+`AWAITING_STAGING_APPROVAL`.
+
+## Security blockers
+
+- `SECURITY_BLOCKER_MUSEMATIC_GIT_SECRETS`: rotate, rewrite coordinated history, and rescan every
+  clone before Musematic write enablement.
+- `SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY`: replace the shared kubeconfig with scoped
+  observer and release identities before any Kubernetes automation is enabled.
+
+C-01 and C-02 remain unexecuted. C-03 is complete with a validated rollback copy under
+`/home/hermes/engineering-backups/20260823T095538Z/`.

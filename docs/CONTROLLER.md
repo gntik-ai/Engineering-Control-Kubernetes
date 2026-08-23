@@ -24,11 +24,13 @@ sudo ./scripts/bootstrap-controller.sh
 
 Configuration lives under `/etc/engineering-control`; PostgreSQL state under
 `/var/lib/engineering-control/postgresql`; evidence and mirrors under `/srv/engineering`. The API
-token is group-readable only by `engineering-api-clients`. The database password is not readable by
-Hermes. Evidence ingest uses identity-bound tokens under
+token is owned by `root:engineering-api-clients` at mode `0640`. A named read-only ACL covers the
+long-lived Hermes user manager without widening the mode bits. The database password is not
+readable by Hermes. Evidence ingest uses identity-bound tokens under
 `/etc/engineering-control/env/evidence-uploaders/`; possessing one grants no control API access.
 Compose ports are never published on all interfaces.
 
 The bootstrap installs a commit-addressed release under `/opt/engineering-control/releases` and
 updates a symlink. It does not touch product repositories, Kubernetes, or existing Hermes service
-state. Restart Hermes separately after its plugin/hook and allowlist are verified.
+definition. It idempotently installs the versioned Hermes plugin/hook extension but does not patch
+vendor source. Restart Hermes separately after its allowlist is verified.

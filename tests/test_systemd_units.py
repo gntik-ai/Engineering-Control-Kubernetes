@@ -89,6 +89,7 @@ def test_controller_config_parents_allow_token_file_group_traversal_only() -> No
         in controller
     )
     assert 'setfacl -m u:hermes:r-- "${CONFIG_ROOT}/env/api.token"' in controller
+    assert "--apply-telegram-lockdown" in controller
 
 
 def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> None:

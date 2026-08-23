@@ -1,9 +1,9 @@
 # Mission requirements matrix
 
-Status is deliberately split between implementation and host activation. `IMPLEMENTED` means the
-version-controlled control-plane behavior exists and has source-level tests. `PREPARED` means
-idempotent configuration/automation exists but has not been installed. `BLOCKED` names an external
-gate that this bootstrap must not bypass. No row claims live deployment or provider validation.
+Status is split between implementation, live host activation, and external gates. `IMPLEMENTED`
+means version-controlled behavior exists and has source tests. `ACTIVE` means it is installed and
+verified on the named host. `BLOCKED` names a credential, security, or authorization gate that the
+platform fails closed rather than bypassing.
 
 | Phase | Status | Evidence or remaining gate |
 | --- | --- | --- |
@@ -11,16 +11,16 @@ gate that this bootstrap must not bypass. No row claims live deployment or provi
 | 1 Host inventory | COMPLETE | Redacted controller/worker inventory and checksum manifests under `/home/hermes/engineering-bootstrap/inventory` |
 | 2 Asset discovery | COMPLETE | Repository/worktree and reusable-agent reports; dirty worktrees remain protected |
 | 3 Security scan | COMPLETE/BLOCKED | Redacted Gitleaks/history inventory; Musematic Git secrets and shared cluster-admin identity are active blockers |
-| 4 Cleanup plan | COMPLETE/AWAITING APPROVAL | `/home/hermes/engineering-bootstrap/CLEANUP-PLAN.md`; no removal has run; exact `APPROVE CLEANUP` is required |
-| 5 Backup before cleanup | BLOCKED | Runs only after cleanup approval and before the reviewed removals; must produce manifest/checksums/restore guide |
-| 6 Filesystem architecture | PREPARED | Controller/worker bootstrap creates `/home/hermes/engineering`, `/srv/engineering`, `/etc/engineering-control`, `/var/lib`, and journald services |
+| 4 Cleanup plan | CONDITIONALLY APPROVED | C-03 complete; C-01/C-02 remain behind the operator's additional acceptance gates |
+| 5 Backup before cleanup | COMPLETE | `engineering-backups/20260823T095538Z` has readable checksums and restore procedures; protected credentials were excluded |
+| 6 Filesystem architecture | ACTIVE | Normalized controller/worker trees, ownership, ACLs, state and journal services are installed |
 | 7 Git repository layout | IMPLEMENTED | Independent local Git repositories for `engineering-control` and `engineering-agent-pack`; no remote repository was created |
-| 8 Controller role | PREPARED | Pinned PostgreSQL/Temporal Compose plus API, workers, scheduler, notifier, evidence ingest, policy and quota services |
-| 9 Worker role | PREPARED | Six isolated users/queues: Codex, Claude, browser, scan, delivery, release; filesystem denial tests included |
-| 10 Native CLIs | PREPARED/BLOCKED | Pinned installers; independent worker OAuth remains `MANUAL_AUTH_REQUIRED_CODEX` and `MANUAL_AUTH_REQUIRED_CLAUDE` |
+| 8 Controller role | ACTIVE | PostgreSQL, Temporal, API, workflow worker, scheduler, notifier and evidence ingest are healthy |
+| 9 Worker role | ACTIVE | Six isolated Unix identities and systemd queues are active; credential-independent verifier passes |
+| 10 Native CLIs | INSTALLED/BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 are installed; independent worker OAuth remains manual |
 | 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction |
 | 12 Quota broker | IMPLEMENTED | Provider-independent snapshots, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff |
-| 13 Temporal | IMPLEMENTED/PENDING LIVE TEST | All nine required workflows plus durable delivery reconciliation, signals/retries/compensation/activity boundaries; reboot/restart proof awaits activation |
+| 13 Temporal | ACTIVE/PASS | All required workflows installed; live worker replacement during an active lifecycle resumed durably |
 | 14 PostgreSQL metadata | IMPLEMENTED | Alembic models/migrations for every required table plus approval candidates, notification outbox and worker heartbeats |
 | 15 ChangeSet | IMPLEMENTED | First-class model, strict state policy, exact PR/CI/provenance reconciliation, digest promotion, artifact-bound approvals and deterministic metadata transitions |
 | 16 Worktrees | IMPLEMENTED | Mirrors, exact-SHA fetch/allocation, branch naming, leases, dirty protection and ACL isolation |
@@ -29,39 +29,41 @@ gate that this bootstrap must not bypass. No row claims live deployment or provi
 | 19 Skills | IMPLEMENTED | Twenty-three canonical skills generated for Claude, Codex and generic `.agents`, with validation CI |
 | 20 Domain packs | IMPLEMENTED | Common plus Falcone/Musematic domain catalogs covering all requested systems |
 | 21 Audit campaigns | IMPLEMENTED | Domain/persona/lens/environment cells, complete coverage statuses and evidence/blocker/exclusion gates |
-| 22 Evidence | IMPLEMENTED/PREPARED | Content-addressed SHA256 metadata/store, identity-bound upload, central redaction and local hierarchy; external S3 is a documented future option |
-| 23 Playwright | IMPLEMENTED/PENDING INSTALL | Chromium/Firefox-capable fixed journeys, isolated context, trace/screenshot/console/network capture, protected credential files |
-| 24 Deterministic security | IMPLEMENTED/PENDING INSTALL | Pinned Gitleaks, Trivy, Semgrep, Syft, Helm, kubeconform and manifest/RBAC/secret-reference checks; existing GitHub CodeQL remains repository-owned |
-| 25 Finding verification | IMPLEMENTED/BLOCKED FOR WRITE | Two attempts where practical, controls, fresh snapshot, fingerprint and GitHub dedupe; controller read token is not provisioned |
+| 22 Evidence | ACTIVE | Content-addressed metadata/store, identity-bound private upload, live redaction and reject-before-persistence canaries pass |
+| 23 Playwright | ACTIVE | Chromium/Firefox runtime and fixed journey harness installed under `browser-runner`; target credentials remain unprovisioned |
+| 24 Deterministic security | ACTIVE | Pinned Gitleaks, Trivy, Semgrep, Syft, Helm, kubeconform and manifest checks installed; CodeQL remains repository-owned |
+| 25 Finding verification | IMPLEMENTED/BLOCKED FOR WRITE | Controls/fingerprints/dedupe exist; controller read token and private Musematic mirror credential are not provisioned |
 | 26 Finding schema | IMPLEMENTED | Draft 2020-12 schema includes every requested identity, impact, evidence and affected-state field |
 | 27 Risk classes | IMPLEMENTED | R0-R3 policy, cross-provider gates, deterministic low-risk approval, human R2/R3 approval and typed R3 confirmation |
 | 28 OpenSpec | IMPLEMENTED | Existing assets preserved; bounded OpenSpec generated per delivery and passed without historical audit context |
 | 29 Falcone adapter | IMPLEMENTED/BLOCKED LIVE | Exact-SHA CI/provenance and digest-only chart promotion plus Helm lint/template/preflight, immutable plans, real backup/migration gates, atomic deploy, verification/recovery; current release workflow lacks the signed candidate contract, target is disabled, and scoped kubeconfig is absent |
 | 30 Musematic adapter | IMPLEMENTED/SECURITY BLOCKED | Exact-SHA CI gate, immutable GitOps validation, draft deployment PR, exact Argo revision observation and Git recovery plan; committed secrets, missing signed candidate contract, tag-only chart rendering and newest-build policy block promotion/write enablement |
-| 31 Kubernetes identity separation | PREPARED/BLOCKED | RBAC templates and negative authorization checks exist; operator must create scoped credentials before activation |
-| 32 Hermes normalization | PREPARED | Canonical 0.20.0 vendor install retained; extension/hook implements fixed allowlisted Telegram commands with no shell; restart awaits checkpoint/backup |
+| 31 Kubernetes identity separation | IMPLEMENTED/BLOCKED CREDENTIALS | RBAC templates and negative checks exist; no scoped observer/release kubeconfigs are installed |
+| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0 and fixed allowlisted hook are active; inbound Telegram canary and later Omni alias cutover remain |
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |
-| 34 Telegram approvals | IMPLEMENTED/PENDING LIVE TEST | Exact artifact display/digest binding, drift invalidation and typed R3 confirmation; allowlist/token service not activated |
-| 35 systemd | PREPARED | Controller and six worker identities use restart/resource/filesystem limits and journald; installed-unit verification awaits sudo bootstrap |
+| 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API and outbound Telegram pass; user-originated `/usage`/`status` canary is pending |
+| 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
 | 36 Observability | IMPLEMENTED | Structured redacted context logs, PostgreSQL-backed Prometheus metrics, authenticated worker heartbeats |
 | 37 Failure/handoff | IMPLEMENTED | Required handoff bundle files and explicit `RATE_LIMITED`/cross-provider semantics |
 | 38 Cleanup automation | IMPLEMENTED/DISABLED | Dry-run retention workflow, terminal-state and incident/evidence protections, worker/controller double authorization |
 | 39 Documentation | IMPLEMENTED | All requested manuals plus cheatsheet, validation status and this matrix |
-| 40 Bootstrap/reinstall | IMPLEMENTED/PENDING RUN | Idempotent controller/worker/bootstrap and verification scripts; destructive cleanup remains separate |
+| 40 Bootstrap/reinstall | PASS | Both bootstraps rerun successfully and installed the same immutable release on controller and worker |
 | 41 Update procedure | IMPLEMENTED | `UPGRADE.md` covers backup, drain, pin, migration, validation and rollback by component |
-| 42 Validation | SOURCE PASS/LIVE BLOCKED | Static/unit/synthetic validation passes; actual services, OAuth, browser/scanners, scoped Kubernetes and restart tests await activation |
-| 43 Acceptance lifecycle | SYNTHETIC PASS/LIVE BLOCKED | Real-Git bounded synthetic maker/checker reaches approval; full Telegram/API/Temporal/native-provider chain awaits activation |
+| 42 Validation | HOST PASS/CREDENTIAL BLOCKED | Source, services, browser/scanners, isolation, evidence and Temporal restart pass; OAuth/Git/Kubernetes credentials remain |
+| 43 Acceptance lifecycle | SYNTHETIC LIVE PASS/PROVIDERS BLOCKED | Authenticated API/Temporal/worktree/evidence chain passes with restart; real provider and inbound Telegram legs remain |
 | 44 Final report | PENDING | `FINAL-HANDOFF.md` must be generated from post-activation facts; it must not claim uninstalled services or unresolved security gates |
 
 ## Gates in required order
 
-1. Operator sends exact `APPROVE CLEANUP` after reviewing the cleanup plan.
-2. Create the approved timestamped backup and execute only reviewed cleanup items.
-3. Operator supplies sudo interactively for controller/worker bootstrap.
-4. Provision controller read-only GitHub issue metadata and worker draft-PR credentials.
-5. Authenticate Codex and Claude independently as their worker identities.
-6. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
+1. Authenticate Codex and Claude independently as their worker identities.
+2. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
+   and registry-read credential without copying interactive user credentials.
+3. Run both real native structured calls and both cross-provider maker/checker directions.
+4. Send allowlisted Telegram `/usage`, `/status`, and a safe dry-run command; record the round trip.
+5. Remove Hermes runtime OmniRoute references, stop OmniRoute without uninstalling, restart the
+   replacement stack, and rerun the full regression suite.
+6. Only after that pass, uninstall the reviewed OmniRoute npm package while retaining `.omniroute`.
+7. Secret-safely prove Caddy has no consumers/traffic, then execute C-02 and rerun the full path.
+8. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
    scoped observer/release identities before any relevant write enablement.
-7. Run live controller/worker, Temporal restart, native cross-provider, Hermes and read-only
-   Kubernetes acceptance validation.
-8. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.
+9. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.
