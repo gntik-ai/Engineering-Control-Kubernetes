@@ -51,3 +51,15 @@ def test_worker_shared_tool_runtimes_are_traversable_but_not_made_writable() -> 
     assert "chmod -R a+rX /opt/engineering-scanners" in scanners
     assert "a+w" not in worker
     assert "a+w" not in scanners
+
+
+def test_worker_parent_state_and_platform_roots_are_identity_traversable() -> None:
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'install -d -o root -g root -m 0755 "${STATE_ROOT}"' in worker
+    assert (
+        'install -d -o root -g root -m 0711 "${STATE_ROOT}/workers" '
+        '"${PLATFORM_ROOT}"'
+    ) in worker
