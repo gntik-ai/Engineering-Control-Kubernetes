@@ -110,7 +110,7 @@ class CodexCLIAdapter:
                 raw_status, error_code = classify_failure(process_result)
                 status = RunStatus(raw_status)
                 if not summary:
-                    summary = process_result.stderr[-4000:]
+                    summary = self._failure_summary(process_result.events, process_result.stderr)
             return AgentResult(
                 run_id=request.run_id,
                 provider=self.provider,
@@ -173,3 +173,21 @@ class CodexCLIAdapter:
             output_tokens=values.get("output_tokens"),
             cached_input_tokens=values.get("cached_input_tokens"),
         )
+
+    @staticmethod
+    def _failure_summary(events: tuple[dict[str, Any], ...], stderr: str) -> str:
+        for event in reversed(events):
+            event_type = str(event.get("type", ""))
+            if "error" not in event and not event_type.endswith(".failed"):
+                continue
+            payload = event.get("error") or event.get("message") or event.get("detail")
+            if payload is None or payload == "" or payload == {}:
+                continue
+            rendered = (
+                payload
+                if isinstance(payload, str)
+                else json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            )
+            safe = SecretRedactor().redact_text(f"{event_type}: {rendered}")
+            return str(safe.value)[-4000:]
+        return str(SecretRedactor().redact_text(stderr[-4000:]).value)

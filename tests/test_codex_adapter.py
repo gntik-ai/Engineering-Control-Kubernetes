@@ -70,3 +70,23 @@ def test_codex_adapter_rejects_symlinked_run_temp_parent(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="real directory"):
         CodexCLIAdapter(temp_root=str(temp_root))._run_temp_parent(request.run_id)
+
+
+def test_codex_failure_summary_uses_only_redacted_error_event_payload() -> None:
+    marker = "ghp_" + "A" * 40
+    summary = CodexCLIAdapter._failure_summary(
+        (
+            {"type": "thread.started", "thread_id": "bounded"},
+            {
+                "type": "turn.failed",
+                "error": {"message": f"provider rejected {marker}", "code": "invalid_request"},
+                "unrelated": "must-not-be-persisted",
+            },
+        ),
+        "stderr fallback",
+    )
+
+    assert marker not in summary
+    assert "[REDACTED]" in summary
+    assert "invalid_request" in summary
+    assert "must-not-be-persisted" not in summary
