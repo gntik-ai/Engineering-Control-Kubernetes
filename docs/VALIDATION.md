@@ -95,7 +95,8 @@ also reached `AWAITING_STAGING_APPROVAL` with independent synthetic providers.
 
 The real native Codex structured maker call passes with the subscription-authenticated
 `codex-runner`. Its synthetic acceptance directory is a provider-owned Git repository, its output
-validates against the strict schema, and the expected bounded file content matches exactly.
+validates against the strict schema, and the expected bounded file content matches exactly. Its
+redacted result also records the installed immutable instruction-bundle revision and content hash.
 
 The following remain blocked and must not be inferred from the synthetic pass:
 

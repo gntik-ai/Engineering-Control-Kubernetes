@@ -4,6 +4,7 @@ import importlib.util
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -61,6 +62,12 @@ def _result(path: Path, provider: str, role: str, structured: dict[str, str]) ->
         "summary": "synthetic",
         "artifacts": [],
         "usage": {"source": "provider_event"},
+        "instruction_bundle": {
+            "sha256": "a" * 64,
+            "revision": "b" * 40,
+            "sources": [f"roles/{role}.yaml"],
+            "allowed_tools": ["Read", "Glob", "Grep"],
+        },
         "structured_result": structured,
         "started_at": datetime.now(UTC).isoformat(),
         "finished_at": datetime.now(UTC).isoformat(),
@@ -158,6 +165,20 @@ async def test_failed_native_run_persists_redacted_normalized_result(
 
     monkeypatch.setattr(MODULE, "CodexCLIAdapter", FailingAdapter)
 
+    class FakeInstructionPack:
+        def __init__(self, _root: Path) -> None:
+            pass
+
+        def enrich(self, request: AgentRequest, _step: str) -> tuple[AgentRequest, SimpleNamespace]:
+            return request, SimpleNamespace(
+                sha256="a" * 64,
+                revision="b" * 40,
+                sources=("roles/implementer.yaml",),
+                allowed_tools=request.allowed_tools,
+            )
+
+    monkeypatch.setattr(MODULE, "AgentInstructionPack", FakeInstructionPack)
+
     with pytest.raises(RuntimeError, match="native smoke returned FAILED"):
         await MODULE.run_one(
             Provider.CODEX,
@@ -170,3 +191,9 @@ async def test_failed_native_run_persists_redacted_normalized_result(
     persisted = json.loads(result_path.read_text(encoding="utf-8"))
     assert persisted["status"] == "FAILED"
     assert persisted["error_code"] == "PROVIDER_FAILED"
+    assert persisted["instruction_bundle"] == {
+        "sha256": "a" * 64,
+        "revision": "b" * 40,
+        "sources": ["roles/implementer.yaml"],
+        "allowed_tools": ["Read", "Glob", "Grep", "Edit", "Write"],
+    }

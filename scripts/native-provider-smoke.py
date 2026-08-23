@@ -16,6 +16,7 @@ from jsonschema import Draft202012Validator
 
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
+from engineering_control.agents.instructions import AgentInstructionPack
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import ModelClass, Project, Provider, RunStatus
 from engineering_control.security.redaction import SecretRedactor
@@ -128,6 +129,12 @@ async def run_one(
     worktree = _bounded(worktree, WORKTREE_ROOT, "acceptance worktree")
     result_file = _bounded(result_file, TEMP_ROOT, "acceptance result", must_exist=False)
     request = _request(provider, mode, worktree, expected_line)
+    request, bundle = AgentInstructionPack(
+        Path(os.environ.get("ENGINEERING_AGENT_PACK_ROOT", "/opt/engineering-agent-pack/source"))
+    ).enrich(
+        request,
+        "delivery.invoke_maker" if mode == "maker" else "delivery.invoke_checker",
+    )
     adapter = (
         CodexCLIAdapter(executable="/usr/local/bin/codex", temp_root=str(result_file.parent))
         if provider is Provider.CODEX
@@ -136,7 +143,21 @@ async def run_one(
     if not await adapter.authenticated():
         raise RuntimeError(f"MANUAL_AUTH_REQUIRED_{provider.value.upper()}")
     result = await adapter.execute(request)
-    safe = SecretRedactor().redact(result.model_dump(mode="json")).value
+    safe = (
+        SecretRedactor()
+        .redact(
+            {
+                **result.model_dump(mode="json"),
+                "instruction_bundle": {
+                    "sha256": bundle.sha256,
+                    "revision": bundle.revision,
+                    "sources": list(bundle.sources),
+                    "allowed_tools": list(bundle.allowed_tools),
+                },
+            }
+        )
+        .value
+    )
     if not isinstance(safe, dict):
         raise TypeError("redacted native result must remain an object")
     _write_json(result_file, safe)
@@ -155,6 +176,15 @@ def _load_result(path: Path, provider: Provider, role: str) -> dict[str, Any]:
         raise ValueError("native result provider or role does not match")
     if value.get("status") != RunStatus.SUCCESS.value:
         raise ValueError("native result did not succeed")
+    bundle = value.get("instruction_bundle")
+    if (
+        not isinstance(bundle, dict)
+        or not isinstance(bundle.get("sha256"), str)
+        or len(bundle["sha256"]) != 64
+        or not isinstance(bundle.get("sources"), list)
+        or not bundle["sources"]
+    ):
+        raise ValueError("native result has no immutable instruction provenance")
     return value
 
 
@@ -218,6 +248,8 @@ def finalize(
                 "role": value["role"],
                 "status": value["status"],
                 "usage": value.get("usage", {}),
+                "instruction_bundle_sha256": value["instruction_bundle"]["sha256"],
+                "agent_pack_revision": value["instruction_bundle"].get("revision"),
             }
             for key, value in results.items()
         },
