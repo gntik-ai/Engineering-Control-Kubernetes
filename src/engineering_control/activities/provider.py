@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +35,8 @@ class ProviderAdapter(Protocol):
 
 class ProviderActivityHandler:
     """Execute a normalized native-CLI request within one assigned worktree."""
+
+    _heartbeat_interval_seconds = 30.0
 
     _request_keys = {
         "audit.agent_cell": "agent_request",
@@ -95,7 +99,25 @@ class ProviderActivityHandler:
                 }
             )
 
-        result = await self.adapter.execute(request, heartbeat_event)
+        async def heartbeat_keepalive() -> None:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval_seconds)
+                activity.heartbeat(
+                    {
+                        "provider": self.provider.value,
+                        "run_id": str(request.run_id),
+                        "sequence": sequence,
+                        "event_type": "provider.keepalive",
+                    }
+                )
+
+        keepalive = asyncio.create_task(heartbeat_keepalive())
+        try:
+            result = await self.adapter.execute(request, heartbeat_event)
+        finally:
+            keepalive.cancel()
+            with suppress(asyncio.CancelledError):
+                await keepalive
         if result.status is RunStatus.SUCCESS:
             self._validate_result_schema(request, result)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,51 @@ async def test_provider_activity_executes_only_in_bounded_worktree(
     assert result["status"] == "SUCCESS"
     assert result["provider"] == "codex"
     assert result["agent_result"]["structured_result"] == {"summary": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_provider_activity_heartbeats_while_cli_emits_no_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    heartbeats: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.activity.heartbeat", heartbeats.append
+    )
+
+    class QuietAdapter(FakeAdapter):
+        async def execute(self, request: AgentRequest, on_event: Any = None) -> AgentResult:
+            await asyncio.sleep(0.03)
+            now = datetime.now(UTC)
+            return AgentResult(
+                run_id=request.run_id,
+                provider=request.provider,
+                role=request.role,
+                status=RunStatus.SUCCESS,
+                summary="bounded result",
+                structured_result={"summary": "ok"},
+                started_at=now,
+                finished_at=now,
+            )
+
+    worktree_root = tmp_path / "worktrees"
+    worktree = worktree_root / "falcone" / "change-set"
+    worktree.mkdir(parents=True)
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
+        "codex",
+        QuietAdapter(),
+    )
+    handler._heartbeat_interval_seconds = 0.005
+
+    result = await handler.handle(
+        "delivery.invoke_maker",
+        {"maker_request": request_for(worktree).model_dump(mode="json")},
+    )
+
+    assert result["status"] == "SUCCESS"
+    keepalives = [item for item in heartbeats if item["event_type"] == "provider.keepalive"]
+    assert len(keepalives) >= 2
+    assert all(item["provider"] == "codex" for item in keepalives)
 
 
 @pytest.mark.asyncio
