@@ -166,9 +166,11 @@ def test_end_to_end_verification_preserves_the_operator_ssh_identity() -> None:
 
     assert "if [[ ${EUID} -ne 0 ]]" in verification
     assert 'runuser -u "${operator}" -- ssh -tt worker' in verification
-    assert 'runuser -u "${operator}" -- "${SCRIPT_DIR}/validate-temporal-lifecycle.py"' in (
+    assert "python_bin=${ENGINEERING_PYTHON_BIN:-/opt/engineering-control/venv/bin/python}" in (
         verification
     )
+    assert 'runuser -u "${operator}" -- "${python_bin}"' in verification
+    assert '"${SCRIPT_DIR}/validate-temporal-lifecycle.py"' in verification
     assert "worker_rc=0" in verification
     assert "independent lifecycle checks passed" in verification
     assert "\nssh -t worker" not in verification

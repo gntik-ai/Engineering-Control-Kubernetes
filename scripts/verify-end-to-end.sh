@@ -17,6 +17,11 @@ if [[ ${operator} == root ]]; then
   operator=hermes
 fi
 id "${operator}" >/dev/null
+python_bin=${ENGINEERING_PYTHON_BIN:-/opt/engineering-control/venv/bin/python}
+if [[ ! -x ${python_bin} ]]; then
+  echo "FAIL Engineering Control Python environment is unavailable" >&2
+  exit 1
+fi
 
 "${SCRIPT_DIR}/verify-controller.sh"
 worker_rc=0
@@ -26,7 +31,8 @@ if [[ ${worker_rc} -ne 0 && ${worker_rc} -ne 2 ]]; then
   echo "FAIL worker verification transport or invariant check" >&2
   exit "${worker_rc}"
 fi
-runuser -u "${operator}" -- "${SCRIPT_DIR}/validate-temporal-lifecycle.py"
+runuser -u "${operator}" -- "${python_bin}" \
+  "${SCRIPT_DIR}/validate-temporal-lifecycle.py"
 if [[ ${worker_rc} -eq 2 ]]; then
   echo "BLOCKED end-to-end verification; independent lifecycle checks passed" >&2
   exit 2
