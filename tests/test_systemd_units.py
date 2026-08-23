@@ -131,6 +131,15 @@ def test_worker_verification_uses_a_neutral_non_home_directory() -> None:
     assert "all credential-independent checks passed" in verification
 
 
+def test_controller_verification_uses_hermes_worker_ssh_identity() -> None:
+    verification = (REPOSITORY_ROOT / "scripts" / "verify-controller.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "runuser -u hermes -- ssh" in verification
+    assert "\nssh -o BatchMode=yes" not in verification
+
+
 def test_worker_bootstrap_clears_satisfied_auth_markers() -> None:
     bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(
         encoding="utf-8"

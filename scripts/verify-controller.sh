@@ -32,5 +32,8 @@ if grep -Eq '(0\.0\.0\.0|\*|\[::\]):(55432|7233|8740|8741|8750)' <<<"${listeners
   echo "FAIL control-plane service exposed on every interface" >&2
   exit 1
 fi
-ssh -o BatchMode=yes -o ConnectTimeout=5 worker true
+# The controller-to-worker key and Host alias intentionally belong to the normal
+# runtime operator, not root. The verifier otherwise needs root for Docker and
+# service inspection, so cross-host connectivity must explicitly use hermes.
+runuser -u hermes -- ssh -o BatchMode=yes -o ConnectTimeout=5 worker true
 echo "PASS controller verification"
