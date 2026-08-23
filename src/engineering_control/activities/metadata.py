@@ -932,6 +932,11 @@ class MetadataActivityHandler:
         evidence = structured.get("evidence")
         if decision not in {"PASS", "FAIL", "BLOCKED", "REQUEST_CHANGES"}:
             raise ValueError("audit result has an unknown decision")
+        finding_payload = structured.get("finding")
+        if decision == "FAIL" and not isinstance(finding_payload, dict):
+            raise ValueError("failed audit result requires a finding")
+        if decision != "FAIL" and finding_payload is not None:
+            raise ValueError("only a failed audit result may contain a finding")
         if not isinstance(evidence, list) or not evidence:
             raise ValueError("audit result requires explicit evidence")
         deterministic_sha = str(payload.get("deterministic_evidence_sha256", ""))
@@ -964,7 +969,7 @@ class MetadataActivityHandler:
                 "open_questions": structured.get("open_questions", []),
             }
             if decision == "FAIL":
-                candidate = FindingCandidateRecord.model_validate(structured.get("finding"))
+                candidate = FindingCandidateRecord.model_validate(finding_payload)
                 fingerprint = self._fingerprint(
                     campaign,
                     cell,
@@ -5316,6 +5321,8 @@ class MetadataActivityHandler:
                 "actual_behavior",
                 "minimal_reproduction",
                 "affected_component",
+                "security_impact",
+                "data_impact",
                 "recommended_action",
             ],
             "properties": {
@@ -5365,14 +5372,8 @@ class MetadataActivityHandler:
                     "maxItems": 100,
                     "items": {"type": "string", "maxLength": 4000},
                 },
-                "finding": {"anyOf": [{"type": "null"}, finding]},
+                "finding": {**finding, "type": ["object", "null"]},
             },
-            "allOf": [
-                {
-                    "if": {"properties": {"decision": {"const": "FAIL"}}},
-                    "then": {"properties": {"finding": finding}},
-                }
-            ],
         }
 
     @staticmethod

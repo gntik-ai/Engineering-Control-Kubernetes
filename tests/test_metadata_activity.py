@@ -4,10 +4,13 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
+from jsonschema.validators import Draft202012Validator
 from sqlalchemy import func, select
+from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
@@ -270,6 +273,77 @@ async def test_audit_cell_preparation_is_bounded_and_schema_driven(tmp_path: Pat
     assert prepared["provider"] == "codex"
     assert request["writable"] is False
     assert request["output_schema"]["properties"]["evidence"]["minItems"] == 1
+    schema = request["output_schema"]
+    Draft202012Validator.check_schema(schema)
+    unsupported = {"allOf", "if", "then"}
+
+    def keywords(value: Any) -> set[str]:
+        if isinstance(value, dict):
+            return set(value).intersection(unsupported) | set().union(
+                *(keywords(item) for item in value.values())
+            )
+        if isinstance(value, list):
+            return set().union(*(keywords(item) for item in value))
+        return set()
+
+    assert keywords(schema) == set()
+    finding = schema["properties"]["finding"]
+    assert finding["type"] == ["object", "null"]
+    assert set(finding["properties"]) == set(finding["required"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "finding"),
+    [
+        ("PASS", {"unexpected": "finding"}),
+        ("FAIL", None),
+        ("BLOCKED", {"unexpected": "finding"}),
+        ("REQUEST_CHANGES", {"unexpected": "finding"}),
+    ],
+)
+async def test_audit_result_decision_and_finding_must_be_consistent(
+    tmp_path: Path, decision: str, finding: object
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / f'audit-{decision}.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    cell = audit_cell()
+    await handler.handle(
+        "campaign.persist_coverage",
+        {"campaign_id": str(campaign.id), "cells": [cell], "total": 1},
+    )
+
+    with pytest.raises(ApplicationError, match="invalid metadata activity input") as caught:
+        await handler.handle(
+            "campaign.persist_cell_result",
+            {
+                "campaign_id": str(campaign.id),
+                "cell": cell,
+                "deterministic_evidence_sha256": "c" * 64,
+                "agent_result": {
+                    "provider": "codex",
+                    "run_id": str(uuid4()),
+                    "structured_result": {
+                        "summary": "bounded synthetic result",
+                        "decision": decision,
+                        "evidence": [
+                            {
+                                "kind": "git-snapshot",
+                                "reference": "source:gateway",
+                                "sha256": "c" * 64,
+                            }
+                        ],
+                        "open_questions": [],
+                        "finding": finding,
+                    },
+                },
+            },
+        )
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert "finding" in str(caught.value.__cause__)
 
 
 @pytest.mark.asyncio
