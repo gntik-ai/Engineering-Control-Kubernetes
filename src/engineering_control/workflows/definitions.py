@@ -219,6 +219,16 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 },
             )
             if prepared.get("status") in {"RATE_LIMITED", "BLOCKED"}:
+                prepared = await self._step(
+                    "campaign.persist_cell_blocker",
+                    {
+                        **prepared,
+                        "deterministic_evidence_sha256": deterministic.get(
+                            "evidence_sha256"
+                        ),
+                        "blocker": prepared.get("blocker", prepared["status"]),
+                    },
+                )
                 return {
                     "status": prepared["status"],
                     "campaign_id": campaign_id,
@@ -237,6 +247,19 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 "TIMED_OUT",
                 "CANCELLED",
             }:
+                if agent_result.get("status") in {"RATE_LIMITED", "BLOCKED"}:
+                    agent_result = await self._step(
+                        "campaign.persist_cell_blocker",
+                        {
+                            **agent_result,
+                            "deterministic_evidence_sha256": deterministic.get(
+                                "evidence_sha256"
+                            ),
+                            "blocker": agent_result.get(
+                                "blocker", agent_result["status"]
+                            ),
+                        },
+                    )
                 return {
                     "status": agent_result["status"],
                     "campaign_id": campaign_id,

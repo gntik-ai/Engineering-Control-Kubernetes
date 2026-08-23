@@ -133,6 +133,47 @@ async def test_campaign_coverage_and_no_finding_require_evidence(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_campaign_provider_blocker_is_bound_to_deterministic_evidence(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'blocked-campaign.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    cell = audit_cell()
+    await handler.handle(
+        "campaign.persist_coverage",
+        {"campaign_id": str(campaign.id), "cells": [cell], "total": 1},
+    )
+
+    result = await handler.handle(
+        "campaign.persist_cell_blocker",
+        {
+            "campaign_id": str(campaign.id),
+            "cell": cell,
+            "provider": "codex",
+            "status": "BLOCKED",
+            "blocker": "MANUAL_AUTH_REQUIRED_CODEX",
+            "deterministic_evidence_sha256": "e" * 64,
+        },
+    )
+    final = await handler.handle(
+        "campaign.finalize",
+        {"campaign_id": str(campaign.id), "expected_cells": 1},
+    )
+
+    with handler.sessions() as session:
+        coverage = session.scalar(select(CoverageCell))
+    assert coverage is not None
+    assert coverage.status == "BLOCKED"
+    assert coverage.blocker == "MANUAL_AUTH_REQUIRED_CODEX"
+    assert coverage.evidence_json[0]["sha256"] == "e" * 64
+    assert result["coverage_status"] == "BLOCKED"
+    assert final["status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
 async def test_audit_cell_preparation_is_bounded_and_schema_driven(tmp_path: Path) -> None:
     handler = MetadataActivityHandler(
         Settings(database_url=f"sqlite:///{tmp_path / 'prepare.sqlite'}")

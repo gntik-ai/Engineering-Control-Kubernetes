@@ -205,6 +205,7 @@ class MetadataActivityHandler:
         {
             "audit.prepare_agent_cell",
             "campaign.persist_coverage",
+            "campaign.persist_cell_blocker",
             "campaign.persist_cell_result",
             "campaign.finalize",
             "finding.load_candidate",
@@ -274,6 +275,8 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._prepare_agent_cell, payload)
             if step == "campaign.persist_coverage":
                 return await asyncio.to_thread(self._persist_coverage, payload)
+            if step == "campaign.persist_cell_blocker":
+                return await asyncio.to_thread(self._persist_cell_blocker, payload)
             if step == "campaign.persist_cell_result":
                 return await asyncio.to_thread(self._persist_cell_result, payload)
             if step == "campaign.finalize":
@@ -457,6 +460,45 @@ class MetadataActivityHandler:
                     )
                 )
         return {**payload, "status": "COVERAGE_PERSISTED", "persisted_cells": len(cells)}
+
+    def _persist_cell_blocker(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["campaign_id"]))
+        cell = CampaignCellRecord.model_validate(payload["cell"])
+        blocker = str(payload.get("blocker") or payload.get("status") or "BLOCKED")
+        if not blocker or len(blocker) > 200:
+            raise ValueError("audit cell blocker is invalid")
+        deterministic_sha = str(payload.get("deterministic_evidence_sha256", ""))
+        if not re.fullmatch(r"[a-f0-9]{64}", deterministic_sha):
+            raise ValueError("audit cell blocker requires deterministic evidence")
+        evidence = [
+            {
+                "kind": "deterministic-snapshot",
+                "reference": (
+                    f"coverage:{cell.domain}:{cell.persona}:{cell.lens.value}:"
+                    f"{cell.environment}"
+                ),
+                "sha256": deterministic_sha,
+            }
+        ]
+        with self.sessions.begin() as session:
+            campaign = session.get(Campaign, campaign_id)
+            coverage = session.get(CoverageCell, self._cell_id(campaign_id, cell))
+            if campaign is None or coverage is None:
+                raise ValueError("campaign coverage cell does not exist")
+            coverage.status = "BLOCKED"
+            coverage.blocker = blocker
+            coverage.evidence_json = evidence
+            coverage.result_json = {
+                "provider": payload.get("provider"),
+                "status": "BLOCKED",
+                "blocker": blocker,
+            }
+        return {
+            **payload,
+            "blocker": blocker,
+            "coverage_status": "BLOCKED",
+            "blocker_evidence": evidence,
+        }
 
     def _prepare_agent_cell(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["campaign_id"]))
