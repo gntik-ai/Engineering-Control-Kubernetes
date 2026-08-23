@@ -38,6 +38,7 @@ install -d -o engineering-control -g engineering-control -m 0750 "${STATE_ROOT}"
   "${STATE_ROOT}/leases"
 install -d -o root -g root -m 0700 "${STATE_ROOT}/postgresql"
 chown 70:70 "${STATE_ROOT}/postgresql"
+install -d -o root -g root -m 0711 "${PLATFORM_ROOT}"
 install -d -o engineering-control -g engineering-control -m 0750 \
   "${PLATFORM_ROOT}/mirrors" "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
