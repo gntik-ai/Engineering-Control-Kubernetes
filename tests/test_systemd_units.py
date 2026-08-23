@@ -10,6 +10,16 @@ def test_migration_unit_remains_active_after_success() -> None:
     assert "RemainAfterExit=yes" in unit
 
 
+def test_scheduler_registration_is_bounded_and_retries_transient_failures() -> None:
+    unit = (REPOSITORY_ROOT / "systemd" / "engineering-scheduler.service").read_text(
+        encoding="utf-8"
+    )
+
+    assert "TimeoutStartSec=45s" in unit
+    assert "Restart=on-failure" in unit
+    assert "RestartSec=15s" in unit
+
+
 def test_acceptance_worker_is_bounded_to_synthetic_temporary_root() -> None:
     unit = (REPOSITORY_ROOT / "systemd" / "engineering-acceptance-worker.service").read_text(
         encoding="utf-8"

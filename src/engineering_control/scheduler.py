@@ -20,6 +20,8 @@ from engineering_control.logging import configure_logging
 from engineering_control.workflows.inputs import CleanupInput, QuotaRefreshInput
 from engineering_control.workflows.names import WorkflowName
 
+CONFIGURE_TIMEOUT_SECONDS = 30.0
+
 
 def schedules(task_queue: str, *, cleanup_execution_enabled: bool = False) -> dict[str, Schedule]:
     return {
@@ -63,12 +65,15 @@ async def ensure_schedule(client: Client, schedule_id: str, desired: Schedule) -
 async def configure() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
-    client = await Client.connect(settings.temporal_target, namespace=settings.temporal_namespace)
-    for schedule_id, desired in schedules(
-        settings.temporal_task_queue,
-        cleanup_execution_enabled=settings.cleanup_execution_enabled,
-    ).items():
-        await ensure_schedule(client, schedule_id, desired)
+    async with asyncio.timeout(CONFIGURE_TIMEOUT_SECONDS):
+        client = await Client.connect(
+            settings.temporal_target, namespace=settings.temporal_namespace
+        )
+        for schedule_id, desired in schedules(
+            settings.temporal_task_queue,
+            cleanup_execution_enabled=settings.cleanup_execution_enabled,
+        ).items():
+            await ensure_schedule(client, schedule_id, desired)
 
 
 def run() -> None:
