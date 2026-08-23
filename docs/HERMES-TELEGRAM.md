@@ -4,8 +4,10 @@ Hermes remains the supported 0.20.0 installation discovered at `/home/hermes/.he
 systemd service is enabled and active. The control plane adds a user plugin for command discovery
 and a gateway command hook for authenticated execution. Vendor source is not patched.
 
-Supported commands are `/audit`, `/campaigns`, `/findings`, `/run`, `/status`, `/evidence`,
-`/approve`, `/reject`, `/pause`, `/resume`, `/cancel`, `/usage`, `/validate`, and `/rollback`.
+Supported commands are `/audit`, `/campaigns`, `/findings`, `/verify`, `/run`, `/status`,
+`/evidence`, `/approve`, `/reject`, `/pause`, `/resume`, `/cancel`, `/usage`, `/validate`, and
+`/rollback`. `/verify <finding-uuid>` starts only the independent read-only verification workflow;
+it cannot file an issue or deliver a change unless the finding later reaches `CONFIRMED`.
 `/validate [hold-seconds]` starts only the bounded local synthetic lifecycle; it has no product,
 model, GitHub, or deployment access. The hook accepts only Telegram events, checks the numeric
 sender against

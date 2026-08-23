@@ -65,6 +65,7 @@ def parser() -> argparse.ArgumentParser:
         commands.add_parser(name).add_argument("workflow_id")
     commands.add_parser("usage")
     commands.add_parser("evidence").add_argument("artifact_id")
+    commands.add_parser("verify-finding").add_argument("finding_id")
     delivery = commands.add_parser("delivery")
     delivery.add_argument("finding_id")
     delivery.add_argument("--risk", choices=("R0", "R1", "R2", "R3"), required=True)
@@ -123,6 +124,8 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         return client.request("GET", "/v1/usage")
     if command == "evidence":
         return client.request("GET", f"/v1/evidence/{arguments.artifact_id}")
+    if command == "verify-finding":
+        return client.request("POST", "/v1/findings/verify", {"finding_id": arguments.finding_id})
     if command == "delivery":
         return client.request(
             "POST",

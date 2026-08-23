@@ -29,3 +29,11 @@ engineering-ctl audit falcone \
 Omit `--execute` for dry-run. Broad campaigns should be scheduled only after mirror access,
 deterministic scanners, quota snapshots, provider authentication, and required environment
 credentials pass validation. Candidate findings are not filed automatically.
+
+When a cell produces `CANDIDATE_FOUND`, the campaign starts a durable
+`FindingVerificationWorkflow` child bound to that finding. The child uses the opposite provider,
+two fresh reproductions, positive and negative controls, environment validation, a deterministic
+fingerprint, and GitHub duplicate search before it can set `CONFIRMED_FINDING`. A credential or
+quota blocker remains explicit and resumable. Operators may retry a `CANDIDATE`, `FLAKY`, or
+`BLOCKED` finding with `engineering-ctl verify-finding <finding-uuid>` or Telegram
+`/verify <finding-uuid>`; neither route can skip verification.

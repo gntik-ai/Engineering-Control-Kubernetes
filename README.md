@@ -22,6 +22,7 @@ repository creation, or credential copy is performed by this repository's bootst
 - approvals bind to immutable source, deployment, image, target, and evidence digests;
 - R3 work requires typed human approval and cross-provider verification;
 - unknown quota is represented as unknown, never invented;
+- provider invocation outcomes and exposed usage are durably tracked by role without storing prompts;
 - native CLI rate limits produce a durable `RATE_LIMITED` handoff, never paid API fallback;
 - all persisted output passes through central secret redaction.
 

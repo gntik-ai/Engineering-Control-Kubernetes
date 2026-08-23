@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 from typing import Any, Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from temporalio.client import Client
 
@@ -23,6 +23,7 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     DeliveryReconciliationInput,
+    FindingVerificationInput,
     IssueDeliveryInput,
     PreviewDeploymentInput,
     RecoveryInput,
@@ -35,6 +36,7 @@ from engineering_control.workflows.names import WorkflowName
 class ControlService(Protocol):
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted: ...
     async def start_delivery(self, request: DeliveryStart) -> OperationAccepted: ...
+    async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted: ...
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
@@ -75,6 +77,23 @@ class TemporalControlService:
         handle = await self.client.start_workflow(
             WorkflowName.ISSUE_DELIVERY.value,
             IssueDeliveryInput(**request.model_dump()),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted:
+        workflow_id = f"finding-verify-{finding_id}-{uuid4()}"
+        project = await self.repository.create_finding_verification_run(workflow_id, finding_id)
+        handle = await self.client.start_workflow(
+            WorkflowName.FINDING_VERIFICATION.value,
+            FindingVerificationInput(
+                finding_id=str(finding_id),
+                project=project.value,
+                fresh_snapshot=True,
+            ),
             id=workflow_id,
             task_queue=self.task_queue,
         )

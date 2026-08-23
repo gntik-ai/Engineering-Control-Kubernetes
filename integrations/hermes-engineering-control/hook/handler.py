@@ -25,6 +25,7 @@ COMMANDS = {
     "resume",
     "cancel",
     "usage",
+    "verify",
     "validate",
     "rollback",
 }
@@ -134,6 +135,11 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if len(args) != 1:
             raise ValueError("usage: /status <workflow-id>")
         return _request("GET", f"/v1/runs/{urllib.parse.quote(args[0], safe='')}", actor)
+    if command == "verify":
+        if len(args) != 1:
+            raise ValueError("usage: /verify <finding-uuid>")
+        finding_id = _uuid(args[0], "finding ID")
+        return _request("POST", "/v1/findings/verify", actor, {"finding_id": finding_id})
     if command == "validate":
         if len(args) > 1:
             raise ValueError("usage: /validate [hold-seconds]")

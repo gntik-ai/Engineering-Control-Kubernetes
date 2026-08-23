@@ -21,6 +21,7 @@ from engineering_control.db.models import (
     CoverageCell,
     Deployment,
     Finding,
+    FindingVerification,
     Incident,
     QuotaSnapshot,
     Run,
@@ -193,6 +194,7 @@ async def test_audit_cell_preparation_is_bounded_and_schema_driven(tmp_path: Pat
                 "deployment_worktree": str(tmp_path / "deployment"),
             },
             "deterministic": {"evidence_sha256": "c" * 64},
+            "orchestration": {"workflow_id": f"audit-falcone-{campaign.id}"},
         },
     )
 
@@ -261,9 +263,14 @@ async def test_failed_audit_cell_creates_candidate_not_confirmed_finding(tmp_pat
     assert result["finding_id"] == str(finding.id)
     assert final["status"] == "VERIFICATION_REQUIRED"
 
+    verification_workflow_id = f"finding-verify-{finding.id}-{uuid4()}"
     loaded = await handler.handle(
         "finding.load_candidate",
-        {"finding_id": str(finding.id), "project": "falcone"},
+        {
+            "finding_id": str(finding.id),
+            "project": "falcone",
+            "orchestration": {"workflow_id": verification_workflow_id},
+        },
     )
     snapshot = {
         **loaded,
@@ -275,7 +282,12 @@ async def test_failed_audit_cell_creates_candidate_not_confirmed_finding(tmp_pat
     }
     prepared = await handler.handle(
         "finding.prepare_verifier",
-        {"finding": loaded, "snapshot": snapshot, "ordinal": 1},
+        {
+            "finding": loaded,
+            "snapshot": snapshot,
+            "ordinal": 1,
+            "orchestration": {"workflow_id": verification_workflow_id},
+        },
     )
     assert prepared["provider"] == "codex"
     attempt = {
@@ -306,19 +318,32 @@ async def test_failed_audit_cell_creates_candidate_not_confirmed_finding(tmp_pat
         "finding.dedupe",
         {"finding": loaded, "attempts": [attempt, attempt], "controls": controls},
     )
-    verified = await handler.handle(
-        "finding.finalize",
-        {
-            "finding": loaded,
-            "attempts": [attempt, attempt],
-            "controls": controls,
-            "duplicate": duplicate,
-        },
-    )
+    verification_payload = {
+        "finding": loaded,
+        "attempts": [attempt, attempt],
+        "controls": controls,
+        "duplicate": duplicate,
+        "orchestration": {"workflow_id": verification_workflow_id},
+    }
+    verified = await handler.handle("finding.finalize", verification_payload)
+    retried = await handler.handle("finding.finalize", verification_payload)
 
     assert controls["disposition"] == "CONFIRMED"
     assert duplicate["blocker"] == "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED"
     assert verified["disposition"] == "BLOCKED"
+    assert retried["disposition"] == "BLOCKED"
+    with handler.sessions() as session:
+        persisted_verification = session.scalar(select(FindingVerification))
+        persisted_run = session.scalar(
+            select(Run).where(Run.workflow_id == verification_workflow_id)
+        )
+        persisted_finding = session.get(Finding, finding.id)
+    assert persisted_verification is not None
+    assert persisted_run is not None
+    assert persisted_verification.run_id == persisted_run.id
+    assert persisted_run is not None and persisted_run.status == "BLOCKED"
+    assert persisted_finding is not None
+    assert len(persisted_finding.evidence_json) == 3
 
 
 @pytest.mark.asyncio

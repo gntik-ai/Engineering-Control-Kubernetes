@@ -40,3 +40,21 @@ def test_cli_reconciliation_defaults_to_observation_only() -> None:
     assert result["path"] == "/v1/deliveries/reconcile"
     assert result["payload"]["dry_run"] is True
     assert result["payload"]["candidate_build_run_id"] == 42
+
+
+def test_cli_finding_verification_uses_only_the_bounded_route() -> None:
+    class FakeClient:
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            return {"method": method, "path": path, "payload": payload}
+
+    finding_id = "11111111-1111-4111-8111-111111111111"
+    arguments = parser().parse_args(["verify-finding", finding_id])
+    result = dispatch(FakeClient(), arguments)  # type: ignore[arg-type]
+
+    assert result == {
+        "method": "POST",
+        "path": "/v1/findings/verify",
+        "payload": {"finding_id": finding_id},
+    }

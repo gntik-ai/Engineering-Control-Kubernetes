@@ -29,6 +29,12 @@ health, deployment duration/failures, verification failures, and indexed evidenc
 role worker publishes a signed identity-bound heartbeat through the upload-only ingest listener;
 a claimed identity that differs from the token owner is rejected.
 
+`engineering-ctl usage` and Telegram `/usage` show each provider's latest native CLI snapshot plus
+a seven-day, PostgreSQL-derived history by role. Unknown capacity, reset time, token counts, and
+estimated cost remain `null`; the control plane never converts missing provider data into an
+estimate. Invocation starts and terminal results are idempotently bound to the Temporal workflow
+and normalized provider run IDs.
+
 Back up PostgreSQL and `/etc/engineering-control` before upgrades. Do not back up provider OAuth or
 SSH private keys into general platform archives. Temporal and PostgreSQL must be healthy before
 starting API/workers. The notifier uses an outbox so an unavailable sink does not lose state.

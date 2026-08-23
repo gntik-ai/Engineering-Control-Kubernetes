@@ -95,6 +95,7 @@ Check—but do not apply—the later C-01 Hermes provider cutover:
 ```bash
 engineering-ctl campaigns --limit 20
 engineering-ctl findings --limit 20
+engineering-ctl verify-finding <finding-uuid>
 engineering-ctl status <workflow-id>
 engineering-ctl pause <workflow-id>
 engineering-ctl resume <workflow-id>

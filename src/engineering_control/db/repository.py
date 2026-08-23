@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
 
-from sqlalchemy import create_engine, func, or_, select
+from sqlalchemy import case, create_engine, func, or_, select
 from sqlalchemy.orm import sessionmaker
 
 from engineering_control.api.schemas import (
@@ -27,6 +27,7 @@ from engineering_control.db.models import (
     ChangeSet,
     Deployment,
     Finding,
+    ProviderUsage,
     QuotaSnapshot,
     Run,
     VerificationResult,
@@ -55,6 +56,9 @@ class MetadataRepository(Protocol):
     ) -> None: ...
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
+    async def create_finding_verification_run(
+        self, workflow_id: str, finding_id: UUID
+    ) -> Project: ...
     async def create_delivery_reconciliation_run(
         self, workflow_id: str, request: DeliveryReconcile
     ) -> None: ...
@@ -72,6 +76,7 @@ class MetadataRepository(Protocol):
     async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None: ...
     async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None: ...
     async def latest_quota_snapshots(self) -> dict[str, dict[str, Any]]: ...
+    async def provider_usage_history(self, days: int = 7) -> dict[str, dict[str, Any]]: ...
     async def workflow_for_change_set(self, change_set_id: UUID) -> str | None: ...
     async def current_approval_candidate(self, change_set_id: UUID) -> dict[str, Any] | None: ...
     async def persist_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
@@ -135,6 +140,39 @@ class SQLMetadataRepository:
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         await asyncio.to_thread(self._create_delivery_run, workflow_id, request)
+
+    async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+        return await asyncio.to_thread(
+            self._create_finding_verification_run, workflow_id, finding_id
+        )
+
+    def _create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+        with self.sessions.begin() as session:
+            finding = session.get(Finding, finding_id)
+            if finding is None or finding.disposition not in {"CANDIDATE", "FLAKY", "BLOCKED"}:
+                raise ValueError("verification requires a CANDIDATE, FLAKY, or BLOCKED finding")
+            active = session.scalar(
+                select(Run).where(
+                    Run.campaign_id == finding.campaign_id,
+                    Run.run_type == "finding-verification",
+                    Run.summary == str(finding.id),
+                    Run.status.in_({"QUEUED", "RUNNING", "RATE_LIMITED"}),
+                )
+            )
+            if active is not None:
+                raise ValueError("an active verification already owns this finding")
+            project = Project(finding.project)
+            session.add(
+                Run(
+                    campaign_id=finding.campaign_id,
+                    workflow_id=workflow_id,
+                    run_type="finding-verification",
+                    status="QUEUED",
+                    project=project.value,
+                    summary=str(finding.id),
+                )
+            )
+            return project
 
     def _create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         with self.sessions.begin() as session:
@@ -593,6 +631,99 @@ class SQLMetadataRepository:
                     latest[row.provider] = serialize_row(row)
             return latest
 
+    async def provider_usage_history(self, days: int = 7) -> dict[str, dict[str, Any]]:
+        if not 1 <= days <= 31:
+            raise ValueError("provider usage history window must be between 1 and 31 days")
+        return await asyncio.to_thread(self._provider_usage_history, days)
+
+    def _provider_usage_history(self, days: int) -> dict[str, dict[str, Any]]:
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        with self.sessions() as session:
+            invocation_rows = session.execute(
+                select(
+                    AgentInvocation.provider,
+                    AgentInvocation.role,
+                    func.count(),
+                    func.sum(case((AgentInvocation.status == "SUCCESS", 1), else_=0)),
+                )
+                .where(AgentInvocation.started_at >= cutoff)
+                .group_by(AgentInvocation.provider, AgentInvocation.role)
+            ).all()
+            usage_rows = session.execute(
+                select(
+                    ProviderUsage.provider,
+                    ProviderUsage.role,
+                    func.sum(ProviderUsage.input_tokens),
+                    func.sum(ProviderUsage.output_tokens),
+                    func.sum(ProviderUsage.cached_input_tokens),
+                    func.sum(ProviderUsage.estimated_cost),
+                )
+                .where(ProviderUsage.created_at >= cutoff)
+                .group_by(ProviderUsage.provider, ProviderUsage.role)
+            ).all()
+            running_rows = session.execute(
+                select(AgentInvocation.provider, func.count())
+                .where(AgentInvocation.status == "RUNNING")
+                .group_by(AgentInvocation.provider)
+            ).all()
+        history: dict[str, dict[str, Any]] = {}
+        for provider, role, invocations, successes in invocation_rows:
+            count = int(invocations or 0)
+            success_count = int(successes or 0)
+            provider_record = history.setdefault(
+                str(provider), {"window_days": days, "running_jobs": 0, "roles": {}}
+            )
+            provider_record["roles"][str(role)] = {
+                "invocations": count,
+                "successes": success_count,
+                "success_rate": success_count / count if count else None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "cached_input_tokens": None,
+                "estimated_cost": None,
+            }
+        for (
+            provider,
+            role,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            estimated_cost,
+        ) in usage_rows:
+            provider_record = history.setdefault(
+                str(provider), {"window_days": days, "running_jobs": 0, "roles": {}}
+            )
+            role_record = provider_record["roles"].setdefault(
+                str(role),
+                {
+                    "invocations": 0,
+                    "successes": 0,
+                    "success_rate": None,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "cached_input_tokens": None,
+                    "estimated_cost": None,
+                },
+            )
+            role_record.update(
+                {
+                    "input_tokens": int(input_tokens) if input_tokens is not None else None,
+                    "output_tokens": int(output_tokens) if output_tokens is not None else None,
+                    "cached_input_tokens": (
+                        int(cached_tokens) if cached_tokens is not None else None
+                    ),
+                    "estimated_cost": (
+                        float(estimated_cost) if estimated_cost is not None else None
+                    ),
+                }
+            )
+        for provider, running_jobs in running_rows:
+            provider_record = history.setdefault(
+                str(provider), {"window_days": days, "running_jobs": 0, "roles": {}}
+            )
+            provider_record["running_jobs"] = int(running_jobs or 0)
+        return history
+
     async def workflow_for_change_set(self, change_set_id: UUID) -> str | None:
         return await asyncio.to_thread(self._workflow_for_change_set, change_set_id)
 
@@ -671,6 +802,9 @@ class EmptyMetadataRepository:
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         return None
 
+    async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+        raise ValueError("finding verification metadata store is unavailable")
+
     async def create_delivery_reconciliation_run(
         self, workflow_id: str, request: DeliveryReconcile
     ) -> None:
@@ -703,6 +837,9 @@ class EmptyMetadataRepository:
         return None
 
     async def latest_quota_snapshots(self) -> dict[str, dict[str, Any]]:
+        return {}
+
+    async def provider_usage_history(self, days: int = 7) -> dict[str, dict[str, Any]]:
         return {}
 
     async def workflow_for_change_set(self, change_set_id: UUID) -> str | None:

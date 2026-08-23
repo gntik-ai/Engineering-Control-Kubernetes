@@ -16,7 +16,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.retention import (
@@ -40,13 +40,14 @@ from engineering_control.db.models import (
     FindingVerification,
     Incident,
     Issue,
+    ProviderUsage,
     QuotaSnapshot,
     Run,
     VerificationResult,
     WorktreeLease,
 )
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
-from engineering_control.models.core import AgentRequest
+from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.core import ChangeSet as ChangeSetModel
 from engineering_control.models.enums import (
     AuditLens,
@@ -232,6 +233,16 @@ class RuntimeTargetRecord(BaseModel):
 class MetadataActivityHandler:
     """Controller-side authoritative metadata writes for idempotent activity results."""
 
+    _provider_request_keys = {
+        "audit.agent_cell": "agent_request",
+        "finding.reproduce": "verifier_request",
+        "delivery.invoke_spec": "spec_request",
+        "delivery.invoke_maker": "maker_request",
+        "delivery.invoke_deployment_maker": "deployment_maker_request",
+        "delivery.invoke_checker": "checker_request",
+        "runtime.independent_review": "runtime_review_request",
+    }
+
     supported_steps = frozenset(
         {
             "audit.prepare_agent_cell",
@@ -244,6 +255,9 @@ class MetadataActivityHandler:
             "finding.controls",
             "finding.dedupe",
             "finding.finalize",
+            "finding.record_terminal",
+            "agent.record_start",
+            "agent.persist_result",
             "delivery.load_confirmed_finding",
             "delivery.ensure_issue",
             "delivery.acquire_leases",
@@ -323,6 +337,12 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._dedupe_finding, payload)
             if step == "finding.finalize":
                 return await asyncio.to_thread(self._finalize_finding, payload)
+            if step == "finding.record_terminal":
+                return await asyncio.to_thread(self._record_finding_terminal, payload)
+            if step == "agent.record_start":
+                return await asyncio.to_thread(self._record_agent_start, payload)
+            if step == "agent.persist_result":
+                return await asyncio.to_thread(self._persist_agent_result, payload)
             if step == "delivery.load_confirmed_finding":
                 return await asyncio.to_thread(self._load_confirmed_finding, payload)
             if step == "delivery.ensure_issue":
@@ -442,6 +462,230 @@ class MetadataActivityHandler:
             ) from error
         raise ApplicationError("unsupported metadata activity", non_retryable=True)
 
+    def _record_agent_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = self._agent_request(payload)
+        workflow_id = self._workflow_id(payload)
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = self._provider_control_run(session, workflow_id, request, payload, now)
+            invocation = session.get(AgentInvocation, request.run_id)
+            if invocation is None:
+                invocation = AgentInvocation(
+                    id=request.run_id,
+                    run_id=run.id,
+                    provider=request.provider.value,
+                    role=request.role,
+                    model_class=request.model_class.value,
+                    provider_session_id=None,
+                    status="RUNNING",
+                    summary=None,
+                    structured_result={},
+                    error_code=None,
+                    started_at=now,
+                    finished_at=None,
+                )
+                session.add(invocation)
+            else:
+                self._validate_invocation_binding(invocation, run, request)
+                if invocation.finished_at is None:
+                    invocation.status = "RUNNING"
+            if run.started_at is None:
+                run.started_at = now
+            if run.status == "QUEUED":
+                run.status = "RUNNING"
+        return {
+            **payload,
+            "agent_invocation_id": str(request.run_id),
+            "agent_invocation_status": "RUNNING",
+        }
+
+    def _persist_agent_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = self._agent_request(payload)
+        workflow_id = self._workflow_id(payload)
+        raw_result = payload.get("agent_result")
+        result = AgentResult.model_validate(raw_result) if isinstance(raw_result, dict) else None
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = self._provider_control_run(session, workflow_id, request, payload, now)
+            invocation = session.get(AgentInvocation, request.run_id)
+            if invocation is None:
+                raise ValueError("provider result has no recorded invocation start")
+            self._validate_invocation_binding(invocation, run, request)
+            if result is not None:
+                if (
+                    result.run_id != request.run_id
+                    or result.provider is not request.provider
+                    or result.role != request.role
+                ):
+                    raise ValueError(
+                        "provider result identity does not match its immutable request"
+                    )
+                if invocation.finished_at is not None and (
+                    invocation.provider_session_id != result.provider_session_id
+                    or invocation.status != result.status.value
+                    or invocation.summary != result.summary
+                    or invocation.structured_result != result.structured_result
+                    or invocation.error_code != result.error_code
+                ):
+                    raise ValueError(
+                        "agent invocation idempotency key conflicts with stored result"
+                    )
+                invocation.provider_session_id = result.provider_session_id
+                invocation.status = result.status.value
+                invocation.summary = result.summary
+                invocation.structured_result = result.structured_result
+                invocation.error_code = result.error_code
+                invocation.started_at = result.started_at
+                invocation.finished_at = result.finished_at
+                usage_id = uuid5(NAMESPACE_URL, f"provider-usage:{request.run_id}")
+                usage = session.get(ProviderUsage, usage_id)
+                if usage is None:
+                    usage = ProviderUsage(
+                        id=usage_id,
+                        provider=result.provider.value,
+                        run_id=run.id,
+                        role=result.role,
+                        input_tokens=result.usage.input_tokens,
+                        output_tokens=result.usage.output_tokens,
+                        cached_input_tokens=result.usage.cached_input_tokens,
+                        estimated_cost=result.usage.estimated_cost,
+                        source=result.usage.source,
+                    )
+                    session.add(usage)
+                else:
+                    self._validate_usage_binding(usage, run, result)
+                if result.status.value != "SUCCESS":
+                    run.status = result.status.value
+                    run.error_code = result.error_code or result.status.value
+                    if result.status.value != "RATE_LIMITED":
+                        run.finished_at = result.finished_at
+            else:
+                status = str(payload.get("status", "BLOCKED"))
+                blocker = str(payload.get("blocker", status))
+                if status not in {"BLOCKED", "RATE_LIMITED", "FAILED", "TIMED_OUT", "CANCELLED"}:
+                    raise ValueError("provider response without a result must be terminal")
+                if invocation.finished_at is not None and (
+                    invocation.status != status or invocation.error_code != blocker
+                ):
+                    raise ValueError(
+                        "agent invocation idempotency key conflicts with stored blocker"
+                    )
+                invocation.status = status
+                invocation.summary = blocker
+                invocation.error_code = blocker
+                invocation.finished_at = now
+                run.status = status
+                run.error_code = blocker
+                if status != "RATE_LIMITED":
+                    run.finished_at = now
+        return {
+            **payload,
+            "agent_invocation_id": str(request.run_id),
+            "agent_invocation_status": result.status.value if result is not None else status,
+        }
+
+    def _agent_request(self, payload: dict[str, Any]) -> AgentRequest:
+        provider_step = str(payload.get("provider_step", ""))
+        request_key = self._provider_request_keys.get(provider_step)
+        if request_key is None:
+            raise ValueError("provider telemetry step is not allowlisted")
+        raw_request = payload.get(request_key)
+        if not isinstance(raw_request, dict):
+            raise ValueError("provider telemetry is missing its normalized request")
+        return AgentRequest.model_validate(raw_request)
+
+    @staticmethod
+    def _workflow_id(payload: dict[str, Any]) -> str:
+        orchestration = payload.get("orchestration")
+        if not isinstance(orchestration, dict):
+            raise ValueError("provider telemetry requires Temporal orchestration identity")
+        workflow_id = str(orchestration.get("workflow_id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,239}", workflow_id):
+            raise ValueError("provider telemetry workflow identity is invalid")
+        return workflow_id
+
+    def _provider_control_run(
+        self,
+        session: Session,
+        workflow_id: str,
+        request: AgentRequest,
+        payload: dict[str, Any],
+        now: datetime,
+    ) -> Run:
+        run = session.scalar(
+            select(Run)
+            .where(Run.workflow_id == workflow_id)
+            .order_by(Run.created_at.desc())
+            .limit(1)
+        )
+        if run is not None:
+            if run.project != request.project.value:
+                raise ValueError("provider telemetry project does not match its control run")
+            return run
+        run = Run(
+            id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
+            campaign_id=request.campaign_id,
+            change_set_id=request.change_set_id,
+            workflow_id=workflow_id,
+            run_type=self._provider_run_type(str(payload["provider_step"])),
+            status="RUNNING",
+            project=request.project.value,
+            worker="controller",
+            started_at=now,
+        )
+        session.add(run)
+        session.flush()
+        return run
+
+    @staticmethod
+    def _provider_run_type(provider_step: str) -> str:
+        if provider_step.startswith("audit."):
+            return "audit-campaign"
+        if provider_step.startswith("finding."):
+            return "finding-verification"
+        if provider_step.startswith("delivery."):
+            return "issue-delivery"
+        if provider_step.startswith("runtime."):
+            return "runtime-verification"
+        raise ValueError("provider telemetry step has no bounded run type")
+
+    @staticmethod
+    def _validate_invocation_binding(
+        invocation: AgentInvocation, run: Run, request: AgentRequest
+    ) -> None:
+        if (
+            invocation.run_id != run.id
+            or invocation.provider != request.provider.value
+            or invocation.role != request.role
+            or invocation.model_class != request.model_class.value
+        ):
+            raise ValueError("agent invocation idempotency key conflicts with stored metadata")
+
+    @staticmethod
+    def _validate_usage_binding(usage: ProviderUsage, run: Run, result: AgentResult) -> None:
+        expected = (
+            run.id,
+            result.provider.value,
+            result.role,
+            result.usage.input_tokens,
+            result.usage.output_tokens,
+            result.usage.cached_input_tokens,
+            result.usage.estimated_cost,
+            result.usage.source,
+        )
+        observed = (
+            usage.run_id,
+            usage.provider,
+            usage.role,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.estimated_cost,
+            usage.source,
+        )
+        if observed != expected:
+            raise ValueError("provider usage idempotency key conflicts with stored telemetry")
+
     async def _quota(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw_snapshots = payload.get("snapshots")
         if not isinstance(raw_snapshots, list):
@@ -555,10 +799,12 @@ class MetadataActivityHandler:
                 "status": decision.status,
                 "routing_reason": decision.reason,
             }
+        workflow_id = self._workflow_id(payload)
         request_id = uuid5(
             NAMESPACE_URL,
             "audit-agent:"
-            f"{campaign_id}:{cell.domain}:{cell.persona}:{cell.lens.value}:{cell.environment}",
+            f"{workflow_id}:{campaign_id}:{cell.domain}:{cell.persona}:"
+            f"{cell.lens.value}:{cell.environment}",
         )
         prompt = (
             "Audit exactly one immutable coverage cell. Do not modify files. "
@@ -721,16 +967,49 @@ class MetadataActivityHandler:
 
     def _load_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
         finding_id = UUID(str(payload["finding_id"]))
-        with self.sessions() as session:
+        workflow_id = self._workflow_id(payload)
+        with self.sessions.begin() as session:
             finding = session.get(Finding, finding_id)
-            if finding is None or finding.disposition != "CANDIDATE":
-                raise ValueError("verification requires a CANDIDATE finding")
+            if finding is None or finding.disposition not in {"CANDIDATE", "FLAKY", "BLOCKED"}:
+                raise ValueError("verification requires a CANDIDATE, FLAKY, or BLOCKED finding")
+            if str(payload.get("project", "")) != finding.project:
+                raise ValueError("verification project does not match the authoritative finding")
             coverage = session.get(CoverageCell, finding.coverage_cell_id)
             if coverage is None:
                 raise ValueError("finding coverage metadata is missing")
             discoverer = coverage.result_json.get("provider")
             if discoverer not in {Provider.CODEX.value, Provider.CLAUDE.value}:
                 raise ValueError("finding discoverer provider is missing")
+            run = session.scalar(
+                select(Run)
+                .where(Run.workflow_id == workflow_id)
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if run is None:
+                run = Run(
+                    id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
+                    campaign_id=finding.campaign_id,
+                    workflow_id=workflow_id,
+                    run_type="finding-verification",
+                    status="RUNNING",
+                    project=finding.project,
+                    worker="controller",
+                    started_at=datetime.now(UTC),
+                    summary=str(finding.id),
+                )
+                session.add(run)
+            elif (
+                run.campaign_id != finding.campaign_id
+                or run.project != finding.project
+                or run.run_type != "finding-verification"
+            ):
+                raise ValueError("finding verification workflow conflicts with stored run metadata")
+            else:
+                if run.status == "QUEUED":
+                    run.status = "RUNNING"
+                if run.started_at is None:
+                    run.started_at = datetime.now(UTC)
             return {
                 **payload,
                 "status": "CANDIDATE_LOADED",
@@ -769,9 +1048,11 @@ class MetadataActivityHandler:
         )
         if routing.primary is None:
             return {**payload, "status": routing.status, "routing_reason": routing.reason}
+        workflow_id = self._workflow_id(payload)
         run_id = uuid5(
             NAMESPACE_URL,
-            f"finding-verifier:{finding['finding_id']}:{snapshot['source_sha']}:{ordinal}",
+            f"finding-verifier:{workflow_id}:{finding['finding_id']}:"
+            f"{snapshot['source_sha']}:{ordinal}",
         )
         prompt = (
             "Independently verify one candidate finding from a fresh immutable snapshot. "
@@ -918,6 +1199,7 @@ class MetadataActivityHandler:
         elif duplicate.get("status") == "DUPLICATE":
             disposition = "DUPLICATE"
         finding_id = UUID(str(finding_payload["finding_id"]))
+        workflow_id = self._workflow_id(payload)
         evidence: list[Any] = []
         verifier_provider: str | None = None
         for attempt in attempts:
@@ -929,8 +1211,55 @@ class MetadataActivityHandler:
                 evidence.extend(attempt_evidence)
         with self.sessions.begin() as session:
             finding = session.get(Finding, finding_id)
-            if finding is None or finding.disposition != "CANDIDATE":
-                raise ValueError("finding is no longer a candidate")
+            if finding is None:
+                raise ValueError("finding does not exist")
+            run = session.scalar(
+                select(Run)
+                .where(Run.workflow_id == workflow_id)
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if run is None or run.project != finding.project:
+                raise ValueError("finding verification control run is missing")
+            verification_id = uuid5(
+                NAMESPACE_URL,
+                f"finding-verification:{finding_id}:{workflow_id}",
+            )
+            existing = session.get(FindingVerification, verification_id)
+            if existing is not None:
+                expected = (
+                    finding_id,
+                    run.id,
+                    verifier_provider or "unknown",
+                    disposition,
+                    int(controls.get("reproduction_count", 0)),
+                    bool(controls.get("positive_control")),
+                    bool(controls.get("negative_control")),
+                    duplicate.get("duplicate_issue_url"),
+                )
+                observed = (
+                    existing.finding_id,
+                    existing.run_id,
+                    existing.verifier_provider,
+                    existing.disposition,
+                    existing.reproduction_count,
+                    existing.positive_control,
+                    existing.negative_control,
+                    existing.duplicate_issue_url,
+                )
+                if observed != expected or finding.disposition != disposition:
+                    raise ValueError(
+                        "finding verification idempotency key conflicts with stored result"
+                    )
+                return {
+                    **payload,
+                    "status": disposition,
+                    "disposition": disposition,
+                    "finding_id": str(finding_id),
+                    "duplicate_issue_url": duplicate.get("duplicate_issue_url"),
+                }
+            if finding.disposition not in {"CANDIDATE", "FLAKY", "BLOCKED"}:
+                raise ValueError("finding is no longer independently verifiable")
             finding.disposition = disposition
             finding.evidence_json = [*finding.evidence_json, *evidence]
             coverage = session.get(CoverageCell, finding.coverage_cell_id)
@@ -945,31 +1274,95 @@ class MetadataActivityHandler:
             }[disposition]
             if disposition == "BLOCKED":
                 coverage.blocker = str(duplicate.get("blocker") or "FINDING_VERIFICATION_BLOCKED")
-            verification_id = uuid5(
-                NAMESPACE_URL,
-                f"finding-verification:{finding_id}:{verifier_provider}:{disposition}",
-            )
-            if session.get(FindingVerification, verification_id) is None:
-                session.add(
-                    FindingVerification(
-                        id=verification_id,
-                        finding_id=finding_id,
-                        run_id=None,
-                        verifier_provider=verifier_provider or "unknown",
-                        disposition=disposition,
-                        reproduction_count=int(controls.get("reproduction_count", 0)),
-                        positive_control=bool(controls.get("positive_control")),
-                        negative_control=bool(controls.get("negative_control")),
-                        duplicate_issue_url=duplicate.get("duplicate_issue_url"),
-                        summary=f"independent verification result: {disposition}",
-                    )
+            else:
+                coverage.blocker = None
+            session.add(
+                FindingVerification(
+                    id=verification_id,
+                    finding_id=finding_id,
+                    run_id=run.id,
+                    verifier_provider=verifier_provider or "unknown",
+                    disposition=disposition,
+                    reproduction_count=int(controls.get("reproduction_count", 0)),
+                    positive_control=bool(controls.get("positive_control")),
+                    negative_control=bool(controls.get("negative_control")),
+                    duplicate_issue_url=duplicate.get("duplicate_issue_url"),
+                    summary=f"independent verification result: {disposition}",
                 )
+            )
+            run.status = (
+                "SUCCESS" if disposition in {"CONFIRMED", "REJECTED", "DUPLICATE"} else "BLOCKED"
+            )
+            run.finished_at = datetime.now(UTC)
+            run.error_code = None if run.status == "SUCCESS" else disposition
+            run.summary = f"independent verification result: {disposition}"
         return {
             **payload,
             "status": disposition,
             "disposition": disposition,
             "finding_id": str(finding_id),
             "duplicate_issue_url": duplicate.get("duplicate_issue_url"),
+        }
+
+    def _record_finding_terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        finding_payload = self._object(payload.get("finding"), "finding")
+        finding_id = UUID(str(finding_payload["finding_id"]))
+        workflow_id = self._workflow_id(payload)
+        status = str(payload.get("status", "BLOCKED"))
+        if status not in {"BLOCKED", "RATE_LIMITED", "FAILED", "TIMED_OUT", "CANCELLED"}:
+            raise ValueError("finding terminal status is not allowlisted")
+        blocker = str(payload.get("blocker") or payload.get("routing_reason") or status)
+        if not blocker or len(blocker) > 500:
+            raise ValueError("finding terminal blocker is invalid")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            finding = session.get(Finding, finding_id)
+            run = session.scalar(
+                select(Run)
+                .where(Run.workflow_id == workflow_id)
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if finding is None or run is None or run.campaign_id != finding.campaign_id:
+                raise ValueError("finding terminal metadata binding is incomplete")
+            if finding.disposition not in {"CANDIDATE", "FLAKY", "BLOCKED"}:
+                raise ValueError("finding is no longer independently verifiable")
+            finding.disposition = "BLOCKED"
+            coverage = session.get(CoverageCell, finding.coverage_cell_id)
+            if coverage is None:
+                raise ValueError("finding coverage metadata is missing")
+            coverage.status = "BLOCKED"
+            coverage.blocker = blocker
+            run.status = status
+            run.error_code = blocker
+            run.summary = f"independent verification blocked: {blocker}"
+            if status != "RATE_LIMITED":
+                run.finished_at = now
+            verification_id = uuid5(
+                NAMESPACE_URL,
+                f"finding-verification-terminal:{finding_id}:{workflow_id}",
+            )
+            if session.get(FindingVerification, verification_id) is None:
+                session.add(
+                    FindingVerification(
+                        id=verification_id,
+                        finding_id=finding_id,
+                        run_id=run.id,
+                        verifier_provider=str(payload.get("provider") or "unassigned"),
+                        disposition="BLOCKED",
+                        reproduction_count=0,
+                        positive_control=False,
+                        negative_control=False,
+                        duplicate_issue_url=None,
+                        summary=f"independent verification blocked: {blocker}",
+                    )
+                )
+        return {
+            **payload,
+            "status": status,
+            "disposition": "BLOCKED",
+            "blocker": blocker,
+            "finding_id": str(finding_id),
         }
 
     def _load_confirmed_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1296,6 +1689,7 @@ class MetadataActivityHandler:
     def _prepare_spec(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider = Provider(str(payload["spec_provider"]))
         change_set_id = UUID(str(payload["change_set_id"]))
+        workflow_id = self._workflow_id(payload)
         prompt = (
             "Produce a bounded provider-neutral OpenSpec for exactly one confirmed GitHub issue. "
             "Do not modify files and do not propose deployment execution. The source and "
@@ -1309,7 +1703,7 @@ class MetadataActivityHandler:
             f"Deployment worktree: {payload['deployment_worktree']}\n"
         )
         request = AgentRequest(
-            run_id=uuid5(NAMESPACE_URL, f"delivery-spec:{change_set_id}"),
+            run_id=uuid5(NAMESPACE_URL, f"delivery-spec:{workflow_id}:{change_set_id}"),
             project=Project(str(payload["project"])),
             role="product-spec-architect",
             provider=provider,
@@ -1358,6 +1752,7 @@ class MetadataActivityHandler:
     def _prepare_maker(self, payload: dict[str, Any], *, deployment: bool) -> dict[str, Any]:
         provider = Provider(str(payload["maker_provider"]))
         change_set_id = UUID(str(payload["change_set_id"]))
+        workflow_id = self._workflow_id(payload)
         target = "deployment" if deployment else "source"
         worktree_key = "deployment_worktree" if deployment else "source_worktree"
         request_key = "deployment_maker_request" if deployment else "maker_request"
@@ -1385,7 +1780,7 @@ class MetadataActivityHandler:
             f"Prior source maker result: {json.dumps(prior, sort_keys=True, default=str)}\n"
         )
         request = AgentRequest(
-            run_id=uuid5(NAMESPACE_URL, f"delivery-{target}-maker:{change_set_id}"),
+            run_id=uuid5(NAMESPACE_URL, f"delivery-{target}-maker:{workflow_id}:{change_set_id}"),
             project=Project(str(payload["project"])),
             role="implementer",
             provider=provider,
@@ -1410,6 +1805,7 @@ class MetadataActivityHandler:
     def _prepare_checker(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider = Provider(str(payload["checker_provider"]))
         change_set_id = UUID(str(payload["change_set_id"]))
+        workflow_id = self._workflow_id(payload)
         source_result = self._object(payload.get("agent_result"), "agent_result")
         source_maker = self._object(payload.get("source_maker_result"), "source_maker_result")
         for label, result in (
@@ -1434,7 +1830,7 @@ class MetadataActivityHandler:
             f"Latest maker result: {json.dumps(source_result, sort_keys=True, default=str)}\n"
         )
         request = AgentRequest(
-            run_id=uuid5(NAMESPACE_URL, f"delivery-checker:{change_set_id}"),
+            run_id=uuid5(NAMESPACE_URL, f"delivery-checker:{workflow_id}:{change_set_id}"),
             project=Project(str(payload["project"])),
             role="code-reviewer",
             provider=provider,
@@ -2951,6 +3347,7 @@ class MetadataActivityHandler:
         providers = payload.get("review_providers")
         if not isinstance(providers, list) or not providers:
             raise ValueError("runtime review providers are missing")
+        workflow_id = self._workflow_id(payload)
         requests: list[dict[str, Any]] = []
         for provider_value in providers:
             provider = Provider(str(provider_value))
@@ -2969,7 +3366,7 @@ class MetadataActivityHandler:
             request = AgentRequest(
                 run_id=uuid5(
                     NAMESPACE_URL,
-                    f"runtime-verifier:{payload['deployment_id']}:{provider.value}",
+                    f"runtime-verifier:{workflow_id}:{payload['deployment_id']}:{provider.value}",
                 ),
                 project=Project(str(payload["project"])),
                 role="runtime-verifier",

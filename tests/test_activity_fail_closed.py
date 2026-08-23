@@ -36,3 +36,10 @@ def test_audit_blocker_persistence_is_controller_only() -> None:
     assert "campaign.persist_cell_blocker" in ControlActivities._worker_steps["controller"]
     for worker in ("scan", "codex", "claude", "browser", "delivery", "release"):
         assert "campaign.persist_cell_blocker" not in ControlActivities._worker_steps[worker]
+
+
+def test_provider_telemetry_persistence_is_controller_only() -> None:
+    for step in ("agent.record_start", "agent.persist_result"):
+        assert step in ControlActivities._worker_steps["controller"]
+        for worker in ("scan", "codex", "claude", "browser", "delivery", "release"):
+            assert step not in ControlActivities._worker_steps[worker]

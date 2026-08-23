@@ -19,7 +19,7 @@ platform fails closed rather than bypassing.
 | 9 Worker role | ACTIVE | Six isolated Unix identities and systemd queues are active; credential-independent verifier passes |
 | 10 Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 are installed; Codex identity auth and a real structured maker call pass; Claude identity OAuth remains manual |
 | 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction |
-| 12 Quota broker | IMPLEMENTED | Provider-independent snapshots, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff |
+| 12 Quota broker | IMPLEMENTED | Provider-independent snapshots, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff, and seven-day per-role invocation/success/token/cost history without invented values |
 | 13 Temporal | ACTIVE/PASS | All required workflows installed; live worker replacement during an active lifecycle resumed durably |
 | 14 PostgreSQL metadata | IMPLEMENTED | Alembic models/migrations for every required table plus approval candidates, notification outbox, worker heartbeats, and artifact-retention tombstones |
 | 15 ChangeSet | IMPLEMENTED | First-class model, strict state policy, exact PR/CI/provenance reconciliation, digest promotion, artifact-bound approvals and deterministic metadata transitions |
@@ -32,7 +32,7 @@ platform fails closed rather than bypassing.
 | 22 Evidence | ACTIVE | Content-addressed metadata/store, identity-bound private upload, live redaction and reject-before-persistence canaries pass |
 | 23 Playwright | ACTIVE | Chromium/Firefox runtime and fixed journey harness installed under `browser-runner`; target credentials remain unprovisioned |
 | 24 Deterministic security | ACTIVE | Pinned Gitleaks, Trivy, Semgrep, Syft, Helm, kubeconform and manifest checks installed; CodeQL remains repository-owned |
-| 25 Finding verification | IMPLEMENTED/BLOCKED FOR WRITE | Controls/fingerprints/dedupe exist; controller read token and private Musematic mirror credential are not provisioned |
+| 25 Finding verification | IMPLEMENTED/BLOCKED FOR EXTERNAL READS | Candidate cells launch durable verification children; bounded API/CLI/Telegram retry exists for candidate/flaky/blocked findings; controls/fingerprints/dedupe are enforced; controller issue-search token and private Musematic mirror credential are not provisioned |
 | 26 Finding schema | IMPLEMENTED | Draft 2020-12 schema includes every requested identity, impact, evidence and affected-state field |
 | 27 Risk classes | IMPLEMENTED | R0-R3 policy, cross-provider gates, deterministic low-risk approval, human R2/R3 approval and typed R3 confirmation |
 | 28 OpenSpec | IMPLEMENTED | Existing assets preserved; bounded OpenSpec generated per delivery and passed without historical audit context |

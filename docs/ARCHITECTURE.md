@@ -47,6 +47,13 @@ commit and draft PR. Deterministic policy code validates evidence before state t
 and checker contexts differ; R3 requires both providers and typed human approval. Large campaigns
 use coverage cells and Temporal continue-as-new rather than one permanent model session.
 
+Every native provider activity is bracketed by controller-owned metadata activities. The start is
+recorded before dispatch and the normalized result (or a bounded authentication/failure code) is
+recorded afterward in `agent_invocations`; only usage fields actually exposed by the CLI are
+written to `provider_usage`. Prompts are never copied into either table. `/v1/usage` combines the
+latest non-invented quota snapshot with seven-day per-role invocation counts, success rates,
+running jobs, tokens, and estimated cost where known. Provider workers have no database access.
+
 Current fail-closed controls are intentional: production activity steps without a configured
 handler raise `NotConfigured`; missing native authentication is a manual blocker; deployment
 mutation needs a deterministic adapter, current artifact binding, and scoped credentials.

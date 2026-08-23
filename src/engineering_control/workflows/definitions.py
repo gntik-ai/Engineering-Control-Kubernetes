@@ -100,6 +100,39 @@ class ControlledWorkflow:
             raise TypeError(f"activity {step} returned a non-object result")
         return result
 
+    async def _agent_step(
+        self, step: str, payload: dict[str, Any], *, timeout_minutes: int
+    ) -> dict[str, Any]:
+        """Persist an invocation boundary before and after a native provider activity."""
+        started = await self._step(
+            "agent.record_start",
+            {**payload, "provider_step": step},
+        )
+        try:
+            result = await self._step(step, started, timeout_minutes=timeout_minutes)
+        except ActivityError as error:
+            cause = error.cause
+            blocker = (
+                cause.type
+                if isinstance(cause, ApplicationError)
+                and cause.type
+                in {
+                    "MANUAL_AUTH_REQUIRED_CODEX",
+                    "MANUAL_AUTH_REQUIRED_CLAUDE",
+                    "PROVIDER_CLI_MISSING_CODEX",
+                    "PROVIDER_CLI_MISSING_CLAUDE",
+                    "RATE_LIMITED",
+                    "SchemaViolation",
+                    "PolicyViolation",
+                }
+                else "PROVIDER_ACTIVITY_FAILED"
+            )
+            return await self._step(
+                "agent.persist_result",
+                {**started, "status": "FAILED", "blocker": blocker},
+            )
+        return await self._step("agent.persist_result", result)
+
     async def _deployment_failure(
         self, context: dict[str, Any], error: ActivityError
     ) -> dict[str, Any]:
@@ -229,7 +262,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 },
             )
             if prepared.get("status") in {"RATE_LIMITED", "BLOCKED"}:
-                prepared = await self._step(
+                await self._step(
                     "campaign.persist_cell_blocker",
                     {
                         **prepared,
@@ -237,13 +270,8 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                         "blocker": prepared.get("blocker", prepared["status"]),
                     },
                 )
-                return {
-                    "status": prepared["status"],
-                    "campaign_id": campaign_id,
-                    "next_cell_offset": index,
-                    "context": prepared,
-                }
-            agent_result = await self._step(
+                continue
+            agent_result = await self._agent_step(
                 "audit.agent_cell",
                 prepared,
                 timeout_minutes=120,
@@ -255,22 +283,16 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 "TIMED_OUT",
                 "CANCELLED",
             }:
-                if agent_result.get("status") in {"RATE_LIMITED", "BLOCKED"}:
-                    agent_result = await self._step(
-                        "campaign.persist_cell_blocker",
-                        {
-                            **agent_result,
-                            "deterministic_evidence_sha256": deterministic.get("evidence_sha256"),
-                            "blocker": agent_result.get("blocker", agent_result["status"]),
-                        },
-                    )
-                return {
-                    "status": agent_result["status"],
-                    "campaign_id": campaign_id,
-                    "next_cell_offset": index,
-                    "context": agent_result,
-                }
-            await self._step(
+                await self._step(
+                    "campaign.persist_cell_blocker",
+                    {
+                        **agent_result,
+                        "deterministic_evidence_sha256": deterministic.get("evidence_sha256"),
+                        "blocker": agent_result.get("blocker", agent_result["status"]),
+                    },
+                )
+                continue
+            persisted = await self._step(
                 "campaign.persist_cell_result",
                 {
                     "campaign_id": campaign_id,
@@ -279,6 +301,23 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "deterministic_evidence_sha256": deterministic.get("evidence_sha256"),
                 },
             )
+            if persisted.get("status") == "CANDIDATE_FOUND":
+                finding_id = str(persisted.get("finding_id", ""))
+                if not finding_id:
+                    raise ValueError("candidate coverage result did not return a finding ID")
+                verification = await workflow.execute_child_workflow(
+                    "FindingVerificationWorkflow",
+                    FindingVerificationInput(
+                        finding_id=finding_id,
+                        project=request.project,
+                        fresh_snapshot=True,
+                    ),
+                    id=f"finding-verify-{finding_id}",
+                    task_queue=workflow.info().task_queue,
+                    execution_timeout=timedelta(hours=4),
+                )
+                if verification.get("status") in {"RATE_LIMITED", "BLOCKED", "FAILED"}:
+                    continue
         next_offset = request.cell_offset + len(batch)
         if next_offset < len(cells):
             workflow.continue_as_new(
@@ -309,9 +348,11 @@ class FindingVerificationWorkflow(ControlledWorkflow):
                 {"finding": candidate, "snapshot": fresh, "ordinal": ordinal},
             )
             if prepared.get("status") in {"RATE_LIMITED", "BLOCKED"}:
+                prepared = await self._step("finding.record_terminal", prepared)
                 return {"status": prepared["status"], "context": prepared}
-            reproduced = await self._step("finding.reproduce", prepared, timeout_minutes=60)
+            reproduced = await self._agent_step("finding.reproduce", prepared, timeout_minutes=60)
             if reproduced.get("status") != "SUCCESS":
+                reproduced = await self._step("finding.record_terminal", reproduced)
                 return {"status": reproduced.get("status", "FAILED"), "context": reproduced}
             attempts.append(reproduced)
         controls = await self._step(
@@ -362,11 +403,16 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
         for step in ordered_steps:
             if not await self._checkpoint(step.upper().replace(".", "_")):
                 return {"status": "CANCELLED", "context": context}
-            context = await self._step(
-                step,
-                {**context, "delivery_request": asdict(request)},
-                timeout_minutes=120 if "invoke" in step else 30,
-            )
+            step_payload = {**context, "delivery_request": asdict(request)}
+            if step in {
+                "delivery.invoke_spec",
+                "delivery.invoke_maker",
+                "delivery.invoke_deployment_maker",
+                "delivery.invoke_checker",
+            }:
+                context = await self._agent_step(step, step_payload, timeout_minutes=120)
+            else:
+                context = await self._step(step, step_payload, timeout_minutes=30)
             if (
                 context.get("status")
                 in {
@@ -593,7 +639,7 @@ class RuntimeVerificationWorkflow(ControlledWorkflow):
                         {**context, "blocker": "CANCELLED"},
                     )
                     return {"status": "CANCELLED", "context": context}
-                reviewed = await self._step(
+                reviewed = await self._agent_step(
                     "runtime.independent_review",
                     {
                         **context,

@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 180 pytest tests; Ruff clean; strict mypy clean across 76 source files; Bash syntax clean |
+| Control-plane Python | PASS | 188 pytest tests; Ruff clean; strict mypy clean across 76 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -31,6 +31,7 @@ test is not represented as a pass, and no paid API fallback was used.
 | Retention schedule | PASS/DISABLED | installed Temporal schedule payload is `dry_run=true`; controller and worker mutation settings remain false |
 | Durable restart/resume | PASS | workflow worker replaced mid-run; workflow resumed and reached `AWAITING_STAGING_APPROVAL` |
 | Quota broker | PASS/PARTIAL DATA | records native CLI auth/status information; capacity/reset remain null when providers expose none |
+| Provider invocation history | PASS | controller records every provider start/result or bounded blocker plus seven-day role success/token/cost aggregates; prompts and invented values are excluded |
 | Paid fallback | PASS | provider environment strips API keys/base URLs; no implicit paid route exists |
 | Network boundary | PASS | API/metrics/database bind loopback; Temporal/evidence bind loopback/private only |
 

@@ -18,6 +18,7 @@ from engineering_control.api.schemas import (
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
+    FindingVerificationStart,
     OperationAccepted,
     RecordList,
     RollbackRequest,
@@ -151,6 +152,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="finding not found")
         return finding
 
+    @app.post("/v1/findings/verify", response_model=OperationAccepted, status_code=202)
+    async def finding_verify(
+        body: FindingVerificationStart,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        try:
+            return await service.start_finding_verification(body.finding_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     @app.post("/v1/deliveries", response_model=OperationAccepted, status_code=202)
     async def delivery_start(
         body: DeliveryStart,
@@ -264,21 +276,32 @@ def create_app(
         repository: MetadataRepository = metadata_dependency,
     ) -> dict[str, Any]:
         snapshots = await repository.latest_quota_snapshots()
-        return {
-            provider: snapshots.get(
-                provider,
-                {
-                    "provider": provider,
-                    "remaining_capacity": None,
-                    "total_capacity": None,
-                    "reset_at": None,
-                    "running_jobs": 0,
-                    "rate_limited": False,
-                    "source": "not-reported",
-                },
+        history = await repository.provider_usage_history(days=7)
+        response: dict[str, Any] = {}
+        for provider in ("codex", "claude"):
+            value = dict(
+                snapshots.get(
+                    provider,
+                    {
+                        "provider": provider,
+                        "remaining_capacity": None,
+                        "total_capacity": None,
+                        "reset_at": None,
+                        "running_jobs": 0,
+                        "rate_limited": False,
+                        "source": "not-reported",
+                    },
+                )
             )
-            for provider in ("codex", "claude")
-        }
+            provider_history = history.get(
+                provider, {"window_days": 7, "running_jobs": 0, "roles": {}}
+            )
+            value["running_jobs"] = max(
+                int(value.get("running_jobs") or 0), int(provider_history["running_jobs"])
+            )
+            value["history"] = provider_history
+            response[provider] = value
+        return response
 
     @app.get("/v1/evidence/{artifact_id}")
     async def evidence_get(

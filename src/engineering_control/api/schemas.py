@@ -42,6 +42,10 @@ class DeliveryStart(APIModel):
     dry_run: bool = True
 
 
+class FindingVerificationStart(APIModel):
+    finding_id: UUID
+
+
 class DeliveryReconcile(APIModel):
     change_set_id: UUID
     candidate_build_run_id: int | None = Field(default=None, ge=1)

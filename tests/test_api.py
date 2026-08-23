@@ -16,6 +16,9 @@ class FakeService:
     async def start_delivery(self, request: Any) -> OperationAccepted:
         return OperationAccepted(workflow_id="delivery-test", run_id="run-test")
 
+    async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted:
+        return OperationAccepted(workflow_id=f"finding-verify-{finding_id}", run_id="run-test")
+
     async def reconcile_delivery(self, request: Any) -> OperationAccepted:
         return OperationAccepted(workflow_id="reconcile-test", run_id="run-test")
 
@@ -71,6 +74,25 @@ class FakeMetadataRepository(EmptyMetadataRepository):
                 "provider": "codex",
                 "remaining_capacity": None,
                 "source": "cli-does-not-report",
+            }
+        }
+
+    async def provider_usage_history(self, days: int = 7) -> dict[str, dict[str, Any]]:
+        return {
+            "codex": {
+                "window_days": days,
+                "running_jobs": 1,
+                "roles": {
+                    "implementer": {
+                        "invocations": 2,
+                        "successes": 1,
+                        "success_rate": 0.5,
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "cached_input_tokens": None,
+                        "estimated_cost": None,
+                    }
+                },
             }
         }
 
@@ -149,6 +171,33 @@ def test_delivery_reconciliation_accepts_only_bounded_identifiers() -> None:
     assert rejected.status_code == 422
 
 
+def test_finding_verification_has_a_bounded_authenticated_route() -> None:
+    finding_id = uuid4()
+    app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
+    with TestClient(app) as client:
+        unauthorized = client.post("/v1/findings/verify", json={"finding_id": str(finding_id)})
+        accepted = client.post(
+            "/v1/findings/verify",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={"finding_id": str(finding_id)},
+        )
+        invalid = client.post(
+            "/v1/findings/verify",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={"finding_id": "not-a-uuid"},
+        )
+        extra = client.post(
+            "/v1/findings/verify",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={"finding_id": str(finding_id), "execute": True},
+        )
+    assert unauthorized.status_code == 401
+    assert accepted.status_code == 202
+    assert accepted.json()["workflow_id"] == f"finding-verify-{finding_id}"
+    assert invalid.status_code == 422
+    assert extra.status_code == 422
+
+
 def test_synthetic_validation_endpoint_is_disabled_by_default() -> None:
     app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
     with TestClient(app) as client:
@@ -221,8 +270,11 @@ def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:
         usage = client.get("/v1/usage", headers=headers)
         assert usage.status_code == 200
         assert usage.json()["codex"]["source"] == "cli-does-not-report"
+        assert usage.json()["codex"]["running_jobs"] == 1
+        assert usage.json()["codex"]["history"]["roles"]["implementer"]["success_rate"] == 0.5
         assert usage.json()["claude"]["source"] == "not-reported"
         assert usage.json()["claude"]["remaining_capacity"] is None
+        assert usage.json()["claude"]["history"]["roles"] == {}
 
 
 def test_metadata_endpoints_return_not_found_for_unknown_ids() -> None:
