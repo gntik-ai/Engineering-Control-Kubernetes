@@ -113,3 +113,11 @@ def test_bootstrap_reruns_restart_services_after_installing_new_code() -> None:
     )
     assert "systemctl restart engineering-worker@codex.service" in worker
     assert "systemctl enable --now engineering-worker@codex.service" not in worker
+
+
+def test_worker_verification_uses_a_neutral_non_home_directory() -> None:
+    verification = (REPOSITORY_ROOT / "scripts" / "verify-worker.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "cd /var/lib/engineering-control" in verification

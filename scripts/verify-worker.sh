@@ -6,6 +6,8 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+cd /var/lib/engineering-control
+
 for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
   id "${identity}" >/dev/null
 done
