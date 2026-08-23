@@ -19,7 +19,16 @@ fi
 id "${operator}" >/dev/null
 
 "${SCRIPT_DIR}/verify-controller.sh"
+worker_rc=0
 runuser -u "${operator}" -- ssh -tt worker \
-  'sudo /opt/engineering-control/source/scripts/verify-worker.sh'
+  'sudo /opt/engineering-control/source/scripts/verify-worker.sh' || worker_rc=$?
+if [[ ${worker_rc} -ne 0 && ${worker_rc} -ne 2 ]]; then
+  echo "FAIL worker verification transport or invariant check" >&2
+  exit "${worker_rc}"
+fi
 runuser -u "${operator}" -- "${SCRIPT_DIR}/validate-temporal-lifecycle.py"
+if [[ ${worker_rc} -eq 2 ]]; then
+  echo "BLOCKED end-to-end verification; independent lifecycle checks passed" >&2
+  exit 2
+fi
 echo "PASS infrastructure boundaries and durable synthetic lifecycle"

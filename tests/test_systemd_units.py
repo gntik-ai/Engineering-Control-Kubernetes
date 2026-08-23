@@ -169,6 +169,8 @@ def test_end_to_end_verification_preserves_the_operator_ssh_identity() -> None:
     assert 'runuser -u "${operator}" -- "${SCRIPT_DIR}/validate-temporal-lifecycle.py"' in (
         verification
     )
+    assert "worker_rc=0" in verification
+    assert "independent lifecycle checks passed" in verification
     assert "\nssh -t worker" not in verification
 
 
