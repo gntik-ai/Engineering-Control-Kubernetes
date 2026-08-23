@@ -126,3 +126,13 @@ def test_worker_verification_uses_a_neutral_non_home_directory() -> None:
     )
 
     assert "cd /var/lib/engineering-control" in verification
+    assert "all credential-independent checks passed" in verification
+
+
+def test_worker_bootstrap_clears_satisfied_auth_markers() -> None:
+    bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"' in bootstrap
+    assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"' in bootstrap

@@ -203,10 +203,14 @@ systemctl restart engineering-worker@codex.service engineering-worker@claude.ser
   engineering-worker@delivery.service \
   engineering-release-worker.service
 
-if ! sudo -u codex-runner -H /usr/local/bin/codex login status >/dev/null 2>&1; then
+if sudo -u codex-runner -H /usr/local/bin/codex login status >/dev/null 2>&1; then
+  rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"
+else
   touch "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"
 fi
-if ! sudo -u claude-runner -H /usr/local/bin/claude auth status >/dev/null 2>&1; then
+if sudo -u claude-runner -H /usr/local/bin/claude auth status >/dev/null 2>&1; then
+  rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"
+else
   touch "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"
 fi
 echo "Worker bootstrap completed; inspect MANUAL_AUTH_REQUIRED markers without copying credentials."
