@@ -70,7 +70,7 @@ from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapsho
 
 
 class QuotaSnapshotRecord(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     provider: Provider
     captured_at: datetime
@@ -79,6 +79,9 @@ class QuotaSnapshotRecord(BaseModel):
     reset_at: datetime | None = None
     running_jobs: int = Field(default=0, ge=0)
     rate_limited: bool = False
+    authenticated: bool | None = None
+    cli_present: bool | None = None
+    status: str | None = Field(default=None, min_length=1, max_length=80)
     source: str = Field(min_length=1, max_length=80)
 
 
@@ -5136,6 +5139,9 @@ class MetadataActivityHandler:
                             ),
                             running_jobs=snapshot.running_jobs,
                             rate_limited=snapshot.rate_limited,
+                            authenticated=snapshot.authenticated,
+                            cli_present=snapshot.cli_present,
+                            status=snapshot.status,
                             source=snapshot.source,
                         )
                     )

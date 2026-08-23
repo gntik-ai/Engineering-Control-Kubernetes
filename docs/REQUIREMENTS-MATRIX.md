@@ -19,7 +19,7 @@ platform fails closed rather than bypassing.
 | 9 Worker role | ACTIVE | Six isolated Unix identities and systemd queues are active; credential-independent verifier passes |
 | 10 Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 are installed; Codex identity auth and a real structured maker call pass; Claude identity OAuth remains manual |
 | 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction |
-| 12 Quota broker | IMPLEMENTED | Provider-independent snapshots, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff, and seven-day per-role invocation/success/token/cost history without invented values |
+| 12 Quota broker | IMPLEMENTED | Provider-independent snapshots persist CLI presence/authentication/status, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff, and seven-day per-role invocation/success/token/cost history without invented values |
 | 13 Temporal | ACTIVE/PASS | All required workflows installed; live worker replacement during an active lifecycle resumed durably |
 | 14 PostgreSQL metadata | IMPLEMENTED | Alembic models/migrations for every required table plus approval candidates, notification outbox, worker heartbeats, and artifact-retention tombstones |
 | 15 ChangeSet | IMPLEMENTED | First-class model, strict state policy, exact PR/CI/provenance reconciliation, digest promotion, artifact-bound approvals and deterministic metadata transitions |

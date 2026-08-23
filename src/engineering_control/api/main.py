@@ -289,6 +289,9 @@ def create_app(
                         "reset_at": None,
                         "running_jobs": 0,
                         "rate_limited": False,
+                        "authenticated": None,
+                        "cli_present": None,
+                        "status": "NOT_REPORTED",
                         "source": "not-reported",
                     },
                 )

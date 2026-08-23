@@ -30,7 +30,7 @@ test is not represented as a pass, and no paid API fallback was used.
 | Workflow/acceptance workers, scheduler and notifier | PASS | all systemd services active; acceptance worker is write-bounded to its synthetic temporary root |
 | Retention schedule | PASS/DISABLED | installed Temporal schedule payload is `dry_run=true`; controller and worker mutation settings remain false |
 | Durable restart/resume | PASS | workflow worker replaced mid-run; workflow resumed and reached `AWAITING_STAGING_APPROVAL` |
-| Quota broker | PASS/PARTIAL DATA | records native CLI auth/status information; capacity/reset remain null when providers expose none |
+| Quota broker | PASS/PARTIAL DATA | persists native CLI presence/authentication/status information; capacity/reset remain null when providers expose none |
 | Provider invocation history | PASS | controller records every provider start/result or bounded blocker plus seven-day role success/token/cost aggregates; prompts and invented values are excluded |
 | Paid fallback | PASS | provider environment strips API keys/base URLs; no implicit paid route exists |
 | Network boundary | PASS | API/metrics/database bind loopback; Temporal/evidence bind loopback/private only |

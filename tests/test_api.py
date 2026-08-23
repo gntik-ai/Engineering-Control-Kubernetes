@@ -73,6 +73,9 @@ class FakeMetadataRepository(EmptyMetadataRepository):
             "codex": {
                 "provider": "codex",
                 "remaining_capacity": None,
+                "authenticated": True,
+                "cli_present": True,
+                "status": "AVAILABLE",
                 "source": "cli-does-not-report",
             }
         }
@@ -270,10 +273,16 @@ def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:
         usage = client.get("/v1/usage", headers=headers)
         assert usage.status_code == 200
         assert usage.json()["codex"]["source"] == "cli-does-not-report"
+        assert usage.json()["codex"]["authenticated"] is True
+        assert usage.json()["codex"]["cli_present"] is True
+        assert usage.json()["codex"]["status"] == "AVAILABLE"
         assert usage.json()["codex"]["running_jobs"] == 1
         assert usage.json()["codex"]["history"]["roles"]["implementer"]["success_rate"] == 0.5
         assert usage.json()["claude"]["source"] == "not-reported"
         assert usage.json()["claude"]["remaining_capacity"] is None
+        assert usage.json()["claude"]["authenticated"] is None
+        assert usage.json()["claude"]["cli_present"] is None
+        assert usage.json()["claude"]["status"] == "NOT_REPORTED"
         assert usage.json()["claude"]["history"]["roles"] == {}
 
 

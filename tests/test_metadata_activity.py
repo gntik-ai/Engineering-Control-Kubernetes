@@ -48,6 +48,8 @@ async def test_quota_persistence_is_idempotent(tmp_path: Path) -> None:
                 "rate_limited": False,
                 "source": "native_cli_auth_status;capacity_not_exposed",
                 "authenticated": False,
+                "cli_present": True,
+                "status": "MANUAL_AUTH_REQUIRED_CODEX",
             }
         ]
     }
@@ -59,7 +61,12 @@ async def test_quota_persistence_is_idempotent(tmp_path: Path) -> None:
     assert second["persisted_snapshots"] == 1
     with handler.sessions() as session:
         count = session.scalar(select(func.count()).select_from(QuotaSnapshot))
+        snapshot = session.scalar(select(QuotaSnapshot))
     assert count == 1
+    assert snapshot is not None
+    assert snapshot.authenticated is False
+    assert snapshot.cli_present is True
+    assert snapshot.status == "MANUAL_AUTH_REQUIRED_CODEX"
 
 
 def add_campaign(handler: MetadataActivityHandler, project: str = "falcone") -> Campaign:

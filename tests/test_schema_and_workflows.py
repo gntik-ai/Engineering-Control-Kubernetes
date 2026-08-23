@@ -29,6 +29,8 @@ def test_metadata_contains_required_tables() -> None:
         "worker_heartbeats",
     }
     assert required.issubset(Base.metadata.tables)
+    quota_columns = Base.metadata.tables["quota_snapshots"].columns
+    assert {"authenticated", "cli_present", "status"}.issubset(quota_columns.keys())
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
 

@@ -51,8 +51,9 @@ Every native provider activity is bracketed by controller-owned metadata activit
 recorded before dispatch and the normalized result (or a bounded authentication/failure code) is
 recorded afterward in `agent_invocations`; only usage fields actually exposed by the CLI are
 written to `provider_usage`. Prompts are never copied into either table. `/v1/usage` combines the
-latest non-invented quota snapshot with seven-day per-role invocation counts, success rates,
-running jobs, tokens, and estimated cost where known. Provider workers have no database access.
+latest non-invented quota snapshot—including native CLI presence/authentication status—with
+seven-day per-role invocation counts, success rates, running jobs, tokens, and estimated cost
+where known. Provider workers have no database access.
 
 Current fail-closed controls are intentional: production activity steps without a configured
 handler raise `NotConfigured`; missing native authentication is a manual blocker; deployment

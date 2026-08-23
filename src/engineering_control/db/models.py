@@ -216,6 +216,9 @@ class QuotaSnapshot(UUIDPrimaryKey, Base):
     reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     running_jobs: Mapped[int] = mapped_column(Integer)
     rate_limited: Mapped[bool] = mapped_column(Boolean, default=False)
+    authenticated: Mapped[bool | None] = mapped_column(Boolean)
+    cli_present: Mapped[bool | None] = mapped_column(Boolean)
+    status: Mapped[str | None] = mapped_column(String(80))
     source: Mapped[str] = mapped_column(String(80))
 
 
