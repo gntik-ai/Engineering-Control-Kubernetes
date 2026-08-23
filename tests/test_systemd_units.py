@@ -159,6 +159,19 @@ def test_controller_verification_uses_hermes_worker_ssh_identity() -> None:
     assert "\nssh -o BatchMode=yes" not in verification
 
 
+def test_end_to_end_verification_preserves_the_operator_ssh_identity() -> None:
+    verification = (REPOSITORY_ROOT / "scripts" / "verify-end-to-end.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "if [[ ${EUID} -ne 0 ]]" in verification
+    assert 'runuser -u "${operator}" -- ssh -tt worker' in verification
+    assert 'runuser -u "${operator}" -- "${SCRIPT_DIR}/validate-temporal-lifecycle.py"' in (
+        verification
+    )
+    assert "\nssh -t worker" not in verification
+
+
 def test_worker_bootstrap_clears_satisfied_auth_markers() -> None:
     bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
 
