@@ -36,3 +36,18 @@ def test_bootstraps_make_release_root_traversable_by_service_users() -> None:
         assert 'install -d -o root -g root -m 0755' in script
         assert '"${INSTALL_ROOT}"' in script
         assert 'install -d -o root -g root -m 0755 "${RELEASE_ROOT}"' in script
+        assert 'chmod -R a+rX "${INSTALL_ROOT}/venv"' in script
+
+
+def test_worker_shared_tool_runtimes_are_traversable_but_not_made_writable() -> None:
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(
+        encoding="utf-8"
+    )
+    scanners = (REPOSITORY_ROOT / "scripts" / "install-scanners.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'chmod -R a+rX "${CLI_ROOT}"' in worker
+    assert "chmod -R a+rX /opt/engineering-scanners" in scanners
+    assert "a+w" not in worker
+    assert "a+w" not in scanners

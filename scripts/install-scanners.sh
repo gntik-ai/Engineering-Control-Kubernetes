@@ -103,6 +103,7 @@ install_release_binary \
 
 python3 -m venv /opt/engineering-scanners/semgrep
 /opt/engineering-scanners/semgrep/bin/pip install --disable-pip-version-check semgrep==1.174.0
+chmod -R a+rX /opt/engineering-scanners
 ln -sfn /opt/engineering-scanners/semgrep/bin/semgrep /usr/local/bin/semgrep
 
 # A scanner that exits successfully while missing a canonical synthetic canary is unsafe.

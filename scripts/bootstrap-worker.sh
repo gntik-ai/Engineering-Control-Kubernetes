@@ -96,6 +96,7 @@ ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
 python3 -m venv "${INSTALL_ROOT}/venv"
 "${INSTALL_ROOT}/venv/bin/pip" install --disable-pip-version-check --upgrade \
   --constraint "${INSTALL_ROOT}/source/requirements.lock" "${INSTALL_ROOT}/source"
+chmod -R a+rX "${INSTALL_ROOT}/venv"
 "${INSTALL_ROOT}/source/scripts/install-scanners.sh"
 
 NODE_SOURCE=$(readlink -f -- "${NODE_BIN}")
@@ -105,6 +106,7 @@ if [[ ${NODE_SOURCE} != /usr/local/bin/node ]]; then
 fi
 "/usr/local/bin/node" "${NPM_CLI}" install --prefix "${CLI_ROOT}" \
   @openai/codex@0.149.0 @anthropic-ai/claude-code@2.1.239
+chmod -R a+rX "${CLI_ROOT}"
 ln -sfn "${CLI_ROOT}/node_modules/.bin/codex" /usr/local/bin/codex
 ln -sfn "${CLI_ROOT}/node_modules/.bin/claude" /usr/local/bin/claude
 

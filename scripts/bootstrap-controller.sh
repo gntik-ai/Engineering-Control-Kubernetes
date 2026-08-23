@@ -60,6 +60,7 @@ ln -sfn "${INSTALL_ROOT}/source/docker" "${INSTALL_ROOT}/infrastructure"
 python3 -m venv "${INSTALL_ROOT}/venv"
 "${INSTALL_ROOT}/venv/bin/pip" install --disable-pip-version-check --upgrade \
   --constraint "${INSTALL_ROOT}/source/requirements.lock" "${INSTALL_ROOT}/source"
+chmod -R a+rX "${INSTALL_ROOT}/venv"
 
 install -o root -g engineering-control -m 0640 \
   "${SOURCE_ROOT}/config/control.yaml" "${CONFIG_ROOT}/control.yaml"
