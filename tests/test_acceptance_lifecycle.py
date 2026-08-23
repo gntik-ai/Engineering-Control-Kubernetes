@@ -17,6 +17,8 @@ async def test_acceptance_lifecycle_uses_real_bounded_git_and_evidence(
     )
     activities = AcceptanceActivities(tmp_path)
     payload: dict[str, object] = {
+        "run_id": str(uuid4()),
+        "created_at": "2026-08-23T00:00:00+00:00",
         "change_set_id": str(uuid4()),
         "validation_root": str(tmp_path / "run"),
         "hold_seconds": 1,
@@ -25,7 +27,9 @@ async def test_acceptance_lifecycle_uses_real_bounded_git_and_evidence(
     payload = activities.worktree(payload)
     payload = activities.maker(payload)
     payload = activities.checker(payload)
+    first_evidence = activities.evidence(payload)
     payload = activities.evidence(payload)
+    assert payload["evidence_sha256"] == first_evidence["evidence_sha256"]
     payload = activities.transition(payload)
 
     assert payload["status"] == "PASS"
@@ -43,6 +47,8 @@ async def test_acceptance_snapshot_is_idempotent(
     )
     activities = AcceptanceActivities(tmp_path)
     request = {
+        "run_id": str(uuid4()),
+        "created_at": "2026-08-23T00:00:00+00:00",
         "change_set_id": str(uuid4()),
         "validation_root": str(tmp_path / "run"),
         "hold_seconds": 1,

@@ -182,12 +182,25 @@ class TemporalControlService:
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         handle = self.client.get_workflow_handle(workflow_id)
         description = await handle.describe()
-        return {
+        response: dict[str, Any] = {
             "workflow_id": workflow_id,
             "run_id": description.run_id,
             "status": description.status.name if description.status is not None else "UNKNOWN",
             "workflow_type": description.workflow_type,
         }
+        if workflow_id.startswith("acceptance-") and response["status"] == "COMPLETED":
+            result = await handle.result()
+            if isinstance(result, dict):
+                allowed = (
+                    "status",
+                    "change_set_state",
+                    "maker_provider",
+                    "checker_provider",
+                    "evidence_sha256",
+                    "redaction_status",
+                )
+                response["validation"] = {key: result.get(key) for key in allowed}
+        return response
 
     async def start_acceptance(
         self, request: AcceptanceLifecycleStart, validation_root: str

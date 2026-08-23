@@ -183,15 +183,22 @@ class AcceptanceActivities:
         target = evidence_dir / "lifecycle.json"
         evidence = self.redactor.redact(
             {
+                "run_id": payload["run_id"],
                 "change_set_id": payload["change_set_id"],
                 "source_sha": payload["source_sha"],
                 "branch": payload["branch"],
                 "maker_provider": payload["maker_provider"],
                 "checker_provider": payload["checker_provider"],
                 "artifact_sha256": payload["checker_sha256"],
+                "content_type": "application/json",
+                "producer": "engineering-acceptance-worker",
+                "created_at": payload["created_at"],
             }
         )
-        content = json.dumps(evidence.value, indent=2, sort_keys=True).encode() + b"\n"
+        safe_evidence = dict(evidence.value)
+        redaction_status = "REDACTED" if evidence.replacements else "SCANNED_CLEAN"
+        safe_evidence["redaction_status"] = redaction_status
+        content = json.dumps(safe_evidence, indent=2, sort_keys=True).encode() + b"\n"
         if target.exists() and target.read_bytes() != content:
             raise ApplicationError("evidence retry found conflicting content", non_retryable=True)
         with tempfile.NamedTemporaryFile(dir=evidence_dir, delete=False) as handle:
@@ -207,7 +214,7 @@ class AcceptanceActivities:
             **payload,
             "evidence_path": str(target),
             "evidence_sha256": digest,
-            "evidence_redacted": bool(evidence.replacements),
+            "redaction_status": redaction_status,
             "evidence_status": "PASS",
         }
 

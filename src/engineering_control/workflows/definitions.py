@@ -223,9 +223,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "campaign.persist_cell_blocker",
                     {
                         **prepared,
-                        "deterministic_evidence_sha256": deterministic.get(
-                            "evidence_sha256"
-                        ),
+                        "deterministic_evidence_sha256": deterministic.get("evidence_sha256"),
                         "blocker": prepared.get("blocker", prepared["status"]),
                     },
                 )
@@ -252,12 +250,8 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                         "campaign.persist_cell_blocker",
                         {
                             **agent_result,
-                            "deterministic_evidence_sha256": deterministic.get(
-                                "evidence_sha256"
-                            ),
-                            "blocker": agent_result.get(
-                                "blocker", agent_result["status"]
-                            ),
+                            "deterministic_evidence_sha256": deterministic.get("evidence_sha256"),
+                            "blocker": agent_result.get("blocker", agent_result["status"]),
                         },
                     )
                 return {
@@ -738,7 +732,11 @@ class AcceptanceLifecycleWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: AcceptanceLifecycleInput) -> dict[str, Any]:
-        context: dict[str, Any] = asdict(request)
+        context: dict[str, Any] = {
+            **asdict(request),
+            "run_id": workflow.info().run_id,
+            "created_at": workflow.now().isoformat(),
+        }
         for step, timeout in (
             ("acceptance.project_snapshot", 2),
             ("acceptance.worktree", 2),
