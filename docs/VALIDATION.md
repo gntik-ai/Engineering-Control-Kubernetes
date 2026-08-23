@@ -28,6 +28,7 @@ test is not represented as a pass, and no paid API fallback was used.
 | Engineering API | PASS | authenticated API healthy on `127.0.0.1:8740` |
 | Evidence ingest | PASS | private listener `10.10.0.2:8750`; identity-bound upload and impersonation denial pass |
 | Workflow/acceptance workers, scheduler and notifier | PASS | all systemd services active; acceptance worker is write-bounded to its synthetic temporary root |
+| Retention schedule | PASS/DISABLED | installed Temporal schedule payload is `dry_run=true`; controller and worker mutation settings remain false |
 | Durable restart/resume | PASS | workflow worker replaced mid-run; workflow resumed and reached `AWAITING_STAGING_APPROVAL` |
 | Quota broker | PASS/PARTIAL DATA | records native CLI auth/status information; capacity/reset remain null when providers expose none |
 | Paid fallback | PASS | provider environment strips API keys/base URLs; no implicit paid route exists |
@@ -42,7 +43,7 @@ container. They are not Engineering Control listeners and remain under cleanup g
 | --- | --- | --- |
 | Installed immutable release | PASS | worker and controller release identities are verified during deployment and host checks |
 | Six Unix/service identities | PASS | Codex, Claude, browser, scan, delivery and release services active |
-| Native CLIs | INSTALLED/BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 installed; both identity-specific logins absent |
+| Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 installed; Codex identity login and a real structured maker call pass; Claude identity login remains absent |
 | Browser runtime | PASS | Playwright 1.62.1 plus Chromium/Firefox dependencies installed under `browser-runner` |
 | Scan tooling | PASS | Gitleaks, Trivy, Semgrep, Syft and kubeconform installed and identity-readable |
 | Release tooling | PASS | kubectl 1.36.3, Helm 4.2.3 and Argo CD CLI 3.5.1 installed under `release-runner` |
@@ -54,7 +55,6 @@ container. They are not Engineering Control listeners and remain under cleanup g
 `verify-worker.sh` completes every credential-independent check, then reports these exact blockers:
 
 ```text
-MANUAL_AUTH_REQUIRED_CODEX
 MANUAL_AUTH_REQUIRED_CLAUDE
 MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED
 MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED
@@ -68,7 +68,7 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Canonical Hermes | PASS | 0.20.0 vendor install retained; no vendor source patch |
 | Engineering Control hook | PASS | native hook loaded for `command:*`; fixed route map only |
 | Authorization | PASS | non-Telegram and unauthorized identities denied; protected numeric allowlist active |
-| Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata |
+| Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata again after the final release restart |
 | Telegram outbound | PASS | Bot API identity check and silent canary delivery succeeded |
 | Telegram inbound command | PENDING OPERATOR | bot cannot generate a user-originated command; operator must send `/usage`, `/validate 30`, then `/status` for the returned workflow |
 | Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
@@ -82,10 +82,15 @@ The current synthetic lifecycle passed through authenticated API -> Temporal -> 
 bounded worktree -> independent synthetic maker/checker -> evidence -> ChangeSet transition. The
 workflow worker was stopped and replaced while the run was active; the durable result resumed with
 maker `codex-synthetic`, checker `claude-synthetic`, and state `AWAITING_STAGING_APPROVAL`.
+A fresh post-release lifecycle started through the installed Hermes hook also completed with
+redaction status `SCANNED_CLEAN`, persisted evidence, and status retrieval through that hook.
+
+The real native Codex structured maker call passes with the subscription-authenticated
+`codex-runner`. Its synthetic acceptance directory is a provider-owned Git repository, its output
+validates against the strict schema, and the expected bounded file content matches exactly.
 
 The following remain blocked and must not be inferred from the synthetic pass:
 
-- real Codex structured native call;
 - real Claude structured native call;
 - Codex maker -> Claude checker;
 - Claude maker -> Codex checker;
@@ -94,8 +99,8 @@ The following remain blocked and must not be inferred from the synthetic pass:
 - scoped Kubernetes observer authorization and release dry-runs;
 - real draft-PR and registry-provenance validation.
 
-The installed `validate-native-providers.sh` runner is ready to evaluate the four native-provider
-items immediately after both identity-specific OAuth logins. It operates only in isolated
+The installed `validate-native-providers.sh` runner is ready to evaluate the remaining Claude and
+cross-provider items immediately after the Claude identity login. It operates only in isolated
 synthetic directories and persists a normalized, redacted, SHA256-addressed acceptance manifest.
 
 Real staging mutation is not authorized. Deployment workflows must stop at

@@ -17,7 +17,7 @@ platform fails closed rather than bypassing.
 | 7 Git repository layout | IMPLEMENTED | Independent local Git repositories for `engineering-control` and `engineering-agent-pack`; no remote repository was created |
 | 8 Controller role | ACTIVE | PostgreSQL, Temporal, API, workflow worker, scheduler, notifier and evidence ingest are healthy |
 | 9 Worker role | ACTIVE | Six isolated Unix identities and systemd queues are active; credential-independent verifier passes |
-| 10 Native CLIs | INSTALLED/BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 are installed; independent worker OAuth remains manual |
+| 10 Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 are installed; Codex identity auth and a real structured maker call pass; Claude identity OAuth remains manual |
 | 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction |
 | 12 Quota broker | IMPLEMENTED | Provider-independent snapshots, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff |
 | 13 Temporal | ACTIVE/PASS | All required workflows installed; live worker replacement during an active lifecycle resumed durably |
@@ -55,10 +55,11 @@ platform fails closed rather than bypassing.
 
 ## Gates in required order
 
-1. Authenticate Codex and Claude independently as their worker identities.
+1. Authenticate Claude independently as `claude-runner`; Codex identity auth is already verified.
 2. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
    and registry-read credential without copying interactive user credentials.
-3. Run both real native structured calls and both cross-provider maker/checker directions.
+3. Run the real Claude structured call and both cross-provider maker/checker directions; the real
+   Codex structured maker call already passes.
 4. Send allowlisted Telegram `/usage`, `/status`, and a safe dry-run command; record the round trip.
 5. Remove Hermes runtime OmniRoute references, stop OmniRoute without uninstalling, restart the
    replacement stack, and rerun the full regression suite.
