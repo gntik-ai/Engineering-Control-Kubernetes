@@ -13,7 +13,7 @@ Authentication must be established independently on worker:
 
 ```bash
 ssh -t worker 'sudo -u codex-runner -H /usr/local/bin/codex login'
-ssh worker 'sudo -u codex-runner -H /usr/local/bin/codex login status >/dev/null'
+ssh worker 'sudo -u codex-runner -H env -i HOME=/var/lib/engineering-control/identities/codex-runner PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/codex login status >/dev/null'
 ```
 
 Never copy `.codex/auth.json` from controller. A missing login leaves

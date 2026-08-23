@@ -18,11 +18,15 @@ for service in engineering-worker@codex engineering-worker@claude engineering-wo
 done
 sudo -u codex-runner -H codex --version >/dev/null
 sudo -u claude-runner -H claude --version >/dev/null
-if ! sudo -u codex-runner -H codex login status >/dev/null 2>&1; then
+if ! sudo -u codex-runner -H env -i \
+  HOME=/var/lib/engineering-control/identities/codex-runner \
+  PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/codex login status >/dev/null 2>&1; then
   echo "BLOCKED MANUAL_AUTH_REQUIRED_CODEX"
   blocked=1
 fi
-if ! sudo -u claude-runner -H claude auth status >/dev/null 2>&1; then
+if ! sudo -u claude-runner -H env -i \
+  HOME=/var/lib/engineering-control/identities/claude-runner \
+  PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/claude auth status >/dev/null 2>&1; then
   echo "BLOCKED MANUAL_AUTH_REQUIRED_CLAUDE"
   blocked=1
 fi

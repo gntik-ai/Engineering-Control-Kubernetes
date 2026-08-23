@@ -5,7 +5,12 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from engineering_control.adapters.process import EventCallback, classify_failure, run_jsonl_process
+from engineering_control.adapters.process import (
+    EventCallback,
+    classify_failure,
+    run_jsonl_process,
+    subscription_only_environment,
+)
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
 from engineering_control.security.redaction import SecretRedactor
@@ -25,6 +30,7 @@ class ClaudeCLIAdapter:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=subscription_only_environment(self.provider.value),
         )
         stdout, _ = await process.communicate()
         if process.returncode != 0:

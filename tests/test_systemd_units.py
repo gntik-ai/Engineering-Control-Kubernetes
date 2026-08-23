@@ -148,3 +148,16 @@ def test_worker_bootstrap_clears_satisfied_auth_markers() -> None:
     assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"' in bootstrap
     assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"' in bootstrap
     assert "MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED" in bootstrap
+
+
+def test_worker_auth_probes_use_subscription_only_minimal_environments() -> None:
+    for name in (
+        "bootstrap-worker.sh",
+        "verify-worker.sh",
+        "validate-native-providers.sh",
+    ):
+        script = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert script.count("env -i") >= 2
+        assert "PATH=/usr/local/bin:/usr/bin:/bin" in script
+        assert "/identities/codex-runner" in script
+        assert "/identities/claude-runner" in script

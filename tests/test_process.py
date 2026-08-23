@@ -1,12 +1,27 @@
 import os
 import sys
+from typing import Any
 
 import pytest
 
+from engineering_control.adapters.claude.client import ClaudeCLIAdapter
+from engineering_control.adapters.codex.client import CodexCLIAdapter
 from engineering_control.adapters.process import (
     run_jsonl_process,
     subscription_only_environment,
 )
+
+
+class _FakeProcess:
+    def __init__(self, stdout: bytes = b"") -> None:
+        self.returncode = 0
+        self.stdout = stdout
+
+    async def wait(self) -> int:
+        return 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self.stdout, b""
 
 
 def test_subscription_environment_removes_api_paid_credentials(
@@ -19,6 +34,35 @@ def test_subscription_environment_removes_api_paid_credentials(
     assert "OPENAI_API_KEY" not in environment
     assert "ANTHROPIC_API_KEY" not in environment
     assert "AWS_ACCESS_KEY_ID" not in environment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter", "stdout"),
+    (
+        (CodexCLIAdapter(), b""),
+        (ClaudeCLIAdapter(), b'{"loggedIn":true}'),
+    ),
+)
+async def test_authentication_probe_removes_api_paid_credentials(
+    adapter: CodexCLIAdapter | ClaudeCLIAdapter,
+    stdout: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _FakeProcess:
+        captured.update(kwargs)
+        return _FakeProcess(stdout)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    assert await adapter.authenticated() is True
+    environment = captured["env"]
+    assert "OPENAI_API_KEY" not in environment
+    assert "ANTHROPIC_API_KEY" not in environment
 
 
 @pytest.mark.asyncio

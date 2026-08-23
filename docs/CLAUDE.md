@@ -12,7 +12,7 @@ Authenticate independently:
 
 ```bash
 ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
-ssh worker 'sudo -u claude-runner -H /usr/local/bin/claude auth status >/dev/null'
+ssh worker 'sudo -u claude-runner -H env -i HOME=/var/lib/engineering-control/identities/claude-runner PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/claude auth status >/dev/null'
 ```
 
 Never copy controller Claude credentials. Missing authentication creates

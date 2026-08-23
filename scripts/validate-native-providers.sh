@@ -16,6 +16,23 @@ done
 
 SCRIPT=/opt/engineering-control/source/scripts/native-provider-smoke.py
 PYTHON=/opt/engineering-control/venv/bin/python
+blocked=false
+if ! sudo -u codex-runner -H env -i \
+  HOME=/var/lib/engineering-control/identities/codex-runner \
+  PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/codex login status >/dev/null 2>&1; then
+  echo "BLOCKED MANUAL_AUTH_REQUIRED_CODEX" >&2
+  blocked=true
+fi
+if ! sudo -u claude-runner -H env -i \
+  HOME=/var/lib/engineering-control/identities/claude-runner \
+  PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/claude auth status >/dev/null 2>&1; then
+  echo "BLOCKED MANUAL_AUTH_REQUIRED_CLAUDE" >&2
+  blocked=true
+fi
+if [[ ${blocked} == true ]]; then
+  exit 2
+fi
+
 RUN_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
 WORK_ROOT="/srv/engineering/worktrees/acceptance/${RUN_ID}"
 TEMP_ROOT="/srv/engineering/tmp/provider-acceptance/${RUN_ID}"

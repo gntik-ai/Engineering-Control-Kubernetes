@@ -7,7 +7,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from engineering_control.adapters.process import EventCallback, classify_failure, run_jsonl_process
+from engineering_control.adapters.process import (
+    EventCallback,
+    classify_failure,
+    run_jsonl_process,
+    subscription_only_environment,
+)
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
 from engineering_control.security.redaction import SecretRedactor
@@ -30,6 +35,7 @@ class CodexCLIAdapter:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=subscription_only_environment(self.provider.value),
         )
         return await process.wait() == 0
 

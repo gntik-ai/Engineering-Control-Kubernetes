@@ -220,12 +220,16 @@ systemctl restart engineering-worker@codex.service engineering-worker@claude.ser
   engineering-worker@delivery.service \
   engineering-release-worker.service
 
-if sudo -u codex-runner -H /usr/local/bin/codex login status >/dev/null 2>&1; then
+if sudo -u codex-runner -H env -i \
+  HOME="${STATE_ROOT}/identities/codex-runner" PATH=/usr/local/bin:/usr/bin:/bin \
+  /usr/local/bin/codex login status >/dev/null 2>&1; then
   rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"
 else
   touch "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"
 fi
-if sudo -u claude-runner -H /usr/local/bin/claude auth status >/dev/null 2>&1; then
+if sudo -u claude-runner -H env -i \
+  HOME="${STATE_ROOT}/identities/claude-runner" PATH=/usr/local/bin:/usr/bin:/bin \
+  /usr/local/bin/claude auth status >/dev/null 2>&1; then
   rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"
 else
   touch "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"
