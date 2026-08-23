@@ -1,8 +1,9 @@
 # Validation status
 
-Validated on 2026-08-23 against engineering-control release
-`30a0e8615edc303ff96c2efcf718ed6a46d8c3ef` and engineering-agent-pack
-`47a6353dafbf0c1ecea649d434db5dd555e6249e`.
+Validated on 2026-08-23 against the immutable engineering-control release selected by
+`/opt/engineering-control/source` on both hosts and engineering-agent-pack release
+`47a6353dafbf0c1ecea649d434db5dd555e6249e`. The verifier checks the installed release identity at
+runtime so this document does not embed a self-referential commit identifier.
 
 This report distinguishes a pass from a credential or security blocker. A blocked native-provider
 test is not represented as a pass, and no paid API fallback was used.
@@ -11,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 148 pytest tests; Ruff clean; strict mypy clean across 73 source files; Bash syntax clean |
+| Control-plane Python | PASS | 151 pytest tests; Ruff clean; strict mypy clean across 74 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -21,7 +22,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Requirement | Result | Evidence |
 | --- | --- | --- |
-| Installed immutable release | PASS | `/opt/engineering-control/source` resolves beneath release `30a0e86...` |
+| Installed immutable release | PASS | `/opt/engineering-control/source` resolves beneath an immutable release directory |
 | PostgreSQL | PASS | pinned container healthy; loopback listener `127.0.0.1:55432`; persistent volume active |
 | Temporal | PASS | loopback/private listeners only; server and namespace healthy |
 | Engineering API | PASS | authenticated API healthy on `127.0.0.1:8740` |
@@ -39,7 +40,7 @@ container. They are not Engineering Control listeners and remain under cleanup g
 
 | Requirement | Result | Evidence |
 | --- | --- | --- |
-| Installed immutable release | PASS | worker release matches controller `30a0e86...` |
+| Installed immutable release | PASS | worker and controller release identities are verified during deployment and host checks |
 | Six Unix/service identities | PASS | Codex, Claude, browser, scan, delivery and release services active |
 | Native CLIs | INSTALLED/BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 installed; both identity-specific logins absent |
 | Browser runtime | PASS | Playwright 1.62.1 plus Chromium/Firefox dependencies installed under `browser-runner` |
@@ -92,6 +93,10 @@ The following remain blocked and must not be inferred from the synthetic pass:
 - Musematic snapshot through the private canonical mirrors;
 - scoped Kubernetes observer authorization and release dry-runs;
 - real draft-PR and registry-provenance validation.
+
+The installed `validate-native-providers.sh` runner is ready to evaluate the four native-provider
+items immediately after both identity-specific OAuth logins. It operates only in isolated
+synthetic directories and persists a normalized, redacted, SHA256-addressed acceptance manifest.
 
 Real staging mutation is not authorized. Deployment workflows must stop at
 `AWAITING_STAGING_APPROVAL`.

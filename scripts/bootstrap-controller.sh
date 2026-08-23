@@ -209,4 +209,4 @@ systemctl enable engineering-api.service engineering-evidence-ingest.service \
 systemctl restart engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service
 
-echo "Controller bootstrap completed without altering Hermes, product repositories, or Kubernetes."
+echo "Controller bootstrap completed without altering Hermes vendor source, product repositories, or Kubernetes."

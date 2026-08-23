@@ -21,3 +21,12 @@ Never copy `.codex/auth.json` from controller. A missing login leaves
 schema, API, or orchestration installation.
 
 Official structured CLI behavior is documented in the [Codex CLI command reference](https://developers.openai.com/codex/cli/reference/).
+
+After both provider logins, run the bounded two-direction acceptance on worker:
+
+```bash
+sudo /opt/engineering-control/source/scripts/validate-native-providers.sh
+```
+
+It uses synthetic worktrees only, performs Codex maker -> Claude checker and Claude maker -> Codex
+checker, persists a redacted SHA256 evidence manifest, and never touches product repositories.

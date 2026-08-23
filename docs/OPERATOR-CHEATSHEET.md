@@ -24,6 +24,7 @@ ssh worker 'cd /home/hermes/engineering/engineering-control && sudo ./scripts/bo
 ```bash
 ssh -t worker 'sudo -u codex-runner -H /usr/local/bin/codex login'
 ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
+ssh -t worker 'sudo /opt/engineering-control/source/scripts/validate-native-providers.sh'
 ```
 
 Provision a separate read-only token for private canonical mirrors:

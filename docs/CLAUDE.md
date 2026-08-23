@@ -17,3 +17,7 @@ ssh worker 'sudo -u claude-runner -H /usr/local/bin/claude auth status >/dev/nul
 
 Never copy controller Claude credentials. Missing authentication creates
 `/var/lib/engineering-control/MANUAL_AUTH_REQUIRED_CLAUDE`; other platform work continues.
+
+Run `sudo /opt/engineering-control/source/scripts/validate-native-providers.sh` after both native
+logins. It exercises both maker/checker directions in isolated synthetic worktrees and persists
+only normalized redacted evidence.
