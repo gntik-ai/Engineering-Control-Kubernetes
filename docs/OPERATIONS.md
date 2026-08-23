@@ -43,6 +43,12 @@ The one-shot schedule registrar bounds its complete Temporal RPC transaction to 
 systemd start to 45 seconds; transient failures restart after 15 seconds instead of holding an
 install indefinitely.
 
+An internal audit recovery may use `BOOTSTRAP_VALIDATION_SUPERSEDED` only for a nonterminal
+campaign whose authoritative metadata is `dry_run=true`. It writes per-cell recovery evidence,
+completes coverage, and records the prior audit Run as `CANCELLED`; the public campaign API cannot
+request this path. It exists to reconcile terminal bootstrap-validation executions without deleting
+their histories or falsely recording them as successful audits.
+
 The daily cleanup schedule defaults to dry-run mode. It becomes a mutating schedule only when the
 operator explicitly sets `ENGINEERING_CLEANUP_EXECUTION_ENABLED=true` on the controller and every
 owning worker, restarts them, and lets the scheduler update the Temporal schedule. Discovery is

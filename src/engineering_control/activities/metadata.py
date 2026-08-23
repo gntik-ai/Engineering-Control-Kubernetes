@@ -788,11 +788,15 @@ class MetadataActivityHandler:
         raw_cells = payload.get("cells")
         total = int(payload["total"])
         blocker = str(payload.get("blocker", ""))
+        allowed_blockers = {
+            "PROJECT_SNAPSHOT_UNAVAILABLE",
+            "BOOTSTRAP_VALIDATION_SUPERSEDED",
+        }
         if (
             not isinstance(raw_cells, list)
             or not raw_cells
             or total < len(raw_cells)
-            or blocker != "PROJECT_SNAPSHOT_UNAVAILABLE"
+            or blocker not in allowed_blockers
         ):
             raise ValueError("snapshot blocker batch is invalid")
         cells = [CampaignCellRecord.model_validate(item) for item in raw_cells]
@@ -800,6 +804,11 @@ class MetadataActivityHandler:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
                 raise ValueError("campaign does not exist")
+            if blocker == "BOOTSTRAP_VALIDATION_SUPERSEDED" and (
+                campaign.metadata_json.get("dry_run") is not True
+                or campaign.status not in {"QUEUED", "IN_PROGRESS"}
+            ):
+                raise ValueError("only a nonterminal dry-run campaign may be superseded")
             campaign.required_cells = total
             campaign.status = "IN_PROGRESS"
             for cell in cells:
@@ -818,8 +827,16 @@ class MetadataActivityHandler:
                 ).encode()
                 evidence = [
                     {
-                        "kind": "snapshot-blocker",
-                        "reference": f"project-snapshot:{campaign.project}",
+                        "kind": (
+                            "snapshot-blocker"
+                            if blocker == "PROJECT_SNAPSHOT_UNAVAILABLE"
+                            else "recovery-blocker"
+                        ),
+                        "reference": (
+                            f"project-snapshot:{campaign.project}"
+                            if blocker == "PROJECT_SNAPSHOT_UNAVAILABLE"
+                            else f"campaign-recovery:{campaign.project}"
+                        ),
                         "sha256": hashlib.sha256(canonical).hexdigest(),
                     }
                 ]
@@ -1027,6 +1044,9 @@ class MetadataActivityHandler:
     def _finalize_campaign(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["campaign_id"]))
         expected = int(payload["expected_cells"])
+        terminal_blocker = payload.get("terminal_blocker")
+        if terminal_blocker not in {None, "BOOTSTRAP_VALIDATION_SUPERSEDED"}:
+            raise ValueError("campaign terminal blocker is invalid")
         with self.sessions.begin() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
@@ -1059,10 +1079,20 @@ class MetadataActivityHandler:
             )
             if run is not None:
                 run.status = (
-                    "SUCCESS" if status in {"COMPLETE", "VERIFICATION_REQUIRED"} else "BLOCKED"
+                    "CANCELLED"
+                    if terminal_blocker == "BOOTSTRAP_VALIDATION_SUPERSEDED"
+                    else "SUCCESS"
+                    if status in {"COMPLETE", "VERIFICATION_REQUIRED"}
+                    else "BLOCKED"
                 )
                 run.finished_at = datetime.now(UTC)
-                run.error_code = None if run.status == "SUCCESS" else status
+                run.error_code = (
+                    str(terminal_blocker)
+                    if terminal_blocker is not None
+                    else None
+                    if run.status == "SUCCESS"
+                    else status
+                )
                 run.summary = f"campaign={campaign_id};status={status};cells={len(cells)}"
         return {**payload, "status": status, "completed_cells": len(cells)}
 

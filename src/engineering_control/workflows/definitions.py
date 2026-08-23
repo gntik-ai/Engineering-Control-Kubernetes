@@ -270,7 +270,16 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     )
                 )
             summary = await self._step(
-                "campaign.finalize", {"campaign_id": campaign_id, "expected_cells": len(cells)}
+                "campaign.finalize",
+                {
+                    "campaign_id": campaign_id,
+                    "expected_cells": len(cells),
+                    "terminal_blocker": (
+                        snapshot_blocker
+                        if snapshot_blocker == "BOOTSTRAP_VALIDATION_SUPERSEDED"
+                        else None
+                    ),
+                },
             )
             return {
                 "status": summary.get("status", "INCOMPLETE"),

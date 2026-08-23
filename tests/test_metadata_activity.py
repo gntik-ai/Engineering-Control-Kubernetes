@@ -245,6 +245,86 @@ async def test_campaign_snapshot_failure_persists_every_blocked_cell_and_finishe
 
 
 @pytest.mark.asyncio
+async def test_nonterminal_dry_run_campaign_can_be_superseded_with_recovery_evidence(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'superseded-campaign.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    workflow_id = f"audit-falcone-{campaign.id}"
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=uuid4(),
+                campaign_id=campaign.id,
+                workflow_id=workflow_id,
+                run_type="audit-campaign",
+                status="RUNNING",
+                project="falcone",
+            )
+        )
+
+    persisted = await handler.handle(
+        "campaign.persist_snapshot_blockers",
+        {
+            "campaign_id": str(campaign.id),
+            "cells": [audit_cell()],
+            "total": 1,
+            "blocker": "BOOTSTRAP_VALIDATION_SUPERSEDED",
+        },
+    )
+    final = await handler.handle(
+        "campaign.finalize",
+        {
+            "campaign_id": str(campaign.id),
+            "expected_cells": 1,
+            "terminal_blocker": "BOOTSTRAP_VALIDATION_SUPERSEDED",
+        },
+    )
+
+    with handler.sessions() as session:
+        coverage = session.scalar(select(CoverageCell))
+        run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+        stored_campaign = session.get(Campaign, campaign.id)
+    assert persisted["status"] == "BLOCKED_COVERAGE_PERSISTED"
+    assert coverage is not None
+    assert coverage.status == "BLOCKED"
+    assert coverage.blocker == "BOOTSTRAP_VALIDATION_SUPERSEDED"
+    assert coverage.evidence_json[0]["kind"] == "recovery-blocker"
+    assert len(coverage.evidence_json[0]["sha256"]) == 64
+    assert stored_campaign is not None and stored_campaign.status == "COMPLETE"
+    assert run is not None and run.status == "CANCELLED"
+    assert run.error_code == "BOOTSTRAP_VALIDATION_SUPERSEDED"
+    assert final["status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_live_campaign_cannot_use_bootstrap_supersession_path(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'live-campaign.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    with handler.sessions.begin() as session:
+        stored = session.get(Campaign, campaign.id)
+        assert stored is not None
+        stored.metadata_json = {"dry_run": False}
+
+    with pytest.raises(ApplicationError, match="invalid metadata activity input"):
+        await handler.handle(
+            "campaign.persist_snapshot_blockers",
+            {
+                "campaign_id": str(campaign.id),
+                "cells": [audit_cell()],
+                "total": 1,
+                "blocker": "BOOTSTRAP_VALIDATION_SUPERSEDED",
+            },
+        )
+
+
+@pytest.mark.asyncio
 async def test_audit_cell_preparation_is_bounded_and_schema_driven(tmp_path: Path) -> None:
     handler = MetadataActivityHandler(
         Settings(database_url=f"sqlite:///{tmp_path / 'prepare.sqlite'}")
