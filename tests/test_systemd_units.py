@@ -19,6 +19,7 @@ def test_role_worker_namespace_allows_scan_owned_mirror_updates() -> None:
 
     writable = next(line for line in unit.splitlines() if line.startswith("ReadWritePaths="))
     assert "/srv/engineering/mirrors" in writable.split()
+    assert "/var/lib/engineering-control/leases" in writable.split()
 
 
 def test_controller_bootstrap_uses_numeric_chown_for_postgres() -> None:
@@ -63,6 +64,10 @@ def test_worker_parent_state_and_platform_roots_are_identity_traversable() -> No
         'install -d -o root -g root -m 0711 "${STATE_ROOT}/workers" '
         '"${PLATFORM_ROOT}"'
     ) in worker
+    assert (
+        'install -d -o scan-runner -g scan-runner -m 0700 "${STATE_ROOT}/leases"'
+        in worker
+    )
 
 
 def test_controller_config_parents_allow_token_file_group_traversal_only() -> None:
