@@ -8,7 +8,8 @@ from uuid import uuid4
 
 import pytest
 
-from engineering_control.models.enums import Provider
+from engineering_control.models.core import AgentRequest, AgentResult
+from engineering_control.models.enums import Provider, RunStatus
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "native-provider-smoke.py"
@@ -109,3 +110,53 @@ def test_finalize_requires_both_cross_provider_directions(
     assert value["status"] == "PASS"
     assert set(value["directions"].values()) == {"PASS"}
     assert len(digest) == 64
+
+
+@pytest.mark.asyncio
+async def test_failed_native_run_persists_redacted_normalized_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_root = tmp_path / "worktrees"
+    temp_root = tmp_path / "tmp"
+    worktree = work_root / "run" / "codex-maker"
+    result_path = temp_root / "run" / "codex-maker.json"
+    worktree.mkdir(parents=True)
+    result_path.parent.mkdir(parents=True)
+    monkeypatch.setattr(MODULE, "WORKTREE_ROOT", work_root)
+    monkeypatch.setattr(MODULE, "TEMP_ROOT", temp_root)
+
+    class FailingAdapter:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        async def authenticated(self) -> bool:
+            return True
+
+        async def execute(self, request: AgentRequest) -> AgentResult:
+            now = datetime.now(UTC)
+            return AgentResult(
+                run_id=request.run_id,
+                provider=Provider.CODEX,
+                role=request.role,
+                status=RunStatus.FAILED,
+                summary="normalized diagnostic",
+                started_at=now,
+                finished_at=now,
+                exit_code=1,
+                error_code="PROVIDER_FAILED",
+            )
+
+    monkeypatch.setattr(MODULE, "CodexCLIAdapter", FailingAdapter)
+
+    with pytest.raises(RuntimeError, match="native smoke returned FAILED"):
+        await MODULE.run_one(
+            Provider.CODEX,
+            "maker",
+            worktree,
+            "provider-acceptance-codex",
+            result_path,
+        )
+
+    persisted = json.loads(result_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "FAILED"
+    assert persisted["error_code"] == "PROVIDER_FAILED"

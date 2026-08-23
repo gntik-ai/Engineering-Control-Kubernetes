@@ -136,13 +136,13 @@ async def run_one(
     if not await adapter.authenticated():
         raise RuntimeError(f"MANUAL_AUTH_REQUIRED_{provider.value.upper()}")
     result = await adapter.execute(request)
-    if result.status is not RunStatus.SUCCESS:
-        raise RuntimeError(f"{provider.value} native smoke returned {result.status.value}")
-    Draft202012Validator(request.output_schema).validate(result.structured_result)
     safe = SecretRedactor().redact(result.model_dump(mode="json")).value
     if not isinstance(safe, dict):
         raise TypeError("redacted native result must remain an object")
     _write_json(result_file, safe)
+    if result.status is not RunStatus.SUCCESS:
+        raise RuntimeError(f"{provider.value} native smoke returned {result.status.value}")
+    Draft202012Validator(request.output_schema).validate(result.structured_result)
     return result
 
 
