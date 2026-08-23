@@ -42,7 +42,7 @@ def _schema(mode: str, expected_line: str) -> dict[str, Any]:
             "additionalProperties": False,
             "required": ["status", "summary"],
             "properties": {
-                "status": {"const": "PASS"},
+                "status": {"type": "string", "const": "PASS"},
                 "summary": {"type": "string", "minLength": 1, "maxLength": 500},
             },
         }
@@ -51,8 +51,8 @@ def _schema(mode: str, expected_line: str) -> dict[str, Any]:
         "additionalProperties": False,
         "required": ["verdict", "observed_line", "summary"],
         "properties": {
-            "verdict": {"const": "PASS"},
-            "observed_line": {"const": expected_line},
+            "verdict": {"type": "string", "const": "PASS"},
+            "observed_line": {"type": "string", "const": expected_line},
             "summary": {"type": "string", "minLength": 1, "maxLength": 500},
         },
     }

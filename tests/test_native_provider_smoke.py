@@ -31,6 +31,9 @@ def test_requests_enforce_maker_checker_boundaries(tmp_path: Path) -> None:
     assert checker.writable is False
     assert checker.role == "code-reviewer"
     assert checker.allowed_tools == ("Read", "Glob", "Grep")
+    assert maker.output_schema["properties"]["status"]["type"] == "string"
+    assert checker.output_schema["properties"]["verdict"]["type"] == "string"
+    assert checker.output_schema["properties"]["observed_line"]["type"] == "string"
 
 
 def test_acceptance_suite_uses_real_provider_owned_git_repositories() -> None:
