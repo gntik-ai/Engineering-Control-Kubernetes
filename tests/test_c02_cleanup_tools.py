@@ -100,6 +100,23 @@ def test_consumer_collector_ignores_hidden_historical_backups(tmp_path: Path) ->
     assert matches == set()
 
 
+def test_consumer_collector_records_reviewed_management_script_exclusions(
+    tmp_path: Path,
+) -> None:
+    module = _load("collect-c02-consumers.py")
+    reviewed = tmp_path / "verify-hermes-policy.py"
+    reviewed.write_text("reject OmniRoute runtime dependencies\n", encoding="utf-8")
+    active = tmp_path / "active.py"
+    active.write_text("endpoint = 'http://127.0.0.1:20128'\n", encoding="utf-8")
+    matches: set[str] = set()
+    excluded: set[str] = set()
+
+    module._scan_engineering_scripts(tmp_path, matches, excluded)
+
+    assert matches == {str(active)}
+    assert excluded == {str(reviewed)}
+
+
 def test_c02_executor_requires_exact_confirmation() -> None:
     module = _load("execute-c02-cutover.py")
     with pytest.raises(ValueError, match="exact confirmation"):

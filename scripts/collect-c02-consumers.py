@@ -40,8 +40,11 @@ REPOSITORY_NAMES = {
     "musematic-flowbench",
 }
 ALLOWLISTED_ENGINEERING_SCRIPTS = {
+    "build-c01-acceptance.py",
     "execute-c01-cutover.py",
     "build-c01-post-stop-acceptance.py",
+    "prepare-hermes-c01-cutover.py",
+    "verify-hermes-policy.py",
     "collect-c02-consumers.py",
     "validate-c02-readiness.py",
     "execute-c02-cutover.py",
@@ -149,6 +152,19 @@ def _scan_repository(root: Path, matches: set[str]) -> None:
             _scan_file(path, matches)
 
 
+def _scan_engineering_scripts(root: Path, matches: set[str], excluded_targets: set[str]) -> None:
+    if not root.is_dir():
+        return
+    for path in root.iterdir():
+        if not path.is_file() or path.is_symlink():
+            continue
+        if path.name in ALLOWLISTED_ENGINEERING_SCRIPTS:
+            if _candidate(path) and _contains_pattern(path):
+                excluded_targets.add(str(path))
+            continue
+        _scan_file(path, matches)
+
+
 def _container_matches(scope: str) -> list[str]:
     listing = subprocess.run(  # noqa: S603 - fixed Docker query
         ["/usr/bin/docker", "ps", "-a", "--format", "{{.Names}}"],
@@ -220,6 +236,7 @@ def collect(scope: str) -> dict[str, Any]:
     if not FULL_SHA.fullmatch(release):
         raise RuntimeError("installed release is not an immutable Git SHA")
     matches: set[str] = set()
+    excluded_targets: set[str] = set()
     for root in (
         Path("/etc/systemd/system"),
         HOME / ".config/systemd/user",
@@ -237,20 +254,16 @@ def collect(scope: str) -> dict[str, Any]:
     ):
         _scan_tree(root, matches)
     scripts = HOME / "engineering/engineering-control/scripts"
-    if scripts.is_dir():
-        for path in scripts.iterdir():
-            if path.name not in ALLOWLISTED_ENGINEERING_SCRIPTS and path.is_file():
-                _scan_file(path, matches)
+    _scan_engineering_scripts(scripts, matches, excluded_targets)
     repositories = _repository_roots()
     for repository in repositories:
         _scan_repository(repository, matches)
     containers = _container_matches(scope)
     ports = _legacy_ports()
-    excluded_targets: list[str] = []
     retired_unit = str(HOME / ".config/systemd/user/omniroute.service")
     if scope == "controller" and retired_unit in matches:
         matches.remove(retired_unit)
-        excluded_targets.append(retired_unit)
+        excluded_targets.add(retired_unit)
     locations = sorted(matches)
     return {
         "schema_version": 1,
@@ -262,7 +275,7 @@ def collect(scope: str) -> dict[str, Any]:
         "container_consumer_names": containers,
         "legacy_listening_ports": ports,
         "repositories_scanned": [str(path) for path in repositories],
-        "excluded_reviewed_cleanup_targets": excluded_targets,
+        "excluded_reviewed_cleanup_targets": sorted(excluded_targets),
         "collector_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "maximum_scanned_file_bytes": MAX_SCAN_FILE_BYTES,
         "secret_values_persisted": False,
