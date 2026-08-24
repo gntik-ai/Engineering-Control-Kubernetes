@@ -62,6 +62,7 @@ class ClaudeCLIAdapter:
             "--print",
             "--output-format",
             "stream-json",
+            "--verbose",
             "--json-schema",
             json.dumps(request.output_schema, separators=(",", ":"), sort_keys=True),
             "--no-session-persistence",
