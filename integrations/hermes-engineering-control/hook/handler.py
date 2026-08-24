@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -8,6 +10,7 @@ import stat
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -35,6 +38,12 @@ ALLOWLIST_FILE = Path(
     os.getenv(
         "ENGINEERING_TELEGRAM_ALLOWLIST_FILE",
         "/etc/engineering-control/env/telegram-allowlist",
+    )
+)
+ACCEPTANCE_LOG = Path(
+    os.getenv(
+        "ENGINEERING_TELEGRAM_ACCEPTANCE_LOG",
+        "/home/hermes/engineering-bootstrap/telegram-acceptance.jsonl",
     )
 )
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -118,6 +127,108 @@ def _uuid(value: str, label: str) -> str:
 
 def _format(value: Any) -> str:
     return _redact(json.dumps(value, indent=2, sort_keys=True, default=str))
+
+
+def _acceptance_summary(command: str, raw_args: str, result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    if command == "usage":
+        providers: dict[str, dict[str, Any]] = {}
+        for provider in ("codex", "claude"):
+            value = result.get(provider)
+            if isinstance(value, dict):
+                providers[provider] = {
+                    key: value.get(key)
+                    for key in (
+                        "status",
+                        "authenticated",
+                        "cli_present",
+                        "rate_limited",
+                        "running_jobs",
+                    )
+                }
+        return {"providers": providers}
+    if command == "validate":
+        return {
+            key: result.get(key)
+            for key in ("workflow_id", "run_id", "status")
+            if result.get(key) is not None
+        }
+    if command == "status":
+        args = shlex.split(raw_args)
+        validation = result.get("validation")
+        safe_validation = (
+            {
+                key: validation.get(key)
+                for key in (
+                    "status",
+                    "change_set_state",
+                    "maker_provider",
+                    "checker_provider",
+                    "evidence_sha256",
+                    "redaction_status",
+                )
+            }
+            if isinstance(validation, dict)
+            else None
+        )
+        return {
+            "requested_workflow_id": args[0] if len(args) == 1 else None,
+            "workflow_id": result.get("workflow_id"),
+            "run_id": result.get("run_id"),
+            "status": result.get("status"),
+            "workflow_type": result.get("workflow_type"),
+            "validation": safe_validation,
+        }
+    return None
+
+
+def _record_acceptance(command: str, raw_args: str, result: Any) -> None:
+    summary = _acceptance_summary(command, raw_args, result)
+    if summary is None:
+        return
+    release_sha = Path("/opt/engineering-control/source").resolve().parent.name
+    serialized_summary = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+    event = {
+        "schema_version": 1,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "release_sha": release_sha,
+        "actor_class": "allowlisted-telegram-user",
+        "command": command,
+        "result_sha256": hashlib.sha256(serialized_summary.encode()).hexdigest(),
+        "summary": summary,
+    }
+    parent = ACCEPTANCE_LOG.parent
+    parent_metadata = parent.stat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.geteuid()
+        or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise PermissionError("Telegram acceptance evidence parent is unsafe")
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        descriptor = os.open(ACCEPTANCE_LOG, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        descriptor = os.open(ACCEPTANCE_LOG, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        ):
+            raise PermissionError("Telegram acceptance evidence file is unsafe")
+        if created:
+            os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, json.dumps(event, sort_keys=True).encode() + b"\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _dispatch(command: str, raw_args: str, actor: str) -> Any:
@@ -254,7 +365,9 @@ def handle(event_type: str, context: dict[str, Any]) -> dict[str, str] | None:
     try:
         if not _authorized(user_id):
             return {"decision": "deny", "message": "Engineering Control access denied."}
-        result = _dispatch(command, str(context.get("raw_args", "")), f"telegram:{user_id}")
+        raw_args = str(context.get("raw_args", ""))
+        result = _dispatch(command, raw_args, f"telegram:{user_id}")
+        _record_acceptance(command, raw_args, result)
         return {"decision": "handled", "message": _format(result)}
     except (OSError, RuntimeError, ValueError) as error:
         return {"decision": "handled", "message": _redact(f"Engineering Control: {error}")}

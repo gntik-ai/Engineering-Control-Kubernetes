@@ -33,6 +33,17 @@ outbound Telegram delivery pass. The operator must still send `/usage`, `/valida
 `/status <returned-workflow-id>` from the allowlisted Telegram account to complete the
 user-originated round-trip check.
 
+Successful responses for those three canaries append a bounded, secret-free, release-bound receipt
+to `/home/hermes/engineering-bootstrap/telegram-acceptance.jsonl` with mode `0600`. After the
+workflow is complete, validate the exact sequence and persist canonical hashed evidence with:
+
+```bash
+sudo /opt/engineering-control/source/scripts/validate-telegram-acceptance.py
+```
+
+The validator rejects mismatched releases/workflows, unauthenticated or rate-limited provider
+status, non-completed workflows, missing evidence hashes, and unsafe receipt permissions.
+
 Hermes receives read-only access to the narrow API token through a named ACL while the file remains
 `root:engineering-api-clients` mode `0640`. It cannot invoke arbitrary shell, SSH, Helm, or
 Kubernetes commands.

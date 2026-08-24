@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 218 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
+| Control-plane Python | PASS | 221 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -76,6 +76,7 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata again after the final release restart |
 | Telegram outbound | PASS | Bot API identity check and silent canary delivery succeeded |
 | Telegram inbound command | PENDING OPERATOR | bot cannot generate a user-originated command; operator must send `/usage`, `/validate 30`, then `/status` for the returned workflow |
+| Telegram acceptance evidence | READY | successful allowlisted responses append only bounded secret-free receipts; the root validator requires one release-bound `/usage` -> `/validate` -> completed `/status` sequence before persisting canonical hashed evidence |
 | Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
 
 Hermes still has runtime OmniRoute provider aliases. Native provider and cross-provider acceptance

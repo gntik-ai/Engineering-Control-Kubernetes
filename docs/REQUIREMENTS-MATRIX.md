@@ -41,7 +41,7 @@ platform fails closed rather than bypassing.
 | 31 Kubernetes identity separation | IMPLEMENTED/BLOCKED CREDENTIALS | RBAC templates and negative checks exist; no scoped observer/release kubeconfigs are installed |
 | 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0, explicitly enabled command plugin, fixed allowlisted hook and bounded `/validate` route are active; only the user-originated Telegram canary and gated Omni alias cutover remain |
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |
-| 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API, bounded `/validate` and outbound Telegram pass; user-originated `/usage`/`validate`/`status` canary is pending |
+| 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API, bounded `/validate`, outbound Telegram, and release/workflow-bound secret-free canary receipts are active; user-originated `/usage`/`validate`/`status` sequence is pending |
 | 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
 | 36 Observability | IMPLEMENTED | Structured redacted context logs, PostgreSQL-backed Prometheus metrics, authenticated worker heartbeats |
 | 37 Failure/handoff | IMPLEMENTED | Required handoff bundle files and explicit `RATE_LIMITED`/cross-provider semantics |

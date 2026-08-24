@@ -77,6 +77,7 @@ def test_authorized_command_records_telegram_actor(monkeypatch: pytest.MonkeyPat
         return {"status": "ok"}
 
     monkeypatch.setattr(handler, "_request", request)
+    monkeypatch.setattr(handler, "_record_acceptance", lambda *_args: None)
     result = handler.handle(
         "command:usage",
         {"platform": "telegram", "user_id": "42", "raw_args": ""},
@@ -101,6 +102,7 @@ def test_validate_command_starts_only_bounded_synthetic_lifecycle(
         return {"status": "ACCEPTED"}
 
     monkeypatch.setattr(handler, "_request", request)
+    monkeypatch.setattr(handler, "_record_acceptance", lambda *_args: None)
     result = handler.handle(
         "command:validate",
         {"platform": "telegram", "user_id": "42", "raw_args": "5"},
@@ -140,3 +142,35 @@ def test_verify_command_starts_only_one_bounded_finding_workflow(
         "payload": {"finding_id": finding_id},
     }
     assert result is not None and result["decision"] == "handled"
+
+
+def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
+    handler = load_handler()
+    handler.ACCEPTANCE_LOG = tmp_path / "telegram-acceptance.jsonl"
+
+    handler._record_acceptance(
+        "usage",
+        "",
+        {
+            "codex": {
+                "status": "AVAILABLE",
+                "authenticated": True,
+                "cli_present": True,
+                "rate_limited": False,
+                "running_jobs": 0,
+                "token": "must-not-persist",
+            },
+            "claude": {
+                "status": "AVAILABLE",
+                "authenticated": True,
+                "cli_present": True,
+                "rate_limited": False,
+                "running_jobs": 0,
+            },
+        },
+    )
+
+    persisted = handler.ACCEPTANCE_LOG.read_text(encoding="utf-8")
+    assert "must-not-persist" not in persisted
+    assert '"actor_class": "allowlisted-telegram-user"' in persisted
+    assert handler.ACCEPTANCE_LOG.stat().st_mode & 0o777 == 0o600
