@@ -68,7 +68,7 @@ def validate_provider(value: dict[str, Any], release_sha: str, agent_pack_sha: s
             not isinstance(run, dict)
             or run.get("provider") != provider
             or run.get("role") != role
-            or run.get("status") != "success"
+            or run.get("status") != "SUCCESS"
             or run.get("agent_pack_revision") != agent_pack_sha
             or not DIGEST.fullmatch(str(run.get("instruction_bundle_sha256", "")))
         ):

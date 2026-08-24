@@ -25,7 +25,7 @@ def test_provider_matrix_requires_release_pack_and_no_paid_fallback() -> None:
         key: {
             "provider": provider,
             "role": role,
-            "status": "success",
+            "status": "SUCCESS",
             "agent_pack_revision": pack,
             "instruction_bundle_sha256": "c" * 64,
         }
@@ -42,6 +42,10 @@ def test_provider_matrix_requires_release_pack_and_no_paid_fallback() -> None:
     }
 
     module.validate_provider(value, release, pack)
+    runs["codex_maker"]["status"] = "success"
+    with pytest.raises(ValueError, match="codex_maker"):
+        module.validate_provider(value, release, pack)
+    runs["codex_maker"]["status"] = "SUCCESS"
     value["paid_api_fallback"] = True
     with pytest.raises(ValueError, match="native replacement"):
         module.validate_provider(value, release, pack)

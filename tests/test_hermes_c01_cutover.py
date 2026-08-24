@@ -79,7 +79,7 @@ def test_pre_cutover_evidence_binds_release_pack_and_restart_resume(tmp_path: Pa
             key: {
                 "provider": provider_name,
                 "role": role,
-                "status": "success",
+                "status": "SUCCESS",
                 "agent_pack_revision": agent_pack,
                 "instruction_bundle_sha256": "c" * 64,
             }

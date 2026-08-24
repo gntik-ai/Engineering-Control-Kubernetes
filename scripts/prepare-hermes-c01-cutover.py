@@ -220,7 +220,7 @@ def _validate_pre_cutover_evidence(
             not isinstance(run, dict)
             or run.get("provider") != provider_name
             or run.get("role") != role
-            or run.get("status") != "success"
+            or run.get("status") != "SUCCESS"
             or run.get("agent_pack_revision") != agent_pack
             or not DIGEST.fullmatch(str(run.get("instruction_bundle_sha256", "")))
         ):
