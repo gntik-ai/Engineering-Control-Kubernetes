@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 234 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
+| Control-plane Python | PASS | 251 pytest tests; Ruff clean; strict mypy clean across 79 source files plus nine privileged cleanup/cutover scripts; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -80,10 +80,17 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Telegram acceptance evidence | READY | successful allowlisted responses append only bounded secret-free receipts; the root validator requires one release-bound `/usage` -> `/validate` -> completed `/status` sequence before persisting canonical hashed evidence |
 | Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
 
-The active Hermes configuration uses native `openai-codex` aliases and contains no OmniRoute
-runtime dependency; the OmniRoute service/package remains intact for rollback. Native provider and
+The active Hermes configuration, project profiles, and agent guidance use the native
+`openai-codex`/Engineering Control path and contain no OmniRoute runtime dependency; the OmniRoute
+service/package remains intact for rollback. Native provider and
 cross-provider acceptance pass; C-01 remains closed until the genuine inbound Telegram canaries
 pass and are recorded.
+
+The cleanup executors are separately tested but unexecuted. Phase A can only stop/disable
+OmniRoute. Phase B requires fresh post-stop provider, Temporal, Telegram, Hermes-restart, and all
+six worker-service restart evidence before it moves the independent wrapper and uninstalls npm.
+C-02 requires fresh secret-free consumer inventories from both hosts, post-C-01 aggregate traffic
+evidence, backup-first Caddy removal, and a fresh post-removal end-to-end regression.
 
 ## Lifecycle acceptance
 

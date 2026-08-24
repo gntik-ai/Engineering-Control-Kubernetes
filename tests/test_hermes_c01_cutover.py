@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from engineering_control.validation.c01 import REQUIRED_PROVIDER_RUNS
+
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "prepare-hermes-c01-cutover.py"
 SPEC = importlib.util.spec_from_file_location("prepare_hermes_c01_cutover", SCRIPT)
@@ -50,6 +52,50 @@ def test_transform_removes_omniroute_and_preserves_unrelated_provider() -> None:
     assert not any(MODULE.OMNI_DEPENDENCY.search(value) for value in MODULE._strings(candidate))
 
 
+def test_transform_profile_replaces_runtime_provider_without_changing_domain_data() -> None:
+    profile = {
+        "project": "falcone",
+        "model_policy": {
+            "provider": "custom:omniroute",
+            "orchestrator": "hermes-coding",
+            "strict_provider_allowlist": True,
+        },
+        "domains": ["gateway", "tenancy"],
+    }
+
+    candidate, changes = MODULE.transform_profile(profile)
+
+    assert candidate["model_policy"]["provider"] == "openai-codex"
+    assert candidate["model_policy"]["orchestrator"] == "hermes-coding"
+    assert candidate["domains"] == ["gateway", "tenancy"]
+    assert changes == ("model_policy.provider:openai-codex",)
+
+
+def test_transform_profile_rejects_unhandled_omniroute_reference() -> None:
+    with pytest.raises(ValueError, match="still contains"):
+        MODULE.transform_profile(
+            {
+                "model_policy": {"provider": "openai-codex"},
+                "endpoint": "http://127.0.0.1:20131/v1",
+            }
+        )
+
+
+def test_transform_runtime_asset_replaces_only_reviewed_instruction() -> None:
+    original = f"Review carefully. {MODULE.QUALITY_SKILL_OMNI_TEXT}\n".encode()
+
+    candidate, changes = MODULE.transform_runtime_asset(original)
+
+    assert b"OmniRoute" not in candidate
+    assert MODULE.QUALITY_SKILL_NATIVE_TEXT.encode() in candidate
+    assert changes == ("quality-cross:engineering-control-checker",)
+
+
+def test_transform_runtime_asset_rejects_unreviewed_reference() -> None:
+    with pytest.raises(ValueError, match="unreviewed"):
+        MODULE.transform_runtime_asset(b"Use OmniRoute directly.\n")
+
+
 def test_apply_requires_exact_confirmation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="exact confirmation"):
         MODULE.apply(
@@ -83,7 +129,7 @@ def test_pre_cutover_evidence_binds_release_pack_and_restart_resume(tmp_path: Pa
                 "agent_pack_revision": agent_pack,
                 "instruction_bundle_sha256": "c" * 64,
             }
-            for key, (provider_name, role) in MODULE.REQUIRED_PROVIDER_RUNS.items()
+            for key, (provider_name, role) in REQUIRED_PROVIDER_RUNS.items()
         },
     }
     provider.write_text(json.dumps(provider_value), encoding="utf-8")

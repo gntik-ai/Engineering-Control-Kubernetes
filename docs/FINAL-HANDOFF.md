@@ -213,8 +213,9 @@ Final inbound canary from the allowlisted account:
 /status <workflow-id-returned-by-validate>
 ```
 
-The active Hermes aliases use its native `openai-codex` subscription path and pass the no-OmniRoute
-policy check. OmniRoute itself remains installed and running as rollback state until every C-01
+The active Hermes aliases, project profiles, and agent guidance use its native `openai-codex`/
+Engineering Control path and pass the no-OmniRoute policy check. OmniRoute itself remains installed and running as
+rollback state until every C-01
 gate and the post-stop regression pass.
 
 ## 10. Codex
@@ -397,7 +398,7 @@ Remote GitHub repository creation was not authorized or performed.
 | Controller API, PostgreSQL, Temporal, scheduler, notifier, evidence ingest | PASS |
 | Controller restart/resume lifecycle | PASS |
 | Worker service users, services, tools, filesystem/credential isolation | PASS |
-| Control-plane tests (234), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
+| Control-plane tests (251), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
 | Agent pack generation, validation, and tests | PASS |
 | Codex install/auth/structured native call | PASS |
 | Claude install | PASS |
@@ -433,5 +434,7 @@ send from the allowlisted Telegram account:
 ```
 
 After those pass, run the provider/Telegram/lifecycle evidence commands and the deterministic C-01
-builder in `docs/HERMES-TELEGRAM.md`. Do not stop OmniRoute or Caddy manually and do not run a
-deployment merely to test the platform.
+builder in `docs/HERMES-TELEGRAM.md`. The documented executors enforce stop-only, fresh post-stop
+regression, uninstall, two-host Caddy consumer/traffic review, backup-first Caddy removal, and a
+fresh post-removal regression. Do not stop OmniRoute or Caddy manually and do not run a deployment
+merely to test the platform.

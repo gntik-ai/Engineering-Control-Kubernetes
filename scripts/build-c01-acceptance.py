@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import pwd
-import re
 import stat
 import subprocess
 import tempfile
@@ -15,20 +13,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from engineering_control.validation.c01 import (
+    FULL_SHA,
+    digest,
+    validate_lifecycle,
+    validate_provider,
+    validate_telegram,
+    validate_usage,
+)
+
 OUTPUT = Path("/home/hermes/engineering-bootstrap/C01-ACCEPTANCE.json")
 API_TOKEN = Path("/etc/engineering-control/env/api.token")
-FULL_SHA = re.compile(r"^[a-f0-9]{40}$")
-DIGEST = re.compile(r"^[a-f0-9]{64}$")
-REQUIRED_PROVIDER_RUNS = {
-    "codex_maker": ("codex", "implementer"),
-    "claude_checker": ("claude", "code-reviewer"),
-    "claude_maker": ("claude", "implementer"),
-    "codex_checker": ("codex", "code-reviewer"),
-}
-
-
-def _digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _load(path: Path, roots: tuple[Path, ...], label: str) -> dict[str, Any]:
@@ -47,86 +42,6 @@ def _load(path: Path, roots: tuple[Path, ...], label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} is not a JSON object")
     return value
-
-
-def validate_provider(value: dict[str, Any], release_sha: str, agent_pack_sha: str) -> None:
-    if (
-        value.get("status") != "PASS"
-        or value.get("release_sha") != release_sha
-        or value.get("redaction_status") != "REDACTED"
-        or value.get("authentication_mode") != "native-subscription-cli"
-        or value.get("paid_api_fallback") is not False
-        or value.get("directions") != {"codex_to_claude": "PASS", "claude_to_codex": "PASS"}
-    ):
-        raise ValueError("provider evidence does not prove the native replacement matrix")
-    runs = value.get("provider_runs")
-    if not isinstance(runs, dict) or set(runs) != set(REQUIRED_PROVIDER_RUNS):
-        raise ValueError("provider evidence has an incomplete invocation matrix")
-    for key, (provider, role) in REQUIRED_PROVIDER_RUNS.items():
-        run = runs[key]
-        if (
-            not isinstance(run, dict)
-            or run.get("provider") != provider
-            or run.get("role") != role
-            or run.get("status") != "SUCCESS"
-            or run.get("agent_pack_revision") != agent_pack_sha
-            or not DIGEST.fullmatch(str(run.get("instruction_bundle_sha256", "")))
-        ):
-            raise ValueError(f"provider evidence run {key} is invalid")
-
-
-def validate_lifecycle(
-    value: dict[str, Any],
-    release_sha: str,
-    evidence_root: Path = Path("/home/hermes/engineering-bootstrap/acceptance-runs"),
-) -> None:
-    if (
-        value.get("status") != "PASS"
-        or value.get("release_sha") != release_sha
-        or value.get("change_set_state") != "AWAITING_STAGING_APPROVAL"
-        or value.get("workflow_worker_restarted") is not True
-        or value.get("authenticated_api_path") is not True
-        or value.get("maker_provider") == value.get("checker_provider")
-        or value.get("redaction_status") not in {"REDACTED", "SCANNED_CLEAN"}
-        or not DIGEST.fullmatch(str(value.get("evidence_sha256", "")))
-    ):
-        raise ValueError("lifecycle evidence does not prove restart/resume and persistence")
-    evidence_path = Path(str(value.get("evidence_path", ""))).resolve()
-    if (
-        not evidence_path.is_file()
-        or not evidence_path.is_relative_to(evidence_root.resolve())
-        or _digest(evidence_path) != value["evidence_sha256"]
-    ):
-        raise ValueError("lifecycle artifact path or digest does not match")
-
-
-def validate_telegram(value: dict[str, Any], release_sha: str) -> None:
-    events = value.get("events")
-    if (
-        value.get("status") != "PASS"
-        or value.get("release_sha") != release_sha
-        or value.get("commands") != ["usage", "validate", "status"]
-        or not isinstance(events, list)
-        or len(events) != 3
-        or any(event.get("release_sha") != release_sha for event in events)
-    ):
-        raise ValueError("Telegram evidence is not a release-bound three-command sequence")
-
-
-def validate_usage(value: dict[str, Any]) -> None:
-    for provider in ("codex", "claude"):
-        snapshot = value.get(provider)
-        if (
-            not isinstance(snapshot, dict)
-            or snapshot.get("status") != "AVAILABLE"
-            or snapshot.get("authenticated") is not True
-            or snapshot.get("cli_present") is not True
-            or snapshot.get("rate_limited") is not False
-        ):
-            raise ValueError(f"quota snapshot for {provider} is not operational")
-        for unknown_safe in ("remaining_capacity", "total_capacity", "reset_at"):
-            if unknown_safe not in snapshot:
-                raise ValueError(f"quota snapshot for {provider} omits {unknown_safe}")
 
 
 def _runtime_checks() -> dict[str, Any]:
@@ -268,11 +183,11 @@ def main() -> None:
         "agent_pack_sha": agent_pack_sha,
         "gates": gates,
         "provider_evidence_path": str(arguments.provider_evidence.resolve()),
-        "provider_evidence_sha256": _digest(arguments.provider_evidence.resolve()),
+        "provider_evidence_sha256": digest(arguments.provider_evidence.resolve()),
         "telegram_evidence_path": str(arguments.telegram_evidence.resolve()),
-        "telegram_evidence_sha256": _digest(arguments.telegram_evidence.resolve()),
+        "telegram_evidence_sha256": digest(arguments.telegram_evidence.resolve()),
         "lifecycle_evidence_path": str(arguments.lifecycle_evidence.resolve()),
-        "lifecycle_evidence_sha256": _digest(arguments.lifecycle_evidence.resolve()),
+        "lifecycle_evidence_sha256": digest(arguments.lifecycle_evidence.resolve()),
     }
     _write_output(payload)
     print(f"PASS C-01 replacement acceptance manifest={OUTPUT}")

@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 import re
+import stat
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ OMNI_DEPENDENCY = re.compile(
 )
 NO_ADMIN = ["engineering-control-no-admin"]
 PLUGIN_NAME = "engineering-control"
+RUNTIME_ASSET_SUFFIXES = {".json", ".md", ".py", ".sh", ".yaml", ".yml"}
 
 
 def _strings(value: Any) -> list[str]:
@@ -52,6 +54,52 @@ def _strings(value: Any) -> list[str]:
             result.extend(_strings(nested))
         return result
     return [str(value)]
+
+
+def _runtime_profiles(hermes_home: Path) -> tuple[Path, ...]:
+    profile_root = hermes_home / "project-profiles"
+    if not profile_root.exists():
+        return ()
+    if profile_root.is_symlink() or not profile_root.is_dir():
+        raise ValueError("Hermes project profile root must be a real directory")
+    profiles: list[Path] = []
+    for path in sorted(profile_root.glob("*.yaml")):
+        metadata = path.stat()
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError(f"Hermes runtime profile is unsafe: {path.name}")
+        profiles.append(path)
+    return tuple(profiles)
+
+
+def _runtime_assets(hermes_home: Path) -> tuple[Path, ...]:
+    assets: list[Path] = []
+    for name in ("commands", "hooks", "plugins", "skills", "tools"):
+        root = hermes_home / name
+        if not root.exists():
+            continue
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError(f"Hermes runtime asset root must be a real directory: {name}")
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root)
+            if any(part.startswith(".") or part == "__pycache__" for part in relative.parts):
+                continue
+            if path.suffix.lower() not in RUNTIME_ASSET_SUFFIXES or not path.is_file():
+                continue
+            metadata = path.stat()
+            if (
+                path.is_symlink()
+                or metadata.st_nlink != 1
+                or metadata.st_size > 2 * 1024 * 1024
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise ValueError(f"Hermes runtime asset is unsafe: {path.relative_to(hermes_home)}")
+            assets.append(path)
+    return tuple(assets)
 
 
 def verify(config_path: Path, hermes_home: Path, require_no_omniroute: bool) -> None:
@@ -91,8 +139,28 @@ def verify(config_path: Path, hermes_home: Path, require_no_omniroute: bool) -> 
     handler = hermes_home / "hooks" / "engineering-control" / "handler.py"
     if not all(path.is_file() for path in (plugin, plugin_module, hook, handler)):
         raise ValueError("Engineering Control Hermes plugin or hook is missing")
-    if require_no_omniroute and any(OMNI_DEPENDENCY.search(item) for item in _strings(config)):
-        raise ValueError("Hermes configuration still contains an OmniRoute runtime dependency")
+    if require_no_omniroute:
+        runtime_documents: list[tuple[str, Any]] = [(config_path.name, config)]
+        for profile in _runtime_profiles(hermes_home):
+            parsed = yaml.safe_load(profile.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError(f"Hermes runtime profile is not a mapping: {profile.name}")
+            runtime_documents.append((f"project-profiles/{profile.name}", parsed))
+        offenders = [
+            label
+            for label, document in runtime_documents
+            if any(OMNI_DEPENDENCY.search(item) for item in _strings(document))
+        ]
+        offenders.extend(
+            str(path.relative_to(hermes_home))
+            for path in _runtime_assets(hermes_home)
+            if OMNI_DEPENDENCY.search(path.read_text(encoding="utf-8"))
+        )
+        if offenders:
+            raise ValueError(
+                "Hermes runtime configuration still contains an OmniRoute dependency: "
+                + ", ".join(offenders)
+            )
 
 
 def _has_direct_secret(config: dict[str, Any]) -> bool:

@@ -11,7 +11,7 @@ platform fails closed rather than bypassing.
 | 1 Host inventory | COMPLETE | Redacted controller/worker inventory and checksum manifests under `/home/hermes/engineering-bootstrap/inventory` |
 | 2 Asset discovery | COMPLETE | Repository/worktree and reusable-agent reports; dirty worktrees remain protected |
 | 3 Security scan | COMPLETE/BLOCKED | Redacted Gitleaks/history inventory; Musematic Git secrets and shared cluster-admin identity are active blockers |
-| 4 Cleanup plan | CONDITIONALLY APPROVED | C-03 complete; C-01/C-02 remain behind the operator's additional acceptance gates; a deterministic release-bound C-01 evidence builder now prevents manual gate claims |
+| 4 Cleanup plan | CONDITIONALLY APPROVED | C-03 complete; C-01/C-02 remain gated; deterministic executors enforce stop-only, fresh post-stop regression, wrapper-before-uninstall, two-host consumer/traffic review, backup-first Caddy removal, and fresh post-removal regression |
 | 5 Backup before cleanup | COMPLETE | `engineering-backups/20260823T095538Z` has readable checksums and restore procedures; protected credentials were excluded |
 | 6 Filesystem architecture | ACTIVE | Normalized controller/worker trees, ownership, ACLs, state and journal services are installed |
 | 7 Git repository layout | IMPLEMENTED | Independent local Git repositories for `engineering-control` and `engineering-agent-pack`; no remote repository was created |
@@ -39,7 +39,7 @@ platform fails closed rather than bypassing.
 | 29 Falcone adapter | IMPLEMENTED/BLOCKED LIVE | Exact-SHA CI/provenance, digest-only chart promotion, rendered-digest enforcement, Helm lint/template plus kubeconform, immutable plans, independent release review, real backup/migration gates, atomic deploy, verification/recovery; current release workflow lacks the signed candidate contract, target is disabled, and scoped kubeconfig is absent |
 | 30 Musematic adapter | IMPLEMENTED/SECURITY BLOCKED | Exact-SHA CI gate, immutable desired-state digest validation, unsafe Image Updater/direct-main rejection, bounded YAML/symlink checks, draft deployment PR, exact Argo observation and Git recovery plan; committed secrets, missing signed candidate contract, tag-only chart rendering and newest-build policy block promotion/write enablement |
 | 31 Kubernetes identity separation | IMPLEMENTED/BLOCKED CREDENTIALS | RBAC templates and negative checks exist; no scoped observer/release kubeconfigs are installed |
-| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0, explicitly enabled command plugin, fixed allowlisted hook and bounded `/validate` route are active; only the user-originated Telegram canary and gated Omni alias cutover remain |
+| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0, explicitly enabled command plugin, fixed allowlisted hook, bounded `/validate`, and native `openai-codex` aliases/project profiles/agent guidance are active; no active OmniRoute dependency remains, while genuine inbound Telegram proof is pending |
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |
 | 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API, bounded `/validate`, outbound Telegram, and release/workflow-bound secret-free canary receipts are active; user-originated `/usage`/`validate`/`status` sequence is pending |
 | 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
@@ -57,15 +57,17 @@ platform fails closed rather than bypassing.
 
 1. Rerun/fetch the release-bound provider matrix and restart/resume lifecycle.
 2. Apply the backup-first native Hermes alias cutover while keeping OmniRoute fully available for
-   rollback; restart Hermes and require the no-OmniRoute active-configuration policy to pass.
+   rollback; restart Hermes and require the no-OmniRoute runtime-configuration/profile/agent-asset
+   policy to pass.
 3. Send allowlisted Telegram `/usage`, `/validate 30`, and `/status`; validate the genuine inbound
    round trip and use the deterministic builder to emit `C01-ACCEPTANCE.json` only if every C-01
    gate passes.
-4. Stop/disable OmniRoute without uninstalling it, restart Hermes/workers, and rerun the complete
-   Telegram regression. Only after that pass, uninstall the reviewed npm package while retaining
-   `.omniroute`.
-5. Secret-safely prove Caddy has no consumers and has no legitimate runtime traffic, then execute
-   C-02 and rerun the complete Telegram regression.
+4. Run the stop-only C-01 executor, restart Hermes and all six worker services, and rerun fresh
+   provider, lifecycle, and genuine Telegram evidence. Build the post-stop manifest; only its PASS
+   permits moving the independent wrapper before npm uninstall. Retain `.omniroute`.
+5. After the observation window, collect root-owned secret-free consumer evidence on both hosts,
+   prove Caddy has no legitimate runtime traffic, run the backup-first C-02 executor, and build a
+   fresh post-removal provider/lifecycle/Telegram regression manifest.
 6. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
    and registry-read credential without copying interactive user credentials.
 7. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with

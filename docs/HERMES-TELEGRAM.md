@@ -30,8 +30,9 @@ sudo chmod 0640 /etc/engineering-control/env/telegram-allowlist
 The service definition and plugin-parent metadata were backed up before activation under
 `engineering-backups/20260823T095538Z`. Direct hook authorization, hook-to-API `/usage`, and
 outbound Telegram delivery pass. Before the final inbound canary, the backup-first native-provider
-configuration cutover must have removed OmniRoute from the active Hermes configuration while
-leaving the OmniRoute service/package and `.omniroute` rollback state intact.
+configuration cutover must have removed OmniRoute from the active Hermes configuration and all
+runtime project profiles/agent guidance while leaving the OmniRoute service/package and
+`.omniroute` rollback state intact.
 
 The C-01 gate is built only from three immutable, release-bound evidence files. First rerun the
 native provider suite on the worker, fetch its redacted operator manifest to the controller, and
@@ -65,7 +66,8 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart hermes-gateway.servi
 Apply mode refuses direct YAML secrets, validates exact-release cross-provider and lifecycle
 evidence, verifies healthy `openai-codex` subscription authentication, and writes a mode-`0600`
 rollback copy plus SHA256 manifest under `/home/hermes/engineering-backups`. It changes only
-Hermes configuration. It does not stop, disable, or uninstall OmniRoute.
+Hermes runtime configuration and the reviewed `quality-cross` guidance. It does not stop, disable,
+or uninstall OmniRoute.
 
 Now send `/usage`, `/validate 30`, and `/status <returned-workflow-id>` from the allowlisted
 Telegram account. Successful responses append a bounded, secret-free, release-bound receipt to
@@ -101,8 +103,9 @@ Hermes receives read-only access to the narrow API token through a named ACL whi
 `root:engineering-api-clients` mode `0640`. It cannot invoke arbitrary shell, SSH, Helm, or
 Kubernetes commands.
 
-Historical Hermes assets may still mention OmniRoute, but the active configuration must not. The
-OmniRoute service remains available as rollback state until the final C-01 acceptance and
+Historical Hermes backups may still mention OmniRoute, but active configuration, project profiles,
+skills, hooks, plugins, commands, and tools must not. The OmniRoute service remains available as
+rollback state until the final C-01 acceptance and
 post-stop regression pass. Both real native structured calls and both cross-provider directions
 pass with redacted evidence.
 
@@ -115,10 +118,70 @@ floor). Validate this boundary with:
   /opt/engineering-control/source/scripts/verify-hermes-policy.py
 ```
 
-The final C-01 manifest authorizes only the reviewed two-step service/package cleanup. Stop and
-disable OmniRoute first without uninstalling it, restart Hermes and workers, and rerun the complete
-Telegram regression. Uninstall the npm package only if that regression still passes; preserve
-`.omniroute` throughout.
+The final C-01 manifest authorizes only phase A of the reviewed two-step service/package cleanup:
+
+```bash
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/execute-c01-cutover.py \
+  --phase stop --confirmation 'STOP C01 OMNIROUTE ONLY'
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart hermes-gateway.service
+ssh -t worker 'sudo systemctl restart \
+  engineering-worker@codex.service engineering-worker@claude.service \
+  engineering-worker@browser.service engineering-worker@scan.service \
+  engineering-worker@delivery.service engineering-release-worker.service'
+```
+
+Phase A backs up the reviewed unit/wrapper metadata and writes `C01-STOPPED.json`; it leaves the
+npm package, independent wrapper, and `.omniroute` untouched. Rerun/fetch the provider matrix and
+restart/resume lifecycle, then send a new Telegram `/usage` -> `/validate 30` -> completed `/status`
+sequence. Validate that new receipt and pass the three new evidence paths to:
+
+```bash
+sudo /opt/engineering-control/source/scripts/build-c01-post-stop-acceptance.py \
+  --provider-evidence "${POST_STOP_PROVIDER_EVIDENCE}" \
+  --telegram-evidence "${POST_STOP_TELEGRAM_EVIDENCE}" \
+  --lifecycle-evidence "${POST_STOP_LIFECYCLE_EVIDENCE}"
+```
+
+The post-stop builder rejects evidence created before the stop and proves Hermes plus all six
+worker services were restarted. Only its PASS manifest permits phase B:
+
+```bash
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/execute-c01-cutover.py \
+  --phase uninstall --confirmation 'UNINSTALL C01 OMNIROUTE PACKAGE'
+```
+
+Phase B moves the independent wrapper into the existing backup before npm uninstall and never
+deletes `.omniroute`.
+
+After at least 15 minutes of post-C-01 observation, collect both hosts' secret-free consumer
+inventories and fetch the worker result:
+
+```bash
+sudo /opt/engineering-control/source/scripts/collect-c02-consumers.py --scope controller
+ssh -t worker 'sudo /opt/engineering-control/source/scripts/collect-c02-consumers.py --scope worker'
+scp -p worker:/home/hermes/engineering-bootstrap/C02-CONSUMERS-worker.json \
+  /home/hermes/engineering-bootstrap/C02-CONSUMERS-worker.json
+chmod 0600 /home/hermes/engineering-bootstrap/C02-CONSUMERS-worker.json
+sudo /opt/engineering-control/source/scripts/validate-c02-readiness.py
+```
+
+The readiness validator persists only file locations, container names, aggregate traffic classes,
+and hashes—never matched lines, request addresses, headers, or secrets. It requires no live
+consumer on either host, no legacy listeners, no API-shaped/successful/non-GET traffic, and the
+exact reviewed Caddy configuration. A PASS permits only the reviewed Caddy container removal:
+
+```bash
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/execute-c02-cutover.py \
+  --confirmation 'REMOVE C02 OMNIROUTE CADDY ONLY'
+```
+
+The Caddyfile and sanitized container metadata are backed up; TLS `/data` and runtime `/config`
+state stay in place. Finally rerun/fetch fresh provider, lifecycle, and genuine Telegram evidence
+and supply it to `build-c02-post-remove-acceptance.py`. That builder requires Caddy to remain
+absent, ports 80/443 to be closed, and the complete Telegram-to-evidence lifecycle to pass.
 
 Run `/approve <change-set-id>` first. It displays the current immutable candidate payload. Approve
 with the returned SHA256. R3 additionally requires exactly:

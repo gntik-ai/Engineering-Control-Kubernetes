@@ -164,6 +164,17 @@ def test_controller_config_parents_allow_token_file_group_traversal_only() -> No
     assert "--apply-telegram-lockdown" in controller
     assert "verify-hermes-runtime.py" in controller
     assert (REPOSITORY_ROOT / "scripts" / "build-c01-acceptance.py").is_file()
+    for script in (
+        "execute-c01-cutover.py",
+        "build-c01-post-stop-acceptance.py",
+        "collect-c02-consumers.py",
+        "validate-c02-readiness.py",
+        "execute-c02-cutover.py",
+        "build-c02-post-remove-acceptance.py",
+    ):
+        path = REPOSITORY_ROOT / "scripts" / script
+        assert path.is_file()
+        assert path.stat().st_mode & 0o111
     provider_fetch = REPOSITORY_ROOT / "scripts" / "fetch-provider-acceptance.sh"
     assert provider_fetch.is_file()
     fetch_content = provider_fetch.read_text(encoding="utf-8")

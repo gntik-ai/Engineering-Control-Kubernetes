@@ -7,6 +7,8 @@ from types import ModuleType
 
 import pytest
 
+from engineering_control.validation.c01 import REQUIRED_PROVIDER_RUNS
+
 
 def load_builder() -> ModuleType:
     path = Path(__file__).parents[1] / "scripts" / "build-c01-acceptance.py"
@@ -29,7 +31,7 @@ def test_provider_matrix_requires_release_pack_and_no_paid_fallback() -> None:
             "agent_pack_revision": pack,
             "instruction_bundle_sha256": "c" * 64,
         }
-        for key, (provider, role) in module.REQUIRED_PROVIDER_RUNS.items()
+        for key, (provider, role) in REQUIRED_PROVIDER_RUNS.items()
     }
     value = {
         "status": "PASS",

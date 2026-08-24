@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import os
 import re
@@ -16,28 +15,39 @@ from typing import Any
 
 import yaml
 
+from engineering_control.validation.c01 import (
+    FULL_SHA,
+    digest,
+    validate_lifecycle,
+    validate_provider,
+)
+
 OMNI_DEPENDENCY = re.compile(
     r"omniroute|omni\.musematic\.ai|(?:127\.0\.0\.1|localhost):201(?:28|31|32)",
     re.IGNORECASE,
 )
 CONFIRMATION = "APPLY NATIVE HERMES CONFIG CUTOVER"
 ACTIVE_CONFIG = Path("/home/hermes/.hermes/config.yaml")
+ACTIVE_PROFILE_ROOT = Path("/home/hermes/.hermes/project-profiles")
+ACTIVE_QUALITY_SKILL = Path("/home/hermes/.hermes/skills/quality-cross/SKILL.md")
 BACKUP_ROOT = Path("/home/hermes/engineering-backups")
 PROVIDER_EVIDENCE_ROOT = Path("/home/hermes/engineering-bootstrap/provider-acceptance")
 LIFECYCLE_EVIDENCE_ROOT = Path("/home/hermes/engineering-bootstrap/acceptance-runs")
-FULL_SHA = re.compile(r"^[a-f0-9]{40}$")
-DIGEST = re.compile(r"^[a-f0-9]{64}$")
-REQUIRED_PROVIDER_RUNS = {
-    "codex_maker": ("codex", "implementer"),
-    "claude_checker": ("claude", "code-reviewer"),
-    "claude_maker": ("claude", "implementer"),
-    "codex_checker": ("codex", "code-reviewer"),
-}
 ALIAS_MODELS = {
     "coding": "gpt-5.6-sol",
     "cheap": "gpt-5.6-luna",
     "smart": "gpt-5.6-terra",
 }
+QUALITY_SKILL_OMNI_TEXT = (
+    "Prefer a separate delegated subagent/model route from the implementer when available "
+    "through Hermes/OmniRoute."
+)
+QUALITY_SKILL_NATIVE_TEXT = (
+    "Prefer an independent checker assigned by Engineering Control, separate from the implementer."
+)
+DIRECT_SECRET_TEXT = re.compile(
+    rb"(?i)(?:token|password|secret|api[_-]?key)\s*[:=]\s*['\"]?[^\s'\"]+"
+)
 
 
 def _strings(value: Any) -> list[str]:
@@ -150,6 +160,87 @@ def transform(config: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
     return candidate, tuple(changes)
 
 
+def transform_profile(config: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
+    candidate = copy.deepcopy(config)
+    changes: list[str] = []
+    policy = candidate.get("model_policy")
+    if isinstance(policy, dict):
+        provider = policy.get("provider")
+        if isinstance(provider, str) and OMNI_DEPENDENCY.search(provider):
+            policy["provider"] = "openai-codex"
+            changes.append("model_policy.provider:openai-codex")
+    if any(OMNI_DEPENDENCY.search(value) for value in _strings(candidate)):
+        raise ValueError(
+            "transformed Hermes project profile still contains an OmniRoute dependency"
+        )
+    return candidate, tuple(changes)
+
+
+def transform_runtime_asset(content: bytes) -> tuple[bytes, tuple[str, ...]]:
+    if DIRECT_SECRET_TEXT.search(content):
+        raise ValueError("Hermes runtime asset appears to contain an inline credential")
+    text = content.decode("utf-8")
+    if not OMNI_DEPENDENCY.search(text):
+        return content, ()
+    if text.count(QUALITY_SKILL_OMNI_TEXT) != 1:
+        raise ValueError("Hermes runtime asset has an unreviewed OmniRoute reference")
+    candidate = text.replace(QUALITY_SKILL_OMNI_TEXT, QUALITY_SKILL_NATIVE_TEXT)
+    if OMNI_DEPENDENCY.search(candidate):
+        raise ValueError("transformed Hermes runtime asset still contains OmniRoute")
+    return candidate.encode(), ("quality-cross:engineering-control-checker",)
+
+
+def _profiles(profile_root: Path) -> tuple[Path, ...]:
+    if not profile_root.exists():
+        return ()
+    if profile_root.is_symlink() or not profile_root.is_dir():
+        raise ValueError("Hermes project profile root must be a real directory")
+    profiles: list[Path] = []
+    for path in sorted(profile_root.glob("*.yaml")):
+        metadata = path.stat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise PermissionError(f"Hermes runtime profile is unsafe: {path.name}")
+        profiles.append(path)
+    return tuple(profiles)
+
+
+def _atomic_yaml(path: Path, value: dict[str, Any], mode: int) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.c01-cutover.",
+        delete=False,
+    ) as handle:
+        yaml.safe_dump(value, handle, sort_keys=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.chmod(mode)
+    os.replace(temporary, path)
+
+
+def _atomic_bytes(path: Path, value: bytes, mode: int) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=path.parent,
+        prefix=f".{path.name}.c01-restore.",
+        delete=False,
+    ) as handle:
+        handle.write(value)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.chmod(mode)
+    os.replace(temporary, path)
+
+
 def _provider_ready() -> bool:
     result = subprocess.run(  # noqa: S603 - fixed local executable and arguments
         ["/home/hermes/.local/bin/hermes", "auth", "status", "openai-codex"],
@@ -161,10 +252,6 @@ def _provider_ready() -> bool:
         env={"HOME": "/home/hermes", "PATH": "/home/hermes/.local/bin:/usr/bin:/bin"},
     )
     return result.returncode == 0
-
-
-def _digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _load_evidence(path: Path, root: Path, label: str) -> dict[str, Any]:
@@ -202,49 +289,10 @@ def _validate_pre_cutover_evidence(
         raise ValueError("installed release identities are not full Git SHAs")
 
     provider = _load_evidence(provider_path, provider_root, "provider evidence")
-    if (
-        provider.get("status") != "PASS"
-        or provider.get("release_sha") != release
-        or provider.get("redaction_status") != "REDACTED"
-        or provider.get("authentication_mode") != "native-subscription-cli"
-        or provider.get("paid_api_fallback") is not False
-        or provider.get("directions") != {"codex_to_claude": "PASS", "claude_to_codex": "PASS"}
-    ):
-        raise ValueError("provider evidence does not prove the native replacement matrix")
-    runs = provider.get("provider_runs")
-    if not isinstance(runs, dict) or set(runs) != set(REQUIRED_PROVIDER_RUNS):
-        raise ValueError("provider evidence has an incomplete invocation matrix")
-    for key, (provider_name, role) in REQUIRED_PROVIDER_RUNS.items():
-        run = runs[key]
-        if (
-            not isinstance(run, dict)
-            or run.get("provider") != provider_name
-            or run.get("role") != role
-            or run.get("status") != "SUCCESS"
-            or run.get("agent_pack_revision") != agent_pack
-            or not DIGEST.fullmatch(str(run.get("instruction_bundle_sha256", "")))
-        ):
-            raise ValueError(f"provider evidence run {key} is invalid")
+    validate_provider(provider, release, agent_pack)
 
     lifecycle = _load_evidence(lifecycle_path, lifecycle_root, "lifecycle evidence")
-    if (
-        lifecycle.get("status") != "PASS"
-        or lifecycle.get("release_sha") != release
-        or lifecycle.get("change_set_state") != "AWAITING_STAGING_APPROVAL"
-        or lifecycle.get("workflow_worker_restarted") is not True
-        or lifecycle.get("authenticated_api_path") is not True
-        or lifecycle.get("maker_provider") == lifecycle.get("checker_provider")
-        or lifecycle.get("redaction_status") not in {"REDACTED", "SCANNED_CLEAN"}
-        or not DIGEST.fullmatch(str(lifecycle.get("evidence_sha256", "")))
-    ):
-        raise ValueError("lifecycle evidence does not prove restart/resume and persistence")
-    lifecycle_artifact = Path(str(lifecycle.get("evidence_path", ""))).resolve()
-    if (
-        not lifecycle_artifact.is_file()
-        or not lifecycle_artifact.is_relative_to(lifecycle_root.resolve())
-        or _digest(lifecycle_artifact) != lifecycle["evidence_sha256"]
-    ):
-        raise ValueError("lifecycle artifact path or digest does not match")
+    validate_lifecycle(lifecycle, release, lifecycle_root)
 
 
 def apply(
@@ -260,6 +308,12 @@ def apply(
         raise ValueError("apply is restricted to the canonical Hermes configuration")
     if backup_root.resolve() != BACKUP_ROOT.resolve():
         raise ValueError("backup root is outside the canonical engineering backup root")
+    profile_root = config_path.parent / "project-profiles"
+    if profile_root.resolve() != ACTIVE_PROFILE_ROOT.resolve():
+        raise ValueError("profile root is outside the canonical Hermes configuration")
+    runtime_asset = config_path.parent / "skills/quality-cross/SKILL.md"
+    if runtime_asset.resolve() != ACTIVE_QUALITY_SKILL.resolve():
+        raise ValueError("runtime asset is outside the canonical Hermes configuration")
     _validate_pre_cutover_evidence(provider_evidence, lifecycle_evidence)
     if not _provider_ready():
         raise RuntimeError("Hermes openai-codex subscription authentication is not healthy")
@@ -270,39 +324,115 @@ def apply(
     if _has_direct_secret(parsed):
         raise ValueError("Hermes YAML contains a direct secret; automatic backup refused")
     candidate, _ = transform(parsed)
+    profile_candidates: list[tuple[Path, bytes, dict[str, Any], int]] = []
+    for profile in _profiles(profile_root):
+        profile_original = profile.read_bytes()
+        profile_parsed = yaml.safe_load(profile_original)
+        if not isinstance(profile_parsed, dict):
+            raise ValueError(f"Hermes runtime profile is not a mapping: {profile.name}")
+        if _has_direct_secret(profile_parsed):
+            raise ValueError(
+                "Hermes runtime profile contains a direct secret; automatic backup refused: "
+                f"{profile.name}"
+            )
+        profile_candidate, changes = transform_profile(profile_parsed)
+        if changes:
+            profile_candidates.append(
+                (
+                    profile,
+                    profile_original,
+                    profile_candidate,
+                    stat.S_IMODE(profile.stat().st_mode),
+                )
+            )
+    runtime_original = runtime_asset.read_bytes()
+    runtime_metadata = runtime_asset.lstat()
+    if (
+        not stat.S_ISREG(runtime_metadata.st_mode)
+        or runtime_metadata.st_uid != os.getuid()
+        or runtime_metadata.st_nlink != 1
+        or runtime_metadata.st_size > 2 * 1024 * 1024
+        or runtime_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise PermissionError("Hermes quality-cross runtime asset is unsafe")
+    runtime_candidate, runtime_changes = transform_runtime_asset(runtime_original)
+    runtime_mode = stat.S_IMODE(runtime_metadata.st_mode)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     backup_directory = backup_root / f"hermes-native-cutover-{stamp}"
     backup_directory.mkdir(parents=True, mode=0o700)
     backup = backup_directory / "config.pre-native-cutover.yaml"
     backup.write_bytes(original)
     backup.chmod(0o600)
-    digest = hashlib.sha256(original).hexdigest()
+    if backup.read_bytes() != original:
+        raise OSError("Hermes configuration backup readability check failed")
+    original_digest = digest(backup)
+    profile_manifest: list[str] = []
+    profile_backup_root = backup_directory / "project-profiles"
+    if profile_candidates:
+        profile_backup_root.mkdir(mode=0o700)
+    for profile, profile_original, _, _ in profile_candidates:
+        profile_backup = profile_backup_root / profile.name
+        profile_backup.write_bytes(profile_original)
+        profile_backup.chmod(0o600)
+        if profile_backup.read_bytes() != profile_original:
+            raise OSError(f"Hermes profile backup readability check failed: {profile.name}")
+        profile_manifest.append(f"- `{profile}` SHA256: `{digest(profile_backup)}`")
+    runtime_manifest_text = "- Runtime text assets changed: none\n"
+    runtime_backup: Path | None = None
+    if runtime_changes:
+        runtime_backup = backup_directory / "runtime-assets/skills/quality-cross/SKILL.md"
+        runtime_backup.parent.mkdir(parents=True, mode=0o700)
+        runtime_backup.write_bytes(runtime_original)
+        runtime_backup.chmod(0o600)
+        if runtime_backup.read_bytes() != runtime_original:
+            raise OSError("Hermes runtime asset backup readability check failed")
+        runtime_manifest_text = f"- `{runtime_asset}` SHA256: `{digest(runtime_backup)}`\n"
+    profile_manifest_text = (
+        "- Runtime project profiles:\n" + "\n".join(profile_manifest) + "\n"
+        if profile_manifest
+        else "- Runtime project profiles changed: none\n"
+    )
     manifest = backup_directory / "BACKUP-MANIFEST.md"
     manifest.write_text(
         "# Hermes native-provider configuration backup\n\n"
         f"- Created: {datetime.now(UTC).isoformat()}\n"
         f"- Source: `{config_path}`\n"
-        f"- SHA256: `{digest}`\n"
+        f"- SHA256: `{original_digest}`\n"
+        f"{profile_manifest_text}"
+        f"{runtime_manifest_text}"
         "- Direct secret values: none detected\n"
-        "- Restore: copy the protected YAML back, mode 0600, then restart "
-        "`hermes-gateway.service`. OmniRoute itself remains installed and available for "
-        "rollback.\n",
+        "- Restore: copy `config.pre-native-cutover.yaml` to the source path and each "
+        "protected `project-profiles/*.yaml` and `runtime-assets/*` file to its matching "
+        "runtime path, restore the recorded modes, then restart `hermes-gateway.service`. "
+        "OmniRoute itself "
+        "remains installed and available for rollback.\n",
         encoding="utf-8",
     )
     manifest.chmod(0o600)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=config_path.parent,
-        prefix=".config.c01-cutover.",
-        delete=False,
-    ) as handle:
-        yaml.safe_dump(candidate, handle, sort_keys=False)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    temporary.chmod(0o600)
-    os.replace(temporary, config_path)
+    config_mode = stat.S_IMODE(config_path.stat().st_mode)
+    updated: list[tuple[Path, bytes, int]] = []
+    try:
+        _atomic_yaml(config_path, candidate, config_mode)
+        updated.append((config_path, original, config_mode))
+        for profile, profile_original, profile_candidate, mode in profile_candidates:
+            _atomic_yaml(profile, profile_candidate, mode)
+            updated.append((profile, profile_original, mode))
+        if runtime_changes:
+            _atomic_bytes(runtime_asset, runtime_candidate, runtime_mode)
+            updated.append((runtime_asset, runtime_original, runtime_mode))
+    except Exception as mutation_error:
+        rollback_errors: list[str] = []
+        for path, prior, mode in reversed(updated):
+            try:
+                _atomic_bytes(path, prior, mode)
+            except Exception:
+                rollback_errors.append(path.name)
+        if rollback_errors:
+            raise RuntimeError(
+                "Hermes profile cutover failed and compensation was incomplete for: "
+                + ", ".join(rollback_errors)
+            ) from mutation_error
+        raise
     return backup_directory
 
 
@@ -321,10 +451,21 @@ def main() -> None:
     parsed = yaml.safe_load(arguments.config.read_text(encoding="utf-8"))
     if not isinstance(parsed, dict):
         raise SystemExit("Hermes configuration must be a mapping")
-    _, changes = transform(parsed)
+    _, config_changes = transform(parsed)
+    profile_changes = 0
+    for profile in _profiles(arguments.config.parent / "project-profiles"):
+        profile_parsed = yaml.safe_load(profile.read_text(encoding="utf-8"))
+        if not isinstance(profile_parsed, dict):
+            raise SystemExit(f"Hermes runtime profile is not a mapping: {profile.name}")
+        _, changes = transform_profile(profile_parsed)
+        profile_changes += len(changes)
+    runtime_asset = arguments.config.parent / "skills/quality-cross/SKILL.md"
+    _, runtime_changes = transform_runtime_asset(runtime_asset.read_bytes())
     if arguments.check:
         print(
-            f"PASS Hermes C-01 candidate can remove OmniRoute dependencies; changes={len(changes)}"
+            "PASS Hermes C-01 candidate can remove OmniRoute dependencies; "
+            f"config_changes={len(config_changes)} profile_changes={profile_changes} "
+            f"runtime_asset_changes={len(runtime_changes)}"
         )
         return
     if arguments.provider_evidence is None or arguments.lifecycle_evidence is None:

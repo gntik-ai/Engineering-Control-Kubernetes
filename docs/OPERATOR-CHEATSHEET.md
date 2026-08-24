@@ -113,6 +113,30 @@ sudo /opt/engineering-control/source/scripts/build-c01-acceptance.py \
 
 Do not stop or uninstall OmniRoute until the builder emits a PASS manifest.
 
+The guarded cleanup executors then enforce the reviewed order:
+
+```bash
+# Phase A only: stop/disable, retain package/wrapper/.omniroute.
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/execute-c01-cutover.py \
+  --phase stop --confirmation 'STOP C01 OMNIROUTE ONLY'
+
+# Restart Hermes plus every worker service, rerun providers/lifecycle, and send a fresh
+# Telegram usage/validate/status sequence before building the post-stop manifest.
+sudo /opt/engineering-control/source/scripts/build-c01-post-stop-acceptance.py \
+  --provider-evidence "${POST_STOP_PROVIDER_EVIDENCE}" \
+  --telegram-evidence "${POST_STOP_TELEGRAM_EVIDENCE}" \
+  --lifecycle-evidence "${POST_STOP_LIFECYCLE_EVIDENCE}"
+
+# Phase B is impossible without that fresh PASS manifest.
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/execute-c01-cutover.py \
+  --phase uninstall --confirmation 'UNINSTALL C01 OMNIROUTE PACKAGE'
+```
+
+Use the complete C-02 consumer/traffic and post-removal sequence in `HERMES-TELEGRAM.md`; do not
+stop or remove the Caddy container manually.
+
 ## Operate
 
 ```bash

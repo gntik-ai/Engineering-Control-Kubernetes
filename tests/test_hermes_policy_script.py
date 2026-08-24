@@ -66,6 +66,39 @@ def test_cutover_policy_rejects_omniroute_dependency(tmp_path: Path) -> None:
         MODULE.verify(config_path, home, require_no_omniroute=True)
 
 
+def test_cutover_policy_rejects_omniroute_project_profile(tmp_path: Path) -> None:
+    config_path, home, _ = _fixture(tmp_path)
+    profiles = home / "project-profiles"
+    profiles.mkdir()
+    profile = profiles / "falcone.yaml"
+    profile.write_text(
+        yaml.safe_dump({"model_policy": {"provider": "custom:omniroute"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="project-profiles/falcone.yaml"):
+        MODULE.verify(config_path, home, require_no_omniroute=True)
+
+
+def test_cutover_policy_rejects_omniroute_runtime_skill(tmp_path: Path) -> None:
+    config_path, home, _ = _fixture(tmp_path)
+    skill = home / "skills/quality-cross/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("route through Hermes/OmniRoute\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="skills/quality-cross/SKILL.md"):
+        MODULE.verify(config_path, home, require_no_omniroute=True)
+
+
+def test_cutover_policy_ignores_historical_hidden_skill_backup(tmp_path: Path) -> None:
+    config_path, home, _ = _fixture(tmp_path)
+    backup = home / "skills/.curator_backups/old/SKILL.md"
+    backup.parent.mkdir(parents=True)
+    backup.write_text("historical OmniRoute guidance\n", encoding="utf-8")
+
+    MODULE.verify(config_path, home, require_no_omniroute=True)
+
+
 def test_policy_rejects_disabled_engineering_plugin(tmp_path: Path) -> None:
     config_path, home, config = _fixture(tmp_path)
     config["plugins"] = {
