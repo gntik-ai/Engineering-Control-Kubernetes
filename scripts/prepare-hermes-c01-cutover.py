@@ -241,6 +241,29 @@ def _atomic_bytes(path: Path, value: bytes, mode: int) -> None:
     os.replace(temporary, path)
 
 
+def _read_owned(path: Path, maximum: int) -> tuple[bytes, int]:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or metadata.st_size > maximum
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise PermissionError(f"Hermes runtime input is unsafe: {path.name}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise PermissionError(f"Hermes runtime input changed during validation: {path.name}")
+        value = os.read(descriptor, maximum + 1)
+        if len(value) > maximum or os.read(descriptor, 1):
+            raise ValueError(f"Hermes runtime input exceeded its size bound: {path.name}")
+        return value, stat.S_IMODE(metadata.st_mode)
+    finally:
+        os.close(descriptor)
+
+
 def _provider_ready() -> bool:
     result = subprocess.run(  # noqa: S603 - fixed local executable and arguments
         ["/home/hermes/.local/bin/hermes", "auth", "status", "openai-codex"],
@@ -317,7 +340,7 @@ def apply(
     _validate_pre_cutover_evidence(provider_evidence, lifecycle_evidence)
     if not _provider_ready():
         raise RuntimeError("Hermes openai-codex subscription authentication is not healthy")
-    original = config_path.read_bytes()
+    original, config_mode = _read_owned(config_path, 2 * 1024 * 1024)
     parsed = yaml.safe_load(original)
     if not isinstance(parsed, dict):
         raise ValueError("Hermes configuration must be a mapping")
@@ -376,7 +399,10 @@ def apply(
         profile_backup.chmod(0o600)
         if profile_backup.read_bytes() != profile_original:
             raise OSError(f"Hermes profile backup readability check failed: {profile.name}")
-        profile_manifest.append(f"- `{profile}` SHA256: `{digest(profile_backup)}`")
+        profile_mode = next(mode for path, _, _, mode in profile_candidates if path == profile)
+        profile_manifest.append(
+            f"- `{profile}` mode: `{profile_mode:04o}` SHA256: `{digest(profile_backup)}`"
+        )
     runtime_manifest_text = "- Runtime text assets changed: none\n"
     runtime_backup: Path | None = None
     if runtime_changes:
@@ -386,7 +412,9 @@ def apply(
         runtime_backup.chmod(0o600)
         if runtime_backup.read_bytes() != runtime_original:
             raise OSError("Hermes runtime asset backup readability check failed")
-        runtime_manifest_text = f"- `{runtime_asset}` SHA256: `{digest(runtime_backup)}`\n"
+        runtime_manifest_text = (
+            f"- `{runtime_asset}` mode: `{runtime_mode:04o}` SHA256: `{digest(runtime_backup)}`\n"
+        )
     profile_manifest_text = (
         "- Runtime project profiles:\n" + "\n".join(profile_manifest) + "\n"
         if profile_manifest
@@ -397,6 +425,7 @@ def apply(
         "# Hermes native-provider configuration backup\n\n"
         f"- Created: {datetime.now(UTC).isoformat()}\n"
         f"- Source: `{config_path}`\n"
+        f"- Source mode: `{config_mode:04o}`\n"
         f"- SHA256: `{original_digest}`\n"
         f"{profile_manifest_text}"
         f"{runtime_manifest_text}"
@@ -409,7 +438,22 @@ def apply(
         encoding="utf-8",
     )
     manifest.chmod(0o600)
-    config_mode = stat.S_IMODE(config_path.stat().st_mode)
+    if not manifest.read_text(encoding="utf-8").startswith(
+        "# Hermes native-provider configuration backup"
+    ):
+        raise OSError("Hermes backup manifest readability check failed")
+    restore = backup_directory / "RESTORE.md"
+    restore.write_text(
+        "# Restore Hermes runtime configuration\n\n"
+        "Restore `config.pre-native-cutover.yaml`, every protected file beneath "
+        "`project-profiles/` and `runtime-assets/` to the source path recorded in "
+        "`BACKUP-MANIFEST.md`, apply each recorded mode, then restart "
+        "`hermes-gateway.service`. Do not delete or copy `.omniroute` during rollback.\n",
+        encoding="utf-8",
+    )
+    restore.chmod(0o600)
+    if not restore.read_text(encoding="utf-8").startswith("# Restore Hermes"):
+        raise OSError("Hermes restore procedure readability check failed")
     updated: list[tuple[Path, bytes, int]] = []
     try:
         _atomic_yaml(config_path, candidate, config_mode)

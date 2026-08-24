@@ -179,6 +179,7 @@ def execute(confirmation: str) -> Path:
     ):
         raise ValueError("C-02 traffic evidence is not safe for endpoint removal")
     caddyfile = _read_safe(CADDYFILE, 64 * 1024)
+    caddyfile_mode = stat.S_IMODE(CADDYFILE.lstat().st_mode)
     if DIRECT_SECRET.search(caddyfile):
         raise ValueError("Caddyfile contains an inline credential and cannot be backed up")
     if b"omni.musematic.ai" not in caddyfile or b"127.0.0.1:20128" not in caddyfile:
@@ -198,6 +199,7 @@ def execute(confirmation: str) -> Path:
         "# C-02 Caddy backup\n\n"
         f"- Created: {datetime.now(UTC).isoformat()}\n"
         f"- Caddyfile SHA256: `{hashlib.sha256(caddyfile).hexdigest()}`\n"
+        f"- Caddyfile original mode: `{caddyfile_mode:04o}`\n"
         f"- Metadata SHA256: `{hashlib.sha256(metadata).hexdigest()}`\n"
         "- TLS `/data` and runtime `/config` state remain in place and were not copied.\n"
     ).encode()
@@ -208,6 +210,14 @@ def execute(confirmation: str) -> Path:
         b"configuration, `/data`, and `/config` mounts, then verify ports 80/443.\n"
     )
     _write_file(backup / "RESTORE.md", restore)
+    for path, expected in (
+        (backup / "Caddyfile", caddyfile),
+        (backup / "container-metadata.json", metadata),
+        (backup / "BACKUP-MANIFEST.md", manifest),
+        (backup / "RESTORE.md", restore),
+    ):
+        if _read_safe(path, 256 * 1024) != expected:
+            raise OSError(f"C-02 backup readability check failed: {path.name}")
     _write_exclusive(
         REMOVING,
         {

@@ -225,6 +225,8 @@ def stop_phase(confirmation: str) -> Path:
     if not active or not enabled:
         raise RuntimeError("OmniRoute is not in the reviewed active/enabled pre-stop state")
     unit, wrapper = _validate_paths(owner)
+    unit_mode = stat.S_IMODE(UNIT.lstat().st_mode)
+    wrapper_mode = stat.S_IMODE(WRAPPER.lstat().st_mode)
     hermes_marker = _user_active_enter_monotonic("hermes-gateway.service")
     worker_markers = _worker_service_markers()
 
@@ -238,7 +240,9 @@ def stop_phase(confirmation: str) -> Path:
         "# C-01 OmniRoute pre-stop backup\n\n"
         f"- Created: {datetime.now(UTC).isoformat()}\n"
         f"- Unit SHA256: `{hashlib.sha256(unit).hexdigest()}`\n"
+        f"- Unit original mode: `{unit_mode:04o}`\n"
         f"- Wrapper SHA256: `{hashlib.sha256(wrapper).hexdigest()}`\n"
+        f"- Wrapper original mode: `{wrapper_mode:04o}`\n"
         f"- Package version: `{PACKAGE_VERSION}`\n"
         "- `.omniroute` was not copied or modified.\n"
         "- The original independent wrapper is moved here only after post-stop acceptance.\n"
@@ -250,6 +254,14 @@ def stop_phase(confirmation: str) -> Path:
         b"prefix if removed, run user daemon-reload, then enable/start `omniroute.service`.\n"
     )
     _write_exclusive(backup / "RESTORE.md", restore, 0o600)
+    for path, expected in (
+        (backup / "omniroute.service", unit),
+        (backup / "omniroute-wrapper.pre-stop-copy", wrapper),
+        (backup / "BACKUP-MANIFEST.md", backup_manifest),
+        (backup / "RESTORE.md", restore),
+    ):
+        if _read_safe(path, maximum=256 * 1024, owner=owner) != expected:
+            raise OSError(f"C-01 backup readability check failed: {path.name}")
 
     try:
         _systemctl("disable", "--now", "omniroute.service")

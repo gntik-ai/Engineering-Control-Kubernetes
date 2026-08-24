@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,24 @@ def test_apply_requires_exact_confirmation(tmp_path: Path) -> None:
             tmp_path / "lifecycle.json",
             "wrong",
         )
+
+
+def test_runtime_input_rejects_symlink_and_group_writable_file(tmp_path: Path) -> None:
+    source = tmp_path / "config.yaml"
+    source.write_text("model: {}\n", encoding="utf-8")
+    source.chmod(0o600)
+    value, mode = MODULE._read_owned(source, 1024)
+    assert value == b"model: {}\n"
+    assert mode == 0o600
+
+    link = tmp_path / "link.yaml"
+    link.symlink_to(source)
+    with pytest.raises(PermissionError, match="unsafe"):
+        MODULE._read_owned(link, 1024)
+    source.chmod(0o620)
+    with pytest.raises(PermissionError, match="unsafe"):
+        MODULE._read_owned(source, 1024)
+    assert source.stat().st_uid == os.geteuid()
 
 
 def test_pre_cutover_evidence_binds_release_pack_and_restart_resume(tmp_path: Path) -> None:
