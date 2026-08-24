@@ -34,4 +34,8 @@ sudo /opt/engineering-control/source/scripts/validate-native-providers.sh
 ```
 
 It uses synthetic worktrees only, performs Codex maker -> Claude checker and Claude maker -> Codex
-checker, persists a redacted SHA256 evidence manifest, and never touches product repositories.
+checker, persists a redacted SHA256 evidence manifest, and never touches product repositories. It
+also exports a mode-restricted copy under
+`/home/hermes/engineering-bootstrap/provider-acceptance/` for the controller's C-01 gate. Fetch
+that copy with `scripts/fetch-provider-acceptance.sh`; never copy either provider's authentication
+files.

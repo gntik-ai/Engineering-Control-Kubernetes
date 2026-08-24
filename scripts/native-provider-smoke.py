@@ -239,6 +239,7 @@ def finalize(
         evidence_directory.mkdir(parents=True, mode=0o750)
     manifest = {
         "run_id": str(run_id),
+        "release_sha": Path("/opt/engineering-control/source").resolve().parent.name,
         "status": "PASS",
         "content_type": "application/json",
         "producer": "native-provider-acceptance",
@@ -260,6 +261,8 @@ def finalize(
             for key, value in results.items()
         },
         "redaction_status": "REDACTED",
+        "authentication_mode": "native-subscription-cli",
+        "paid_api_fallback": False,
         "created_at": datetime.now(UTC).isoformat(),
     }
     manifest_path = evidence_directory / "native-provider-acceptance.json"

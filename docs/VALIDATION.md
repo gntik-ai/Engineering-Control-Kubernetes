@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 221 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
+| Control-plane Python | PASS | 226 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -110,7 +110,11 @@ The following remain blocked and must not be inferred from the synthetic pass:
 - real draft-PR and registry-provenance validation.
 
 The installed `validate-native-providers.sh` runner operates only in isolated synthetic directories
-and persists a normalized, redacted, SHA256-addressed acceptance manifest.
+and persists a normalized, redacted, SHA256-addressed acceptance manifest. A protected,
+operator-readable copy can be fetched without transferring native authentication state. The
+root-only C-01 builder combines it with canonical Telegram evidence and the lifecycle verifier's
+release-bound `acceptance-summary.json`; it rechecks all runtime dependencies before emitting the
+single-use `C01-ACCEPTANCE.json` consumed by the cutover tool.
 
 Real staging mutation is not authorized. Deployment workflows must stop at
 `AWAITING_STAGING_APPROVAL`.

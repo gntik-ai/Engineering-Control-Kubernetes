@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
 import secrets
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,6 +24,28 @@ from engineering_control.config import Settings
 from engineering_control.db.repository import EmptyMetadataRepository
 from engineering_control.validation.lifecycle import AcceptanceActivities
 from engineering_control.workflows.definitions import AcceptanceLifecycleWorkflow
+
+
+def _write_summary(path: Path, value: dict[str, object]) -> str:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.chmod(0o640)
+    os.replace(temporary, path)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _installed_release() -> str:
+    return Path("/opt/engineering-control/source").resolve().parent.name
 
 
 async def run(target: str, namespace: str, root: Path, hold_seconds: int) -> dict[str, object]:
@@ -105,7 +131,7 @@ async def run(target: str, namespace: str, root: Path, hold_seconds: int) -> dic
         evidence = Path(str(result["evidence_path"]))
         if not evidence.is_file() or not evidence.resolve().is_relative_to(root):  # noqa: ASYNC240
             raise RuntimeError("acceptance evidence is missing or outside its root")
-        return {
+        summary: dict[str, object] = {
             "status": result["status"],
             "workflow_id": handle.id,
             "run_id": accepted["run_id"],
@@ -117,6 +143,16 @@ async def run(target: str, namespace: str, root: Path, hold_seconds: int) -> dic
             "evidence_sha256": result["evidence_sha256"],
             "workflow_worker_restarted": True,
             "authenticated_api_path": True,
+            "release_sha": await asyncio.to_thread(_installed_release),
+            "redaction_status": "SCANNED_CLEAN",
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        summary_path = run_root / "acceptance-summary.json"
+        summary_sha256 = await asyncio.to_thread(_write_summary, summary_path, summary)
+        return {
+            **summary,
+            "summary_path": str(summary_path),
+            "summary_sha256": summary_sha256,
         }
     finally:
         await replacement.shutdown()

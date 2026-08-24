@@ -83,6 +83,23 @@ From the allowlisted Telegram account, run `/usage`, `/validate 30`, then
 `/status <workflow-id-returned-by-validate>`. The validation worker operates only on its local
 synthetic fixture under `/srv/engineering/tmp/acceptance`.
 
+After the three inbound commands pass, create the three-part C-01 evidence chain. Copy the exact
+paths printed by each command into the final builder invocation:
+
+```bash
+ssh -t worker 'sudo /opt/engineering-control/source/scripts/validate-native-providers.sh'
+/opt/engineering-control/source/scripts/fetch-provider-acceptance.sh
+sudo /opt/engineering-control/source/scripts/validate-telegram-acceptance.py
+sudo /opt/engineering-control/source/scripts/verify-end-to-end.sh
+PROVIDER_EVIDENCE=/absolute/path/printed-by-provider-fetch
+TELEGRAM_EVIDENCE=/absolute/path/printed-by-telegram-validator
+LIFECYCLE_EVIDENCE=/absolute/acceptance-summary/path/printed-by-lifecycle-verifier
+sudo /opt/engineering-control/source/scripts/build-c01-acceptance.py \
+  --provider-evidence "${PROVIDER_EVIDENCE}" \
+  --telegram-evidence "${TELEGRAM_EVIDENCE}" \
+  --lifecycle-evidence "${LIFECYCLE_EVIDENCE}"
+```
+
 Check—but do not apply—the later C-01 Hermes provider cutover:
 
 ```bash

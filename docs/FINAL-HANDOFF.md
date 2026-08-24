@@ -390,7 +390,7 @@ Remote GitHub repository creation was not authorized or performed.
 | Controller API, PostgreSQL, Temporal, scheduler, notifier, evidence ingest | PASS |
 | Controller restart/resume lifecycle | PASS |
 | Worker service users, services, tools, filesystem/credential isolation | PASS |
-| Control-plane tests (221), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
+| Control-plane tests (226), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
 | Agent pack generation, validation, and tests | PASS |
 | Codex install/auth/structured native call | PASS |
 | Claude install | PASS |
@@ -425,5 +425,6 @@ allowlisted Telegram account:
 /status <workflow-id-returned-by-validate>
 ```
 
-After those pass, rerun the documented C-01 gate preparation. Do not stop OmniRoute or Caddy
-manually and do not run a deployment merely to test the platform.
+After those pass, run the provider/Telegram/lifecycle evidence commands and the deterministic C-01
+builder in `docs/HERMES-TELEGRAM.md`. Do not stop OmniRoute or Caddy manually and do not run a
+deployment merely to test the platform.

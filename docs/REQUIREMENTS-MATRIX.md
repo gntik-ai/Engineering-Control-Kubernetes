@@ -11,7 +11,7 @@ platform fails closed rather than bypassing.
 | 1 Host inventory | COMPLETE | Redacted controller/worker inventory and checksum manifests under `/home/hermes/engineering-bootstrap/inventory` |
 | 2 Asset discovery | COMPLETE | Repository/worktree and reusable-agent reports; dirty worktrees remain protected |
 | 3 Security scan | COMPLETE/BLOCKED | Redacted Gitleaks/history inventory; Musematic Git secrets and shared cluster-admin identity are active blockers |
-| 4 Cleanup plan | CONDITIONALLY APPROVED | C-03 complete; C-01/C-02 remain behind the operator's additional acceptance gates |
+| 4 Cleanup plan | CONDITIONALLY APPROVED | C-03 complete; C-01/C-02 remain behind the operator's additional acceptance gates; a deterministic release-bound C-01 evidence builder now prevents manual gate claims |
 | 5 Backup before cleanup | COMPLETE | `engineering-backups/20260823T095538Z` has readable checksums and restore procedures; protected credentials were excluded |
 | 6 Filesystem architecture | ACTIVE | Normalized controller/worker trees, ownership, ACLs, state and journal services are installed |
 | 7 Git repository layout | IMPLEMENTED | Independent local Git repositories for `engineering-control` and `engineering-agent-pack`; no remote repository was created |
@@ -57,12 +57,15 @@ platform fails closed rather than bypassing.
 
 1. Send allowlisted Telegram `/usage`, `/validate 30`, and `/status`; record the genuine inbound
    round trip.
-2. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
-   and registry-read credential without copying interactive user credentials.
-3. Remove Hermes runtime OmniRoute references, stop OmniRoute without uninstalling, restart the
-   replacement stack, and rerun the full regression suite.
+2. Rerun/fetch the release-bound provider matrix, Telegram validator and restart/resume lifecycle;
+   use the deterministic builder to emit `C01-ACCEPTANCE.json` only if every C-01 gate passes.
+3. Apply the backup-first Hermes alias cutover, stop/disable OmniRoute without uninstalling,
+   restart Hermes/workers, and rerun the complete Telegram regression.
 4. Only after that pass, uninstall the reviewed OmniRoute npm package while retaining `.omniroute`.
-5. Secret-safely prove Caddy has no consumers/traffic, then execute C-02 and rerun the full path.
-6. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
+5. Secret-safely prove Caddy has no consumers and has no legitimate runtime traffic, then execute
+   C-02 and rerun the complete Telegram regression.
+6. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
+   and registry-read credential without copying interactive user credentials.
+7. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
    scoped observer/release identities before any relevant write enablement.
-7. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.
+8. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.

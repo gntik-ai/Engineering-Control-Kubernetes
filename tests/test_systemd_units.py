@@ -163,6 +163,12 @@ def test_controller_config_parents_allow_token_file_group_traversal_only() -> No
     assert 'setfacl -m u:hermes:r-- "${CONFIG_ROOT}/env/api.token"' in controller
     assert "--apply-telegram-lockdown" in controller
     assert "verify-hermes-runtime.py" in controller
+    assert (REPOSITORY_ROOT / "scripts" / "build-c01-acceptance.py").is_file()
+    provider_fetch = REPOSITORY_ROOT / "scripts" / "fetch-provider-acceptance.sh"
+    assert provider_fetch.is_file()
+    fetch_content = provider_fetch.read_text(encoding="utf-8")
+    assert "Run as the normal hermes operator; do not run with sudo" in fetch_content
+    assert "refusing overwrite" in fetch_content
 
 
 def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> None:

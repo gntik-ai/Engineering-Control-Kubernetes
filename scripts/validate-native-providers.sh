@@ -7,7 +7,7 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
-for command_name in python3 sudo install setfacl flock git; do
+for command_name in python3 sudo install setfacl flock git sha256sum awk; do
   command -v "${command_name}" >/dev/null || {
     echo "Required command missing: ${command_name}" >&2
     exit 1
@@ -101,3 +101,11 @@ install -d -o root -g root -m 0750 "${EVIDENCE_ROOT}"
   --claude-maker "${TEMP_ROOT}/claude-maker/result.json" \
   --codex-checker "${TEMP_ROOT}/codex-checker/result.json" \
   --evidence-directory "${EVIDENCE_ROOT}"
+
+OPERATOR_EVIDENCE_ROOT=/home/hermes/engineering-bootstrap/provider-acceptance
+install -d -o root -g hermes -m 0750 "${OPERATOR_EVIDENCE_ROOT}"
+OPERATOR_EVIDENCE="${OPERATOR_EVIDENCE_ROOT}/${RUN_ID}.json"
+install -o root -g hermes -m 0640 \
+  "${EVIDENCE_ROOT}/native-provider-acceptance.json" "${OPERATOR_EVIDENCE}"
+OPERATOR_SHA=$(sha256sum "${OPERATOR_EVIDENCE}" | awk '{print $1}')
+echo "PASS operator-readable redacted provider evidence=${OPERATOR_EVIDENCE} sha256=${OPERATOR_SHA}"

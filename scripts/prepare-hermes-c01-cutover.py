@@ -168,22 +168,44 @@ def _provider_ready() -> bool:
     return result.returncode == 0
 
 
-def _validate_gate_manifest(path: Path) -> None:
+def _validate_gate_manifest(
+    path: Path,
+    expected_release: str | None = None,
+    expected_agent_pack: str | None = None,
+) -> None:
     if path.resolve() != GATE_MANIFEST.resolve():
         raise ValueError("C-01 gate manifest must use the canonical bootstrap path")
     metadata = path.stat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO)
+    ):
         raise PermissionError("C-01 gate manifest permissions are too broad")
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or value.get("status") != "PASS":
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or value.get("status") != "PASS"
+    ):
         raise ValueError("C-01 gate manifest is not a PASS")
-    release = Path("/opt/engineering-control/source").resolve().parent.name
+    release = expected_release or Path("/opt/engineering-control/source").resolve().parent.name
+    agent_pack = (
+        expected_agent_pack or Path("/opt/engineering-agent-pack/source").resolve().parent.name
+    )
     if value.get("release_sha") != release:
         raise ValueError("C-01 gate manifest does not bind to the installed release")
+    if value.get("agent_pack_sha") != agent_pack:
+        raise ValueError("C-01 gate manifest does not bind to the installed agent pack")
     gates = value.get("gates")
     if not isinstance(gates, dict) or any(gates.get(gate) != "PASS" for gate in REQUIRED_GATES):
         raise ValueError("C-01 gate manifest does not pass every required replacement check")
-    for key in ("provider_evidence_sha256", "telegram_evidence_sha256"):
+    for key in (
+        "provider_evidence_sha256",
+        "telegram_evidence_sha256",
+        "lifecycle_evidence_sha256",
+    ):
         if not re.fullmatch(r"[a-f0-9]{64}", str(value.get(key, ""))):
             raise ValueError(f"C-01 gate manifest {key} is missing or invalid")
 

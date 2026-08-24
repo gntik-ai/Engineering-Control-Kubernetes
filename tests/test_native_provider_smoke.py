@@ -127,6 +127,9 @@ def test_finalize_requires_both_cross_provider_directions(
 
     value = json.loads(manifest.read_text(encoding="utf-8"))
     assert value["status"] == "PASS"
+    assert value["authentication_mode"] == "native-subscription-cli"
+    assert value["paid_api_fallback"] is False
+    assert len(value["release_sha"]) == 40
     assert set(value["directions"].values()) == {"PASS"}
     assert len(digest) == 64
     with pytest.raises(ValueError, match="not empty"):

@@ -44,6 +44,34 @@ sudo /opt/engineering-control/source/scripts/validate-telegram-acceptance.py
 The validator rejects mismatched releases/workflows, unauthenticated or rate-limited provider
 status, non-completed workflows, missing evidence hashes, and unsafe receipt permissions.
 
+The C-01 gate is built only from three immutable, release-bound evidence files. After rerunning the
+native provider suite on the worker, fetch its redacted operator manifest to the controller:
+
+```bash
+ssh -t worker 'sudo /opt/engineering-control/source/scripts/validate-native-providers.sh'
+/opt/engineering-control/source/scripts/fetch-provider-acceptance.sh
+sudo /opt/engineering-control/source/scripts/verify-end-to-end.sh
+```
+
+The fetch, lifecycle verifier, and preceding Telegram validator print their exact evidence paths.
+Assign those paths literally, then supply them to the root-only builder:
+
+```bash
+PROVIDER_EVIDENCE=/absolute/path/printed-by-provider-fetch
+TELEGRAM_EVIDENCE=/absolute/path/printed-by-telegram-validator
+LIFECYCLE_EVIDENCE=/absolute/acceptance-summary/path/printed-by-lifecycle-verifier
+sudo /opt/engineering-control/source/scripts/build-c01-acceptance.py \
+  --provider-evidence "${PROVIDER_EVIDENCE}" \
+  --telegram-evidence "${TELEGRAM_EVIDENCE}" \
+  --lifecycle-evidence "${LIFECYCLE_EVIDENCE}"
+```
+
+The builder independently rechecks the provider matrix, agent-pack revision, no-paid-fallback
+marker, Telegram sequence, lifecycle artifact digest, worker restart, API, PostgreSQL, Temporal,
+quota semantics, Hermes policy, and live Hermes command registry. It refuses to replace an existing
+`C01-ACCEPTANCE.json`; preserve stale manifests as historical evidence or remove them explicitly
+only after proving they are superseded.
+
 Hermes receives read-only access to the narrow API token through a named ACL while the file remains
 `root:engineering-api-clients` mode `0640`. It cannot invoke arbitrary shell, SSH, Helm, or
 Kubernetes commands.
@@ -71,9 +99,10 @@ Prepare the exact provider/alias transformation without changing live state with
 
 The apply mode is backup-first, refuses direct YAML secrets, requires healthy Hermes
 `openai-codex` subscription authentication, and validates a mode-restricted canonical
-`C01-ACCEPTANCE.json` bound to the installed release and every required replacement gate. It also
-requires the exact confirmation printed by its help. It only updates Hermes configuration; it does
-not restart Hermes or stop/uninstall OmniRoute.
+`C01-ACCEPTANCE.json` bound to the installed control-plane release, installed agent pack, all three
+evidence digests, and every required replacement gate. It also requires the exact confirmation
+printed by its help. It only updates Hermes configuration; it does not restart Hermes or
+stop/uninstall OmniRoute.
 
 Run `/approve <change-set-id>` first. It displays the current immutable candidate payload. Approve
 with the returned SHA256. R3 additionally requires exactly:

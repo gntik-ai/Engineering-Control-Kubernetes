@@ -21,4 +21,5 @@ Never copy controller Claude credentials. If authentication expires, the bootstr
 
 Run `sudo /opt/engineering-control/source/scripts/validate-native-providers.sh` after both native
 logins. It passed both maker/checker directions in isolated synthetic worktrees and persisted only
-normalized redacted evidence.
+normalized redacted evidence. The resulting operator manifest is safe to fetch with
+`scripts/fetch-provider-acceptance.sh`; native Claude authentication material is never transferred.
