@@ -10,6 +10,7 @@ COMMANDS = {
     "audit": "Start a bounded read-only audit campaign.",
     "campaigns": "List audit campaigns.",
     "findings": "List verified findings.",
+    "verify": "Start independent verification for one candidate finding.",
     "run": "Start delivery for one confirmed finding.",
     "status": "Show a workflow run.",
     "evidence": "Show redacted evidence metadata.",

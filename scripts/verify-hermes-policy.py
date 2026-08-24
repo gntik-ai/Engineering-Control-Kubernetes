@@ -36,6 +36,7 @@ OMNI_DEPENDENCY = re.compile(
     re.IGNORECASE,
 )
 NO_ADMIN = ["engineering-control-no-admin"]
+PLUGIN_NAME = "engineering-control"
 
 
 def _strings(value: Any) -> list[str]:
@@ -75,10 +76,20 @@ def verify(config_path: Path, hermes_home: Path, require_no_omniroute: bool) -> 
             or set(configured) != ENGINEERING_COMMANDS
         ):
             raise ValueError(f"{key} must equal the Engineering Control command set")
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        raise ValueError("Hermes plugin configuration must be a mapping")
+    enabled = plugins.get("enabled")
+    disabled = plugins.get("disabled", [])
+    if not isinstance(enabled, list) or PLUGIN_NAME not in enabled:
+        raise ValueError("Engineering Control plugin must be explicitly enabled")
+    if not isinstance(disabled, list) or PLUGIN_NAME in disabled:
+        raise ValueError("Engineering Control plugin must not be disabled")
     plugin = hermes_home / "plugins" / "engineering-control" / "plugin.yaml"
+    plugin_module = hermes_home / "plugins" / "engineering-control" / "__init__.py"
     hook = hermes_home / "hooks" / "engineering-control" / "HOOK.yaml"
     handler = hermes_home / "hooks" / "engineering-control" / "handler.py"
-    if not all(path.is_file() for path in (plugin, hook, handler)):
+    if not all(path.is_file() for path in (plugin, plugin_module, hook, handler)):
         raise ValueError("Engineering Control Hermes plugin or hook is missing")
     if require_no_omniroute and any(OMNI_DEPENDENCY.search(item) for item in _strings(config)):
         raise ValueError("Hermes configuration still contains an OmniRoute runtime dependency")
@@ -123,6 +134,16 @@ def apply_telegram_lockdown(config_path: Path, backup_root: Path) -> Path | None
     telegram = platforms.setdefault("telegram", {})
     if not isinstance(telegram, dict):
         raise ValueError("Hermes Telegram policy must be a mapping")
+    plugins = config.get("plugins")
+    if plugins is None:
+        plugins = {}
+        config["plugins"] = plugins
+    if not isinstance(plugins, dict):
+        raise ValueError("Hermes plugin configuration must be a mapping")
+    enabled = plugins.get("enabled", [])
+    disabled = plugins.get("disabled", [])
+    if not isinstance(enabled, list) or not isinstance(disabled, list):
+        raise ValueError("Hermes plugin enable/disable lists must be arrays")
     expected_commands = sorted(ENGINEERING_COMMANDS)
     compliant = (
         toolsets.get("telegram") == []
@@ -130,6 +151,8 @@ def apply_telegram_lockdown(config_path: Path, backup_root: Path) -> Path | None
         and telegram.get("group_allow_admin_from") == NO_ADMIN
         and telegram.get("user_allowed_commands") == expected_commands
         and telegram.get("group_user_allowed_commands") == expected_commands
+        and PLUGIN_NAME in enabled
+        and PLUGIN_NAME not in disabled
     )
     if compliant:
         return None
@@ -160,6 +183,9 @@ def apply_telegram_lockdown(config_path: Path, backup_root: Path) -> Path | None
     telegram["group_allow_admin_from"] = list(NO_ADMIN)
     telegram["user_allowed_commands"] = expected_commands
     telegram["group_user_allowed_commands"] = expected_commands
+    plugins["enabled"] = sorted({str(value) for value in enabled} | {PLUGIN_NAME})
+    if disabled:
+        plugins["disabled"] = [value for value in disabled if value != PLUGIN_NAME]
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",

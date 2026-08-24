@@ -18,6 +18,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     home = tmp_path / "hermes"
     for relative in (
         "plugins/engineering-control/plugin.yaml",
+        "plugins/engineering-control/__init__.py",
         "hooks/engineering-control/HOOK.yaml",
         "hooks/engineering-control/handler.py",
     ):
@@ -25,6 +26,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("fixture\n", encoding="utf-8")
     config: dict[str, object] = {
+        "plugins": {"enabled": [MODULE.PLUGIN_NAME]},
         "platform_toolsets": {"telegram": []},
         "platforms": {
             "telegram": {
@@ -64,9 +66,22 @@ def test_cutover_policy_rejects_omniroute_dependency(tmp_path: Path) -> None:
         MODULE.verify(config_path, home, require_no_omniroute=True)
 
 
+def test_policy_rejects_disabled_engineering_plugin(tmp_path: Path) -> None:
+    config_path, home, config = _fixture(tmp_path)
+    config["plugins"] = {
+        "enabled": [MODULE.PLUGIN_NAME],
+        "disabled": [MODULE.PLUGIN_NAME],
+    }
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not be disabled"):
+        MODULE.verify(config_path, home, require_no_omniroute=False)
+
+
 def test_lockdown_is_backup_first_and_idempotent(tmp_path: Path) -> None:
     config_path, home, config = _fixture(tmp_path)
     config["platform_toolsets"] = {"telegram": ["terminal"]}
+    config["plugins"] = None
     telegram = config["platforms"]["telegram"]  # type: ignore[index]
     telegram.pop("allow_admin_from")  # type: ignore[union-attr]
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")

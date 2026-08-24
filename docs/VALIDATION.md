@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 216 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
+| Control-plane Python | PASS | 218 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -71,7 +71,7 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Requirement | Result | Evidence |
 | --- | --- | --- |
 | Canonical Hermes | PASS | 0.20.0 vendor install retained; no vendor source patch |
-| Engineering Control hook | PASS | native hook loaded for `command:*`; fixed route map only |
+| Engineering Control hook | PASS | command-discovery plugin explicitly enabled; native hook loaded for `command:*`; fixed route map only |
 | Authorization | PASS | non-Telegram and unauthorized identities denied; protected numeric allowlist active |
 | Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata again after the final release restart |
 | Telegram outbound | PASS | Bot API identity check and silent canary delivery succeeded |

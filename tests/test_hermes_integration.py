@@ -23,6 +23,35 @@ def load_handler() -> ModuleType:
     return module
 
 
+def load_plugin() -> ModuleType:
+    path = (
+        Path(__file__).parents[1]
+        / "integrations"
+        / "hermes-engineering-control"
+        / "plugin"
+        / "__init__.py"
+    )
+    spec = importlib.util.spec_from_file_location("engineering_control_hermes_plugin", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_plugin_registers_every_hook_command() -> None:
+    plugin = load_plugin()
+    handler = load_handler()
+    registered: set[str] = set()
+
+    class Context:
+        def register_command(self, name: str, **_kwargs: Any) -> None:
+            registered.add(name)
+
+    plugin.register(Context())
+
+    assert registered == handler.COMMANDS
+
+
 def test_non_telegram_command_is_denied() -> None:
     handler = load_handler()
     result = handler.handle("command:usage", {"platform": "discord", "user_id": "1"})
