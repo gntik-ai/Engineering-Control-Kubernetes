@@ -23,6 +23,11 @@ runuser -u engineering-control -- test -r \
   /opt/engineering-agent-pack/source/generators/validate.py
 grep -q '^ENGINEERING_AGENT_PACK_ROOT=/opt/engineering-agent-pack/source$' \
   /etc/engineering-control/env/control.env
+runuser -u hermes -- env \
+  HOME=/home/hermes \
+  PYTHONPATH=/home/hermes/.hermes/hermes-agent \
+  /home/hermes/.hermes/hermes-agent/venv/bin/python \
+  /opt/engineering-control/source/scripts/verify-hermes-runtime.py
 
 services=(engineering-infrastructure engineering-migrate engineering-api engineering-evidence-ingest engineering-temporal-worker engineering-scheduler engineering-notifier engineering-acceptance-worker)
 for service in "${services[@]}"; do

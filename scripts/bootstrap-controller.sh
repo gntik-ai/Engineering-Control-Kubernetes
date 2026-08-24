@@ -215,6 +215,11 @@ if [[ -f "${HERMES_HOME}/config.yaml" ]]; then
     --hermes-home "${HERMES_HOME}" \
     --apply-telegram-lockdown \
     --backup-root /home/hermes/engineering-backups
+  runuser -u hermes -- env \
+    HOME=/home/hermes \
+    PYTHONPATH=/home/hermes/.hermes/hermes-agent \
+    /home/hermes/.hermes/hermes-agent/venv/bin/python \
+    "${RELEASE_ROOT}/source/scripts/verify-hermes-runtime.py"
 fi
 
 if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then

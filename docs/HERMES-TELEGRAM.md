@@ -6,6 +6,8 @@ and a gateway command hook for authenticated execution. Vendor source is not pat
 The bootstrap explicitly enables the `engineering-control` plugin, and the policy verifier rejects
 a missing or disabled registration so configured commands cannot degrade into Hermes's
 unknown-command path.
+The controller verifier also loads Hermes's real runtime registry and requires all 15 bounded
+commands to resolve before reporting healthy.
 
 Supported commands are `/audit`, `/campaigns`, `/findings`, `/verify`, `/run`, `/status`,
 `/evidence`, `/approve`, `/reject`, `/pause`, `/resume`, `/cancel`, `/usage`, `/validate`, and

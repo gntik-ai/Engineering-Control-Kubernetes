@@ -41,6 +41,11 @@ def load_plugin() -> ModuleType:
 def test_plugin_registers_every_hook_command() -> None:
     plugin = load_plugin()
     handler = load_handler()
+    policy_path = Path(__file__).parents[1] / "scripts" / "verify-hermes-policy.py"
+    policy_spec = importlib.util.spec_from_file_location("engineering_control_policy", policy_path)
+    assert policy_spec is not None and policy_spec.loader is not None
+    policy = importlib.util.module_from_spec(policy_spec)
+    policy_spec.loader.exec_module(policy)
     registered: set[str] = set()
 
     class Context:
@@ -50,6 +55,7 @@ def test_plugin_registers_every_hook_command() -> None:
     plugin.register(Context())
 
     assert registered == handler.COMMANDS
+    assert registered == policy.ENGINEERING_COMMANDS
 
 
 def test_non_telegram_command_is_denied() -> None:

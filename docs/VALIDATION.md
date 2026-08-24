@@ -71,7 +71,7 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Requirement | Result | Evidence |
 | --- | --- | --- |
 | Canonical Hermes | PASS | 0.20.0 vendor install retained; no vendor source patch |
-| Engineering Control hook | PASS | command-discovery plugin explicitly enabled; native hook loaded for `command:*`; fixed route map only |
+| Engineering Control hook | PASS | command-discovery plugin explicitly enabled; all 15 commands resolve in the live Hermes registry; native hook loaded for `command:*`; fixed route map only |
 | Authorization | PASS | non-Telegram and unauthorized identities denied; protected numeric allowlist active |
 | Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata again after the final release restart |
 | Telegram outbound | PASS | Bot API identity check and silent canary delivery succeeded |
