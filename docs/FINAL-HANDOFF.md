@@ -19,10 +19,11 @@ metrics, bootstraps, tests, and recovery workflows. No product source was modifi
 repository was created, and no Kubernetes staging or production mutation was performed.
 
 Codex and Claude are independently authenticated; both structured native calls and both
-cross-provider maker/checker directions pass. Private Musematic mirror access, GitHub
-delivery/registry credentials, scoped Kubernetes identities, and user-originated Telegram canaries
-remain manual blockers. OmniRoute and its Caddy endpoint remain running because cleanup gates C-01
-and C-02 are not satisfied.
+cross-provider maker/checker directions pass. The allowlisted, user-originated Telegram
+`/usage` -> `/validate` -> `/status` lifecycle also passes with persisted, redacted evidence.
+Private Musematic mirror access, GitHub delivery/registry credentials, and scoped Kubernetes
+identities remain external blockers. The approved C-01/C-02/C-03 cleanup completed through its
+deterministic gates; rollback configuration/state was preserved.
 
 ## 2. Final architecture
 
@@ -72,8 +73,6 @@ Engineering API 127.0.0.1:8740 ----> PostgreSQL 127.0.0.1:55432
 Temporal UI: 127.0.0.1:8741 only
 SSH controller -> worker: private port 22
 Provider/GitHub/browser access: worker outbound TLS only
-Retained pre-cutover OmniRoute Caddy: public 80/443
-Retained OmniRoute service: controller loopback 20128/20131/20132
 ```
 
 PostgreSQL, the API, metrics, and Temporal UI are not public. Temporal and evidence ingest bind
@@ -81,22 +80,30 @@ only loopback/private interfaces. Worker evidence tokens cannot call the control
 
 ## 4. Removed software
 
-Only approved cleanup item C-03 was executed:
+The three approved items were removed from the controller and nothing was removed from the worker:
 
-- controller `omniroute-migration-test.service` was disabled, confirmed inactive, backed up, and
-  removed from `/etc/systemd/system`;
-- rollback material and checksums are under
-  `/home/hermes/engineering-backups/20260823T095538Z/`.
+- C-03: inactive `omniroute-migration-test.service`, after backup and inactive-state proof;
+- C-01: OmniRoute user service, npm package, npm launcher, and independent wrapper, only after the
+  native replacement stack and both post-stop cross-provider/Temporal/Telegram regressions passed;
+- C-02: the dedicated `omniroute-caddy` container, only after two-host consumer scans, a 1,334
+  second observation with no legitimate traffic, and backup/readability checks.
 
-C-01 and C-02 were not executed. No repository, worktree, credential, historical evidence,
-`.hmw`, legacy workflow asset, update bundle, old backup, `/opt/omniroute`, OpenBao data, or TLS
-state was removed.
+Rollback material is under `/home/hermes/engineering-backups/20260823T095538Z/`,
+`/home/hermes/engineering-backups/20260824T083018Z/`, and
+`/home/hermes/engineering-backups/20260824T090006Z/`. Cleanup ran against immutable release
+`91d4cabfb35b7aa684a154eecff8b307094d3ed5`; the PASS manifests are
+`C01-COMPLETE.json`, `C02-COMPLETE.json`, and `C02-POST-REMOVE-ACCEPTANCE.json` beneath
+`/home/hermes/engineering-bootstrap/`.
+
+No repository, worktree, credential, historical evidence, `.hmw`, legacy workflow asset, update
+bundle, old backup, `/opt/omniroute`, OpenBao data, or Caddy TLS/runtime state was removed.
 
 ## 5. Retained software
 
 - canonical Hermes: required Telegram interface;
-- OmniRoute service/package/wrapper and `~/.omniroute`: required rollback state until C-01 passes;
-- OmniRoute Caddy and TLS state: retained until C-02 consumer/traffic and regression gates pass;
+- `~/.omniroute`: preserved exactly as rollback state; it is not an active runtime dependency;
+- Caddy configuration, TLS data, and runtime state: preserved for rollback while the dedicated
+  container remains absent;
 - OpenBao: retained for Falcone secret lifecycle and because its runtime dependencies are not
   safely removable;
 - all product repositories, worktrees, OpenSpec assets, `.hmw`, legacy Hermes workflows, update
@@ -205,7 +212,7 @@ Supported Telegram commands are `/audit`, `/campaigns`, `/findings`, `/verify`, 
 `/etc/engineering-control/env/telegram-allowlist` and maps them to fixed API routes. It has no
 generic shell, SSH, Helm, or kubectl tool.
 
-Final inbound canary from the allowlisted account:
+The accepted inbound canary from the allowlisted account is:
 
 ```text
 /usage
@@ -214,9 +221,8 @@ Final inbound canary from the allowlisted account:
 ```
 
 The active Hermes aliases, project profiles, and agent guidance use its native `openai-codex`/
-Engineering Control path and pass the no-OmniRoute policy check. OmniRoute itself remains installed and running as
-rollback state until every C-01
-gate and the post-stop regression pass.
+Engineering Control path and pass the no-OmniRoute policy check. OmniRoute is absent; its preserved
+configuration and checked backups provide the bounded rollback path.
 
 ## 10. Codex
 
@@ -374,20 +380,19 @@ Detailed component instructions are in `docs/UPGRADE.md`.
   with scoped observer/release identities before Kubernetes automation.
 - Mirror, delivery, registry, and Kubernetes credentials are absent from their isolated worker
   domains; this is a fail-closed blocker, not a failed installation.
-- OmniRoute remains a rollback dependency and public Caddy endpoint until gated cutover. C-02
-  requires a fresh secret-safe consumer search and traffic review after C-01.
+- The public OmniRoute Caddy endpoint and legacy loopback listeners are absent. Rollback state is
+  protected and excluded from automatic retention cleanup.
 
 Central redaction runs before persistence. Secret values are absent from PostgreSQL, reports,
 evidence, Telegram responses, prompts, and commits.
 
 ## 20. Remaining manual actions
 
-1. Send inbound Telegram `/usage`, `/validate 30`, and `/status` canaries.
-2. Provision a contents-read-only private-mirror credential for `scan-runner`.
-3. Provision a separate draft-PR credential and GHCR read configuration for `delivery-runner`.
-4. Rotate/rewrite/rescan the Musematic credential history before write enablement.
-5. Provision scoped Kubernetes observer/release identities and negative permission tests.
-6. Authorize any real staging deployment separately.
+1. Provision a contents-read-only private-mirror credential for `scan-runner`.
+2. Provision a separate draft-PR credential and GHCR read configuration for `delivery-runner`.
+3. Rotate/rewrite/rescan the Musematic credential history before write enablement.
+4. Provision scoped Kubernetes observer/release identities and negative permission tests.
+5. Authorize any real staging deployment separately.
 
 Remote GitHub repository creation was not authorized or performed.
 
@@ -398,7 +403,7 @@ Remote GitHub repository creation was not authorized or performed.
 | Controller API, PostgreSQL, Temporal, scheduler, notifier, evidence ingest | PASS |
 | Controller restart/resume lifecycle | PASS |
 | Worker service users, services, tools, filesystem/credential isolation | PASS |
-| Control-plane tests (253), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
+| Control-plane tests (257), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
 | Agent pack generation, validation, and tests | PASS |
 | Codex install/auth/structured native call | PASS |
 | Claude install | PASS |
@@ -407,7 +412,7 @@ Remote GitHub repository creation was not authorized or performed.
 | Claude maker -> Codex checker | PASS |
 | Quota broker without invented values or paid fallback | PASS |
 | Hermes fixed command policy, allowlist, API `/usage`, outbound Telegram | PASS |
-| User-originated Telegram `/usage`/`validate`/`status` | PENDING OPERATOR |
+| User-originated Telegram `/usage`/`validate`/`status` | PASS |
 | Synthetic API -> Temporal -> worktree -> maker/checker -> evidence lifecycle | PASS |
 | Independent queue and workflow-worker restart/resume | PASS |
 | Falcone public mirrors and exact-SHA worktrees | PASS |
@@ -417,24 +422,20 @@ Remote GitHub repository creation was not authorized or performed.
 | Kubernetes read-only health and release dry-run | BLOCKED: scoped identities |
 | Real staging/production mutation | NOT AUTHORIZED / NOT RUN |
 | Cleanup C-03 | PASS |
-| Cleanup C-01/C-02 | GATED / NOT RUN |
+| Cleanup C-01/C-02/C-03 | PASS |
 
 The detailed live evidence is in `docs/VALIDATION.md` and the inventory under
 `/home/hermes/engineering-bootstrap/inventory/`.
 
 ## 22. Exact next commands
 
-The native configuration and provider portions of C-01 pass. To close the remaining Telegram gate,
-send from the allowlisted Telegram account:
+No command is required to finish the control-plane acceptance or approved cleanup. The next
+operator action is credential remediation/provisioning described above. After installing those
+machine-local credentials, run only:
 
-```text
-/usage
-/validate 30
-/status <workflow-id-returned-by-validate>
+```bash
+sudo /opt/engineering-control/source/scripts/verify-controller.sh
+ssh -t worker 'sudo /opt/engineering-control/source/scripts/verify-worker.sh'
 ```
 
-After those pass, run the provider/Telegram/lifecycle evidence commands and the deterministic C-01
-builder in `docs/HERMES-TELEGRAM.md`. The documented executors enforce stop-only, fresh post-stop
-regression, uninstall, two-host Caddy consumer/traffic review, backup-first Caddy removal, and a
-fresh post-removal regression. Do not stop OmniRoute or Caddy manually and do not run a deployment
-merely to test the platform.
+Do not run a real deployment merely to validate the platform; staging remains separately gated.

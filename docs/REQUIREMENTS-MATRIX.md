@@ -11,8 +11,8 @@ platform fails closed rather than bypassing.
 | 1 Host inventory | COMPLETE | Redacted controller/worker inventory and checksum manifests under `/home/hermes/engineering-bootstrap/inventory` |
 | 2 Asset discovery | COMPLETE | Repository/worktree and reusable-agent reports; dirty worktrees remain protected |
 | 3 Security scan | COMPLETE/BLOCKED | Redacted Gitleaks/history inventory; Musematic Git secrets and shared cluster-admin identity are active blockers |
-| 4 Cleanup plan | CONDITIONALLY APPROVED | C-03 complete; C-01/C-02 remain gated; deterministic executors enforce stop-only, fresh post-stop regression, wrapper-before-uninstall, two-host consumer/traffic review, backup-first Caddy removal, and fresh post-removal regression |
-| 5 Backup before cleanup | COMPLETE | `engineering-backups/20260823T095538Z` has readable checksums and restore procedures; protected credentials were excluded |
+| 4 Cleanup plan | COMPLETE | C-01/C-02/C-03 executed exactly within the conditional approval; deterministic stop-only, fresh regression, wrapper-before-uninstall, two-host consumer/traffic review, backup-first removal, and post-removal gates all passed |
+| 5 Backup before cleanup | COMPLETE | timestamped C-03, C-01, and C-02 backups have readable checksums and restore procedures; protected credentials and Caddy TLS state were excluded from copying and preserved in place |
 | 6 Filesystem architecture | ACTIVE | Normalized controller/worker trees, ownership, ACLs, state and journal services are installed |
 | 7 Git repository layout | IMPLEMENTED | Independent local Git repositories for `engineering-control` and `engineering-agent-pack`; no remote repository was created |
 | 8 Controller role | ACTIVE | PostgreSQL, Temporal, API, workflow worker, scheduler, notifier and evidence ingest are healthy |
@@ -39,9 +39,9 @@ platform fails closed rather than bypassing.
 | 29 Falcone adapter | IMPLEMENTED/BLOCKED LIVE | Exact-SHA CI/provenance, digest-only chart promotion, rendered-digest enforcement, Helm lint/template plus kubeconform, immutable plans, independent release review, real backup/migration gates, atomic deploy, verification/recovery; current release workflow lacks the signed candidate contract, target is disabled, and scoped kubeconfig is absent |
 | 30 Musematic adapter | IMPLEMENTED/SECURITY BLOCKED | Exact-SHA CI gate, immutable desired-state digest validation, unsafe Image Updater/direct-main rejection, bounded YAML/symlink checks, draft deployment PR, exact Argo observation and Git recovery plan; committed secrets, missing signed candidate contract, tag-only chart rendering and newest-build policy block promotion/write enablement |
 | 31 Kubernetes identity separation | IMPLEMENTED/BLOCKED CREDENTIALS | RBAC templates and negative checks exist; no scoped observer/release kubeconfigs are installed |
-| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0, explicitly enabled command plugin, fixed allowlisted hook, bounded `/validate`, and native `openai-codex` aliases/project profiles/agent guidance are active; no active OmniRoute dependency remains, while genuine inbound Telegram proof is pending |
+| 32 Hermes normalization | ACTIVE/PASS | Canonical 0.20.0, explicitly enabled command plugin, fixed allowlisted hook, bounded `/validate`, native aliases/profiles/guidance, and genuine inbound Telegram proof pass; OmniRoute is absent and preserved state is rollback-only |
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |
-| 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API, bounded `/validate`, outbound Telegram, and release/workflow-bound secret-free canary receipts are active; user-originated `/usage`/`validate`/`status` sequence is pending |
+| 34 Telegram approvals | ACTIVE/PASS | Allowlist, fixed hook-to-API, bounded `/validate`, outbound Telegram, and release/workflow-bound secret-free user-originated `/usage`/`validate`/`status` receipts pass |
 | 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
 | 36 Observability | IMPLEMENTED | Structured redacted context logs, PostgreSQL-backed Prometheus metrics, authenticated worker heartbeats |
 | 37 Failure/handoff | IMPLEMENTED | Required handoff bundle files and explicit `RATE_LIMITED`/cross-provider semantics |
@@ -50,26 +50,17 @@ platform fails closed rather than bypassing.
 | 40 Bootstrap/reinstall | PASS | Both bootstraps rerun successfully and installed the same immutable release on controller and worker |
 | 41 Update procedure | IMPLEMENTED | `UPGRADE.md` covers backup, drain, pin, migration, validation and rollback by component |
 | 42 Validation | HOST/PROVIDER PASS; EXTERNAL BLOCKED | Source, services, both native providers, browser/scanners, isolation, evidence and Temporal restart pass; GitHub/Kubernetes credentials remain |
-| 43 Acceptance lifecycle | SYNTHETIC AND PROVIDERS PASS / INBOUND PENDING | Authenticated API/Temporal/worktree/evidence chain passes with restart; both real cross-provider directions pass; inbound Telegram remains |
+| 43 Acceptance lifecycle | PASS | Authenticated Telegram/Hermes/API/Temporal/worktree/evidence chain passes with restart; both real cross-provider directions pass |
 | 44 Final report | COMPLETE | Version-controlled `FINAL-HANDOFF.md` records post-activation facts, exact blockers, cleanup state, recovery, verification, and next commands without claiming gated acceptance |
 
-## Gates in required order
+## Remaining external gates in required order
 
-1. Rerun/fetch the release-bound provider matrix and restart/resume lifecycle.
-2. Apply the backup-first native Hermes alias cutover while keeping OmniRoute fully available for
-   rollback; restart Hermes and require the no-OmniRoute runtime-configuration/profile/agent-asset
-   policy to pass.
-3. Send allowlisted Telegram `/usage`, `/validate 30`, and `/status`; validate the genuine inbound
-   round trip and use the deterministic builder to emit `C01-ACCEPTANCE.json` only if every C-01
-   gate passes.
-4. Run the stop-only C-01 executor, restart Hermes and all six worker services, and rerun fresh
-   provider, lifecycle, and genuine Telegram evidence. Build the post-stop manifest; only its PASS
-   permits moving the independent wrapper before npm uninstall. Retain `.omniroute`.
-5. After the observation window, collect root-owned secret-free consumer evidence on both hosts,
-   prove Caddy has no legitimate runtime traffic, run the backup-first C-02 executor, and build a
-   fresh post-removal provider/lifecycle/Telegram regression manifest.
-6. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
+The approved cleanup sequence (native alias cutover, C-01 stop, fresh regression, C-01 uninstall,
+two-host C-02 consumer/traffic review, backup-first C-02 removal, and fresh end-to-end regression)
+is complete. Remaining gates are:
+
+1. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
    and registry-read credential without copying interactive user credentials.
-7. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
+2. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
    scoped observer/release identities before any relevant write enablement.
-8. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.
+3. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.

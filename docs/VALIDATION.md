@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 253 pytest tests; Ruff clean; strict mypy clean across 79 source files plus nine privileged cleanup/cutover scripts; Bash syntax clean |
+| Control-plane Python | PASS | 257 pytest tests; Ruff clean; strict mypy clean across 79 package files plus 13 standalone validation/cutover scripts; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -39,8 +39,8 @@ test is not represented as a pass, and no paid API fallback was used.
 | Paid fallback | PASS | provider environment strips API keys/base URLs; no implicit paid route exists |
 | Network boundary | PASS | API/metrics/database bind loopback; Temporal/evidence bind loopback/private only |
 
-The only public HTTP listeners are ports 80/443 on the retained, pre-cutover OmniRoute Caddy
-container. They are not Engineering Control listeners and remain under cleanup gate C-02.
+The dedicated OmniRoute Caddy container and its public 80/443 listeners are absent after C-02.
+No Engineering Control service is exposed publicly.
 
 ## Worker activation
 
@@ -76,21 +76,17 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Authorization | PASS | non-Telegram and unauthorized identities denied; protected numeric allowlist active |
 | Hermes -> API `/usage` | PASS | allowlisted installed hook returned live Codex and Claude metadata again after the final release restart |
 | Telegram outbound | PASS | Bot API identity check and silent canary delivery succeeded |
-| Telegram inbound command | PENDING OPERATOR | bot cannot generate a user-originated command; operator must send `/usage`, `/validate 30`, then `/status` for the returned workflow |
-| Telegram acceptance evidence | READY | successful allowlisted responses append only bounded secret-free receipts; the root validator requires one release-bound `/usage` -> `/validate` -> completed `/status` sequence before persisting canonical hashed evidence |
+| Telegram inbound command | PASS | allowlisted user sent `/usage`, `/validate 30`, and completed `/status`; the hook returned the persisted lifecycle |
+| Telegram acceptance evidence | PASS | bounded secret-free, release/workflow-bound receipts were validated and persisted as canonical hashed evidence before and after both cleanup cutovers |
 | Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
 
 The active Hermes configuration, project profiles, and agent guidance use the native
-`openai-codex`/Engineering Control path and contain no OmniRoute runtime dependency; the OmniRoute
-service/package remains intact for rollback. Native provider and
-cross-provider acceptance pass; C-01 remains closed until the genuine inbound Telegram canaries
-pass and are recorded.
-
-The cleanup executors are separately tested but unexecuted. Phase A can only stop/disable
-OmniRoute. Phase B requires fresh post-stop provider, Temporal, Telegram, Hermes-restart, and all
-six worker-service restart evidence before it moves the independent wrapper and uninstalls npm.
-C-02 requires fresh secret-free consumer inventories from both hosts, post-C-01 aggregate traffic
-evidence, backup-first Caddy removal, and a fresh post-removal end-to-end regression.
+`openai-codex`/Engineering Control path and contain no OmniRoute runtime dependency. C-01 removed
+the legacy service/package/wrapper only after the stop-only phase and fresh provider, Temporal,
+Telegram, Hermes-restart, and all-six-worker restart evidence passed. `.omniroute` remains intact
+for rollback. C-02 then passed two-host secret-safe consumer inventories and a 1,334 second
+zero-legitimate-traffic review before removing only the dedicated Caddy container; TLS and runtime
+state remain preserved. A fresh post-removal end-to-end regression passed.
 
 ## Lifecycle acceptance
 
@@ -117,7 +113,6 @@ provenance; the C-01 builder rejects evidence from any other release.
 
 The following remain blocked and must not be inferred from the synthetic pass:
 
-- inbound Telegram `/usage`, `/validate 30`, and `/status` for the returned workflow;
 - Musematic snapshot through the private canonical mirrors;
 - scoped Kubernetes observer authorization and release dry-runs;
 - real draft-PR and registry-provenance validation.
@@ -139,5 +134,6 @@ Real staging mutation is not authorized. Deployment workflows must stop at
 - `SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY`: replace the shared kubeconfig with scoped
   observer and release identities before any Kubernetes automation is enabled.
 
-C-01 and C-02 remain unexecuted. C-03 is complete with a validated rollback copy under
-`/home/hermes/engineering-backups/20260823T095538Z/`.
+C-01, C-02, and C-03 are complete. Their guarded execution and rollback manifests are beneath
+`/home/hermes/engineering-bootstrap/` and `/home/hermes/engineering-backups/`; protected
+configuration, credentials, repositories, historical evidence, and TLS state were not removed.
