@@ -142,18 +142,32 @@ def transform(config: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
         alias = aliases.setdefault(name, {})
         if not isinstance(alias, dict):
             raise ValueError(f"Hermes model alias {name} must be a mapping")
+        alias_changed = False
         for key in ("api_mode", "base_url", "api_key", "key_env"):
-            alias.pop(key, None)
-        alias["provider"] = "openai-codex"
-        alias["model"] = model_name
-        changes.append(f"model_aliases.{name}:openai-codex")
+            if key in alias:
+                alias.pop(key)
+                alias_changed = True
+        if alias.get("provider") != "openai-codex":
+            alias["provider"] = "openai-codex"
+            alias_changed = True
+        if alias.get("model") != model_name:
+            alias["model"] = model_name
+            alias_changed = True
+        if alias_changed:
+            changes.append(f"model_aliases.{name}:openai-codex")
 
     delegation = candidate.get("delegation")
     if isinstance(delegation, dict):
+        delegation_changed = False
         for key in ("api_mode", "base_url", "api_key", "key_env", "provider"):
-            delegation.pop(key, None)
-        delegation["model"] = ALIAS_MODELS["cheap"]
-        changes.append("delegation:subscription-model")
+            if key in delegation:
+                delegation.pop(key)
+                delegation_changed = True
+        if delegation.get("model") != ALIAS_MODELS["cheap"]:
+            delegation["model"] = ALIAS_MODELS["cheap"]
+            delegation_changed = True
+        if delegation_changed:
+            changes.append("delegation:subscription-model")
 
     if any(OMNI_DEPENDENCY.search(value) for value in _strings(candidate)):
         raise ValueError("transformed Hermes configuration still contains an OmniRoute dependency")

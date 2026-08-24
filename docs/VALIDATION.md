@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 252 pytest tests; Ruff clean; strict mypy clean across 79 source files plus nine privileged cleanup/cutover scripts; Bash syntax clean |
+| Control-plane Python | PASS | 253 pytest tests; Ruff clean; strict mypy clean across 79 source files plus nine privileged cleanup/cutover scripts; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |

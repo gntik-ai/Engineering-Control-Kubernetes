@@ -53,6 +53,15 @@ def test_transform_removes_omniroute_and_preserves_unrelated_provider() -> None:
     assert not any(MODULE.OMNI_DEPENDENCY.search(value) for value in MODULE._strings(candidate))
 
 
+def test_transform_is_idempotent_after_native_cutover() -> None:
+    candidate, _ = MODULE.transform(_fixture())
+
+    repeated, changes = MODULE.transform(candidate)
+
+    assert repeated == candidate
+    assert changes == ()
+
+
 def test_transform_profile_replaces_runtime_provider_without_changing_domain_data() -> None:
     profile = {
         "project": "falcone",
