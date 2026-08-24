@@ -30,5 +30,13 @@ def _hook_required(_raw_args: str) -> str:
 
 
 def register(ctx) -> None:
+    try:
+        from hermes_cli.commands import resolve_command
+    except ImportError:  # Unit validation runs outside the Hermes vendor environment.
+
+        def resolve_command(_name: str) -> None:
+            return None
+
     for name, description in COMMANDS.items():
-        ctx.register_command(name, handler=_hook_required, description=description)
+        if resolve_command(name) is None:
+            ctx.register_command(name, handler=_hook_required, description=description)
