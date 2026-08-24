@@ -74,6 +74,8 @@ class ClaudeCLIAdapter:
             "dontAsk",
             "--tools",
             ",".join(tools),
+            "--allowed-tools",
+            ",".join(tools),
         ]
         if request.model:
             command.extend(("--model", request.model))

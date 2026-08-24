@@ -46,6 +46,8 @@ async def test_claude_stream_json_invocation_enables_verbose(
         prompt="perform a bounded synthetic task",
         working_directory=str(tmp_path),
         output_schema={"type": "object"},
+        writable=True,
+        allowed_tools=("Read", "Edit", "Write"),
     )
 
     result = await ClaudeCLIAdapter().execute(request)
@@ -53,11 +55,32 @@ async def test_claude_stream_json_invocation_enables_verbose(
     command = observed["command"]
     assert command[command.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in command
+    assert command[command.index("--permission-mode") + 1] == "dontAsk"
+    assert command[command.index("--tools") + 1] == "Read,Edit,Write"
+    assert command[command.index("--allowed-tools") + 1] == "Read,Edit,Write"
+    assert "--dangerously-skip-permissions" not in command
     assert result.status is RunStatus.SUCCESS
     assert result.structured_result == {"status": "PASS"}
     assert result.usage.input_tokens == 120
     assert result.usage.output_tokens == 24
     assert result.usage.cached_input_tokens == 8
+
+
+@pytest.mark.asyncio
+async def test_claude_read_only_request_rejects_write_tools(tmp_path: Path) -> None:
+    request = AgentRequest(
+        project=Project.FALCONE,
+        role="code-reviewer",
+        provider=Provider.CLAUDE,
+        model_class=ModelClass.JUDGE,
+        prompt="review a bounded synthetic task",
+        working_directory=str(tmp_path),
+        output_schema={"type": "object"},
+        allowed_tools=("Read", "Write"),
+    )
+
+    with pytest.raises(ValueError, match="read-only Claude requests"):
+        await ClaudeCLIAdapter().execute(request)
 
 
 def test_claude_usage_ignores_malformed_or_redacted_counters() -> None:
