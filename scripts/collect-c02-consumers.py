@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pwd
@@ -46,25 +47,38 @@ ALLOWLISTED_ENGINEERING_SCRIPTS = {
     "execute-c02-cutover.py",
     "build-c02-post-remove-acceptance.py",
 }
+MAX_SCAN_FILE_BYTES = 64 * 1024 * 1024
+SCAN_CHUNK_BYTES = 64 * 1024
+PATTERN_OVERLAP_BYTES = 256
 
 
-def _read_bounded(path: Path, maximum: int = 2 * 1024 * 1024) -> bytes:
+def _contains_pattern(path: Path, maximum: int = MAX_SCAN_FILE_BYTES) -> bool:
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > maximum:
         raise PermissionError(f"unsafe or oversized consumer-scan input: {path}")
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        chunks: list[bytes] = []
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_size > maximum
+            or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise PermissionError(f"consumer-scan input changed during validation: {path}")
+        overlap = b""
         total = 0
         while True:
-            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - total))
+            chunk = os.read(descriptor, min(SCAN_CHUNK_BYTES, maximum + 1 - total))
             if not chunk:
-                break
-            chunks.append(chunk)
+                return False
             total += len(chunk)
             if total > maximum:
                 raise ValueError(f"consumer-scan input exceeded its size bound: {path}")
-        return b"".join(chunks)
+            candidate = overlap + chunk
+            if PATTERN.search(candidate):
+                return True
+            overlap = candidate[-PATTERN_OVERLAP_BYTES:]
     finally:
         os.close(descriptor)
 
@@ -74,7 +88,7 @@ def _candidate(path: Path) -> bool:
 
 
 def _scan_file(path: Path, matches: set[str]) -> None:
-    if _candidate(path) and PATTERN.search(_read_bounded(path)):
+    if _candidate(path) and _contains_pattern(path):
         matches.add(str(path))
 
 
@@ -249,6 +263,8 @@ def collect(scope: str) -> dict[str, Any]:
         "legacy_listening_ports": ports,
         "repositories_scanned": [str(path) for path in repositories],
         "excluded_reviewed_cleanup_targets": excluded_targets,
+        "collector_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "maximum_scanned_file_bytes": MAX_SCAN_FILE_BYTES,
         "secret_values_persisted": False,
     }
 

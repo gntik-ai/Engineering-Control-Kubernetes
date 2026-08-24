@@ -64,6 +64,27 @@ def test_consumer_collector_persists_locations_only(tmp_path: Path) -> None:
     assert "password" not in json.dumps(sorted(matches))
 
 
+def test_consumer_collector_streams_files_larger_than_two_mebibytes(tmp_path: Path) -> None:
+    module = _load("collect-c02-consumers.py")
+    source = tmp_path / "large.json"
+    source.write_bytes(b"x" * (2 * 1024 * 1024 + module.SCAN_CHUNK_BYTES - 5) + b"/omniroute")
+    matches: set[str] = set()
+
+    module._scan_file(source, matches)
+
+    assert matches == {str(source)}
+
+
+def test_consumer_collector_rejects_files_over_hard_limit(tmp_path: Path) -> None:
+    module = _load("collect-c02-consumers.py")
+    source = tmp_path / "oversized.json"
+    with source.open("wb") as handle:
+        handle.truncate(module.MAX_SCAN_FILE_BYTES + 1)
+
+    with pytest.raises(PermissionError, match="unsafe or oversized"):
+        module._scan_file(source, set())
+
+
 def test_consumer_collector_ignores_hidden_historical_backups(tmp_path: Path) -> None:
     module = _load("collect-c02-consumers.py")
     active = tmp_path / "skills/active/SKILL.md"
