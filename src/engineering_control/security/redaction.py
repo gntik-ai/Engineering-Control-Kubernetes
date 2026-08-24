@@ -60,6 +60,15 @@ class SecretRedactor:
         r"(?i)(password|passwd|secret|token|api.?key|access.?key|client.?secret|private.?key|encryption.?key|credential|kubeconfig)"
     )
     _safe_reference_keys = re.compile(r"(?i)(?:_path|_file|_filename|_ref|_reference|_id|_sha256)$")
+    _usage_counter_keys = frozenset(
+        {
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        }
+    )
 
     def redact_text(self, value: str) -> RedactionReport:
         replacements = 0
@@ -78,6 +87,14 @@ class SecretRedactor:
 
         def walk(item: Any, key: str | None = None) -> Any:
             nonlocal replacements
+            if (
+                key is not None
+                and key.lower() in self._usage_counter_keys
+                and isinstance(item, int)
+                and not isinstance(item, bool)
+                and item >= 0
+            ):
+                return item
             if (
                 key is not None
                 and self._sensitive_keys.search(key)

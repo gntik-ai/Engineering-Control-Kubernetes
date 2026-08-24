@@ -27,6 +27,11 @@ async def test_claude_stream_json_invocation_enables_verbose(
                     "type": "result",
                     "structured_output": {"status": "PASS"},
                     "result": "bounded",
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 24,
+                        "cache_read_input_tokens": 8,
+                    },
                 },
             ),
             stderr="",
@@ -50,3 +55,25 @@ async def test_claude_stream_json_invocation_enables_verbose(
     assert "--verbose" in command
     assert result.status is RunStatus.SUCCESS
     assert result.structured_result == {"status": "PASS"}
+    assert result.usage.input_tokens == 120
+    assert result.usage.output_tokens == 24
+    assert result.usage.cached_input_tokens == 8
+
+
+def test_claude_usage_ignores_malformed_or_redacted_counters() -> None:
+    usage = ClaudeCLIAdapter._usage(
+        (
+            {
+                "type": "result",
+                "usage": {
+                    "input_tokens": "[REDACTED]",
+                    "output_tokens": True,
+                    "cache_read_input_tokens": -1,
+                },
+            },
+        )
+    )
+
+    assert usage.input_tokens is None
+    assert usage.output_tokens is None
+    assert usage.cached_input_tokens is None

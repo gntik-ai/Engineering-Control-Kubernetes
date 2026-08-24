@@ -133,12 +133,19 @@ class ClaudeCLIAdapter:
 
     @staticmethod
     def _usage(events: tuple[dict[str, Any], ...]) -> ProviderUsage:
+        def counter(value: Any) -> int | None:
+            return (
+                value
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                else None
+            )
+
         for event in reversed(events):
             usage = event.get("usage")
             if isinstance(usage, dict):
                 return ProviderUsage(
-                    input_tokens=usage.get("input_tokens"),
-                    output_tokens=usage.get("output_tokens"),
-                    cached_input_tokens=usage.get("cache_read_input_tokens"),
+                    input_tokens=counter(usage.get("input_tokens")),
+                    output_tokens=counter(usage.get("output_tokens")),
+                    cached_input_tokens=counter(usage.get("cache_read_input_tokens")),
                 )
         return ProviderUsage()

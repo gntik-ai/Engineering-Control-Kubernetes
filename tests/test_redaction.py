@@ -41,3 +41,27 @@ def test_preserves_secret_reference_paths_but_not_values() -> None:
     assert report.value["kubeconfig_path"] == "/protected/release.kubeconfig"
     assert report.value["credential"] == REDACTED
     assert report.value["kubeconfig"] == REDACTED
+
+
+def test_preserves_numeric_usage_counters_but_redacts_token_strings() -> None:
+    report = SecretRedactor().redact(
+        {
+            "usage": {
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "cache_read_input_tokens": 67,
+                "cache_creation_input_tokens": 8,
+            },
+            "input_tokens": "credential-like-string",
+            "auth_token": 123456,
+        }
+    )
+
+    assert report.value["usage"] == {
+        "input_tokens": 123,
+        "output_tokens": 45,
+        "cache_read_input_tokens": 67,
+        "cache_creation_input_tokens": 8,
+    }
+    assert report.value["input_tokens"] == REDACTED
+    assert report.value["auth_token"] == REDACTED
