@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/engineering-control/venv/bin/python
 from __future__ import annotations
 
 import argparse

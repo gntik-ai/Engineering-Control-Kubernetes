@@ -179,9 +179,18 @@ exact reviewed Caddy configuration. A PASS permits only the reviewed Caddy conta
 ```
 
 The Caddyfile and sanitized container metadata are backed up; TLS `/data` and runtime `/config`
-state stay in place. Finally rerun/fetch fresh provider, lifecycle, and genuine Telegram evidence
-and supply it to `build-c02-post-remove-acceptance.py`. That builder requires Caddy to remain
-absent, ports 80/443 to be closed, and the complete Telegram-to-evidence lifecycle to pass.
+state stay in place. Finally rerun/fetch fresh provider, lifecycle, and genuine Telegram evidence,
+then run:
+
+```bash
+sudo /opt/engineering-control/source/scripts/build-c02-post-remove-acceptance.py \
+  --provider-evidence "${POST_C02_PROVIDER_EVIDENCE}" \
+  --telegram-evidence "${POST_C02_TELEGRAM_EVIDENCE}" \
+  --lifecycle-evidence "${POST_C02_LIFECYCLE_EVIDENCE}"
+```
+
+The builder requires Caddy to remain absent, ports 80/443 to be closed, and the complete
+Telegram-to-evidence lifecycle to pass.
 
 Run `/approve <change-set-id>` first. It displays the current immutable candidate payload. Approve
 with the returned SHA256. R3 additionally requires exactly:

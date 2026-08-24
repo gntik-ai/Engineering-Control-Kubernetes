@@ -182,6 +182,20 @@ def test_controller_config_parents_allow_token_file_group_traversal_only() -> No
     assert "refusing overwrite" in fetch_content
 
 
+def test_direct_sudo_python_gates_use_the_installed_control_venv() -> None:
+    for script in (
+        "build-c01-acceptance.py",
+        "build-c01-post-stop-acceptance.py",
+        "collect-c02-consumers.py",
+        "validate-c02-readiness.py",
+        "build-c02-post-remove-acceptance.py",
+    ):
+        first_line = (
+            (REPOSITORY_ROOT / "scripts" / script).read_text(encoding="utf-8").splitlines()[0]
+        )
+        assert first_line == "#!/opt/engineering-control/venv/bin/python"
+
+
 def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> None:
     script = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
 
