@@ -26,7 +26,8 @@ policy approval; R2/R3 pause for human approval, and R3 also requires its typed 
 
 Before either project reaches deployment preparation, `DeliveryReconciliationWorkflow` must bind
 the exact source PR head, named CI checks, signed candidate image manifest, per-image GitHub
-provenance, and deployment PR. Falcone promotion is digest-only and Helm-render validated.
+provenance, deployment PR, deterministic diff-impact classification, recovery-plan hash, and an
+opposite-provider release-plan review. Falcone promotion is digest-only and Helm-render validated.
 Musematic promotion remains disabled until its charts render digests, mutable image-updater policy
 is removed, and its active security blocker is remediated. Reconciliation cannot merge or deploy.
 
@@ -56,8 +57,11 @@ becomes eligible.
 Falcone targets require a chart-relative values list, release name, exact kube context, and an
 absolute mode-`0600` kubeconfig under `/etc/engineering-control/env/release/`. The release worker
 verifies its chart worktree and exact chart SHA, runs `helm lint` and `helm template`, and captures
-hashes before an approval candidate can exist. A migration additionally requires real backup and
-environment-parity evidence hashes. The approved adapter uses
+hashes before an approval candidate can exist. Every approved digest must already be present in the
+promoted values and rendered output; the adapter never masks a bad promotion with generic
+`--set-string` overrides. The rendered manifest also passes pinned `kubeconform` schema validation.
+A migration additionally requires real backup and environment-parity evidence hashes. The approved
+adapter uses
 `helm upgrade --install --atomic --wait`; arbitrary Helm arguments are not accepted. Before
 mutation it also captures the existing
 Helm revision and hashes its manifest as a recovery baseline. Recovery requires a second immutable
@@ -66,7 +70,10 @@ migration-bearing releases fail closed.
 
 Musematic targets require an Argo CD application name. Preflight demands a clean bounded
 `musematic-deploy` worktree at the exact deployment SHA, immutable image digests, and no known
-mutable-image updater pattern. Desired-state change still occurs only through the protected
+mutable-image updater pattern, including prefixed Image Updater annotations and direct-main
+writeback syntax. Every approved digest must exist in the exact bounded Git desired state; YAML
+symlink escapes and oversized desired-state input are rejected. Desired-state change still occurs
+only through the protected
 deployment PR. After approval, the release adapter observes Argo CD and accepts only the exact
 approved revision when both sync and health are good; it does not patch Kubernetes. Recovery
 similarly refuses live mutation and produces a protected deployment-repository revert plan

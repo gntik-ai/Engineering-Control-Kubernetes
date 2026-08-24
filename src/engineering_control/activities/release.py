@@ -34,6 +34,7 @@ class ReleaseActivityHandler:
             {
                 "git": Path("/usr/bin/git"),
                 "helm": settings.helm_executable,
+                "kubeconform": settings.kubeconform_executable,
                 "argocd": settings.argocd_executable,
             }
         )
@@ -68,9 +69,17 @@ class ReleaseActivityHandler:
         plan_value = {key: value for key, value in raw_plan.items() if key != "strategy"}
         try:
             if strategy == "helm":
-                result = self._helm_release(plan_value, approval)
+                result = self._helm_release(
+                    plan_value,
+                    approval,
+                    self._approved_preflight(payload),
+                )
             elif strategy == "argocd-gitops":
-                result = self._gitops_observe(plan_value, approval)
+                result = self._gitops_observe(
+                    plan_value,
+                    approval,
+                    self._approved_preflight(payload),
+                )
             else:
                 raise ApplicationError(
                     "release strategy is not allowlisted",
@@ -222,12 +231,21 @@ class ReleaseActivityHandler:
             raise TypeError("redacted release preflight must remain an object")
         return safe
 
-    def _helm_release(self, value: dict[str, Any], approval: dict[str, Any]) -> dict[str, Any]:
+    def _helm_release(
+        self,
+        value: dict[str, Any],
+        approval: dict[str, Any],
+        approved_preflight: dict[str, Any],
+    ) -> dict[str, Any]:
         plan = FalconeReleasePlan.model_validate(value)
         self._bounded_worktree(plan.chart_directory)
         self._scoped_credential(plan.kubeconfig_path)
         self._matching_binding(plan.approval_binding_sha256, approval)
-        command = self.helm.deploy(plan, approval_is_current=True)
+        command = self.helm.deploy(
+            plan,
+            approval_is_current=True,
+            approved_preflight=approved_preflight,
+        )
         transaction = hashlib.sha256(command.stdout.encode()).hexdigest()
         return {
             "status": "DEPLOYED",
@@ -236,10 +254,21 @@ class ReleaseActivityHandler:
             "return_code": command.return_code,
         }
 
-    def _gitops_observe(self, value: dict[str, Any], approval: dict[str, Any]) -> dict[str, Any]:
+    def _gitops_observe(
+        self,
+        value: dict[str, Any],
+        approval: dict[str, Any],
+        approved_preflight: dict[str, Any],
+    ) -> dict[str, Any]:
         plan = MusematicPromotion.model_validate(value)
         self._bounded_worktree(plan.deployment_repository)
         self._matching_binding(plan.approval_binding_sha256, approval)
+        if self.gitops.preflight(plan) != approved_preflight:
+            raise ApplicationError(
+                "GitOps desired state drifted after immutable approval",
+                type="ApprovalMismatch",
+                non_retryable=True,
+            )
         observed = self.gitops.observe_reconciliation(plan)
         if (
             observed.get("revision_matches") is not True
@@ -251,6 +280,17 @@ class ReleaseActivityHandler:
                 type="ReconciliationPending",
             )
         return {"status": "DEPLOYED", "strategy": "argocd-gitops", **observed}
+
+    @staticmethod
+    def _approved_preflight(payload: dict[str, Any]) -> dict[str, Any]:
+        value = payload.get("release_preflight")
+        if not isinstance(value, dict) or value.get("status") != "PREFLIGHT_PASS":
+            raise ApplicationError(
+                "release requires the exact approved preflight result",
+                type="ApprovalMismatch",
+                non_retryable=True,
+            )
+        return value
 
     def _bounded_worktree(self, path: Path) -> None:
         root = self.settings.worktree_root.resolve()

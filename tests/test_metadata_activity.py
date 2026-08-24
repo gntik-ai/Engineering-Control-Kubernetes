@@ -1102,7 +1102,6 @@ configuration:
         )
         assert deployment_lease is not None
         assert deployment_lease.component_key == "musematic:deploy:staging"
-
     with handler.sessions.begin() as session:
         session.add(
             Approval(
@@ -1160,6 +1159,98 @@ configuration:
             .where(ComponentLease.released_at.is_(None))
         )
         assert active_lease_count == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_deployment_requires_real_backup_and_parity_evidence(
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "targets"
+    target_root.mkdir()
+    (target_root / "musematic-staging.yaml").write_text(
+        """version: 1
+enabled: true
+project: musematic
+environment: staging
+strategy: argocd-gitops
+target_context: musematic-staging-observer
+target_namespace: musematic-staging
+configuration:
+  argo_application: musematic-staging
+""",
+        encoding="utf-8",
+    )
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'migration-evidence.sqlite'}",
+            deployment_target_root=target_root,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    run_id = uuid4()
+    workflow_id = "migration-evidence-required"
+    recovery = {
+        "release_evidence": {
+            "rollback_plan_sha256": "1" * 64,
+            "ci_result_sha256": "2" * 64,
+            "independent_review_sha256": "3" * 64,
+            "backup_requirement": "real-backup-and-parity-required",
+            "migration": True,
+            "backup_evidence_sha256": None,
+            "parity_evidence_sha256": None,
+        }
+    }
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="musematic",
+                risk_class="R3",
+                state="DEPLOY_PR",
+                version=1,
+                source_repository="musematic",
+                source_branch=f"agent/musematic/1/{change_set_id}",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url="https://github.com/gntik-ai/musematic/pull/1",
+                deployment_repository="musematic-deploy",
+                deployment_branch=f"agent/musematic/1/{change_set_id}",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url="https://github.com/gntik-ai/musematic-deploy/pull/1",
+                image_digests={"api": f"sha256:{'e' * 64}"},
+                chart_version=None,
+                recovery_json=recovery,
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id=workflow_id,
+                run_type="staging-deployment",
+                status="QUEUED",
+                project="musematic",
+            )
+        )
+
+    result = await handler.handle(
+        "staging.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "RELEASE_EVIDENCE_INCOMPLETE"
+    assert result["missing_requirements"] == [
+        "backup_evidence_sha256",
+        "parity_evidence_sha256",
+    ]
 
 
 @pytest.mark.asyncio

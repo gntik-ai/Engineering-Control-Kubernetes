@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -93,9 +94,30 @@ class FalconeHelmAdapter:
         ]
         for values in plan.values_files:
             template_arguments.extend(("--values", str(values)))
-        for component, digest in sorted(plan.image_digests.items()):
-            template_arguments.extend(("--set-string", f"images.{component}.digest={digest}"))
         rendered = self.runner.run("helm", template_arguments, cwd=plan.chart_directory)
+        missing_digests = sorted(
+            component
+            for component, digest in plan.image_digests.items()
+            if digest not in rendered.stdout
+        )
+        if missing_digests:
+            raise ValueError(
+                "rendered Falcone manifests are missing approved immutable image digests for: "
+                + ", ".join(missing_digests)
+            )
+        with tempfile.TemporaryDirectory(prefix="engineering-falcone-manifest-") as raw:
+            manifest = Path(raw) / "rendered.yaml"
+            manifest.write_text(rendered.stdout, encoding="utf-8")
+            schema_validation = self.runner.run(
+                "kubeconform",
+                [
+                    "-strict",
+                    "-summary",
+                    "-ignore-missing-schemas",
+                    str(manifest),
+                ],
+                cwd=plan.chart_directory,
+            )
         previous = self._current_release(plan)
         documents = [item for item in yaml.safe_load_all(rendered.stdout) if item]
         return {
@@ -103,6 +125,9 @@ class FalconeHelmAdapter:
             "chart_version": plan.chart_version,
             "lint_sha256": hashlib.sha256(lint.stdout.encode()).hexdigest(),
             "rendered_sha256": hashlib.sha256(rendered.stdout.encode()).hexdigest(),
+            "schema_validation_sha256": hashlib.sha256(
+                schema_validation.stdout.encode()
+            ).hexdigest(),
             "manifest_count": len(documents),
             "migration": plan.migration,
             "backup_evidence_sha256": plan.backup_evidence_sha256,
@@ -113,10 +138,18 @@ class FalconeHelmAdapter:
             "status": "PREFLIGHT_PASS",
         }
 
-    def deploy(self, plan: FalconeReleasePlan, *, approval_is_current: bool) -> CommandResult:
+    def deploy(
+        self,
+        plan: FalconeReleasePlan,
+        *,
+        approval_is_current: bool,
+        approved_preflight: dict[str, Any],
+    ) -> CommandResult:
         if not approval_is_current:
             raise ValueError("release approval is absent, invalid, or bound to changed artifacts")
-        self.preflight(plan)
+        current_preflight = self.preflight(plan)
+        if current_preflight != approved_preflight:
+            raise ValueError("release preflight drifted after immutable approval")
         arguments = [
             "upgrade",
             "--install",
@@ -135,8 +168,6 @@ class FalconeHelmAdapter:
         ]
         for values in plan.values_files:
             arguments.extend(("--values", str(values)))
-        for component, digest in sorted(plan.image_digests.items()):
-            arguments.extend(("--set-string", f"images.{component}.digest={digest}"))
         return self.runner.run(
             "helm",
             arguments,

@@ -184,6 +184,8 @@ class ControlledWorkflow:
             return f"engineering-{cls._nested_value(payload, 'maker_provider', 'codex')}"
         if step == "delivery.invoke_checker":
             return f"engineering-{cls._nested_value(payload, 'checker_provider', 'claude')}"
+        if step == "reconcile.invoke_release_reviewer":
+            return f"engineering-{cls._nested_value(payload, 'release_review_provider', 'claude')}"
         if step == "quota.refresh":
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step == "runtime.independent_review":
@@ -521,6 +523,19 @@ class DeliveryReconciliationWorkflow(ControlledWorkflow):
             return {"status": "CANCELLED", "context": context}
         context = await self._step("reconcile.publish_promotion", context, timeout_minutes=30)
         context = await self._step("reconcile.persist_promotion_publication", context)
+        if context.get("status") != "RELEASE_REVIEW_REQUIRED":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
+        if not await self._checkpoint("RECONCILE_RELEASE_REVIEW"):
+            return {"status": "CANCELLED", "context": context}
+        context = await self._step("reconcile.prepare_release_review", context)
+        if context.get("status") != "RELEASE_REVIEW_READY":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
+        context = await self._agent_step(
+            "reconcile.invoke_release_reviewer", context, timeout_minutes=90
+        )
+        if context.get("agent_invocation_status") != "SUCCESS":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
+        context = await self._step("reconcile.persist_release_review", context)
         return {"status": context.get("status", "DEPLOY_PR"), "context": context}
 
 

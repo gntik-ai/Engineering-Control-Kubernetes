@@ -927,6 +927,11 @@ class ScanActivityHandler:
                 )
             changes[name] = {
                 **summary,
+                "release_impact": self._classify_release_impact(
+                    repository=str(payload[f"{name}_repository"]),
+                    changed_paths=summary["changed_paths"],
+                    diff=diff,
+                ),
                 "diff_path": (None if secret.get("status") == "FINDINGS" else str(diff_path)),
                 "diff_withheld": secret.get("status") == "FINDINGS",
                 "diff_redacted_sha256": hashlib.sha256(safe_diff.encode()).hexdigest(),
@@ -954,6 +959,65 @@ class ScanActivityHandler:
             "blocker": "CHANGESET_VALIDATION_FINDINGS" if blocked else None,
             "change_evidence": changes,
         }
+
+    @staticmethod
+    def _classify_release_impact(
+        *, repository: str, changed_paths: object, diff: str
+    ) -> dict[str, Any]:
+        """Classify release gates without persisting source or secret-bearing snippets."""
+        if not isinstance(changed_paths, list) or any(
+            not isinstance(path, str) for path in changed_paths
+        ):
+            raise ValueError("release impact requires bounded changed paths")
+        normalized_paths = "\n".join(str(path).lower() for path in changed_paths)
+        searchable = f"{normalized_paths}\n{diff.lower()}"
+        patterns = {
+            "migration": (
+                r"(?:^|/)(?:migrations?|alembic|flyway|liquibase)(?:/|$)",
+                r"\b(?:create|alter|drop|truncate)\s+(?:table|index|schema|database)\b",
+                r"\b(?:alembic|flyway|liquibase|schema migration)\b",
+            ),
+            "secret_lifecycle": (
+                r"\b(?:externalsecret|sealedsecret|secretstore|clustersecretstore)\b",
+                r"\b(?:openbao|vault|sops|secret lifecycle|encryption key)\b",
+                r"(?:^|/)(?:secrets?|external-secrets|openbao|vault)(?:/|$)",
+            ),
+            "cluster_scoped": (
+                r"\bkind:\s*(?:customresourcedefinition|clusterrole|clusterrolebinding|namespace|storageclass|validatingwebhookconfiguration|mutatingwebhookconfiguration)\b",
+                r"(?:^|/)(?:crds?|clusterroles?|webhooks?)(?:/|$)",
+            ),
+            "auth_or_tenant_boundary": (
+                r"(?:^|/)(?:auth|iam|rbac|keycloak|tenan(?:t|cy)|authorization)(?:/|$)",
+                (
+                    r"\b(?:tenant isolation|authorization|authentication|keycloak|"
+                    r"clusterrolebinding)\b"
+                ),
+            ),
+            "destructive_lifecycle": (
+                r"\b(?:drop\s+(?:table|schema|database)|truncate\s+table|delete\s+from)\b",
+                r"\b(?:purge|destructive lifecycle|backup restore)\b",
+            ),
+        }
+        matched = sorted(
+            category
+            for category, expressions in patterns.items()
+            if any(re.search(expression, searchable, re.MULTILINE) for expression in expressions)
+        )
+        deployment_repository = repository in {"falcone-charts", "musematic-deploy"}
+        risk_floor = "R3" if matched else "R2" if deployment_repository and changed_paths else "R1"
+        classifier = {
+            "version": 1,
+            "repository": repository,
+            "changed_paths_sha256": hashlib.sha256(normalized_paths.encode()).hexdigest(),
+            "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
+            "categories": matched,
+            "migration": "migration" in matched,
+            "risk_floor": risk_floor,
+        }
+        classifier["sha256"] = hashlib.sha256(
+            json.dumps(classifier, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return classifier
 
     @staticmethod
     def _severe_vulnerability_count(report: dict[str, Any]) -> int:

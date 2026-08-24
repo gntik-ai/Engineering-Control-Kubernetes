@@ -71,6 +71,18 @@ def review_recovery() -> dict[str, object]:
     }
 
 
+def releasable_recovery() -> dict[str, object]:
+    value = review_recovery()
+    value["ci"] = {"checks_sha256": "4" * 64}
+    value["release_impact"] = {
+        "risk_floor": "R1",
+        "migration": False,
+        "categories": [],
+        "classifier_sha256": "5" * 64,
+    }
+    return value
+
+
 @pytest.mark.asyncio
 async def test_metadata_advances_ci_but_persists_actual_candidate_contract_blocker(
     tmp_path: Path,
@@ -246,7 +258,9 @@ async def test_promotion_metadata_binds_commit_pr_and_releases_component_lease(
         )
     )
     Base.metadata.create_all(handler.engine)
-    change_set_id, run_id, workflow_id = seed_reconciliation(handler, recovery=review_recovery())
+    change_set_id, run_id, workflow_id = seed_reconciliation(
+        handler, recovery=releasable_recovery()
+    )
     with handler.sessions.begin() as session:
         change_set = session.get(ChangeSet, change_set_id)
         assert change_set is not None and change_set.deployment_branch is not None
@@ -300,7 +314,7 @@ async def test_promotion_metadata_binds_commit_pr_and_releases_component_lease(
             "promotion_artifacts": [{"id": str(uuid4())}],
         },
     )
-    result = await handler.handle(
+    published = await handler.handle(
         "reconcile.persist_promotion_publication",
         {
             **persisted,
@@ -314,7 +328,36 @@ async def test_promotion_metadata_binds_commit_pr_and_releases_component_lease(
         },
     )
 
+    assert published["status"] == "RELEASE_REVIEW_REQUIRED"
+    prepared_review = await handler.handle("reconcile.prepare_release_review", published)
+    now = datetime.now(UTC)
+    review_request = prepared_review["release_review_request"]
+    structured_review = {
+        "decision": "PASS",
+        "findings": [],
+        "verified_tests": ["release-plan:" + prepared_review["release_review_plan"]["plan_sha256"]],
+        "risk_assessment": "immutable release and recovery bindings are coherent",
+    }
+    result = await handler.handle(
+        "reconcile.persist_release_review",
+        {
+            **prepared_review,
+            "agent_result": {
+                "run_id": review_request["run_id"],
+                "provider": review_request["provider"],
+                "role": "release-plan-reviewer",
+                "status": "SUCCESS",
+                "summary": "review passed",
+                "structured_result": structured_review,
+                "started_at": (now - timedelta(seconds=1)).isoformat(),
+                "finished_at": now.isoformat(),
+                "exit_code": 0,
+            },
+        },
+    )
+
     assert result["status"] == "DEPLOY_PR"
+    assert result["release_evidence"]["release_plan_review_sha256"]
     with handler.sessions() as session:
         change_set = session.get(ChangeSet, change_set_id)
         run = session.get(Run, run_id)
@@ -323,4 +366,5 @@ async def test_promotion_metadata_binds_commit_pr_and_releases_component_lease(
         assert change_set.deployment_head_sha == promoted_sha
         assert change_set.chart_version == "1.2.3"
         assert run is not None and run.status == "SUCCESS"
+        assert change_set.recovery_json["release_evidence"]["ci_result_sha256"] == "4" * 64
         assert component.released_at is not None

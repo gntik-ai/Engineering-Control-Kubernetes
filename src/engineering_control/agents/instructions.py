@@ -34,6 +34,7 @@ class AgentInstructionPack:
         "delivery.invoke_maker": "implement-issue",
         "delivery.invoke_deployment_maker": "implement-issue",
         "delivery.invoke_checker": "review-change",
+        "reconcile.invoke_release_reviewer": "prepare-staging",
         "runtime.independent_review": "verify-runtime",
     }
 
@@ -73,6 +74,8 @@ class AgentInstructionPack:
             Draft202012Validator.check_schema(schema)
         except Exception as error:  # noqa: BLE001 - normalized at the trust boundary
             raise ValueError("agent-pack output schema is invalid") from error
+        if step == "reconcile.invoke_release_reviewer" and request.output_schema != schema:
+            raise ValueError("release review request drifted from its canonical output schema")
 
         digest = self._digest(sources)
         allowed_tools = tuple(str(tool) for tool in role["tools"])

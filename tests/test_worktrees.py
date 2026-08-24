@@ -178,6 +178,7 @@ def test_change_evidence_includes_tracked_and_untracked_files(tmp_path: Path) ->
     evidence, diff = manager.change_evidence(allocation.path, base_sha=sha)
 
     assert evidence["changed_file_count"] == 2
+    assert evidence["changed_paths"] == ["README.md", "generated/evidence.txt"]
     assert evidence["diff_sha256"] == hashlib.sha256(diff.encode()).hexdigest()
     assert evidence["untracked"] == [
         {

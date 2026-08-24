@@ -183,6 +183,29 @@ async def test_worktree_allocation_requires_independent_providers(tmp_path: Path
         await handler.handle("delivery.allocate_worktrees", {"allocation_request": request})
 
 
+def test_release_impact_classifier_escalates_migrations_and_security_boundaries() -> None:
+    impact = ScanActivityHandler._classify_release_impact(
+        repository="falcone-charts",
+        changed_paths=[
+            "charts/in-falcone/templates/clusterrole.yaml",
+            "migrations/0042.sql",
+            "src/auth/policy.py",
+        ],
+        diff=(
+            "+kind: ClusterRole\n+ALTER TABLE tenant_credentials ADD COLUMN encrypted_value text;\n"
+        ),
+    )
+
+    assert impact["risk_floor"] == "R3"
+    assert impact["migration"] is True
+    assert impact["categories"] == [
+        "auth_or_tenant_boundary",
+        "cluster_scoped",
+        "migration",
+    ]
+    assert len(impact["sha256"]) == 64
+
+
 @pytest.mark.asyncio
 async def test_runtime_observation_reduces_read_only_cluster_evidence(tmp_path: Path) -> None:
     credential_root = tmp_path / "observer"

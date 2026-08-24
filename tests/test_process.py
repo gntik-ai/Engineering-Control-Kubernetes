@@ -82,3 +82,23 @@ async def test_jsonl_process_redacts_events_and_prompt(tmp_path: object) -> None
     assert result.exit_code == 0
     assert fake_token not in str(result.events)
     assert result.events[0]["secret"] == "[REDACTED]"  # noqa: S105
+
+
+@pytest.mark.asyncio
+async def test_jsonl_process_preserves_numeric_usage_counters_during_redaction() -> None:
+    script = (
+        "import json; print(json.dumps({'type':'result','usage':"
+        "{'input_tokens':123,'output_tokens':17,'cache_read_input_tokens':9}}))"
+    )
+    result = await run_jsonl_process(
+        [sys.executable, "-c", script],
+        prompt="bounded",
+        cwd=os.getcwd(),
+        timeout_seconds=30,
+        provider="claude",
+    )
+
+    usage = ClaudeCLIAdapter._usage(result.events)
+    assert usage.input_tokens == 123
+    assert usage.output_tokens == 17
+    assert usage.cached_input_tokens == 9

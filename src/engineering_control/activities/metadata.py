@@ -263,6 +263,7 @@ class MetadataActivityHandler:
         "delivery.invoke_maker": "maker_request",
         "delivery.invoke_deployment_maker": "deployment_maker_request",
         "delivery.invoke_checker": "checker_request",
+        "reconcile.invoke_release_reviewer": "release_review_request",
         "runtime.independent_review": "runtime_review_request",
     }
 
@@ -300,6 +301,8 @@ class MetadataActivityHandler:
             "reconcile.prepare_promotion",
             "reconcile.persist_promotion",
             "reconcile.persist_promotion_publication",
+            "reconcile.prepare_release_review",
+            "reconcile.persist_release_review",
             "preview.prepare",
             "preview.record_candidate",
             "preview.validate_approval",
@@ -419,6 +422,10 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._persist_promotion, payload)
             if step == "reconcile.persist_promotion_publication":
                 return await asyncio.to_thread(self._persist_promotion_publication, payload)
+            if step == "reconcile.prepare_release_review":
+                return await asyncio.to_thread(self._prepare_release_review, payload)
+            if step == "reconcile.persist_release_review":
+                return await asyncio.to_thread(self._persist_release_review, payload)
             if step == "preview.prepare":
                 return await asyncio.to_thread(self._prepare_deployment, payload, "preview")
             if step == "preview.record_candidate":
@@ -703,7 +710,7 @@ class MetadataActivityHandler:
             return "audit-campaign"
         if provider_step.startswith("finding."):
             return "finding-verification"
-        if provider_step.startswith("delivery."):
+        if provider_step.startswith(("delivery.", "reconcile.")):
             return "issue-delivery"
         if provider_step.startswith("runtime."):
             return "runtime-verification"
@@ -2203,27 +2210,115 @@ class MetadataActivityHandler:
                 str(deployment["pr_url"]) if deployment is not None else None
             )
             checker = payload.get("agent_result")
-            if isinstance(checker, dict) and isinstance(checker.get("structured_result"), dict):
-                structured = checker["structured_result"]
-                if structured.get("decision") == "PASS":
-                    recovery = dict(change_set.recovery_json)
-                    recovery["provider_chain"] = {
-                        "maker": str(payload.get("maker_provider", "")),
-                        "checker": str(payload.get("checker_provider", "")),
+            if not isinstance(checker, dict) or not isinstance(
+                checker.get("structured_result"), dict
+            ):
+                raise ValueError("publication has no persisted independent checker result")
+            structured = checker["structured_result"]
+            if structured.get("decision") != "PASS":
+                raise ValueError("publication independent checker did not pass")
+            evidence = self._object(payload.get("change_evidence"), "change_evidence")
+            release_impacts: dict[str, dict[str, Any]] = {}
+            release_change_evidence: dict[str, dict[str, Any]] = {}
+            risk_order = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+            risk_floor = change_set.risk_class
+            for repository_role in ("source", "deployment"):
+                repository_evidence = self._object(
+                    evidence.get(repository_role), f"{repository_role} change evidence"
+                )
+                impact = self._validated_release_impact(
+                    repository_evidence.get("release_impact"), repository_role
+                )
+                expected_repository = (
+                    change_set.source_repository
+                    if repository_role == "source"
+                    else change_set.deployment_repository
+                )
+                expected_base_sha = (
+                    change_set.source_base_sha
+                    if repository_role == "source"
+                    else change_set.deployment_base_sha
+                )
+                expected_head_sha = (
+                    change_set.source_head_sha
+                    if repository_role == "source"
+                    else change_set.deployment_head_sha
+                )
+                changed_paths = repository_evidence.get("changed_paths")
+                if not isinstance(changed_paths, list) or any(
+                    not isinstance(path, str) for path in changed_paths
+                ):
+                    raise ValueError(f"{repository_role} changed paths are invalid")
+                changed_paths_sha = hashlib.sha256(
+                    "\n".join(path.lower() for path in changed_paths).encode()
+                ).hexdigest()
+                expected_floor = (
+                    "R3"
+                    if impact["categories"]
+                    else "R2"
+                    if repository_role == "deployment" and changed_paths
+                    else "R1"
+                )
+                if (
+                    repository_evidence.get("base_sha") != expected_base_sha
+                    or repository_evidence.get("head_sha") != expected_head_sha
+                    or repository_evidence.get("changed_file_count") != len(changed_paths)
+                    or impact["repository"] != expected_repository
+                    or impact["diff_sha256"] != repository_evidence.get("diff_sha256")
+                    or impact["changed_paths_sha256"] != changed_paths_sha
+                    or impact["risk_floor"] != expected_floor
+                ):
+                    raise ValueError(f"{repository_role} release impact is not diff-bound")
+                release_impacts[repository_role] = impact
+                if risk_order[impact["risk_floor"]] > risk_order[risk_floor]:
+                    risk_floor = impact["risk_floor"]
+                release_change_evidence[repository_role] = {
+                    key: repository_evidence.get(key)
+                    for key in (
+                        "base_sha",
+                        "head_sha",
+                        "changed_file_count",
+                        "changed_paths",
+                        "status_sha256",
+                        "diff_sha256",
+                        "diff_redacted_sha256",
+                    )
+                }
+                release_change_evidence[repository_role]["release_impact"] = impact
+            change_set.risk_class = risk_floor
+            recovery = dict(change_set.recovery_json)
+            recovery["provider_chain"] = {
+                "maker": str(payload.get("maker_provider", "")),
+                "checker": str(payload.get("checker_provider", "")),
+            }
+            recovery["independent_review"] = {
+                "decision": "PASS",
+                "provider": str(payload.get("checker_provider", "")),
+                "sha256": hashlib.sha256(
+                    json.dumps(
+                        structured,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ).encode()
+                ).hexdigest(),
+            }
+            recovery["change_evidence"] = release_change_evidence
+            recovery["release_impact"] = {
+                "risk_floor": risk_floor,
+                "migration": any(impact["migration"] for impact in release_impacts.values()),
+                "categories": sorted(
+                    {
+                        category
+                        for impact in release_impacts.values()
+                        for category in impact["categories"]
                     }
-                    recovery["independent_review"] = {
-                        "decision": "PASS",
-                        "provider": str(payload.get("checker_provider", "")),
-                        "sha256": hashlib.sha256(
-                            json.dumps(
-                                structured,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                                default=str,
-                            ).encode()
-                        ).hexdigest(),
-                    }
-                    change_set.recovery_json = recovery
+                ),
+                "classifier_sha256": hashlib.sha256(
+                    json.dumps(release_impacts, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+            }
+            change_set.recovery_json = recovery
             change_set.state = ChangeSetState.SOURCE_PR.value
             change_set.version += 1
             run.status = "SUCCESS"
@@ -2669,16 +2764,208 @@ class MetadataActivityHandler:
             change_set.deployment_pr_url = str(result["pr_url"])
             change_set.state = ChangeSetState.DEPLOY_PR.value
             change_set.version += 1
+            run.status = "RUNNING"
+            run.error_code = None
+            run.summary = (
+                "signed candidate digests published; independent release-plan review pending"
+            )
+        return {
+            **payload,
+            "status": "RELEASE_REVIEW_REQUIRED",
+            "deployment_pr": result["pr_url"],
+            "deployment_sha": result["head_sha"],
+        }
+
+    def _prepare_release_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        workflow_id = self._workflow_id(payload)
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            run = session.scalar(
+                select(Run).where(
+                    Run.workflow_id == workflow_id,
+                    Run.change_set_id == change_set_id,
+                    Run.run_type == "delivery-reconciliation",
+                )
+            )
+            if change_set is None or run is None:
+                raise ValueError("release review metadata binding is missing")
+            if (
+                change_set.state != ChangeSetState.DEPLOY_PR.value
+                or not change_set.deployment_pr_url
+                or not change_set.deployment_head_sha
+            ):
+                raise ValueError("release review requires an exact protected deployment PR")
+            recovery = dict(change_set.recovery_json)
+            chain = self._object(recovery.get("provider_chain"), "provider_chain")
+            provider = Provider(str(chain.get("checker", "")))
+            if provider.value == chain.get("maker"):
+                raise ValueError("release review provider is not independent from the maker")
+            review_plan = self._build_release_review_plan(change_set)
+            lease = session.scalar(
+                select(WorktreeLease).where(
+                    WorktreeLease.change_set_id == change_set.id,
+                    WorktreeLease.repository == change_set.deployment_repository,
+                )
+            )
+            if lease is None:
+                raise ValueError("release review deployment worktree is missing")
+            prompt = (
+                "Independently review this immutable deterministic release and recovery plan. "
+                "Do not modify files, deploy, approve, merge, read credentials, inspect Secret "
+                "values, or invoke Kubernetes/Helm/Argo commands. Fail closed on any mismatch "
+                "between the plan and the bounded deployment worktree. Return only the required "
+                "structured review result.\n\nRelease plan:\n"
+                + json.dumps(review_plan, sort_keys=True, separators=(",", ":"))
+            )
+            request = AgentRequest(
+                run_id=uuid5(
+                    NAMESPACE_URL,
+                    (
+                        f"release-plan-review:{change_set.id}:"
+                        f"{change_set.deployment_head_sha}:"
+                        f"{review_plan['plan_sha256']}"
+                    ),
+                ),
+                project=Project(change_set.project),
+                role="release-plan-reviewer",
+                provider=provider,
+                model_class=ModelClass.JUDGE,
+                prompt=prompt,
+                working_directory=lease.worktree_path,
+                output_schema=self._release_review_output_schema(),
+                timeout_seconds=5400,
+                effort="high",
+                writable=False,
+                change_set_id=change_set.id,
+            )
+        return {
+            **payload,
+            "status": "RELEASE_REVIEW_READY",
+            "release_review_provider": provider.value,
+            "release_review_plan": review_plan,
+            "release_review_request": request.model_dump(mode="json"),
+        }
+
+    def _persist_release_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        workflow_id = self._workflow_id(payload)
+        request = AgentRequest.model_validate(payload.get("release_review_request"))
+        result = AgentResult.model_validate(payload.get("agent_result"))
+        structured = result.structured_result
+        decision = str(structured.get("decision", ""))
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            run = session.scalar(
+                select(Run).where(
+                    Run.workflow_id == workflow_id,
+                    Run.change_set_id == change_set_id,
+                    Run.run_type == "delivery-reconciliation",
+                )
+            )
+            if change_set is None or run is None:
+                raise ValueError("release review persistence binding is missing")
+            expected_plan = self._build_release_review_plan(change_set)
+            supplied_plan = self._object(payload.get("release_review_plan"), "release review plan")
+            if supplied_plan != expected_plan:
+                raise ValueError("release review plan changed during independent review")
+            recovery = dict(change_set.recovery_json)
+            chain = self._object(recovery.get("provider_chain"), "provider_chain")
+            original_review = self._object(recovery.get("independent_review"), "independent_review")
+            lease = session.scalar(
+                select(WorktreeLease).where(
+                    WorktreeLease.change_set_id == change_set.id,
+                    WorktreeLease.repository == change_set.deployment_repository,
+                )
+            )
+            if (
+                result.run_id != request.run_id
+                or result.provider is not request.provider
+                or result.role != request.role
+                or request.change_set_id != change_set.id
+                or lease is None
+                or request.working_directory != lease.worktree_path
+            ):
+                raise ValueError("release review result identity changed during execution")
+            if (
+                result.provider.value != chain.get("checker")
+                or result.provider.value == chain.get("maker")
+                or result.role != "release-plan-reviewer"
+            ):
+                raise ValueError("release review result is not independently provider-bound")
+            release_review_sha = hashlib.sha256(
+                json.dumps(structured, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if decision != "PASS":
+                run.status = "BLOCKED"
+                run.error_code = (
+                    "RELEASE_PLAN_REQUEST_CHANGES"
+                    if decision == "REQUEST_CHANGES"
+                    else "RELEASE_PLAN_REVIEW_BLOCKED"
+                )
+                run.summary = "independent release-plan reviewer did not approve the plan"
+                run.finished_at = datetime.now(UTC)
+                if decision == "REQUEST_CHANGES":
+                    change_set.state = ChangeSetState.REQUEST_CHANGES.value
+                    change_set.version += 1
+                recovery["release_plan_review"] = {
+                    "decision": decision,
+                    "provider": result.provider.value,
+                    "sha256": release_review_sha,
+                }
+                change_set.recovery_json = recovery
+                self._release_reconciliation_component(session, change_set, run)
+                return {
+                    **payload,
+                    "status": "REQUEST_CHANGES" if decision == "REQUEST_CHANGES" else "BLOCKED",
+                    "blocker": run.error_code,
+                }
+            code_review_sha = str(original_review.get("sha256", ""))
+            if not self._is_digest(code_review_sha):
+                raise ValueError("original code review evidence is not immutable")
+            combined_review_sha = hashlib.sha256(
+                json.dumps(
+                    {
+                        "code_review_sha256": code_review_sha,
+                        "release_plan_review_sha256": release_review_sha,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            rollback_plan = self._object(expected_plan.get("rollback_plan"), "rollback_plan")
+            release_evidence = {
+                "version": 1,
+                "migration": bool(expected_plan["migration"]),
+                "backup_requirement": expected_plan["backup_requirement"],
+                "rollback_strategy": rollback_plan["strategy"],
+                "rollback_plan_sha256": expected_plan["rollback_plan_sha256"],
+                "ci_result_sha256": expected_plan["ci_result_sha256"],
+                "code_review_sha256": code_review_sha,
+                "release_plan_review_sha256": release_review_sha,
+                "independent_review_sha256": combined_review_sha,
+                "release_plan_sha256": expected_plan["plan_sha256"],
+                "impact_classifier_sha256": expected_plan["impact_classifier_sha256"],
+                "backup_evidence_sha256": None,
+                "parity_evidence_sha256": None,
+            }
+            recovery["release_plan_review"] = {
+                "decision": "PASS",
+                "provider": result.provider.value,
+                "sha256": release_review_sha,
+            }
+            recovery["rollback_plan"] = rollback_plan
+            recovery["release_evidence"] = release_evidence
+            change_set.recovery_json = recovery
             run.status = "SUCCESS"
             run.error_code = None
-            run.summary = "signed candidate digests published through a protected deployment PR"
+            run.summary = "immutable release and recovery plan independently reviewed"
             run.finished_at = datetime.now(UTC)
             self._release_reconciliation_component(session, change_set, run)
         return {
             **payload,
             "status": "DEPLOY_PR",
-            "deployment_pr": result["pr_url"],
-            "deployment_sha": result["head_sha"],
+            "release_evidence": release_evidence,
         }
 
     def _promotion_publication(
@@ -2708,6 +2995,93 @@ class MetadataActivityHandler:
             title=f"changeset {str(change_set.id)[:8]}: promote immutable candidate",
             body=body,
         )
+
+    def _build_release_review_plan(self, change_set: ChangeSet) -> dict[str, Any]:
+        recovery = dict(change_set.recovery_json)
+        ci = self._object(recovery.get("ci"), "release CI evidence")
+        original_review = self._object(
+            recovery.get("independent_review"), "release independent review"
+        )
+        impact = self._object(recovery.get("release_impact"), "release impact")
+        promotion = self._object(recovery.get("promotion"), "immutable promotion evidence")
+        ci_sha = str(ci.get("checks_sha256", ""))
+        code_review_sha = str(original_review.get("sha256", ""))
+        impact_sha = str(impact.get("classifier_sha256", ""))
+        promotion_diff_sha = str(promotion.get("diff_sha256", ""))
+        rendered_sha = str(promotion.get("rendered_manifest_sha256", ""))
+        if any(
+            not self._is_digest(value)
+            for value in (
+                ci_sha,
+                code_review_sha,
+                impact_sha,
+                promotion_diff_sha,
+                rendered_sha,
+            )
+        ):
+            raise ValueError("release plan evidence is incomplete")
+        if (
+            not change_set.source_head_sha
+            or not change_set.source_pr_url
+            or not change_set.deployment_head_sha
+            or not change_set.deployment_pr_url
+            or not change_set.image_digests
+            or promotion.get("promoted_head_sha") != change_set.deployment_head_sha
+        ):
+            raise ValueError("release plan immutable ChangeSet identity is incomplete")
+        migration = bool(impact.get("migration", False))
+        categories = impact.get("categories")
+        if not isinstance(categories, list):
+            raise ValueError("release impact categories are invalid")
+        if change_set.project == Project.FALCONE.value:
+            strategy = "forward-recovery-only" if migration else "helm-revision-rollback"
+        else:
+            strategy = "protected-git-revert-pr"
+        rollback_plan = {
+            "version": 1,
+            "strategy": strategy,
+            "project": change_set.project,
+            "change_set_id": str(change_set.id),
+            "source_base_sha": change_set.source_base_sha,
+            "source_head_sha": change_set.source_head_sha,
+            "deployment_base_sha": change_set.deployment_base_sha,
+            "deployment_head_sha": change_set.deployment_head_sha,
+            "migration": migration,
+            "requires_second_approval": True,
+            "prohibits_direct_git_or_cluster_mutation": True,
+        }
+        rollback_plan_sha = hashlib.sha256(
+            json.dumps(rollback_plan, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        plan = {
+            "version": 1,
+            "project": change_set.project,
+            "change_set_id": str(change_set.id),
+            "risk_class": change_set.risk_class,
+            "source_pr": change_set.source_pr_url,
+            "source_sha": change_set.source_head_sha,
+            "deployment_pr": change_set.deployment_pr_url,
+            "deployment_sha": change_set.deployment_head_sha,
+            "image_digests": dict(sorted(change_set.image_digests.items())),
+            "chart_version": change_set.chart_version,
+            "migration": migration,
+            "impact_categories": sorted(str(category) for category in categories),
+            "impact_classifier_sha256": impact_sha,
+            "promotion_diff_sha256": promotion_diff_sha,
+            "rendered_manifest_sha256": rendered_sha,
+            "ci_result_sha256": ci_sha,
+            "code_review_sha256": code_review_sha,
+            "backup_requirement": (
+                "real-backup-and-parity-required" if migration else "not-required"
+            ),
+            "rollback_plan": rollback_plan,
+            "rollback_plan_sha256": rollback_plan_sha,
+            "paid_api_fallback": False,
+        }
+        plan["plan_sha256"] = hashlib.sha256(
+            json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return plan
 
     def _block_reconciliation(self, payload: dict[str, Any], blocker: str) -> dict[str, Any]:
         plan = CIReconciliationPlan.model_validate(payload.get("reconciliation_plan"))
@@ -2828,6 +3202,10 @@ class MetadataActivityHandler:
             ):
                 if not self._is_digest(release_evidence.get(key)):
                     missing.append(key)
+            if bool(release_evidence.get("migration", False)):
+                for key in ("backup_evidence_sha256", "parity_evidence_sha256"):
+                    if not self._is_digest(release_evidence.get(key)):
+                        missing.append(key)
             if missing:
                 run.status = "BLOCKED"
                 run.error_code = "RELEASE_EVIDENCE_INCOMPLETE"
@@ -5238,6 +5616,50 @@ class MetadataActivityHandler:
         }
         return [name for name, value in values.items() if not value]
 
+    @classmethod
+    def _validated_release_impact(cls, value: Any, label: str) -> dict[str, Any]:
+        impact = cls._object(value, f"{label} release impact")
+        required = {
+            "version",
+            "repository",
+            "changed_paths_sha256",
+            "diff_sha256",
+            "categories",
+            "migration",
+            "risk_floor",
+            "sha256",
+        }
+        if set(impact) != required:
+            raise ValueError(f"{label} release impact schema is incomplete")
+        categories = impact.get("categories")
+        allowed_categories = {
+            "migration",
+            "secret_lifecycle",
+            "cluster_scoped",
+            "auth_or_tenant_boundary",
+            "destructive_lifecycle",
+        }
+        if (
+            impact.get("version") != 1
+            or impact.get("risk_floor") not in {"R1", "R2", "R3"}
+            or not isinstance(categories, list)
+            or categories != sorted(set(str(item) for item in categories))
+            or not set(categories).issubset(allowed_categories)
+            or impact.get("migration") != ("migration" in categories)
+            or any(
+                not cls._is_digest(impact.get(key))
+                for key in ("changed_paths_sha256", "diff_sha256", "sha256")
+            )
+        ):
+            raise ValueError(f"{label} release impact is invalid")
+        canonical = {key: impact[key] for key in required if key != "sha256"}
+        expected = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if impact["sha256"] != expected:
+            raise ValueError(f"{label} release impact digest changed")
+        return impact
+
     @staticmethod
     def _is_digest(value: Any) -> bool:
         return (
@@ -5720,5 +6142,37 @@ class MetadataActivityHandler:
                     "maxItems": 100,
                     "items": {"type": "string", "maxLength": 4000},
                 },
+            },
+        }
+
+    @staticmethod
+    def _release_review_output_schema() -> dict[str, Any]:
+        return {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision", "findings", "verified_tests", "risk_assessment"],
+            "properties": {
+                "decision": {
+                    "enum": ["PASS", "REQUEST_CHANGES", "FAIL", "BLOCKED"],
+                },
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["severity", "location", "summary"],
+                        "properties": {
+                            "severity": {"type": "string"},
+                            "location": {"type": "string"},
+                            "summary": {"type": "string"},
+                        },
+                    },
+                },
+                "verified_tests": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "risk_assessment": {"type": "string"},
             },
         }

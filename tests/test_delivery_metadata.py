@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -11,6 +13,80 @@ from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
 from engineering_control.db.models import ChangeSet, ComponentLease, Run
+
+
+def release_impact(
+    repository: str,
+    *,
+    changed_paths: list[str],
+    diff_sha256: str,
+    risk_floor: str = "R1",
+) -> dict[str, object]:
+    impact: dict[str, object] = {
+        "version": 1,
+        "repository": repository,
+        "changed_paths_sha256": hashlib.sha256(
+            "\n".join(path.lower() for path in changed_paths).encode()
+        ).hexdigest(),
+        "diff_sha256": diff_sha256,
+        "categories": [],
+        "migration": False,
+        "risk_floor": risk_floor,
+    }
+    impact["sha256"] = hashlib.sha256(
+        json.dumps(impact, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return impact
+
+
+def publication_evidence(
+    source_head: str, deployment_head: str, *, deployment_changed: bool
+) -> dict[str, object]:
+    source_paths = ["src/change.py"]
+    deployment_paths = ["values.yaml"] if deployment_changed else []
+    source_diff_sha = "2" * 64
+    deployment_diff_sha = "8" * 64
+    return {
+        "source": {
+            "base_sha": "a" * 40,
+            "head_sha": source_head,
+            "changed_file_count": 1,
+            "changed_paths": source_paths,
+            "status_sha256": "3" * 64,
+            "diff_sha256": source_diff_sha,
+            "diff_redacted_sha256": "4" * 64,
+            "release_impact": release_impact(
+                "falcone", changed_paths=source_paths, diff_sha256=source_diff_sha
+            ),
+        },
+        "deployment": {
+            "base_sha": "c" * 40,
+            "head_sha": deployment_head,
+            "changed_file_count": 1 if deployment_changed else 0,
+            "changed_paths": deployment_paths,
+            "status_sha256": "5" * 64,
+            "diff_sha256": deployment_diff_sha,
+            "diff_redacted_sha256": "6" * 64,
+            "release_impact": release_impact(
+                "falcone-charts",
+                changed_paths=deployment_paths,
+                diff_sha256=deployment_diff_sha,
+                risk_floor="R2" if deployment_changed else "R1",
+            ),
+        },
+    }
+
+
+def checker_result() -> dict[str, object]:
+    return {
+        "structured_result": {
+            "decision": "PASS",
+            "summary": "independent review passed",
+            "findings": [],
+            "evidence": [{"kind": "diff", "reference": "bounded", "sha256": "7" * 64}],
+            "open_questions": [],
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -151,6 +227,12 @@ async def test_publication_persists_both_prs_and_releases_implementation_leases(
             "status": "SOURCE_PRS_CREATED",
             "publication_plan": plan,
             "publication_results": results,
+            "change_evidence": publication_evidence(
+                source_head, deployment_head, deployment_changed=True
+            ),
+            "agent_result": checker_result(),
+            "maker_provider": "codex",
+            "checker_provider": "claude",
         },
     )
 
@@ -246,6 +328,12 @@ async def test_source_pr_persists_with_deployment_bound_but_deferred(tmp_path: P
             "status": "SOURCE_PRS_CREATED",
             "publication_plan": plan,
             "publication_results": results,
+            "change_evidence": publication_evidence(
+                source_head, deployment_head, deployment_changed=False
+            ),
+            "agent_result": checker_result(),
+            "maker_provider": "codex",
+            "checker_provider": "claude",
         },
     )
 

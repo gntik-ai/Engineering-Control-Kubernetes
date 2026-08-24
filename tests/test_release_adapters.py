@@ -27,7 +27,7 @@ class FakeRunner:
         self,
         *,
         sha: str = SHA,
-        rendered: str = "apiVersion: v1\nkind: Service\n",
+        rendered: str = f"apiVersion: v1\nkind: Pod\nimage: example.invalid/api@sha256:{DIGEST}\n",
         history_return_code: int = 0,
         history_stderr: str = "",
     ) -> None:
@@ -93,13 +93,64 @@ def test_falcone_preflight_renders_but_does_not_deploy(tmp_path: Path) -> None:
     assert result["manifest_count"] == 1
     assert result["previous_revision"] == 3
     assert result["previous_manifest_sha256"]
+    assert result["schema_validation_sha256"]
+    assert any(executable == "kubeconform" for executable, _ in runner.calls)
     assert not any(arguments[0] == "upgrade" for _, arguments in runner.calls)
+
+
+def test_falcone_preflight_requires_promoted_values_to_render_every_digest(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(rendered="apiVersion: v1\nkind: Service\n")
+
+    with pytest.raises(ValueError, match="missing approved immutable image digests for: api"):
+        FalconeHelmAdapter(runner).preflight(falcone_plan(tmp_path))
+
+    template = next(arguments for _, arguments in runner.calls if arguments[0] == "template")
+    assert "--set-string" not in template
 
 
 def test_falcone_deploy_requires_current_artifact_binding(tmp_path: Path) -> None:
     runner = FakeRunner()
     with pytest.raises(ValueError, match="approval"):
-        FalconeHelmAdapter(runner).deploy(falcone_plan(tmp_path), approval_is_current=False)
+        FalconeHelmAdapter(runner).deploy(
+            falcone_plan(tmp_path),
+            approval_is_current=False,
+            approved_preflight={"status": "PREFLIGHT_PASS"},
+        )
+    assert not any(arguments[0] == "upgrade" for _, arguments in runner.calls)
+
+
+def test_falcone_deploy_uses_only_approved_promoted_values_files(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    adapter = FalconeHelmAdapter(runner)
+    plan = falcone_plan(tmp_path)
+    approved_preflight = adapter.preflight(plan)
+
+    adapter.deploy(
+        plan,
+        approval_is_current=True,
+        approved_preflight=approved_preflight,
+    )
+
+    upgrade = next(arguments for _, arguments in runner.calls if arguments[0] == "upgrade")
+    assert "--set-string" not in upgrade
+
+
+def test_falcone_deploy_rejects_preflight_drift_before_upgrade(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    adapter = FalconeHelmAdapter(runner)
+    plan = falcone_plan(tmp_path)
+    approved_preflight = adapter.preflight(plan)
+    approved_preflight["previous_revision"] = 99
+
+    with pytest.raises(ValueError, match="preflight drifted"):
+        adapter.deploy(
+            plan,
+            approval_is_current=True,
+            approved_preflight=approved_preflight,
+        )
+
     assert not any(arguments[0] == "upgrade" for _, arguments in runner.calls)
 
 
@@ -185,9 +236,41 @@ def musematic_plan(repository: Path) -> MusematicPromotion:
 def test_musematic_rejects_newest_build_and_direct_main_writeback(tmp_path: Path) -> None:
     repository = create_deployment_repo(
         tmp_path,
-        "update-strategy: newest-build\nwrite-back-target: git:branch:main\n",
+        (
+            "argocd-image-updater.argoproj.io/api.update-strategy: newest-build\n"
+            'argocd-image-updater.argoproj.io/write-back-target: "git:branch=main"\n'
+        ),
     )
     with pytest.raises(ValueError, match="mutable image promotion"):
+        MusematicGitOpsAdapter(FakeRunner()).preflight(musematic_plan(repository))
+
+
+def test_musematic_preflight_requires_every_digest_in_exact_git_state(tmp_path: Path) -> None:
+    repository = create_deployment_repo(
+        tmp_path,
+        f"images:\n  api:\n    digest: sha256:{DIGEST}\n",
+    )
+
+    result = MusematicGitOpsAdapter(FakeRunner()).preflight(musematic_plan(repository))
+
+    assert result["status"] == "PREFLIGHT_PASS"
+    assert result["image_digests"] == {"api": f"sha256:{DIGEST}"}
+
+    (repository / "application.yaml").write_text(
+        f"images:\n  api:\n    digest: sha256:{'f' * 64}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing approved immutable image digests for: api"):
+        MusematicGitOpsAdapter(FakeRunner()).preflight(musematic_plan(repository))
+
+
+def test_musematic_preflight_rejects_yaml_symlink_escape(tmp_path: Path) -> None:
+    repository = create_deployment_repo(tmp_path, f"digest: sha256:{DIGEST}\n")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(f"digest: sha256:{DIGEST}\n", encoding="utf-8")
+    (repository / "escaped.yaml").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="escaped its deployment worktree"):
         MusematicGitOpsAdapter(FakeRunner()).preflight(musematic_plan(repository))
 
 

@@ -33,10 +33,18 @@ class MusematicPromotion(BaseModel):
 
 class MusematicGitOpsAdapter:
     _unsafe_patterns = {
-        "newest-build": re.compile(r"(?im)^\s*update-strategy:\s*newest-build\s*$"),
-        "latest-tag": re.compile(r"(?im)(?:newTag|tag):\s*(?:latest|newest)\s*$"),
-        "direct-main-writeback": re.compile(r"(?im)^\s*write-back-target:\s*git:branch:main\s*$"),
+        "newest-build": re.compile(
+            r"(?im)^\s*[^#\n]*update-strategy\s*:\s*['\"]?newest-build['\"]?\s*$"
+        ),
+        "latest-tag": re.compile(
+            r"(?im)^\s*[^#\n]*(?:newTag|tag)\s*:\s*['\"]?(?:latest|newest)['\"]?\s*$"
+        ),
+        "direct-main-writeback": re.compile(
+            r"(?im)^\s*[^#\n]*write-back-target\s*:\s*['\"]?git:branch(?:=|:)main['\"]?\s*$"
+        ),
     }
+    _max_yaml_bytes = 4 * 1024 * 1024
+    _max_repository_yaml_bytes = 64 * 1024 * 1024
 
     def __init__(self, runner: SafeCommandRunner) -> None:
         self.runner = runner
@@ -54,11 +62,36 @@ class MusematicGitOpsAdapter:
         ).stdout.strip()
         if revision != plan.deployment_repository_sha or revision != plan.target_revision:
             raise ValueError("deployment Git SHA does not match the approved Argo target revision")
+        repository_root = plan.deployment_repository.resolve()
+        yaml_paths = sorted(
+            {
+                path
+                for pattern in ("*.yaml", "*.yml")
+                for path in plan.deployment_repository.rglob(pattern)
+                if ".git" not in path.parts
+            }
+        )
+        if not yaml_paths:
+            raise ValueError("Musematic deployment repository contains no YAML desired state")
         violations: list[str] = []
-        for path in plan.deployment_repository.rglob("*.yaml"):
-            if ".git" in path.parts:
-                continue
+        desired_state: list[str] = []
+        total_bytes = 0
+        for path in yaml_paths:
+            metadata = path.lstat()
+            resolved = path.resolve()
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or not resolved.is_relative_to(repository_root)
+            ):
+                raise ValueError("Musematic desired-state YAML escaped its deployment worktree")
+            if metadata.st_size > self._max_yaml_bytes:
+                raise ValueError("Musematic desired-state YAML exceeds its per-file size bound")
+            total_bytes += metadata.st_size
+            if total_bytes > self._max_repository_yaml_bytes:
+                raise ValueError("Musematic desired-state YAML exceeds its repository size bound")
             text = path.read_text(encoding="utf-8", errors="replace")
+            desired_state.append(text)
             violations.extend(
                 f"{name}:{path.relative_to(plan.deployment_repository)}"
                 for name, pattern in self._unsafe_patterns.items()
@@ -67,6 +100,17 @@ class MusematicGitOpsAdapter:
         if violations:
             raise ValueError(
                 "uncontrolled mutable image promotion is forbidden: " + ", ".join(violations)
+            )
+        rendered_desired_state = "\n".join(desired_state)
+        missing_digests = sorted(
+            component
+            for component, digest in plan.image_digests.items()
+            if digest not in rendered_desired_state
+        )
+        if missing_digests:
+            raise ValueError(
+                "Musematic desired Git state is missing approved immutable image digests for: "
+                + ", ".join(missing_digests)
             )
         return {
             "status": "PREFLIGHT_PASS",

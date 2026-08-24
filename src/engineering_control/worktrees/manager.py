@@ -567,13 +567,13 @@ class GitWorktreeManager:
                         "size_bytes": untracked_file.stat().st_size,
                     }
                 )
+        changed_paths = sorted(committed_or_tracked.union(str(item["path"]) for item in untracked))
         summary: dict[str, object] = {
             "base_sha": base_sha,
             "head_sha": self._run(["git", "rev-parse", "HEAD"], resolved),
             "changed_entries": len(status.splitlines()),
-            "changed_file_count": len(
-                committed_or_tracked.union(str(item["path"]) for item in untracked)
-            ),
+            "changed_file_count": len(changed_paths),
+            "changed_paths": changed_paths,
             "status_sha256": hashlib.sha256(status.encode()).hexdigest(),
             "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
             "untracked": untracked,

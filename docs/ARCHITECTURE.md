@@ -43,9 +43,13 @@ deployment repository is recorded as deferred until a real immutable artifact ex
 plane never creates a no-diff PR or invents a digest. `DeliveryReconciliationWorkflow` later binds
 the exact source PR head and CI, verifies the configured candidate manifest and every OCI
 attestation, and may ask the non-LLM promotion activity for one allowlisted digest-only deployment
-commit and draft PR. Deterministic policy code validates evidence before state transitions. Maker
-and checker contexts differ; R3 requires both providers and typed human approval. Large campaigns
-use coverage cells and Temporal continue-as-new rather than one permanent model session.
+commit and draft PR. It then derives release impact and recovery bindings from hashes of the actual
+diffs, invokes the opposite-provider read-only release-plan reviewer, and persists a combined
+CI/code-review/release-review evidence record. Migration, secret-lifecycle, cluster, tenant/auth,
+and destructive changes deterministically raise the risk floor; real backup evidence is never
+inferred. Deterministic policy code validates evidence before state transitions. Maker and checker
+contexts differ; R3 requires both providers and typed human approval. Large campaigns use coverage
+cells and Temporal continue-as-new rather than one permanent model session.
 
 Every native provider activity is bracketed by controller-owned metadata activities. The start is
 recorded before dispatch and the normalized result (or a bounded authentication/failure code) is

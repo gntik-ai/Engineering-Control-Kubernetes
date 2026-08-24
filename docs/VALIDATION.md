@@ -51,6 +51,7 @@ container. They are not Engineering Control listeners and remain under cleanup g
 | Native CLIs | PASS | Codex 0.149.0 and Claude Code 2.1.239 are independently authenticated; both structured calls and both cross-provider maker/checker directions pass |
 | Browser runtime | PASS | Playwright 1.62.1 launches Chromium and Firefox against an offline bounded journey and produces structured results, screenshots, and traces under `browser-runner` |
 | Scan tooling | PASS | Gitleaks, Trivy, Semgrep, Syft and kubeconform installed and identity-readable |
+| Release transaction controls | PASS | deterministic diff-risk escalation, exact rendered/Git digest enforcement, kubeconform, opposite-provider release-plan review, and migration backup/parity fail-closed tests pass |
 | Release tooling | PASS | kubectl 1.36.3, Helm 4.2.3 and Argo CD CLI 3.5.1 installed under `release-runner` |
 | Credential separation | PASS | release cannot read model auth; model/browser/delivery cannot read release credentials; evidence impersonation denied |
 | Canonical mirrors | PARTIAL/BLOCKED | Falcone mirrors pass; private Musematic mirrors require a distinct contents-read `scan-runner` credential |

@@ -20,8 +20,15 @@ class FakeHelm:
             "rendered_sha256": "f" * 64,
         }
 
-    def deploy(self, plan: Any, *, approval_is_current: bool) -> CommandResult:
+    def deploy(
+        self,
+        plan: Any,
+        *,
+        approval_is_current: bool,
+        approved_preflight: dict[str, Any],
+    ) -> CommandResult:
         assert approval_is_current
+        assert approved_preflight == self.preflight(plan)
         return CommandResult(0, "bounded helm transaction", "")
 
     def verify(self, plan: Any) -> dict[str, Any]:
@@ -84,6 +91,11 @@ def helm_payload(worktree: Path, kubeconfig: Path) -> dict[str, Any]:
         "approval_validation": {
             "current": True,
             "artifact_binding_sha256": binding,
+        },
+        "release_preflight": {
+            "status": "PREFLIGHT_PASS",
+            "chart_sha": "a" * 40,
+            "rendered_sha256": "f" * 64,
         },
     }
 
