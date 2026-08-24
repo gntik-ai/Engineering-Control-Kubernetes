@@ -111,9 +111,11 @@ def test_finalize_requires_both_cross_provider_directions(
         "code-reviewer",
         {"verdict": "PASS", "observed_line": "provider-acceptance-claude"},
     )
+    (evidence_root / "run").mkdir(parents=True)
 
+    run_id = uuid4()
     manifest, digest = MODULE.finalize(
-        uuid4(),
+        run_id,
         codex_work,
         claude_work,
         paths["codex_maker"],
@@ -127,6 +129,17 @@ def test_finalize_requires_both_cross_provider_directions(
     assert value["status"] == "PASS"
     assert set(value["directions"].values()) == {"PASS"}
     assert len(digest) == 64
+    with pytest.raises(ValueError, match="not empty"):
+        MODULE.finalize(
+            run_id,
+            codex_work,
+            claude_work,
+            paths["codex_maker"],
+            paths["claude_checker"],
+            paths["claude_maker"],
+            paths["codex_checker"],
+            evidence_root / "run",
+        )
 
 
 @pytest.mark.asyncio

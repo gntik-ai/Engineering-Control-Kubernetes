@@ -230,7 +230,13 @@ def finalize(
     evidence_directory = _bounded(
         evidence_directory, EVIDENCE_ROOT, "native acceptance evidence", must_exist=False
     )
-    evidence_directory.mkdir(parents=True, mode=0o750)
+    if evidence_directory.exists():
+        if evidence_directory.is_symlink() or not evidence_directory.is_dir():
+            raise ValueError("native acceptance evidence path is not a real directory")
+        if any(evidence_directory.iterdir()):
+            raise ValueError("native acceptance evidence directory is not empty")
+    else:
+        evidence_directory.mkdir(parents=True, mode=0o750)
     manifest = {
         "run_id": str(run_id),
         "status": "PASS",
