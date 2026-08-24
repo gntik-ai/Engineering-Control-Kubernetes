@@ -169,6 +169,7 @@ def _runtime_checks() -> dict[str, Any]:
         [
             "/opt/engineering-control/venv/bin/python",
             "/opt/engineering-control/source/scripts/verify-hermes-policy.py",
+            "--require-no-omniroute",
         ],
         [
             "env",

@@ -79,33 +79,39 @@ ssh -t worker 'sudo /opt/engineering-control/source/scripts/verify-worker.sh'
 ./scripts/validate-temporal-lifecycle.py
 ```
 
-From the allowlisted Telegram account, run `/usage`, `/validate 30`, then
-`/status <workflow-id-returned-by-validate>`. The validation worker operates only on its local
-synthetic fixture under `/srv/engineering/tmp/acceptance`.
-
-After the three inbound commands pass, create the three-part C-01 evidence chain. Copy the exact
-paths printed by each command into the final builder invocation:
+Before the inbound Telegram commands, create fresh provider and lifecycle evidence, then perform
+the reversible native Hermes configuration cutover. The validation worker operates only on its
+local synthetic fixture under `/srv/engineering/tmp/acceptance`.
 
 ```bash
 ssh -t worker 'sudo /opt/engineering-control/source/scripts/validate-native-providers.sh'
 /opt/engineering-control/source/scripts/fetch-provider-acceptance.sh
-sudo /opt/engineering-control/source/scripts/validate-telegram-acceptance.py
 sudo /opt/engineering-control/source/scripts/verify-end-to-end.sh
 PROVIDER_EVIDENCE=/absolute/path/printed-by-provider-fetch
-TELEGRAM_EVIDENCE=/absolute/path/printed-by-telegram-validator
 LIFECYCLE_EVIDENCE=/absolute/acceptance-summary/path/printed-by-lifecycle-verifier
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/prepare-hermes-c01-cutover.py \
+  --apply --provider-evidence "${PROVIDER_EVIDENCE}" \
+  --lifecycle-evidence "${LIFECYCLE_EVIDENCE}" \
+  --confirmation 'APPLY NATIVE HERMES CONFIG CUTOVER'
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart hermes-gateway.service
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/verify-hermes-policy.py --require-no-omniroute
+```
+
+From the allowlisted Telegram account, run `/usage`, `/validate 30`, then
+`/status <workflow-id-returned-by-validate>`. Validate the receipt and build the final C-01 gate:
+
+```bash
+sudo /opt/engineering-control/source/scripts/validate-telegram-acceptance.py
+TELEGRAM_EVIDENCE=/absolute/path/printed-by-telegram-validator
 sudo /opt/engineering-control/source/scripts/build-c01-acceptance.py \
   --provider-evidence "${PROVIDER_EVIDENCE}" \
   --telegram-evidence "${TELEGRAM_EVIDENCE}" \
   --lifecycle-evidence "${LIFECYCLE_EVIDENCE}"
 ```
 
-Check—but do not apply—the later C-01 Hermes provider cutover:
-
-```bash
-/opt/engineering-control/venv/bin/python \
-  /opt/engineering-control/source/scripts/prepare-hermes-c01-cutover.py --check
-```
+Do not stop or uninstall OmniRoute until the builder emits a PASS manifest.
 
 ## Operate
 

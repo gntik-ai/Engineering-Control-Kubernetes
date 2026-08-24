@@ -55,13 +55,15 @@ platform fails closed rather than bypassing.
 
 ## Gates in required order
 
-1. Send allowlisted Telegram `/usage`, `/validate 30`, and `/status`; record the genuine inbound
-   round trip.
-2. Rerun/fetch the release-bound provider matrix, Telegram validator and restart/resume lifecycle;
-   use the deterministic builder to emit `C01-ACCEPTANCE.json` only if every C-01 gate passes.
-3. Apply the backup-first Hermes alias cutover, stop/disable OmniRoute without uninstalling,
-   restart Hermes/workers, and rerun the complete Telegram regression.
-4. Only after that pass, uninstall the reviewed OmniRoute npm package while retaining `.omniroute`.
+1. Rerun/fetch the release-bound provider matrix and restart/resume lifecycle.
+2. Apply the backup-first native Hermes alias cutover while keeping OmniRoute fully available for
+   rollback; restart Hermes and require the no-OmniRoute active-configuration policy to pass.
+3. Send allowlisted Telegram `/usage`, `/validate 30`, and `/status`; validate the genuine inbound
+   round trip and use the deterministic builder to emit `C01-ACCEPTANCE.json` only if every C-01
+   gate passes.
+4. Stop/disable OmniRoute without uninstalling it, restart Hermes/workers, and rerun the complete
+   Telegram regression. Only after that pass, uninstall the reviewed npm package while retaining
+   `.omniroute`.
 5. Secret-safely prove Caddy has no consumers and has no legitimate runtime traffic, then execute
    C-02 and rerun the complete Telegram regression.
 6. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,

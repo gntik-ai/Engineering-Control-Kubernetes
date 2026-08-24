@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -51,31 +52,74 @@ def test_transform_removes_omniroute_and_preserves_unrelated_provider() -> None:
 
 def test_apply_requires_exact_confirmation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="exact confirmation"):
-        MODULE.apply(tmp_path / "config.yaml", tmp_path, tmp_path / "gates.json", "wrong")
+        MODULE.apply(
+            tmp_path / "config.yaml",
+            tmp_path,
+            tmp_path / "providers.json",
+            tmp_path / "lifecycle.json",
+            "wrong",
+        )
 
 
-def test_gate_manifest_binds_control_agent_pack_and_all_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    manifest = tmp_path / "C01-ACCEPTANCE.json"
+def test_pre_cutover_evidence_binds_release_pack_and_restart_resume(tmp_path: Path) -> None:
     release = "a" * 40
     agent_pack = "b" * 40
-    value = {
-        "schema_version": 1,
+    artifact = tmp_path / "lifecycle-artifact.json"
+    artifact.write_text('{"redaction":"clean"}\n', encoding="utf-8")
+    artifact.chmod(0o600)
+    provider = tmp_path / "providers.json"
+    provider_value = {
         "status": "PASS",
         "release_sha": release,
-        "agent_pack_sha": agent_pack,
-        "gates": {gate: "PASS" for gate in MODULE.REQUIRED_GATES},
-        "provider_evidence_sha256": "c" * 64,
-        "telegram_evidence_sha256": "d" * 64,
-        "lifecycle_evidence_sha256": "e" * 64,
+        "redaction_status": "REDACTED",
+        "authentication_mode": "native-subscription-cli",
+        "paid_api_fallback": False,
+        "directions": {"codex_to_claude": "PASS", "claude_to_codex": "PASS"},
+        "provider_runs": {
+            key: {
+                "provider": provider_name,
+                "role": role,
+                "status": "success",
+                "agent_pack_revision": agent_pack,
+                "instruction_bundle_sha256": "c" * 64,
+            }
+            for key, (provider_name, role) in MODULE.REQUIRED_PROVIDER_RUNS.items()
+        },
     }
-    manifest.write_text(json.dumps(value), encoding="utf-8")
-    manifest.chmod(0o600)
-    monkeypatch.setattr(MODULE, "GATE_MANIFEST", manifest)
+    provider.write_text(json.dumps(provider_value), encoding="utf-8")
+    provider.chmod(0o600)
+    lifecycle = tmp_path / "lifecycle.json"
+    lifecycle_value = {
+        "status": "PASS",
+        "release_sha": release,
+        "change_set_state": "AWAITING_STAGING_APPROVAL",
+        "workflow_worker_restarted": True,
+        "authenticated_api_path": True,
+        "maker_provider": "codex-synthetic",
+        "checker_provider": "claude-synthetic",
+        "redaction_status": "SCANNED_CLEAN",
+        "evidence_path": str(artifact),
+        "evidence_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+    }
+    lifecycle.write_text(json.dumps(lifecycle_value), encoding="utf-8")
+    lifecycle.chmod(0o600)
 
-    MODULE._validate_gate_manifest(manifest, release, agent_pack)
-    del value["lifecycle_evidence_sha256"]
-    manifest.write_text(json.dumps(value), encoding="utf-8")
-    with pytest.raises(ValueError, match="lifecycle_evidence_sha256"):
-        MODULE._validate_gate_manifest(manifest, release, agent_pack)
+    MODULE._validate_pre_cutover_evidence(
+        provider,
+        lifecycle,
+        release,
+        agent_pack,
+        provider_root=tmp_path,
+        lifecycle_root=tmp_path,
+    )
+    provider_value["directions"] = {"codex_to_claude": "PASS"}
+    provider.write_text(json.dumps(provider_value), encoding="utf-8")
+    with pytest.raises(ValueError, match="native replacement matrix"):
+        MODULE._validate_pre_cutover_evidence(
+            provider,
+            lifecycle,
+            release,
+            agent_pack,
+            provider_root=tmp_path,
+            lifecycle_root=tmp_path,
+        )

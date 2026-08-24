@@ -20,24 +20,19 @@ OMNI_DEPENDENCY = re.compile(
     r"omniroute|omni\.musematic\.ai|(?:127\.0\.0\.1|localhost):201(?:28|31|32)",
     re.IGNORECASE,
 )
-CONFIRMATION = "APPLY C01 HERMES CONFIG CUTOVER"
+CONFIRMATION = "APPLY NATIVE HERMES CONFIG CUTOVER"
 ACTIVE_CONFIG = Path("/home/hermes/.hermes/config.yaml")
 BACKUP_ROOT = Path("/home/hermes/engineering-backups")
-GATE_MANIFEST = Path("/home/hermes/engineering-bootstrap/C01-ACCEPTANCE.json")
-REQUIRED_GATES = (
-    "engineering_api",
-    "temporal_restart_resume",
-    "postgresql",
-    "codex_structured_call",
-    "claude_structured_call",
-    "codex_maker_claude_checker",
-    "claude_maker_codex_checker",
-    "quota_broker",
-    "no_paid_fallback",
-    "hermes_api",
-    "telegram_usage_status_validate",
-    "persistence_evidence_redaction",
-)
+PROVIDER_EVIDENCE_ROOT = Path("/home/hermes/engineering-bootstrap/provider-acceptance")
+LIFECYCLE_EVIDENCE_ROOT = Path("/home/hermes/engineering-bootstrap/acceptance-runs")
+FULL_SHA = re.compile(r"^[a-f0-9]{40}$")
+DIGEST = re.compile(r"^[a-f0-9]{64}$")
+REQUIRED_PROVIDER_RUNS = {
+    "codex_maker": ("codex", "implementer"),
+    "claude_checker": ("claude", "code-reviewer"),
+    "claude_maker": ("claude", "implementer"),
+    "codex_checker": ("codex", "code-reviewer"),
+}
 ALIAS_MODELS = {
     "coding": "gpt-5.6-sol",
     "cheap": "gpt-5.6-luna",
@@ -168,56 +163,104 @@ def _provider_ready() -> bool:
     return result.returncode == 0
 
 
-def _validate_gate_manifest(
-    path: Path,
-    expected_release: str | None = None,
-    expected_agent_pack: str | None = None,
-) -> None:
-    if path.resolve() != GATE_MANIFEST.resolve():
-        raise ValueError("C-01 gate manifest must use the canonical bootstrap path")
-    metadata = path.stat()
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_evidence(path: Path, root: Path, label: str) -> dict[str, Any]:
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise ValueError(f"{label} escaped its allowlisted evidence root")
+    metadata = resolved.stat()
     if (
         path.is_symlink()
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
+        or metadata.st_size > 2 * 1024 * 1024
         or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO)
     ):
-        raise PermissionError("C-01 gate manifest permissions are too broad")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != 1
-        or value.get("status") != "PASS"
-    ):
-        raise ValueError("C-01 gate manifest is not a PASS")
+        raise PermissionError(f"{label} ownership, mode, link count, or size is unsafe")
+    value = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    return value
+
+
+def _validate_pre_cutover_evidence(
+    provider_path: Path,
+    lifecycle_path: Path,
+    expected_release: str | None = None,
+    expected_agent_pack: str | None = None,
+    provider_root: Path = PROVIDER_EVIDENCE_ROOT,
+    lifecycle_root: Path = LIFECYCLE_EVIDENCE_ROOT,
+) -> None:
     release = expected_release or Path("/opt/engineering-control/source").resolve().parent.name
     agent_pack = (
         expected_agent_pack or Path("/opt/engineering-agent-pack/source").resolve().parent.name
     )
-    if value.get("release_sha") != release:
-        raise ValueError("C-01 gate manifest does not bind to the installed release")
-    if value.get("agent_pack_sha") != agent_pack:
-        raise ValueError("C-01 gate manifest does not bind to the installed agent pack")
-    gates = value.get("gates")
-    if not isinstance(gates, dict) or any(gates.get(gate) != "PASS" for gate in REQUIRED_GATES):
-        raise ValueError("C-01 gate manifest does not pass every required replacement check")
-    for key in (
-        "provider_evidence_sha256",
-        "telegram_evidence_sha256",
-        "lifecycle_evidence_sha256",
+    if not FULL_SHA.fullmatch(release) or not FULL_SHA.fullmatch(agent_pack):
+        raise ValueError("installed release identities are not full Git SHAs")
+
+    provider = _load_evidence(provider_path, provider_root, "provider evidence")
+    if (
+        provider.get("status") != "PASS"
+        or provider.get("release_sha") != release
+        or provider.get("redaction_status") != "REDACTED"
+        or provider.get("authentication_mode") != "native-subscription-cli"
+        or provider.get("paid_api_fallback") is not False
+        or provider.get("directions") != {"codex_to_claude": "PASS", "claude_to_codex": "PASS"}
     ):
-        if not re.fullmatch(r"[a-f0-9]{64}", str(value.get(key, ""))):
-            raise ValueError(f"C-01 gate manifest {key} is missing or invalid")
+        raise ValueError("provider evidence does not prove the native replacement matrix")
+    runs = provider.get("provider_runs")
+    if not isinstance(runs, dict) or set(runs) != set(REQUIRED_PROVIDER_RUNS):
+        raise ValueError("provider evidence has an incomplete invocation matrix")
+    for key, (provider_name, role) in REQUIRED_PROVIDER_RUNS.items():
+        run = runs[key]
+        if (
+            not isinstance(run, dict)
+            or run.get("provider") != provider_name
+            or run.get("role") != role
+            or run.get("status") != "success"
+            or run.get("agent_pack_revision") != agent_pack
+            or not DIGEST.fullmatch(str(run.get("instruction_bundle_sha256", "")))
+        ):
+            raise ValueError(f"provider evidence run {key} is invalid")
+
+    lifecycle = _load_evidence(lifecycle_path, lifecycle_root, "lifecycle evidence")
+    if (
+        lifecycle.get("status") != "PASS"
+        or lifecycle.get("release_sha") != release
+        or lifecycle.get("change_set_state") != "AWAITING_STAGING_APPROVAL"
+        or lifecycle.get("workflow_worker_restarted") is not True
+        or lifecycle.get("authenticated_api_path") is not True
+        or lifecycle.get("maker_provider") == lifecycle.get("checker_provider")
+        or lifecycle.get("redaction_status") not in {"REDACTED", "SCANNED_CLEAN"}
+        or not DIGEST.fullmatch(str(lifecycle.get("evidence_sha256", "")))
+    ):
+        raise ValueError("lifecycle evidence does not prove restart/resume and persistence")
+    lifecycle_artifact = Path(str(lifecycle.get("evidence_path", ""))).resolve()
+    if (
+        not lifecycle_artifact.is_file()
+        or not lifecycle_artifact.is_relative_to(lifecycle_root.resolve())
+        or _digest(lifecycle_artifact) != lifecycle["evidence_sha256"]
+    ):
+        raise ValueError("lifecycle artifact path or digest does not match")
 
 
-def apply(config_path: Path, backup_root: Path, gate_manifest: Path, confirmation: str) -> Path:
+def apply(
+    config_path: Path,
+    backup_root: Path,
+    provider_evidence: Path,
+    lifecycle_evidence: Path,
+    confirmation: str,
+) -> Path:
     if confirmation != CONFIRMATION:
         raise ValueError(f"exact confirmation required: {CONFIRMATION}")
     if config_path.resolve() != ACTIVE_CONFIG.resolve():
         raise ValueError("apply is restricted to the canonical Hermes configuration")
     if backup_root.resolve() != BACKUP_ROOT.resolve():
         raise ValueError("backup root is outside the canonical engineering backup root")
-    _validate_gate_manifest(gate_manifest)
+    _validate_pre_cutover_evidence(provider_evidence, lifecycle_evidence)
     if not _provider_ready():
         raise RuntimeError("Hermes openai-codex subscription authentication is not healthy")
     original = config_path.read_bytes()
@@ -228,21 +271,22 @@ def apply(config_path: Path, backup_root: Path, gate_manifest: Path, confirmatio
         raise ValueError("Hermes YAML contains a direct secret; automatic backup refused")
     candidate, _ = transform(parsed)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    backup_directory = backup_root / f"hermes-c01-{stamp}"
+    backup_directory = backup_root / f"hermes-native-cutover-{stamp}"
     backup_directory.mkdir(parents=True, mode=0o700)
-    backup = backup_directory / "config.pre-c01-cutover.yaml"
+    backup = backup_directory / "config.pre-native-cutover.yaml"
     backup.write_bytes(original)
     backup.chmod(0o600)
     digest = hashlib.sha256(original).hexdigest()
     manifest = backup_directory / "BACKUP-MANIFEST.md"
     manifest.write_text(
-        "# Hermes C-01 configuration backup\n\n"
+        "# Hermes native-provider configuration backup\n\n"
         f"- Created: {datetime.now(UTC).isoformat()}\n"
         f"- Source: `{config_path}`\n"
         f"- SHA256: `{digest}`\n"
         "- Direct secret values: none detected\n"
         "- Restore: copy the protected YAML back, mode 0600, then restart "
-        "`hermes-gateway.service`.\n",
+        "`hermes-gateway.service`. OmniRoute itself remains installed and available for "
+        "rollback.\n",
         encoding="utf-8",
     )
     manifest.chmod(0o600)
@@ -266,7 +310,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=ACTIVE_CONFIG)
     parser.add_argument("--backup-root", type=Path, default=BACKUP_ROOT)
-    parser.add_argument("--gate-manifest", type=Path, default=GATE_MANIFEST)
+    parser.add_argument("--provider-evidence", type=Path)
+    parser.add_argument("--lifecycle-evidence", type=Path)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirmation", default="")
@@ -282,13 +327,16 @@ def main() -> None:
             f"PASS Hermes C-01 candidate can remove OmniRoute dependencies; changes={len(changes)}"
         )
         return
+    if arguments.provider_evidence is None or arguments.lifecycle_evidence is None:
+        raise SystemExit("--apply requires --provider-evidence and --lifecycle-evidence")
     backup = apply(
         arguments.config,
         arguments.backup_root,
-        arguments.gate_manifest,
+        arguments.provider_evidence,
+        arguments.lifecycle_evidence,
         arguments.confirmation,
     )
-    print(f"PASS Hermes C-01 configuration applied; backup={backup}")
+    print(f"PASS Hermes native-provider configuration applied; backup={backup}")
 
 
 if __name__ == "__main__":

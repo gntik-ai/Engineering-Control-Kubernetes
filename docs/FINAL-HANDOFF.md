@@ -13,9 +13,10 @@ Codex, Claude, browser tests, scans, GitHub delivery, and deterministic release 
 
 The platform implements bounded audit coverage cells, independent finding verification,
 ChangeSets spanning source and deployment repositories, isolated Git worktrees, component leases,
-maker/checker separation, deterministic deployment gates, central redaction, durable handoffs,
-cleanup policy, metrics, bootstraps, tests, and recovery workflows. No product source was modified,
-no GitHub repository was created, and no Kubernetes staging or production mutation was performed.
+maker/checker separation, deterministic diff-based risk escalation, cross-provider release-plan
+review, drift-bound deployment preflights, central redaction, durable handoffs, cleanup policy,
+metrics, bootstraps, tests, and recovery workflows. No product source was modified, no GitHub
+repository was created, and no Kubernetes staging or production mutation was performed.
 
 Codex and Claude are independently authenticated; both structured native calls and both
 cross-provider maker/checker directions pass. Private Musematic mirror access, GitHub
@@ -212,7 +213,9 @@ Final inbound canary from the allowlisted account:
 /status <workflow-id-returned-by-validate>
 ```
 
-Hermes still contains rollback OmniRoute aliases. Do not remove them until every C-01 gate passes.
+The active Hermes aliases use its native `openai-codex` subscription path and pass the no-OmniRoute
+policy check. OmniRoute itself remains installed and running as rollback state until every C-01
+gate and the post-stop regression pass.
 
 ## 10. Codex
 
@@ -314,7 +317,9 @@ source PR -> candidate digest evidence -> falcone-charts PR -> immutable approva
 ```
 
 Migration, OpenBao/External Secrets, backup, parity, and recovery gates remain fail-closed. The
-adapter never fakes backup verification.
+adapter never fakes backup verification. Approved digests must already exist in the promoted
+rendered manifests, pinned kubeconform must pass, and the mutation-time preflight must exactly
+match the approved preflight so repository or cluster-baseline drift fails closed.
 
 Musematic flow:
 
@@ -323,8 +328,10 @@ source PR -> immutable candidate digest -> musematic-deploy protected PR
 -> approved Git state -> Argo CD reconciliation -> post-sync verification -> Git rollback
 ```
 
-No uncontrolled latest/newest tag promotion or undocumented live patch is accepted. Real staging
-mutation requires separate authorization and credentials and otherwise stops at
+No uncontrolled latest/newest tag promotion, image-updater direct-main writeback, or undocumented
+live patch is accepted. Approved digests must exist in the exact protected Git desired state, and
+the mutation-time preflight must exactly match the approved preflight. Real staging mutation
+requires separate authorization and credentials and otherwise stops at
 `AWAITING_STAGING_APPROVAL`.
 
 ## 17. Recovery
@@ -390,7 +397,7 @@ Remote GitHub repository creation was not authorized or performed.
 | Controller API, PostgreSQL, Temporal, scheduler, notifier, evidence ingest | PASS |
 | Controller restart/resume lifecycle | PASS |
 | Worker service users, services, tools, filesystem/credential isolation | PASS |
-| Control-plane tests (226), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
+| Control-plane tests (234), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
 | Agent pack generation, validation, and tests | PASS |
 | Codex install/auth/structured native call | PASS |
 | Claude install | PASS |
@@ -416,8 +423,8 @@ The detailed live evidence is in `docs/VALIDATION.md` and the inventory under
 
 ## 22. Exact next commands
 
-The provider portion of C-01 passes. To close the remaining Telegram gate, send from the
-allowlisted Telegram account:
+The native configuration and provider portions of C-01 pass. To close the remaining Telegram gate,
+send from the allowlisted Telegram account:
 
 ```text
 /usage

@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 226 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
+| Control-plane Python | PASS | 234 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -80,8 +80,10 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Telegram acceptance evidence | READY | successful allowlisted responses append only bounded secret-free receipts; the root validator requires one release-bound `/usage` -> `/validate` -> completed `/status` sequence before persisting canonical hashed evidence |
 | Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
 
-Hermes still has runtime OmniRoute provider aliases. Native provider and cross-provider acceptance
-now pass; C-01 remains closed until the genuine inbound Telegram canaries pass and are recorded.
+The active Hermes configuration uses native `openai-codex` aliases and contains no OmniRoute
+runtime dependency; the OmniRoute service/package remains intact for rollback. Native provider and
+cross-provider acceptance pass; C-01 remains closed until the genuine inbound Telegram canaries
+pass and are recorded.
 
 ## Lifecycle acceptance
 
@@ -100,8 +102,11 @@ maker -> Codex checker. Each provider owns its maker repository, checker access 
 result validates against a strict schema, and exact deterministic file content is verified. The
 normalized result preserves only numeric usage counters, redacts credential-shaped token values,
 and records the installed immutable instruction-bundle revision and content hash. The resulting
-manifest is `/srv/engineering/evidence/acceptance/62344004-b893-4673-9366-b2d8fc1f23f8/native-provider-acceptance.json`
-on the worker with SHA256 `716d500d1eca057eb705b3917fb35331d8f68042088f7f7baede4c1a952338e3`.
+manifest is stored beneath `/srv/engineering/evidence/acceptance/<run-id>/` on the worker and its
+mode-restricted controller copy beneath
+`/home/hermes/engineering-bootstrap/provider-acceptance/`. The manifest itself records the exact
+installed release, agent-pack revision, run identifier, cross-provider directions, and SHA256
+provenance; the C-01 builder rejects evidence from any other release.
 
 The following remain blocked and must not be inferred from the synthetic pass:
 
