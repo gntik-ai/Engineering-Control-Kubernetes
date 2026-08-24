@@ -1,6 +1,6 @@
 # Validation status
 
-Validated on 2026-08-23 against the immutable engineering-control release selected by
+Validated on 2026-08-24 against the immutable engineering-control release selected by
 `/opt/engineering-control/source` on both hosts and engineering-agent-pack release
 `a279690ade98d7c968cb646ce9f87d8e083b0e1a`. The verifier checks the installed release identity at
 runtime so this document does not embed a self-referential commit identifier.
@@ -12,7 +12,7 @@ test is not represented as a pass, and no paid API fallback was used.
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Control-plane Python | PASS | 212 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
+| Control-plane Python | PASS | 216 pytest tests; Ruff clean; strict mypy clean across 78 source files; Bash syntax clean |
 | Agent pack | PASS | 351 generated files changed 0; validator PASS; 2 pytest tests; Ruff clean |
 | Schemas/migrations | PASS | Draft 2020-12 validation and migration tests are in the control-plane suite |
 | Secret persistence | PASS | Gitleaks worktree scan has zero findings; central redaction tests and live rejection canary pass |
@@ -48,7 +48,7 @@ container. They are not Engineering Control listeners and remain under cleanup g
 | --- | --- | --- |
 | Installed immutable release | PASS | worker and controller release identities are verified during deployment and host checks |
 | Six Unix/service identities | PASS | Codex, Claude, browser, scan, delivery and release services active |
-| Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 installed; Codex identity login and a real structured maker call pass; Claude identity login remains absent |
+| Native CLIs | PASS | Codex 0.149.0 and Claude Code 2.1.239 are independently authenticated; both structured calls and both cross-provider maker/checker directions pass |
 | Browser runtime | PASS | Playwright 1.62.1 launches Chromium and Firefox against an offline bounded journey and produces structured results, screenshots, and traces under `browser-runner` |
 | Scan tooling | PASS | Gitleaks, Trivy, Semgrep, Syft and kubeconform installed and identity-readable |
 | Release tooling | PASS | kubectl 1.36.3, Helm 4.2.3 and Argo CD CLI 3.5.1 installed under `release-runner` |
@@ -57,10 +57,10 @@ container. They are not Engineering Control listeners and remain under cleanup g
 | GitHub delivery/provenance | BLOCKED | draft-PR token and GHCR read credential have not been provisioned |
 | Kubernetes identities | BLOCKED | no scoped observer or release kubeconfigs are provisioned; shared cluster-admin remains excluded |
 
-`verify-worker.sh` completes every credential-independent check, then reports these exact blockers:
+`verify-worker.sh` completes every credential-independent check, then reports these exact external
+GitHub blockers:
 
 ```text
-MANUAL_AUTH_REQUIRED_CLAUDE
 MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED
 MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED
 MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
@@ -78,8 +78,8 @@ MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED
 | Telegram inbound command | PENDING OPERATOR | bot cannot generate a user-originated command; operator must send `/usage`, `/validate 30`, then `/status` for the returned workflow |
 | Service supervision | PASS | user systemd unit enabled, active, linger enabled, zero restarts |
 
-Hermes still has runtime OmniRoute provider aliases. C-01 explicitly requires those references to
-be removed only after real native provider and cross-provider acceptance passes.
+Hermes still has runtime OmniRoute provider aliases. Native provider and cross-provider acceptance
+now pass; C-01 remains closed until the genuine inbound Telegram canaries pass and are recorded.
 
 ## Lifecycle acceptance
 
@@ -93,24 +93,23 @@ The standalone lifecycle verifier uses unique internal workflow and activity que
 cannot race the persistent production acceptance worker; its latest isolated restart/resume run
 also reached `AWAITING_STAGING_APPROVAL` with independent synthetic providers.
 
-The real native Codex structured maker call passes with the subscription-authenticated
-`codex-runner`. Its synthetic acceptance directory is a provider-owned Git repository, its output
-validates against the strict schema, and the expected bounded file content matches exactly. Its
-redacted result also records the installed immutable instruction-bundle revision and content hash.
+The real native provider matrix passes in both directions: Codex maker -> Claude checker and Claude
+maker -> Codex checker. Each provider owns its maker repository, checker access is read-only, each
+result validates against a strict schema, and exact deterministic file content is verified. The
+normalized result preserves only numeric usage counters, redacts credential-shaped token values,
+and records the installed immutable instruction-bundle revision and content hash. The resulting
+manifest is `/srv/engineering/evidence/acceptance/62344004-b893-4673-9366-b2d8fc1f23f8/native-provider-acceptance.json`
+on the worker with SHA256 `716d500d1eca057eb705b3917fb35331d8f68042088f7f7baede4c1a952338e3`.
 
 The following remain blocked and must not be inferred from the synthetic pass:
 
-- real Claude structured native call;
-- Codex maker -> Claude checker;
-- Claude maker -> Codex checker;
-- inbound Telegram `/usage`, `/status`, and safe synthetic run command;
+- inbound Telegram `/usage`, `/validate 30`, and `/status` for the returned workflow;
 - Musematic snapshot through the private canonical mirrors;
 - scoped Kubernetes observer authorization and release dry-runs;
 - real draft-PR and registry-provenance validation.
 
-The installed `validate-native-providers.sh` runner is ready to evaluate the remaining Claude and
-cross-provider items immediately after the Claude identity login. It operates only in isolated
-synthetic directories and persists a normalized, redacted, SHA256-addressed acceptance manifest.
+The installed `validate-native-providers.sh` runner operates only in isolated synthetic directories
+and persists a normalized, redacted, SHA256-addressed acceptance manifest.
 
 Real staging mutation is not authorized. Deployment workflows must stop at
 `AWAITING_STAGING_APPROVAL`.

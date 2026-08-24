@@ -33,8 +33,8 @@ Hermes receives read-only access to the narrow API token through a named ACL whi
 Kubernetes commands.
 
 Current Hermes model aliases still reference OmniRoute for rollback continuity. Do not remove
-those references or execute cleanup C-01 until both real native structured calls, both
-cross-provider directions, and the inbound Telegram canaries pass.
+those references or execute cleanup C-01 until the inbound Telegram canaries pass. Both real
+native structured calls and both cross-provider directions now pass with redacted evidence.
 
 The active Telegram platform toolset is empty, and both DM/group slash policies allow only the
 Engineering Control commands listed above (plus Hermes's built-in read-only `/help` and `/whoami`

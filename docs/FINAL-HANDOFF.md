@@ -1,6 +1,6 @@
 # Engineering Control Plane final handoff
 
-Generated and validated on 2026-08-23 UTC. This document is the version-controlled source for
+Generated and validated on 2026-08-24 UTC. This document is the version-controlled source for
 `/home/hermes/engineering/FINAL-HANDOFF.md`. Runtime release identity is the commit-addressed
 directory selected by `/opt/engineering-control/source` on both hosts.
 
@@ -17,10 +17,11 @@ maker/checker separation, deterministic deployment gates, central redaction, dur
 cleanup policy, metrics, bootstraps, tests, and recovery workflows. No product source was modified,
 no GitHub repository was created, and no Kubernetes staging or production mutation was performed.
 
-Codex is authenticated and structured native execution passes. Claude authentication, private
-Musematic mirror access, GitHub delivery/registry credentials, scoped Kubernetes identities, and
-user-originated Telegram canaries remain manual blockers. OmniRoute and its Caddy endpoint remain
-running because cleanup gates C-01 and C-02 are not satisfied.
+Codex and Claude are independently authenticated; both structured native calls and both
+cross-provider maker/checker directions pass. Private Musematic mirror access, GitHub
+delivery/registry credentials, scoped Kubernetes identities, and user-originated Telegram canaries
+remain manual blockers. OmniRoute and its Caddy endpoint remain running because cleanup gates C-01
+and C-02 are not satisfied.
 
 ## 2. Final architecture
 
@@ -230,14 +231,14 @@ ssh worker 'sudo -u codex-runner -H env -i \
 
 ## 11. Claude
 
-Claude Code is installed under `claude-runner`, but worker authentication is not established.
-The platform records `MANUAL_AUTH_REQUIRED_CLAUDE` and continues independent work. No controller
-credential was copied.
+Claude Code is independently subscription-authenticated under `claude-runner`; no controller
+credential was copied. Structured execution, bounded noninteractive tool authorization, schema and
+usage normalization, redaction, and both cross-provider directions pass without a dangerous
+permission bypass or paid API fallback.
 
-Authenticate interactively, then verify:
+Verify without displaying authentication material:
 
 ```bash
-ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
 ssh worker 'sudo -u claude-runner -H env -i \
   HOME=/var/lib/engineering-control/identities/claude-runner \
   PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/claude auth status >/dev/null'
@@ -363,8 +364,8 @@ Detailed component instructions are in `docs/UPGRADE.md`.
   deployment enablement. Values are intentionally absent from reports.
 - `SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY`: replace the shared cluster-admin kubeconfig
   with scoped observer/release identities before Kubernetes automation.
-- Claude, mirror, delivery, registry, and Kubernetes credentials are absent from their isolated
-  worker domains; this is a fail-closed blocker, not a failed installation.
+- Mirror, delivery, registry, and Kubernetes credentials are absent from their isolated worker
+  domains; this is a fail-closed blocker, not a failed installation.
 - OmniRoute remains a rollback dependency and public Caddy endpoint until gated cutover. C-02
   requires a fresh secret-safe consumer search and traffic review after C-01.
 
@@ -373,14 +374,12 @@ evidence, Telegram responses, prompts, and commits.
 
 ## 20. Remaining manual actions
 
-1. Authenticate Claude independently as `claude-runner`.
-2. Run both real cross-provider synthetic directions.
-3. Send inbound Telegram `/usage`, `/validate 30`, and `/status` canaries.
-4. Provision a contents-read-only private-mirror credential for `scan-runner`.
-5. Provision a separate draft-PR credential and GHCR read configuration for `delivery-runner`.
-6. Rotate/rewrite/rescan the Musematic credential history before write enablement.
-7. Provision scoped Kubernetes observer/release identities and negative permission tests.
-8. Authorize any real staging deployment separately.
+1. Send inbound Telegram `/usage`, `/validate 30`, and `/status` canaries.
+2. Provision a contents-read-only private-mirror credential for `scan-runner`.
+3. Provision a separate draft-PR credential and GHCR read configuration for `delivery-runner`.
+4. Rotate/rewrite/rescan the Musematic credential history before write enablement.
+5. Provision scoped Kubernetes observer/release identities and negative permission tests.
+6. Authorize any real staging deployment separately.
 
 Remote GitHub repository creation was not authorized or performed.
 
@@ -391,13 +390,13 @@ Remote GitHub repository creation was not authorized or performed.
 | Controller API, PostgreSQL, Temporal, scheduler, notifier, evidence ingest | PASS |
 | Controller restart/resume lifecycle | PASS |
 | Worker service users, services, tools, filesystem/credential isolation | PASS |
-| Control-plane tests (212), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
+| Control-plane tests (216), Ruff, formatting, strict mypy, shell/systemd verification | PASS |
 | Agent pack generation, validation, and tests | PASS |
 | Codex install/auth/structured native call | PASS |
 | Claude install | PASS |
-| Claude authentication/structured native call | BLOCKED: manual auth |
-| Codex maker -> Claude checker | BLOCKED: manual Claude auth |
-| Claude maker -> Codex checker | BLOCKED: manual Claude auth |
+| Claude authentication/structured native call | PASS |
+| Codex maker -> Claude checker | PASS |
+| Claude maker -> Codex checker | PASS |
 | Quota broker without invented values or paid fallback | PASS |
 | Hermes fixed command policy, allowlist, API `/usage`, outbound Telegram | PASS |
 | User-originated Telegram `/usage`/`validate`/`status` | PENDING OPERATOR |
@@ -417,14 +416,8 @@ The detailed live evidence is in `docs/VALIDATION.md` and the inventory under
 
 ## 22. Exact next commands
 
-The smallest next sequence that can close the provider and Telegram portions of C-01 is:
-
-```bash
-ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
-ssh -t worker 'sudo /opt/engineering-control/source/scripts/validate-native-providers.sh'
-```
-
-Then send from the allowlisted Telegram account:
+The provider portion of C-01 passes. To close the remaining Telegram gate, send from the
+allowlisted Telegram account:
 
 ```text
 /usage

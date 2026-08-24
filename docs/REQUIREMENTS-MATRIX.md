@@ -17,7 +17,7 @@ platform fails closed rather than bypassing.
 | 7 Git repository layout | IMPLEMENTED | Independent local Git repositories for `engineering-control` and `engineering-agent-pack`; no remote repository was created |
 | 8 Controller role | ACTIVE | PostgreSQL, Temporal, API, workflow worker, scheduler, notifier and evidence ingest are healthy |
 | 9 Worker role | ACTIVE | Six isolated Unix identities and systemd queues are active; credential-independent verifier passes |
-| 10 Native CLIs | CODEX PASS / CLAUDE BLOCKED AUTH | Codex 0.149.0 and Claude Code 2.1.239 are installed; Codex identity auth and a real structured maker call pass; Claude identity OAuth remains manual |
+| 10 Native CLIs | PASS | Codex 0.149.0 and Claude Code 2.1.239 are independently authenticated; both structured calls and both cross-provider maker/checker directions pass with redacted evidence |
 | 11 Model adapters | IMPLEMENTED | Native structured Codex JSONL and Claude stream-JSON adapters, cancellation/timeouts/usage/events, redaction, and immutable role/skill/domain instruction-bundle provenance |
 | 12 Quota broker | IMPLEMENTED | Provider-independent snapshots persist CLI presence/authentication/status, unknown-capacity semantics, logical classes, 25% reserve, no paid fallback, durable rate-limit handoff, and seven-day per-role invocation/success/token/cost history without invented values |
 | 13 Temporal | ACTIVE/PASS | All required workflows installed; live worker replacement during an active lifecycle resumed durably |
@@ -39,7 +39,7 @@ platform fails closed rather than bypassing.
 | 29 Falcone adapter | IMPLEMENTED/BLOCKED LIVE | Exact-SHA CI/provenance and digest-only chart promotion plus Helm lint/template/preflight, immutable plans, real backup/migration gates, atomic deploy, verification/recovery; current release workflow lacks the signed candidate contract, target is disabled, and scoped kubeconfig is absent |
 | 30 Musematic adapter | IMPLEMENTED/SECURITY BLOCKED | Exact-SHA CI gate, immutable GitOps validation, draft deployment PR, exact Argo revision observation and Git recovery plan; committed secrets, missing signed candidate contract, tag-only chart rendering and newest-build policy block promotion/write enablement |
 | 31 Kubernetes identity separation | IMPLEMENTED/BLOCKED CREDENTIALS | RBAC templates and negative checks exist; no scoped observer/release kubeconfigs are installed |
-| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0, fixed allowlisted hook and bounded `/validate` route are active; user-originated Telegram canary and later Omni alias cutover remain |
+| 32 Hermes normalization | ACTIVE/PARTIAL | Canonical 0.20.0, fixed allowlisted hook and bounded `/validate` route are active; only the user-originated Telegram canary and gated Omni alias cutover remain |
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |
 | 34 Telegram approvals | ACTIVE/PENDING INBOUND | Allowlist, hook-to-API, bounded `/validate` and outbound Telegram pass; user-originated `/usage`/`validate`/`status` canary is pending |
 | 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
@@ -49,22 +49,20 @@ platform fails closed rather than bypassing.
 | 39 Documentation | IMPLEMENTED | All requested manuals plus cheatsheet, validation status and this matrix |
 | 40 Bootstrap/reinstall | PASS | Both bootstraps rerun successfully and installed the same immutable release on controller and worker |
 | 41 Update procedure | IMPLEMENTED | `UPGRADE.md` covers backup, drain, pin, migration, validation and rollback by component |
-| 42 Validation | HOST PASS/CREDENTIAL BLOCKED | Source, services, browser/scanners, isolation, evidence and Temporal restart pass; OAuth/Git/Kubernetes credentials remain |
-| 43 Acceptance lifecycle | SYNTHETIC LIVE PASS/PROVIDERS BLOCKED | Authenticated API/Temporal/worktree/evidence chain passes with restart; real provider and inbound Telegram legs remain |
+| 42 Validation | HOST/PROVIDER PASS; EXTERNAL BLOCKED | Source, services, both native providers, browser/scanners, isolation, evidence and Temporal restart pass; GitHub/Kubernetes credentials remain |
+| 43 Acceptance lifecycle | SYNTHETIC AND PROVIDERS PASS / INBOUND PENDING | Authenticated API/Temporal/worktree/evidence chain passes with restart; both real cross-provider directions pass; inbound Telegram remains |
 | 44 Final report | COMPLETE | Version-controlled `FINAL-HANDOFF.md` records post-activation facts, exact blockers, cleanup state, recovery, verification, and next commands without claiming gated acceptance |
 
 ## Gates in required order
 
-1. Authenticate Claude independently as `claude-runner`; Codex identity auth is already verified.
+1. Send allowlisted Telegram `/usage`, `/validate 30`, and `/status`; record the genuine inbound
+   round trip.
 2. Provision the distinct read-only mirror token, controller issue-search token, draft-PR token,
    and registry-read credential without copying interactive user credentials.
-3. Run the real Claude structured call and both cross-provider maker/checker directions; the real
-   Codex structured maker call already passes.
-4. Send allowlisted Telegram `/usage`, `/status`, and a safe dry-run command; record the round trip.
-5. Remove Hermes runtime OmniRoute references, stop OmniRoute without uninstalling, restart the
+3. Remove Hermes runtime OmniRoute references, stop OmniRoute without uninstalling, restart the
    replacement stack, and rerun the full regression suite.
-6. Only after that pass, uninstall the reviewed OmniRoute npm package while retaining `.omniroute`.
-7. Secret-safely prove Caddy has no consumers/traffic, then execute C-02 and rerun the full path.
-8. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
+4. Only after that pass, uninstall the reviewed OmniRoute npm package while retaining `.omniroute`.
+5. Secret-safely prove Caddy has no consumers/traffic, then execute C-02 and rerun the full path.
+6. Remediate Musematic committed credentials and replace the shared cluster-admin kubeconfig with
    scoped observer/release identities before any relevant write enablement.
-9. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.
+7. Keep real staging mutation at `AWAITING_STAGING_APPROVAL` until separately authorized.
