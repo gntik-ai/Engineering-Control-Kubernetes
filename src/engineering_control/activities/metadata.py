@@ -40,12 +40,15 @@ from engineering_control.db.models import (
     FindingVerification,
     Incident,
     Issue,
+    ProjectSnapshot,
     ProviderUsage,
     QuotaSnapshot,
     Run,
     VerificationResult,
     WorktreeLease,
 )
+from engineering_control.engineering.github import FindingPublication
+from engineering_control.engineering.models import ProjectManifest
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.core import ChangeSet as ChangeSetModel
@@ -108,8 +111,10 @@ class InstructionBundleRecord(BaseModel):
 class CampaignCellRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    repository_surface: Literal["source", "deployment", "pair", "runtime"] = "source"
     domain: str = Field(pattern=r"^[a-z][a-z0-9-]{0,119}$")
     persona: str = Field(pattern=r"^[a-z][a-z0-9-]{0,119}$")
+    flow: str = Field(default="repository-static", pattern=r"^[a-z][a-z0-9-]{0,119}$")
     lens: AuditLens
     environment: str = Field(pattern=r"^[a-z][a-z0-9-]{0,79}$")
 
@@ -265,6 +270,8 @@ class MetadataActivityHandler:
         "delivery.invoke_checker": "checker_request",
         "reconcile.invoke_release_reviewer": "release_review_request",
         "runtime.independent_review": "runtime_review_request",
+        "enhancement.discover": "discovery_request",
+        "enhancement.product_review": "product_review_request",
     }
 
     supported_steps = frozenset(
@@ -280,6 +287,8 @@ class MetadataActivityHandler:
             "finding.controls",
             "finding.dedupe",
             "finding.finalize",
+            "finding.prepare_publication",
+            "finding.persist_publication",
             "finding.record_terminal",
             "agent.record_start",
             "agent.persist_result",
@@ -366,6 +375,10 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._dedupe_finding, payload)
             if step == "finding.finalize":
                 return await asyncio.to_thread(self._finalize_finding, payload)
+            if step == "finding.prepare_publication":
+                return await asyncio.to_thread(self._prepare_finding_publication, payload)
+            if step == "finding.persist_publication":
+                return await asyncio.to_thread(self._persist_finding_publication, payload)
             if step == "finding.record_terminal":
                 return await asyncio.to_thread(self._record_finding_terminal, payload)
             if step == "agent.record_start":
@@ -793,8 +806,10 @@ class MetadataActivityHandler:
                     CoverageCell(
                         id=identity,
                         campaign_id=campaign_id,
+                        repository_surface=cell.repository_surface,
                         domain=cell.domain,
                         persona=cell.persona,
+                        flow=cell.flow,
                         lens=cell.lens.value,
                         environment=cell.environment,
                         status="NOT_STARTED",
@@ -906,8 +921,10 @@ class MetadataActivityHandler:
                     coverage = CoverageCell(
                         id=identity,
                         campaign_id=campaign_id,
+                        repository_surface=cell.repository_surface,
                         domain=cell.domain,
                         persona=cell.persona,
+                        flow=cell.flow,
                         lens=cell.lens.value,
                         environment=cell.environment,
                         status="BLOCKED",
@@ -964,15 +981,16 @@ class MetadataActivityHandler:
         request_id = uuid5(
             NAMESPACE_URL,
             "audit-agent:"
-            f"{workflow_id}:{campaign_id}:{cell.domain}:{cell.persona}:"
-            f"{cell.lens.value}:{cell.environment}",
+            f"{workflow_id}:{campaign_id}:{cell.repository_surface}:{cell.domain}:"
+            f"{cell.persona}:{cell.flow}:{cell.lens.value}:{cell.environment}",
         )
         prompt = (
             "Audit exactly one immutable coverage cell. Do not modify files. "
             "Use the deterministic evidence supplied below and inspect only the bounded source "
             "and deployment worktrees. Report PASS only with evidence. Report FAIL only with a "
             "minimal reproducible finding.\n\n"
-            f"Project: {project.value}\nDomain: {cell.domain}\nPersona: {cell.persona}\n"
+            f"Project: {project.value}\nRepository surface: {cell.repository_surface}\n"
+            f"Domain: {cell.domain}\nPersona: {cell.persona}\nFlow: {cell.flow}\n"
             f"Lens: {cell.lens.value}\nEnvironment: {cell.environment}\n"
             f"Source SHA: {snapshot['source_sha']}\n"
             f"Deployment SHA: {snapshot['deployment_sha']}\n"
@@ -1091,6 +1109,13 @@ class MetadataActivityHandler:
                             impact_json={
                                 "security": candidate.security_impact,
                                 "data": candidate.data_impact,
+                                "repository_surface": cell.repository_surface,
+                                "flow": cell.flow,
+                                "cleanup_result": self._cleanup_result_for_flow(
+                                    campaign.project,
+                                    cell.repository_surface,
+                                    cell.flow,
+                                ),
                             },
                             recommended_action=candidate.recommended_action,
                         )
@@ -1221,6 +1246,8 @@ class MetadataActivityHandler:
                 "affected_source_sha": finding.affected_source_sha,
                 "affected_deployment_sha": finding.affected_deployment_sha,
                 "affected_component": finding.affected_component,
+                "repository_surface": finding.impact_json.get("repository_surface", "source"),
+                "flow": finding.impact_json.get("flow", "repository-static"),
                 "discoverer_provider": discoverer,
             }
 
@@ -1336,46 +1363,63 @@ class MetadataActivityHandler:
                 "blocker": "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED",
                 "duplicate_issue_url": None,
             }
-        repository = {
-            Project.FALCONE.value: "gntik-ai/falcone",
-            Project.MUSEMATIC.value: "gntik-ai/musematic",
-        }[str(finding["project"])]
+        project = Project(str(finding["project"]))
+        source_repository, deployment_repository = self._project_issue_repositories(project)
+        surface = str(finding.get("repository_surface", "source"))
+        repositories = {
+            "source": [source_repository],
+            "deployment": [deployment_repository],
+            "pair": [source_repository, deployment_repository],
+            "runtime": [source_repository, deployment_repository],
+        }.get(surface)
+        if repositories is None:
+            raise ValueError("finding repository surface is invalid")
         runner = SafeCommandRunner({"gh": self.settings.github_executable})
-        try:
-            result = runner.run(
-                "gh",
-                [
-                    "issue",
-                    "list",
-                    "--repo",
-                    repository,
-                    "--state",
-                    "all",
-                    "--search",
-                    f'"{finding["fingerprint"]}"',
-                    "--json",
-                    "number,title,url,state",
-                    "--limit",
-                    "100",
-                ],
-                cwd=self.settings.run_root,
-                environment={"GH_TOKEN": token},
-            )
-        except CommandFailure:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_DUPLICATE_SEARCH_FAILED",
-                "duplicate_issue_url": None,
-            }
-        matches = json.loads(result.stdout)
-        if not isinstance(matches, list):
-            raise ValueError("GitHub duplicate search returned invalid data")
-        duplicate = matches[0].get("url") if matches and isinstance(matches[0], dict) else None
+        duplicate: str | None = None
+        searched: list[str] = []
+        for repository in repositories:
+            try:
+                result = runner.run(
+                    "gh",
+                    [
+                        "issue",
+                        "list",
+                        "--repo",
+                        repository,
+                        "--state",
+                        "all",
+                        "--search",
+                        f'"{finding["fingerprint"]}"',
+                        "--json",
+                        "number,title,url,state",
+                        "--limit",
+                        "100",
+                    ],
+                    cwd=self.settings.run_root,
+                    environment={"GH_TOKEN": token},
+                )
+            except CommandFailure:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "GITHUB_DUPLICATE_SEARCH_FAILED",
+                    "duplicate_issue_url": None,
+                    "searched_repositories": searched,
+                }
+            searched.append(repository)
+            matches = json.loads(result.stdout)
+            if not isinstance(matches, list):
+                raise ValueError("GitHub duplicate search returned invalid data")
+            if matches and isinstance(matches[0], dict):
+                candidate = matches[0].get("url")
+                if isinstance(candidate, str) and candidate:
+                    duplicate = candidate
+                    break
         return {
             **payload,
             "status": "DUPLICATE" if duplicate else "CLEAR",
             "duplicate_issue_url": duplicate,
+            "searched_repositories": searched,
         }
 
     def _finalize_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1496,6 +1540,144 @@ class MetadataActivityHandler:
             "duplicate_issue_url": duplicate.get("duplicate_issue_url"),
         }
 
+    def _prepare_finding_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
+        finding_id = UUID(str(payload["finding_id"]))
+        with self.sessions() as session:
+            finding = session.get(Finding, finding_id)
+            if finding is None or finding.disposition != "CONFIRMED":
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "CONFIRMED_FINDING_REQUIRED",
+                }
+            existing = session.scalar(select(Issue).where(Issue.finding_id == finding_id))
+            if existing is not None:
+                return {
+                    **payload,
+                    "status": "ALREADY_PUBLISHED",
+                    "issue_url": existing.url,
+                    "issue_repository": existing.repository,
+                }
+            surface = str(finding.impact_json.get("repository_surface", "source"))
+            flow = str(finding.impact_json.get("flow", "repository-static"))
+            cleanup_result = finding.impact_json.get("cleanup_result")
+            if not isinstance(cleanup_result, str) or not cleanup_result:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "CLEANUP_RESULT_REQUIRED_FOR_PUBLICATION",
+                }
+            project = Project(finding.project)
+            source_repository, deployment_repository = self._project_issue_repositories(project)
+            classification = {
+                "source": "application",
+                "deployment": "deployment",
+                "pair": "cross-repository",
+                "runtime": "cross-repository",
+            }.get(surface)
+            if classification is None:
+                raise ValueError("finding publication repository surface is invalid")
+            typed_classification = cast(
+                Literal["application", "deployment", "cross-repository"],
+                classification,
+            )
+            affected_repositories = {
+                "application": [source_repository],
+                "deployment": [deployment_repository],
+                "cross-repository": [source_repository, deployment_repository],
+            }[typed_classification]
+            snapshot = session.scalar(
+                select(ProjectSnapshot).where(ProjectSnapshot.campaign_id == finding.campaign_id)
+            )
+            running_revision = (
+                finding.affected_image_digest
+                or (snapshot.live_revision if snapshot is not None else None)
+                or f"deployment-sha:{finding.affected_deployment_sha}"
+            )
+            evidence_handles = []
+            for item in finding.evidence_json:
+                if not isinstance(item, dict):
+                    continue
+                reference = str(item.get("reference", "evidence"))
+                digest = str(item.get("sha256", ""))
+                if re.fullmatch(r"[a-f0-9]{64}", digest):
+                    evidence_handles.append(f"{reference}:{digest}")
+            if not evidence_handles:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "EVIDENCE_HANDLES_REQUIRED_FOR_PUBLICATION",
+                }
+            publication = FindingPublication(
+                project=project.value,
+                classification=typed_classification,
+                affected_repositories=affected_repositories,
+                source_sha=finding.affected_source_sha,
+                deployment_sha=str(finding.affected_deployment_sha),
+                running_revision=running_revision,
+                persona=finding.persona,
+                flow=flow,
+                expected_behavior=finding.expected_behavior,
+                actual_behavior=finding.actual_behavior,
+                minimal_reproduction=[str(item) for item in finding.minimal_reproduction],
+                evidence_handles=evidence_handles,
+                severity=finding.severity,
+                risk=cast(Literal["R0", "R1", "R2", "R3"], finding.risk_class),
+                fingerprint=finding.fingerprint,
+                acceptance_criteria=[finding.recommended_action],
+                cleanup_result=cleanup_result,
+            )
+        return {
+            **payload,
+            "status": "PUBLICATION_READY",
+            "finding_publication": {
+                "finding_id": str(finding_id),
+                "repository": publication.primary_repository(),
+                "title": f"Finding: {finding.actual_behavior.splitlines()[0]}"[:200],
+                "body": publication.body(),
+                "fingerprint": publication.fingerprint,
+            },
+        }
+
+    def _persist_finding_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
+        publication = self._object(payload.get("finding_publication"), "finding_publication")
+        finding_id = UUID(str(publication["finding_id"]))
+        repository = str(publication["repository"])
+        issue_url = str(payload.get("issue_url", ""))
+        match = re.fullmatch(
+            rf"https://github\.com/{re.escape(repository)}/issues/([1-9][0-9]*)",
+            issue_url,
+        )
+        if payload.get("status") != "PUBLISHED" or match is None:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "FINDING_PUBLICATION_EVIDENCE_INVALID",
+            }
+        with self.sessions.begin() as session:
+            finding = session.get(Finding, finding_id)
+            if finding is None or finding.disposition != "CONFIRMED":
+                raise ValueError("published issue lost its confirmed finding binding")
+            existing = session.scalar(select(Issue).where(Issue.finding_id == finding_id))
+            issue_id = uuid5(NAMESPACE_URL, f"finding-issue:{finding_id}")
+            if existing is None:
+                existing = Issue(
+                    id=issue_id,
+                    finding_id=finding_id,
+                    repository=repository,
+                    number=int(match.group(1)),
+                    url=issue_url,
+                    state="OPEN",
+                    openspec_change=None,
+                )
+                session.add(existing)
+            elif existing.repository != repository or existing.url != issue_url:
+                raise ValueError("finding issue publication idempotency binding changed")
+            change_set = session.scalar(select(ChangeSet).where(ChangeSet.finding_id == finding_id))
+            if change_set is not None:
+                change_set.issue_id = existing.id
+        return {**payload, "status": "PUBLISHED", "issue_id": str(issue_id)}
+
     def _record_finding_terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
         finding_payload = self._object(payload.get("finding"), "finding")
         finding_id = UUID(str(finding_payload["finding_id"]))
@@ -1580,6 +1762,18 @@ class MetadataActivityHandler:
                 Project.FALCONE: ("falcone", "falcone-charts"),
                 Project.MUSEMATIC: ("musematic", "musematic-deploy"),
             }[project]
+            surface = str(finding.impact_json.get("repository_surface", "source"))
+            source_issue_repository, deployment_issue_repository = self._project_issue_repositories(
+                project
+            )
+            issue_repository = {
+                "source": source_issue_repository,
+                "deployment": deployment_issue_repository,
+                "pair": source_issue_repository,
+                "runtime": source_issue_repository,
+            }.get(surface)
+            if issue_repository is None:
+                raise ValueError("confirmed finding repository surface is invalid")
             change_set_id = uuid5(NAMESPACE_URL, f"changeset:{finding.id}")
             change_set = session.get(ChangeSet, change_set_id)
             if change_set is None:
@@ -1610,6 +1804,8 @@ class MetadataActivityHandler:
             run.status = "RUNNING"
             run.project = project.value
             issue = session.scalar(select(Issue).where(Issue.finding_id == finding.id))
+            if issue is not None and issue.repository != issue_repository:
+                raise ValueError("bound issue repository does not match finding classification")
             return {
                 **payload,
                 "status": "CONFIRMED_LOADED",
@@ -1625,6 +1821,8 @@ class MetadataActivityHandler:
                 "actual_behavior": finding.actual_behavior,
                 "minimal_reproduction": finding.minimal_reproduction,
                 "affected_component": finding.affected_component,
+                "repository_surface": surface,
+                "issue_repository": issue_repository,
                 "source_repository": source_repository,
                 "source_base_sha": finding.affected_source_sha,
                 "source_base_ref": "refs/heads/main",
@@ -1647,118 +1845,10 @@ class MetadataActivityHandler:
             }
         if payload.get("issue_number") and payload.get("issue_url"):
             return {**payload, "status": "ISSUE_READY"}
-        if payload.get("risk_class") == RiskClass.R3.value:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "R3_GITHUB_ISSUE_REQUIRES_HUMAN_APPROVAL",
-            }
-        token = self._github_token()
-        if token is None:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_ISSUE_CREATE_NOT_CONFIGURED",
-            }
-        project = Project(str(payload["project"]))
-        repository = {
-            Project.FALCONE: "gntik-ai/falcone",
-            Project.MUSEMATIC: "gntik-ai/musematic",
-        }[project]
-        change_set_id = UUID(str(payload["change_set_id"]))
-        body_directory = self.settings.state_root / "github"
-        body_directory.mkdir(parents=True, exist_ok=True, mode=0o750)
-        body_path = body_directory / f"{change_set_id}-issue.md"
-        body = (
-            "## Confirmed finding\n\n"
-            f"Fingerprint: `{payload['fingerprint']}`\n\n"
-            f"Expected: {payload['expected_behavior']}\n\n"
-            f"Actual: {payload['actual_behavior']}\n\n"
-            "Minimal reproduction:\n"
-            + "\n".join(f"1. {step}" for step in payload["minimal_reproduction"])
-            + "\n\nThis issue was independently verified twice by the Engineering Control Plane.\n"
-        )
-        self._atomic_text(body_path, body)
-        title = (
-            f"[{payload['domain']}] confirmed behavior mismatch "
-            f"({str(payload['fingerprint'])[:12]})"
-        )
-        runner = SafeCommandRunner({"gh": self.settings.github_executable})
-        try:
-            search = runner.run(
-                "gh",
-                [
-                    "issue",
-                    "list",
-                    "--repo",
-                    repository,
-                    "--state",
-                    "all",
-                    "--search",
-                    f'"{payload["fingerprint"]}"',
-                    "--json",
-                    "number,title,url,state",
-                    "--limit",
-                    "100",
-                ],
-                cwd=self.settings.state_root,
-                environment={"GH_TOKEN": token},
-            )
-            matches = json.loads(search.stdout)
-            if not isinstance(matches, list):
-                raise ValueError("GitHub issue idempotency search returned invalid data")
-            if matches and isinstance(matches[0], dict):
-                issue_url = str(matches[0].get("url", ""))
-            else:
-                created = runner.run(
-                    "gh",
-                    [
-                        "issue",
-                        "create",
-                        "--repo",
-                        repository,
-                        "--title",
-                        title,
-                        "--body-file",
-                        str(body_path),
-                    ],
-                    cwd=self.settings.state_root,
-                    environment={"GH_TOKEN": token},
-                )
-                issue_url = created.stdout.strip()
-        except CommandFailure:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_ISSUE_CREATE_FAILED",
-            }
-        issue_number_text = issue_url.rstrip("/").rsplit("/", 1)[-1]
-        if not issue_url.startswith("https://github.com/") or not issue_number_text.isdigit():
-            raise ValueError("GitHub issue creation returned an invalid URL")
-        issue_number = int(issue_number_text)
-        with self.sessions.begin() as session:
-            finding_id = UUID(str(payload["finding_id"]))
-            issue = session.scalar(select(Issue).where(Issue.finding_id == finding_id))
-            if issue is None:
-                issue = Issue(
-                    finding_id=finding_id,
-                    repository=repository,
-                    number=issue_number,
-                    url=issue_url,
-                    state="OPEN",
-                    openspec_change=None,
-                )
-                session.add(issue)
-                session.flush()
-            change_set = session.get(ChangeSet, change_set_id)
-            if change_set is None:
-                raise ValueError("ChangeSet disappeared during issue creation")
-            change_set.issue_id = issue.id
         return {
             **payload,
-            "status": "ISSUE_READY",
-            "issue_number": issue_number,
-            "issue_url": issue_url,
+            "status": "BLOCKED",
+            "blocker": "EXPLICIT_FINDING_PUBLICATION_REQUIRED",
         }
 
     def _acquire_delivery_leases(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3106,6 +3196,46 @@ class MetadataActivityHandler:
         if not isinstance(value, dict) or value.get("project") != project.value:
             raise ValueError("project delivery-control policy identity is invalid")
         return DeliveryControlPolicy.model_validate(value.get("delivery_control"))
+
+    def _project_issue_repositories(self, project: Project) -> tuple[str, str]:
+        root = self.settings.project_config_root.resolve()
+        path = (root / f"{project.value}.yaml").resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            raise ValueError("project repository-pair manifest is missing")
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        try:
+            manifest = ProjectManifest.model_validate(raw)
+        except ValidationError as error:
+            raise ValueError("project repository-pair manifest is invalid") from error
+        if manifest.project != project.value:
+            raise ValueError("project repository-pair manifest identity is invalid")
+        return (
+            str(manifest.repositories.source.issue_repository),
+            str(manifest.repositories.deployment.issue_repository),
+        )
+
+    def _cleanup_result_for_flow(
+        self, project: str, repository_surface: str, flow_id: str
+    ) -> str | None:
+        if repository_surface != "runtime" or flow_id == "repository-static":
+            return "NOT_APPLICABLE_NON_MUTATING_REPOSITORY_AUDIT"
+        root = (self.settings.flow_config_root.resolve() / project).resolve()
+        if not root.is_dir() or not root.is_relative_to(self.settings.flow_config_root.resolve()):
+            return None
+        for path in sorted(root.glob("*.yaml")):
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+            flows = raw.get("flows") if isinstance(raw, dict) else None
+            if not isinstance(flows, list):
+                continue
+            for flow in flows:
+                if not isinstance(flow, dict) or flow.get("id") != flow_id:
+                    continue
+                return (
+                    "NOT_APPLICABLE_NON_MUTATING_FLOW"
+                    if flow.get("mutation") == "non-mutating"
+                    else None
+                )
+        return None
 
     @staticmethod
     def _release_reconciliation_component(session: Any, change_set: ChangeSet, run: Run) -> None:
@@ -5783,7 +5913,8 @@ class MetadataActivityHandler:
         return uuid5(
             NAMESPACE_URL,
             "coverage-cell:"
-            f"{campaign_id}:{cell.domain}:{cell.persona}:{cell.lens.value}:{cell.environment}",
+            f"{campaign_id}:{cell.repository_surface}:{cell.domain}:{cell.persona}:"
+            f"{cell.flow}:{cell.lens.value}:{cell.environment}",
         )
 
     @staticmethod
@@ -5802,8 +5933,10 @@ class MetadataActivityHandler:
         canonical = json.dumps(
             {
                 "project": campaign.project,
+                "repository_surface": cell.repository_surface,
                 "domain": cell.domain,
                 "persona": cell.persona,
+                "flow": cell.flow,
                 "lens": cell.lens.value,
                 "component": component,
                 "reproduction": reproduction,
@@ -5981,14 +6114,25 @@ class MetadataActivityHandler:
         }
 
     def _github_token(self) -> str | None:
-        path = self.settings.github_token_file
+        path = self.settings.github_read_token_file
         if path is None or not path.is_file():
             return None
-        metadata = path.stat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
+        root = self.settings.credential_root.resolve()
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError("GitHub read token escaped its credential root")
+        metadata = resolved.stat()
+        permissions = stat.S_IMODE(metadata.st_mode)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IRWXO:
             raise ValueError("GitHub token file permissions are too broad")
-        token = path.read_text(encoding="utf-8").strip()
-        if len(token) < 20:
+        if self.settings.environment == "production" and (
+            metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640
+        ):
+            raise ValueError("production GitHub read token ownership is invalid")
+        if self.settings.environment != "production" and permissions not in {0o600, 0o640}:
+            raise ValueError("GitHub read token permissions are invalid")
+        token = resolved.read_text(encoding="utf-8").strip()
+        if len(token) < 32:
             raise ValueError("GitHub token file is not provisioned")
         return token
 

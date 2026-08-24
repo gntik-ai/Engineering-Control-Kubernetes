@@ -38,6 +38,47 @@
           {
             "type": "object",
             "additionalProperties": false,
+            "required": ["action", "url"],
+            "properties": {
+              "action": {"const": "goto"},
+              "url": {"type": "string", "pattern": "^https?://[^\\s]+$", "maxLength": 2048}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "selector"],
+            "properties": {
+              "action": {"enum": ["click-selector", "expect-selector"]},
+              "selector": {"type": "string", "minLength": 1, "maxLength": 500}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "selector", "value_from_env"],
+            "properties": {
+              "action": {"const": "fill-selector"},
+              "selector": {"type": "string", "minLength": 1, "maxLength": 500},
+              "value_from_env": {
+                "type": "string",
+                "pattern": "^JOURNEY_[A-Z0-9_]+$",
+                "maxLength": 100
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "name"],
+            "properties": {
+              "action": {"const": "capture"},
+              "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,79}$"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
             "required": ["action", "label", "value_from_env"],
             "properties": {
               "action": {"const": "fill"},

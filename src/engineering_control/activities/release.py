@@ -5,10 +5,11 @@ import stat
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import ValidationError
 from temporalio.exceptions import ApplicationError
 
-from engineering_control.adapters.command import SafeCommandRunner
+from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.falcone.release import (
     FalconeHelmAdapter,
     FalconeRecoveryPlan,
@@ -16,6 +17,7 @@ from engineering_control.adapters.falcone.release import (
 )
 from engineering_control.adapters.musematic.gitops import MusematicGitOpsAdapter, MusematicPromotion
 from engineering_control.config import Settings
+from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -38,11 +40,20 @@ class ReleaseActivityHandler:
                 "argocd": settings.argocd_executable,
             }
         )
+        self.runner = runner
         self.helm = helm or FalconeHelmAdapter(runner)
         self.gitops = gitops or MusematicGitOpsAdapter(runner)
         self.redactor = SecretRedactor()
+        self.catalog = EngineeringCatalog(
+            project_root=settings.project_config_root,
+            persona_root=settings.persona_config_root,
+            flow_root=settings.flow_config_root,
+            credential_root=settings.credential_root,
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step == "deployment.render":
+            return self._render(payload)
         if step == "recovery.execute":
             return self._recover(payload)
         if step in {"preview.preflight", "staging.preflight"}:
@@ -96,6 +107,93 @@ class ReleaseActivityHandler:
         if not isinstance(safe, dict):
             raise TypeError("redacted release result must remain an object")
         return safe
+
+    def _render(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project = payload.get("project")
+        snapshot = payload.get("snapshot")
+        if project not in {"falcone", "musematic"} or not isinstance(snapshot, dict):
+            raise ApplicationError(
+                "deployment rendering requires a project and immutable snapshot",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        manifest = self.catalog.project(project)
+        chart_worktree_key = f"{manifest.deployment.chart_repository}_worktree"
+        chart_worktree = Path(str(snapshot.get(chart_worktree_key))).resolve()
+        deployment_worktree = Path(str(snapshot.get("deployment_worktree"))).resolve()
+        try:
+            self._bounded_worktree(chart_worktree)
+            self._bounded_worktree(deployment_worktree)
+            chart = (chart_worktree / manifest.deployment.chart_path).resolve()
+            if not chart.is_dir() or not chart.is_relative_to(chart_worktree):
+                raise ValueError("configured chart path escaped its immutable worktree")
+            normal_values = [
+                self._bounded_render_file(chart_worktree, relative)
+                for relative in manifest.deployment.values_paths
+            ]
+            isolated_values = [
+                self._bounded_render_file(deployment_worktree, relative)
+                for relative in manifest.deployment.secret_bearing_values_paths
+            ]
+            lint_arguments = ["lint", str(chart)]
+            render_arguments = [
+                "template",
+                "engineering-render",
+                str(chart),
+                "--namespace",
+                manifest.deployment.namespaces[0],
+            ]
+            for values_file in [*normal_values, *isolated_values]:
+                lint_arguments.extend(("--values", str(values_file)))
+                render_arguments.extend(("--values", str(values_file)))
+            lint = self.runner.run("helm", lint_arguments, cwd=chart_worktree, timeout_seconds=900)
+            rendered = self.runner.run(
+                "helm", render_arguments, cwd=chart_worktree, timeout_seconds=900
+            )
+            documents = [document for document in yaml.safe_load_all(rendered.stdout) if document]
+            if not documents:
+                raise ValueError("configured chart rendered no Kubernetes objects")
+            kinds: dict[str, int] = {}
+            for document in documents:
+                kind = (
+                    str(document.get("kind", "Unknown"))
+                    if isinstance(document, dict)
+                    else "Unknown"
+                )
+                kinds[kind] = kinds.get(kind, 0) + 1
+            return {
+                **payload,
+                "status": "DEPLOYMENT_RENDER_PASS",
+                "render_evidence": {
+                    "chart_repository": manifest.deployment.chart_repository,
+                    "chart_path": manifest.deployment.chart_path,
+                    "normal_values_paths": manifest.deployment.values_paths,
+                    "secret_bearing_values_paths": [
+                        "[ISOLATED_SECRET_BEARING_VALUES]"
+                        for _ in manifest.deployment.secret_bearing_values_paths
+                    ],
+                    "helm_lint_sha256": hashlib.sha256(lint.stdout.encode()).hexdigest(),
+                    "rendered_sha256": hashlib.sha256(rendered.stdout.encode()).hexdigest(),
+                    "manifest_count": len(documents),
+                    "kinds": dict(sorted(kinds.items())),
+                    "rendered_content_persisted": False,
+                },
+            }
+        except (CommandFailure, OSError, ValueError, yaml.YAMLError) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "DEPLOYMENT_RENDER_FAILED",
+                "error_type": type(error).__name__,
+                "rendered_content_persisted": False,
+            }
+
+    @staticmethod
+    def _bounded_render_file(root: Path, relative: str) -> Path:
+        path = (root / relative).resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            raise ValueError("configured values path escaped its immutable worktree")
+        return path
 
     def _verify_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw_plan = payload.get("release_plan")

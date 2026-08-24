@@ -79,8 +79,12 @@ install -d -o hermes -g hermes -m 0755 \
   "${OPERATOR_ROOT}/bootstrap" "${OPERATOR_ROOT}/docs" \
   "${OPERATOR_ROOT}/project-config"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}" \
-  "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/targets" \
+  "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/personas.d" \
+  "${CONFIG_ROOT}/flows.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/policy" \
+  "${CONFIG_ROOT}/targets" \
   "${CONFIG_ROOT}/runtime" "${CONFIG_ROOT}/systemd"
+install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials"
+install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/github"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"
 install -d -o root -g engineering-control -m 0750 "${LOG_ROOT}"
 install -d -o engineering-control -g engineering-control -m 0750 "${STATE_ROOT}" \
@@ -125,9 +129,25 @@ install -o root -g engineering-control -m 0640 \
   "${RELEASE_ROOT}/source/config/projects/falcone.yaml" "${CONFIG_ROOT}/projects.d/falcone.yaml"
 install -o root -g engineering-control -m 0640 \
   "${RELEASE_ROOT}/source/config/projects/musematic.yaml" "${CONFIG_ROOT}/projects.d/musematic.yaml"
+for persona in "${RELEASE_ROOT}"/source/config/personas/*.yaml; do
+  install -o root -g engineering-control -m 0640 "${persona}" "${CONFIG_ROOT}/personas.d/"
+done
+for project_flows in "${RELEASE_ROOT}"/source/config/flows/*; do
+  project_name=$(basename "${project_flows}")
+  install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/flows.d/${project_name}"
+  for flow in "${project_flows}"/*.yaml; do
+    install -o root -g engineering-control -m 0640 \
+      "${flow}" "${CONFIG_ROOT}/flows.d/${project_name}/"
+  done
+done
 for policy in "${RELEASE_ROOT}"/source/config/policies/*.yaml; do
   install -o root -g engineering-control -m 0640 "${policy}" "${CONFIG_ROOT}/policies/"
 done
+if [[ ! -f "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]; then
+  install -o root -g engineering-control -m 0640 \
+    "${RELEASE_ROOT}/source/config/policy/github-issue-write-validation.yaml" \
+    "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml"
+fi
 for target in "${RELEASE_ROOT}"/source/config/targets/*.yaml; do
   target_name=$(basename "${target}")
   if [[ ! -f "${CONFIG_ROOT}/targets/${target_name}" ]]; then
@@ -237,7 +257,7 @@ if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
       "${ENGINEERING_DB_PASSWORD}"
     printf 'ENGINEERING_EVIDENCE_ROOT=%s/evidence\n' "${PLATFORM_ROOT}"
     printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
-    printf 'ENGINEERING_GITHUB_TOKEN_FILE=%s/env/github.token\n' "${CONFIG_ROOT}"
+    printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/controller-read.token\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
     printf 'ENGINEERING_ACCEPTANCE_ENABLED=true\n'
     printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
@@ -251,6 +271,17 @@ fi
 if ! grep -q '^ENGINEERING_AGENT_PACK_ROOT=' "${CONFIG_ROOT}/env/control.env"; then
   printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' \
     "${AGENT_PACK_INSTALL_ROOT}" >>"${CONFIG_ROOT}/env/control.env"
+fi
+if ! grep -q '^ENGINEERING_GITHUB_READ_TOKEN_FILE=' "${CONFIG_ROOT}/env/control.env"; then
+  printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/controller-read.token\n' \
+    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/control.env"
+fi
+if [[ -f "${CONFIG_ROOT}/credentials/github/controller-read.token" ]]; then
+  chown root:engineering-control \
+    "${CONFIG_ROOT}/credentials/github/controller-read.token"
+  chmod 0640 "${CONFIG_ROOT}/credentials/github/controller-read.token"
+else
+  touch "${STATE_ROOT}/MANUAL_GITHUB_READ_CREDENTIAL_REQUIRED"
 fi
 
 for unit in engineering-infrastructure.service engineering-migrate.service \
@@ -274,6 +305,7 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-scheduler.service \
   /etc/systemd/system/engineering-notifier.service \
   /etc/systemd/system/engineering-acceptance-worker.service
+"${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope controller
 systemctl daemon-reload
 systemctl enable engineering-infrastructure.service
 systemctl restart engineering-infrastructure.service
@@ -284,5 +316,7 @@ systemctl enable engineering-api.service engineering-evidence-ingest.service \
 systemctl restart engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
   engineering-acceptance-worker.service
+
+"${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope controller
 
 echo "Controller bootstrap completed without altering Hermes vendor source, product repositories, or Kubernetes."

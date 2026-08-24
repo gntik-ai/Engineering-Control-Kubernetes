@@ -7,9 +7,12 @@ receive the platform user identity. This fallback deliberately performs no actio
 from __future__ import annotations
 
 COMMANDS = {
+    "audit-plan": "Show a validated paired-repository campaign plan.",
     "audit": "Start a bounded read-only audit campaign.",
     "campaigns": "List audit campaigns.",
     "findings": "List verified findings.",
+    "loop": "Plan or control a durable issue-solution loop.",
+    "enhancements": "Discover, review, or run an approved enhancement.",
     "verify": "Start independent verification for one candidate finding.",
     "run": "Start delivery for one confirmed finding.",
     "status": "Show a workflow run.",

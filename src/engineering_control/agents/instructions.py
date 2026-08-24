@@ -36,6 +36,8 @@ class AgentInstructionPack:
         "delivery.invoke_checker": "review-change",
         "reconcile.invoke_release_reviewer": "prepare-staging",
         "runtime.independent_review": "verify-runtime",
+        "enhancement.discover": "discover-enhancements",
+        "enhancement.product_review": "review-enhancement",
     }
 
     def __init__(self, root: Path) -> None:

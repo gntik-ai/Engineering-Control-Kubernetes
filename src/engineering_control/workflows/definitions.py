@@ -13,8 +13,12 @@ from engineering_control.workflows.inputs import (
     AuditCampaignInput,
     CleanupInput,
     DeliveryReconciliationInput,
+    EnhancementDeliveryInput,
+    EnhancementDiscoveryInput,
+    EnhancementSolutionLoopInput,
     FindingVerificationInput,
     IssueDeliveryInput,
+    IssueSolutionLoopInput,
     PreviewDeploymentInput,
     QuotaRefreshInput,
     RecoveryInput,
@@ -52,6 +56,8 @@ class ControlledWorkflow:
         self._cancelled = False
         self._approval: dict[str, Any] | None = None
         self._phase = "INITIALIZING"
+        self._skip_reason: str | None = None
+        self._retry_step: str | None = None
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -70,6 +76,14 @@ class ControlledWorkflow:
     async def approval(self, payload: dict[str, Any]) -> None:
         self._approval = payload
 
+    @workflow.signal(name="skip")
+    async def skip(self, reason: str) -> None:
+        self._skip_reason = reason[:500]
+
+    @workflow.signal(name="retry")
+    async def retry(self, step: str) -> None:
+        self._retry_step = step[:120]
+
     @workflow.query(name="status")
     def status(self) -> dict[str, Any]:
         return {
@@ -77,6 +91,8 @@ class ControlledWorkflow:
             "paused": self._paused,
             "cancelled": self._cancelled,
             "approval_received": self._approval is not None,
+            "skip_reason": self._skip_reason,
+            "retry_step": self._retry_step,
         }
 
     async def _checkpoint(self, phase: str) -> bool:
@@ -162,6 +178,12 @@ class ControlledWorkflow:
             return "engineering-release"
         if step in {
             "project.snapshot",
+            "project.snapshot_pair",
+            "deployment.compare_live",
+            "audit.static_source",
+            "audit.static_deployment",
+            "audit.kubernetes_observe",
+            "audit.correlate_runtime",
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
@@ -175,6 +197,14 @@ class ControlledWorkflow:
         if step == "finding.reproduce":
             return f"engineering-{cls._nested_value(payload, 'provider', 'claude')}"
         if step == "audit.agent_cell":
+            return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+        if step in {"audit.api_flow", "audit.browser_flow"}:
+            return "engineering-browser"
+        if step in {"deployment.render"}:
+            return "engineering-release"
+        if step in {"finding.github_dedupe", "finding.publish", "enhancement.publish"}:
+            return "engineering-delivery"
+        if step in {"enhancement.discover", "enhancement.product_review"}:
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step == "delivery.invoke_spec":
             return f"engineering-{cls._nested_value(payload, 'spec_provider', 'claude')}"
@@ -226,20 +256,39 @@ class ControlledWorkflow:
 class AuditCampaignWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: AuditCampaignInput) -> dict[str, Any]:
+        plan = await self._step("campaign.plan", asdict(request))
+        repository_surfaces = request.repository_surfaces or list(
+            plan.get("repository_surfaces", [])
+        )
+        domains = request.domains or list(plan.get("domains", ["product"]))
+        personas = request.personas or list(plan.get("personas", ["anonymous"]))
+        flows = request.flows or list(plan.get("flows", ["repository-static"]))
+        lenses = request.lenses or list(plan.get("lenses", ["correctness"]))
+        environments = request.environments or [request.environment]
+        if not flows:
+            flows = ["repository-static"]
+        if not repository_surfaces:
+            repository_surfaces = ["source", "deployment", "pair"]
         if not await self._checkpoint("SNAPSHOT"):
             return {"status": "CANCELLED"}
         cells = [
             {
+                "repository_surface": repository_surface,
                 "domain": domain,
                 "persona": persona,
+                "flow": flow,
                 "lens": lens,
                 "environment": environment,
             }
-            for domain in request.domains
-            for persona in request.personas
-            for lens in request.lenses
-            for environment in request.environments
+            for repository_surface in repository_surfaces
+            for domain in domains
+            for persona in personas
+            for flow in flows
+            for lens in lenses
+            for environment in environments
         ]
+        if len(cells) > 100_000:
+            return {"status": "BLOCKED", "blocker": "COVERAGE_MATRIX_LIMIT"}
         batch = cells[request.cell_offset : request.cell_offset + 50]
         snapshot: dict[str, Any] | None = None
         snapshot_blocker = request.snapshot_blocker
@@ -291,6 +340,87 @@ class AuditCampaignWorkflow(ControlledWorkflow):
             }
         if snapshot is None:
             raise RuntimeError("project snapshot result is missing")
+        await self._step(
+            "project.persist_snapshot",
+            {
+                "campaign_id": campaign_id,
+                "project": request.project,
+                "snapshot": snapshot,
+            },
+        )
+        if plan.get("blockers"):
+            return {
+                "status": "BLOCKED_BY_CREDENTIAL",
+                "campaign_id": campaign_id,
+                "blockers": plan["blockers"],
+                "plan": plan,
+                "snapshot": snapshot,
+            }
+        e2e = "runtime" in repository_surfaces
+        if e2e:
+            pair_snapshot = await self._step(
+                "project.snapshot_pair", {**asdict(request), "snapshot": snapshot}
+            )
+            await self._step(
+                "project.persist_snapshot",
+                {
+                    "campaign_id": campaign_id,
+                    "project": request.project,
+                    "snapshot": snapshot,
+                    "pair_snapshot": pair_snapshot,
+                },
+            )
+            if pair_snapshot.get("status") in {"BLOCKED", "LIVE_REVISION_DRIFT"}:
+                return {
+                    "status": "BLOCKED",
+                    "campaign_id": campaign_id,
+                    "blocker": pair_snapshot.get("blocker", pair_snapshot.get("status")),
+                    "snapshot": pair_snapshot,
+                }
+            snapshot = {**snapshot, "pair_snapshot": pair_snapshot}
+        stage_context: dict[str, Any] = {
+            **asdict(request),
+            "campaign_id": campaign_id,
+            "snapshot": snapshot,
+            "plan": plan,
+        }
+        stages = [
+            "audit.static_source",
+            "audit.static_deployment",
+            "deployment.render",
+            "deployment.compare_live",
+        ]
+        if e2e:
+            stages.extend(
+                [
+                    "audit.api_flow",
+                    "audit.browser_flow",
+                    "audit.kubernetes_observe",
+                    "audit.correlate_runtime",
+                ]
+            )
+        stages.extend(
+            [
+                "audit.classify_candidate",
+                "audit.discover_enhancements",
+                "audit.verify_cleanup",
+            ]
+        )
+        for stage in stages:
+            if not await self._checkpoint(stage.upper().replace(".", "_")):
+                return {"status": "CANCELLED", "campaign_id": campaign_id}
+            stage_context = await self._step(stage, stage_context, timeout_minutes=120)
+            if stage_context.get("status") in {
+                "BLOCKED",
+                "BLOCKED_BY_CREDENTIAL",
+                "FAILED",
+            }:
+                return {
+                    "status": "BLOCKED",
+                    "campaign_id": campaign_id,
+                    "blocker": stage_context.get("blocker", stage_context["status"]),
+                    "context": stage_context,
+                }
         await self._step(
             "campaign.persist_coverage",
             {"campaign_id": campaign_id, "cells": batch, "total": len(cells)},
@@ -368,6 +498,24 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                 )
                 if verification.get("status") in {"RATE_LIMITED", "BLOCKED", "FAILED"}:
                     continue
+                if verification.get("status") == "CONFIRMED" and request.publish_findings:
+                    publication = await self._step(
+                        "finding.prepare_publication",
+                        {"finding_id": finding_id, "campaign_id": campaign_id},
+                    )
+                    if publication.get("status") == "PUBLICATION_READY":
+                        publication = await self._step(
+                            "finding.publish", {**publication, "dry_run": False}
+                        )
+                    if publication.get("status") == "PUBLISHED":
+                        publication = await self._step("finding.persist_publication", publication)
+                    if publication.get("status") not in {"PUBLISHED", "ALREADY_PUBLISHED"}:
+                        return {
+                            "status": "BLOCKED",
+                            "campaign_id": campaign_id,
+                            "blocker": publication.get("blocker", "FINDING_PUBLICATION_FAILED"),
+                            "publication": publication,
+                        }
         next_offset = request.cell_offset + len(batch)
         if next_offset < len(cells):
             workflow.continue_as_new(
@@ -906,6 +1054,217 @@ class AcceptanceLifecycleWorkflow(ControlledWorkflow):
         return context
 
 
+@workflow.defn(name="IssueSolutionLoopWorkflow")
+class IssueSolutionLoopWorkflow(ControlledWorkflow):
+    """Durable one-issue-at-a-time solution loop; production mode is intentionally absent."""
+
+    @workflow.run
+    async def run(self, request: IssueSolutionLoopInput) -> dict[str, Any]:
+        if request.execution_mode not in {"plan-only", "source-pr", "preview", "staging"}:
+            raise ValueError("unsupported issue-loop execution mode")
+        if not 1 <= request.maximum_items <= 100 or not 1 <= request.component_concurrency <= 4:
+            raise ValueError("issue-loop bounds are invalid")
+        context = await self._step("loop.load_selection", asdict(request))
+        raw_items = context.get("items", [])
+        if not isinstance(raw_items, list):
+            raise TypeError("issue-loop selection must be a list")
+        items = raw_items[: request.maximum_items]
+        results: list[dict[str, Any]] = []
+        for ordinal, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                raise TypeError("issue-loop item must be an object")
+            if not await self._checkpoint(f"ISSUE_{ordinal}_ELIGIBILITY"):
+                return {"status": "CANCELLED", "results": results}
+            if self._skip_reason:
+                skipped = await self._step(
+                    "loop.record_skip",
+                    {**context, "item": item, "reason": self._skip_reason},
+                )
+                results.append(skipped)
+                self._skip_reason = None
+                continue
+            leased = await self._step("loop.acquire_component", {**context, "item": item})
+            if leased.get("status") == "BLOCKED":
+                return {"status": "PAUSED", "blocker": leased.get("blocker"), "results": results}
+            try:
+                delivery: dict[str, Any] = {}
+                for review_attempt in range(1, 4):
+                    delivery = await workflow.execute_child_workflow(
+                        "IssueDeliveryWorkflow",
+                        IssueDeliveryInput(
+                            finding_id=str(item["finding_id"]),
+                            risk_class=str(item["risk_class"]),
+                            dry_run=request.dry_run or request.execution_mode == "plan-only",
+                        ),
+                        id=f"{workflow.info().workflow_id}-issue-{ordinal}-review-{review_attempt}",
+                        task_queue=workflow.info().task_queue,
+                        execution_timeout=timedelta(hours=12),
+                    )
+                    if delivery.get("status") != "REQUEST_CHANGES":
+                        break
+                if delivery.get("status") in {
+                    "BLOCKED",
+                    "FAILED",
+                    "RATE_LIMITED",
+                    "TIMED_OUT",
+                    "REQUEST_CHANGES",
+                }:
+                    blocked = await self._step(
+                        "loop.record_blocker",
+                        {**leased, "item": item, "delivery": delivery},
+                    )
+                    return {
+                        "status": "PAUSED",
+                        "blocker": blocked.get("blocker", delivery.get("status")),
+                        "results": results,
+                    }
+                if request.execution_mode in {"preview", "staging"} and not request.dry_run:
+                    change_set_id = str(delivery.get("context", {}).get("change_set_id", ""))
+                    if not change_set_id:
+                        return {
+                            "status": "PAUSED",
+                            "blocker": "CHANGE_SET_BINDING_MISSING",
+                            "results": results,
+                        }
+                    reconciled = await workflow.execute_child_workflow(
+                        "DeliveryReconciliationWorkflow",
+                        DeliveryReconciliationInput(
+                            change_set_id=change_set_id,
+                            dry_run=False,
+                        ),
+                        id=f"{workflow.info().workflow_id}-issue-{ordinal}-reconcile",
+                        task_queue=workflow.info().task_queue,
+                        execution_timeout=timedelta(hours=12),
+                    )
+                    if reconciled.get("status") not in {"READY", "COMPLETE", "PASS"}:
+                        return {
+                            "status": "PAUSED",
+                            "blocker": reconciled.get("status", "RECONCILIATION_FAILED"),
+                            "results": results,
+                        }
+                    deployment = await workflow.execute_child_workflow(
+                        "PreviewDeploymentWorkflow"
+                        if request.execution_mode == "preview"
+                        else "StagingDeploymentWorkflow",
+                        PreviewDeploymentInput(
+                            change_set_id=change_set_id,
+                            project=request.project,
+                            dry_run=False,
+                        )
+                        if request.execution_mode == "preview"
+                        else StagingDeploymentInput(
+                            change_set_id=change_set_id,
+                            environment="staging",
+                            dry_run=False,
+                        ),
+                        id=f"{workflow.info().workflow_id}-issue-{ordinal}-deploy",
+                        task_queue=workflow.info().task_queue,
+                        execution_timeout=timedelta(hours=12),
+                    )
+                    if deployment.get("status") not in {"COMPLETE", "PASS", "VERIFIED"}:
+                        return {
+                            "status": "PAUSED",
+                            "blocker": deployment.get("status", "DEPLOYMENT_FAILED"),
+                            "results": results,
+                        }
+                completed = await self._step(
+                    "loop.record_item", {**leased, "item": item, "delivery": delivery}
+                )
+                results.append(completed)
+            finally:
+                await self._step("loop.release_component", {**leased, "item": item})
+        finalized = await self._step(
+            "loop.finalize", {**context, "processed": results, "requested_items": len(items)}
+        )
+        return {"status": finalized.get("status", "COMPLETE"), "results": results}
+
+
+@workflow.defn(name="EnhancementDiscoveryWorkflow")
+class EnhancementDiscoveryWorkflow(ControlledWorkflow):
+    @workflow.run
+    async def run(self, request: EnhancementDiscoveryInput) -> dict[str, Any]:
+        context: dict[str, Any] = asdict(request)
+        for step in ("enhancement.load_evidence", "enhancement.prepare_discovery"):
+            if not await self._checkpoint(step.upper().replace(".", "_")):
+                return {"status": "CANCELLED", "context": context}
+            context = await self._step(step, context)
+            if context.get("status") in {"BLOCKED", "FAILED"}:
+                return {"status": context["status"], "context": context}
+        if request.dry_run:
+            return {"status": "DRY_RUN", "context": context}
+        for step in (
+            "enhancement.discover",
+            "enhancement.validate_evidence",
+            "enhancement.dedupe",
+            "enhancement.github_dedupe",
+            "enhancement.product_review",
+            "enhancement.persist",
+        ):
+            if not await self._checkpoint(step.upper().replace(".", "_")):
+                return {"status": "CANCELLED", "context": context}
+            if step in {"enhancement.discover", "enhancement.product_review"}:
+                context = await self._agent_step(step, context, timeout_minutes=120)
+            else:
+                context = await self._step(step, context)
+            if (
+                step in {"enhancement.dedupe", "enhancement.github_dedupe"}
+                and context.get("status") == "DUPLICATE"
+            ):
+                return {"status": "DUPLICATE", "context": context}
+            if context.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED"}:
+                return {"status": context["status"], "context": context}
+        return {"status": "CANDIDATE_ENHANCEMENT", "context": context}
+
+
+@workflow.defn(name="EnhancementDeliveryWorkflow")
+class EnhancementDeliveryWorkflow(ControlledWorkflow):
+    @workflow.run
+    async def run(self, request: EnhancementDeliveryInput) -> dict[str, Any]:
+        context = await self._step("enhancement.load_approved", asdict(request))
+        if context.get("status") != "APPROVED":
+            return {"status": "BLOCKED", "blocker": "ENHANCEMENT_APPROVAL_REQUIRED"}
+        context = await self._step("enhancement.create_openspec", context)
+        if not request.publish:
+            context = await self._step("enhancement.publication_dry_run", context)
+            return {"status": "DRY_RUN", "context": context}
+        context = await self._step("enhancement.publish", {**context, "dry_run": False})
+        if context.get("status") != "PUBLISHED":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
+        context = await self._step("enhancement.persist_publication", context)
+        return {"status": context.get("status", "PUBLISHED"), "context": context}
+
+
+@workflow.defn(name="EnhancementSolutionLoopWorkflow")
+class EnhancementSolutionLoopWorkflow(ControlledWorkflow):
+    @workflow.run
+    async def run(self, request: EnhancementSolutionLoopInput) -> dict[str, Any]:
+        approved = await self._step("enhancement.load_approved", asdict(request))
+        if approved.get("status") != "APPROVED":
+            return {"status": "BLOCKED", "blocker": "ENHANCEMENT_APPROVAL_REQUIRED"}
+        prepared = await self._step("enhancement.prepare_solution", approved)
+        if request.dry_run or request.execution_mode == "plan-only":
+            return {"status": "DRY_RUN", "context": prepared}
+        result = await workflow.execute_child_workflow(
+            "IssueSolutionLoopWorkflow",
+            IssueSolutionLoopInput(
+                project=str(prepared["project"]),
+                campaign_id=str(prepared["campaign_id"]),
+                maximum_risk=request.risk,
+                maximum_items=1,
+                execution_mode=request.execution_mode,
+                component_concurrency=1,
+                stop_policy="pause-on-blocker",
+                dry_run=False,
+            ),
+            id=f"{workflow.info().workflow_id}-solution",
+            task_queue=workflow.info().task_queue,
+            execution_timeout=timedelta(days=7),
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("enhancement solution child returned an invalid result")
+        return result
+
+
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     FindingVerificationWorkflow,
@@ -918,4 +1277,8 @@ ALL_WORKFLOWS = [
     QuotaRefreshWorkflow,
     CleanupWorkflow,
     AcceptanceLifecycleWorkflow,
+    IssueSolutionLoopWorkflow,
+    EnhancementDiscoveryWorkflow,
+    EnhancementDeliveryWorkflow,
+    EnhancementSolutionLoopWorkflow,
 ]

@@ -25,6 +25,8 @@ repository creation, or credential copy is performed by this repository's bootst
 - provider invocation outcomes and exposed usage are durably tracked by role without storing prompts;
 - native CLI rate limits produce a durable `RATE_LIMITED` handoff, never paid API fallback;
 - all persisted output passes through central secret redaction.
+- every controller, worker, bootstrap, upgrade, and end-to-end verification runs the fail-closed
+  `scripts/verify-no-omniroute.sh` negative policy before acceptance.
 
 See `docs/ARCHITECTURE.md`, `docs/REQUIREMENTS-MATRIX.md`, `docs/VALIDATION.md`, and
 `docs/OPERATOR-CHEATSHEET.md`. Exact PR/CI, signed candidate image, and digest-only deployment

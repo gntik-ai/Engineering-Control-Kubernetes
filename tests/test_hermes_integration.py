@@ -86,8 +86,11 @@ def test_authorized_command_records_telegram_actor(monkeypatch: pytest.MonkeyPat
     assert result is not None and result["decision"] == "handled"
 
 
-def test_unknown_command_is_ignored() -> None:
-    assert load_handler().handle("command:help", {}) is None
+def test_unknown_command_is_denied() -> None:
+    assert load_handler().handle("command:help", {}) == {
+        "decision": "deny",
+        "message": "Unknown engineering command denied.",
+    }
 
 
 def test_validate_command_starts_only_bounded_synthetic_lifecycle(
@@ -174,3 +177,69 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
     assert "must-not-persist" not in persisted
     assert '"actor_class": "allowlisted-telegram-user"' in persisted
     assert handler.ACCEPTANCE_LOG.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("command", "raw_args", "method", "path"),
+    [
+        ("audit-plan", "falcone e2e-smoke staging", "POST", "/v1/audit-plan"),
+        ("audit", "falcone e2e-smoke staging --execute", "POST", "/v1/campaigns"),
+        ("campaigns", "", "GET", "/v1/campaigns?limit=20"),
+        ("findings", "", "GET", "/v1/findings?limit=20"),
+        (
+            "verify",
+            "11111111-1111-4111-8111-111111111111",
+            "POST",
+            "/v1/findings/verify",
+        ),
+        (
+            "loop",
+            "plan falcone 11111111-1111-4111-8111-111111111111",
+            "POST",
+            "/v1/loops",
+        ),
+        ("loop", "status loop-safe-id", "GET", "/v1/loops/loop-safe-id"),
+        (
+            "enhancements",
+            "discover musematic 11111111-1111-4111-8111-111111111111",
+            "POST",
+            "/v1/enhancements/discover",
+        ),
+        ("enhancements", "list musematic", "GET", "/v1/enhancements?project=musematic"),
+        ("status", "workflow-safe-id", "GET", "/v1/runs/workflow-safe-id"),
+        ("evidence", "artifact-safe-id", "GET", "/v1/evidence/artifact-safe-id"),
+        ("usage", "", "GET", "/v1/usage"),
+        ("pause", "workflow-safe-id", "POST", "/v1/campaigns/workflow-safe-id/pause"),
+        ("resume", "workflow-safe-id", "POST", "/v1/campaigns/workflow-safe-id/resume"),
+        ("cancel", "workflow-safe-id", "POST", "/v1/runs/workflow-safe-id/cancel"),
+    ],
+)
+def test_required_telegram_commands_are_fixed_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    raw_args: str,
+    method: str,
+    path: str,
+) -> None:
+    handler = load_handler()
+    observed: list[tuple[str, str]] = []
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+    monkeypatch.setattr(handler, "_record_acceptance", lambda *_args: None)
+
+    def request(
+        actual_method: str,
+        actual_path: str,
+        _actor: str,
+        _payload: Any = None,
+    ) -> dict[str, str]:
+        observed.append((actual_method, actual_path))
+        return {"status": "ACCEPTED"}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        f"command:{command}",
+        {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
+    )
+
+    assert result is not None and result["decision"] == "handled"
+    assert observed == [(method, path)]

@@ -102,6 +102,11 @@ install -d -o root -g root -m 0711 "${STATE_ROOT}/workers" "${PLATFORM_ROOT}"
 install -d -o scan-runner -g scan-runner -m 0700 "${STATE_ROOT}/leases"
 install -d -o root -g root -m 0755 "${CONFIG_ROOT}"
 install -d -o root -g root -m 0755 "${CONFIG_ROOT}/systemd"
+install -d -o root -g root -m 0751 \
+  "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/personas.d" "${CONFIG_ROOT}/flows.d"
+install -d -o root -g delivery-runner -m 0750 "${CONFIG_ROOT}/policy"
+install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials"
+install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/github"
 install -d -o root -g root -m 0750 "${LOG_ROOT}"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/env"
 install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/journeys"
@@ -115,7 +120,8 @@ install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
 install -d -o root -g root -m 0711 \
   "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
-for repository in falcone falcone-charts musematic musematic-deploy; do
+for repository in falcone falcone-charts musematic musematic-deploy \
+  gntik-ai-falcone gntik-ai-falcone-charts gntik-ai-musematic gntik-ai-musematic-deploy; do
   install -d -o scan-runner -g scan-runner -m 0730 \
     "${PLATFORM_ROOT}/worktrees/${repository}"
 done
@@ -139,6 +145,24 @@ RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse --verify HEAD) || {
 }
 RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${RELEASE_ID}")
 ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
+for project in falcone musematic; do
+  install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/${project}"
+  install -o root -g root -m 0644 \
+    "${RELEASE_ROOT}/source/config/projects/${project}.yaml" \
+    "${CONFIG_ROOT}/projects.d/${project}.yaml"
+  install -o root -g root -m 0644 \
+    "${RELEASE_ROOT}/source/config/personas/${project}.yaml" \
+    "${CONFIG_ROOT}/personas.d/${project}.yaml"
+  install -d -o root -g root -m 0755 "${CONFIG_ROOT}/flows.d/${project}"
+  for flow in "${RELEASE_ROOT}/source/config/flows/${project}"/*.yaml; do
+    install -o root -g root -m 0644 "${flow}" "${CONFIG_ROOT}/flows.d/${project}/"
+  done
+done
+if [[ ! -f "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]; then
+  install -o root -g delivery-runner -m 0640 \
+    "${RELEASE_ROOT}/source/config/policy/github-issue-write-validation.yaml" \
+    "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml"
+fi
 
 AGENT_PACK_RELEASE_ID=$(git -C "${AGENT_PACK_SOURCE_ROOT}" rev-parse --verify HEAD) || {
   echo "Agent-pack bootstrap requires its independent version-controlled checkout" >&2
@@ -212,7 +236,9 @@ for identity in codex-runner claude-runner browser-runner scan-runner delivery-r
 done
 if [[ ! -f "${CONFIG_ROOT}/env/delivery-worker.env" ]]; then
   {
-    printf 'ENGINEERING_GITHUB_TOKEN_FILE=%s/env/delivery/github.token\n' "${CONFIG_ROOT}"
+    printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/delivery-read.token\n' "${CONFIG_ROOT}"
+    printf 'ENGINEERING_GITHUB_ISSUE_WRITE_TOKEN_FILE=%s/credentials/github/issues-write.token\n' "${CONFIG_ROOT}"
+    printf 'ENGINEERING_GITHUB_PR_WRITE_TOKEN_FILE=%s/env/delivery/github-pr-write.token\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=%s/env/delivery/registry/config.json\n' \
       "${CONFIG_ROOT}"
     printf 'ENGINEERING_DELIVERY_CREDENTIAL_ROOT=%s/env/delivery\n' "${CONFIG_ROOT}"
@@ -242,13 +268,37 @@ if ! grep -q '^ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=' \
   printf 'ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=%s/env/delivery/registry/config.json\n' \
     "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
 fi
-if [[ ! -f "${CONFIG_ROOT}/env/delivery/github.token" ]]; then
+if ! grep -q '^ENGINEERING_GITHUB_READ_TOKEN_FILE=' \
+  "${CONFIG_ROOT}/env/delivery-worker.env"; then
+  printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/delivery-read.token\n' \
+    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
+fi
+if ! grep -q '^ENGINEERING_GITHUB_ISSUE_WRITE_TOKEN_FILE=' \
+  "${CONFIG_ROOT}/env/delivery-worker.env"; then
+  printf 'ENGINEERING_GITHUB_ISSUE_WRITE_TOKEN_FILE=%s/credentials/github/issues-write.token\n' \
+    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
+fi
+if ! grep -q '^ENGINEERING_GITHUB_PR_WRITE_TOKEN_FILE=' \
+  "${CONFIG_ROOT}/env/delivery-worker.env"; then
+  printf 'ENGINEERING_GITHUB_PR_WRITE_TOKEN_FILE=%s/env/delivery/github-pr-write.token\n' \
+    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
+fi
+if [[ ! -f "${CONFIG_ROOT}/env/delivery/github-pr-write.token" ]]; then
   touch "${STATE_ROOT}/MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
 else
-  chown root:delivery-runner "${CONFIG_ROOT}/env/delivery/github.token"
-  chmod 0640 "${CONFIG_ROOT}/env/delivery/github.token"
+  chown root:delivery-runner "${CONFIG_ROOT}/env/delivery/github-pr-write.token"
+  chmod 0640 "${CONFIG_ROOT}/env/delivery/github-pr-write.token"
   rm -f -- "${STATE_ROOT}/MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
 fi
+for github_credential in delivery-read.token issues-write.token; do
+  github_path="${CONFIG_ROOT}/credentials/github/${github_credential}"
+  if [[ -f "${github_path}" ]]; then
+    chown root:delivery-runner "${github_path}"
+    chmod 0640 "${github_path}"
+  else
+    touch "${STATE_ROOT}/MANUAL_GITHUB_${github_credential^^}_REQUIRED"
+  fi
+done
 if [[ ! -f "${CONFIG_ROOT}/env/delivery/registry/config.json" ]]; then
   touch "${STATE_ROOT}/MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED"
 else
@@ -277,6 +327,7 @@ systemctl enable engineering-worker@codex.service engineering-worker@claude.serv
   engineering-worker@browser.service engineering-worker@scan.service \
   engineering-worker@delivery.service \
   engineering-release-worker.service
+"${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope worker
 systemctl restart engineering-worker@codex.service engineering-worker@claude.service \
   engineering-worker@browser.service engineering-worker@scan.service \
   engineering-worker@delivery.service \
@@ -296,4 +347,5 @@ if sudo -u claude-runner -H env -i \
 else
   touch "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"
 fi
+"${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope worker
 echo "Worker bootstrap completed; inspect MANUAL_AUTH_REQUIRED markers without copying credentials."

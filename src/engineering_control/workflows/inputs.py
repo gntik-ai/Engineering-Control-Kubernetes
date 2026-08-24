@@ -6,14 +6,19 @@ from dataclasses import dataclass, field
 @dataclass
 class AuditCampaignInput:
     project: str
-    name: str
-    source_sha: str
-    deployment_sha: str
-    domains: list[str]
-    personas: list[str]
-    lenses: list[str]
-    environments: list[str]
+    name: str = "audit"
+    preset: str = "snapshot"
+    environment: str = "staging"
+    source_sha: str | None = None
+    deployment_sha: str | None = None
+    repository_surfaces: list[str] = field(default_factory=list)
+    domains: list[str] = field(default_factory=list)
+    personas: list[str] = field(default_factory=list)
+    flows: list[str] = field(default_factory=list)
+    lenses: list[str] = field(default_factory=list)
+    environments: list[str] = field(default_factory=list)
     dry_run: bool = True
+    publish_findings: bool = False
     campaign_id: str | None = None
     cell_offset: int = 0
     snapshot_blocker: str | None = None
@@ -84,3 +89,38 @@ class AcceptanceLifecycleInput:
     validation_root: str
     hold_seconds: int = 5
     activity_task_queue: str = "engineering-acceptance"
+
+
+@dataclass
+class IssueSolutionLoopInput:
+    project: str
+    campaign_id: str
+    maximum_risk: str = "R1"
+    maximum_items: int = 1
+    execution_mode: str = "plan-only"
+    component_concurrency: int = 1
+    stop_policy: str = "pause-on-blocker"
+    dry_run: bool = True
+
+
+@dataclass
+class EnhancementDiscoveryInput:
+    project: str
+    campaign_id: str
+    dry_run: bool = True
+
+
+@dataclass
+class EnhancementDeliveryInput:
+    enhancement_id: str
+    approval_binding: str
+    publish: bool = False
+
+
+@dataclass
+class EnhancementSolutionLoopInput:
+    enhancement_id: str
+    approval_binding: str
+    risk: str
+    execution_mode: str = "plan-only"
+    dry_run: bool = True

@@ -13,6 +13,9 @@ from engineering_control.api.schemas import (
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
+    EnhancementDiscover,
+    EnhancementRun,
+    IssueLoopStart,
     OperationAccepted,
     RollbackRequest,
     RuntimeVerificationStart,
@@ -23,8 +26,11 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     DeliveryReconciliationInput,
+    EnhancementDiscoveryInput,
+    EnhancementSolutionLoopInput,
     FindingVerificationInput,
     IssueDeliveryInput,
+    IssueSolutionLoopInput,
     PreviewDeploymentInput,
     RecoveryInput,
     RuntimeVerificationInput,
@@ -49,6 +55,13 @@ class ControlService(Protocol):
     async def start_acceptance(
         self, request: AcceptanceLifecycleStart, validation_root: str
     ) -> OperationAccepted: ...
+    async def start_issue_loop(self, request: IssueLoopStart) -> OperationAccepted: ...
+    async def start_enhancement_discovery(
+        self, request: EnhancementDiscover
+    ) -> OperationAccepted: ...
+    async def start_enhancement_solution(
+        self, enhancement_id: str, request: EnhancementRun
+    ) -> OperationAccepted: ...
 
 
 class TemporalControlService:
@@ -69,9 +82,12 @@ class TemporalControlService:
         campaign_id = uuid4()
         workflow_id = f"audit-{request.project.value}-{campaign_id}"
         await self.repository.create_campaign(campaign_id, workflow_id, request)
+        value = request.model_dump(mode="json")
+        value["preset"] = request.preset or "static-full"
+        value["environment"] = request.environment or request.environments[0]
         handle = await self.client.start_workflow(
             WorkflowName.AUDIT_CAMPAIGN.value,
-            AuditCampaignInput(**request.model_dump(), campaign_id=str(campaign_id)),
+            AuditCampaignInput(**value, campaign_id=str(campaign_id)),
             id=workflow_id,
             task_queue=self.task_queue,
         )
@@ -123,7 +139,7 @@ class TemporalControlService:
         )
 
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None:
-        allowed = {"pause", "resume", "cancel", "approval"}
+        allowed = {"pause", "resume", "cancel", "approval", "skip", "retry"}
         if signal not in allowed:
             raise ValueError("unsupported control signal")
         handle = self.client.get_workflow_handle(workflow_id)
@@ -241,6 +257,47 @@ class TemporalControlService:
                 validation_root=validation_root,
                 hold_seconds=request.hold_seconds,
                 activity_task_queue=self.acceptance_activity_task_queue,
+            ),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_issue_loop(self, request: IssueLoopStart) -> OperationAccepted:
+        workflow_id = f"loop-{request.project.value}-{request.campaign_id}-{uuid4()}"
+        handle = await self.client.start_workflow(
+            WorkflowName.ISSUE_SOLUTION_LOOP.value,
+            IssueSolutionLoopInput(**request.model_dump(mode="json")),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_enhancement_discovery(self, request: EnhancementDiscover) -> OperationAccepted:
+        workflow_id = f"enhance-discover-{request.project.value}-{request.campaign_id}-{uuid4()}"
+        handle = await self.client.start_workflow(
+            WorkflowName.ENHANCEMENT_DISCOVERY.value,
+            EnhancementDiscoveryInput(**request.model_dump(mode="json")),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_enhancement_solution(
+        self, enhancement_id: str, request: EnhancementRun
+    ) -> OperationAccepted:
+        workflow_id = f"enhance-solution-{enhancement_id}-{uuid4()}"
+        handle = await self.client.start_workflow(
+            WorkflowName.ENHANCEMENT_SOLUTION_LOOP.value,
+            EnhancementSolutionLoopInput(
+                enhancement_id=enhancement_id,
+                **request.model_dump(mode="json"),
             ),
             id=workflow_id,
             task_queue=self.task_queue,

@@ -6,6 +6,9 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+"${SCRIPT_DIR}/verify-no-omniroute.sh" --scope controller
+
 for path in /home/hermes/engineering/bootstrap /home/hermes/engineering/docs \
   /home/hermes/engineering/project-config /etc/engineering-control/systemd \
   /var/log/engineering-control /opt/engineering-agent-pack/source; do

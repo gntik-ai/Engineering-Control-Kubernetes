@@ -16,8 +16,11 @@ import yaml
 ENGINEERING_COMMANDS = frozenset(
     {
         "audit",
+        "audit-plan",
         "campaigns",
         "findings",
+        "loop",
+        "enhancements",
         "run",
         "status",
         "evidence",
@@ -33,12 +36,18 @@ ENGINEERING_COMMANDS = frozenset(
     }
 )
 OMNI_DEPENDENCY = re.compile(
-    r"omniroute|omni\.musematic\.ai|(?:127\.0\.0\.1|localhost):201(?:28|31|32)",
+    r"omniroute|omni\.musematic\.ai|(?<!\d)201(?:28|31|32)(?!\d)",
     re.IGNORECASE,
 )
 NO_ADMIN = ["engineering-control-no-admin"]
 PLUGIN_NAME = "engineering-control"
 RUNTIME_ASSET_SUFFIXES = {".json", ".md", ".py", ".sh", ".yaml", ".yml"}
+RUNTIME_METADATA = (
+    ".env",
+    "auth.json",
+    "context_length_cache.yaml",
+    "provider_models_cache.json",
+)
 
 
 def _strings(value: Any) -> list[str]:
@@ -102,6 +111,25 @@ def _runtime_assets(hermes_home: Path) -> tuple[Path, ...]:
     return tuple(assets)
 
 
+def _runtime_metadata(hermes_home: Path) -> tuple[Path, ...]:
+    documents: list[Path] = []
+    for name in RUNTIME_METADATA:
+        path = hermes_home / name
+        if not path.exists():
+            continue
+        metadata = path.stat()
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 2 * 1024 * 1024
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError(f"Hermes runtime metadata is unsafe: {name}")
+        documents.append(path)
+    return tuple(documents)
+
+
 def verify(config_path: Path, hermes_home: Path, require_no_omniroute: bool) -> None:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
@@ -154,6 +182,11 @@ def verify(config_path: Path, hermes_home: Path, require_no_omniroute: bool) -> 
         offenders.extend(
             str(path.relative_to(hermes_home))
             for path in _runtime_assets(hermes_home)
+            if OMNI_DEPENDENCY.search(path.read_text(encoding="utf-8"))
+        )
+        offenders.extend(
+            path.name
+            for path in _runtime_metadata(hermes_home)
             if OMNI_DEPENDENCY.search(path.read_text(encoding="utf-8"))
         )
         if offenders:

@@ -1,46 +1,73 @@
-version: 1
+schema_version: 1
 project: musematic
-source:
-  repository: gntik-ai/musematic
-  default_branch: main
-  discovered_controller_path: /home/hermes/projects/musematic
-  discovered_head: 3e609bd80c10a7645cea3a1bb62e0f59392806c8
+api_url: https://api.musematic.ai
+repositories:
+  source:
+    full_name: gntik-ai/musematic
+    url: https://github.com/gntik-ai/musematic.git
+    mirror: /srv/engineering/mirrors/musematic.git
+    default_branch: main
+    issue_repository: gntik-ai/musematic
+  deployment:
+    full_name: gntik-ai/musematic-deploy
+    url: https://github.com/gntik-ai/musematic-deploy.git
+    mirror: /srv/engineering/mirrors/musematic-deploy.git
+    default_branch: main
+    issue_repository: gntik-ai/musematic-deploy
 deployment:
-  repository: gntik-ai/musematic-deploy
-  default_branch: main
-  strategy: argocd-gitops
-  discovered_controller_path: /home/hermes/projects/musematic-deploy
-  discovered_head: 419aebf8d1269a178dff3ba0a2974c311c67d0c9
-  adapter: engineering_control.adapters.musematic.gitops.MusematicGitOpsAdapter
-  required_gates:
-    - protected-deployment-pr
-    - immutable-image-digests
-    - approved-git-sha
-    - argocd-observed-revision
-    - post-sync-verification
-  prohibited:
-    - newest-build-promotion
-    - latest-tag-promotion
-    - direct-main-image-writeback
-    - undocumented-live-kubernetes-patch
-    - llm-direct-argocd-sync
-components:
-  - musematic:control-plane
-  - musematic:runtime-controller
-  - musematic:web
-  - musematic:deploy:staging
-security_blockers:
-  - id: SECURITY_BLOCKER_MUSEMATIC_GIT_SECRETS
-    source_write_enablement: false
-    deployment_write_enablement: false
-    remediation: rotate credentials and remove them from current Git state/history through an R3 ChangeSet
-  - id: SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY
-    write_enablement: false
-    remediation: provision scoped observer and GitOps verification identities
-discovered_argocd_risk:
-  image_updater_strategy: newest-build
-  writeback_target: main
-  status: MUST_BE_REPLACED_BEFORE_PROMOTION_ENABLEMENT
+  strategy: argocd
+  adapter: musematic
+  chart_repository: source
+  chart_path: deploy/helm/platform
+  values_paths: [deploy/helm/platform/values.prod.yaml]
+  secret_bearing_values_paths: [apps/musematic-platform/values.override.yaml]
+  build_workflows:
+    - repository: gntik-ai/musematic
+      workflow: ci.yml
+      exact_sha_input: false
+      immutable_digest_output: false
+      enabled: false
+      blocker: MUSEMATIC_EXACT_SHA_CANDIDATE_CONTRACT_MISSING
+    - repository: gntik-ai/musematic
+      workflow: deploy.yml
+      exact_sha_input: false
+      immutable_digest_output: false
+      enabled: false
+      blocker: MUSEMATIC_STABLE_WORKFLOW_IS_NOT_A_PREVIEW_CONTRACT
+  image_repositories:
+    control-plane: ghcr.io/gntik-ai/musematic/control-plane
+    runtime-controller: ghcr.io/gntik-ai/musematic/runtime-controller
+    reasoning-engine: ghcr.io/gntik-ai/musematic/reasoning-engine
+    simulation-controller: ghcr.io/gntik-ai/musematic/simulation-controller
+    sandbox-manager: ghcr.io/gntik-ai/musematic/sandbox-manager
+    web: ghcr.io/gntik-ai/musematic/web
+  runtime_url: https://app.musematic.ai
+  helm_release: null
+  argocd_application: musematic-platform
+  kubernetes_context_ref: musematic-observer
+  api_server_identity: https://178.104.182.200:6443
+  namespaces: [musematic-platform, platform-data, argocd]
+  observer_credential_ref: file:/etc/engineering-control/credentials/musematic/observer.kubeconfig
+  deployment_revision_annotation: argocd.argoproj.io/tracking-id
+  preview_policy:
+    enabled: false
+    isolated_target_required: true
+    namespace_prefix: musematic-preview-
+    approval_required: true
+    credential_ref: file:/etc/engineering-control/credentials/musematic/preview-releaser.kubeconfig
+    blocker: MUSEMATIC_ISOLATED_ARGOCD_PREVIEW_APPLICATION_MISSING
+  staging_policy:
+    enabled: false
+    production: false
+    approval_required: true
+    credential_ref: file:/etc/engineering-control/credentials/musematic/staging-releaser.kubeconfig
+    blocker: MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC
+source_test_commands:
+  - [make, test]
+  - [corepack, pnpm, --dir, apps/web, test]
+deployment_test_commands:
+  - [python3, scripts/verify_argocd_release_drift.py, --help]
+  - [python3, -m, pytest, tests/gitops_release_guard]
 delivery_control:
   source_ci_workflow: CI
   candidate_build:
@@ -56,12 +83,12 @@ delivery_control:
     deployment_file: apps/musematic-platform/values.override.yaml
     component_lease: musematic:deploy:staging
     image_repositories:
-      control-plane: ghcr.io/gntik-ai/musematic-control-plane
-      web: ghcr.io/gntik-ai/musematic-web
-      reasoning-engine: ghcr.io/gntik-ai/musematic-reasoning-engine
-      runtime-controller: ghcr.io/gntik-ai/musematic-runtime-controller
-      sandbox-manager: ghcr.io/gntik-ai/musematic-sandbox-manager
-      simulation-controller: ghcr.io/gntik-ai/musematic-simulation-controller
+      control-plane: ghcr.io/gntik-ai/musematic/control-plane
+      web: ghcr.io/gntik-ai/musematic/web
+      reasoning-engine: ghcr.io/gntik-ai/musematic/reasoning-engine
+      runtime-controller: ghcr.io/gntik-ai/musematic/runtime-controller
+      sandbox-manager: ghcr.io/gntik-ai/musematic/sandbox-manager
+      simulation-controller: ghcr.io/gntik-ai/musematic/simulation-controller
     digest_paths:
       control-plane: images.controlPlane.digest
       web: images.web.digest

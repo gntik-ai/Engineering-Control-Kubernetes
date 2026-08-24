@@ -14,11 +14,17 @@ from engineering_control.api.auth import bearer_auth
 from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
     ApprovalRecord,
+    AuditPlanRequest,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
+    EnhancementApproval,
+    EnhancementDiscover,
+    EnhancementRejection,
+    EnhancementRun,
     FindingVerificationStart,
+    IssueLoopStart,
     OperationAccepted,
     RecordList,
     RollbackRequest,
@@ -31,7 +37,9 @@ from engineering_control.db.repository import (
     MetadataRepository,
     SQLMetadataRepository,
 )
+from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.logging import configure_logging
+from engineering_control.models.enums import Project
 from engineering_control.observability.metrics import ControlPlaneMetrics
 
 
@@ -86,6 +94,12 @@ def create_app(
     control_dependency = Depends(control)
     metadata_dependency = Depends(metadata)
     control_metrics = ControlPlaneMetrics()
+    engineering_catalog = EngineeringCatalog(
+        project_root=resolved.project_config_root,
+        persona_root=resolved.persona_config_root,
+        flow_root=resolved.flow_config_root,
+        credential_root=resolved.credential_root,
+    )
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
@@ -104,6 +118,18 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
         return await service.start_campaign(body)
+
+    @app.post("/v1/audit-plan")
+    async def audit_plan(
+        body: AuditPlanRequest,
+        _subject: str = auth_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return engineering_catalog.plan(
+                body.project.value, body.preset, body.environment
+            ).model_dump(mode="json")
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/v1/campaigns", response_model=RecordList)
     async def campaign_list(
@@ -140,6 +166,105 @@ def create_app(
         repository: MetadataRepository = metadata_dependency,
     ) -> RecordList:
         return RecordList(items=await repository.list_findings(limit), next_cursor=None)
+
+    @app.post("/v1/loops", response_model=OperationAccepted, status_code=202)
+    async def issue_loop_start(
+        body: IssueLoopStart,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        return await service.start_issue_loop(body)
+
+    @app.get("/v1/loops/{workflow_id}")
+    async def issue_loop_get(
+        workflow_id: str,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> dict[str, Any]:
+        return await service.get_workflow(workflow_id)
+
+    @app.post("/v1/loops/{workflow_id}/{action}", status_code=202)
+    async def issue_loop_control(
+        workflow_id: str,
+        action: str,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> dict[str, str]:
+        if action not in {"pause", "resume", "cancel"}:
+            raise HTTPException(status_code=404, detail="unknown loop action")
+        await service.signal(workflow_id, action)
+        return {"status": "ACCEPTED"}
+
+    @app.post("/v1/enhancements/discover", response_model=OperationAccepted, status_code=202)
+    async def enhancement_discover(
+        body: EnhancementDiscover,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        return await service.start_enhancement_discovery(body)
+
+    @app.get("/v1/enhancements", response_model=RecordList)
+    async def enhancement_list(
+        project: Project,
+        status: str | None = Query(default=None, pattern=r"^[A-Z_]{3,64}$"),
+        limit: int = Query(default=50, ge=1, le=200),
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> RecordList:
+        return RecordList(
+            items=await repository.list_enhancements(project, status, limit),
+            next_cursor=None,
+        )
+
+    @app.get("/v1/enhancements/{enhancement_id}")
+    async def enhancement_get(
+        enhancement_id: str,
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        value = await repository.get_enhancement(enhancement_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="enhancement not found")
+        return value
+
+    @app.post("/v1/enhancements/{enhancement_id}/approve")
+    async def enhancement_approve(
+        enhancement_id: str,
+        body: EnhancementApproval,
+        subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.approve_enhancement(
+                enhancement_id, body.approval_binding, subject
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/enhancements/{enhancement_id}/reject")
+    async def enhancement_reject(
+        enhancement_id: str,
+        body: EnhancementRejection,
+        subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.reject_enhancement(enhancement_id, body.reason, subject)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post(
+        "/v1/enhancements/{enhancement_id}/run",
+        response_model=OperationAccepted,
+        status_code=202,
+    )
+    async def enhancement_run(
+        enhancement_id: str,
+        body: EnhancementRun,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        return await service.start_enhancement_solution(enhancement_id, body)
 
     @app.get("/v1/findings/{finding_id}")
     async def finding_get(

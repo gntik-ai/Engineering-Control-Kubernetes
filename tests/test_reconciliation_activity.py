@@ -163,7 +163,7 @@ def reconciliation_handler(
         Settings(
             run_root=tmp_path / "runs",
             delivery_credential_root=credential_root,
-            github_token_file=token,
+            github_pr_write_token_file=token,
             github_registry_auth_file=registry_auth,
         ),
         runner,  # type: ignore[arg-type]

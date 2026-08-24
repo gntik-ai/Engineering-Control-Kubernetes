@@ -51,16 +51,29 @@ class Settings(BaseSettings):
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")
     argocd_executable: Path = Path("/usr/local/bin/argocd")
     release_credential_root: Path = Path("/etc/engineering-control/env/release")
-    observer_credential_root: Path = Path("/etc/engineering-control/env/observer")
+    observer_credential_root: Path = Path("/etc/engineering-control/credentials")
     node_executable: Path = Path("/usr/local/bin/node")
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")
     project_config_root: Path = Path("/etc/engineering-control/projects.d")
+    persona_config_root: Path = Path("/etc/engineering-control/personas.d")
+    flow_config_root: Path = Path("/etc/engineering-control/flows.d")
+    credential_root: Path = Path("/etc/engineering-control/credentials")
+    engineering_profile_manifest: Path = Path(
+        "/opt/engineering-agent-pack/source/profiles/engineering.yaml"
+    )
     agent_pack_root: Path = Path("/opt/engineering-agent-pack/source")
-    browser_credential_root: Path = Path("/etc/engineering-control/env/browser")
+    browser_credential_root: Path = Path("/etc/engineering-control/credentials")
     browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
     github_executable: Path = Path("/usr/bin/gh")
+    github_read_token_file: Path | None = None
+    github_issue_write_token_file: Path | None = None
+    github_pr_write_token_file: Path | None = None
+    github_issue_write_validation_file: Path = Path(
+        "/etc/engineering-control/policy/github-issue-write-validation.yaml"
+    )
+    # Deprecated compatibility field. New engineering workflows do not consume it.
     github_token_file: Path | None = None
     github_registry_auth_file: Path | None = None
     git_read_token_file: Path | None = None

@@ -8,14 +8,18 @@ import stat
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urljoin, urlparse
 from uuid import UUID
 
+import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import SafeCommandRunner
 from engineering_control.config import Settings
+from engineering_control.engineering.configuration import EngineeringCatalog
+from engineering_control.engineering.models import E2EFlow, FlowStep
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.models.enums import Project, RedactionStatus
 from engineering_control.security.redaction import SecretRedactor
@@ -31,13 +35,19 @@ class BrowserActivityHandler:
         settings: Settings,
         runner: SafeCommandRunner | None = None,
         publisher: EvidencePublisher | None = None,
+        api_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.settings = settings
         self.runner = runner or SafeCommandRunner({"node": settings.node_executable})
         self.redactor = SecretRedactor()
         self.publisher = publisher or EvidencePublisher(settings, settings.browser_evidence_root)
+        self.api_transport = api_transport
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step == "audit.api_flow":
+            return await self._handle_api_catalog(payload)
+        if step == "audit.browser_flow":
+            return await self._handle_browser_catalog(payload)
         if step != "runtime.browser_checks":
             raise ApplicationError("unsupported browser activity", non_retryable=True)
         plan = self._bounded_file(payload.get("journey_plan_path"), self.settings.journey_plan_root)
@@ -97,6 +107,490 @@ class BrowserActivityHandler:
             "result": safe,
             "artifacts": artifacts,
             "evidence_receipts": receipts,
+        }
+
+    def _catalog(self) -> EngineeringCatalog:
+        return EngineeringCatalog(
+            project_root=self.settings.project_config_root,
+            persona_root=self.settings.persona_config_root,
+            flow_root=self.settings.flow_config_root,
+            credential_root=self.settings.credential_root,
+        )
+
+    def _selected_flows(self, payload: dict[str, Any]) -> tuple[EngineeringCatalog, list[E2EFlow]]:
+        project = payload.get("project")
+        if project not in {"falcone", "musematic"}:
+            raise ApplicationError("unknown E2E project", non_retryable=True)
+        catalog = self._catalog()
+        selected = payload.get("plan", {}).get("flows", payload.get("flows", []))
+        if not isinstance(selected, list) or not all(isinstance(item, str) for item in selected):
+            raise ApplicationError("E2E flow selection is invalid", non_retryable=True)
+        selected_ids = set(selected)
+        flows = [flow for flow in catalog.flows(project) if flow.id in selected_ids]
+        if {flow.id for flow in flows} != selected_ids:
+            raise ApplicationError(
+                "E2E flow selection references an unknown flow", non_retryable=True
+            )
+        return catalog, flows
+
+    def _credential_for_persona(
+        self,
+        catalog: EngineeringCatalog,
+        project: str,
+        persona_id: str,
+    ) -> tuple[dict[str, str], Path | None, dict[str, Any] | None]:
+        personas = {item.id: item for item in catalog.personas(project).personas}
+        persona = personas.get(persona_id)
+        if persona is None:
+            raise ApplicationError("flow persona is absent from the catalog", non_retryable=True)
+        reference = persona.credential_ref
+        if reference is None:
+            return {}, None, None
+        readiness = catalog.credential_readiness(str(reference))
+        if not readiness.present or not readiness.permissions_valid:
+            return (
+                {},
+                None,
+                {
+                    "status": "BLOCKED_BY_CREDENTIAL",
+                    "blocker": "PERSONA_CREDENTIAL_UNAVAILABLE",
+                    "missing_credential_refs": [str(reference)],
+                },
+            )
+        credentials, path = self._credentials(str(reference).removeprefix("file:"))
+        return credentials, path, None
+
+    async def _handle_api_catalog(self, payload: dict[str, Any]) -> dict[str, Any]:
+        catalog, flows = self._selected_flows(payload)
+        project = str(payload["project"])
+        manifest = catalog.project(project)
+        campaign_id = self._bounded_campaign_id(payload.get("campaign_id"))
+        summaries: list[dict[str, Any]] = []
+        credential_blockers: list[str] = []
+        status = "PASS"
+        blocker: str | None = None
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            follow_redirects=False,
+            verify=True,
+            transport=self.api_transport,
+        ) as client:
+            for flow in flows:
+                steps = [item for item in flow.steps if item.channel == "api"]
+                if not steps:
+                    continue
+                credentials, _, credential_block = self._credential_for_persona(
+                    catalog, project, flow.persona
+                )
+                if credential_block is not None:
+                    credential_blockers.extend(credential_block["missing_credential_refs"])
+                    continue
+                if flow.persona != "anonymous" and not credentials.get("JOURNEY_ACCESS_TOKEN"):
+                    credential_blockers.append(f"{flow.persona}:JOURNEY_ACCESS_TOKEN")
+                    continue
+                if (
+                    flow.mutation == "disposable"
+                    and credentials.get("JOURNEY_SAFE_E2E_MUTATION", "").lower() != "true"
+                ):
+                    status = "BLOCKED"
+                    blocker = "SAFE_E2E_MUTATION_NOT_AUTHORIZED"
+                    break
+                result = await self._execute_api_flow(
+                    client,
+                    flow,
+                    steps,
+                    str(manifest.api_url),
+                    campaign_id,
+                    credentials,
+                )
+                summaries.append(result)
+                if result["status"] != "PASS":
+                    status = "FAILED"
+                    blocker = "API_FLOW_FAILED"
+                    break
+        if credential_blockers:
+            status = "BLOCKED_BY_CREDENTIAL"
+            blocker = "PERSONA_CREDENTIAL_UNAVAILABLE"
+        report = {
+            "project": project,
+            "campaign_id": campaign_id,
+            "status": status,
+            "blocker": blocker,
+            "missing_credential_refs": sorted(set(credential_blockers)),
+            "flows": summaries,
+        }
+        receipt = self._write_catalog_result("api", campaign_id, report)
+        return {**payload, **report, "evidence": receipt}
+
+    async def _execute_api_flow(
+        self,
+        client: httpx.AsyncClient,
+        flow: E2EFlow,
+        steps: list[FlowStep],
+        api_url: str,
+        campaign_id: str,
+        credentials: dict[str, str],
+    ) -> dict[str, Any]:
+        created_id: str | None = None
+        cleanup_attempted = False
+        requests: list[dict[str, Any]] = []
+        replacements = self._replacement_values(campaign_id, credentials)
+        delete_step: FlowStep | None = None
+        for candidate in steps:
+            if candidate.method == "DELETE" and "<created-id>" in candidate.target:
+                delete_step = candidate
+        try:
+            for step in steps:
+                if created_id is not None:
+                    replacements["created-id"] = created_id
+                path = self._replace_template(step.target, replacements)
+                if "<" in path or ">" in path:
+                    return self._api_flow_failure(flow, requests, "REQUIRED_REFERENCE_MISSING")
+                headers = {"Accept": "application/json", "X-E2E-Campaign-ID": campaign_id}
+                token = credentials.get("JOURNEY_ACCESS_TOKEN")
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                body = self._replace_body(step.body_template, replacements)
+                response = await client.request(
+                    str(step.method),
+                    urljoin(api_url.rstrip("/") + "/", path.lstrip("/")),
+                    headers=headers,
+                    json=body,
+                )
+                request_summary = {
+                    "method": step.method,
+                    "path": path,
+                    "expected_status": step.expected_status,
+                    "actual_status": response.status_code,
+                    "request_id": self._response_request_id(response),
+                }
+                requests.append(request_summary)
+                if response.status_code != step.expected_status:
+                    return self._api_flow_failure(flow, requests, "HTTP_STATUS_MISMATCH")
+                if created_id is None and step.method == "POST" and response.content:
+                    created_id = self._created_identifier(response)
+                if step.method == "DELETE" and "<created-id>" in step.target:
+                    cleanup_attempted = True
+                if step.value_ref == "assert-json-absent:<created-id>" and created_id:
+                    if created_id in response.text:
+                        return self._api_flow_failure(flow, requests, "CLEANUP_NOT_VERIFIED")
+            cleanup_verified = flow.mutation != "disposable" or (
+                cleanup_attempted
+                and bool(requests)
+                and (
+                    requests[-1]["actual_status"] == 404
+                    or steps[-1].value_ref == "assert-json-absent:<created-id>"
+                )
+            )
+            if not cleanup_verified:
+                return self._api_flow_failure(flow, requests, "CLEANUP_NOT_VERIFIED")
+            return {
+                "flow_id": flow.id,
+                "persona": flow.persona,
+                "status": "PASS",
+                "requests": requests,
+                "created_resource_handle": self._opaque_handle(created_id),
+                "cleanup_verified": cleanup_verified,
+            }
+        finally:
+            if (
+                flow.mutation == "disposable"
+                and created_id
+                and not cleanup_attempted
+                and delete_step
+            ):
+                replacements["created-id"] = created_id
+                cleanup_path = self._replace_template(delete_step.target, replacements)
+                headers = {"X-E2E-Campaign-ID": campaign_id}
+                if credentials.get("JOURNEY_ACCESS_TOKEN"):
+                    headers["Authorization"] = f"Bearer {credentials['JOURNEY_ACCESS_TOKEN']}"
+                try:
+                    await client.request("DELETE", urljoin(api_url, cleanup_path), headers=headers)
+                except httpx.HTTPError:
+                    pass
+
+    async def _handle_browser_catalog(self, payload: dict[str, Any]) -> dict[str, Any]:
+        catalog, flows = self._selected_flows(payload)
+        project = str(payload["project"])
+        manifest = catalog.project(project)
+        campaign_id = self._bounded_campaign_id(payload.get("campaign_id"))
+        grouped: dict[str, list[E2EFlow]] = {}
+        for flow in flows:
+            if any(step.channel == "browser" for step in flow.steps):
+                grouped.setdefault(str(flow.persona), []).append(flow)
+        reports: list[dict[str, Any]] = []
+        blockers: list[str] = []
+        for persona, persona_flows in sorted(grouped.items()):
+            credentials, credential_path, credential_block = self._credential_for_persona(
+                catalog, project, persona
+            )
+            if credential_block is not None:
+                blockers.extend(credential_block["missing_credential_refs"])
+                continue
+            ordered = sorted(persona_flows, key=self._browser_flow_order)
+            try:
+                plan_value = self._browser_plan(
+                    ordered,
+                    str(manifest.deployment.runtime_url),
+                    str(manifest.api_url),
+                    campaign_id,
+                    credentials,
+                )
+            except KeyError as error:
+                blockers.append(f"{persona}:{error.args[0]}")
+                continue
+            plan_root = self.settings.temporary_root / "browser-plans" / campaign_id
+            plan_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            plan_path = plan_root / f"{persona}.json"
+            self._atomic_json(plan_path, plan_value)
+            self._validate_plan(plan_path)
+            output = self.settings.browser_evidence_root / campaign_id / persona
+            self._clear_previous_attempt(output)
+            output.mkdir(parents=True, exist_ok=True, mode=0o700)
+            environment = {
+                "ENGINEERING_JOURNEY_PLAN": str(plan_path),
+                "ENGINEERING_JOURNEY_OUTPUT": str(output),
+                **credentials,
+            }
+            result = self.runner.run(
+                "node",
+                [str(self.settings.browser_script)],
+                cwd=self.settings.browser_script.parent,
+                timeout_seconds=3600,
+                environment=environment,
+                check=False,
+            )
+            result_path = output / "result.json"
+            if not result_path.is_file():
+                reports.append(
+                    {"persona": persona, "status": "FAILED", "blocker": "BROWSER_RUNNER_FAILED"}
+                )
+                continue
+            report = json.loads(result_path.read_text(encoding="utf-8"))
+            safe = self._redact_known(self.redactor.redact(report).value, set(credentials.values()))
+            self._atomic_json(result_path, safe)
+            reports.append(
+                {
+                    "persona": persona,
+                    "status": safe.get("status", "FAILED"),
+                    "return_code": result.return_code,
+                    "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                    "visual_evidence": safe.get("visual_evidence", "UNKNOWN"),
+                }
+            )
+            if (
+                credential_path is not None
+                and safe.get("visual_evidence") != "DISABLED_CREDENTIAL_SAFETY"
+            ):
+                raise ApplicationError(
+                    "credentialed journey produced visual evidence",
+                    type="SecurityBlocker",
+                    non_retryable=True,
+                )
+        status = (
+            "BLOCKED_BY_CREDENTIAL"
+            if blockers
+            else "PASS"
+            if all(item["status"] == "PASS" for item in reports)
+            else "FAILED"
+        )
+        return {
+            **payload,
+            "status": status,
+            "blocker": "PERSONA_CREDENTIAL_UNAVAILABLE" if blockers else None,
+            "missing_credential_refs": sorted(set(blockers)),
+            "browser_flows": reports,
+        }
+
+    @staticmethod
+    def _browser_flow_order(flow: E2EFlow) -> tuple[int, str]:
+        if flow.id.startswith("valid-login"):
+            return (0, flow.id)
+        if flow.id.startswith("session-refresh"):
+            return (10, flow.id)
+        if flow.id.startswith("logout"):
+            return (100, flow.id)
+        if flow.category == "authorization":
+            return (70, flow.id)
+        return (30, flow.id)
+
+    def _browser_plan(
+        self,
+        flows: list[E2EFlow],
+        runtime_url: str,
+        api_url: str,
+        campaign_id: str,
+        credentials: dict[str, str],
+    ) -> dict[str, Any]:
+        replacements = self._replacement_values(campaign_id, credentials)
+        plan_steps: list[dict[str, Any]] = []
+        credential_names = {
+            "credential.username": "JOURNEY_USERNAME",
+            "credential.password": "JOURNEY_PASSWORD",
+        }
+        for flow in flows:
+            for step in flow.steps:
+                if step.channel != "browser":
+                    continue
+                if step.action == "navigate":
+                    target = self._replace_template(step.target, replacements)
+                    if "<" in target or ">" in target:
+                        raise KeyError("JOURNEY_ROUTE_REFERENCE")
+                    plan_steps.append({"action": "goto", "url": urljoin(runtime_url, target)})
+                elif step.action == "fill-credential":
+                    environment_name = credential_names.get(str(step.value_ref))
+                    if environment_name is None or not credentials.get(environment_name):
+                        raise KeyError(environment_name or "JOURNEY_CREDENTIAL_FIELD")
+                    plan_steps.append(
+                        {
+                            "action": "fill-selector",
+                            "selector": step.target,
+                            "value_from_env": environment_name,
+                        }
+                    )
+                elif step.action == "click":
+                    plan_steps.append({"action": "click-selector", "selector": step.target})
+                elif step.action == "assert-visible":
+                    if step.value_ref:
+                        plan_steps.append(
+                            {"action": "wait-for-text", "text": step.value_ref, "exact": True}
+                        )
+                    else:
+                        plan_steps.append({"action": "expect-selector", "selector": step.target})
+                elif step.action == "assert-url":
+                    plan_steps.append({"action": "expect-url", "path_contains": step.target})
+                elif step.action == "capture":
+                    name = re.sub(r"[^a-z0-9-]", "-", step.target.lower()).strip("-")
+                    plan_steps.append({"action": "capture", "name": name or "capture"})
+                elif step.action in {"fill-generated", "assert-status"}:
+                    raise ApplicationError(
+                        f"browser flow action {step.action} has no safe runner mapping",
+                        non_retryable=True,
+                    )
+        runtime_origin = self._origin(runtime_url)
+        api_origin = self._origin(api_url)
+        return {
+            "start_url": runtime_url,
+            "allowed_origins": sorted({runtime_origin, api_origin}),
+            "browser": "chromium",
+            "timeout_ms": min(
+                max(sum(flow.timeout_seconds for flow in flows) * 1000, 1000), 120000
+            ),
+            "capture_visual_evidence": not bool(credentials),
+            "steps": plan_steps,
+        }
+
+    @staticmethod
+    def _origin(value: str) -> str:
+        parsed = urlparse(value)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    @staticmethod
+    def _replacement_values(campaign_id: str, credentials: dict[str, str]) -> dict[str, str]:
+        mapping = {
+            "campaign-id": campaign_id,
+            "tenant-id": credentials.get("JOURNEY_TENANT_ID", ""),
+            "other-tenant-id": credentials.get("JOURNEY_OTHER_TENANT_ID", ""),
+            "configured-tenant-id": credentials.get("JOURNEY_TENANT_ID", ""),
+            "workspace-id": credentials.get("JOURNEY_WORKSPACE_ID", ""),
+            "session-id": credentials.get("JOURNEY_SESSION_ID", ""),
+            "credential.refresh-token": credentials.get("JOURNEY_REFRESH_TOKEN", ""),
+        }
+        return {key: value for key, value in mapping.items() if value}
+
+    @staticmethod
+    def _replace_template(value: str, replacements: dict[str, str]) -> str:
+        result = value
+        for key, replacement in replacements.items():
+            result = result.replace(f"<{key}>", quote(replacement, safe=""))
+        return result
+
+    @classmethod
+    def _replace_body(
+        cls, value: dict[str, object] | None, replacements: dict[str, str]
+    ) -> dict[str, object] | None:
+        if value is None:
+            return None
+
+        def replace(item: object) -> object:
+            if isinstance(item, str):
+                result = item
+                for key, replacement in replacements.items():
+                    result = result.replace(f"<{key}>", replacement)
+                return result
+            if isinstance(item, dict):
+                return {str(key): replace(nested) for key, nested in item.items()}
+            if isinstance(item, list):
+                return [replace(nested) for nested in item]
+            return item
+
+        return {key: replace(item) for key, item in value.items()}
+
+    @staticmethod
+    def _response_request_id(response: httpx.Response) -> str | None:
+        for name in ("x-request-id", "x-correlation-id", "traceparent"):
+            value = response.headers.get(name)
+            if value:
+                return str(value)[:200]
+        return None
+
+    @staticmethod
+    def _created_identifier(response: httpx.Response) -> str | None:
+        try:
+            value = response.json()
+        except ValueError:
+            return None
+
+        def find(item: Any) -> str | None:
+            if isinstance(item, dict):
+                for key in ("workspaceId", "workspace_id", "noteId", "note_id", "id"):
+                    candidate = item.get(key)
+                    if isinstance(candidate, str) and 0 < len(candidate) <= 200:
+                        return candidate
+                for nested in item.values():
+                    candidate = find(nested)
+                    if candidate:
+                        return candidate
+            return None
+
+        return find(value)
+
+    @staticmethod
+    def _api_flow_failure(
+        flow: E2EFlow, requests: list[dict[str, Any]], blocker: str
+    ) -> dict[str, Any]:
+        return {
+            "flow_id": flow.id,
+            "persona": flow.persona,
+            "status": "FAILED",
+            "blocker": blocker,
+            "requests": requests,
+            "cleanup_verified": False if flow.mutation == "disposable" else None,
+        }
+
+    @staticmethod
+    def _opaque_handle(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return "resource-sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+    @staticmethod
+    def _bounded_campaign_id(value: Any) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,120}", value):
+            raise ApplicationError("campaign ID is invalid", non_retryable=True)
+        return value
+
+    def _write_catalog_result(
+        self, channel: str, campaign_id: str, report: dict[str, Any]
+    ) -> dict[str, Any]:
+        output = self.settings.browser_evidence_root / campaign_id / channel
+        output.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = output / "result.json"
+        self._atomic_json(path, report)
+        return {
+            "handle": f"browser-evidence:{campaign_id}:{channel}:result.json",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "redaction_status": "REDACTED",
         }
 
     def _publish_result(self, payload: dict[str, Any], result_path: Path) -> list[dict[str, Any]]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
         target = home / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("fixture\n", encoding="utf-8")
+        target.chmod(0o600)
     config: dict[str, object] = {
         "plugins": {"enabled": [MODULE.PLUGIN_NAME]},
         "platform_toolsets": {"telegram": []},
@@ -39,6 +41,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     }
     path = home / "config.yaml"
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    path.chmod(0o600)
     return path, home, config
 
 
@@ -75,6 +78,7 @@ def test_cutover_policy_rejects_omniroute_project_profile(tmp_path: Path) -> Non
         yaml.safe_dump({"model_policy": {"provider": "custom:omniroute"}}),
         encoding="utf-8",
     )
+    profile.chmod(0o600)
 
     with pytest.raises(ValueError, match="project-profiles/falcone.yaml"):
         MODULE.verify(config_path, home, require_no_omniroute=True)
@@ -85,6 +89,7 @@ def test_cutover_policy_rejects_omniroute_runtime_skill(tmp_path: Path) -> None:
     skill = home / "skills/quality-cross/SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text("route through Hermes/OmniRoute\n", encoding="utf-8")
+    skill.chmod(0o600)
 
     with pytest.raises(ValueError, match="skills/quality-cross/SKILL.md"):
         MODULE.verify(config_path, home, require_no_omniroute=True)
@@ -97,6 +102,25 @@ def test_cutover_policy_ignores_historical_hidden_skill_backup(tmp_path: Path) -
     backup.write_text("historical OmniRoute guidance\n", encoding="utf-8")
 
     MODULE.verify(config_path, home, require_no_omniroute=True)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (".env", "OMNIROUTE_URL=http://127.0.0.1:20128\n"),
+        ("auth.json", '{"credential_pool": {"custom:omniroute": []}}\n'),
+        ("context_length_cache.yaml", "native-model: 20131\n"),
+        ("provider_models_cache.json", '{"http://localhost:20132": {}}\n'),
+    ],
+)
+def test_cutover_policy_rejects_runtime_metadata(tmp_path: Path, name: str, value: str) -> None:
+    config_path, home, _ = _fixture(tmp_path)
+    metadata = home / name
+    metadata.write_text(value, encoding="utf-8")
+    metadata.chmod(0o600)
+
+    with pytest.raises(ValueError, match=re.escape(name)):
+        MODULE.verify(config_path, home, require_no_omniroute=True)
 
 
 def test_policy_rejects_disabled_engineering_plugin(tmp_path: Path) -> None:

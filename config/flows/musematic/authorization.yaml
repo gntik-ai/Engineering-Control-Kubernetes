@@ -1,0 +1,41 @@
+flows:
+  - schema_version: 1
+    id: insufficient-role-denied
+    project: musematic
+    persona: standard-user
+    category: authorization
+    purpose: Prove an ordinary member cannot invoke platform administration directly.
+    preconditions: [valid-login-standard completed]
+    steps:
+      - {channel: api, action: request, target: /api/v1/admin/health, method: GET, expected_status: 403}
+      - {channel: browser, action: navigate, target: /admin/health}
+      - {channel: browser, action: assert-visible, target: h1, value_ref: Admin role required}
+    expected_result: Direct API and URL access fail without administrative data leakage.
+    positive_controls: [workspace-read succeeds for the same identity]
+    negative_controls: [admin health response is denied]
+    resources_created: []
+    cleanup_instructions: []
+    safe_target_requirements: [read-only negative control]
+    evidence_requirements: [browser trace, HTTP summary, correlation IDs]
+    timeout_seconds: 120
+    retry_policy: {maximum_attempts: 2, backoff_seconds: 2}
+    mutation: non-mutating
+  - schema_version: 1
+    id: cross-tenant-denial-control
+    project: musematic
+    persona: platform-administrator
+    category: authorization
+    purpose: Compare an approved platform read with a standard user's cross-tenant denial.
+    preconditions: [platform-administrator credential passes, two safe tenant IDs configured]
+    steps:
+      - {channel: api, action: request, target: /api/v1/admin/workspaces, method: GET, expected_status: 200}
+    expected_result: The explicit platform role succeeds and the ordinary-user paired control fails.
+    positive_controls: [platform administration read succeeds]
+    negative_controls: [standard-user execution of the same call is denied]
+    resources_created: []
+    cleanup_instructions: []
+    safe_target_requirements: [read-only platform audit identity]
+    evidence_requirements: [HTTP summary, correlation IDs]
+    timeout_seconds: 120
+    retry_policy: {maximum_attempts: 1, backoff_seconds: 0}
+    mutation: non-mutating

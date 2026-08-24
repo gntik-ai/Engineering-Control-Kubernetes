@@ -1,0 +1,48 @@
+# Manual application only. Engineering Control bootstrap never applies cluster RBAC.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: engineering-musematic-observer
+  namespace: musematic-platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: engineering-musematic-observer
+  namespace: musematic-platform
+subjects:
+  - kind: ServiceAccount
+    name: engineering-musematic-observer
+    namespace: musematic-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: engineering-observer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: engineering-musematic-observer
+  namespace: platform-data
+subjects:
+  - kind: ServiceAccount
+    name: engineering-musematic-observer
+    namespace: musematic-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: engineering-observer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: engineering-musematic-observer
+  namespace: argocd
+subjects:
+  - kind: ServiceAccount
+    name: engineering-musematic-observer
+    namespace: musematic-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: engineering-observer

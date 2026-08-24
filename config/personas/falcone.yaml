@@ -1,0 +1,38 @@
+schema_version: 1
+project: falcone
+personas:
+  - id: anonymous
+    product_roles: []
+    scope: public
+    credential_ref: null
+    allowed_flows: [public-smoke]
+    forbidden_flows: [workspace-read, workspace-crud, tenant-admin-overview]
+    expected_permissions: [public-page.read, public-health.read]
+  - id: standard-user
+    product_roles: [workspace_developer]
+    scope: workspace
+    credential_ref: file:/etc/engineering-control/credentials/falcone/standard-user.env
+    allowed_flows: [valid-login-standard, session-refresh-standard, logout-standard, workspace-read]
+    forbidden_flows: [tenant-admin-overview, workspace-crud]
+    expected_permissions: [workspace.read, application.read, application.write]
+  - id: privileged-admin
+    product_roles: [tenant_admin, workspace_admin]
+    scope: tenant
+    credential_ref: file:/etc/engineering-control/credentials/falcone/privileged-admin.env
+    allowed_flows: [valid-login-admin, tenant-admin-overview, workspace-crud]
+    forbidden_flows: [platform-cross-tenant-read]
+    expected_permissions: [tenant.read, tenant.membership.manage, workspace.manage]
+  - id: platform-administrator
+    product_roles: [platform_admin, superadmin]
+    scope: platform
+    credential_ref: file:/etc/engineering-control/credentials/falcone/platform-administrator.env
+    allowed_flows: [valid-login-admin, platform-cross-tenant-read]
+    forbidden_flows: []
+    expected_permissions: [platform.read, platform.manage, cross-tenant.audit]
+  - id: developer-operator
+    product_roles: [workspace_operator, platform_operator]
+    scope: operator
+    credential_ref: file:/etc/engineering-control/credentials/falcone/developer-operator.env
+    allowed_flows: [workspace-read, integration-health]
+    forbidden_flows: [workspace-crud, tenant-admin-overview]
+    expected_permissions: [workspace.runtime.read, workload.health.read]

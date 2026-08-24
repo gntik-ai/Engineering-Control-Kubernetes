@@ -6,7 +6,17 @@ const allowedBrowsers = new Map([
   ["chromium", chromium],
   ["firefox", firefox],
 ]);
-const allowedActions = new Set(["click", "fill", "expect-url", "wait-for-text"]);
+const allowedActions = new Set([
+  "click",
+  "click-selector",
+  "fill",
+  "fill-selector",
+  "goto",
+  "expect-selector",
+  "expect-url",
+  "wait-for-text",
+  "capture",
+]);
 
 function required(name) {
   const value = process.env[name];
@@ -28,7 +38,7 @@ const target = new URL(plan.start_url);
 if (!origins.has(target.origin)) throw new Error("start_url is outside the journey allowlist");
 for (const step of plan.steps) {
   if (!allowedActions.has(step.action)) throw new Error("unsupported journey action");
-  if (step.action === "fill") {
+  if (step.action === "fill" || step.action === "fill-selector") {
     if (
       typeof step.value_from_env !== "string" ||
       !/^JOURNEY_[A-Z0-9_]+$/.test(step.value_from_env)
@@ -38,7 +48,7 @@ for (const step of plan.steps) {
     if (Object.hasOwn(step, "value")) throw new Error("literal fill values are forbidden");
   }
 }
-const usesCredentials = plan.steps.some((step) => step.action === "fill");
+const usesCredentials = plan.steps.some((step) => ["fill", "fill-selector"].includes(step.action));
 const captureVisualEvidence = !usesCredentials && plan.capture_visual_evidence !== false;
 await fs.mkdir(outputRoot, { recursive: true, mode: 0o700 });
 
@@ -88,8 +98,21 @@ try {
   for (const step of plan.steps) {
     if (step.action === "click") {
       await page.getByRole(step.role, { name: step.name }).click();
+    } else if (step.action === "click-selector") {
+      await page.locator(step.selector).click();
     } else if (step.action === "fill") {
       await page.getByLabel(step.label).fill(required(step.value_from_env));
+    } else if (step.action === "fill-selector") {
+      await page.locator(step.selector).fill(required(step.value_from_env));
+    } else if (step.action === "goto") {
+      const next = new URL(step.url);
+      if (!origins.has(next.origin)) throw new Error("goto URL is outside the journey allowlist");
+      await page.goto(next.href, {
+        waitUntil: "networkidle",
+        timeout: Math.min(Math.max(plan.timeout_ms || 30000, 1000), 120000),
+      });
+    } else if (step.action === "expect-selector") {
+      await page.locator(step.selector).waitFor();
     } else if (step.action === "expect-url") {
       const current = new URL(page.url());
       if (!origins.has(current.origin) || !current.pathname.includes(step.path_contains)) {
@@ -97,6 +120,8 @@ try {
       }
     } else if (step.action === "wait-for-text") {
       await page.getByText(step.text, { exact: Boolean(step.exact) }).waitFor();
+    } else if (step.action === "capture" && captureVisualEvidence) {
+      await page.screenshot({ path: path.join(outputRoot, `${step.name}.png`), fullPage: true });
     }
   }
   if (captureVisualEvidence) {

@@ -6,6 +6,9 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+"${SCRIPT_DIR}/verify-no-omniroute.sh" --scope worker
+
 cd /var/lib/engineering-control
 blocked=0
 

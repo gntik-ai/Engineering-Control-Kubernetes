@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from temporalio.exceptions import ApplicationError
 
@@ -103,6 +104,12 @@ class DeliveryActivityHandler:
         self.redactor = SecretRedactor()
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step == "enhancement.github_dedupe":
+            return self._dedupe_enhancement(payload)
+        if step == "enhancement.publish":
+            return self._publish_enhancement(payload)
+        if step == "finding.publish":
+            return self._publish_finding(payload)
         if step == "reconcile.inspect_ci":
             return self._inspect_ci(payload)
         if step == "reconcile.publish_promotion":
@@ -661,28 +668,337 @@ class DeliveryActivityHandler:
             raise ValueError("publication escaped its exact ChangeSet worktree")
         return resolved
 
-    def _token(self) -> str | None:
-        path = self.settings.github_token_file
+    def _dedupe_enhancement(self, payload: dict[str, Any]) -> dict[str, Any]:
+        repository = self._enhancement_repository(payload)
+        fingerprint = str(payload.get("enhancement_fingerprint", ""))
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", fingerprint):
+            raise ApplicationError(
+                "enhancement deduplication requires its deterministic fingerprint",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        token = self._credential_token(
+            self.settings.github_read_token_file,
+            self.settings.credential_root,
+            "GitHub read-only token",
+        )
+        if token is None:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED",
+            }
+        root = (self.settings.run_root / "delivery").resolve()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            result = self.runner.run(
+                "gh",
+                [
+                    "issue",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--state",
+                    "all",
+                    "--search",
+                    f'"{fingerprint}"',
+                    "--json",
+                    "number,title,url,state",
+                    "--limit",
+                    "100",
+                ],
+                cwd=root,
+                environment={"GH_TOKEN": token},
+            )
+            matches = json.loads(result.stdout)
+        except (CommandFailure, json.JSONDecodeError):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_DUPLICATE_SEARCH_FAILED",
+            }
+        if not isinstance(matches, list):
+            raise ApplicationError(
+                "GitHub enhancement search returned invalid data",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        duplicate = matches[0].get("url") if matches and isinstance(matches[0], dict) else None
+        return {
+            **payload,
+            "status": "DUPLICATE" if duplicate else "CLEAR",
+            "duplicate_issue_url": duplicate,
+            "searched_repository": repository,
+        }
+
+    def _publish_enhancement(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("approval_validated") is not True or not payload.get("approval_binding"):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "ENHANCEMENT_APPROVAL_REQUIRED",
+            }
+        repository = self._enhancement_repository(payload)
+        checkpoint = self._issue_write_checkpoint(repository)
+        if checkpoint is not None:
+            return {**payload, "status": "BLOCKED", "blocker": checkpoint}
+        token = self._credential_token(
+            self.settings.github_issue_write_token_file,
+            self.settings.credential_root,
+            "GitHub issue-write token",
+        )
+        if token is None:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_WRITE_NOT_CONFIGURED",
+            }
+        title_value = str(payload.get("proposed_outcome", "")).strip().splitlines()[0]
+        title = f"Enhancement: {title_value}"[:200]
+        if len(title_value) < 1:
+            raise ApplicationError(
+                "enhancement publication requires a proposed outcome",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        body = self._enhancement_body(payload, repository)
+        root = (self.settings.run_root / "delivery").resolve()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor, raw_path = tempfile.mkstemp(prefix="enhancement-", suffix=".md", dir=root)
+        body_path = Path(raw_path)
+        os.chmod(body_path, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(str(self.redactor.redact_text(body).value))
+            created = self.runner.run(
+                "gh",
+                [
+                    "issue",
+                    "create",
+                    "--repo",
+                    repository,
+                    "--title",
+                    title,
+                    "--body-file",
+                    str(body_path),
+                ],
+                cwd=root,
+                environment={"GH_TOKEN": token},
+            ).stdout.strip()
+        except CommandFailure:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_PUBLICATION_FAILED",
+            }
+        finally:
+            body_path.unlink(missing_ok=True)
+        if not re.fullmatch(
+            rf"https://github\.com/{re.escape(repository)}/issues/[1-9][0-9]*", created
+        ):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_PUBLICATION_RESULT_INVALID",
+            }
+        return {**payload, "status": "PUBLISHED", "issue_url": created}
+
+    def _publish_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
+        publication = payload.get("finding_publication")
+        if payload.get("status") != "PUBLICATION_READY" or not isinstance(publication, dict):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "FINDING_PUBLICATION_NOT_PREPARED",
+            }
+        repository = str(publication.get("repository", ""))
+        if repository not in {
+            "gntik-ai/falcone",
+            "gntik-ai/falcone-charts",
+            "gntik-ai/musematic",
+            "gntik-ai/musematic-deploy",
+        }:
+            raise ApplicationError(
+                "finding publication repository is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        checkpoint = self._issue_write_checkpoint(repository)
+        if checkpoint is not None:
+            return {**payload, "status": "BLOCKED", "blocker": checkpoint}
+        title = str(publication.get("title", ""))
+        body = str(publication.get("body", ""))
+        fingerprint = str(publication.get("fingerprint", ""))
+        if not title or len(title) > 200 or fingerprint not in body:
+            raise ApplicationError(
+                "finding publication body is not bound to its fingerprint",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        token = self._credential_token(
+            self.settings.github_issue_write_token_file,
+            self.settings.credential_root,
+            "GitHub issue-write token",
+        )
+        if token is None:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_WRITE_NOT_CONFIGURED",
+            }
+        root = (self.settings.run_root / "delivery").resolve()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor, raw_path = tempfile.mkstemp(prefix="finding-", suffix=".md", dir=root)
+        body_path = Path(raw_path)
+        os.chmod(body_path, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(str(self.redactor.redact_text(body).value))
+            created = self.runner.run(
+                "gh",
+                [
+                    "issue",
+                    "create",
+                    "--repo",
+                    repository,
+                    "--title",
+                    title,
+                    "--body-file",
+                    str(body_path),
+                ],
+                cwd=root,
+                environment={"GH_TOKEN": token},
+            ).stdout.strip()
+        except CommandFailure:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_PUBLICATION_FAILED",
+            }
+        finally:
+            body_path.unlink(missing_ok=True)
+        if not re.fullmatch(
+            rf"https://github\.com/{re.escape(repository)}/issues/[1-9][0-9]*", created
+        ):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_ISSUE_PUBLICATION_RESULT_INVALID",
+            }
+        return {**payload, "status": "PUBLISHED", "issue_url": created}
+
+    @staticmethod
+    def _enhancement_repository(payload: dict[str, Any]) -> str:
+        enhancement = payload.get("enhancement")
+        repository = (
+            enhancement.get("affected_repository")
+            if isinstance(enhancement, dict)
+            else payload.get("affected_repository")
+        )
+        allowed = {
+            "gntik-ai/falcone",
+            "gntik-ai/falcone-charts",
+            "gntik-ai/musematic",
+            "gntik-ai/musematic-deploy",
+        }
+        if repository not in allowed:
+            raise ApplicationError(
+                "enhancement repository is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        return str(repository)
+
+    @staticmethod
+    def _enhancement_body(payload: dict[str, Any], repository: str) -> str:
+        evidence = "\n".join(f"- `{item}`" for item in payload.get("evidence_handles", []))
+        dependencies = "\n".join(f"- {item}" for item in payload.get("dependencies", []))
+        criteria = "\n".join(f"- [ ] {item}" for item in payload.get("acceptance_criteria", []))
+        return (
+            "## Engineering Control enhancement\n\n"
+            f"- Enhancement: `{payload.get('enhancement_id')}`\n"
+            f"- Project: `{payload.get('project')}`\n"
+            f"- Persona: `{payload.get('persona')}`\n"
+            f"- Affected repository: `{repository}`\n"
+            f"- Risk: `{payload.get('risk')}`\n"
+            f"- Fingerprint: `{payload.get('enhancement_fingerprint')}`\n"
+            f"- Approval binding: `{payload.get('approval_binding')}`\n\n"
+            f"## Observed problem\n\n{payload.get('observed_problem')}\n\n"
+            f"## Current behavior\n\n{payload.get('current_behavior')}\n\n"
+            f"## Proposed outcome\n\n{payload.get('proposed_outcome')}\n\n"
+            f"## User/business value\n\n{payload.get('user_value')}\n\n"
+            f"## Success metric\n\n{payload.get('success_metric')}\n\n"
+            f"## Evidence\n\n{evidence}\n\n"
+            f"## Dependencies\n\n{dependencies or '- None identified'}\n\n"
+            "## Security and data implications\n\n"
+            f"{payload.get('security_data_implications')}\n\n"
+            f"## Acceptance criteria\n\n{criteria}\n\n"
+            f"## Rollout strategy\n\n{payload.get('rollout_strategy')}\n\n"
+            f"## Kill switch\n\n{payload.get('kill_switch') or 'Not applicable'}\n"
+        )
+
+    def _credential_token(self, path: Path | None, root_path: Path, label: str) -> str | None:
         if path is None or not path.exists():
             return None
-        root = self.settings.delivery_credential_root.resolve()
+        root = root_path.resolve()
         resolved = path.resolve()
         if not resolved.is_file() or not resolved.is_relative_to(root):
-            raise ValueError("GitHub delivery token escaped its credential root")
-        mode = resolved.stat().st_mode
-        permissions = stat.S_IMODE(mode)
-        if not stat.S_ISREG(mode) or mode & stat.S_IRWXO:
-            raise ValueError("GitHub delivery token permissions are too broad")
+            raise ValueError(f"{label} escaped its credential root")
+        metadata = resolved.stat()
+        permissions = stat.S_IMODE(metadata.st_mode)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IRWXO:
+            raise ValueError(f"{label} permissions are too broad")
         if self.settings.environment == "production":
-            metadata = resolved.stat()
             if metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640:
-                raise ValueError("production GitHub delivery token ownership is invalid")
+                raise ValueError(f"production {label} ownership is invalid")
         elif permissions not in {0o600, 0o640}:
-            raise ValueError("GitHub delivery token permissions are invalid")
+            raise ValueError(f"{label} permissions are invalid")
         token = resolved.read_text(encoding="utf-8").strip()
         if len(token) < 32:
-            raise ValueError("GitHub delivery token is invalid")
+            raise ValueError(f"{label} is invalid")
         return token
+
+    def _issue_write_checkpoint(self, repository: str) -> str | None:
+        path = self.settings.github_issue_write_validation_file
+        if not path.is_file():
+            return "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
+        root = self.settings.project_config_root.resolve().parent
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError("GitHub issue write-validation policy escaped config root")
+        metadata = resolved.stat()
+        permissions = stat.S_IMODE(metadata.st_mode)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError("GitHub issue write-validation policy permissions are unsafe")
+        if self.settings.environment == "production" and (
+            metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640
+        ):
+            raise ValueError("production GitHub issue write-validation ownership is invalid")
+        raw = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+            raise ValueError("GitHub issue write-validation policy is invalid")
+        repositories = raw.get("safe_repositories")
+        if raw.get("enabled") is not True or not isinstance(repositories, list):
+            return "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
+        allowed = {
+            "gntik-ai/falcone",
+            "gntik-ai/falcone-charts",
+            "gntik-ai/musematic",
+            "gntik-ai/musematic-deploy",
+        }
+        if any(not isinstance(item, str) or item not in allowed for item in repositories) or len(
+            repositories
+        ) != len(set(repositories)):
+            raise ValueError("GitHub issue write-validation policy has an unsafe repository")
+        if repository not in repositories:
+            return "GITHUB_ISSUE_SAFE_TARGET_NOT_CONFIGURED"
+        return None
+
+    def _token(self) -> str | None:
+        path = self.settings.github_pr_write_token_file
+        return self._credential_token(
+            path, self.settings.delivery_credential_root, "GitHub PR-write token"
+        )
 
     def _askpass(self) -> Path:
         configured = self.settings.git_askpass_executable

@@ -26,6 +26,7 @@ from engineering_control.db.models import (
     Campaign,
     ChangeSet,
     Deployment,
+    Enhancement,
     Finding,
     ProviderUsage,
     QuotaSnapshot,
@@ -73,6 +74,16 @@ class MetadataRepository(Protocol):
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
     async def list_findings(self, limit: int) -> list[dict[str, Any]]: ...
+    async def list_enhancements(
+        self, project: Project, status: str | None, limit: int
+    ) -> list[dict[str, Any]]: ...
+    async def get_enhancement(self, enhancement_id: str) -> dict[str, Any] | None: ...
+    async def approve_enhancement(
+        self, enhancement_id: str, binding: str, actor: str
+    ) -> dict[str, Any]: ...
+    async def reject_enhancement(
+        self, enhancement_id: str, reason: str, actor: str
+    ) -> dict[str, Any]: ...
     async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None: ...
     async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None: ...
     async def latest_quota_snapshots(self) -> dict[str, dict[str, Any]]: ...
@@ -125,7 +136,15 @@ class SQLMetadataRepository:
                         * len(request.lenses)
                         * len(request.environments)
                     ),
-                    metadata_json={"dry_run": request.dry_run},
+                    metadata_json={
+                        "dry_run": request.dry_run,
+                        "preset": request.preset,
+                        "environment": request.environment,
+                        "publish_findings": request.publish_findings,
+                        "snapshot_resolution": (
+                            "automatic" if request.source_sha is None else "explicit"
+                        ),
+                    },
                 )
             )
             session.add(
@@ -374,6 +393,85 @@ class SQLMetadataRepository:
                 select(Finding).order_by(Finding.created_at.desc()).limit(limit)
             ).all()
             return [serialize_row(row) for row in rows]
+
+    async def list_enhancements(
+        self, project: Project, status: str | None, limit: int
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_enhancements, project, status, limit)
+
+    def _list_enhancements(
+        self, project: Project, status: str | None, limit: int
+    ) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(Enhancement).where(Enhancement.project == project.value)
+            if status is not None:
+                query = query.where(Enhancement.status == status)
+            rows = session.scalars(query.order_by(Enhancement.created_at.desc()).limit(limit)).all()
+            return [serialize_row(row) for row in rows]
+
+    async def get_enhancement(self, enhancement_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_enhancement, enhancement_id)
+
+    def _get_enhancement(self, enhancement_id: str) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            row = session.scalar(
+                select(Enhancement).where(Enhancement.enhancement_key == enhancement_id)
+            )
+            return serialize_row(row) if row else None
+
+    async def approve_enhancement(
+        self, enhancement_id: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._approve_enhancement, enhancement_id, binding, actor)
+
+    def _approve_enhancement(self, enhancement_id: str, binding: str, actor: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            row = session.scalar(
+                select(Enhancement)
+                .where(Enhancement.enhancement_key == enhancement_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise ValueError("enhancement not found")
+            if row.status != "CANDIDATE_ENHANCEMENT":
+                raise ValueError("only a candidate enhancement can be approved")
+            if row.approval_binding_sha256 != binding:
+                raise ValueError("enhancement approval binding changed")
+            row.status = "APPROVED"
+            row.payload_json = {
+                **row.payload_json,
+                "approval": {"actor": actor, "recorded_at": datetime.now(UTC).isoformat()},
+            }
+            session.flush()
+            return serialize_row(row)
+
+    async def reject_enhancement(
+        self, enhancement_id: str, reason: str, actor: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._reject_enhancement, enhancement_id, reason, actor)
+
+    def _reject_enhancement(self, enhancement_id: str, reason: str, actor: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            row = session.scalar(
+                select(Enhancement)
+                .where(Enhancement.enhancement_key == enhancement_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise ValueError("enhancement not found")
+            if row.status not in {"CANDIDATE_ENHANCEMENT", "APPROVED"}:
+                raise ValueError("enhancement cannot be rejected from its current state")
+            row.status = "REJECTED"
+            row.payload_json = {
+                **row.payload_json,
+                "rejection": {
+                    "actor": actor,
+                    "reason": reason,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+            }
+            session.flush()
+            return serialize_row(row)
 
     async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._get_artifact, artifact_id)
@@ -829,6 +927,24 @@ class EmptyMetadataRepository:
 
     async def list_findings(self, limit: int) -> list[dict[str, Any]]:
         return []
+
+    async def list_enhancements(
+        self, project: Project, status: str | None, limit: int
+    ) -> list[dict[str, Any]]:
+        return []
+
+    async def get_enhancement(self, enhancement_id: str) -> dict[str, Any] | None:
+        return None
+
+    async def approve_enhancement(
+        self, enhancement_id: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        raise ValueError("enhancement metadata store is unavailable")
+
+    async def reject_enhancement(
+        self, enhancement_id: str, reason: str, actor: str
+    ) -> dict[str, Any]:
+        raise ValueError("enhancement metadata store is unavailable")
 
     async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None:
         return None

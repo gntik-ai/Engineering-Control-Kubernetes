@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,20 +19,92 @@ class APIModel(BaseModel):
 
 class CampaignStart(APIModel):
     project: Project
-    name: str = Field(min_length=1, max_length=200)
-    source_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
-    deployment_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
-    domains: list[CoverageSlug] = Field(min_length=1, max_length=100)
-    personas: list[CoverageSlug] = Field(min_length=1, max_length=100)
-    lenses: list[AuditLens] = Field(min_length=1, max_length=20)
-    environments: list[CoverageSlug] = Field(min_length=1, max_length=10)
+    name: str = Field(default="audit", min_length=1, max_length=200)
+    preset: (
+        Literal["snapshot", "static-full", "e2e-smoke", "full-e2e", "security", "ux", "deployment"]
+        | None
+    ) = None
+    environment: CoverageSlug | None = None
+    source_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+    deployment_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+    domains: list[CoverageSlug] = Field(default_factory=list, max_length=100)
+    personas: list[CoverageSlug] = Field(default_factory=list, max_length=100)
+    lenses: list[AuditLens] = Field(default_factory=list, max_length=20)
+    environments: list[CoverageSlug] = Field(default_factory=list, max_length=10)
     dry_run: bool = True
+    publish_findings: bool = False
 
     @model_validator(mode="after")
     def bounded_coverage_matrix(self) -> CampaignStart:
+        if self.publish_findings and self.dry_run:
+            raise ValueError("finding publication requires explicit execution mode")
+        if self.preset is not None:
+            if self.environment is None:
+                raise ValueError("preset campaigns require one environment")
+            if any((self.domains, self.personas, self.lenses, self.environments)):
+                raise ValueError("preset campaigns cannot include a free-form coverage matrix")
+            return self
+        if not all((self.source_sha, self.deployment_sha)):
+            raise ValueError("advanced campaigns require both immutable repository SHAs")
+        if not all((self.domains, self.personas, self.lenses, self.environments)):
+            raise ValueError("advanced campaigns require a complete bounded coverage matrix")
         cells = len(self.domains) * len(self.personas) * len(self.lenses) * len(self.environments)
         if cells > 100_000:
             raise ValueError("coverage matrix exceeds the 100000-cell safety bound")
+        return self
+
+
+class AuditPlanRequest(APIModel):
+    project: Project
+    preset: Literal[
+        "snapshot", "static-full", "e2e-smoke", "full-e2e", "security", "ux", "deployment"
+    ]
+    environment: CoverageSlug
+
+
+class IssueLoopStart(APIModel):
+    project: Project
+    campaign_id: UUID
+    maximum_risk: RiskClass = RiskClass.R1
+    maximum_items: int = Field(default=1, ge=1, le=50)
+    execution_mode: Literal["plan-only", "source-pr", "preview", "staging"] = "plan-only"
+    component_concurrency: int = Field(default=1, ge=1, le=8)
+    stop_policy: Literal["pause-on-blocker", "continue-eligible", "stop-on-failure"] = (
+        "pause-on-blocker"
+    )
+    dry_run: bool = True
+
+    @model_validator(mode="after")
+    def execute_is_explicit(self) -> IssueLoopStart:
+        if self.execution_mode != "plan-only" and self.dry_run:
+            raise ValueError("non-planning loop modes require explicit execution")
+        return self
+
+
+class EnhancementDiscover(APIModel):
+    project: Project
+    campaign_id: UUID
+    dry_run: bool = True
+
+
+class EnhancementApproval(APIModel):
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class EnhancementRejection(APIModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class EnhancementRun(APIModel):
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    risk: RiskClass
+    execution_mode: Literal["plan-only", "source-pr", "preview", "staging"] = "plan-only"
+    dry_run: bool = True
+
+    @model_validator(mode="after")
+    def approval_still_requires_execute(self) -> EnhancementRun:
+        if self.execution_mode != "plan-only" and self.dry_run:
+            raise ValueError("enhancement execution requires --execute")
         return self
 
 

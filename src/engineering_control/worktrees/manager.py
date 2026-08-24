@@ -234,6 +234,16 @@ class GitWorktreeManager:
             "sha": actual,
         }
 
+    def resolve_head(self, repository: str, *, base_ref: str) -> str:
+        """Resolve a freshly fetched immutable head without trusting a caller-supplied SHA."""
+        mirror = self.verify_mirror(repository)
+        self.fetch(repository)
+        fetched_ref = self._fetched_ref(base_ref)
+        actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
+        if not re.fullmatch(r"[a-f0-9]{40}", actual):
+            raise WorktreeError(f"resolved Git head is not immutable for {repository}")
+        return actual
+
     def allocate(
         self,
         *,

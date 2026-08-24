@@ -4,7 +4,7 @@ metadata:
   name: engineering-observer
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "services", "events", "namespaces"]
+    resources: ["pods", "pods/log", "services", "events", "namespaces", "configmaps"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]

@@ -13,3 +13,7 @@ class WorkflowName(StrEnum):
     QUOTA_REFRESH = "QuotaRefreshWorkflow"
     CLEANUP = "CleanupWorkflow"
     ACCEPTANCE_LIFECYCLE = "AcceptanceLifecycleWorkflow"
+    ISSUE_SOLUTION_LOOP = "IssueSolutionLoopWorkflow"
+    ENHANCEMENT_DISCOVERY = "EnhancementDiscoveryWorkflow"
+    ENHANCEMENT_DELIVERY = "EnhancementDeliveryWorkflow"
+    ENHANCEMENT_SOLUTION_LOOP = "EnhancementSolutionLoopWorkflow"

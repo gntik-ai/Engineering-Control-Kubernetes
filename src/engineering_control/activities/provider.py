@@ -54,6 +54,8 @@ class ProviderActivityHandler:
         "delivery.invoke_checker": "checker_request",
         "reconcile.invoke_release_reviewer": "release_review_request",
         "runtime.independent_review": "runtime_review_request",
+        "enhancement.discover": "discovery_request",
+        "enhancement.product_review": "product_review_request",
     }
 
     def __init__(

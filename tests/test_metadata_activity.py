@@ -575,6 +575,7 @@ async def test_delivery_transaction_routes_and_leases_both_worktrees(tmp_path: P
             database_url=f"sqlite:///{tmp_path / 'delivery.sqlite'}",
             worktree_root=worktree_root,
             state_root=tmp_path / "state",
+            project_config_root=Path(__file__).parents[1] / "config/projects",
         )
     )
     Base.metadata.create_all(handler.engine)
@@ -653,7 +654,7 @@ async def test_delivery_transaction_routes_and_leases_both_worktrees(tmp_path: P
 
     assert issue_gate["status"] == "DRY_RUN"
     assert "issue creation" in issue_gate["dry_run_summary"]
-    assert live_issue_gate["blocker"] == "GITHUB_ISSUE_CREATE_NOT_CONFIGURED"
+    assert live_issue_gate["blocker"] == "EXPLICIT_FINDING_PUBLICATION_REQUIRED"
     assert routed["maker_provider"] == "codex"
     assert routed["checker_provider"] == "claude"
     assert len(persisted["worktree_lease_ids"]) == 2

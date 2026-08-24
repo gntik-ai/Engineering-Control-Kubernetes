@@ -66,6 +66,16 @@ class FakeObserverRunner:
     def run(self, executable: str, arguments: Any, **kwargs: Any) -> CommandResult:
         assert executable == "kubectl"
         if "auth" in arguments:
+            if "can-i" in arguments:
+                index = arguments.index("can-i")
+                verb, resource = arguments[index + 1 : index + 3]
+                allowed = verb in {"get", "list", "watch"} and resource not in {
+                    "secrets",
+                    "pods/exec",
+                    "pods/attach",
+                    "pods/portforward",
+                }
+                return CommandResult(0, "yes\n" if allowed else "no\n", "")
             return CommandResult(0, "no\n", "")
         resource = arguments[arguments.index("get") + 1]
         revision = "d" * 40

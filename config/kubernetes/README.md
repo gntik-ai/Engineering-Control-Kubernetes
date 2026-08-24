@@ -5,6 +5,8 @@ ClusterRoleBinding. Bind them with a namespaced RoleBinding only after the targe
 service account are explicitly approved.
 
 - `engineering-observer` excludes Secrets and every mutation verb.
+- `falcone-observer-rbac.yaml` and `musematic-observer-rbac.yaml` bind separate identities only to
+  their manifest-declared namespaces. They are manual templates and are never applied by bootstrap.
 - `engineering-preview-releaser` is bound separately in each pre-created preview namespace.
 - `engineering-falcone-staging-releaser` is bound only in the Falcone staging namespace and uses
   `HELM_DRIVER=configmap`; it has no Secret read permission.

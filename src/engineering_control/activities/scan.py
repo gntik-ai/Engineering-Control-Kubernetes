@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -19,6 +20,8 @@ from engineering_control.adapters.command import CommandFailure, SafeCommandRunn
 from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
+from engineering_control.engineering.configuration import EngineeringCatalog
+from engineering_control.engineering.models import ProjectPairSnapshot
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.models.enums import Project, Provider, RedactionStatus
 from engineering_control.models.reconciliation import PromotionPlan
@@ -100,6 +103,12 @@ class ScanActivityHandler:
     supported_steps = frozenset(
         {
             "project.snapshot",
+            "project.snapshot_pair",
+            "deployment.compare_live",
+            "audit.static_source",
+            "audit.static_deployment",
+            "audit.kubernetes_observe",
+            "audit.correlate_runtime",
             "audit.deterministic_cell",
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
@@ -153,11 +162,27 @@ class ScanActivityHandler:
         self.promotion_runner = promotion_runner or SafeCommandRunner(
             {"git": settings.git_executable, "helm": settings.helm_executable}
         )
+        self.catalog = EngineeringCatalog(
+            project_root=settings.project_config_root,
+            persona_root=settings.persona_config_root,
+            flow_root=settings.flow_config_root,
+            credential_root=settings.credential_root,
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             if step == "project.snapshot":
                 return self._snapshot(payload)
+            if step == "project.snapshot_pair":
+                return self._snapshot_pair(payload)
+            if step in {"audit.static_source", "audit.static_deployment"}:
+                return self._static_surface(step, payload)
+            if step == "deployment.compare_live":
+                return self._compare_live(payload)
+            if step == "audit.kubernetes_observe":
+                return self._kubernetes_observe(payload)
+            if step == "audit.correlate_runtime":
+                return self._correlate_runtime(payload)
             if step == "audit.deterministic_cell":
                 return self._deterministic_cell(payload)
             if step == "finding.fresh_snapshot":
@@ -744,9 +769,13 @@ class ScanActivityHandler:
     def _snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = Project(str(payload.get("project")))
         campaign_id = UUID(str(payload.get("campaign_id")))
-        source_sha = self._sha(payload.get("source_sha"), "source_sha")
-        deployment_sha = self._sha(payload.get("deployment_sha"), "deployment_sha")
         source_repository, deployment_repository = self._repositories[project]
+        source_sha = self._optional_or_resolved_sha(
+            payload.get("source_sha"), source_repository, "source_sha"
+        )
+        deployment_sha = self._optional_or_resolved_sha(
+            payload.get("deployment_sha"), deployment_repository, "deployment_sha"
+        )
         source = self.manager.snapshot(
             source_repository,
             base_ref="refs/heads/main",
@@ -772,11 +801,241 @@ class ScanActivityHandler:
         return {
             **payload,
             "status": "SNAPSHOT_VERIFIED",
+            "campaign_id": str(campaign_id),
+            "source_sha": source_sha,
+            "deployment_sha": deployment_sha,
             "source_snapshot": source,
             "deployment_snapshot": deployment,
             "source_worktree": str(source_worktree.path),
             "deployment_worktree": str(deployment_worktree.path),
         }
+
+    def _optional_or_resolved_sha(self, value: Any, repository: str, field: str) -> str:
+        if value is None:
+            return self.manager.resolve_head(repository, base_ref="refs/heads/main")
+        return self._sha(value, field)
+
+    def _static_surface(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        snapshot = self._find_mapping(payload, "snapshot")
+        if snapshot is None:
+            raise ValueError("static audit requires the immutable paired repository snapshot")
+        source = step == "audit.static_source"
+        name = "source" if source else "deployment"
+        worktree = Path(str(snapshot[f"{name}_worktree"]))
+        sha = str(snapshot[f"{name}_sha"])
+        inspection = self.manager.inspect_snapshot(worktree, expected_sha=sha)
+        canonical = json.dumps(inspection, separators=(",", ":"), sort_keys=True).encode()
+        return {
+            **payload,
+            "status": "STATIC_SOURCE_PASS" if source else "STATIC_DEPLOYMENT_PASS",
+            f"{name}_inspection": inspection,
+            f"{name}_inspection_sha256": hashlib.sha256(canonical).hexdigest(),
+        }
+
+    def _snapshot_pair(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project = Project(str(payload.get("project")))
+        snapshot = self._find_mapping(payload, "snapshot")
+        if snapshot is None:
+            raise ValueError("paired snapshot requires both repository snapshots")
+        manifest = self.catalog.project(project.value)
+        readiness = self.catalog.credential_readiness(manifest.deployment.observer_credential_ref)
+        if not readiness.present or not readiness.permissions_valid:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "readiness": "BLOCKED_BY_CREDENTIAL",
+                "blocker": (
+                    "KUBERNETES_OBSERVER_CREDENTIAL_MISSING"
+                    if not readiness.present
+                    else "KUBERNETES_OBSERVER_CREDENTIAL_PERMISSIONS"
+                ),
+                "missing_credential_ref": readiness.reference,
+            }
+        kubeconfig = self._observer_credential(
+            Path(manifest.deployment.observer_credential_ref.removeprefix("file:"))
+        )
+        observer = KubernetesObserver(
+            self.observer_runner,
+            kubeconfig=kubeconfig,
+            context=manifest.deployment.kubernetes_context_ref,
+            working_directory=self.settings.run_root / "scan",
+        )
+        namespace = manifest.deployment.namespaces[0]
+        resources = ["deployments", "statefulsets", "pods", "events"]
+        if manifest.deployment.strategy == "argocd":
+            resources.append("applications.argoproj.io")
+        observer.verify_permissions((namespace,), tuple(resources))
+        identity = observer.identity()
+        if identity["context"] != manifest.deployment.kubernetes_context_ref:
+            raise PermissionError("observer Kubernetes context changed")
+        if identity["api_server"] != manifest.deployment.api_server_identity:
+            raise PermissionError("observer API server identity changed")
+        summaries: dict[str, Any] = {}
+        revisions: set[str] = set()
+        image_digests: set[str] = set()
+        failures: list[str] = []
+        pod_names: list[str] = []
+        helm_revisions: set[int] = set()
+        for resource in resources:
+            name = (
+                manifest.deployment.argocd_application
+                if resource == "applications.argoproj.io"
+                else None
+            )
+            observed = json.loads(observer.get(resource, namespace=namespace, name=name).stdout)
+            summary = self._summarize_runtime_resource(
+                resource,
+                observed,
+                revision_annotation=manifest.deployment.deployment_revision_annotation,
+            )
+            summaries[resource] = summary
+            revisions.update(summary["revisions"])
+            image_digests.update(summary["image_digests"])
+            failures.extend(summary["failures"])
+            if resource == "pods":
+                pod_names.extend(summary["names"][:3])
+            if manifest.deployment.helm_release_revision_annotation:
+                helm_revisions.update(
+                    self._integer_annotations(
+                        observed, manifest.deployment.helm_release_revision_annotation
+                    )
+                )
+        logs = self._bounded_redacted_logs(observer, namespace, pod_names)
+        intended_revision = str(snapshot["deployment_sha"])
+        deployed_revision = intended_revision if revisions == {intended_revision} else None
+        if deployed_revision is None:
+            return {
+                **payload,
+                "status": "LIVE_REVISION_DRIFT" if revisions else "BLOCKED",
+                "blocker": (
+                    "LIVE_REVISION_DRIFT" if revisions else "RUNTIME_DEPLOYMENT_REVISION_UNPROVEN"
+                ),
+                "intended_deployment_sha": intended_revision,
+                "observed_deployment_revisions": sorted(revisions),
+                "kubernetes_identity": identity,
+                "workload_observation": summaries,
+                "bounded_redacted_logs": logs,
+            }
+        if not image_digests:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "RUNNING_IMAGE_DIGESTS_UNPROVEN",
+                "kubernetes_identity": identity,
+                "workload_observation": summaries,
+            }
+        if manifest.deployment.strategy == "helm" and len(helm_revisions) != 1:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "HELM_RELEASE_REVISION_UNPROVEN_WITHOUT_SECRET_ACCESS",
+                "kubernetes_identity": identity,
+                "workload_observation": summaries,
+            }
+        runtime = {
+            "running_image_digests": {
+                f"image-{index}": digest for index, digest in enumerate(sorted(image_digests), 1)
+            },
+            "helm_release_revision": next(iter(helm_revisions), None),
+            "argocd_revision": (
+                deployed_revision if manifest.deployment.strategy == "argocd" else None
+            ),
+            "kubernetes_context_identity": str(identity["username"]),
+            "api_server_identity": str(identity["api_server"]),
+            "namespace": namespace,
+            "runtime_url": str(manifest.deployment.runtime_url),
+            "deployed_revision": deployed_revision,
+        }
+        pair = ProjectPairSnapshot.model_validate(
+            {
+                "schema_version": 1,
+                "project": project.value,
+                "source": {
+                    "url": str(manifest.repositories.source.url),
+                    "branch": manifest.repositories.source.default_branch,
+                    "sha": snapshot["source_sha"],
+                },
+                "deployment": {
+                    "url": str(manifest.repositories.deployment.url),
+                    "branch": manifest.repositories.deployment.default_branch,
+                    "sha": snapshot["deployment_sha"],
+                },
+                "runtime": runtime,
+                "intended_deployment_sha": intended_revision,
+                "deployment_revision_matches": True,
+                "capture_time": datetime.now(UTC),
+                "status": "PASS",
+            }
+        )
+        return {
+            **payload,
+            "status": "PAIR_SNAPSHOT_PASS" if not failures else "BLOCKED",
+            "blocker": "KUBERNETES_WORKLOAD_NOT_READY" if failures else None,
+            "pair_snapshot": pair.model_dump(mode="json"),
+            "workload_observation": summaries,
+            "bounded_redacted_logs": logs,
+        }
+
+    @staticmethod
+    def _integer_annotations(value: Any, annotation: str) -> set[int]:
+        if not isinstance(value, dict):
+            return set()
+        items = value.get("items")
+        values = items if isinstance(items, list) else [value]
+        result: set[int] = set()
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            annotations = item.get("metadata", {}).get("annotations", {})
+            candidate = annotations.get(annotation) if isinstance(annotations, dict) else None
+            if isinstance(candidate, str) and candidate.isdigit():
+                result.add(int(candidate))
+        return result
+
+    @staticmethod
+    def _bounded_redacted_logs(
+        observer: KubernetesObserver, namespace: str, pod_names: list[str]
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        redactor = SecretRedactor()
+        for pod in sorted(set(pod_names))[:3]:
+            result = observer.logs(pod, namespace=namespace, tail=100)
+            safe = str(redactor.redact_text(result.stdout[-16_384:]).value)
+            records.append(
+                {
+                    "pod": pod,
+                    "tail_lines": 100,
+                    "content": safe,
+                    "sha256": hashlib.sha256(safe.encode()).hexdigest(),
+                }
+            )
+        return records
+
+    @staticmethod
+    def _pair_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+        snapshot = payload.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        pair = snapshot.get("pair_snapshot")
+        return pair if isinstance(pair, dict) else None
+
+    def _compare_live(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pair = self._pair_from_payload(payload)
+        if pair is None or pair.get("status") != "PAIR_SNAPSHOT_PASS":
+            return {**payload, "status": "BLOCKED", "blocker": "PAIR_SNAPSHOT_NOT_PASSING"}
+        return {**payload, "status": "LIVE_DEPLOYMENT_MATCH"}
+
+    def _kubernetes_observe(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pair = self._pair_from_payload(payload)
+        if pair is None or not isinstance(pair.get("workload_observation"), dict):
+            return {**payload, "status": "BLOCKED", "blocker": "KUBERNETES_EVIDENCE_MISSING"}
+        return {**payload, "status": "KUBERNETES_OBSERVATION_PASS"}
+
+    def _correlate_runtime(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pair = self._pair_from_payload(payload)
+        if pair is None or not isinstance(pair.get("pair_snapshot"), dict):
+            return {**payload, "status": "BLOCKED", "blocker": "RUNTIME_CORRELATION_MISSING"}
+        return {**payload, "status": "RUNTIME_CORRELATION_PASS"}
 
     def _allocate(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw = self._find_mapping(payload, "allocation_request")

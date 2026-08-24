@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 from engineering_control.adapters.command import CommandResult, SafeCommandRunner
 
@@ -18,6 +20,7 @@ class KubernetesObserver:
         "jobs",
         "cronjobs",
         "events",
+        "configmaps",
         "applications.argoproj.io",
         "externalsecrets.external-secrets.io",
     }
@@ -114,6 +117,58 @@ class KubernetesObserver:
         }
         for verb, resource in sorted(cluster_forbidden):
             self._require_denied(verb, resource)
+
+        required = set(observed_resources) | {"pods", "pods/log", "events"}
+        if not required.issubset(self._resources | {"pods/log"}):
+            raise PermissionError("observer resource request is outside the read-only allowlist")
+        for namespace in namespaces:
+            for resource in sorted(required):
+                for verb in ("get", "list"):
+                    self._require_allowed(verb, resource, namespace=namespace)
+            for resource in sorted(required - {"pods/log"}):
+                self._require_allowed("watch", resource, namespace=namespace)
+            for subresource in ("pods/exec", "pods/attach", "pods/portforward"):
+                self._require_denied("create", subresource, namespace=namespace)
+
+    def identity(self) -> dict[str, Any]:
+        """Return non-secret context, API server, and authenticated subject identity."""
+        configuration = self.runner.run(
+            "kubectl",
+            [*self._base(), "config", "view", "--minify", "--output", "json"],
+            cwd=self.working_directory,
+        )
+        value = json.loads(configuration.stdout)
+        clusters = value.get("clusters") if isinstance(value, dict) else None
+        contexts = value.get("contexts") if isinstance(value, dict) else None
+        if not isinstance(clusters, list) or len(clusters) != 1:
+            raise PermissionError("observer API server identity could not be proven")
+        cluster = clusters[0].get("cluster") if isinstance(clusters[0], dict) else None
+        server = cluster.get("server") if isinstance(cluster, dict) else None
+        if not isinstance(server, str) or not server.startswith("https://"):
+            raise PermissionError("observer API server identity is invalid")
+        if not isinstance(contexts, list) or len(contexts) != 1:
+            raise PermissionError("observer context identity could not be proven")
+        whoami = self.runner.run(
+            "kubectl",
+            [*self._base(), "auth", "whoami", "--output", "json"],
+            cwd=self.working_directory,
+        )
+        subject = json.loads(whoami.stdout)
+        username = subject.get("status", {}).get("userInfo", {}).get("username")
+        if not isinstance(username, str) or not username:
+            raise PermissionError("observer authenticated subject could not be proven")
+        return {"context": self.context, "api_server": server, "username": username}
+
+    def _require_allowed(self, verb: str, resource: str, *, namespace: str | None = None) -> None:
+        arguments = self._base() + ["auth", "can-i", verb, resource]
+        if namespace is not None:
+            arguments.extend(("--namespace", namespace))
+        result = self.runner.run("kubectl", arguments, cwd=self.working_directory, check=False)
+        if result.stdout.strip().lower() != "yes":
+            location = f" in {namespace}" if namespace is not None else " cluster-wide"
+            raise PermissionError(
+                f"observer credential lacks required access: {verb} {resource}{location}"
+            )
 
     def _require_denied(self, verb: str, resource: str, *, namespace: str | None = None) -> None:
         arguments = self._base() + ["auth", "can-i", verb, resource]

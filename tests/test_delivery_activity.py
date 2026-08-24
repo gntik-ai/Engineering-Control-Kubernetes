@@ -120,7 +120,7 @@ async def test_delivery_publishes_exact_heads_as_draft_prs_without_merging(
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             delivery_credential_root=credential_root,
-            github_token_file=token_file,
+            github_pr_write_token_file=token_file,
             git_askpass_executable=askpass,
         ),
         runner,  # type: ignore[arg-type]
@@ -166,7 +166,7 @@ async def test_delivery_rejects_non_executable_askpass_helper(tmp_path: Path) ->
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             delivery_credential_root=credential_root,
-            github_token_file=token_file,
+            github_pr_write_token_file=token_file,
             git_askpass_executable=askpass,
         ),
         runner,  # type: ignore[arg-type]
@@ -206,7 +206,7 @@ async def test_source_only_publication_binds_deferred_deployment(tmp_path: Path)
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             delivery_credential_root=credential_root,
-            github_token_file=token_file,
+            github_pr_write_token_file=token_file,
             git_askpass_executable=askpass,
         ),
         runner,  # type: ignore[arg-type]
@@ -217,3 +217,104 @@ async def test_source_only_publication_binds_deferred_deployment(tmp_path: Path)
     assert result["status"] == "SOURCE_PRS_CREATED"
     assert [item["repository_slug"] for item in result["publication_results"]] == ["falcone"]
     assert runner.pushes == ["falcone"]
+
+
+@pytest.mark.asyncio
+async def test_finding_publication_fails_closed_without_write_validation(
+    tmp_path: Path,
+) -> None:
+    config_root = tmp_path / "config"
+    (config_root / "projects.d").mkdir(parents=True)
+    handler = DeliveryActivityHandler(
+        Settings(
+            project_config_root=config_root / "projects.d",
+            github_issue_write_validation_file=(
+                config_root / "policy/github-issue-write-validation.yaml"
+            ),
+            run_root=tmp_path / "runs",
+        ),
+        FakePublicationRunner("main", {}),  # type: ignore[arg-type]
+    )
+
+    result = await handler.handle(
+        "finding.publish",
+        {
+            "status": "PUBLICATION_READY",
+            "finding_publication": {
+                "repository": "gntik-ai/falcone",
+                "title": "Synthetic finding",
+                "body": "Fingerprint: sha256:" + "a" * 64,
+                "fingerprint": "sha256:" + "a" * 64,
+            },
+        },
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_enhancement_publication_honors_disabled_write_validation(
+    tmp_path: Path,
+) -> None:
+    config_root = tmp_path / "config"
+    (config_root / "projects.d").mkdir(parents=True)
+    policy = config_root / "policy/github-issue-write-validation.yaml"
+    policy.parent.mkdir()
+    policy.write_text(
+        "schema_version: 1\nenabled: false\nsafe_repositories: []\n",
+        encoding="utf-8",
+    )
+    policy.chmod(0o600)
+    handler = DeliveryActivityHandler(
+        Settings(
+            project_config_root=config_root / "projects.d",
+            github_issue_write_validation_file=policy,
+            run_root=tmp_path / "runs",
+        ),
+        FakePublicationRunner("main", {}),  # type: ignore[arg-type]
+    )
+
+    result = await handler.handle(
+        "enhancement.publish",
+        {
+            "approval_validated": True,
+            "approval_binding": "sha256:" + "b" * 64,
+            "affected_repository": "gntik-ai/musematic",
+        },
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_finding_publication_rejects_unsafe_write_validation_target(
+    tmp_path: Path,
+) -> None:
+    config_root = tmp_path / "config"
+    (config_root / "projects.d").mkdir(parents=True)
+    policy = config_root / "policy/github-issue-write-validation.yaml"
+    policy.parent.mkdir()
+    policy.write_text(
+        "schema_version: 1\nenabled: true\nsafe_repositories:\n  - outside/target\n",
+        encoding="utf-8",
+    )
+    policy.chmod(0o600)
+    handler = DeliveryActivityHandler(
+        Settings(
+            project_config_root=config_root / "projects.d",
+            github_issue_write_validation_file=policy,
+            run_root=tmp_path / "runs",
+        ),
+        FakePublicationRunner("main", {}),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError, match="unsafe repository"):
+        await handler.handle(
+            "finding.publish",
+            {
+                "status": "PUBLICATION_READY",
+                "finding_publication": {"repository": "gntik-ai/falcone"},
+            },
+        )

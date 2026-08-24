@@ -28,8 +28,8 @@ class Campaign(UUIDPrimaryKey, Timestamps, Base):
     project: Mapped[str] = mapped_column(String(32), index=True)
     name: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(64), index=True)
-    source_sha: Mapped[str] = mapped_column(String(40))
-    deployment_sha: Mapped[str] = mapped_column(String(40))
+    source_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    deployment_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
     required_cells: Mapped[int] = mapped_column(Integer, default=0)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
@@ -39,8 +39,10 @@ class CoverageCell(UUIDPrimaryKey, Timestamps, Base):
     campaign_id: Mapped[UUID] = mapped_column(
         Uuid, ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
     )
+    repository_surface: Mapped[str] = mapped_column(String(32), default="source")
     domain: Mapped[str] = mapped_column(String(120))
     persona: Mapped[str] = mapped_column(String(120))
+    flow: Mapped[str] = mapped_column(String(120), default="repository-static")
     lens: Mapped[str] = mapped_column(String(64))
     environment: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(64), index=True)
@@ -50,7 +52,14 @@ class CoverageCell(UUIDPrimaryKey, Timestamps, Base):
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     __table_args__ = (
         UniqueConstraint(
-            "campaign_id", "domain", "persona", "lens", "environment", name="uq_coverage_cell"
+            "campaign_id",
+            "repository_surface",
+            "domain",
+            "persona",
+            "flow",
+            "lens",
+            "environment",
+            name="uq_coverage_cell",
         ),
     )
 
@@ -328,9 +337,47 @@ class WorkerHeartbeat(UUIDPrimaryKey, Timestamps, Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class ProjectSnapshot(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "project_snapshots"
+    campaign_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("campaigns.id"), index=True)
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    source_sha: Mapped[str] = mapped_column(String(40), index=True)
+    deployment_sha: Mapped[str] = mapped_column(String(40), index=True)
+    live_revision: Mapped[str | None] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class SolutionLoop(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "solution_loops"
+    workflow_id: Mapped[str] = mapped_column(String(240), unique=True, index=True)
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    campaign_id: Mapped[str | None] = mapped_column(String(240), index=True)
+    execution_mode: Mapped[str] = mapped_column(String(32))
+    maximum_risk: Mapped[str] = mapped_column(String(8))
+    maximum_items: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class Enhancement(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "enhancements"
+    enhancement_key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    campaign_id: Mapped[str] = mapped_column(String(240), index=True)
+    persona: Mapped[str] = mapped_column(String(120))
+    affected_repository: Mapped[str] = mapped_column(String(200))
+    risk_class: Mapped[str] = mapped_column(String(8), index=True)
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    approval_binding_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 Index("ix_runs_active", Run.status, Run.project)
 Index("ix_change_sets_project_state", ChangeSet.project, ChangeSet.state)
 Index("ix_findings_project_disposition", Finding.project, Finding.disposition)
+Index("ix_enhancements_project_status", Enhancement.project, Enhancement.status)
 Index(
     "uq_component_leases_active_key",
     ComponentLease.component_key,

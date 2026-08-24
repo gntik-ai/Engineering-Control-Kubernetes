@@ -14,6 +14,7 @@ from engineering_control.security.redaction import SecretRedactor
 
 from .browser import BrowserActivityHandler
 from .delivery import DeliveryActivityHandler
+from .engineering import EngineeringActivityHandler
 from .metadata import MetadataActivityHandler
 from .preview_cleanup import PreviewCleanupActivityHandler
 from .provider import ProviderActivityHandler
@@ -27,6 +28,9 @@ class ControlActivities:
 
     _allowed_steps = {
         "project.snapshot",
+        "project.snapshot_pair",
+        "project.persist_snapshot",
+        "campaign.plan",
         "campaign.persist_coverage",
         "campaign.persist_snapshot_blockers",
         "campaign.persist_cell_blocker",
@@ -35,6 +39,17 @@ class ControlActivities:
         "audit.agent_cell",
         "campaign.persist_cell_result",
         "campaign.finalize",
+        "deployment.render",
+        "deployment.compare_live",
+        "audit.static_source",
+        "audit.static_deployment",
+        "audit.api_flow",
+        "audit.browser_flow",
+        "audit.kubernetes_observe",
+        "audit.correlate_runtime",
+        "audit.classify_candidate",
+        "audit.discover_enhancements",
+        "audit.verify_cleanup",
         "finding.fresh_snapshot",
         "finding.load_candidate",
         "finding.prepare_verifier",
@@ -42,6 +57,9 @@ class ControlActivities:
         "finding.controls",
         "finding.dedupe",
         "finding.finalize",
+        "finding.prepare_publication",
+        "finding.publish",
+        "finding.persist_publication",
         "finding.record_terminal",
         "agent.record_start",
         "agent.persist_result",
@@ -123,6 +141,27 @@ class ControlActivities:
         "cleanup.execute_preview_namespaces",
         "cleanup.execute_metadata",
         "cleanup.finalize",
+        "loop.load_selection",
+        "loop.acquire_component",
+        "loop.record_skip",
+        "loop.record_blocker",
+        "loop.record_item",
+        "loop.release_component",
+        "loop.finalize",
+        "enhancement.load_evidence",
+        "enhancement.prepare_discovery",
+        "enhancement.discover",
+        "enhancement.validate_evidence",
+        "enhancement.dedupe",
+        "enhancement.github_dedupe",
+        "enhancement.product_review",
+        "enhancement.persist",
+        "enhancement.load_approved",
+        "enhancement.create_openspec",
+        "enhancement.publication_dry_run",
+        "enhancement.publish",
+        "enhancement.persist_publication",
+        "enhancement.prepare_solution",
     }
     _mutation_steps = {
         "preview.deploy",
@@ -137,12 +176,19 @@ class ControlActivities:
         "cleanup.execute_metadata",
         "reconcile.apply_promotion",
         "reconcile.publish_promotion",
+        "enhancement.publish",
     }
 
     _worker_steps = {
         "controller": _allowed_steps
         - {
             "project.snapshot",
+            "project.snapshot_pair",
+            "deployment.compare_live",
+            "audit.static_source",
+            "audit.static_deployment",
+            "audit.kubernetes_observe",
+            "audit.correlate_runtime",
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
@@ -160,6 +206,7 @@ class ControlActivities:
             "cleanup.inspect_preview_namespaces",
             "cleanup.execute_preview_namespaces",
             "preview.preflight",
+            "deployment.render",
             "audit.agent_cell",
             "delivery.invoke_spec",
             "delivery.invoke_maker",
@@ -172,6 +219,8 @@ class ControlActivities:
             "reconcile.publish_promotion",
             "quota.refresh",
             "runtime.browser_checks",
+            "audit.api_flow",
+            "audit.browser_flow",
             "staging.preflight",
             "preview.deploy",
             "preview.verify",
@@ -180,6 +229,12 @@ class ControlActivities:
         },
         "scan": {
             "project.snapshot",
+            "project.snapshot_pair",
+            "deployment.compare_live",
+            "audit.static_source",
+            "audit.static_deployment",
+            "audit.kubernetes_observe",
+            "audit.correlate_runtime",
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
@@ -202,6 +257,8 @@ class ControlActivities:
             "runtime.independent_review",
             "cleanup.inspect_codex_files",
             "cleanup.execute_codex_files",
+            "enhancement.discover",
+            "enhancement.product_review",
         },
         "claude": {
             "audit.agent_cell",
@@ -213,9 +270,13 @@ class ControlActivities:
             "reconcile.invoke_release_reviewer",
             "quota.refresh",
             "runtime.independent_review",
+            "enhancement.discover",
+            "enhancement.product_review",
         },
         "browser": {
             "runtime.browser_checks",
+            "audit.api_flow",
+            "audit.browser_flow",
             "cleanup.inspect_browser_files",
             "cleanup.execute_browser_files",
         },
@@ -223,9 +284,13 @@ class ControlActivities:
             "delivery.publish",
             "reconcile.inspect_ci",
             "reconcile.publish_promotion",
+            "enhancement.publish",
+            "enhancement.github_dedupe",
+            "finding.publish",
         },
         "release": {
             "preview.preflight",
+            "deployment.render",
             "staging.preflight",
             "preview.deploy",
             "preview.verify",
@@ -268,6 +333,9 @@ class ControlActivities:
         )
         self.preview_cleanup_handler = (
             PreviewCleanupActivityHandler(settings) if self.worker_kind == "release" else None
+        )
+        self.engineering_handler = (
+            EngineeringActivityHandler(settings) if self.worker_kind == "controller" else None
         )
 
     @activity.defn(name="execute_control_step")
@@ -327,6 +395,11 @@ class ControlActivities:
             return await self.provider_handler.handle(step, safe_payload)
         if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:
             return await self.metadata_handler.handle(step, safe_payload)
+        if (
+            self.engineering_handler is not None
+            and step in self.engineering_handler.supported_steps
+        ):
+            return await self.engineering_handler.handle(step, safe_payload)
         if self.browser_handler is not None:
             return await self.browser_handler.handle(step, safe_payload)
         if self.delivery_handler is not None:
@@ -385,6 +458,18 @@ class ControlActivities:
             result["campaign_id"] = payload.get("campaign_id") or str(uuid4())
         if step == "delivery.load_confirmed_finding":
             result["change_set_id"] = str(uuid4())
+        if step == "loop.load_selection":
+            result["items"] = [
+                {
+                    "finding_id": str(uuid4()),
+                    "risk_class": payload.get("maximum_risk", "R1"),
+                    "component": f"{payload.get('project', 'falcone')}:synthetic",
+                }
+            ]
+        if step == "enhancement.load_approved":
+            result["status"] = "APPROVED"
+            result.setdefault("project", "falcone")
+            result.setdefault("campaign_id", "synthetic-campaign")
         if step == "delivery.route_providers":
             result["maker_provider"] = "codex"
             result["checker_provider"] = "claude"

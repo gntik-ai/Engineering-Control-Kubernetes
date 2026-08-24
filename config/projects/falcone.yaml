@@ -1,38 +1,68 @@
-version: 1
+schema_version: 1
 project: falcone
-source:
-  repository: gntik-ai/falcone
-  default_branch: main
-  discovered_controller_path: /home/hermes/projects/falcone
-  discovered_head: 3ecc86496e6fa121910471f893a44017aa75fb78
+api_url: https://baas.musematic.ai
+repositories:
+  source:
+    full_name: gntik-ai/falcone
+    url: https://github.com/gntik-ai/falcone.git
+    mirror: /srv/engineering/mirrors/falcone.git
+    default_branch: main
+    issue_repository: gntik-ai/falcone
+  deployment:
+    full_name: gntik-ai/falcone-charts
+    url: https://github.com/gntik-ai/falcone-charts.git
+    mirror: /srv/engineering/mirrors/falcone-charts.git
+    default_branch: main
+    issue_repository: gntik-ai/falcone-charts
 deployment:
-  repository: gntik-ai/falcone-charts
-  default_branch: main
   strategy: helm
-  discovered_controller_path: /home/hermes/projects/falcone-charts
-  discovered_head: 95dd05540ae04815051c77ecf2a426d27af4f373
-  adapter: engineering_control.adapters.falcone.release.FalconeHelmAdapter
-  required_gates:
-    - chart-lint
-    - chart-template
-    - immutable-image-digests
-    - migration-parity
-    - real-backup-evidence-when-required
-    - independent-release-review
-    - immutable-approval-binding
-  prohibited:
-    - fake-backup-evidence
-    - migration-safety-bypass
-    - llm-direct-helm
-components:
-  - falcone:control-plane
-  - falcone:gateway
-  - falcone:web-console
-  - falcone:charts:staging
-security_blockers:
-  - id: SECURITY_BLOCKER_KUBERNETES_CLUSTER_ADMIN_IDENTITY
-    write_enablement: false
-    remediation: provision scoped observer and Falcone release identities
+  adapter: falcone
+  chart_repository: deployment
+  chart_path: charts/in-falcone
+  values_paths: [charts/in-falcone/values.yaml]
+  secret_bearing_values_paths: []
+  build_workflows:
+    - repository: gntik-ai/falcone
+      workflow: release-images.yml
+      exact_sha_input: false
+      immutable_digest_output: false
+      enabled: false
+      blocker: FALCONE_EXACT_SHA_CANDIDATE_CONTRACT_MISSING
+  image_repositories:
+    control-plane: ghcr.io/gntik-ai/in-falcone-control-plane
+    control-plane-executor: ghcr.io/gntik-ai/in-falcone-control-plane-executor
+    web-console: ghcr.io/gntik-ai/in-falcone-web-console
+    function-runtime: ghcr.io/gntik-ai/in-falcone-fn-runtime
+    workflow-worker: ghcr.io/gntik-ai/in-falcone-workflow-worker
+    mcp-runtime: ghcr.io/gntik-ai/in-falcone-mcp-runtime
+  runtime_url: https://baas.musematic.ai
+  helm_release: falcone
+  argocd_application: null
+  kubernetes_context_ref: falcone-observer
+  api_server_identity: https://178.104.182.200:6443
+  namespaces: [in-falcone-staging]
+  observer_credential_ref: file:/etc/engineering-control/credentials/falcone/observer.kubeconfig
+  deployment_revision_annotation: engineering.gntik.ai/deployment-sha
+  helm_release_revision_annotation: engineering.gntik.ai/helm-release-revision
+  preview_policy:
+    enabled: false
+    isolated_target_required: true
+    namespace_prefix: falcone-preview-
+    approval_required: true
+    credential_ref: file:/etc/engineering-control/credentials/falcone/preview-releaser.kubeconfig
+    blocker: FALCONE_DISPOSABLE_PREVIEW_TARGET_MISSING
+  staging_policy:
+    enabled: false
+    production: false
+    approval_required: true
+    credential_ref: file:/etc/engineering-control/credentials/falcone/staging-releaser.kubeconfig
+    blocker: FALCONE_SCOPED_STAGING_RELEASER_AND_REPOSITORY_VALUES_MISSING
+source_test_commands:
+  - [corepack, pnpm, test]
+  - [corepack, pnpm, --dir, apps/web-console, test]
+deployment_test_commands:
+  - [helm, lint, charts/in-falcone]
+  - [helm, template, engineering-render, charts/in-falcone, --namespace, in-falcone-staging]
 delivery_control:
   source_ci_workflow: ci
   candidate_build:
@@ -47,8 +77,7 @@ delivery_control:
     enabled: true
     deployment_file: charts/in-falcone/values/staging.yaml
     chart_directory: charts/in-falcone
-    values_files:
-      - charts/in-falcone/values/staging.yaml
+    values_files: [charts/in-falcone/values/staging.yaml]
     component_lease: falcone:charts:staging
     image_repositories:
       control-plane: ghcr.io/gntik-ai/in-falcone-control-plane

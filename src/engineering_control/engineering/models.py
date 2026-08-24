@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import StrEnum
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+
+Slug = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,119}$")]
+GitSHA = Annotated[str, Field(pattern=r"^[a-f0-9]{40}$")]
+Digest = Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
+RepositoryName = Annotated[
+    str,
+    Field(pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy)$"),
+]
+CredentialReference = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^file:/etc/engineering-control/credentials/"
+            r"[a-z0-9-]+/[a-z0-9][a-z0-9._-]*\.(env|token|kubeconfig)$"
+        )
+    ),
+]
+
+
+class EngineeringModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ReadinessStatus(StrEnum):
+    OPERATIONAL = "OPERATIONAL"
+    AVAILABLE_UNTESTED = "AVAILABLE_UNTESTED"
+    BLOCKED_BY_CREDENTIAL = "BLOCKED_BY_CREDENTIAL"
+    DISABLED = "DISABLED"
+    NOT_INSTALLED = "NOT_INSTALLED"
+
+
+class DiscoveryStatus(StrEnum):
+    DISCOVERED_ON_DISK = "DISCOVERED_ON_DISK"
+    LOADED_BY_RUNTIME = "LOADED_BY_RUNTIME"
+    EXPOSED_THROUGH_TELEGRAM = "EXPOSED_THROUGH_TELEGRAM"
+    OPERATIONAL_END_TO_END = "OPERATIONAL_END_TO_END"
+    BLOCKED_BY_CREDENTIAL = "BLOCKED_BY_CREDENTIAL"
+    DISABLED = "DISABLED"
+
+
+class RepositoryManifest(EngineeringModel):
+    full_name: RepositoryName
+    url: HttpUrl
+    mirror: str = Field(pattern=r"^/srv/engineering/mirrors/[a-z0-9-]+\.git$")
+    default_branch: Literal["main"]
+    issue_repository: RepositoryName
+
+
+class RepositoryPair(EngineeringModel):
+    source: RepositoryManifest
+    deployment: RepositoryManifest
+
+    @model_validator(mode="after")
+    def pair_is_distinct(self) -> RepositoryPair:
+        if self.source.full_name == self.deployment.full_name:
+            raise ValueError("source and deployment repositories must be distinct")
+        return self
+
+
+class BuildWorkflow(EngineeringModel):
+    repository: RepositoryName
+    workflow: str = Field(pattern=r"^[A-Za-z0-9._-]+\.ya?ml$")
+    exact_sha_input: bool
+    immutable_digest_output: bool
+    enabled: bool = False
+    blocker: str | None = Field(default=None, pattern=r"^[A-Z0-9_]+$")
+
+
+class PreviewPolicy(EngineeringModel):
+    enabled: bool = False
+    isolated_target_required: bool = True
+    namespace_prefix: str | None = Field(default=None, pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?-$")
+    approval_required: bool = True
+    credential_ref: CredentialReference | None = None
+    blocker: str | None = Field(default=None, pattern=r"^[A-Z0-9_]+$")
+
+
+class StagingPolicy(EngineeringModel):
+    enabled: bool = False
+    production: Literal[False] = False
+    approval_required: bool = True
+    credential_ref: CredentialReference | None = None
+    blocker: str = Field(pattern=r"^[A-Z0-9_]+$")
+
+
+class DeploymentManifest(EngineeringModel):
+    strategy: Literal["helm", "argocd"]
+    adapter: Literal["falcone", "musematic"]
+    chart_repository: Literal["source", "deployment"]
+    chart_path: str = Field(pattern=r"^[A-Za-z0-9._/-]+$")
+    values_paths: list[str] = Field(default_factory=list, max_length=10)
+    secret_bearing_values_paths: list[str] = Field(default_factory=list, max_length=10)
+    build_workflows: list[BuildWorkflow] = Field(min_length=1, max_length=10)
+    image_repositories: dict[Slug, str] = Field(min_length=1, max_length=20)
+    runtime_url: HttpUrl
+    helm_release: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
+    argocd_application: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
+    kubernetes_context_ref: str = Field(pattern=r"^[a-z0-9-]+$")
+    api_server_identity: str = Field(pattern=r"^https://[^\s]+$")
+    namespaces: list[str] = Field(min_length=1, max_length=10)
+    observer_credential_ref: CredentialReference
+    deployment_revision_annotation: str = Field(
+        pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?/[A-Za-z0-9]([-.A-Za-z0-9]*[A-Za-z0-9])?$"
+    )
+    helm_release_revision_annotation: str | None = Field(
+        default=None,
+        pattern=(
+            r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?/"
+            r"[A-Za-z0-9]([-.A-Za-z0-9]*[A-Za-z0-9])?$"
+        ),
+    )
+    preview_policy: PreviewPolicy
+    staging_policy: StagingPolicy
+
+    @model_validator(mode="after")
+    def strategy_contract(self) -> DeploymentManifest:
+        if self.strategy == "helm" and not self.helm_release:
+            raise ValueError("Helm strategy requires helm_release")
+        if self.strategy == "argocd" and not self.argocd_application:
+            raise ValueError("Argo CD strategy requires argocd_application")
+        overlap = set(self.values_paths) & set(self.secret_bearing_values_paths)
+        if overlap:
+            raise ValueError("secret-bearing values paths cannot be normal render inputs")
+        return self
+
+
+class ProjectManifest(EngineeringModel):
+    schema_version: Literal[1]
+    project: Literal["falcone", "musematic"]
+    repositories: RepositoryPair
+    api_url: HttpUrl
+    deployment: DeploymentManifest
+    delivery_control: dict[str, object]
+    source_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
+    deployment_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
+
+    @field_validator("source_test_commands", "deployment_test_commands")
+    @classmethod
+    def fixed_commands(cls, commands: list[list[str]]) -> list[list[str]]:
+        forbidden = {"sh", "bash", "zsh", "fish", "ssh", "kubectl", "argocd"}
+        for command in commands:
+            if not command or len(command) > 20 or command[0] in forbidden:
+                raise ValueError("test commands must use fixed non-shell executables")
+            if any("\n" in argument or "\x00" in argument for argument in command):
+                raise ValueError("test command arguments must be single bounded values")
+        return commands
+
+
+class Persona(EngineeringModel):
+    id: Slug
+    product_roles: list[str] = Field(default_factory=list, max_length=20)
+    scope: Literal["public", "platform", "tenant", "workspace", "personal", "operator"]
+    credential_ref: CredentialReference | None = None
+    allowed_flows: list[Slug] = Field(min_length=1, max_length=50)
+    forbidden_flows: list[Slug] = Field(default_factory=list, max_length=50)
+    expected_permissions: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def anonymous_has_no_credential(self) -> Persona:
+        if self.id == "anonymous" and self.credential_ref is not None:
+            raise ValueError("anonymous persona cannot have a credential reference")
+        if self.id != "anonymous" and self.credential_ref is None:
+            raise ValueError("authenticated personas require a credential reference")
+        return self
+
+
+class PersonaManifest(EngineeringModel):
+    schema_version: Literal[1]
+    project: Literal["falcone", "musematic"]
+    personas: list[Persona] = Field(min_length=3, max_length=30)
+
+    @model_validator(mode="after")
+    def minimum_lanes(self) -> PersonaManifest:
+        ids = {persona.id for persona in self.personas}
+        required = {"anonymous", "standard-user", "privileged-admin"}
+        if not required.issubset(ids):
+            raise ValueError("persona catalog lacks the minimum E2E lanes")
+        if len(ids) != len(self.personas):
+            raise ValueError("persona IDs must be unique")
+        return self
+
+
+class FlowStep(EngineeringModel):
+    channel: Literal["browser", "api"]
+    action: Literal[
+        "navigate",
+        "request",
+        "fill-credential",
+        "fill-generated",
+        "click",
+        "assert-visible",
+        "assert-status",
+        "assert-url",
+        "capture",
+    ]
+    target: str = Field(min_length=1, max_length=500)
+    method: Literal["GET", "POST", "PATCH", "PUT", "DELETE"] | None = None
+    expected_status: int | None = Field(default=None, ge=100, le=599)
+    value_ref: str | None = Field(default=None, max_length=120)
+    body_template: dict[str, object] | None = None
+
+    @field_validator("target")
+    @classmethod
+    def no_script_target(cls, value: str) -> str:
+        if "\n" in value or value.startswith(("javascript:", "file:", "data:")):
+            raise ValueError("flow targets cannot contain script or local-file URLs")
+        return value
+
+    @model_validator(mode="after")
+    def request_contract(self) -> FlowStep:
+        if self.action == "request":
+            if self.method is None or self.expected_status is None:
+                raise ValueError("API requests require an explicit method and expected status")
+        elif self.method is not None or self.body_template is not None:
+            raise ValueError("HTTP method/body are only valid for API request steps")
+        if self.body_template is not None and self.method not in {"POST", "PATCH", "PUT", "DELETE"}:
+            raise ValueError("request bodies are limited to explicit mutating methods")
+        return self
+
+
+class RetryPolicy(EngineeringModel):
+    maximum_attempts: int = Field(default=2, ge=1, le=3)
+    backoff_seconds: int = Field(default=2, ge=0, le=30)
+
+
+class E2EFlow(EngineeringModel):
+    schema_version: Literal[1]
+    id: Slug
+    project: Literal["falcone", "musematic"]
+    persona: Slug
+    category: Literal[
+        "public",
+        "authentication",
+        "standard-user",
+        "admin",
+        "authorization",
+        "integrations",
+    ]
+    purpose: str = Field(min_length=1, max_length=500)
+    preconditions: list[str] = Field(default_factory=list, max_length=30)
+    steps: list[FlowStep] = Field(min_length=1, max_length=100)
+    expected_result: str = Field(min_length=1, max_length=1000)
+    positive_controls: list[str] = Field(min_length=1, max_length=30)
+    negative_controls: list[str] = Field(min_length=1, max_length=30)
+    resources_created: list[str] = Field(default_factory=list, max_length=30)
+    cleanup_instructions: list[str] = Field(default_factory=list, max_length=30)
+    safe_target_requirements: list[str] = Field(min_length=1, max_length=30)
+    evidence_requirements: list[str] = Field(min_length=1, max_length=30)
+    timeout_seconds: int = Field(default=300, ge=10, le=1800)
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    mutation: Literal["non-mutating", "disposable"]
+
+    @model_validator(mode="after")
+    def cleanup_required_for_mutation(self) -> E2EFlow:
+        if self.mutation == "disposable":
+            if not self.resources_created or not self.cleanup_instructions:
+                raise ValueError("disposable flows require resources and cleanup")
+            if not any("e2e-<campaign-id>-" in item for item in self.resources_created):
+                raise ValueError("disposable resources require the campaign prefix")
+        return self
+
+
+class RepositorySnapshot(EngineeringModel):
+    url: HttpUrl
+    branch: Literal["main"]
+    sha: GitSHA
+
+
+class RuntimeSnapshot(EngineeringModel):
+    running_image_digests: dict[str, Digest] = Field(min_length=1, max_length=100)
+    helm_release_revision: int | None = Field(default=None, ge=1)
+    argocd_revision: GitSHA | None = None
+    kubernetes_context_identity: str = Field(min_length=1, max_length=253)
+    api_server_identity: str = Field(pattern=r"^https://[^\s]+$")
+    namespace: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    runtime_url: HttpUrl
+    deployed_revision: GitSHA
+
+
+class ProjectPairSnapshot(EngineeringModel):
+    schema_version: Literal[1]
+    project: Literal["falcone", "musematic"]
+    source: RepositorySnapshot
+    deployment: RepositorySnapshot
+    runtime: RuntimeSnapshot
+    intended_deployment_sha: GitSHA
+    deployment_revision_matches: bool
+    capture_time: datetime
+    status: Literal["PASS", "LIVE_REVISION_DRIFT"]
+
+    @model_validator(mode="after")
+    def fail_closed_drift(self) -> ProjectPairSnapshot:
+        matches = self.runtime.deployed_revision == self.intended_deployment_sha
+        if self.deployment_revision_matches != matches:
+            raise ValueError("deployment match flag does not reflect the immutable SHAs")
+        if matches != (self.status == "PASS"):
+            raise ValueError("snapshot status must fail closed on deployment drift")
+        return self
+
+
+class CredentialReadiness(EngineeringModel):
+    reference: CredentialReference
+    present: bool
+    permissions_valid: bool
+    blocker: Literal["MISSING", "PERMISSIONS", "NONE"]
+
+
+class CampaignPlan(EngineeringModel):
+    project: Literal["falcone", "musematic"]
+    preset: Literal[
+        "snapshot", "static-full", "e2e-smoke", "full-e2e", "security", "ux", "deployment"
+    ]
+    environment: Slug
+    repository_pair: RepositoryPair
+    repository_surfaces: list[Literal["source", "deployment", "pair", "runtime"]]
+    personas: list[Slug]
+    flows: list[Slug]
+    lenses: list[Slug]
+    mutating_flows: list[Slug]
+    credential_readiness: list[CredentialReadiness]
+    kubernetes_readiness: ReadinessStatus
+    estimated_model_allocation: dict[Literal["codex", "claude"], int]
+    blockers: list[str]
+
+
+class EnhancementStatus(StrEnum):
+    CANDIDATE_ENHANCEMENT = "CANDIDATE_ENHANCEMENT"
+    EVIDENCE_VALIDATED = "EVIDENCE_VALIDATED"
+    DUPLICATE = "DUPLICATE"
+    PRODUCT_REVIEWED = "PRODUCT_REVIEWED"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    PUBLISHED = "PUBLISHED"
+    DELIVERY_ACTIVE = "DELIVERY_ACTIVE"
+    DELIVERED = "DELIVERED"
+
+
+class EnhancementRecord(EngineeringModel):
+    enhancement_id: str = Field(pattern=r"^enh-[a-f0-9]{16,64}$")
+    project: Literal["falcone", "musematic"]
+    campaign_id: str = Field(min_length=1, max_length=200)
+    persona: Slug
+    observed_problem: str = Field(min_length=1, max_length=2000)
+    current_behavior: str = Field(min_length=1, max_length=2000)
+    evidence_handles: list[str] = Field(min_length=1, max_length=50)
+    proposed_outcome: str = Field(min_length=1, max_length=2000)
+    user_value: str = Field(min_length=1, max_length=2000)
+    success_metric: str = Field(min_length=1, max_length=1000)
+    affected_repository: RepositoryName
+    dependencies: list[str] = Field(default_factory=list, max_length=50)
+    security_data_implications: str = Field(min_length=1, max_length=2000)
+    risk: Literal["R0", "R1", "R2", "R3"]
+    acceptance_criteria: list[str] = Field(min_length=1, max_length=50)
+    rollout_strategy: str = Field(min_length=1, max_length=2000)
+    kill_switch: str | None = Field(default=None, max_length=1000)
+    status: EnhancementStatus = EnhancementStatus.CANDIDATE_ENHANCEMENT
+    approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class EnhancementProposal(EngineeringModel):
+    persona: Slug
+    observed_problem: str = Field(min_length=1, max_length=2000)
+    current_behavior: str = Field(min_length=1, max_length=2000)
+    evidence_handles: list[str] = Field(min_length=1, max_length=50)
+    proposed_outcome: str = Field(min_length=1, max_length=2000)
+    user_value: str = Field(min_length=1, max_length=2000)
+    success_metric: str = Field(min_length=1, max_length=1000)
+    affected_repository: RepositoryName
+    dependencies: list[str] = Field(default_factory=list, max_length=50)
+    security_data_implications: str = Field(min_length=1, max_length=2000)
+    risk: Literal["R0", "R1", "R2", "R3"]
+    acceptance_criteria: list[str] = Field(min_length=1, max_length=50)
+    rollout_strategy: str = Field(min_length=1, max_length=2000)
+    kill_switch: str | None = Field(default=None, max_length=1000)
