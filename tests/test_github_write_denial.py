@@ -6,7 +6,9 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from temporalio import workflow
 from temporalio.converter import DataConverter
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 from engineering_control.activities.core import ControlActivities
 from engineering_control.activities.delivery import DeliveryActivityHandler
@@ -20,6 +22,7 @@ from engineering_control.policy.github_write import (
 )
 from engineering_control.validation.github_write import (
     DENIAL_ACCEPTANCE_STATUS,
+    GitHubWriteDenialAcceptanceWorkflow,
     classify_write_denial,
 )
 from engineering_control.workflows import definitions
@@ -350,3 +353,11 @@ def test_acceptance_harness_requires_exact_safe_denial_and_one_activity_start() 
             classify_write_denial(unsafe, activity_starts=1)
     with pytest.raises(RuntimeError, match="unconsumed or retried"):
         classify_write_denial(result, activity_starts=2)
+
+
+@pytest.mark.asyncio
+async def test_write_denial_acceptance_workflow_validates_in_default_temporal_sandbox() -> None:
+    runner = SandboxedWorkflowRunner()
+    definition = workflow._Definition.must_from_class(GitHubWriteDenialAcceptanceWorkflow)
+
+    runner.prepare_workflow(definition)
