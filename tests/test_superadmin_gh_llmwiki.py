@@ -196,6 +196,69 @@ async def test_superadmin_session_material_is_ephemeral_and_redacted() -> None:
     assert redactor.redact_text(secret).value == secret
 
 
+@pytest.mark.asyncio
+async def test_falcone_documented_platform_roles_prove_superadmin() -> None:
+    secret = secrets.token_urlsafe(32)
+    refresh = secrets.token_urlsafe(32)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "sessionId": "bounded-session",
+                    "tokenSet": {"accessToken": secret, "refreshToken": refresh},
+                    "principal": {"platformRoles": ["superadmin"]},
+                },
+            )
+        return httpx.Response(200, json={"status": "accepted"})
+
+    adapter = SuperadminSessionAdapter(
+        redactor=SecretRedactor(), transport=httpx.MockTransport(handler)
+    )
+    credential = SuperadminCredential(
+        project="falcone",
+        base_url="https://staging.example.invalid",
+        username="superadmin-test",
+        password=secrets.token_urlsafe(32),
+    )
+
+    async with adapter.login(credential) as session:
+        assert session.superadmin_role_valid is True
+
+
+@pytest.mark.asyncio
+async def test_falcone_platform_roles_reject_non_superadmin() -> None:
+    secret = secrets.token_urlsafe(32)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "sessionId": "bounded-session",
+                    "tokenSet": {"accessToken": secret},
+                    "principal": {"platformRoles": ["tenant_admin"]},
+                },
+            )
+        return httpx.Response(200, json={"status": "accepted"})
+
+    adapter = SuperadminSessionAdapter(
+        redactor=SecretRedactor(), transport=httpx.MockTransport(handler)
+    )
+    credential = SuperadminCredential(
+        project="falcone",
+        base_url="https://staging.example.invalid",
+        username="tenant-admin-test",
+        password=secrets.token_urlsafe(32),
+    )
+
+    with pytest.raises(ApplicationError) as error:
+        async with adapter.login(credential):
+            pass
+    assert error.value.type == "SUPERADMIN_ROLE_INVALID"
+
+
 class _PersonaAdmin:
     def __init__(
         self,

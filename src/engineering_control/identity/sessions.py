@@ -180,6 +180,16 @@ class SuperadminSessionAdapter:
     @staticmethod
     def _superadmin_role(value: dict[str, Any]) -> bool:
         roles: list[str] = []
+        role_containers = {
+            "role",
+            "roles",
+            "authority",
+            "authorities",
+            # Falcone's documented ConsoleSessionPrincipal field. Keep this
+            # explicit: accepting arbitrary fields would weaken role proof.
+            "platformroles",
+            "platform_roles",
+        }
 
         def walk(item: Any, key: str = "") -> None:
             if isinstance(item, dict):
@@ -188,12 +198,7 @@ class SuperadminSessionAdapter:
             elif isinstance(item, list):
                 for nested in item:
                     walk(nested, key)
-            elif isinstance(item, str) and key.lower() in {
-                "role",
-                "roles",
-                "authority",
-                "authorities",
-            }:
+            elif isinstance(item, str) and key.lower() in role_containers:
                 roles.append(item.lower())
 
         walk(value)
