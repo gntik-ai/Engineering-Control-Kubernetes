@@ -28,7 +28,8 @@ ReadinessReference = Annotated[
         pattern=(
             r"^(?:file:/etc/engineering-control/credentials/[a-z0-9-]+/"
             r"[a-z0-9][a-z0-9._-]*\.(?:env|token|kubeconfig)|"
-            r"worker-attestation:(?:falcone|musematic)-superadmin)$"
+            r"worker-attestation:(?:(?:falcone|musematic)-superadmin|"
+            r"(?:falcone|musematic|llmwiki)-observer))$"
         )
     ),
 ]

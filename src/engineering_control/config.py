@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     credential_root: Path = Path("/etc/engineering-control/credentials")
     credential_attestation_root: Path = Path("/var/lib/engineering-control/attestations")
     browser_worker_identity: str = "browser-runner@hermes-worker"
+    scan_worker_identity: str = "scan-runner@hermes-worker"
     engineering_profile_manifest: Path = Path(
         "/opt/engineering-agent-pack/source/profiles/engineering.yaml"
     )

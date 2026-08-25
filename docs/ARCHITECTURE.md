@@ -28,7 +28,9 @@ Trust boundaries:
 - `browser-runner` receives journey credentials by protected file handle, never prompt text.
 - `scan-runner` owns canonical mirrors, deterministic scanners, a contents-read-only Git token for
   private mirrors, and a separate read-only observer kubeconfig that is programmatically rejected
-  if it can read Secrets or mutate workloads.
+  if it can read Secrets or mutate workloads. Plan-only and execution workflows ask that worker
+  for a short-lived, secret-free observer attestation; the controller never stats, reads, or copies
+  the worker kubeconfig.
 - `delivery-runner` may push only exact validated ChangeSet heads and create draft PRs for the
   configured repository pair. It cannot merge, deploy, or read either model provider home.
 - The controller-only `engineering-github-worker` runs as `hermes` and uses that identity's

@@ -39,7 +39,6 @@ from engineering_control.db.repository import (
     MetadataRepository,
     SQLMetadataRepository,
 )
-from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project
 from engineering_control.observability.metrics import ControlPlaneMetrics
@@ -96,14 +95,6 @@ def create_app(
     control_dependency = Depends(control)
     metadata_dependency = Depends(metadata)
     control_metrics = ControlPlaneMetrics()
-    engineering_catalog = EngineeringCatalog(
-        project_root=resolved.project_config_root,
-        persona_root=resolved.persona_config_root,
-        flow_root=resolved.flow_config_root,
-        credential_root=resolved.credential_root,
-        attestation_root=resolved.credential_attestation_root,
-        browser_worker_identity=resolved.browser_worker_identity,
-    )
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
@@ -127,11 +118,10 @@ def create_app(
     async def audit_plan(
         body: AuditPlanRequest,
         _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
     ) -> dict[str, Any]:
         try:
-            return engineering_catalog.plan(
-                body.project.value, body.preset, body.environment
-            ).model_dump(mode="json")
+            return await service.plan_campaign(body)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 

@@ -10,6 +10,14 @@ from engineering_control.db.repository import EmptyMetadataRepository
 
 
 class FakeService:
+    async def plan_campaign(self, request: Any) -> dict[str, Any]:
+        return {
+            "project": request.project.value,
+            "preset": request.preset,
+            "environment": request.environment,
+            "blockers": [],
+        }
+
     async def start_campaign(self, request: Any) -> OperationAccepted:
         return OperationAccepted(workflow_id="audit-test", run_id="run-test")
 

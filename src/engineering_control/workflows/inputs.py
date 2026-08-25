@@ -19,6 +19,7 @@ class AuditCampaignInput:
     environments: list[str] = field(default_factory=list)
     dry_run: bool = True
     publish_findings: bool = False
+    plan_only: bool = False
     application_data_mutation_approved: bool = False
     campaign_id: str | None = None
     cell_offset: int = 0

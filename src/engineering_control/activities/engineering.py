@@ -14,7 +14,9 @@ from engineering_control.db import models as db
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import EnhancementProposal
 from engineering_control.identity.attestation import (
+    ObserverReadinessAttestation,
     SuperadminReadinessAttestation,
+    observer_contract_hash,
     superadmin_contract_hash,
 )
 from engineering_control.models.core import AgentRequest
@@ -62,6 +64,7 @@ class EngineeringActivityHandler:
             credential_root=settings.credential_root,
             attestation_root=settings.credential_attestation_root,
             browser_worker_identity=settings.browser_worker_identity,
+            scan_worker_identity=settings.scan_worker_identity,
         )
         database_url = settings.database_url.get_secret_value()
         engine_options: dict[str, Any] = {"pool_pre_ping": True}
@@ -106,6 +109,37 @@ class EngineeringActivityHandler:
                 value["blockers"] = [item for item in value["blockers"] if reference not in item]
                 if not attestation.ready():
                     value["blockers"].append(f"CREDENTIAL:{reference}:{attestation.blocker_code}")
+            raw_observer_attestation = payload.get("observer_attestation")
+            if isinstance(raw_observer_attestation, dict):
+                observer_attestation = ObserverReadinessAttestation.model_validate(
+                    raw_observer_attestation
+                )
+                project = str(payload.get("project"))
+                if (
+                    observer_attestation.project != project
+                    or observer_attestation.worker_identity != self.settings.scan_worker_identity
+                    or observer_attestation.contract_hash != observer_contract_hash(project)
+                ):
+                    raise ValueError("worker observer attestation authority mismatch")
+                reference = f"worker-attestation:{project}-observer"
+                for item in value["credential_readiness"]:
+                    if item["reference"] == reference:
+                        item.update(
+                            present=observer_attestation.file_present,
+                            permissions_valid=observer_attestation.permissions_valid,
+                            worker_attested=observer_attestation.ready(),
+                            blocker=(
+                                "NONE" if observer_attestation.ready() else "ATTESTATION_INVALID"
+                            ),
+                        )
+                value["blockers"] = [item for item in value["blockers"] if reference not in item]
+                if observer_attestation.ready():
+                    value["kubernetes_readiness"] = "OPERATIONAL"
+                else:
+                    value["kubernetes_readiness"] = "BLOCKED_BY_CREDENTIAL"
+                    value["blockers"].append(
+                        f"CREDENTIAL:{reference}:{observer_attestation.blocker_code}"
+                    )
             value["domains"] = self._domains(str(payload.get("preset", "snapshot")))
             return {**payload, **value, "status": "PLANNED"}
         if step == "project.persist_snapshot":

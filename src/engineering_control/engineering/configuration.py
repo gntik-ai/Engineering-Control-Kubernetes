@@ -108,6 +108,7 @@ class EngineeringCatalog:
         credential_root: Path = Path("/etc/engineering-control/credentials"),
         attestation_root: Path = Path("/var/lib/engineering-control/attestations"),
         browser_worker_identity: str = "browser-runner@hermes-worker",
+        scan_worker_identity: str = "scan-runner@hermes-worker",
     ) -> None:
         self.project_root = project_root
         self.persona_root = persona_root
@@ -115,6 +116,7 @@ class EngineeringCatalog:
         self.credential_root = credential_root.resolve()
         self.attestation_root = attestation_root.resolve()
         self.browser_worker_identity = browser_worker_identity
+        self.scan_worker_identity = scan_worker_identity
 
     def project(self, project: str) -> ProjectManifest:
         return ProjectManifest.model_validate(self._yaml(self.project_root / f"{project}.yaml"))
@@ -162,7 +164,7 @@ class EngineeringCatalog:
             authority = personas.identity_authority
             readiness.append(self.superadmin_readiness(authority))
         requires_runtime = "runtime" in policy["surfaces"]
-        observer = self.credential_readiness(manifest.deployment.observer_credential_ref)
+        observer = self.observer_readiness(project)
         if requires_runtime:
             readiness.append(observer)
         blockers = [
@@ -267,6 +269,54 @@ class EngineeringCatalog:
             reference=reference,
             present=True,
             permissions_valid=True,
+            worker_attested=attestation.ready(),
+            blocker="NONE" if attestation.ready() else "ATTESTATION_INVALID",
+        )
+
+    def observer_readiness(self, project: str) -> CredentialReadiness:
+        reference = f"worker-attestation:{project}-observer"
+        path = (self.attestation_root / f"{project}-observer.json").resolve()
+        if not path.is_relative_to(self.attestation_root) or not path.is_file():
+            return CredentialReadiness(
+                reference=reference,
+                present=False,
+                permissions_valid=False,
+                worker_attested=False,
+                blocker="ATTESTATION_MISSING",
+            )
+        try:
+            from engineering_control.identity.attestation import (
+                ObserverReadinessAttestation,
+                observer_contract_hash,
+            )
+
+            value = json.loads(path.read_text(encoding="utf-8"))
+            attestation = ObserverReadinessAttestation.model_validate(value)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return CredentialReadiness(
+                reference=reference,
+                present=True,
+                permissions_valid=False,
+                worker_attested=False,
+                blocker="ATTESTATION_INVALID",
+            )
+        if (
+            attestation.project != project
+            or attestation.worker_identity != self.scan_worker_identity
+            or attestation.contract_hash != observer_contract_hash(project)
+            or not attestation.current()
+        ):
+            return CredentialReadiness(
+                reference=reference,
+                present=True,
+                permissions_valid=False,
+                worker_attested=False,
+                blocker="ATTESTATION_STALE",
+            )
+        return CredentialReadiness(
+            reference=reference,
+            present=attestation.file_present,
+            permissions_valid=attestation.permissions_valid,
             worker_attested=attestation.ready(),
             blocker="NONE" if attestation.ready() else "ATTESTATION_INVALID",
         )

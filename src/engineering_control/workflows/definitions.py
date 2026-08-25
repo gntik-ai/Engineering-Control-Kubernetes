@@ -216,6 +216,7 @@ class ControlledWorkflow:
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
+            "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
         }:
@@ -327,7 +328,13 @@ class AuditCampaignWorkflow(ControlledWorkflow):
             plan_payload["worker_attestation"] = await self._step(
                 "identity.superadmin_attest", {"project": authority}
             )
+        if request.preset != "static-full":
+            plan_payload["observer_attestation"] = await self._step(
+                "identity.observer_attest", {"project": request.project}
+            )
         plan = await self._step("campaign.plan", plan_payload)
+        if request.plan_only:
+            return plan
         repository_surfaces = request.repository_surfaces or list(
             plan.get("repository_surfaces", [])
         )

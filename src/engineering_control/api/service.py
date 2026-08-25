@@ -9,6 +9,7 @@ from temporalio.client import Client
 from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
     ApprovalRecord,
+    AuditPlanRequest,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
@@ -23,6 +24,7 @@ from engineering_control.api.schemas import (
     RuntimeVerificationStart,
 )
 from engineering_control.db.repository import MetadataRepository
+from engineering_control.engineering.models import CampaignPlan
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
@@ -43,6 +45,7 @@ from engineering_control.workflows.names import WorkflowName
 
 
 class ControlService(Protocol):
+    async def plan_campaign(self, request: AuditPlanRequest) -> dict[str, Any]: ...
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted: ...
     async def start_delivery(self, request: DeliveryStart) -> OperationAccepted: ...
     async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted: ...
@@ -86,6 +89,27 @@ class TemporalControlService:
         self.task_queue = task_queue
         self.repository = repository
         self.acceptance_activity_task_queue = acceptance_activity_task_queue
+
+    async def plan_campaign(self, request: AuditPlanRequest) -> dict[str, Any]:
+        value = await self.client.execute_workflow(
+            WorkflowName.AUDIT_CAMPAIGN.value,
+            AuditCampaignInput(
+                project=request.project.value,
+                name=f"{request.preset}-{request.environment}-plan",
+                preset=request.preset,
+                environment=request.environment,
+                dry_run=True,
+                plan_only=True,
+            ),
+            id=f"audit-plan-{request.project.value}-{uuid4()}",
+            task_queue=self.task_queue,
+        )
+        if not isinstance(value, dict):
+            raise RuntimeError("audit plan workflow returned an invalid result")
+        fields = CampaignPlan.model_fields
+        return CampaignPlan.model_validate({field: value[field] for field in fields}).model_dump(
+            mode="json"
+        )
 
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted:
         campaign_id = uuid4()

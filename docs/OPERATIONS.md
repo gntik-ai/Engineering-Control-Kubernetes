@@ -37,6 +37,15 @@ ssh worker 'systemctl status engineering-worker@codex engineering-worker@claude 
 ssh worker 'journalctl -u engineering-worker@codex -n 100 --no-pager'
 ```
 
+`/audit-plan` is a real plan-only Temporal execution. Runtime presets obtain bounded
+`identity.superadmin_attest` and `identity.observer_attest` results from the browser and scan
+workers before returning readiness. The observer result contains booleans, contract binding,
+worker identity, timestamp, TTL, and blocker code only. It contains no kubeconfig path, cluster
+subject, authentication material, or Secret data. Observer files remain worker-only and must be
+either private to the scan worker (`0600`) or `root`-owned and group-readable only by the effective
+scan-worker group (`0640`). Missing, stale, wrong-worker, wrong-target, overprivileged, or insecure
+observer credentials fail closed before an audit proceeds.
+
 All logs are structured and redacted. Run context fields are campaign ID, ChangeSet ID, run ID,
 project, role, provider, and worker. Metrics are available only on the authenticated loopback API
 listener at `/internal/metrics`. They are derived from PostgreSQL and include active campaigns,

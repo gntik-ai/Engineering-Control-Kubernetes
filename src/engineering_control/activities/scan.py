@@ -23,6 +23,7 @@ from engineering_control.config import Settings
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import ProjectPairSnapshot
 from engineering_control.evidence.transfer import EvidencePublisher
+from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
 from engineering_control.models.reconciliation import PromotionPlan
 from engineering_control.security.redaction import SecretRedactor
@@ -118,6 +119,7 @@ class ScanActivityHandler:
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "runtime.deterministic_checks",
+            "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
             "reconcile.apply_promotion",
@@ -196,6 +198,8 @@ class ScanActivityHandler:
                 return self._delivery_prechecks(payload)
             if step == "runtime.deterministic_checks":
                 return self._runtime_deterministic_checks(payload)
+            if step == "identity.observer_attest":
+                return self._observer_attestation(payload)
             if step == "cleanup.protect_active":
                 return self._protect_cleanup_candidates(payload)
             if step == "cleanup.execute":
@@ -620,13 +624,107 @@ class ScanActivityHandler:
 
     def _observer_credential(self, path: Path) -> Path:
         root = self.settings.observer_credential_root.resolve()
+        if path.is_symlink():
+            raise ValueError("observer kubeconfig must not be a symlink")
         resolved = path.resolve()
         if not resolved.is_file() or not resolved.is_relative_to(root):
             raise ValueError("observer kubeconfig escaped its credential root")
-        mode = resolved.stat().st_mode
-        if not stat.S_ISREG(mode) or mode & (stat.S_IRWXG | stat.S_IRWXO):
+        metadata = resolved.stat()
+        effective_groups = {os.getegid(), *os.getgroups()}
+        if not self._observer_mode_valid(
+            metadata,
+            effective_uid=os.geteuid(),
+            effective_groups=effective_groups,
+        ):
             raise ValueError("observer kubeconfig permissions are too broad")
         return resolved
+
+    @staticmethod
+    def _observer_mode_valid(
+        metadata: os.stat_result, *, effective_uid: int, effective_groups: set[int]
+    ) -> bool:
+        mode = stat.S_IMODE(metadata.st_mode)
+        if not stat.S_ISREG(metadata.st_mode):
+            return False
+        owner_private = metadata.st_uid == effective_uid and mode == 0o600
+        root_group_read = (
+            metadata.st_uid == 0 and metadata.st_gid in effective_groups and mode == 0o640
+        )
+        return owner_private or root_group_read
+
+    def _observer_attestation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project_value = str(payload.get("project"))
+        if project_value not in {"falcone", "musematic", "llmwiki"}:
+            raise ValueError("observer attestation project is invalid")
+        manifest = self.catalog.project(project_value)
+        raw_path = Path(manifest.deployment.observer_credential_ref.removeprefix("file:"))
+        checked = datetime.now(UTC).isoformat()
+        base = {
+            "project": project_value,
+            "contract_id": f"{project_value}-observer",
+            "worker_identity": f"scan-runner@{os.uname().nodename}",
+            "checked_timestamp": checked,
+            "attestation_ttl_seconds": 300,
+            "contract_hash": observer_contract_hash(project_value),
+        }
+        file_present = raw_path.is_file() and not raw_path.is_symlink()
+        try:
+            kubeconfig = self._observer_credential(raw_path)
+        except (OSError, ValueError):
+            return {
+                **base,
+                "file_present": file_present,
+                "parser_valid": False,
+                "target_valid": False,
+                "permissions_valid": False,
+                "secret_access_denied": False,
+                "mutation_access_denied": False,
+                "blocker_code": (
+                    "OBSERVER_FILE_PERMISSIONS" if file_present else "OBSERVER_CREDENTIAL_MISSING"
+                ),
+            }
+
+        observer = KubernetesObserver(
+            self.observer_runner,
+            kubeconfig=kubeconfig,
+            context=manifest.deployment.kubernetes_context_ref,
+            working_directory=self.settings.run_root / "scan",
+        )
+        try:
+            primary_namespace = manifest.deployment.namespaces[0]
+            observer.verify_permissions(
+                (primary_namespace,), ("deployments", "statefulsets", "pods", "events")
+            )
+            for namespace in manifest.deployment.namespaces[1:]:
+                observer.verify_permissions((namespace,), ("pods", "events"))
+            if manifest.deployment.argocd_application:
+                observer.verify_permissions(("argocd",), ("applications.argoproj.io",))
+            identity = observer.identity()
+        except (CommandFailure, PermissionError, ValueError, json.JSONDecodeError):
+            return {
+                **base,
+                "file_present": True,
+                "parser_valid": False,
+                "target_valid": False,
+                "permissions_valid": False,
+                "secret_access_denied": False,
+                "mutation_access_denied": False,
+                "blocker_code": "OBSERVER_AUTHORIZATION_INVALID",
+            }
+        target_valid = (
+            identity.get("context") == manifest.deployment.kubernetes_context_ref
+            and identity.get("api_server") == manifest.deployment.api_server_identity
+        )
+        return {
+            **base,
+            "file_present": True,
+            "parser_valid": True,
+            "target_valid": target_valid,
+            "permissions_valid": True,
+            "secret_access_denied": True,
+            "mutation_access_denied": True,
+            "blocker_code": "NONE" if target_valid else "OBSERVER_TARGET_INVALID",
+        }
 
     @staticmethod
     def _summarize_runtime_resource(
