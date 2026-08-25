@@ -89,12 +89,18 @@ install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"
 install -d -o root -g engineering-control -m 0750 "${LOG_ROOT}"
 install -d -o engineering-control -g engineering-control -m 0750 "${STATE_ROOT}" \
   "${STATE_ROOT}/leases"
+setfacl -m u:hermes:--x "${STATE_ROOT}"
+install -d -o root -g root -m 0711 "${STATE_ROOT}/workers"
+install -d -o hermes -g hermes -m 0700 "${STATE_ROOT}/workers/github"
 install -d -o root -g root -m 0700 "${STATE_ROOT}/postgresql"
 chown 70:70 "${STATE_ROOT}/postgresql"
 install -d -o root -g root -m 0711 "${PLATFORM_ROOT}"
 install -d -o engineering-control -g engineering-control -m 0750 \
   "${PLATFORM_ROOT}/mirrors" "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
+setfacl -m u:hermes:rwx \
+  "${PLATFORM_ROOT}/mirrors" "${PLATFORM_ROOT}/worktrees" \
+  "${PLATFORM_ROOT}/runs" "${PLATFORM_ROOT}/tmp"
 install -d -o engineering-control -g engineering-control -m 0750 \
   "${PLATFORM_ROOT}/tmp/acceptance"
 
@@ -271,10 +277,36 @@ if ! grep -q '^ENGINEERING_AGENT_PACK_ROOT=' "${CONFIG_ROOT}/env/control.env"; t
   printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' \
     "${AGENT_PACK_INSTALL_ROOT}" >>"${CONFIG_ROOT}/env/control.env"
 fi
+if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]; then
+  {
+    printf 'ENGINEERING_ENVIRONMENT=production\n'
+    printf 'ENGINEERING_TEMPORAL_TARGET=127.0.0.1:7233\n'
+    printf 'ENGINEERING_TEMPORAL_NAMESPACE=engineering-control\n'
+    printf 'ENGINEERING_GITHUB_EXECUTABLE=/usr/bin/gh\n'
+    printf 'ENGINEERING_GITHUB_AUTHENTICATED_HOME=/home/hermes\n'
+    printf 'ENGINEERING_GITHUB_WRITES_ENABLED=false\n'
+    printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
+    printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
+    printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
+  } >"${CONFIG_ROOT}/env/github-worker.env"
+fi
+if grep -Eiq '^ENGINEERING_GITHUB_WRITES_ENABLED=(1|true|yes|on)$' \
+  "${CONFIG_ROOT}/env/github-worker.env"; then
+  echo "Refusing to install GitHub worker with write policy enabled" >&2
+  exit 1
+fi
+if ! grep -q '^ENGINEERING_GITHUB_WRITES_ENABLED=' \
+  "${CONFIG_ROOT}/env/github-worker.env"; then
+  printf 'ENGINEERING_GITHUB_WRITES_ENABLED=false\n' \
+    >>"${CONFIG_ROOT}/env/github-worker.env"
+fi
+chown root:hermes "${CONFIG_ROOT}/env/github-worker.env"
+chmod 0640 "${CONFIG_ROOT}/env/github-worker.env"
 for unit in engineering-infrastructure.service engineering-migrate.service \
   engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service \
-  engineering-notifier.service engineering-acceptance-worker.service; do
+  engineering-notifier.service engineering-acceptance-worker.service \
+  engineering-github-worker.service; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
   install -o root -g root -m 0644 \
@@ -291,7 +323,11 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-temporal-worker.service \
   /etc/systemd/system/engineering-scheduler.service \
   /etc/systemd/system/engineering-notifier.service \
-  /etc/systemd/system/engineering-acceptance-worker.service
+  /etc/systemd/system/engineering-acceptance-worker.service \
+  /etc/systemd/system/engineering-github-worker.service
+"${INSTALL_ROOT}/venv/bin/python" \
+  "${RELEASE_ROOT}/source/scripts/verify-worker-registry.py" --host controller \
+  --write-policy "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml"
 "${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope controller
 systemctl daemon-reload
 systemctl enable engineering-infrastructure.service
@@ -299,10 +335,10 @@ systemctl restart engineering-infrastructure.service
 systemctl restart engineering-migrate.service
 systemctl enable engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
-  engineering-acceptance-worker.service
+  engineering-acceptance-worker.service engineering-github-worker.service
 systemctl restart engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
-  engineering-acceptance-worker.service
+  engineering-acceptance-worker.service engineering-github-worker.service
 
 "${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope controller
 

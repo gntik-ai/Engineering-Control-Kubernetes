@@ -331,6 +331,13 @@ class ControlActivities:
         "synthetic": _allowed_steps,
     }
 
+    @classmethod
+    def steps_for_worker(cls, worker_kind: str) -> frozenset[str]:
+        try:
+            return frozenset(cls._worker_steps[worker_kind])
+        except KeyError as error:
+            raise ValueError(f"unknown worker kind: {worker_kind}") from error
+
     def __init__(self, settings: Settings, worker_kind: str | None = None) -> None:
         self.settings = settings
         self.worker_kind = worker_kind or settings.worker_kind

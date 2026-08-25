@@ -32,13 +32,20 @@ runuser -u hermes -- env \
   /home/hermes/.hermes/hermes-agent/venv/bin/python \
   /opt/engineering-control/source/scripts/verify-hermes-runtime.py
 
-services=(engineering-infrastructure engineering-migrate engineering-api engineering-evidence-ingest engineering-temporal-worker engineering-scheduler engineering-notifier engineering-acceptance-worker)
+services=(engineering-infrastructure engineering-migrate engineering-api engineering-evidence-ingest engineering-temporal-worker engineering-scheduler engineering-notifier engineering-acceptance-worker engineering-github-worker)
 for service in "${services[@]}"; do
   systemctl is-active --quiet "${service}.service" || {
     echo "FAIL service ${service}" >&2
     exit 1
   }
 done
+/opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/verify-worker-registry.py --host controller \
+  --write-policy /etc/engineering-control/policy/github-issue-write-validation.yaml
+runuser -u hermes -- env -i \
+  HOME=/home/hermes PATH=/usr/local/bin:/usr/bin:/bin \
+  /opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/validate-gh-cli-broker.py
 for service in "${services[@]}"; do
   cmp -s "/etc/engineering-control/systemd/${service}.service" \
     "/etc/systemd/system/${service}.service"

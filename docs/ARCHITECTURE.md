@@ -10,6 +10,7 @@ Telegram user (allowlist)
   -> Engineering API 127.0.0.1:8740
   -> Temporal frontend 127.0.0.1/10.10.0.2:7233
   -> control workflow worker
+       -> engineering-github task queue on controller (typed gh broker as hermes)
        -> engineering-scan / codex / claude / browser / delivery / release task queues on worker
        -> evidence ingest 10.10.0.2:8750 (identity-bound upload tokens, 32 MiB/artifact)
   -> PostgreSQL 127.0.0.1:55432
@@ -30,6 +31,10 @@ Trust boundaries:
   if it can read Secrets or mutate workloads.
 - `delivery-runner` may push only exact validated ChangeSet heads and create draft PRs for the
   configured repository pair. It cannot merge, deploy, or read either model provider home.
+- The controller-only `engineering-github-worker` runs as `hermes` and uses that identity's
+  existing authenticated `gh` store in place. Its `engineering-github` queue accepts only typed
+  broker activities. It cannot extract tokens, execute arbitrary `gh`/`gh api`, read provider or
+  Kubernetes credential paths, or enable GitHub writes through its unit configuration.
 - `release-runner` receives only scoped release plans and release credentials. It has no model
   home or prompt-driven execution.
 - Each worker identity receives its own upload-scoped evidence token; producer impersonation is

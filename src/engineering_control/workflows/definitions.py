@@ -26,6 +26,12 @@ from engineering_control.workflows.inputs import (
     RuntimeVerificationInput,
     StagingDeploymentInput,
 )
+from engineering_control.workflows.worker_registry import (
+    CONTROL_TASK_QUEUE,
+    GITHUB_TASK_QUEUE,
+    provider_task_queue,
+    task_queue_for,
+)
 
 ACTIVITY_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
@@ -168,15 +174,15 @@ class ControlledWorkflow:
     @classmethod
     def _activity_queue(cls, step: str, payload: dict[str, Any]) -> str:
         if step in {"cleanup.inspect_evidence_files", "cleanup.execute_evidence_files"}:
-            return "engineering-control"
+            return CONTROL_TASK_QUEUE
         if step in {"cleanup.inspect_delivery_files", "cleanup.execute_delivery_files"}:
-            return "engineering-delivery"
+            return task_queue_for("delivery")
         if step in {"cleanup.inspect_browser_files", "cleanup.execute_browser_files"}:
-            return "engineering-browser"
+            return task_queue_for("browser")
         if step in {"cleanup.inspect_codex_files", "cleanup.execute_codex_files"}:
-            return "engineering-codex"
+            return task_queue_for("codex")
         if step in {"cleanup.inspect_preview_namespaces", "cleanup.execute_preview_namespaces"}:
-            return "engineering-release"
+            return task_queue_for("release")
         if step in {
             "project.snapshot",
             "project.snapshot_pair",
@@ -194,11 +200,15 @@ class ControlledWorkflow:
             "cleanup.protect_active",
             "cleanup.execute",
         }:
-            return "engineering-scan"
+            return task_queue_for("scan")
         if step == "finding.reproduce":
-            return f"engineering-{cls._nested_value(payload, 'provider', 'claude')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "provider", "claude"), default="claude"
+            )
         if step == "audit.agent_cell":
-            return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "provider", "codex"), default="codex"
+            )
         if step in {
             "audit.api_flow",
             "audit.browser_flow",
@@ -207,46 +217,63 @@ class ControlledWorkflow:
             "identity.inspect_stale",
             "identity.recover_stale",
         }:
-            return "engineering-browser"
+            return task_queue_for("browser")
         if step in {"deployment.render"}:
-            return "engineering-release"
+            return task_queue_for("release")
         if step in {
             "finding.dedupe",
             "finding.publish",
             "enhancement.publish",
             "enhancement.github_dedupe",
         }:
-            return "engineering-github"
+            return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.plan":
-            return "engineering-github"
+            return GITHUB_TASK_QUEUE
         if step == "github.refresh_mirrors":
-            return "engineering-github"
+            return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.execute":
-            return "engineering-release"
+            return task_queue_for("release")
         if step in {"enhancement.discover", "enhancement.product_review"}:
-            return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "provider", "codex"), default="codex"
+            )
         if step == "delivery.invoke_spec":
-            return f"engineering-{cls._nested_value(payload, 'spec_provider', 'claude')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "spec_provider", "claude"), default="claude"
+            )
         if step == "delivery.invoke_maker":
-            return f"engineering-{cls._nested_value(payload, 'maker_provider', 'codex')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "maker_provider", "codex"), default="codex"
+            )
         if step == "delivery.invoke_deployment_maker":
-            return f"engineering-{cls._nested_value(payload, 'maker_provider', 'codex')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "maker_provider", "codex"), default="codex"
+            )
         if step == "delivery.invoke_checker":
-            return f"engineering-{cls._nested_value(payload, 'checker_provider', 'claude')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "checker_provider", "claude"), default="claude"
+            )
         if step == "reconcile.invoke_release_reviewer":
-            return f"engineering-{cls._nested_value(payload, 'release_review_provider', 'claude')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "release_review_provider", "claude"),
+                default="claude",
+            )
         if step == "quota.refresh":
-            return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "provider", "codex"), default="codex"
+            )
         if step == "runtime.independent_review":
-            return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
+            return provider_task_queue(
+                cls._nested_value(payload, "provider", "codex"), default="codex"
+            )
         if step == "delivery.publish":
-            return "engineering-github"
+            return GITHUB_TASK_QUEUE
         if step in {"reconcile.inspect_ci", "reconcile.publish_promotion"}:
-            return "engineering-github"
+            return GITHUB_TASK_QUEUE
         if step == "reconcile.apply_promotion":
-            return "engineering-scan"
+            return task_queue_for("scan")
         if step in {"runtime.browser_checks"}:
-            return "engineering-browser"
+            return task_queue_for("browser")
         if step in {
             "preview.preflight",
             "preview.verify",
@@ -255,8 +282,8 @@ class ControlledWorkflow:
             "staging.deploy",
             "recovery.execute",
         }:
-            return "engineering-release"
-        return "engineering-control"
+            return task_queue_for("release")
+        return CONTROL_TASK_QUEUE
 
     @staticmethod
     def _nested_value(value: Any, key: str, default: str) -> str:

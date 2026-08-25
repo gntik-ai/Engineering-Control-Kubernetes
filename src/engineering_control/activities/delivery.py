@@ -102,6 +102,18 @@ class PublicationPlan(BaseModel):
 class DeliveryActivityHandler:
     """Publish exact validated commits and draft PRs; never merge or rewrite history."""
 
+    supported_steps = frozenset(
+        {
+            "finding.dedupe",
+            "enhancement.github_dedupe",
+            "enhancement.publish",
+            "finding.publish",
+            "reconcile.inspect_ci",
+            "reconcile.publish_promotion",
+            "delivery.publish",
+        }
+    )
+
     def __init__(
         self,
         settings: Settings,

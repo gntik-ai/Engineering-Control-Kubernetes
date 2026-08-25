@@ -7,8 +7,10 @@ Wants=network-online.target
 Type=simple
 User=hermes
 Group=hermes
-WorkingDirectory=/home/hermes
-EnvironmentFile=/etc/engineering-control/env/worker-common.env
+WorkingDirectory=/opt/engineering-control/source
+EnvironmentFile=/etc/engineering-control/env/github-worker.env
+Environment=HOME=/home/hermes
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=ENGINEERING_WORKER_KIND=github
 Environment=ENGINEERING_GITHUB_AUTHENTICATED_HOME=/home/hermes
 Environment=ENGINEERING_GITHUB_WRITES_ENABLED=false
@@ -27,6 +29,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 ReadOnlyPaths=/home/hermes/.config/gh /home/hermes/.gitconfig
+InaccessiblePaths=-/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.ssh -/home/hermes/.kube -/etc/engineering-control/credentials -/etc/engineering-control/env/release
 ReadWritePaths=/var/lib/engineering-control/workers/github /srv/engineering/mirrors /srv/engineering/worktrees /srv/engineering/runs /srv/engineering/tmp
 MemoryMax=1G
 CPUQuota=100%

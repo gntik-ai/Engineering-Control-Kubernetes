@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from engineering_control.activities.core import ControlActivities
+from engineering_control.activities.delivery import DeliveryActivityHandler
+from engineering_control.activities.github import GitHubActivityHandler
+from engineering_control.config import Settings
+from engineering_control.workflows import worker_registry
+from engineering_control.workflows.definitions import ControlledWorkflow
+from engineering_control.workflows.role_worker import QUEUES
+from engineering_control.workflows.worker_registry import (
+    GITHUB_TASK_QUEUE,
+    ROLE_WORKER_REGISTRY,
+    provider_task_queue,
+    role_worker_spec,
+)
+
+ROOT = Path(__file__).parents[1]
+ROLE_KINDS = {"codex", "claude", "browser", "scan", "delivery", "release", "github"}
+GITHUB_STEPS = frozenset(
+    {
+        "llmwiki.bootstrap.plan",
+        "github.refresh_mirrors",
+        "finding.dedupe",
+        "delivery.publish",
+        "reconcile.inspect_ci",
+        "reconcile.publish_promotion",
+        "enhancement.publish",
+        "enhancement.github_dedupe",
+        "finding.publish",
+    }
+)
+
+
+def test_role_worker_registry_is_complete_and_github_is_controller_only() -> None:
+    assert set(ROLE_WORKER_REGISTRY) == ROLE_KINDS
+    assert QUEUES == {kind: spec.task_queue for kind, spec in ROLE_WORKER_REGISTRY.items()}
+    assert len(set(QUEUES.values())) == len(QUEUES)
+    assert ROLE_WORKER_REGISTRY["github"].host == "controller"
+    assert ROLE_WORKER_REGISTRY["github"].unix_user == "hermes"
+    assert ROLE_WORKER_REGISTRY["github"].service == "engineering-github-worker.service"
+    assert ROLE_WORKER_REGISTRY["github"].task_queue == "engineering-github"
+    assert all(
+        spec.host == "worker" for kind, spec in ROLE_WORKER_REGISTRY.items() if kind != "github"
+    )
+
+
+def test_unknown_worker_kind_and_queue_typo_fail_closed() -> None:
+    with pytest.raises(ValueError, match="bounded worker role"):
+        role_worker_spec("github-typo")
+    with pytest.raises(ValidationError):
+        Settings(worker_kind="github-typo")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="canonical queue"):
+        Settings(github_task_queue="engineering-github-typo")
+    with pytest.raises(ValueError, match="codex or claude"):
+        provider_task_queue("github", default="codex")
+
+
+def test_original_missing_github_registration_failure_is_reproduced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre_fix_registry = dict(ROLE_WORKER_REGISTRY)
+    pre_fix_registry.pop("github")
+    monkeypatch.setattr(worker_registry, "ROLE_WORKER_REGISTRY", pre_fix_registry)
+    with pytest.raises(ValueError, match="bounded worker role"):
+        worker_registry.role_worker_spec("github")
+
+
+def test_github_activity_set_is_typed_reachable_and_exclusive() -> None:
+    registered = ControlActivities.steps_for_worker("github")
+    assert registered == GITHUB_STEPS
+    assert registered == (
+        GitHubActivityHandler.supported_steps | DeliveryActivityHandler.supported_steps
+    )
+    assert all(
+        ControlledWorkflow._activity_queue(step, {}) == GITHUB_TASK_QUEUE for step in registered
+    )
+    assert not registered & ControlActivities.steps_for_worker("release")
+    assert not registered & ControlActivities.steps_for_worker("browser")
+    assert not registered & ControlActivities.steps_for_worker("scan")
+    assert not registered & ControlActivities.steps_for_worker("codex")
+    assert not registered & ControlActivities.steps_for_worker("claude")
+
+
+def test_every_role_kind_has_a_queue_activity_set_and_service() -> None:
+    for kind, spec in ROLE_WORKER_REGISTRY.items():
+        assert ControlActivities.steps_for_worker(kind)
+        assert spec.task_queue == f"engineering-{kind}"
+        if kind in {"codex", "claude", "browser", "scan", "delivery"}:
+            assert spec.service == f"engineering-worker@{kind}.service"
+        else:
+            assert (ROOT / "systemd" / spec.service).is_file()
+
+
+def test_github_systemd_contract_is_hardened_and_secret_free() -> None:
+    unit = (ROOT / "systemd/engineering-github-worker.service").read_text(encoding="utf-8")
+    for required in (
+        "User=hermes",
+        "Group=hermes",
+        "WorkingDirectory=/opt/engineering-control/source",
+        "EnvironmentFile=/etc/engineering-control/env/github-worker.env",
+        "Environment=HOME=/home/hermes",
+        "Environment=PATH=/usr/local/bin:/usr/bin:/bin",
+        "Environment=ENGINEERING_WORKER_KIND=github",
+        "Environment=ENGINEERING_GITHUB_WRITES_ENABLED=false",
+        "ExecStart=/opt/engineering-control/venv/bin/engineering-role-worker",
+        "Restart=on-failure",
+        "NoNewPrivileges=true",
+        "PrivateTmp=true",
+        "ProtectSystem=strict",
+        "ProtectKernelTunables=true",
+        "ProtectKernelModules=true",
+        "ProtectControlGroups=true",
+        "RestrictSUIDSGID=true",
+        "UMask=0077",
+    ):
+        assert required in unit
+    assert "/home/hermes/.config/gh" in unit
+    assert "/home/hermes/.codex" in unit
+    assert "/home/hermes/.claude" in unit
+    assert "/home/hermes/.kube" in unit
+    assert "/etc/engineering-control/env/release" in unit
+    for forbidden in ("GITHUB_TOKEN", "GH_TOKEN", "auth token", "worker-common.env"):
+        assert forbidden not in unit
+
+
+def test_controller_bootstrap_owns_github_worker_and_worker_bootstrap_does_not() -> None:
+    controller = (ROOT / "scripts/bootstrap-controller.sh").read_text(encoding="utf-8")
+    worker = (ROOT / "scripts/bootstrap-worker.sh").read_text(encoding="utf-8")
+    unit = "engineering-github-worker.service"
+    assert controller.count(unit) >= 4
+    assert unit not in worker
+    assert 'if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]' in controller
+    assert "ENGINEERING_GITHUB_WRITES_ENABLED=false" in controller
+    assert "Refusing to install GitHub worker with write policy enabled" in controller
+    assert "systemctl daemon-reload" in controller
+    assert "github-issue-write-validation.yaml" in controller
+    assert "auth token" not in controller
+    assert ".config/gh" not in controller
+    assert "GITHUB_TOKEN" not in controller
+    assert "GH_TOKEN" not in controller
+
+
+def test_registry_verifier_is_mandatory_for_both_bootstraps() -> None:
+    verifier = (ROOT / "scripts/verify-worker-registry.py").read_text(encoding="utf-8")
+    assert "ROLE_WORKER_REGISTRY" in verifier
+    assert "ControlActivities.steps_for_worker" in verifier
+    assert "ControlledWorkflow._activity_queue" in verifier
+    assert "GitHub write policy must remain disabled" in verifier
+    assert "GitHub safe repository list must be empty" in verifier
+    for bootstrap in ("bootstrap-controller.sh", "bootstrap-worker.sh"):
+        content = (ROOT / "scripts" / bootstrap).read_text(encoding="utf-8")
+        assert "verify-worker-registry.py" in content
+
+
+def test_controller_github_bootstrap_is_source_idempotent() -> None:
+    controller = (ROOT / "scripts/bootstrap-controller.sh").read_text(encoding="utf-8")
+    assert controller.count('if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]') == 1
+    assert "install -d -o hermes -g hermes -m 0700" in controller
+    assert 'chown root:hermes "${CONFIG_ROOT}/env/github-worker.env"' in controller
+    assert 'chmod 0640 "${CONFIG_ROOT}/env/github-worker.env"' in controller
+    assert "systemctl enable engineering-api.service" in controller
+    assert "systemctl restart engineering-api.service" in controller
+    assert "systemctl enable --now engineering-github-worker.service" not in controller
+    assert 'if [[ ! -f "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]' in controller
+
+
+def test_github_runtime_validator_uses_only_typed_broker_reads() -> None:
+    script = (ROOT / "scripts/validate-gh-cli-broker.py").read_text(encoding="utf-8")
+    assert "GhCliBroker" in script
+    assert "broker.preflight(REQUIRED_REPOSITORIES)" in script
+    assert "writes_enabled=False" in script
+    assert "auth token" not in script
+    assert "GITHUB_TOKEN" not in script
+    assert "GH_TOKEN" not in script
+    assert "create_issue" not in script
+    assert "create_pull_request" not in script

@@ -9,8 +9,10 @@ mode in production; implement and test the handler or keep the workflow blocked.
 `RATE_LIMITED`: inspect the redacted handoff directory and quota reset metadata. Resume the same
 provider later or record an explicit cross-provider handoff.
 
-`MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED`: provision the scoped worker token documented in
-`WORKER.md`. Do not copy the controller's issue-search token or an interactive GitHub credential.
+`BLOCKED_BY_GH_AUTH`: authenticate `gh` interactively as `hermes` on the controller. Do not copy
+the auth store, extract a token, create a token file, or install the GitHub Temporal worker on the
+worker VPS. Run `scripts/verify-worker-registry.py --host controller` to detect a
+unit/kind/queue/activity mismatch before bootstrap reaches systemd.
 
 `GITHUB_PUBLICATION_FAILED`: verify the exact ChangeSet worktree is clean at its recorded branch
 and head, the protected askpass helper is executable, the token can push the branch and create a

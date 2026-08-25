@@ -5,8 +5,14 @@ import stat
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from engineering_control.workflows.worker_registry import (
+    CONTROL_TASK_QUEUE,
+    ROLE_WORKER_REGISTRY,
+    WorkerKind,
+)
 
 
 class Settings(BaseSettings):
@@ -20,14 +26,14 @@ class Settings(BaseSettings):
     api_token_file: Path = Path("/etc/engineering-control/env/api.token")
     temporal_target: str = "127.0.0.1:7233"
     temporal_namespace: str = "engineering-control"
-    temporal_task_queue: str = "engineering-control"
-    codex_task_queue: str = "engineering-codex"
-    claude_task_queue: str = "engineering-claude"
-    browser_task_queue: str = "engineering-browser"
-    scan_task_queue: str = "engineering-scan"
-    release_task_queue: str = "engineering-release"
-    delivery_task_queue: str = "engineering-delivery"
-    github_task_queue: str = "engineering-github"
+    temporal_task_queue: str = CONTROL_TASK_QUEUE
+    codex_task_queue: str = ROLE_WORKER_REGISTRY["codex"].task_queue
+    claude_task_queue: str = ROLE_WORKER_REGISTRY["claude"].task_queue
+    browser_task_queue: str = ROLE_WORKER_REGISTRY["browser"].task_queue
+    scan_task_queue: str = ROLE_WORKER_REGISTRY["scan"].task_queue
+    release_task_queue: str = ROLE_WORKER_REGISTRY["release"].task_queue
+    delivery_task_queue: str = ROLE_WORKER_REGISTRY["delivery"].task_queue
+    github_task_queue: str = ROLE_WORKER_REGISTRY["github"].task_queue
     database_url: SecretStr = SecretStr(
         "postgresql+psycopg://engineering_control@127.0.0.1/engineering_control"
     )
@@ -91,7 +97,7 @@ class Settings(BaseSettings):
     lease_root: Path = Path("/var/lib/engineering-control/leases")
     log_level: str = "INFO"
     synthetic_mode: bool = False
-    worker_kind: str = "controller"
+    worker_kind: WorkerKind = "controller"
     notification_sink_url: str | None = None
     notification_token_file: Path | None = None
     notification_poll_seconds: int = Field(default=10, ge=2, le=300)
@@ -99,6 +105,26 @@ class Settings(BaseSettings):
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
     cleanup_expiry_grace_hours: int = Field(default=24, ge=1, le=720)
     worker_heartbeat_seconds: int = Field(default=30, ge=10, le=300)
+
+    @field_validator(
+        "codex_task_queue",
+        "claude_task_queue",
+        "browser_task_queue",
+        "scan_task_queue",
+        "release_task_queue",
+        "delivery_task_queue",
+        "github_task_queue",
+    )
+    @classmethod
+    def canonical_role_task_queue(cls, value: str, info: ValidationInfo) -> str:
+        field_name = info.field_name
+        if field_name is None:
+            raise ValueError("canonical task queue validation requires a field name")
+        kind = field_name.removesuffix("_task_queue")
+        expected = ROLE_WORKER_REGISTRY[kind].task_queue  # type: ignore[index]
+        if value != expected:
+            raise ValueError(f"{field_name} must remain the canonical queue {expected}")
+        return value
 
     @field_validator("api_host")
     @classmethod

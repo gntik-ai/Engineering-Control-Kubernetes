@@ -271,27 +271,25 @@ else
   touch "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED"
 fi
 
-for unit in engineering-worker@.service engineering-release-worker.service \
-  engineering-github-worker.service; do
+for unit in engineering-worker@.service engineering-release-worker.service; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
   install -o root -g root -m 0644 \
     "${CONFIG_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
 done
 systemd-analyze verify /etc/systemd/system/engineering-worker@.service \
-  /etc/systemd/system/engineering-release-worker.service \
-  /etc/systemd/system/engineering-github-worker.service
+  /etc/systemd/system/engineering-release-worker.service
+"${INSTALL_ROOT}/venv/bin/python" \
+  "${RELEASE_ROOT}/source/scripts/verify-worker-registry.py" --host worker
 systemctl daemon-reload
 systemctl enable engineering-worker@codex.service engineering-worker@claude.service \
   engineering-worker@browser.service engineering-worker@scan.service \
   engineering-worker@delivery.service \
-  engineering-github-worker.service \
   engineering-release-worker.service
 "${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope worker
 systemctl restart engineering-worker@codex.service engineering-worker@claude.service \
   engineering-worker@browser.service engineering-worker@scan.service \
   engineering-worker@delivery.service \
-  engineering-github-worker.service \
   engineering-release-worker.service
 
 if sudo -u codex-runner -H env -i \

@@ -1,6 +1,7 @@
 # Worker
 
-The worker executes bounded activities through separated identities plus one typed GitHub broker:
+The worker executes bounded activities through separated identities. The typed GitHub broker is a
+controller-only service and is deliberately not installed by the worker bootstrap:
 
 | Identity | Purpose | Explicitly forbidden |
 | --- | --- | --- |
@@ -10,7 +11,6 @@ The worker executes bounded activities through separated identities plus one typ
 | `scan-runner` | mirrors, worktree allocation, scanners | model auth, release credentials |
 | `delivery-runner` | exact-head Git push and draft PR publication | model auth, release credentials, merge, force-push |
 | `release-runner` | deterministic bounded release activity | model auth, arbitrary prompts, general LLM work |
-| `hermes` (`engineering-github-worker`) | typed `gh` broker and authenticated mirror refresh | arbitrary `gh`, token extraction, merge, administration |
 
 Install:
 
@@ -28,15 +28,17 @@ only from the installed `gh` credential store of the exact `hermes` broker ident
 Control never calls `gh auth token`, copies that store, or places a GitHub token in configuration,
 environment variables, arguments, logs, evidence, or workflow state.
 
-Validate the broker and configure Git's `gh` credential helper interactively:
+Worker-side `gh` remains available for secret-safe operator diagnostics and source preparation,
+but no worker-VPS GitHub Temporal queue is declared. Configure Git's `gh` credential helper only
+as a documented operator action when local clone/fetch preparation needs it:
 
 ```bash
 ssh -t worker 'gh auth status --hostname github.com && gh auth setup-git && \
   sudo /opt/engineering-control/source/scripts/bootstrap-mirrors.sh'
 ```
 
-The application constrains the broad operator identity to five allowlisted repositories and typed
-operations. GitHub writes stay disabled until an approval-bound policy enables them.
+The controller application constrains the broad operator identity to five allowlisted repositories
+and typed operations. GitHub writes stay disabled until an approval-bound policy enables them.
 
 The bootstrap installs Codex 0.149.0, Claude Code 2.1.239, Playwright 1.62.1, GitHub CLI 2.98.0,
 Gitleaks 8.30.0,

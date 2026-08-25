@@ -13,6 +13,8 @@ Components:
 - upload-only evidence ingest on private `10.10.0.2:8750`;
 - orchestration worker, bounded synthetic acceptance worker, scheduler, notifier, and migrations
   under systemd;
+- controller-only `engineering-github-worker` on the `engineering-github` queue, running as
+  `hermes` so it can use the existing authenticated `gh` store without copying or extracting it;
 - Hermes user plugin and gateway hook under `/home/hermes/.hermes`.
 
 Install only after reviewing host inventory and the cleanup checkpoint:
@@ -39,3 +41,17 @@ The bootstrap installs a commit-addressed release under `/opt/engineering-contro
 updates a symlink. It does not touch product repositories, Kubernetes, or existing Hermes service
 definition. It idempotently installs the versioned Hermes plugin/hook extension but does not patch
 vendor source. Restart Hermes separately after its allowlist is verified.
+
+The GitHub worker unit uses `/opt/engineering-control/source` as its immutable working directory,
+`HOME=/home/hermes`, and a deterministic PATH. Its writable paths are limited to the GitHub worker
+state directory and engineering mirrors/worktrees/run/temp roots. Provider homes, SSH and
+Kubernetes credentials, product credentials, and release credentials are explicitly hidden by
+the systemd sandbox. The controller bootstrap preserves the disabled GitHub write policy and
+refuses a GitHub-worker environment that enables writes.
+
+Validate its existing authentication without displaying a token:
+
+```bash
+sudo -u hermes -H /opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/validate-gh-cli-broker.py
+```
