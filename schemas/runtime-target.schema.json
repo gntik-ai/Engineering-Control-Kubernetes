@@ -15,7 +15,7 @@
   "properties": {
     "version": {"const": 1},
     "enabled": {"type": "boolean"},
-    "project": {"enum": ["falcone", "musematic"]},
+    "project": {"enum": ["falcone", "musematic", "llmwiki"]},
     "environment": {"const": "staging"},
     "target_context": {"type": "string", "minLength": 1, "maxLength": 160},
     "target_namespace": {"type": "string", "minLength": 1, "maxLength": 160},
@@ -50,15 +50,21 @@
         "journey_plan_path": {
           "type": "string",
           "pattern": "^/etc/engineering-control/journeys/[^/]+\\.json$"
-        },
-        "browser_credential_file": {
-          "type": ["string", "null"],
-          "pattern": "^/etc/engineering-control/env/browser/[^/]+\\.env$"
         }
       }
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "enabled": {"const": true},
+          "project": {"const": "llmwiki"}
+        },
+        "required": ["enabled", "project"]
+      },
+      "then": {"properties": {"configuration": {"required": ["revision_annotation"]}}}
+    },
     {
       "if": {"properties": {"enabled": {"const": false}}, "required": ["enabled"]},
       "then": {"required": ["blocker"], "properties": {"configuration": {"maxProperties": 0}}}

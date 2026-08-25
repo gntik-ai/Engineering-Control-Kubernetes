@@ -200,11 +200,13 @@ def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> No
     script = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
 
     assert "set -euo pipefail" in script
-    assert "repositories=(falcone falcone-charts musematic musematic-deploy)" in script
-    assert 'if [[ ! -e "${target}" ]]; then' in script
-    assert "clone --mirror" in script
+    assert "repositories=(falcone falcone-charts musematic musematic-deploy llmwiki)" in script
+    assert "if [[ ! -e ${target} ]]; then" in script
+    assert "-- --mirror" in script
     assert "remote get-url origin" in script
-    assert "ENGINEERING_GITHUB_TOKEN_FILE" in script
+    assert "gh auth status --hostname github.com" in script
+    assert "gh repo clone" in script
+    assert "auth token" not in script
     assert "rm -" not in script
 
 
@@ -276,7 +278,8 @@ def test_worker_bootstrap_clears_satisfied_auth_markers() -> None:
 
     assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CODEX"' in bootstrap
     assert 'rm -f -- "${STATE_ROOT}/MANUAL_AUTH_REQUIRED_CLAUDE"' in bootstrap
-    assert "MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED" in bootstrap
+    assert "MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED" not in bootstrap
+    assert "MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED" in bootstrap
 
 
 def test_worker_auth_probes_use_subscription_only_minimal_environments() -> None:

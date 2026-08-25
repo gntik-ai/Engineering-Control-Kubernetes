@@ -535,10 +535,13 @@ async def test_failed_audit_cell_creates_candidate_not_confirmed_finding(tmp_pat
         "finding.controls",
         {"finding": loaded, "snapshot": snapshot, "attempts": [attempt, attempt]},
     )
-    duplicate = await handler.handle(
-        "finding.dedupe",
-        {"finding": loaded, "attempts": [attempt, attempt], "controls": controls},
-    )
+    # GitHub duplicate search is a delivery concern.  Metadata consumes its
+    # typed result and never executes a GitHub client itself.
+    duplicate = {
+        "status": "BLOCKED",
+        "blocker": "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED",
+        "matches": [],
+    }
     verification_payload = {
         "finding": loaded,
         "attempts": [attempt, attempt],
@@ -1353,7 +1356,6 @@ configuration:
   observed_resources: [deployments, pods]
   revision_annotation: engineering.gntik.ai/deployment-sha
   journey_plan_path: /etc/engineering-control/journeys/falcone-staging.json
-  browser_credential_file: null
 """,
         encoding="utf-8",
     )

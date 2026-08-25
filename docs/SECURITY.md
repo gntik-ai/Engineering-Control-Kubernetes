@@ -22,18 +22,11 @@ scan cache. ACLs grant write only to that ChangeSet's maker and read only to its
 objects are exposed only through a read-only alternate. No model receives write access to shared
 repository refs.
 
-Private mirror fetches use a dedicated contents-read credential at
-`/etc/engineering-control/env/scan/github-read.token`, owned by `root:scan-runner` and mode `0640`.
-The fixed askpass helper reads that file only when Git requests a password. Model, browser,
-delivery, and release identities are denied access. This credential has no publication or package
-permissions and is never shared with the write-capable delivery identity.
-
-GitHub write publication uses a separate `delivery-runner` identity and token. It receives read
-access only to an exact validated ChangeSet repository pair, may push only the bound branch head,
-and may create or reuse draft PRs. The adapter forbids force-push and merge operations, validates
-the clean branch/head immediately before push, and supplies credentials through a protected
-askpass helper rather than command arguments. `delivery-runner` cannot read model or release
-credentials. The controller's issue-search token remains a separate read-only credential.
+Every GitHub operation uses the installed `gh` binary through `GhCliBroker`. The broker verifies
+`gh auth status`, the active `gh api user` identity, and exact repository access before each batch.
+It exposes typed operations only, rejects model-supplied API paths or CLI fragments, and never
+extracts or transports a token. Git writes use the operator-configured `gh auth setup-git` helper;
+issue and PR writes remain policy-disabled, ChangeSet-bound, draft-only, and never merge.
 
 Kubernetes definitions under `config/kubernetes` create no binding by themselves. Observer access
 can get/list/watch selected resources and logs but has no Secret or mutation permission. Preview
@@ -78,18 +71,9 @@ Active security blockers:
 Do not print findings. Record only type, file/location, history presence, and remediation. Security
 evidence and incidents are excluded from automatic cleanup.
 
-GitHub duplicate search uses a controller-only fine-grained token file at
-`/etc/engineering-control/env/github.token`. Provision it as `root:engineering-control` mode
-`0640`, with read-only issue metadata permission for the in-scope repositories. Until that file
-exists and works, independent finding verification terminates `BLOCKED`; it does not confirm or
-file an issue. Never reuse or copy the interactive `hermes` GitHub credential file.
-
-Draft PR publication requires a second fine-grained token at
-`/etc/engineering-control/env/delivery/github.token` on the worker, owned by
-`root:delivery-runner` and mode `0640`. Scope it only to contents/PR write access for the four
-configured repositories, with
-no administration, Actions-secret, environment, or merge-bypass permission. Do not reuse the
-controller token or an interactive user credential.
+There are no GitHub token-file contracts. Authentication expiry pauses the bounded operation as
+`BLOCKED_BY_GH_AUTH`. Application policy restricts the operator identity to Falcone, Falcone
+Charts, Musematic, Musematic Deploy, and LLMWiki, with writes disabled by default.
 
 Candidate provenance verification additionally requires registry authentication at
 `/etc/engineering-control/env/delivery/registry/config.json`, owned by

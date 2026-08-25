@@ -15,6 +15,7 @@ from engineering_control.security.redaction import SecretRedactor
 from .browser import BrowserActivityHandler
 from .delivery import DeliveryActivityHandler
 from .engineering import EngineeringActivityHandler
+from .github import GitHubActivityHandler
 from .metadata import MetadataActivityHandler
 from .preview_cleanup import PreviewCleanupActivityHandler
 from .provider import ProviderActivityHandler
@@ -45,6 +46,10 @@ class ControlActivities:
         "audit.static_deployment",
         "audit.api_flow",
         "audit.browser_flow",
+        "audit.llmwiki_consumer_suite",
+        "identity.superadmin_attest",
+        "identity.inspect_stale",
+        "identity.recover_stale",
         "audit.kubernetes_observe",
         "audit.correlate_runtime",
         "audit.classify_candidate",
@@ -162,6 +167,9 @@ class ControlActivities:
         "enhancement.publish",
         "enhancement.persist_publication",
         "enhancement.prepare_solution",
+        "llmwiki.bootstrap.plan",
+        "llmwiki.bootstrap.execute",
+        "github.refresh_mirrors",
     }
     _mutation_steps = {
         "preview.deploy",
@@ -177,6 +185,8 @@ class ControlActivities:
         "reconcile.apply_promotion",
         "reconcile.publish_promotion",
         "enhancement.publish",
+        "llmwiki.bootstrap.execute",
+        "identity.recover_stale",
     }
 
     _worker_steps = {
@@ -221,11 +231,18 @@ class ControlActivities:
             "runtime.browser_checks",
             "audit.api_flow",
             "audit.browser_flow",
+            "audit.llmwiki_consumer_suite",
+            "identity.superadmin_attest",
+            "identity.inspect_stale",
+            "identity.recover_stale",
             "staging.preflight",
             "preview.deploy",
             "preview.verify",
             "staging.deploy",
             "recovery.execute",
+            "llmwiki.bootstrap.plan",
+            "llmwiki.bootstrap.execute",
+            "github.refresh_mirrors",
         },
         "scan": {
             "project.snapshot",
@@ -277,10 +294,21 @@ class ControlActivities:
             "runtime.browser_checks",
             "audit.api_flow",
             "audit.browser_flow",
+            "audit.llmwiki_consumer_suite",
+            "identity.superadmin_attest",
+            "identity.inspect_stale",
+            "identity.recover_stale",
             "cleanup.inspect_browser_files",
             "cleanup.execute_browser_files",
         },
         "delivery": {
+            "cleanup.inspect_delivery_files",
+            "cleanup.execute_delivery_files",
+        },
+        "github": {
+            "llmwiki.bootstrap.plan",
+            "github.refresh_mirrors",
+            "finding.dedupe",
             "delivery.publish",
             "reconcile.inspect_ci",
             "reconcile.publish_promotion",
@@ -298,6 +326,7 @@ class ControlActivities:
             "recovery.execute",
             "cleanup.inspect_preview_namespaces",
             "cleanup.execute_preview_namespaces",
+            "llmwiki.bootstrap.execute",
         },
         "synthetic": _allowed_steps,
     }
@@ -323,7 +352,9 @@ class ControlActivities:
             BrowserActivityHandler(settings) if self.worker_kind == "browser" else None
         )
         self.delivery_handler = (
-            DeliveryActivityHandler(settings) if self.worker_kind == "delivery" else None
+            DeliveryActivityHandler(settings)
+            if self.worker_kind in {"delivery", "github"}
+            else None
         )
         self.scan_handler = ScanActivityHandler(settings) if self.worker_kind == "scan" else None
         self.retention_handler = (
@@ -336,6 +367,9 @@ class ControlActivities:
         )
         self.engineering_handler = (
             EngineeringActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
+        self.github_handler = (
+            GitHubActivityHandler(settings) if self.worker_kind == "github" else None
         )
 
     @activity.defn(name="execute_control_step")
@@ -359,6 +393,17 @@ class ControlActivities:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:
                 return self._envelope(step, safe_payload, "DRY_RUN")
+            if (
+                step == "llmwiki.bootstrap.execute"
+                and not self.settings.llmwiki_staging_bootstrap_enabled
+            ):
+                raise ApplicationError(
+                    "LLMWiki staging bootstrap execution is disabled",
+                    type="SecurityBlocker",
+                    non_retryable=True,
+                )
+            if step == "identity.recover_stale" and self.browser_handler is not None:
+                return await self.browser_handler.handle(step, safe_payload)
             if (
                 self.retention_handler is not None
                 and step in self.retention_handler.supported_steps
@@ -400,6 +445,8 @@ class ControlActivities:
             and step in self.engineering_handler.supported_steps
         ):
             return await self.engineering_handler.handle(step, safe_payload)
+        if self.github_handler is not None and step in self.github_handler.supported_steps:
+            return await self.github_handler.handle(step, safe_payload)
         if self.browser_handler is not None:
             return await self.browser_handler.handle(step, safe_payload)
         if self.delivery_handler is not None:

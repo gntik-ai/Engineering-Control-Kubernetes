@@ -13,6 +13,10 @@ from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import EnhancementProposal
+from engineering_control.identity.attestation import (
+    SuperadminReadinessAttestation,
+    superadmin_contract_hash,
+)
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
 
@@ -56,6 +60,8 @@ class EngineeringActivityHandler:
             persona_root=settings.persona_config_root,
             flow_root=settings.flow_config_root,
             credential_root=settings.credential_root,
+            attestation_root=settings.credential_attestation_root,
+            browser_worker_identity=settings.browser_worker_identity,
         )
         database_url = settings.database_url.get_secret_value()
         engine_options: dict[str, Any] = {"pool_pre_ping": True}
@@ -76,6 +82,30 @@ class EngineeringActivityHandler:
                 str(payload.get("environment", "staging")),
             )
             value = plan.model_dump(mode="json")
+            raw_attestation = payload.get("worker_attestation")
+            if isinstance(raw_attestation, dict):
+                attestation = SuperadminReadinessAttestation.model_validate(raw_attestation)
+                authority = (
+                    "falcone" if payload.get("project") == "llmwiki" else payload.get("project")
+                )
+                if (
+                    attestation.project != authority
+                    or attestation.worker_identity != self.settings.browser_worker_identity
+                    or attestation.contract_hash != superadmin_contract_hash(str(authority))
+                ):
+                    raise ValueError("worker superadmin attestation authority mismatch")
+                reference = f"worker-attestation:{authority}-superadmin"
+                for item in value["credential_readiness"]:
+                    if item["reference"] == reference:
+                        item.update(
+                            present=attestation.file_present,
+                            permissions_valid=True,
+                            worker_attested=attestation.ready(),
+                            blocker="NONE" if attestation.ready() else "ATTESTATION_INVALID",
+                        )
+                value["blockers"] = [item for item in value["blockers"] if reference not in item]
+                if not attestation.ready():
+                    value["blockers"].append(f"CREDENTIAL:{reference}:{attestation.blocker_code}")
             value["domains"] = self._domains(str(payload.get("preset", "snapshot")))
             return {**payload, **value, "status": "PLANNED"}
         if step == "project.persist_snapshot":

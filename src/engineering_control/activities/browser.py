@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
-import stat
 import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
@@ -17,10 +19,16 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import SafeCommandRunner
+from engineering_control.adapters.llmwiki import LLMWikiFalconeConsumerSuite
 from engineering_control.config import Settings
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import E2EFlow, FlowStep
 from engineering_control.evidence.transfer import EvidencePublisher
+from engineering_control.identity.attestation import superadmin_contract_hash
+from engineering_control.identity.credentials import SuperadminCredentialLoader
+from engineering_control.identity.persona_factory import EphemeralPersonaFactory
+from engineering_control.identity.product_admin import HttpPersonaAdminClient
+from engineering_control.identity.sessions import SuperadminSessionAdapter
 from engineering_control.models.enums import Project, RedactionStatus
 from engineering_control.security.redaction import SecretRedactor
 
@@ -28,33 +36,47 @@ from engineering_control.security.redaction import SecretRedactor
 class BrowserActivityHandler:
     """Run an allowlisted browser journey without placing credentials in workflow history."""
 
-    _credential_name = re.compile(r"^JOURNEY_[A-Z0-9_]+$")
-
     def __init__(
         self,
         settings: Settings,
         runner: SafeCommandRunner | None = None,
         publisher: EvidencePublisher | None = None,
         api_transport: httpx.AsyncBaseTransport | None = None,
+        consumer_runner: SafeCommandRunner | None = None,
     ) -> None:
         self.settings = settings
         self.runner = runner or SafeCommandRunner({"node": settings.node_executable})
         self.redactor = SecretRedactor()
         self.publisher = publisher or EvidencePublisher(settings, settings.browser_evidence_root)
         self.api_transport = api_transport
+        self.consumer_suite = LLMWikiFalconeConsumerSuite(
+            consumer_runner or SafeCommandRunner({"pnpm": settings.pnpm_executable})
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step in {"identity.inspect_stale", "identity.recover_stale"}:
+            return await self._stale_identity_operation(step, payload)
+        if step == "identity.superadmin_attest":
+            return await self._superadmin_attestation(payload)
         if step == "audit.api_flow":
             return await self._handle_api_catalog(payload)
         if step == "audit.browser_flow":
             return await self._handle_browser_catalog(payload)
+        if step == "audit.llmwiki_consumer_suite":
+            return await self._handle_llmwiki_consumer_suite(payload)
         if step != "runtime.browser_checks":
             raise ApplicationError("unsupported browser activity", non_retryable=True)
         plan = self._bounded_file(payload.get("journey_plan_path"), self.settings.journey_plan_root)
         self._validate_plan(plan)
         output = self._bounded_output(payload.get("output_directory"))
         self._clear_previous_attempt(output)
-        credentials, credential_path = self._credentials(payload.get("credential_file"))
+        if payload.get("credential_file") is not None:
+            raise ApplicationError(
+                "persistent browser persona credentials are prohibited",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        credentials: dict[str, str] = {}
         environment = {
             "ENGINEERING_JOURNEY_PLAN": str(plan),
             "ENGINEERING_JOURNEY_OUTPUT": str(output),
@@ -92,14 +114,6 @@ class BrowserActivityHandler:
                     ),
                 }
             )
-        if credential_path is not None and any(
-            item["name"] in {"trace.zip", "final.png", "failure.png"} for item in artifacts
-        ):
-            raise ApplicationError(
-                "credentialed journey unexpectedly produced visual evidence",
-                type="SecurityBlocker",
-                non_retryable=True,
-            )
         receipts = self._publish_result(payload, result_path)
         return {
             **payload,
@@ -109,17 +123,144 @@ class BrowserActivityHandler:
             "evidence_receipts": receipts,
         }
 
+    async def _stale_identity_operation(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step == "identity.recover_stale" and payload.get("dry_run") is not False:
+            raise ApplicationError(
+                "stale identity recovery requires explicit execution",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        supplied = payload.get("stale_identity_candidates", {})
+        if not isinstance(supplied, dict):
+            raise ApplicationError("stale identity candidates are invalid", non_retryable=True)
+        discovered: dict[str, list[dict[str, str]]] = {}
+        recovered: dict[str, list[str]] = {}
+        blockers: dict[str, str] = {}
+        loader = SuperadminCredentialLoader(
+            self.settings.browser_credential_root,
+            production_permissions=self.settings.environment == "production",
+        )
+        for project in ("falcone", "musematic"):
+            try:
+                credential = loader.load(project)
+                if not self._superadmin_target_valid(project, credential.base_url):
+                    raise ApplicationError(
+                        "superadmin target does not match the configured staging API",
+                        type="SUPERADMIN_TARGET_INVALID",
+                        non_retryable=True,
+                    )
+                adapter = SuperadminSessionAdapter(
+                    redactor=self.redactor, transport=self.api_transport
+                )
+                async with adapter.login(credential) as session:
+                    admin = HttpPersonaAdminClient(
+                        session,
+                        tenant_id=credential.tenant_id,
+                        workspace_id=credential.workspace_id,
+                        redactor=self.redactor,
+                    )
+                    try:
+                        if step == "identity.inspect_stale":
+                            discovered[project] = await admin.list_stale_managed_resources()
+                        else:
+                            project_candidates = supplied.get(project, [])
+                            if not isinstance(project_candidates, list) or not all(
+                                isinstance(item, dict) for item in project_candidates
+                            ):
+                                raise ApplicationError(
+                                    "stale identity candidate set changed",
+                                    type="PolicyViolation",
+                                    non_retryable=True,
+                                )
+                            recovered[project] = await admin.recover_stale_managed_resources(
+                                project_candidates
+                            )
+                    finally:
+                        admin.destroy_ephemeral_secrets()
+            except ApplicationError as error:
+                blockers[project] = error.type or "SUPERADMIN_UNAVAILABLE"
+        return {
+            **payload,
+            "status": "BLOCKED" if blockers else "PASS",
+            "stale_identity_candidates": discovered
+            if step == "identity.inspect_stale"
+            else supplied,
+            "recovered_managed_identities": recovered,
+            "identity_recovery_blockers": blockers,
+        }
+
+    async def _superadmin_attestation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project = payload.get("project")
+        if project not in {"falcone", "musematic"}:
+            raise ApplicationError("superadmin attestation project is invalid", non_retryable=True)
+        checked = datetime.now(UTC).isoformat()
+        contract_hash = superadmin_contract_hash(str(project))
+        loader = SuperadminCredentialLoader(
+            self.settings.browser_credential_root,
+            production_permissions=self.settings.environment == "production",
+        )
+        try:
+            credential = loader.load(project)
+            target_valid = self._superadmin_target_valid(project, credential.base_url)
+            if not target_valid:
+                raise ApplicationError(
+                    "superadmin target does not match the configured staging API",
+                    type="SUPERADMIN_TARGET_INVALID",
+                    non_retryable=True,
+                )
+            adapter = SuperadminSessionAdapter(redactor=self.redactor, transport=self.api_transport)
+            async with adapter.login(credential) as session:
+                authentication_valid = True
+                role_valid = session.superadmin_role_valid
+            blocker = (
+                "NONE"
+                if target_valid and authentication_valid and role_valid
+                else "SUPERADMIN_PREFLIGHT_FAILED"
+            )
+            return {
+                "project": project,
+                "contract_id": f"{project}-superadmin",
+                "file_present": True,
+                "parser_valid": True,
+                "target_valid": target_valid,
+                "authentication_valid": authentication_valid,
+                "superadmin_role_valid": role_valid,
+                "worker_identity": f"browser-runner@{os.uname().nodename}",
+                "checked_timestamp": checked,
+                "attestation_ttl_seconds": 300,
+                "contract_hash": contract_hash,
+                "blocker_code": blocker,
+            }
+        except ApplicationError as error:
+            return {
+                "project": project,
+                "contract_id": f"{project}-superadmin",
+                "file_present": error.type
+                not in {f"MANUAL_{project.upper()}_SUPERADMIN_INPUT_REQUIRED"},
+                "parser_valid": False,
+                "target_valid": False,
+                "authentication_valid": False,
+                "superadmin_role_valid": False,
+                "worker_identity": f"browser-runner@{os.uname().nodename}",
+                "checked_timestamp": checked,
+                "attestation_ttl_seconds": 300,
+                "contract_hash": contract_hash,
+                "blocker_code": error.type or "SUPERADMIN_PREFLIGHT_FAILED",
+            }
+
     def _catalog(self) -> EngineeringCatalog:
         return EngineeringCatalog(
             project_root=self.settings.project_config_root,
             persona_root=self.settings.persona_config_root,
             flow_root=self.settings.flow_config_root,
             credential_root=self.settings.credential_root,
+            attestation_root=self.settings.credential_attestation_root,
+            browser_worker_identity=self.settings.browser_worker_identity,
         )
 
     def _selected_flows(self, payload: dict[str, Any]) -> tuple[EngineeringCatalog, list[E2EFlow]]:
         project = payload.get("project")
-        if project not in {"falcone", "musematic"}:
+        if project not in {"falcone", "musematic", "llmwiki"}:
             raise ApplicationError("unknown E2E project", non_retryable=True)
         catalog = self._catalog()
         selected = payload.get("plan", {}).get("flows", payload.get("flows", []))
@@ -133,32 +274,129 @@ class BrowserActivityHandler:
             )
         return catalog, flows
 
-    def _credential_for_persona(
+    @asynccontextmanager
+    async def _persona_execution(
         self,
         catalog: EngineeringCatalog,
         project: str,
         persona_id: str,
-    ) -> tuple[dict[str, str], Path | None, dict[str, Any] | None]:
+        campaign_id: str,
+        application_data_mutation_approved: bool = False,
+    ) -> AsyncIterator[tuple[dict[str, str], Path | None]]:
         personas = {item.id: item for item in catalog.personas(project).personas}
         persona = personas.get(persona_id)
         if persona is None:
             raise ApplicationError("flow persona is absent from the catalog", non_retryable=True)
-        reference = persona.credential_ref
-        if reference is None:
-            return {}, None, None
-        readiness = catalog.credential_readiness(str(reference))
-        if not readiness.present or not readiness.permissions_valid:
-            return (
-                {},
-                None,
-                {
-                    "status": "BLOCKED_BY_CREDENTIAL",
-                    "blocker": "PERSONA_CREDENTIAL_UNAVAILABLE",
-                    "missing_credential_refs": [str(reference)],
-                },
+        if persona_id == "anonymous":
+            yield {}, None
+            return
+        manifest = catalog.personas(project)
+        authority = manifest.identity_authority
+        loader = SuperadminCredentialLoader(
+            self.settings.browser_credential_root,
+            production_permissions=self.settings.environment == "production",
+        )
+        credential = loader.load(authority)
+        if not self._superadmin_target_valid(authority, credential.base_url):
+            raise ApplicationError(
+                "superadmin target does not match the configured staging API",
+                type="SUPERADMIN_TARGET_INVALID",
+                non_retryable=True,
             )
-        credentials, path = self._credentials(str(reference).removeprefix("file:"))
-        return credentials, path, None
+        adapter = SuperadminSessionAdapter(redactor=self.redactor, transport=self.api_transport)
+        async with adapter.login(credential) as session:
+            admin = HttpPersonaAdminClient(
+                session,
+                tenant_id=credential.tenant_id,
+                workspace_id=credential.workspace_id,
+                redactor=self.redactor,
+            )
+            factory = EphemeralPersonaFactory(admin)
+            try:
+                async with factory.persona(
+                    project=project,
+                    campaign_id=campaign_id,
+                    persona=persona_id,
+                    scope=persona.scope,
+                ) as generated:
+                    environment = {
+                        "JOURNEY_USERNAME": generated.username,
+                        "JOURNEY_PASSWORD": generated.password,
+                        "JOURNEY_SAFE_E2E_MUTATION": (
+                            "true"
+                            if self.settings.application_data_mutation_enabled
+                            and application_data_mutation_approved
+                            else "false"
+                        ),
+                    }
+                    if generated.access_token:
+                        environment["JOURNEY_ACCESS_TOKEN"] = generated.access_token
+                    if credential.tenant_id:
+                        environment["JOURNEY_TENANT_ID"] = credential.tenant_id
+                    if credential.workspace_id:
+                        environment["JOURNEY_WORKSPACE_ID"] = credential.workspace_id
+                    for secret in environment.values():
+                        self.redactor.register_secret(secret)
+                        self.runner.redactor.register_secret(secret)
+                    try:
+                        yield (
+                            environment,
+                            self.settings.browser_credential_root / authority / "superadmin.env",
+                        )
+                    finally:
+                        for secret in environment.values():
+                            self.redactor.unregister_secret(secret)
+                            self.runner.redactor.unregister_secret(secret)
+            finally:
+                admin.destroy_ephemeral_secrets()
+
+    def _superadmin_target_valid(self, project: str, base_url: str) -> bool:
+        configured = str(self._catalog().project(project).api_url).rstrip("/")
+        return base_url.rstrip("/") == configured and "prod" not in base_url.lower()
+
+    async def _handle_llmwiki_consumer_suite(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("project") != "falcone" or payload.get("preset") != "falcone-intensive":
+            raise ApplicationError(
+                "LLMWiki consumer suite is bound to falcone-intensive",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        snapshot = payload.get("llmwiki_consumer_snapshot")
+        if not isinstance(snapshot, dict):
+            raise ApplicationError("LLMWiki consumer snapshot is missing", non_retryable=True)
+        worktree = Path(str(snapshot.get("source_worktree", "")))
+        catalog = self._catalog()
+        campaign_id = self._bounded_campaign_id(payload.get("campaign_id"))
+        async with self._persona_execution(
+            catalog, "falcone", "developer-operator", campaign_id
+        ) as (credentials, _):
+            token = credentials.get("JOURNEY_ACCESS_TOKEN")
+            if not token:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "EPHEMERAL_FALCONE_SESSION_TOKEN_UNAVAILABLE",
+                }
+            results = self.consumer_suite.run(
+                source_worktree=worktree,
+                command_ids=("lint", "test", "smoke", "e2e", "s14", "s14-integration"),
+                falcone_access_token=token,
+                falcone_api_base_url=str(catalog.project("falcone").api_url),
+                campaign_id=campaign_id,
+            )
+        return {
+            **payload,
+            "status": "PASS" if all(item.status == "PASS" for item in results) else "FAILED",
+            "llmwiki_consumer_results": [
+                {
+                    "command": item.command,
+                    "status": item.status,
+                    "return_code": item.return_code,
+                }
+                for item in results
+            ],
+            "llmwiki_consumer_cleanup": "PROVEN",
+        }
 
     async def _handle_api_catalog(self, payload: dict[str, Any]) -> dict[str, Any]:
         catalog, flows = self._selected_flows(payload)
@@ -179,30 +417,35 @@ class BrowserActivityHandler:
                 steps = [item for item in flow.steps if item.channel == "api"]
                 if not steps:
                     continue
-                credentials, _, credential_block = self._credential_for_persona(
-                    catalog, project, flow.persona
-                )
-                if credential_block is not None:
-                    credential_blockers.extend(credential_block["missing_credential_refs"])
+                try:
+                    async with self._persona_execution(
+                        catalog,
+                        project,
+                        flow.persona,
+                        campaign_id,
+                        application_data_mutation_approved=(
+                            payload.get("preset") == "full-e2e"
+                            and payload.get("application_data_mutation_approved") is True
+                        ),
+                    ) as (credentials, _):
+                        if (
+                            flow.mutation == "disposable"
+                            and credentials.get("JOURNEY_SAFE_E2E_MUTATION", "").lower() != "true"
+                        ):
+                            status = "BLOCKED"
+                            blocker = "APPLICATION_DATA_MUTATION_NOT_AUTHORIZED"
+                            break
+                        result = await self._execute_api_flow(
+                            client,
+                            flow,
+                            steps,
+                            str(manifest.api_url),
+                            campaign_id,
+                            credentials,
+                        )
+                except ApplicationError as error:
+                    credential_blockers.append(error.type or "SUPERADMIN_UNAVAILABLE")
                     continue
-                if flow.persona != "anonymous" and not credentials.get("JOURNEY_ACCESS_TOKEN"):
-                    credential_blockers.append(f"{flow.persona}:JOURNEY_ACCESS_TOKEN")
-                    continue
-                if (
-                    flow.mutation == "disposable"
-                    and credentials.get("JOURNEY_SAFE_E2E_MUTATION", "").lower() != "true"
-                ):
-                    status = "BLOCKED"
-                    blocker = "SAFE_E2E_MUTATION_NOT_AUTHORIZED"
-                    break
-                result = await self._execute_api_flow(
-                    client,
-                    flow,
-                    steps,
-                    str(manifest.api_url),
-                    campaign_id,
-                    credentials,
-                )
                 summaries.append(result)
                 if result["status"] != "PASS":
                     status = "FAILED"
@@ -321,45 +564,49 @@ class BrowserActivityHandler:
         reports: list[dict[str, Any]] = []
         blockers: list[str] = []
         for persona, persona_flows in sorted(grouped.items()):
-            credentials, credential_path, credential_block = self._credential_for_persona(
-                catalog, project, persona
-            )
-            if credential_block is not None:
-                blockers.extend(credential_block["missing_credential_refs"])
-                continue
             ordered = sorted(persona_flows, key=self._browser_flow_order)
             try:
-                plan_value = self._browser_plan(
-                    ordered,
-                    str(manifest.deployment.runtime_url),
-                    str(manifest.api_url),
+                async with self._persona_execution(
+                    catalog,
+                    project,
+                    persona,
                     campaign_id,
-                    credentials,
-                )
-            except KeyError as error:
-                blockers.append(f"{persona}:{error.args[0]}")
+                    application_data_mutation_approved=(
+                        payload.get("preset") == "full-e2e"
+                        and payload.get("application_data_mutation_approved") is True
+                    ),
+                ) as (credentials, credential_path):
+                    plan_value = self._browser_plan(
+                        ordered,
+                        str(manifest.deployment.runtime_url),
+                        str(manifest.api_url),
+                        campaign_id,
+                        credentials,
+                    )
+                    plan_root = self.settings.temporary_root / "browser-plans" / campaign_id
+                    plan_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    plan_path = plan_root / f"{persona}.json"
+                    self._atomic_json(plan_path, plan_value)
+                    self._validate_plan(plan_path)
+                    output = self.settings.browser_evidence_root / campaign_id / persona
+                    self._clear_previous_attempt(output)
+                    output.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    environment = {
+                        "ENGINEERING_JOURNEY_PLAN": str(plan_path),
+                        "ENGINEERING_JOURNEY_OUTPUT": str(output),
+                        **credentials,
+                    }
+                    result = self.runner.run(
+                        "node",
+                        [str(self.settings.browser_script)],
+                        cwd=self.settings.browser_script.parent,
+                        timeout_seconds=3600,
+                        environment=environment,
+                        check=False,
+                    )
+            except (ApplicationError, KeyError) as error:
+                blockers.append(f"{persona}:{getattr(error, 'type', None) or type(error).__name__}")
                 continue
-            plan_root = self.settings.temporary_root / "browser-plans" / campaign_id
-            plan_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            plan_path = plan_root / f"{persona}.json"
-            self._atomic_json(plan_path, plan_value)
-            self._validate_plan(plan_path)
-            output = self.settings.browser_evidence_root / campaign_id / persona
-            self._clear_previous_attempt(output)
-            output.mkdir(parents=True, exist_ok=True, mode=0o700)
-            environment = {
-                "ENGINEERING_JOURNEY_PLAN": str(plan_path),
-                "ENGINEERING_JOURNEY_OUTPUT": str(output),
-                **credentials,
-            }
-            result = self.runner.run(
-                "node",
-                [str(self.settings.browser_script)],
-                cwd=self.settings.browser_script.parent,
-                timeout_seconds=3600,
-                environment=environment,
-                check=False,
-            )
             result_path = output / "result.json"
             if not result_path.is_file():
                 reports.append(
@@ -437,8 +684,14 @@ class BrowserActivityHandler:
                     if "<" in target or ">" in target:
                         raise KeyError("JOURNEY_ROUTE_REFERENCE")
                     plan_steps.append({"action": "goto", "url": urljoin(runtime_url, target)})
-                elif step.action == "fill-credential":
-                    environment_name = credential_names.get(str(step.value_ref))
+                elif step.action in {"fill-credential", "fill-generated"}:
+                    generated_names = {
+                        "ephemeral.username": "JOURNEY_USERNAME",
+                        "ephemeral.password": "JOURNEY_PASSWORD",
+                    }
+                    environment_name = credential_names.get(
+                        str(step.value_ref)
+                    ) or generated_names.get(str(step.value_ref))
                     if environment_name is None or not credentials.get(environment_name):
                         raise KeyError(environment_name or "JOURNEY_CREDENTIAL_FIELD")
                     plan_steps.append(
@@ -462,7 +715,7 @@ class BrowserActivityHandler:
                 elif step.action == "capture":
                     name = re.sub(r"[^a-z0-9-]", "-", step.target.lower()).strip("-")
                     plan_steps.append({"action": "capture", "name": name or "capture"})
-                elif step.action in {"fill-generated", "assert-status"}:
+                elif step.action == "assert-status":
                     raise ApplicationError(
                         f"browser flow action {step.action} has no safe runner mapping",
                         non_retryable=True,
@@ -671,37 +924,6 @@ class BrowserActivityHandler:
             candidate = output / filename
             if candidate.is_file() or candidate.is_symlink():
                 candidate.unlink()
-
-    def _credentials(self, value: Any) -> tuple[dict[str, str], Path | None]:
-        if value is None:
-            return {}, None
-        path = self._bounded_file(value, self.settings.browser_credential_root)
-        mode = path.stat().st_mode
-        if mode & (stat.S_IRWXG | stat.S_IRWXO):
-            raise ApplicationError(
-                "browser credential file grants group or other access",
-                type="PolicyViolation",
-                non_retryable=True,
-            )
-        values: dict[str, str] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line or line.lstrip().startswith("#"):
-                continue
-            name, separator, raw = line.partition("=")
-            if not separator or not self._credential_name.fullmatch(name):
-                raise ApplicationError(
-                    "browser credential file contains an invalid entry",
-                    type="PolicyViolation",
-                    non_retryable=True,
-                )
-            values[name] = raw
-        if not values or any(not item for item in values.values()):
-            raise ApplicationError(
-                "browser credential file is empty or incomplete",
-                type="PolicyViolation",
-                non_retryable=True,
-            )
-        return values, path
 
     @classmethod
     def _redact_known(cls, value: Any, secrets: set[str]) -> Any:

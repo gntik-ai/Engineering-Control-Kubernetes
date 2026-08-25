@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -38,9 +37,26 @@ class FakePublicationRunner:
             self.pushes.append(cwd.parent.name)
             environment = kwargs.get("environment")
             assert isinstance(environment, dict)
-            assert environment["ENGINEERING_GITHUB_TOKEN"] == "t" * 48
-            assert all("t" * 20 not in argument for argument in arguments)
+            assert environment["HOME"] == "/home/hermes"
             return CommandResult(0, "ok\n", "")
+        if executable == "gh" and arguments[:2] == ["auth", "status"]:
+            return CommandResult(0, "", "")
+        if executable == "gh" and arguments[:2] == ["api", "user"]:
+            return CommandResult(0, '{"login":"operator","type":"User"}', "")
+        if executable == "gh" and arguments[:2] == ["repo", "view"]:
+            repository = arguments[2]
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "nameWithOwner": repository,
+                        "defaultBranchRef": {"name": "main"},
+                        "viewerPermission": "ADMIN",
+                        "isPrivate": False,
+                    }
+                ),
+                "",
+            )
         if executable == "gh" and arguments[:2] == ["pr", "create"]:
             repository = arguments[arguments.index("--repo") + 1]
             body_file = Path(arguments[arguments.index("--body-file") + 1])
@@ -106,22 +122,12 @@ async def test_delivery_publishes_exact_heads_as_draft_prs_without_merging(
 ) -> None:
     worktree_root = tmp_path / "worktrees"
     payload, branch, heads = publication_payload(worktree_root)
-    credential_root = tmp_path / "delivery"
-    credential_root.mkdir()
-    token_file = credential_root / "github.token"
-    token_file.write_text("t" * 48, encoding="utf-8")
-    os.chmod(token_file, 0o600)
-    askpass = tmp_path / "git-askpass.sh"
-    askpass.write_text("fixture", encoding="utf-8")
-    askpass.chmod(0o700)
     runner = FakePublicationRunner(branch, heads)
     handler = DeliveryActivityHandler(
         Settings(
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
-            delivery_credential_root=credential_root,
-            github_pr_write_token_file=token_file,
-            git_askpass_executable=askpass,
+            github_writes_enabled=True,
         ),
         runner,  # type: ignore[arg-type]
     )
@@ -135,7 +141,7 @@ async def test_delivery_publishes_exact_heads_as_draft_prs_without_merging(
 
 
 @pytest.mark.asyncio
-async def test_delivery_without_scoped_credential_returns_structured_handoff(
+async def test_delivery_with_writes_disabled_returns_structured_handoff(
     tmp_path: Path,
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
@@ -145,29 +151,18 @@ async def test_delivery_without_scoped_credential_returns_structured_handoff(
     )
     result = await handler.handle("delivery.publish", payload)
     assert result["status"] == "BLOCKED"
-    assert result["blocker"] == "MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
+    assert result["blocker"] == "GITHUB_WRITES_DISABLED"
 
 
 @pytest.mark.asyncio
-async def test_delivery_rejects_non_executable_askpass_helper(tmp_path: Path) -> None:
+async def test_delivery_write_policy_blocks_before_git_push(tmp_path: Path) -> None:
     worktree_root = tmp_path / "worktrees"
     payload, branch, heads = publication_payload(worktree_root)
-    credential_root = tmp_path / "delivery"
-    credential_root.mkdir()
-    token_file = credential_root / "github.token"
-    token_file.write_text("t" * 48, encoding="utf-8")
-    token_file.chmod(0o600)
-    askpass = tmp_path / "git-askpass.sh"
-    askpass.write_text("fixture", encoding="utf-8")
-    askpass.chmod(0o600)
     runner = FakePublicationRunner(branch, heads)
     handler = DeliveryActivityHandler(
         Settings(
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
-            delivery_credential_root=credential_root,
-            github_pr_write_token_file=token_file,
-            git_askpass_executable=askpass,
         ),
         runner,  # type: ignore[arg-type]
     )
@@ -175,7 +170,7 @@ async def test_delivery_rejects_non_executable_askpass_helper(tmp_path: Path) ->
     result = await handler.handle("delivery.publish", payload)
 
     assert result["status"] == "BLOCKED"
-    assert result["blocker"] == "GITHUB_PUBLICATION_FAILED"
+    assert result["blocker"] == "GITHUB_WRITES_DISABLED"
     assert runner.pushes == []
 
 
@@ -192,22 +187,12 @@ async def test_source_only_publication_binds_deferred_deployment(tmp_path: Path)
         "base_sha": deployment["head_sha"],
         "reason": "AWAITING_IMMUTABLE_ARTIFACT",
     }
-    credential_root = tmp_path / "delivery"
-    credential_root.mkdir()
-    token_file = credential_root / "github.token"
-    token_file.write_text("t" * 48, encoding="utf-8")
-    token_file.chmod(0o600)
-    askpass = tmp_path / "git-askpass.sh"
-    askpass.write_text("fixture", encoding="utf-8")
-    askpass.chmod(0o700)
     runner = FakePublicationRunner(branch, heads)
     handler = DeliveryActivityHandler(
         Settings(
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
-            delivery_credential_root=credential_root,
-            github_pr_write_token_file=token_file,
-            git_askpass_executable=askpass,
+            github_writes_enabled=True,
         ),
         runner,  # type: ignore[arg-type]
     )

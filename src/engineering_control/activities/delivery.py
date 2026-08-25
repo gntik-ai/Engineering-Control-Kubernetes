@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
+from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker, GhCliPolicyError
 from engineering_control.config import Settings
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.models.enums import RedactionStatus
@@ -30,11 +31,15 @@ class RepositoryPublication(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     repository: str = Field(
-        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy)$"
+        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
     )
-    repository_slug: str = Field(pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy)$")
+    repository_slug: str = Field(
+        pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
+    )
     working_directory: Path
-    branch: str = Field(pattern=r"^agent/(falcone|musematic)/[A-Za-z0-9._-]+/[a-f0-9-]{36}$")
+    branch: str = Field(
+        pattern=r"^agent/(falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}$"
+    )
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     base_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
     title: str = Field(min_length=1, max_length=240)
@@ -74,7 +79,8 @@ class PublicationPlan(BaseModel):
             {"musematic", "musematic-deploy"},
         )
         source_only = slugs in ({"falcone"}, {"musematic"})
-        if slugs not in full_pairs and not source_only:
+        llmwiki_self_contained = slugs == {"llmwiki"}
+        if slugs not in full_pairs and not source_only and not llmwiki_self_contained:
             raise ValueError("publication plan does not match a configured ChangeSet")
         if source_only:
             expected = "falcone-charts" if slugs == {"falcone"} else "musematic-deploy"
@@ -96,14 +102,29 @@ class PublicationPlan(BaseModel):
 class DeliveryActivityHandler:
     """Publish exact validated commits and draft PRs; never merge or rewrite history."""
 
-    def __init__(self, settings: Settings, runner: SafeCommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        runner: SafeCommandRunner | None = None,
+        broker: GhCliBroker | None = None,
+    ) -> None:
         self.settings = settings
         self.runner = runner or SafeCommandRunner(
             {"git": settings.git_executable, "gh": settings.github_executable}
         )
         self.redactor = SecretRedactor()
+        broker_root = (settings.run_root / "delivery").resolve()
+        broker_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.broker = broker or GhCliBroker(
+            self.runner,
+            broker_root,
+            writes_enabled=settings.github_writes_enabled,
+            authenticated_home=settings.github_authenticated_home,
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step == "finding.dedupe":
+            return self._dedupe_finding(payload)
         if step == "enhancement.github_dedupe":
             return self._dedupe_enhancement(payload)
         if step == "enhancement.publish":
@@ -116,17 +137,22 @@ class DeliveryActivityHandler:
             return self._publish_promotion(payload)
         if step != "delivery.publish":
             raise ApplicationError("unsupported delivery activity", non_retryable=True)
+        if not self.broker.writes_enabled:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_WRITES_DISABLED",
+            }
         try:
             plan = PublicationPlan.model_validate(payload.get("publication_plan"))
-            token = self._token()
-            if token is None:
-                return {
-                    **payload,
-                    "status": "BLOCKED",
-                    "blocker": "MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED",
-                }
-            askpass = self._askpass()
-            results = [self._publish(item, token, askpass) for item in plan.publications]
+            self.broker.preflight(tuple(item.repository for item in plan.publications))
+            results = [self._publish(item) for item in plan.publications]
+        except GhCliAuthError:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "BLOCKED_BY_GH_AUTH",
+            }
         except (CommandFailure, OSError, ValueError) as error:
             return {
                 **payload,
@@ -144,17 +170,10 @@ class DeliveryActivityHandler:
     def _inspect_ci(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             plan = CIReconciliationPlan.model_validate(payload.get("reconciliation_plan"))
-            token = self._token()
-            if token is None:
-                return {
-                    **payload,
-                    "status": "BLOCKED",
-                    "blocker": "MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED",
-                }
             root = (self.settings.run_root / "delivery").resolve()
             root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            environment = {"GH_TOKEN": token}
-            pull_request = self._pull_request(plan, root, environment)
+            self.broker.preflight((plan.repository,))
+            pull_request = self._pull_request(plan)
             ci_evidence = self._evaluate_pull_request(plan, pull_request)
             if ci_evidence["status"] != "CI_VALIDATED":
                 return self._with_ci_evidence(
@@ -190,9 +209,7 @@ class DeliveryActivityHandler:
                     status="CI_VALIDATED",
                     candidate_status="MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED",
                 )
-            manifest, candidate_evidence = self._candidate_manifest(
-                plan, root, environment, registry_auth
-            )
+            manifest, candidate_evidence = self._candidate_manifest(plan, root, registry_auth)
             combined = {**ci_evidence, "candidate": candidate_evidence}
             return self._with_ci_evidence(
                 payload,
@@ -202,6 +219,12 @@ class DeliveryActivityHandler:
                 candidate_status="VERIFIED",
                 candidate_manifest=manifest.model_dump(mode="json"),
             )
+        except GhCliAuthError:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "BLOCKED_BY_GH_AUTH",
+            }
         except (
             CommandFailure,
             OSError,
@@ -219,30 +242,8 @@ class DeliveryActivityHandler:
     def _pull_request(
         self,
         plan: CIReconciliationPlan,
-        cwd: Path,
-        environment: dict[str, str],
     ) -> dict[str, Any]:
-        result = self.runner.run(
-            "gh",
-            [
-                "pr",
-                "view",
-                str(plan.source_pr_number),
-                "--repo",
-                plan.repository,
-                "--json",
-                (
-                    "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
-                    "mergeStateStatus,reviewDecision,statusCheckRollup"
-                ),
-            ],
-            cwd=cwd,
-            environment=environment,
-        )
-        value = json.loads(result.stdout)
-        if not isinstance(value, dict):
-            raise ValueError("GitHub PR inspection returned an invalid object")
-        return value
+        return self.broker.view_pull_request(plan.repository, plan.source_pr_number)
 
     @staticmethod
     def _evaluate_pull_request(
@@ -316,30 +317,13 @@ class DeliveryActivityHandler:
         self,
         plan: CIReconciliationPlan,
         cwd: Path,
-        environment: dict[str, str],
         registry_auth: Path,
     ) -> tuple[CandidateArtifactManifest, dict[str, Any]]:
         policy = plan.policy.candidate_build
         run_id = plan.candidate_build_run_id
         if run_id is None:
             raise ValueError("candidate build run is missing")
-        viewed = self.runner.run(
-            "gh",
-            [
-                "run",
-                "view",
-                str(run_id),
-                "--repo",
-                plan.repository,
-                "--json",
-                "databaseId,workflowName,headSha,status,conclusion,event,url",
-            ],
-            cwd=cwd,
-            environment=environment,
-        )
-        run = json.loads(viewed.stdout)
-        if not isinstance(run, dict):
-            raise ValueError("candidate build run returned an invalid object")
+        run = self.broker.workflow_run(plan.repository, run_id)
         expected_run = {
             "databaseId": run_id,
             "workflowName": policy.workflow_name,
@@ -353,22 +337,8 @@ class DeliveryActivityHandler:
             raise ValueError("candidate build run is not successful at the exact source SHA")
         with tempfile.TemporaryDirectory(prefix=f"candidate-{run_id}-", dir=cwd) as raw:
             download_root = Path(raw)
-            self.runner.run(
-                "gh",
-                [
-                    "run",
-                    "download",
-                    str(run_id),
-                    "--repo",
-                    plan.repository,
-                    "--name",
-                    policy.artifact_name,
-                    "--dir",
-                    str(download_root),
-                ],
-                cwd=cwd,
-                timeout_seconds=900,
-                environment=environment,
+            self.broker.download_run_artifact(
+                plan.repository, run_id, policy.artifact_name, download_root
             )
             files = sorted(path for path in download_root.rglob("*") if path.is_file())
             manifest_path = download_root / policy.manifest_file
@@ -389,34 +359,19 @@ class DeliveryActivityHandler:
         ):
             raise ValueError("candidate manifest changed its immutable project binding")
         attestation_hashes: dict[str, str] = {}
-        attestation_environment = {
-            **environment,
-            "DOCKER_CONFIG": str(registry_auth.parent),
-        }
         for image in manifest.images:
-            arguments = [
-                "attestation",
-                "verify",
-                f"oci://{image.repository}@{image.digest}",
-                "--repo",
-                plan.repository,
-                "--signer-workflow",
-                policy.signer_workflow,
-                "--source-digest",
-                plan.source_head_sha,
-                "--format",
-                "json",
-            ]
-            if policy.deny_self_hosted_runners:
-                arguments.append("--deny-self-hosted-runners")
-            verified = self.runner.run(
-                "gh", arguments, cwd=cwd, timeout_seconds=900, environment=attestation_environment
+            result = self.broker.verify_attestation(
+                repository=plan.repository,
+                subject=f"oci://{image.repository}@{image.digest}",
+                signer_workflow=policy.signer_workflow,
+                source_digest=plan.source_head_sha,
+                deny_self_hosted_runners=policy.deny_self_hosted_runners,
+                docker_config=registry_auth.parent,
             )
-            result = json.loads(verified.stdout)
-            if not isinstance(result, list) or not result:
+            if not result:
                 raise ValueError("candidate image has no verified provenance attestation")
             attestation_hashes[image.component] = hashlib.sha256(
-                verified.stdout.encode()
+                json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
         return manifest, {
             "workflow_run_id": run_id,
@@ -494,15 +449,14 @@ class DeliveryActivityHandler:
     def _publish_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             promotion = PromotionPublication.model_validate(payload.get("promotion_publication"))
-            token = self._token()
-            if token is None:
-                return {
-                    **payload,
-                    "status": "BLOCKED",
-                    "blocker": "MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED",
-                }
             publication = RepositoryPublication.model_validate(promotion.model_dump())
-            result = self._publish(publication, token, self._askpass())
+            result = self._publish(publication)
+        except GhCliAuthError:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "BLOCKED_BY_GH_AUTH",
+            }
         except (CommandFailure, OSError, ValueError, ValidationError) as error:
             return {
                 **payload,
@@ -540,7 +494,7 @@ class DeliveryActivityHandler:
             raise ValueError("GitHub registry auth file permissions are invalid")
         return resolved
 
-    def _publish(self, plan: RepositoryPublication, token: str, askpass: Path) -> dict[str, Any]:
+    def _publish(self, plan: RepositoryPublication) -> dict[str, Any]:
         worktree = self._bounded_worktree(plan)
         git_arguments = ["-c", f"safe.directory={worktree}"]
         branch = self.runner.run(
@@ -555,9 +509,7 @@ class DeliveryActivityHandler:
         if branch != plan.branch or head != plan.head_sha or status:
             raise ValueError("publication worktree identity, head, or cleanliness changed")
         environment = {
-            "ENGINEERING_GITHUB_TOKEN": token,
-            "GH_TOKEN": token,
-            "GIT_ASKPASS": str(askpass),
+            "HOME": str(self.broker.authenticated_home),
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "safe.directory",
@@ -576,30 +528,19 @@ class DeliveryActivityHandler:
             timeout_seconds=900,
             environment=environment,
         )
-        existing = self._existing_pull_request(plan, environment)
+        existing = self._existing_pull_request(plan)
         if existing is None:
             body_path = self._body_file(plan)
             try:
-                created = self.runner.run(
-                    "gh",
-                    [
-                        "pr",
-                        "create",
-                        "--repo",
-                        plan.repository,
-                        "--head",
-                        plan.branch,
-                        "--base",
-                        plan.base_branch,
-                        "--title",
-                        plan.title,
-                        "--body-file",
-                        str(body_path),
-                        "--draft",
-                    ],
-                    cwd=worktree,
-                    environment=environment,
-                ).stdout.strip()
+                created = self.broker.create_pull_request(
+                    repository=plan.repository,
+                    head=plan.branch,
+                    base=plan.base_branch,
+                    title=plan.title,
+                    body_file=body_path,
+                    change_binding=f"changeset:{plan.branch.rsplit('/', 1)[-1]}",
+                    draft=True,
+                )
                 if not re.fullmatch(
                     rf"https://github\.com/{re.escape(plan.repository)}/pull/[1-9][0-9]*",
                     created,
@@ -607,7 +548,7 @@ class DeliveryActivityHandler:
                     raise ValueError("GitHub PR creation returned an invalid URL")
             finally:
                 body_path.unlink(missing_ok=True)
-            existing = self._existing_pull_request(plan, environment)
+            existing = self._existing_pull_request(plan)
         if existing is None or existing.get("headRefOid") != plan.head_sha:
             raise ValueError("GitHub PR does not bind to the exact validated commit")
         return {
@@ -625,30 +566,8 @@ class DeliveryActivityHandler:
     def _existing_pull_request(
         self,
         plan: RepositoryPublication,
-        environment: dict[str, str],
     ) -> dict[str, Any] | None:
-        result = self.runner.run(
-            "gh",
-            [
-                "pr",
-                "list",
-                "--repo",
-                plan.repository,
-                "--head",
-                plan.branch,
-                "--state",
-                "all",
-                "--json",
-                "number,url,state,isDraft,headRefOid,baseRefName",
-                "--limit",
-                "10",
-            ],
-            cwd=plan.working_directory,
-            environment=environment,
-        )
-        value = json.loads(result.stdout)
-        if not isinstance(value, list):
-            raise ValueError("GitHub PR lookup returned a non-list response")
+        value = self.broker.list_pull_requests(plan.repository, head=plan.branch, state="all")
         matches = [
             item
             for item in value
@@ -677,41 +596,11 @@ class DeliveryActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
-        token = self._credential_token(
-            self.settings.github_read_token_file,
-            self.settings.credential_root,
-            "GitHub read-only token",
-        )
-        if token is None:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED",
-            }
-        root = (self.settings.run_root / "delivery").resolve()
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            result = self.runner.run(
-                "gh",
-                [
-                    "issue",
-                    "list",
-                    "--repo",
-                    repository,
-                    "--state",
-                    "all",
-                    "--search",
-                    f'"{fingerprint}"',
-                    "--json",
-                    "number,title,url,state",
-                    "--limit",
-                    "100",
-                ],
-                cwd=root,
-                environment={"GH_TOKEN": token},
-            )
-            matches = json.loads(result.stdout)
-        except (CommandFailure, json.JSONDecodeError):
+            matches = self.broker.search_issues(repository, f'"{fingerprint}"')
+        except GhCliAuthError:
+            return {**payload, "status": "BLOCKED", "blocker": "BLOCKED_BY_GH_AUTH"}
+        except (CommandFailure, GhCliPolicyError):
             return {
                 **payload,
                 "status": "BLOCKED",
@@ -731,6 +620,80 @@ class DeliveryActivityHandler:
             "searched_repository": repository,
         }
 
+    def _dedupe_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
+        controls = payload.get("controls")
+        finding = payload.get("finding")
+        if not isinstance(controls, dict) or not isinstance(finding, dict):
+            raise ApplicationError(
+                "finding deduplication requires finding and controls",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if controls.get("disposition") != "CONFIRMED":
+            return {**payload, "status": "SKIPPED", "duplicate_issue_url": None}
+        project = str(finding.get("project", ""))
+        pairs = {
+            "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
+            "musematic": ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
+            "llmwiki": ("gntik-ai/llmwiki", "gntik-ai/llmwiki"),
+        }
+        if project not in pairs:
+            raise ApplicationError(
+                "finding project is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        source_repository, deployment_repository = pairs[project]
+        surface = str(finding.get("repository_surface", "source"))
+        repositories = {
+            "source": (source_repository,),
+            "deployment": (deployment_repository,),
+            "pair": tuple(dict.fromkeys((source_repository, deployment_repository))),
+            "runtime": tuple(dict.fromkeys((source_repository, deployment_repository))),
+        }.get(surface)
+        if repositories is None:
+            raise ApplicationError(
+                "finding repository surface is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        searched: list[str] = []
+        duplicate: str | None = None
+        try:
+            self.broker.preflight(repositories)
+            for repository in repositories:
+                matches = self.broker.search_issues(
+                    repository, f'"{finding.get("fingerprint", "")}"'
+                )
+                searched.append(repository)
+                if matches and isinstance(matches[0], dict):
+                    candidate = matches[0].get("url")
+                    if isinstance(candidate, str) and candidate:
+                        duplicate = candidate
+                        break
+        except GhCliAuthError:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "BLOCKED_BY_GH_AUTH",
+                "duplicate_issue_url": None,
+                "searched_repositories": searched,
+            }
+        except (CommandFailure, GhCliPolicyError):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "GITHUB_DUPLICATE_SEARCH_FAILED",
+                "duplicate_issue_url": None,
+                "searched_repositories": searched,
+            }
+        return {
+            **payload,
+            "status": "DUPLICATE" if duplicate else "CLEAR",
+            "duplicate_issue_url": duplicate,
+            "searched_repositories": searched,
+        }
+
     def _publish_enhancement(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("approval_validated") is not True or not payload.get("approval_binding"):
             return {
@@ -742,17 +705,6 @@ class DeliveryActivityHandler:
         checkpoint = self._issue_write_checkpoint(repository)
         if checkpoint is not None:
             return {**payload, "status": "BLOCKED", "blocker": checkpoint}
-        token = self._credential_token(
-            self.settings.github_issue_write_token_file,
-            self.settings.credential_root,
-            "GitHub issue-write token",
-        )
-        if token is None:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_ISSUE_WRITE_NOT_CONFIGURED",
-            }
         title_value = str(payload.get("proposed_outcome", "")).strip().splitlines()[0]
         title = f"Enhancement: {title_value}"[:200]
         if len(title_value) < 1:
@@ -770,22 +722,15 @@ class DeliveryActivityHandler:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 handle.write(str(self.redactor.redact_text(body).value))
-            created = self.runner.run(
-                "gh",
-                [
-                    "issue",
-                    "create",
-                    "--repo",
-                    repository,
-                    "--title",
-                    title,
-                    "--body-file",
-                    str(body_path),
-                ],
-                cwd=root,
-                environment={"GH_TOKEN": token},
-            ).stdout.strip()
-        except CommandFailure:
+            created = self.broker.create_issue(
+                repository=repository,
+                title=title,
+                body_file=body_path,
+                change_binding=f"enhancement:{payload.get('enhancement_id')}",
+            )
+        except GhCliAuthError:
+            return {**payload, "status": "BLOCKED", "blocker": "BLOCKED_BY_GH_AUTH"}
+        except (CommandFailure, GhCliPolicyError):
             return {
                 **payload,
                 "status": "BLOCKED",
@@ -817,6 +762,7 @@ class DeliveryActivityHandler:
             "gntik-ai/falcone-charts",
             "gntik-ai/musematic",
             "gntik-ai/musematic-deploy",
+            "gntik-ai/llmwiki",
         }:
             raise ApplicationError(
                 "finding publication repository is not allowlisted",
@@ -835,17 +781,6 @@ class DeliveryActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
-        token = self._credential_token(
-            self.settings.github_issue_write_token_file,
-            self.settings.credential_root,
-            "GitHub issue-write token",
-        )
-        if token is None:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_ISSUE_WRITE_NOT_CONFIGURED",
-            }
         root = (self.settings.run_root / "delivery").resolve()
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         descriptor, raw_path = tempfile.mkstemp(prefix="finding-", suffix=".md", dir=root)
@@ -854,22 +789,15 @@ class DeliveryActivityHandler:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 handle.write(str(self.redactor.redact_text(body).value))
-            created = self.runner.run(
-                "gh",
-                [
-                    "issue",
-                    "create",
-                    "--repo",
-                    repository,
-                    "--title",
-                    title,
-                    "--body-file",
-                    str(body_path),
-                ],
-                cwd=root,
-                environment={"GH_TOKEN": token},
-            ).stdout.strip()
-        except CommandFailure:
+            created = self.broker.create_issue(
+                repository=repository,
+                title=title,
+                body_file=body_path,
+                change_binding=f"finding:{payload.get('finding_id')}",
+            )
+        except GhCliAuthError:
+            return {**payload, "status": "BLOCKED", "blocker": "BLOCKED_BY_GH_AUTH"}
+        except (CommandFailure, GhCliPolicyError):
             return {
                 **payload,
                 "status": "BLOCKED",
@@ -900,6 +828,7 @@ class DeliveryActivityHandler:
             "gntik-ai/falcone-charts",
             "gntik-ai/musematic",
             "gntik-ai/musematic-deploy",
+            "gntik-ai/llmwiki",
         }
         if repository not in allowed:
             raise ApplicationError(
@@ -937,27 +866,6 @@ class DeliveryActivityHandler:
             f"## Kill switch\n\n{payload.get('kill_switch') or 'Not applicable'}\n"
         )
 
-    def _credential_token(self, path: Path | None, root_path: Path, label: str) -> str | None:
-        if path is None or not path.exists():
-            return None
-        root = root_path.resolve()
-        resolved = path.resolve()
-        if not resolved.is_file() or not resolved.is_relative_to(root):
-            raise ValueError(f"{label} escaped its credential root")
-        metadata = resolved.stat()
-        permissions = stat.S_IMODE(metadata.st_mode)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IRWXO:
-            raise ValueError(f"{label} permissions are too broad")
-        if self.settings.environment == "production":
-            if metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640:
-                raise ValueError(f"production {label} ownership is invalid")
-        elif permissions not in {0o600, 0o640}:
-            raise ValueError(f"{label} permissions are invalid")
-        token = resolved.read_text(encoding="utf-8").strip()
-        if len(token) < 32:
-            raise ValueError(f"{label} is invalid")
-        return token
-
     def _issue_write_checkpoint(self, repository: str) -> str | None:
         path = self.settings.github_issue_write_validation_file
         if not path.is_file():
@@ -993,26 +901,6 @@ class DeliveryActivityHandler:
         if repository not in repositories:
             return "GITHUB_ISSUE_SAFE_TARGET_NOT_CONFIGURED"
         return None
-
-    def _token(self) -> str | None:
-        path = self.settings.github_pr_write_token_file
-        return self._credential_token(
-            path, self.settings.delivery_credential_root, "GitHub PR-write token"
-        )
-
-    def _askpass(self) -> Path:
-        configured = self.settings.git_askpass_executable
-        if not configured.is_absolute():
-            raise ValueError("Git askpass executable must use an absolute path")
-        resolved = configured.resolve()
-        if not resolved.is_file():
-            raise ValueError("Git askpass executable is missing")
-        mode = resolved.stat().st_mode
-        if not stat.S_ISREG(mode) or mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise ValueError("Git askpass executable permissions are unsafe")
-        if not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
-            raise ValueError("Git askpass helper is not executable")
-        return resolved
 
     def _body_file(self, plan: RepositoryPublication) -> Path:
         root = (self.settings.run_root / "delivery").resolve()

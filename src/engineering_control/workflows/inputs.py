@@ -19,6 +19,7 @@ class AuditCampaignInput:
     environments: list[str] = field(default_factory=list)
     dry_run: bool = True
     publish_findings: bool = False
+    application_data_mutation_approved: bool = False
     campaign_id: str | None = None
     cell_offset: int = 0
     snapshot_blocker: str | None = None
@@ -124,3 +125,11 @@ class EnhancementSolutionLoopInput:
     risk: str
     execution_mode: str = "plan-only"
     dry_run: bool = True
+
+
+@dataclass
+class LLMWikiStagingBootstrapInput:
+    project: str = "llmwiki"
+    environment: str = "staging"
+    approval_binding: str | None = None
+    execute: bool = False

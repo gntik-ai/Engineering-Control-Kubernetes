@@ -106,7 +106,6 @@ install -d -o root -g root -m 0751 \
   "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/personas.d" "${CONFIG_ROOT}/flows.d"
 install -d -o root -g delivery-runner -m 0750 "${CONFIG_ROOT}/policy"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials"
-install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/github"
 install -d -o root -g root -m 0750 "${LOG_ROOT}"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/env"
 install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/journeys"
@@ -120,8 +119,9 @@ install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
 install -d -o root -g root -m 0711 \
   "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
-for repository in falcone falcone-charts musematic musematic-deploy \
-  gntik-ai-falcone gntik-ai-falcone-charts gntik-ai-musematic gntik-ai-musematic-deploy; do
+for repository in falcone falcone-charts musematic musematic-deploy llmwiki \
+  gntik-ai-falcone gntik-ai-falcone-charts gntik-ai-musematic gntik-ai-musematic-deploy \
+  gntik-ai-llmwiki; do
   install -d -o scan-runner -g scan-runner -m 0730 \
     "${PLATFORM_ROOT}/worktrees/${repository}"
 done
@@ -132,6 +132,9 @@ for kind in codex claude browser scan delivery release; do
     "${PLATFORM_ROOT}/runs/${kind}" "${PLATFORM_ROOT}/evidence/${kind}" \
     "${PLATFORM_ROOT}/cache/${kind}" "${PLATFORM_ROOT}/tmp/${kind}"
 done
+install -d -o hermes -g hermes -m 0700 \
+  "${STATE_ROOT}/workers/github" "${PLATFORM_ROOT}/runs/github" \
+  "${PLATFORM_ROOT}/tmp/github"
 install -d -o scan-runner -g scan-runner -m 0710 \
   "${PLATFORM_ROOT}/cache/scan/worktree-git"
 for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
@@ -145,8 +148,12 @@ RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse --verify HEAD) || {
 }
 RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${RELEASE_ID}")
 ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
-for project in falcone musematic; do
-  install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/${project}"
+for project in falcone musematic llmwiki; do
+  if [[ ${project} == falcone || ${project} == musematic ]]; then
+    install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/credentials/${project}"
+  else
+    install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/${project}"
+  fi
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/config/projects/${project}.yaml" \
     "${CONFIG_ROOT}/projects.d/${project}.yaml"
@@ -234,71 +241,21 @@ for identity in codex-runner claude-runner browser-runner scan-runner delivery-r
     evidence_tokens_ready=false
   fi
 done
-if [[ ! -f "${CONFIG_ROOT}/env/delivery-worker.env" ]]; then
-  {
-    printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/delivery-read.token\n' "${CONFIG_ROOT}"
-    printf 'ENGINEERING_GITHUB_ISSUE_WRITE_TOKEN_FILE=%s/credentials/github/issues-write.token\n' "${CONFIG_ROOT}"
-    printf 'ENGINEERING_GITHUB_PR_WRITE_TOKEN_FILE=%s/env/delivery/github-pr-write.token\n' "${CONFIG_ROOT}"
-    printf 'ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=%s/env/delivery/registry/config.json\n' \
-      "${CONFIG_ROOT}"
-    printf 'ENGINEERING_DELIVERY_CREDENTIAL_ROOT=%s/env/delivery\n' "${CONFIG_ROOT}"
-    printf 'ENGINEERING_GITHUB_EXECUTABLE=/usr/local/bin/gh\n'
-  } >"${CONFIG_ROOT}/env/delivery-worker.env"
-  chown root:delivery-runner "${CONFIG_ROOT}/env/delivery-worker.env"
-  chmod 0640 "${CONFIG_ROOT}/env/delivery-worker.env"
-fi
 {
-  printf 'ENGINEERING_GIT_READ_TOKEN_FILE=%s/env/scan/github-read.token\n' \
+  printf 'ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=%s/env/delivery/registry/config.json\n' \
     "${CONFIG_ROOT}"
-  printf 'ENGINEERING_GIT_READ_CREDENTIAL_ROOT=%s/env/scan\n' "${CONFIG_ROOT}"
-  printf 'ENGINEERING_GIT_ASKPASS_EXECUTABLE=%s/source/scripts/git-askpass.sh\n' \
-    "${INSTALL_ROOT}"
-} >"${CONFIG_ROOT}/env/scan-worker.env"
+  printf 'ENGINEERING_DELIVERY_CREDENTIAL_ROOT=%s/env/delivery\n' "${CONFIG_ROOT}"
+} >"${CONFIG_ROOT}/env/delivery-worker.env"
+chown root:delivery-runner "${CONFIG_ROOT}/env/delivery-worker.env"
+chmod 0640 "${CONFIG_ROOT}/env/delivery-worker.env"
+printf 'ENGINEERING_GITHUB_WRITES_ENABLED=false\n' >"${CONFIG_ROOT}/env/scan-worker.env"
 chown root:scan-runner "${CONFIG_ROOT}/env/scan-worker.env"
 chmod 0640 "${CONFIG_ROOT}/env/scan-worker.env"
-if [[ ! -f "${CONFIG_ROOT}/env/scan/github-read.token" ]]; then
-  touch "${STATE_ROOT}/MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED"
-else
-  chown root:scan-runner "${CONFIG_ROOT}/env/scan/github-read.token"
-  chmod 0640 "${CONFIG_ROOT}/env/scan/github-read.token"
-  rm -f -- "${STATE_ROOT}/MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED"
-fi
 if ! grep -q '^ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=' \
   "${CONFIG_ROOT}/env/delivery-worker.env"; then
   printf 'ENGINEERING_GITHUB_REGISTRY_AUTH_FILE=%s/env/delivery/registry/config.json\n' \
     "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
 fi
-if ! grep -q '^ENGINEERING_GITHUB_READ_TOKEN_FILE=' \
-  "${CONFIG_ROOT}/env/delivery-worker.env"; then
-  printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/delivery-read.token\n' \
-    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
-fi
-if ! grep -q '^ENGINEERING_GITHUB_ISSUE_WRITE_TOKEN_FILE=' \
-  "${CONFIG_ROOT}/env/delivery-worker.env"; then
-  printf 'ENGINEERING_GITHUB_ISSUE_WRITE_TOKEN_FILE=%s/credentials/github/issues-write.token\n' \
-    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
-fi
-if ! grep -q '^ENGINEERING_GITHUB_PR_WRITE_TOKEN_FILE=' \
-  "${CONFIG_ROOT}/env/delivery-worker.env"; then
-  printf 'ENGINEERING_GITHUB_PR_WRITE_TOKEN_FILE=%s/env/delivery/github-pr-write.token\n' \
-    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/delivery-worker.env"
-fi
-if [[ ! -f "${CONFIG_ROOT}/env/delivery/github-pr-write.token" ]]; then
-  touch "${STATE_ROOT}/MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
-else
-  chown root:delivery-runner "${CONFIG_ROOT}/env/delivery/github-pr-write.token"
-  chmod 0640 "${CONFIG_ROOT}/env/delivery/github-pr-write.token"
-  rm -f -- "${STATE_ROOT}/MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
-fi
-for github_credential in delivery-read.token issues-write.token; do
-  github_path="${CONFIG_ROOT}/credentials/github/${github_credential}"
-  if [[ -f "${github_path}" ]]; then
-    chown root:delivery-runner "${github_path}"
-    chmod 0640 "${github_path}"
-  else
-    touch "${STATE_ROOT}/MANUAL_GITHUB_${github_credential^^}_REQUIRED"
-  fi
-done
 if [[ ! -f "${CONFIG_ROOT}/env/delivery/registry/config.json" ]]; then
   touch "${STATE_ROOT}/MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED"
 else
@@ -314,23 +271,27 @@ else
   touch "${STATE_ROOT}/MANUAL_EVIDENCE_INGEST_TOKEN_REQUIRED"
 fi
 
-for unit in engineering-worker@.service engineering-release-worker.service; do
+for unit in engineering-worker@.service engineering-release-worker.service \
+  engineering-github-worker.service; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
   install -o root -g root -m 0644 \
     "${CONFIG_ROOT}/systemd/${unit}" "/etc/systemd/system/${unit}"
 done
 systemd-analyze verify /etc/systemd/system/engineering-worker@.service \
-  /etc/systemd/system/engineering-release-worker.service
+  /etc/systemd/system/engineering-release-worker.service \
+  /etc/systemd/system/engineering-github-worker.service
 systemctl daemon-reload
 systemctl enable engineering-worker@codex.service engineering-worker@claude.service \
   engineering-worker@browser.service engineering-worker@scan.service \
   engineering-worker@delivery.service \
+  engineering-github-worker.service \
   engineering-release-worker.service
 "${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope worker
 systemctl restart engineering-worker@codex.service engineering-worker@claude.service \
   engineering-worker@browser.service engineering-worker@scan.service \
   engineering-worker@delivery.service \
+  engineering-github-worker.service \
   engineering-release-worker.service
 
 if sudo -u codex-runner -H env -i \

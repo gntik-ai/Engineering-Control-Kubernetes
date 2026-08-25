@@ -1,0 +1,12 @@
+version: 1
+mutation_class: IDENTITY_BOOTSTRAP
+allowed: true
+environments: [staging]
+projects: [falcone, musematic, llmwiki]
+resource_prefix: e2e-
+cleanup_required: true
+max_users_per_campaign: 8
+max_roles_per_campaign: 4
+default_ttl_minutes: 120
+production_target_available: false
+publication_requires_cleanup_complete: true

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import stat
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,28 @@ PRESETS: dict[str, dict[str, tuple[str, ...]]] = {
         "categories": ("public",),
         "lenses": ("deployment", "operations", "observability", "supply-chain"),
     },
+    "falcone-intensive": {
+        "surfaces": ("source", "deployment", "pair", "runtime"),
+        "categories": (
+            "public",
+            "authentication",
+            "standard-user",
+            "admin",
+            "authorization",
+            "integrations",
+        ),
+        "lenses": (
+            "correctness",
+            "contract",
+            "security",
+            "authorization",
+            "tenant-isolation",
+            "reliability",
+            "data-lifecycle",
+            "observability",
+            "deployment",
+        ),
+    },
 }
 
 
@@ -83,11 +106,15 @@ class EngineeringCatalog:
         persona_root: Path,
         flow_root: Path,
         credential_root: Path = Path("/etc/engineering-control/credentials"),
+        attestation_root: Path = Path("/var/lib/engineering-control/attestations"),
+        browser_worker_identity: str = "browser-runner@hermes-worker",
     ) -> None:
         self.project_root = project_root
         self.persona_root = persona_root
         self.flow_root = flow_root
         self.credential_root = credential_root.resolve()
+        self.attestation_root = attestation_root.resolve()
+        self.browser_worker_identity = browser_worker_identity
 
     def project(self, project: str) -> ProjectManifest:
         return ProjectManifest.model_validate(self._yaml(self.project_root / f"{project}.yaml"))
@@ -120,6 +147,10 @@ class EngineeringCatalog:
         personas = self.personas(project)
         all_flows = self.flows(project)
         policy = PRESETS[preset]
+        if project == "llmwiki" and environment != "staging":
+            raise ValueError("LLMWiki rejects every non-staging target")
+        if project != "falcone" and preset == "falcone-intensive":
+            raise ValueError("falcone-intensive is bound to Falcone")
         selected = [flow for flow in all_flows if flow.category in policy["categories"]]
         persona_by_id = {persona.id: persona for persona in personas.personas}
         selected_personas = sorted({flow.persona for flow in selected})
@@ -127,10 +158,9 @@ class EngineeringCatalog:
         if missing:
             raise ValueError(f"flows reference unknown personas: {missing}")
         readiness: list[CredentialReadiness] = []
-        for persona_id in selected_personas:
-            reference = persona_by_id[persona_id].credential_ref
-            if reference is not None:
-                readiness.append(self.credential_readiness(reference))
+        if any(persona_id != "anonymous" for persona_id in selected_personas):
+            authority = personas.identity_authority
+            readiness.append(self.superadmin_readiness(authority))
         requires_runtime = "runtime" in policy["surfaces"]
         observer = self.credential_readiness(manifest.deployment.observer_credential_ref)
         if requires_runtime:
@@ -191,6 +221,54 @@ class EngineeringCatalog:
             present=True,
             permissions_valid=permissions_valid,
             blocker="NONE" if permissions_valid else "PERMISSIONS",
+        )
+
+    def superadmin_readiness(self, project: str) -> CredentialReadiness:
+        reference = f"worker-attestation:{project}-superadmin"
+        path = (self.attestation_root / f"{project}-superadmin.json").resolve()
+        if not path.is_relative_to(self.attestation_root) or not path.is_file():
+            return CredentialReadiness(
+                reference=reference,
+                present=False,
+                permissions_valid=True,
+                worker_attested=False,
+                blocker="ATTESTATION_MISSING",
+            )
+        try:
+            from engineering_control.identity.attestation import (
+                SuperadminReadinessAttestation,
+                superadmin_contract_hash,
+            )
+
+            value = json.loads(path.read_text(encoding="utf-8"))
+            attestation = SuperadminReadinessAttestation.model_validate(value)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return CredentialReadiness(
+                reference=reference,
+                present=True,
+                permissions_valid=True,
+                worker_attested=False,
+                blocker="ATTESTATION_INVALID",
+            )
+        if (
+            attestation.project != project
+            or attestation.worker_identity != self.browser_worker_identity
+            or attestation.contract_hash != superadmin_contract_hash(project)
+            or not attestation.current()
+        ):
+            return CredentialReadiness(
+                reference=reference,
+                present=True,
+                permissions_valid=True,
+                worker_attested=False,
+                blocker="ATTESTATION_STALE",
+            )
+        return CredentialReadiness(
+            reference=reference,
+            present=True,
+            permissions_valid=True,
+            worker_attested=attestation.ready(),
+            blocker="NONE" if attestation.ready() else "ATTESTATION_INVALID",
         )
 
     @staticmethod

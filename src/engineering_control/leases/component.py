@@ -20,7 +20,7 @@ class ComponentLeaseConflict(RuntimeError):
 class ComponentLeaseManager:
     """Transactional component writer leases with project and global limits."""
 
-    _component_pattern = re.compile(r"^(falcone|musematic):[a-z0-9][a-z0-9:-]*$")
+    _component_pattern = re.compile(r"^(falcone|musematic|llmwiki):[a-z0-9][a-z0-9:-]*$")
     _modes = frozenset({"implementation", "deployment", "migration-secret"})
 
     def __init__(self, *, max_implementation_per_project: int = 2) -> None:

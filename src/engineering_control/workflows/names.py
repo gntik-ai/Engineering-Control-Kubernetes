@@ -17,3 +17,4 @@ class WorkflowName(StrEnum):
     ENHANCEMENT_DISCOVERY = "EnhancementDiscoveryWorkflow"
     ENHANCEMENT_DELIVERY = "EnhancementDeliveryWorkflow"
     ENHANCEMENT_SOLUTION_LOOP = "EnhancementSolutionLoopWorkflow"
+    LLMWIKI_STAGING_BOOTSTRAP = "LLMWikiStagingBootstrapWorkflow"

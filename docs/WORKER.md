@@ -1,6 +1,6 @@
 # Worker
 
-The worker executes bounded activities from six task queues using six Unix identities:
+The worker executes bounded activities through separated identities plus one typed GitHub broker:
 
 | Identity | Purpose | Explicitly forbidden |
 | --- | --- | --- |
@@ -10,6 +10,7 @@ The worker executes bounded activities from six task queues using six Unix ident
 | `scan-runner` | mirrors, worktree allocation, scanners | model auth, release credentials |
 | `delivery-runner` | exact-head Git push and draft PR publication | model auth, release credentials, merge, force-push |
 | `release-runner` | deterministic bounded release activity | model auth, arbitrary prompts, general LLM work |
+| `hermes` (`engineering-github-worker`) | typed `gh` broker and authenticated mirror refresh | arbitrary `gh`, token extraction, merge, administration |
 
 Install:
 
@@ -22,26 +23,20 @@ sudo ./scripts/verify-worker.sh
 ```
 
 The mirror bootstrap verifies exact origins and bare-repository structure, stages new clones
-outside the canonical path, and never replaces an existing mirror. Public repositories can use
-anonymous access. Private repositories use a distinct read-only token at
-`/etc/engineering-control/env/scan/github-read.token`, owned by `root:scan-runner` and mode `0640`.
-An absent file beneath that protected root means anonymous-only operation; an out-of-root path,
-symlink escape, non-regular file, or unsafe mode fails closed.
-Git receives only the token file path through the fixed askpass adapter; the value is not placed in
-service configuration, command arguments, or logs. Never reuse the delivery credential.
+outside the canonical path, and never replaces an existing mirror. GitHub authentication comes
+only from the installed `gh` credential store of the exact `hermes` broker identity. Engineering
+Control never calls `gh auth token`, copies that store, or places a GitHub token in configuration,
+environment variables, arguments, logs, evidence, or workflow state.
 
-Provision private-mirror access interactively, without printing the token:
+Validate the broker and configure Git's `gh` credential helper interactively:
 
 ```bash
-ssh -t worker 'sudoedit /etc/engineering-control/env/scan/github-read.token && \
-  sudo chown root:scan-runner /etc/engineering-control/env/scan/github-read.token && \
-  sudo chmod 0640 /etc/engineering-control/env/scan/github-read.token && \
+ssh -t worker 'gh auth status --hostname github.com && gh auth setup-git && \
   sudo /opt/engineering-control/source/scripts/bootstrap-mirrors.sh'
 ```
 
-Use a fine-grained credential limited to repository contents read access for the four configured
-repositories. It must not grant pull-request write, Actions, administration, package write,
-deployment, or organization-management access.
+The application constrains the broad operator identity to five allowlisted repositories and typed
+operations. GitHub writes stay disabled until an approval-bound policy enables them.
 
 The bootstrap installs Codex 0.149.0, Claude Code 2.1.239, Playwright 1.62.1, GitHub CLI 2.98.0,
 Gitleaks 8.30.0,
@@ -77,11 +72,9 @@ Provider activities heartbeat Temporal every 30 seconds independently of native 
 This keeps a long, quiet test or code-mode command on its original durable activity attempt while
 preserving event-driven heartbeats and the provider timeout/cancellation boundary.
 
-Bootstrap does not provision GitHub or Kubernetes credentials. Provide the read-only mirror token
-only to `scan-runner`, separate provider OAuth to model identities, a scoped GitHub token only to
-`delivery-runner`, and namespaced kubeconfigs only to the identities documented in `SECURITY.md`.
-The delivery token is root-owned, group-readable by `delivery-runner`, and mode `0640`; the service
-can use it but cannot replace it.
+Bootstrap does not provision GitHub or Kubernetes credentials. It validates the existing `gh`
+broker identity in place, never copies it, keeps provider OAuth isolated, and accepts only scoped
+kubeconfigs documented in `SECURITY.md`.
 
 Runtime observation uses only `/etc/engineering-control/env/observer/*.kubeconfig`, owned by
 `scan-runner` and mode `0600`. Release kubeconfigs remain in the disjoint `release-runner` directory.

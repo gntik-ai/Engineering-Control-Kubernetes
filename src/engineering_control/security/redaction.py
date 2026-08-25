@@ -70,10 +70,26 @@ class SecretRedactor:
         }
     )
 
+    def __init__(self) -> None:
+        self._runtime_secrets: set[str] = set()
+
+    def register_secret(self, value: str) -> None:
+        """Register bounded execution-only material before any output is captured."""
+        if value and value != REDACTED:
+            self._runtime_secrets.add(value)
+
+    def unregister_secret(self, value: str) -> None:
+        self._runtime_secrets.discard(value)
+
     def redact_text(self, value: str) -> RedactionReport:
         replacements = 0
         categories: list[str] = []
         redacted = value
+        for secret in sorted(self._runtime_secrets, key=len, reverse=True):
+            redacted, count = redacted.replace(secret, REDACTED), redacted.count(secret)
+            if count:
+                replacements += count
+                categories.append("runtime_secret")
         for category, pattern, replacement in self._patterns:
             redacted, count = pattern.subn(replacement, redacted)
             if count:

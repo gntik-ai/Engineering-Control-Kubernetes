@@ -27,29 +27,17 @@ ssh -t worker 'sudo -u claude-runner -H /usr/local/bin/claude auth login'
 ssh -t worker 'sudo /opt/engineering-control/source/scripts/validate-native-providers.sh'
 ```
 
-Provision a separate read-only token for private canonical mirrors:
+Validate `gh` in place and configure Git without extracting a token:
 
 ```bash
-ssh -t worker 'sudoedit /etc/engineering-control/env/scan/github-read.token && \
-  sudo chown root:scan-runner /etc/engineering-control/env/scan/github-read.token && \
-  sudo chmod 0640 /etc/engineering-control/env/scan/github-read.token && \
-  sudo /opt/engineering-control/source/scripts/bootstrap-mirrors.sh'
+gh auth status --hostname github.com
+gh auth setup-git
+ssh worker 'gh auth status --hostname github.com && gh auth setup-git'
+ssh worker 'sudo /opt/engineering-control/source/scripts/bootstrap-mirrors.sh'
 ```
 
-Limit it to contents-read access on the four configured repositories. Do not reuse the delivery
-token.
-
-Provision the independent delivery token without exposing it in shell history or terminal output:
-
-```bash
-ssh -t worker 'sudoedit /etc/engineering-control/env/delivery/github.token && \
-  sudo chown root:delivery-runner /etc/engineering-control/env/delivery/github.token && \
-  sudo chmod 0640 /etc/engineering-control/env/delivery/github.token'
-```
-
-Use a fine-grained token limited to contents and pull-request write access on the four configured
-repositories. It must not have merge-bypass, repository administration, Actions-secret, or
-deployment credentials access.
+The broker validates access to all five configured repositories. Application policy remains the
+effective least-privilege boundary and GitHub writes remain disabled by default.
 
 Authenticate `delivery-runner` to GHCR interactively; do not paste a token into a command line or
 copy an interactive Docker config from another account:

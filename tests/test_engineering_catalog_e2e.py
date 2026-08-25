@@ -45,7 +45,11 @@ def test_pair_persona_and_flow_catalogs_are_strict_and_source_backed(tmp_path: P
     assert str(musematic.repositories.deployment.full_name) == "gntik-ai/musematic-deploy"
     assert str(falcone.api_url) == "https://baas.musematic.ai/"
     assert str(musematic.api_url) == "https://api.musematic.ai/"
-    for project in ("falcone", "musematic"):
+    llmwiki = catalog.project("llmwiki")
+    assert str(llmwiki.repositories.source.full_name) == "gntik-ai/llmwiki"
+    assert str(llmwiki.repositories.deployment.full_name) == "gntik-ai/llmwiki"
+    assert llmwiki.repositories.source.default_branch == "master"
+    for project in ("falcone", "musematic", "llmwiki"):
         flows = catalog.flows(project)
         assert {flow.persona for flow in flows}.issuperset(
             {"anonymous", "standard-user", "privileged-admin"}
@@ -100,6 +104,4 @@ async def test_authenticated_catalog_flow_fails_closed_without_reference(tmp_pat
     assert result["status"] == "BLOCKED_BY_CREDENTIAL"
     assert result["blocker"] == "PERSONA_CREDENTIAL_UNAVAILABLE"
     assert result["flows"] == []
-    assert result["missing_credential_refs"] == [
-        "file:/etc/engineering-control/credentials/musematic/standard-user.env"
-    ]
+    assert result["missing_credential_refs"] == ["MANUAL_MUSEMATIC_SUPERADMIN_INPUT_REQUIRED"]

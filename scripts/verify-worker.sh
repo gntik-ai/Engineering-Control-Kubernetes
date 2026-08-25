@@ -72,22 +72,13 @@ sudo -u release-runner /usr/local/bin/kubectl version --client=true -o json | \
   grep -q '"gitVersion": "v1.36.3"'
 sudo -u release-runner /usr/local/bin/argocd version --client --short | \
   grep -q '^argocd: v3\.5\.1+'
-sudo -u delivery-runner /usr/local/bin/gh --version | head -n 1 | \
+sudo -u hermes /usr/local/bin/gh --version | head -n 1 | \
   grep -q '^gh version 2\.98\.0 '
-if sudo -u scan-runner test -s /etc/engineering-control/env/scan/github-read.token; then
-  [[ $(stat -c '%a:%U:%G' /etc/engineering-control/env/scan/github-read.token) == \
-    640:root:scan-runner ]]
-else
-  echo "BLOCKED MANUAL_GITHUB_MIRROR_CREDENTIAL_REQUIRED"
-  blocked=1
-fi
-if sudo -u delivery-runner test -s /etc/engineering-control/env/delivery/github.token; then
-  [[ $(stat -c '%a:%U:%G' /etc/engineering-control/env/delivery/github.token) == \
-    640:root:delivery-runner ]]
-else
-  echo "BLOCKED MANUAL_GITHUB_DELIVERY_CREDENTIAL_REQUIRED"
-  blocked=1
-fi
+sudo -u hermes -H /usr/local/bin/gh auth status --hostname github.com >/dev/null
+for repository in falcone falcone-charts musematic musematic-deploy llmwiki; do
+  sudo -u hermes -H /usr/local/bin/gh repo view "gntik-ai/${repository}" \
+    --json nameWithOwner,defaultBranchRef,viewerPermission,isPrivate >/dev/null
+done
 if sudo -u delivery-runner test -s \
   /etc/engineering-control/env/delivery/registry/config.json; then
   [[ $(stat -c '%a:%U:%G' \
@@ -123,20 +114,8 @@ if sudo -u claude-runner test -r /etc/engineering-control/env/release-worker.env
 fi
 for identity in codex-runner claude-runner browser-runner scan-runner release-runner; do
   if sudo -u "${identity}" test -r \
-    /etc/engineering-control/env/delivery/github.token 2>/dev/null; then
-    echo "FAIL ${identity} can read GitHub delivery credentials" >&2
-    exit 1
-  fi
-  if sudo -u "${identity}" test -r \
     /etc/engineering-control/env/delivery/registry/config.json 2>/dev/null; then
     echo "FAIL ${identity} can read GitHub registry credentials" >&2
-    exit 1
-  fi
-done
-for identity in codex-runner claude-runner browser-runner delivery-runner release-runner; do
-  if sudo -u "${identity}" test -r \
-    /etc/engineering-control/env/scan/github-read.token 2>/dev/null; then
-    echo "FAIL ${identity} can read the GitHub mirror credential" >&2
     exit 1
   fi
 done

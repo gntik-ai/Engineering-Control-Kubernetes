@@ -1,0 +1,8 @@
+version: 1
+enabled: false
+project: llmwiki
+environment: staging
+target_context: UNCONFIGURED
+target_namespace: llmwiki-e2e
+blocker: BLOCKED_BY_RUNTIME_METADATA
+configuration: {}

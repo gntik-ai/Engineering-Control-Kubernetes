@@ -25,6 +25,8 @@ from engineering_control.api.schemas import (
     EnhancementRun,
     FindingVerificationStart,
     IssueLoopStart,
+    LLMWikiBootstrapExecuteRequest,
+    LLMWikiBootstrapPlanRequest,
     OperationAccepted,
     RecordList,
     RollbackRequest,
@@ -99,6 +101,8 @@ def create_app(
         persona_root=resolved.persona_config_root,
         flow_root=resolved.flow_config_root,
         credential_root=resolved.credential_root,
+        attestation_root=resolved.credential_attestation_root,
+        browser_worker_identity=resolved.browser_worker_identity,
     )
 
     @app.get("/health/live")
@@ -130,6 +134,22 @@ def create_app(
             ).model_dump(mode="json")
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/bootstrap-plan", response_model=OperationAccepted, status_code=202)
+    async def llmwiki_bootstrap_plan(
+        body: LLMWikiBootstrapPlanRequest,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        return await service.start_llmwiki_bootstrap_plan(body)
+
+    @app.post("/v1/bootstrap", response_model=OperationAccepted, status_code=202)
+    async def llmwiki_bootstrap(
+        body: LLMWikiBootstrapExecuteRequest,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        return await service.start_llmwiki_bootstrap(body)
 
     @app.get("/v1/campaigns", response_model=RecordList)
     async def campaign_list(

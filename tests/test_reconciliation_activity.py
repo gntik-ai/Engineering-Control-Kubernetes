@@ -90,6 +90,24 @@ class FakeReconciliationRunner:
         **kwargs: Any,
     ) -> CommandResult:
         assert executable == "gh"
+        if arguments[:2] == ["auth", "status"]:
+            return CommandResult(0, "", "")
+        if arguments[:2] == ["api", "user"]:
+            return CommandResult(0, '{"login":"operator","type":"User"}', "")
+        if arguments[:2] == ["repo", "view"]:
+            repository = arguments[2]
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "nameWithOwner": repository,
+                        "defaultBranchRef": {"name": "main"},
+                        "viewerPermission": "ADMIN",
+                        "isPrivate": True,
+                    }
+                ),
+                "",
+            )
         if arguments[:2] == ["pr", "view"]:
             return CommandResult(
                 0,
@@ -153,9 +171,6 @@ def reconciliation_handler(
     credential_root = tmp_path / "credentials"
     registry = credential_root / "registry"
     registry.mkdir(parents=True)
-    token = credential_root / "github.token"
-    token.write_text("t" * 48, encoding="utf-8")
-    token.chmod(0o600)
     registry_auth = registry / "config.json"
     registry_auth.write_text('{"auths":{}}', encoding="utf-8")
     registry_auth.chmod(0o600)
@@ -163,7 +178,6 @@ def reconciliation_handler(
         Settings(
             run_root=tmp_path / "runs",
             delivery_credential_root=credential_root,
-            github_pr_write_token_file=token,
             github_registry_auth_file=registry_auth,
         ),
         runner,  # type: ignore[arg-type]

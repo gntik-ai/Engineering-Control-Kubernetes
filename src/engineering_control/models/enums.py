@@ -4,6 +4,7 @@ from enum import StrEnum
 class Project(StrEnum):
     FALCONE = "falcone"
     MUSEMATIC = "musematic"
+    LLMWIKI = "llmwiki"
 
 
 class Provider(StrEnum):

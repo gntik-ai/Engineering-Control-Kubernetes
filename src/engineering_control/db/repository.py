@@ -281,6 +281,8 @@ class SQLMetadataRepository:
             if active is not None:
                 raise ValueError("an active deployment workflow already owns this ChangeSet target")
             project = Project(change_set.project)
+            if project is Project.LLMWIKI and request.environment != "staging":
+                raise ValueError("LLMWiki is staging-only")
             session.add(
                 Run(
                     change_set_id=change_set.id,

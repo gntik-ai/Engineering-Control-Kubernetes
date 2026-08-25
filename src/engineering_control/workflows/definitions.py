@@ -19,6 +19,7 @@ from engineering_control.workflows.inputs import (
     FindingVerificationInput,
     IssueDeliveryInput,
     IssueSolutionLoopInput,
+    LLMWikiStagingBootstrapInput,
     PreviewDeploymentInput,
     QuotaRefreshInput,
     RecoveryInput,
@@ -198,12 +199,30 @@ class ControlledWorkflow:
             return f"engineering-{cls._nested_value(payload, 'provider', 'claude')}"
         if step == "audit.agent_cell":
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
-        if step in {"audit.api_flow", "audit.browser_flow"}:
+        if step in {
+            "audit.api_flow",
+            "audit.browser_flow",
+            "audit.llmwiki_consumer_suite",
+            "identity.superadmin_attest",
+            "identity.inspect_stale",
+            "identity.recover_stale",
+        }:
             return "engineering-browser"
         if step in {"deployment.render"}:
             return "engineering-release"
-        if step in {"finding.github_dedupe", "finding.publish", "enhancement.publish"}:
-            return "engineering-delivery"
+        if step in {
+            "finding.dedupe",
+            "finding.publish",
+            "enhancement.publish",
+            "enhancement.github_dedupe",
+        }:
+            return "engineering-github"
+        if step == "llmwiki.bootstrap.plan":
+            return "engineering-github"
+        if step == "github.refresh_mirrors":
+            return "engineering-github"
+        if step == "llmwiki.bootstrap.execute":
+            return "engineering-release"
         if step in {"enhancement.discover", "enhancement.product_review"}:
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step == "delivery.invoke_spec":
@@ -221,9 +240,9 @@ class ControlledWorkflow:
         if step == "runtime.independent_review":
             return f"engineering-{cls._nested_value(payload, 'provider', 'codex')}"
         if step == "delivery.publish":
-            return "engineering-delivery"
+            return "engineering-github"
         if step in {"reconcile.inspect_ci", "reconcile.publish_promotion"}:
-            return "engineering-delivery"
+            return "engineering-github"
         if step == "reconcile.apply_promotion":
             return "engineering-scan"
         if step in {"runtime.browser_checks"}:
@@ -256,7 +275,13 @@ class ControlledWorkflow:
 class AuditCampaignWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: AuditCampaignInput) -> dict[str, Any]:
-        plan = await self._step("campaign.plan", asdict(request))
+        plan_payload = asdict(request)
+        if request.preset in {"e2e-smoke", "full-e2e", "security", "falcone-intensive"}:
+            authority = "falcone" if request.project == "llmwiki" else request.project
+            plan_payload["worker_attestation"] = await self._step(
+                "identity.superadmin_attest", {"project": authority}
+            )
+        plan = await self._step("campaign.plan", plan_payload)
         repository_surfaces = request.repository_surfaces or list(
             plan.get("repository_surfaces", [])
         )
@@ -294,6 +319,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
         snapshot_blocker = request.snapshot_blocker
         if snapshot_blocker is None:
             try:
+                await self._step("github.refresh_mirrors", {"project": request.project})
                 snapshot = await self._step("project.snapshot", asdict(request))
             except ActivityError:
                 snapshot_blocker = "PROJECT_SNAPSHOT_UNAVAILABLE"
@@ -384,6 +410,16 @@ class AuditCampaignWorkflow(ControlledWorkflow):
             "snapshot": snapshot,
             "plan": plan,
         }
+        if request.preset == "falcone-intensive":
+            await self._step("github.refresh_mirrors", {"project": "llmwiki"})
+            stage_context["llmwiki_consumer_snapshot"] = await self._step(
+                "project.snapshot",
+                {
+                    "project": "llmwiki",
+                    "campaign_id": campaign_id,
+                    "environment": "staging",
+                },
+            )
         stages = [
             "audit.static_source",
             "audit.static_deployment",
@@ -399,6 +435,8 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "audit.correlate_runtime",
                 ]
             )
+        if request.preset == "falcone-intensive":
+            stages.append("audit.llmwiki_consumer_suite")
         stages.extend(
             [
                 "audit.classify_candidate",
@@ -691,6 +729,12 @@ class DeliveryReconciliationWorkflow(ControlledWorkflow):
 class PreviewDeploymentWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: PreviewDeploymentInput) -> dict[str, Any]:
+        if request.project == "llmwiki":
+            raise ApplicationError(
+                "LLMWiki rejects preview and production targets",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
         context: dict[str, Any] = asdict(request)
         try:
             for step in ("preview.prepare", "preview.preflight"):
@@ -973,6 +1017,7 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step("cleanup.inspect_evidence_files", context)
             context = await self._step("cleanup.inspect_delivery_files", context)
             context = await self._step("cleanup.inspect_browser_files", context)
+            context = await self._step("identity.inspect_stale", context)
             context = await self._step("cleanup.inspect_codex_files", context)
             context = await self._step("cleanup.inspect_preview_namespaces", context)
             if request.dry_run:
@@ -995,6 +1040,7 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step(
                 "cleanup.execute_browser_files", {**context, "dry_run": False}
             )
+            context = await self._step("identity.recover_stale", {**context, "dry_run": False})
             context = await self._step("cleanup.execute_codex_files", {**context, "dry_run": False})
             context = await self._step(
                 "cleanup.execute_preview_namespaces", {**context, "dry_run": False}
@@ -1265,6 +1311,36 @@ class EnhancementSolutionLoopWorkflow(ControlledWorkflow):
         return result
 
 
+@workflow.defn(name="LLMWikiStagingBootstrapWorkflow")
+class LLMWikiStagingBootstrapWorkflow(ControlledWorkflow):
+    """Plan and, only after an exact binding, reconcile first-stage LLMWiki staging."""
+
+    @workflow.run
+    async def run(self, request: LLMWikiStagingBootstrapInput) -> dict[str, Any]:
+        if request.project != "llmwiki" or request.environment != "staging":
+            raise ApplicationError(
+                "LLMWiki bootstrap rejects non-staging targets",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        plan = await self._step("llmwiki.bootstrap.plan", asdict(request))
+        if not request.execute:
+            return plan
+        if plan.get("blockers"):
+            return {**plan, "status": "BLOCKED"}
+        if plan.get("approval_binding") != request.approval_binding:
+            raise ApplicationError(
+                "LLMWiki bootstrap binding changed",
+                type="ApprovalMismatch",
+                non_retryable=True,
+            )
+        return await self._step(
+            "llmwiki.bootstrap.execute",
+            {**plan, "dry_run": False, "approval_binding_valid": True},
+            timeout_minutes=120,
+        )
+
+
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     FindingVerificationWorkflow,
@@ -1281,4 +1357,5 @@ ALL_WORKFLOWS = [
     EnhancementDiscoveryWorkflow,
     EnhancementDeliveryWorkflow,
     EnhancementSolutionLoopWorkflow,
+    LLMWikiStagingBootstrapWorkflow,
 ]

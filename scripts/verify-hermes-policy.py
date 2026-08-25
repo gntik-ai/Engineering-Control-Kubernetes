@@ -17,6 +17,8 @@ ENGINEERING_COMMANDS = frozenset(
     {
         "audit",
         "audit-plan",
+        "bootstrap-plan",
+        "bootstrap",
         "campaigns",
         "findings",
         "loop",

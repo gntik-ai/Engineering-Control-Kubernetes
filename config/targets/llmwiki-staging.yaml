@@ -1,0 +1,9 @@
+version: 1
+enabled: false
+project: llmwiki
+environment: staging
+strategy: repo-local-manifest
+target_context: UNCONFIGURED
+target_namespace: llmwiki-e2e
+blocker: LLMWIKI_FIRST_STAGE_BOOTSTRAP_NOT_APPROVED
+configuration: {}

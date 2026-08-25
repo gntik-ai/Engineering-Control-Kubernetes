@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,8 +51,10 @@ class WorktreeAccess:
 
 
 class GitWorktreeManager:
-    _repositories = frozenset({"falcone", "falcone-charts", "musematic", "musematic-deploy"})
-    _deployment_repositories = frozenset({"falcone-charts", "musematic-deploy"})
+    _repositories = frozenset(
+        {"falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"}
+    )
+    _deployment_repositories = frozenset({"falcone-charts", "musematic-deploy", "llmwiki"})
 
     def __init__(
         self,
@@ -61,12 +62,6 @@ class GitWorktreeManager:
         worktree_root: Path = Path("/srv/engineering/worktrees"),
         lease_root: Path = Path("/var/lib/engineering-control/leases/worktrees"),
         metadata_root: Path | None = None,
-        git_read_token_file: Path | None = None,
-        git_read_credential_root: Path = Path("/etc/engineering-control/env/scan"),
-        git_askpass_executable: Path = Path(
-            "/opt/engineering-control/source/scripts/git-askpass.sh"
-        ),
-        production_credentials: bool = False,
     ) -> None:
         self.mirror_root = mirror_root
         self.worktree_root = worktree_root
@@ -74,10 +69,6 @@ class GitWorktreeManager:
         self.metadata_root = metadata_root or (
             worktree_root.parent / "cache" / "scan" / "worktree-git"
         )
-        self.git_read_token_file = git_read_token_file
-        self.git_read_credential_root = git_read_credential_root
-        self.git_askpass_executable = git_askpass_executable
-        self.production_credentials = production_credentials
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -112,36 +103,9 @@ class GitWorktreeManager:
         return result.stdout.strip()
 
     def _fetch_environment(self) -> dict[str, str]:
-        environment = {"GIT_TERMINAL_PROMPT": "0"}
-        token_path = self.git_read_token_file
-        if token_path is None:
-            return environment
-        resolved = token_path.resolve()
-        root = self.git_read_credential_root.resolve()
-        if not resolved.is_relative_to(root):
-            raise WorktreeError("Git read credential is outside its bounded root")
-        try:
-            metadata = resolved.stat()
-        except FileNotFoundError:
-            return environment
-        if not stat.S_ISREG(metadata.st_mode):
-            raise WorktreeError("Git read credential is not an ordinary file")
-        permissions = stat.S_IMODE(metadata.st_mode)
-        if metadata.st_mode & (stat.S_IWGRP | stat.S_IRWXO):
-            raise WorktreeError("Git read credential permissions are too broad")
-        if self.production_credentials and (
-            metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640
-        ):
-            raise WorktreeError("production Git read credential ownership is invalid")
-        if not self.git_askpass_executable.resolve().is_file():
-            raise WorktreeError("Git askpass executable is unavailable")
-        environment.update(
-            {
-                "GIT_ASKPASS": str(self.git_askpass_executable),
-                "ENGINEERING_GITHUB_TOKEN_FILE": str(resolved),
-            }
-        )
-        return environment
+        # GitHub authentication is configured out-of-band with `gh auth setup-git`
+        # for this exact Unix identity. Engineering Control never extracts a token.
+        return {"GIT_TERMINAL_PROMPT": "0"}
 
     def mirror_path(self, repository: str) -> Path:
         return self.mirror_root / f"{self._slug(repository)}.git"
@@ -193,27 +157,18 @@ class GitWorktreeManager:
 
     def fetch(self, repository: str) -> None:
         mirror = self.verify_mirror(repository)
-        # Never use a mirror clone's default +refs/*:refs/* refspec here: pruning it can
-        # delete the agent branch that backs an active linked worktree.
-        self._run(
-            [
-                "git",
-                "fetch",
-                "--prune",
-                "origin",
-                "+refs/heads/*:refs/remotes/origin/*",
-                "+refs/tags/*:refs/tags/*",
-            ],
-            mirror,
-            timeout=900,
-            environment=self._fetch_environment(),
-        )
+        # The authenticated GitHub worker refreshes the canonical mirror before
+        # the scan activity; scan-runner never handles GitHub credentials.
+        self._run(["git", "remote", "get-url", "origin"], mirror)
 
-    @staticmethod
-    def _fetched_ref(base_ref: str) -> str:
+    def _fetched_ref(self, base_ref: str, mirror: Path) -> str:
         prefix = "refs/heads/"
         if base_ref.startswith(prefix):
-            return f"refs/remotes/origin/{base_ref.removeprefix(prefix)}"
+            remote_ref = f"refs/remotes/origin/{base_ref.removeprefix(prefix)}"
+            available = self._run(
+                ["git", "for-each-ref", "--format=%(refname)", remote_ref], mirror
+            )
+            return remote_ref if available == remote_ref else base_ref
         return base_ref
 
     def snapshot(self, repository: str, *, base_ref: str, expected_sha: str) -> dict[str, str]:
@@ -221,7 +176,7 @@ class GitWorktreeManager:
             raise ValueError("expected snapshot SHA must contain 40 hexadecimal characters")
         mirror = self.verify_mirror(repository)
         self.fetch(repository)
-        fetched_ref = self._fetched_ref(base_ref)
+        fetched_ref = self._fetched_ref(base_ref, mirror)
         actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
         if actual != expected_sha:
             raise WorktreeError(
@@ -238,7 +193,7 @@ class GitWorktreeManager:
         """Resolve a freshly fetched immutable head without trusting a caller-supplied SHA."""
         mirror = self.verify_mirror(repository)
         self.fetch(repository)
-        fetched_ref = self._fetched_ref(base_ref)
+        fetched_ref = self._fetched_ref(base_ref, mirror)
         actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
         if not re.fullmatch(r"[a-f0-9]{40}", actual):
             raise WorktreeError(f"resolved Git head is not immutable for {repository}")
@@ -262,7 +217,7 @@ class GitWorktreeManager:
         lease = FileLease(self.lease_root, f"{repository}/{change_set_id}", owner)
         with lease:
             self.fetch(repository)
-            fetched_ref = self._fetched_ref(base_ref)
+            fetched_ref = self._fetched_ref(base_ref, mirror)
             actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
             if actual != expected_base_sha:
                 raise WorktreeError(
@@ -321,7 +276,7 @@ class GitWorktreeManager:
         with lease:
             self.fetch(repository)
             if require_base_ref_match:
-                fetched_ref = self._fetched_ref(base_ref)
+                fetched_ref = self._fetched_ref(base_ref, mirror)
                 actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
             else:
                 actual = self._run(["git", "rev-parse", f"{expected_base_sha}^{{commit}}"], mirror)

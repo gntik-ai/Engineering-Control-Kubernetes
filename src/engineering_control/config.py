@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     scan_task_queue: str = "engineering-scan"
     release_task_queue: str = "engineering-release"
     delivery_task_queue: str = "engineering-delivery"
+    github_task_queue: str = "engineering-github"
     database_url: SecretStr = SecretStr(
         "postgresql+psycopg://engineering_control@127.0.0.1/engineering_control"
     )
@@ -53,6 +54,7 @@ class Settings(BaseSettings):
     release_credential_root: Path = Path("/etc/engineering-control/env/release")
     observer_credential_root: Path = Path("/etc/engineering-control/credentials")
     node_executable: Path = Path("/usr/local/bin/node")
+    pnpm_executable: Path = Path("/opt/engineering-browser/node_modules/.bin/pnpm")
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")
@@ -60,6 +62,8 @@ class Settings(BaseSettings):
     persona_config_root: Path = Path("/etc/engineering-control/personas.d")
     flow_config_root: Path = Path("/etc/engineering-control/flows.d")
     credential_root: Path = Path("/etc/engineering-control/credentials")
+    credential_attestation_root: Path = Path("/var/lib/engineering-control/attestations")
+    browser_worker_identity: str = "browser-runner@hermes-worker"
     engineering_profile_manifest: Path = Path(
         "/opt/engineering-agent-pack/source/profiles/engineering.yaml"
     )
@@ -67,20 +71,16 @@ class Settings(BaseSettings):
     browser_credential_root: Path = Path("/etc/engineering-control/credentials")
     browser_evidence_root: Path = Path("/srv/engineering/evidence/browser")
     github_executable: Path = Path("/usr/bin/gh")
-    github_read_token_file: Path | None = None
-    github_issue_write_token_file: Path | None = None
-    github_pr_write_token_file: Path | None = None
+    github_authenticated_home: Path | None = None
+    github_writes_enabled: bool = False
+    llmwiki_staging_bootstrap_enabled: bool = False
+    application_data_mutation_enabled: bool = False
     github_issue_write_validation_file: Path = Path(
         "/etc/engineering-control/policy/github-issue-write-validation.yaml"
     )
-    # Deprecated compatibility field. New engineering workflows do not consume it.
-    github_token_file: Path | None = None
     github_registry_auth_file: Path | None = None
-    git_read_token_file: Path | None = None
     git_executable: Path = Path("/usr/bin/git")
-    git_read_credential_root: Path = Path("/etc/engineering-control/env/scan")
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
-    git_askpass_executable: Path = Path("/opt/engineering-control/source/scripts/git-askpass.sh")
     gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")
     trivy_executable: Path = Path("/usr/local/bin/trivy")
     semgrep_executable: Path = Path("/usr/local/bin/semgrep")

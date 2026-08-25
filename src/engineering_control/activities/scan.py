@@ -90,9 +90,13 @@ class CleanupCandidate(BaseModel):
 
     lease_id: UUID
     change_set_id: UUID
-    repository: str = Field(pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy)$")
+    repository: str = Field(
+        pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
+    )
     worktree_path: Path
-    branch: str = Field(pattern=r"^agent/(falcone|musematic)/[a-zA-Z0-9._-]+/[a-f0-9-]{36}$")
+    branch: str = Field(
+        pattern=r"^agent/(falcone|musematic|llmwiki)/[a-zA-Z0-9._-]+/[a-f0-9-]{36}$"
+    )
     base_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     reason: str = Field(pattern=r"^(RELEASED_RETENTION_EXPIRED|ABANDONED_LEASE_EXPIRED)$")
 
@@ -122,6 +126,7 @@ class ScanActivityHandler:
     _repositories = {
         Project.FALCONE: ("falcone", "falcone-charts"),
         Project.MUSEMATIC: ("musematic", "musematic-deploy"),
+        Project.LLMWIKI: ("llmwiki", "llmwiki"),
     }
 
     def __init__(
@@ -139,10 +144,6 @@ class ScanActivityHandler:
             worktree_root=settings.worktree_root,
             lease_root=settings.lease_root / "worktrees",
             metadata_root=settings.worktree_metadata_root,
-            git_read_token_file=settings.git_read_token_file,
-            git_read_credential_root=settings.git_read_credential_root,
-            git_askpass_executable=settings.git_askpass_executable,
-            production_credentials=settings.environment == "production",
         )
         self.scanner = scanner or DeterministicScanner(
             SafeCommandRunner(
@@ -167,6 +168,8 @@ class ScanActivityHandler:
             persona_root=settings.persona_config_root,
             flow_root=settings.flow_config_root,
             credential_root=settings.credential_root,
+            attestation_root=settings.credential_attestation_root,
+            browser_worker_identity=settings.browser_worker_identity,
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -737,20 +740,25 @@ class ScanActivityHandler:
             payload.get("affected_deployment_sha"), "affected_deployment_sha"
         )
         source_repository, deployment_repository = self._repositories[project]
+        base_ref = self._base_ref(project)
+        if source_repository == deployment_repository and source_sha != deployment_sha:
+            raise ValueError("self-contained project snapshot SHAs must match")
         source = self.manager.allocate_audit_snapshot(
             repository=source_repository,
             campaign_id=finding_id,
-            base_ref="refs/heads/main",
+            base_ref=base_ref,
             expected_base_sha=source_sha,
             require_base_ref_match=False,
         )
-        deployment = self.manager.allocate_audit_snapshot(
-            repository=deployment_repository,
-            campaign_id=finding_id,
-            base_ref="refs/heads/main",
-            expected_base_sha=deployment_sha,
-            require_base_ref_match=False,
-        )
+        deployment = source
+        if source_repository != deployment_repository:
+            deployment = self.manager.allocate_audit_snapshot(
+                repository=deployment_repository,
+                campaign_id=finding_id,
+                base_ref=base_ref,
+                expected_base_sha=deployment_sha,
+                require_base_ref_match=False,
+            )
         evidence = {
             "finding_id": str(finding_id),
             "source_sha": source.base_sha,
@@ -770,34 +778,41 @@ class ScanActivityHandler:
         project = Project(str(payload.get("project")))
         campaign_id = UUID(str(payload.get("campaign_id")))
         source_repository, deployment_repository = self._repositories[project]
+        base_ref = self._base_ref(project)
         source_sha = self._optional_or_resolved_sha(
-            payload.get("source_sha"), source_repository, "source_sha"
+            payload.get("source_sha"), source_repository, "source_sha", base_ref
         )
         deployment_sha = self._optional_or_resolved_sha(
-            payload.get("deployment_sha"), deployment_repository, "deployment_sha"
+            payload.get("deployment_sha"), deployment_repository, "deployment_sha", base_ref
         )
+        if source_repository == deployment_repository and source_sha != deployment_sha:
+            raise ValueError("self-contained project snapshot SHAs must match")
         source = self.manager.snapshot(
             source_repository,
-            base_ref="refs/heads/main",
+            base_ref=base_ref,
             expected_sha=source_sha,
         )
-        deployment = self.manager.snapshot(
-            deployment_repository,
-            base_ref="refs/heads/main",
-            expected_sha=deployment_sha,
-        )
+        deployment = source
+        if source_repository != deployment_repository:
+            deployment = self.manager.snapshot(
+                deployment_repository,
+                base_ref=base_ref,
+                expected_sha=deployment_sha,
+            )
         source_worktree = self.manager.allocate_audit_snapshot(
             repository=source_repository,
             campaign_id=campaign_id,
-            base_ref="refs/heads/main",
+            base_ref=base_ref,
             expected_base_sha=source_sha,
         )
-        deployment_worktree = self.manager.allocate_audit_snapshot(
-            repository=deployment_repository,
-            campaign_id=campaign_id,
-            base_ref="refs/heads/main",
-            expected_base_sha=deployment_sha,
-        )
+        deployment_worktree = source_worktree
+        if source_repository != deployment_repository:
+            deployment_worktree = self.manager.allocate_audit_snapshot(
+                repository=deployment_repository,
+                campaign_id=campaign_id,
+                base_ref=base_ref,
+                expected_base_sha=deployment_sha,
+            )
         return {
             **payload,
             "status": "SNAPSHOT_VERIFIED",
@@ -810,10 +825,16 @@ class ScanActivityHandler:
             "deployment_worktree": str(deployment_worktree.path),
         }
 
-    def _optional_or_resolved_sha(self, value: Any, repository: str, field: str) -> str:
+    def _optional_or_resolved_sha(
+        self, value: Any, repository: str, field: str, base_ref: str
+    ) -> str:
         if value is None:
-            return self.manager.resolve_head(repository, base_ref="refs/heads/main")
+            return self.manager.resolve_head(repository, base_ref=base_ref)
         return self._sha(value, field)
+
+    @staticmethod
+    def _base_ref(project: Project) -> str:
+        return "refs/heads/master" if project is Project.LLMWIKI else "refs/heads/main"
 
     def _static_surface(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         snapshot = self._find_mapping(payload, "snapshot")
@@ -1057,15 +1078,23 @@ class ScanActivityHandler:
             expected_base_sha=request.source_base_sha,
             access=access,
         )
-        deployment = self.manager.allocate(
-            repository=request.deployment_repository,
-            project=request.project.value,
-            issue=request.issue,
-            change_set_id=request.change_set_id,
-            base_ref=request.deployment_base_ref,
-            expected_base_sha=request.deployment_base_sha,
-            access=access,
-        )
+        deployment = source
+        if request.source_repository == request.deployment_repository:
+            if (
+                request.source_base_sha != request.deployment_base_sha
+                or request.source_base_ref != request.deployment_base_ref
+            ):
+                raise ValueError("self-contained ChangeSet source/deployment bases must match")
+        else:
+            deployment = self.manager.allocate(
+                repository=request.deployment_repository,
+                project=request.project.value,
+                issue=request.issue,
+                change_set_id=request.change_set_id,
+                base_ref=request.deployment_base_ref,
+                expected_base_sha=request.deployment_base_sha,
+                access=access,
+            )
         return {
             **payload,
             "status": "WORKTREES_ALLOCATED",

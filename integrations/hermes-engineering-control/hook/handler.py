@@ -18,6 +18,8 @@ from uuid import UUID
 COMMANDS = {
     "audit",
     "audit-plan",
+    "bootstrap-plan",
+    "bootstrap",
     "campaigns",
     "findings",
     "loop",
@@ -52,8 +54,17 @@ ACCEPTANCE_LOG = Path(
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _SHA = re.compile(r"^[a-f0-9]{40}$")
 _ENHANCEMENT_ID = re.compile(r"^enh-[a-f0-9]{16,64}$")
-_PROJECTS = {"falcone", "musematic"}
-_PRESETS = {"snapshot", "static-full", "e2e-smoke", "full-e2e", "security", "ux", "deployment"}
+_PROJECTS = {"falcone", "musematic", "llmwiki"}
+_PRESETS = {
+    "snapshot",
+    "static-full",
+    "e2e-smoke",
+    "full-e2e",
+    "security",
+    "ux",
+    "deployment",
+    "falcone-intensive",
+}
 _LOOP_MODES = {"plan-only", "source-pr", "preview", "staging"}
 
 
@@ -299,7 +310,13 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         )
     if command == "audit-plan":
         if len(args) != 3 or args[0] not in _PROJECTS or args[1] not in _PRESETS:
-            raise ValueError("usage: /audit-plan <falcone|musematic> <preset> <environment>")
+            raise ValueError(
+                "usage: /audit-plan <falcone|musematic|llmwiki> <preset> <environment>"
+            )
+        if args[0] == "llmwiki" and args[2] != "staging":
+            raise ValueError("LLMWiki supports staging only")
+        if args[1] == "falcone-intensive" and args[0] != "falcone":
+            raise ValueError("falcone-intensive is bound to Falcone")
         return _request(
             "POST",
             "/v1/audit-plan",
@@ -313,6 +330,10 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 raise ValueError("audit flags are not allowlisted")
             if "--publish-findings" in flags and "--execute" not in flags:
                 raise ValueError("--publish-findings requires --execute")
+            if args[0] == "llmwiki" and args[2] != "staging":
+                raise ValueError("LLMWiki supports staging only")
+            if args[1] == "falcone-intensive" and args[0] != "falcone":
+                raise ValueError("falcone-intensive is bound to Falcone")
             return _request(
                 "POST",
                 "/v1/campaigns",
@@ -347,6 +368,34 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 "lenses": [args[6]],
                 "environments": [args[7]],
                 "dry_run": len(args) == 8 or args[8] != "--execute",
+            },
+        )
+    if command == "bootstrap-plan":
+        if args != ["llmwiki", "staging"]:
+            raise ValueError("usage: /bootstrap-plan llmwiki staging")
+        return _request(
+            "POST",
+            "/v1/bootstrap-plan",
+            actor,
+            {"project": "llmwiki", "environment": "staging"},
+        )
+    if command == "bootstrap":
+        if (
+            len(args) != 4
+            or args[0:2] != ["llmwiki", "staging"]
+            or not _DIGEST.fullmatch(args[2])
+            or args[3] != "--execute"
+        ):
+            raise ValueError("usage: /bootstrap llmwiki staging <binding-sha256> --execute")
+        return _request(
+            "POST",
+            "/v1/bootstrap",
+            actor,
+            {
+                "project": "llmwiki",
+                "environment": "staging",
+                "approval_binding": args[2],
+                "execute": True,
             },
         )
     if command == "loop":

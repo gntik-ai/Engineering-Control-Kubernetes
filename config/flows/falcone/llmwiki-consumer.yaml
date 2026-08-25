@@ -1,0 +1,25 @@
+schema_version: 1
+id: llmwiki-consumer-contracts
+project: falcone
+persona: developer-operator
+category: integrations
+purpose: Execute the LLMWiki consumer-driven contract suite against real Falcone staging.
+preconditions:
+  - Falcone superadmin worker attestation is current
+  - LLMWiki staging runtime provenance is observable
+  - all protocol session material remains ephemeral
+steps:
+  - channel: api
+    action: request
+    target: /.well-known/openid-configuration
+    method: GET
+    expected_status: 200
+expected_result: LLMWiki's real Falcone surfaces satisfy the pinned consumer contracts.
+positive_controls: [public OIDC discovery succeeds]
+negative_controls: [mock or fallback Falcone runtime is rejected]
+resources_created: [e2e-<campaign-id>-llmwiki-consumer]
+cleanup_instructions: [remove temporary identity and all bounded consumer fixtures]
+safe_target_requirements: [staging only, exact Falcone and LLMWiki runtime provenance]
+evidence_requirements: [Falcone SHA, chart SHA, LLMWiki SHA, digests, correlation IDs]
+mutation: non-mutating
+mutation_class: IDENTITY_BOOTSTRAP

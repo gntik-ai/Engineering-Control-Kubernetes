@@ -1,0 +1,202 @@
+flows:
+  - schema_version: 1
+    id: portal-health
+    project: llmwiki
+    persona: anonymous
+    category: public
+    purpose: Verify the portal frontend and wiki API health without authentication.
+    preconditions: [staging target configured]
+    steps:
+      - {channel: browser, action: navigate, target: /}
+      - {channel: browser, action: assert-visible, target: body}
+      - {channel: api, action: request, target: /healthz, method: GET, expected_status: 200}
+    expected_result: Frontend and API are healthy.
+    positive_controls: [frontend renders]
+    negative_controls: [no credential is supplied]
+    resources_created: []
+    cleanup_instructions: []
+    safe_target_requirements: [staging only]
+    evidence_requirements: [redacted status and correlation ID]
+    mutation: non-mutating
+    mutation_class: NONE
+  - schema_version: 1
+    id: oidc-login-standard
+    project: llmwiki
+    persona: standard-user
+    category: authentication
+    purpose: Authenticate a generated Falcone user through public-client OIDC code plus PKCE.
+    preconditions: [Falcone superadmin attestation valid, ephemeral identity cleanup registered]
+    steps:
+      - {channel: browser, action: navigate, target: /sign-in}
+      - {channel: browser, action: click, target: '[data-testid="oidc-login"]'}
+      - {channel: browser, action: fill-generated, target: 'input[name="username"]', value_ref: ephemeral.username}
+      - {channel: browser, action: fill-generated, target: 'input[name="password"]', value_ref: ephemeral.password}
+      - {channel: browser, action: click, target: 'button[type="submit"]'}
+      - {channel: browser, action: assert-url, target: /}
+    expected_result: OIDC callback establishes only a server-side LLMWiki session.
+    positive_controls: [one workspace claim is accepted]
+    negative_controls: [missing or ambiguous workspace claim is rejected]
+    resources_created: [e2e-<campaign-id>-llmwiki-standard-user]
+    cleanup_instructions: [logout, delete or restore generated Falcone identity]
+    safe_target_requirements: [staging only, public OIDC client, no client secret]
+    evidence_requirements: [no token or cookie capture]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: profile-bootstrap
+    project: llmwiki
+    persona: standard-user
+    category: standard-user
+    purpose: Verify first login creates the workspace-scoped profile through real Falcone Documents.
+    preconditions: [OIDC login complete, dedicated LLMWiki workspace]
+    steps:
+      - {channel: browser, action: navigate, target: /}
+      - {channel: browser, action: assert-visible, target: '[data-testid="profile-ready"]'}
+    expected_result: One profile exists in the bound workspace and contains no protocol token.
+    positive_controls: [profile is visible to its owner]
+    negative_controls: [sibling workspace cannot read profile]
+    resources_created: [e2e-<campaign-id>-llmwiki-profile]
+    cleanup_instructions: [delete profile fixture, cleanup identity]
+    safe_target_requirements: [staging only, exact workspace claim]
+    evidence_requirements: [redacted profile identifier handle]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: falcone-backed-read
+    project: llmwiki
+    persona: standard-user
+    category: standard-user
+    purpose: Verify one bounded read-only portal journey uses real Falcone APIs.
+    preconditions: [OIDC login complete]
+    steps:
+      - {channel: browser, action: navigate, target: /projects}
+      - {channel: browser, action: assert-visible, target: main}
+    expected_result: Portal renders a real workspace-scoped Falcone response.
+    positive_controls: [correlation ID returned]
+    negative_controls: [no mock runtime or fallback]
+    resources_created: [e2e-<campaign-id>-llmwiki-standard-user]
+    cleanup_instructions: [cleanup identity]
+    safe_target_requirements: [staging only]
+    evidence_requirements: [redacted request summary]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: logout-standard
+    project: llmwiki
+    persona: standard-user
+    category: authentication
+    purpose: Verify LLMWiki local session deletion and Keycloak logout continuation.
+    preconditions: [OIDC login complete]
+    steps:
+      - {channel: browser, action: navigate, target: /}
+      - {channel: browser, action: click, target: '[data-testid="logout"]'}
+      - {channel: browser, action: assert-url, target: /sign-in}
+    expected_result: Local and identity-provider sessions are ended where supported.
+    positive_controls: [post-logout redirect exact]
+    negative_controls: [old session cannot access authenticated route]
+    resources_created: [e2e-<campaign-id>-llmwiki-standard-user]
+    cleanup_instructions: [cleanup identity]
+    safe_target_requirements: [staging only]
+    evidence_requirements: [no cookie capture]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: oidc-login-admin
+    project: llmwiki
+    persona: privileged-admin
+    category: admin
+    purpose: Verify a generated workspace administrator logs in with minimum scope.
+    preconditions: [Falcone superadmin attestation valid]
+    steps:
+      - {channel: browser, action: navigate, target: /sign-in}
+      - {channel: browser, action: click, target: '[data-testid="oidc-login"]'}
+    expected_result: Admin session is bound to exactly one LLMWiki workspace.
+    positive_controls: [workspace admin control visible]
+    negative_controls: [platform control absent]
+    resources_created: [e2e-<campaign-id>-llmwiki-privileged-admin]
+    cleanup_instructions: [logout, cleanup identity]
+    safe_target_requirements: [staging only]
+    evidence_requirements: [role assertion without sensitive claims]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: workspace-admin-control
+    project: llmwiki
+    persona: privileged-admin
+    category: admin
+    purpose: Verify bounded workspace administration without platform authority.
+    preconditions: [admin login complete]
+    steps:
+      - {channel: browser, action: navigate, target: /settings}
+      - {channel: browser, action: assert-visible, target: main}
+    expected_result: Workspace controls are visible and platform controls are absent.
+    positive_controls: [workspace scope accepted]
+    negative_controls: [cross-workspace request denied]
+    resources_created: [e2e-<campaign-id>-llmwiki-privileged-admin]
+    cleanup_instructions: [cleanup identity]
+    safe_target_requirements: [staging only]
+    evidence_requirements: [authorization result]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: workspace-claim-negative-control
+    project: llmwiki
+    persona: platform-administrator
+    category: authorization
+    purpose: Prove missing or ambiguous workspace claims fail closed at the BFF.
+    preconditions: [generated negative-control identity]
+    steps:
+      - {channel: browser, action: navigate, target: /sign-in}
+      - {channel: browser, action: assert-visible, target: '[data-testid="sign-in"]'}
+    expected_result: The BFF refuses an ambiguous workspace binding.
+    positive_controls: [single workspace claim succeeds]
+    negative_controls: [zero or multiple workspace claims fail]
+    resources_created: [e2e-<campaign-id>-llmwiki-platform-administrator]
+    cleanup_instructions: [cleanup identity]
+    safe_target_requirements: [staging only]
+    evidence_requirements: [normalized blocker only]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: flow-sse-monitor
+    project: llmwiki
+    persona: developer-operator
+    category: integrations
+    purpose: Verify Flow execution monitoring uses the real Falcone SSE surface.
+    preconditions: [existing bounded staging flow fixture]
+    steps:
+      - {channel: browser, action: navigate, target: /runs}
+      - {channel: browser, action: assert-visible, target: main}
+    expected_result: Terminal Flow state is immutable and correlated.
+    positive_controls: [node status events normalize]
+    negative_controls: [malformed or cross-workspace event rejected]
+    resources_created: [e2e-<campaign-id>-llmwiki-developer-operator]
+    cleanup_instructions: [cleanup identity]
+    safe_target_requirements: [staging only]
+    evidence_requirements: [redacted SSE summaries]
+    mutation: non-mutating
+    mutation_class: IDENTITY_BOOTSTRAP
+  - schema_version: 1
+    id: falcone-backed-crud
+    project: llmwiki
+    persona: privileged-admin
+    category: integrations
+    purpose: Exercise disposable Documents, Storage, Flow and run fixtures through LLMWiki.
+    preconditions: [application data mutation separately approved]
+    steps:
+      - channel: api
+        action: request
+        target: /api/e2e/contracts
+        method: POST
+        expected_status: 201
+        body_template: {name: e2e-<campaign-id>-llmwiki-contract}
+      - {channel: api, action: request, target: /api/e2e/contracts/<created-id>, method: DELETE, expected_status: 204}
+    expected_result: Every created resource is removed and absence is verified.
+    positive_controls: [create and delete succeed]
+    negative_controls: [cross-workspace operations denied]
+    resources_created: [e2e-<campaign-id>-llmwiki-contract]
+    cleanup_instructions: [delete document, object, execution fixture and identity]
+    safe_target_requirements: [staging only, application-data mutation approved]
+    evidence_requirements: [opaque resource handles, cleanup receipt]
+    mutation: disposable
+    mutation_class: APPLICATION_DATA_MUTATION

@@ -69,7 +69,7 @@ def write_plan(path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_browser_activity_redacts_credentials_and_contains_evidence(tmp_path: Path) -> None:
+async def test_browser_activity_rejects_persistent_persona_credentials(tmp_path: Path) -> None:
     plan_root = tmp_path / "plans"
     plan_root.mkdir()
     plan = plan_root / "journey.json"
@@ -98,20 +98,15 @@ async def test_browser_activity_redacts_credentials_and_contains_evidence(tmp_pa
         FakeBrowserRunner(),  # type: ignore[arg-type]
     )
 
-    result = await handler.handle(
-        "runtime.browser_checks",
-        {
-            "journey_plan_path": str(plan),
-            "credential_file": str(credentials),
-            "output_directory": str(evidence_root / "run-id"),
-        },
-    )
-
-    assert result["status"] == "PASS"
-    serialized = json.dumps(result)
-    assert "credential-value-for-test" not in serialized
-    assert "[REDACTED:journey-credential]" in serialized
-    assert [item["name"] for item in result["artifacts"]] == ["result.json"]
+    with pytest.raises(ApplicationError, match="persistent browser persona credentials"):
+        await handler.handle(
+            "runtime.browser_checks",
+            {
+                "journey_plan_path": str(plan),
+                "credential_file": str(credentials),
+                "output_directory": str(evidence_root / "run-id"),
+            },
+        )
 
 
 @pytest.mark.asyncio

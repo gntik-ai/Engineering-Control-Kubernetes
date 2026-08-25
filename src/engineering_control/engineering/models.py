@@ -11,7 +11,7 @@ GitSHA = Annotated[str, Field(pattern=r"^[a-f0-9]{40}$")]
 Digest = Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
 RepositoryName = Annotated[
     str,
-    Field(pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy)$"),
+    Field(pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"),
 ]
 CredentialReference = Annotated[
     str,
@@ -19,6 +19,16 @@ CredentialReference = Annotated[
         pattern=(
             r"^file:/etc/engineering-control/credentials/"
             r"[a-z0-9-]+/[a-z0-9][a-z0-9._-]*\.(env|token|kubeconfig)$"
+        )
+    ),
+]
+ReadinessReference = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^(?:file:/etc/engineering-control/credentials/[a-z0-9-]+/"
+            r"[a-z0-9][a-z0-9._-]*\.(?:env|token|kubeconfig)|"
+            r"worker-attestation:(?:falcone|musematic)-superadmin)$"
         )
     ),
 ]
@@ -49,7 +59,7 @@ class RepositoryManifest(EngineeringModel):
     full_name: RepositoryName
     url: HttpUrl
     mirror: str = Field(pattern=r"^/srv/engineering/mirrors/[a-z0-9-]+\.git$")
-    default_branch: Literal["main"]
+    default_branch: Literal["main", "master"]
     issue_repository: RepositoryName
 
 
@@ -59,7 +69,9 @@ class RepositoryPair(EngineeringModel):
 
     @model_validator(mode="after")
     def pair_is_distinct(self) -> RepositoryPair:
-        if self.source.full_name == self.deployment.full_name:
+        if self.source.full_name == self.deployment.full_name and str(self.source.full_name) != (
+            "gntik-ai/llmwiki"
+        ):
             raise ValueError("source and deployment repositories must be distinct")
         return self
 
@@ -91,8 +103,8 @@ class StagingPolicy(EngineeringModel):
 
 
 class DeploymentManifest(EngineeringModel):
-    strategy: Literal["helm", "argocd"]
-    adapter: Literal["falcone", "musematic"]
+    strategy: Literal["helm", "argocd", "repo-local-manifest"]
+    adapter: Literal["falcone", "musematic", "llmwiki-staging"]
     chart_repository: Literal["source", "deployment"]
     chart_path: str = Field(pattern=r"^[A-Za-z0-9._/-]+$")
     values_paths: list[str] = Field(default_factory=list, max_length=10)
@@ -118,6 +130,9 @@ class DeploymentManifest(EngineeringModel):
     )
     preview_policy: PreviewPolicy
     staging_policy: StagingPolicy
+    environment_policy: Literal["staging-only"] | None = None
+    production_supported: Literal[False] = False
+    production_installed: Literal[False] = False
 
     @model_validator(mode="after")
     def strategy_contract(self) -> DeploymentManifest:
@@ -125,6 +140,10 @@ class DeploymentManifest(EngineeringModel):
             raise ValueError("Helm strategy requires helm_release")
         if self.strategy == "argocd" and not self.argocd_application:
             raise ValueError("Argo CD strategy requires argocd_application")
+        if self.strategy == "repo-local-manifest" and self.adapter != "llmwiki-staging":
+            raise ValueError("repo-local manifest strategy is reserved for LLMWiki staging")
+        if self.adapter == "llmwiki-staging" and self.environment_policy != "staging-only":
+            raise ValueError("LLMWiki must be staging-only")
         overlap = set(self.values_paths) & set(self.secret_bearing_values_paths)
         if overlap:
             raise ValueError("secret-bearing values paths cannot be normal render inputs")
@@ -133,13 +152,15 @@ class DeploymentManifest(EngineeringModel):
 
 class ProjectManifest(EngineeringModel):
     schema_version: Literal[1]
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     repositories: RepositoryPair
     api_url: HttpUrl
     deployment: DeploymentManifest
     delivery_control: dict[str, object]
     source_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
     deployment_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
+    dependencies: dict[str, object] = Field(default_factory=dict)
+    classification: dict[str, bool] = Field(default_factory=dict)
 
     @field_validator("source_test_commands", "deployment_test_commands")
     @classmethod
@@ -158,22 +179,31 @@ class Persona(EngineeringModel):
     product_roles: list[str] = Field(default_factory=list, max_length=20)
     scope: Literal["public", "platform", "tenant", "workspace", "personal", "operator"]
     credential_ref: CredentialReference | None = None
+    identity_source: Literal["anonymous", "ephemeral-superadmin", "ephemeral-falcone-oidc"] = (
+        "ephemeral-superadmin"
+    )
     allowed_flows: list[Slug] = Field(min_length=1, max_length=50)
     forbidden_flows: list[Slug] = Field(default_factory=list, max_length=50)
     expected_permissions: list[str] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
-    def anonymous_has_no_credential(self) -> Persona:
+    def runtime_generated_identity(self) -> Persona:
         if self.id == "anonymous" and self.credential_ref is not None:
             raise ValueError("anonymous persona cannot have a credential reference")
-        if self.id != "anonymous" and self.credential_ref is None:
-            raise ValueError("authenticated personas require a credential reference")
+        if self.credential_ref is not None:
+            raise ValueError("persistent persona credentials are prohibited")
+        if self.id == "anonymous" and self.identity_source != "anonymous":
+            raise ValueError("anonymous persona must use anonymous identity source")
+        if self.id != "anonymous" and self.identity_source == "anonymous":
+            raise ValueError("authenticated persona must be runtime generated")
         return self
 
 
 class PersonaManifest(EngineeringModel):
     schema_version: Literal[1]
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
+    identity_authority: Literal["falcone", "musematic"]
+    persistent_contract: CredentialReference | None = None
     personas: list[Persona] = Field(min_length=3, max_length=30)
 
     @model_validator(mode="after")
@@ -184,6 +214,12 @@ class PersonaManifest(EngineeringModel):
             raise ValueError("persona catalog lacks the minimum E2E lanes")
         if len(ids) != len(self.personas):
             raise ValueError("persona IDs must be unique")
+        if self.project in {"falcone", "musematic"}:
+            expected = f"file:/etc/engineering-control/credentials/{self.project}/superadmin.env"
+            if str(self.persistent_contract) != expected:
+                raise ValueError("product persona factory requires exactly its superadmin contract")
+        elif self.persistent_contract is not None or self.identity_authority != "falcone":
+            raise ValueError("LLMWiki personas use Falcone authority without a credential file")
         return self
 
 
@@ -233,7 +269,7 @@ class RetryPolicy(EngineeringModel):
 class E2EFlow(EngineeringModel):
     schema_version: Literal[1]
     id: Slug
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     persona: Slug
     category: Literal[
         "public",
@@ -256,6 +292,7 @@ class E2EFlow(EngineeringModel):
     timeout_seconds: int = Field(default=300, ge=10, le=1800)
     retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
     mutation: Literal["non-mutating", "disposable"]
+    mutation_class: Literal["NONE", "IDENTITY_BOOTSTRAP", "APPLICATION_DATA_MUTATION"] = "NONE"
 
     @model_validator(mode="after")
     def cleanup_required_for_mutation(self) -> E2EFlow:
@@ -264,12 +301,14 @@ class E2EFlow(EngineeringModel):
                 raise ValueError("disposable flows require resources and cleanup")
             if not any("e2e-<campaign-id>-" in item for item in self.resources_created):
                 raise ValueError("disposable resources require the campaign prefix")
+        if self.mutation_class == "APPLICATION_DATA_MUTATION" and self.mutation != "disposable":
+            raise ValueError("application-data mutation must be disposable")
         return self
 
 
 class RepositorySnapshot(EngineeringModel):
     url: HttpUrl
-    branch: Literal["main"]
+    branch: Literal["main", "master"]
     sha: GitSHA
 
 
@@ -286,7 +325,7 @@ class RuntimeSnapshot(EngineeringModel):
 
 class ProjectPairSnapshot(EngineeringModel):
     schema_version: Literal[1]
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     source: RepositorySnapshot
     deployment: RepositorySnapshot
     runtime: RuntimeSnapshot
@@ -306,16 +345,31 @@ class ProjectPairSnapshot(EngineeringModel):
 
 
 class CredentialReadiness(EngineeringModel):
-    reference: CredentialReference
+    reference: ReadinessReference
     present: bool
     permissions_valid: bool
-    blocker: Literal["MISSING", "PERMISSIONS", "NONE"]
+    worker_attested: bool = False
+    blocker: Literal[
+        "MISSING",
+        "PERMISSIONS",
+        "ATTESTATION_MISSING",
+        "ATTESTATION_STALE",
+        "ATTESTATION_INVALID",
+        "NONE",
+    ]
 
 
 class CampaignPlan(EngineeringModel):
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     preset: Literal[
-        "snapshot", "static-full", "e2e-smoke", "full-e2e", "security", "ux", "deployment"
+        "snapshot",
+        "static-full",
+        "e2e-smoke",
+        "full-e2e",
+        "security",
+        "ux",
+        "deployment",
+        "falcone-intensive",
     ]
     environment: Slug
     repository_pair: RepositoryPair
@@ -344,7 +398,7 @@ class EnhancementStatus(StrEnum):
 
 class EnhancementRecord(EngineeringModel):
     enhancement_id: str = Field(pattern=r"^enh-[a-f0-9]{16,64}$")
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     campaign_id: str = Field(min_length=1, max_length=200)
     persona: Slug
     observed_problem: str = Field(min_length=1, max_length=2000)

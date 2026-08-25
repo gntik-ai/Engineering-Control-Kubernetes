@@ -70,6 +70,8 @@ def test_deployment_target_templates_match_the_strict_schema() -> None:
         "falcone-staging",
         "musematic-preview",
         "musematic-staging",
+        "llmwiki-preview",
+        "llmwiki-staging",
     }
     for path in targets:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -117,7 +119,11 @@ def test_runtime_target_templates_match_the_strict_schema() -> None:
     )
     validator = Draft202012Validator(schema)
     targets = sorted((ROOT / "config" / "runtime").glob("*.yaml"))
-    assert {path.stem for path in targets} == {"falcone-staging", "musematic-staging"}
+    assert {path.stem for path in targets} == {
+        "falcone-staging",
+        "musematic-staging",
+        "llmwiki-staging",
+    }
     for path in targets:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
         validator.validate(value)

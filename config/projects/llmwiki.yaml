@@ -1,0 +1,105 @@
+schema_version: 1
+project: llmwiki
+api_url: http://127.0.0.1:3001
+repositories:
+  source:
+    full_name: gntik-ai/llmwiki
+    url: https://github.com/gntik-ai/llmwiki.git
+    mirror: /srv/engineering/mirrors/llmwiki.git
+    default_branch: master
+    issue_repository: gntik-ai/llmwiki
+  deployment:
+    full_name: gntik-ai/llmwiki
+    url: https://github.com/gntik-ai/llmwiki.git
+    mirror: /srv/engineering/mirrors/llmwiki.git
+    default_branch: master
+    issue_repository: gntik-ai/llmwiki
+deployment:
+  strategy: repo-local-manifest
+  adapter: llmwiki-staging
+  chart_repository: source
+  chart_path: infra/portal
+  values_paths: [infra/portal/e2e-deployment.yaml]
+  secret_bearing_values_paths: []
+  build_workflows:
+    - repository: gntik-ai/llmwiki
+      workflow: ci.yml
+      exact_sha_input: false
+      immutable_digest_output: false
+      enabled: false
+      blocker: LLMWIKI_IMMUTABLE_IMAGE_PUBLICATION_CONTRACT_MISSING
+  image_repositories:
+    portal-api: ghcr.io/gntik-ai/llmwiki-portal-api
+    portal-frontend: ghcr.io/gntik-ai/llmwiki-portal-frontend
+  runtime_url: http://127.0.0.1:5173
+  helm_release: null
+  argocd_application: null
+  kubernetes_context_ref: llmwiki-staging-observer
+  api_server_identity: https://178.104.182.200:6443
+  namespaces: [llmwiki-e2e]
+  observer_credential_ref: file:/etc/engineering-control/credentials/llmwiki/observer.kubeconfig
+  deployment_revision_annotation: engineering.gntik.ai/deployment-sha
+  preview_policy:
+    enabled: false
+    isolated_target_required: true
+    namespace_prefix: llmwiki-preview-
+    approval_required: true
+    credential_ref: null
+    blocker: LLMWIKI_PREVIEW_PROHIBITED
+  staging_policy:
+    enabled: false
+    production: false
+    approval_required: true
+    credential_ref: file:/etc/engineering-control/credentials/llmwiki/staging-releaser.kubeconfig
+    blocker: LLMWIKI_FIRST_STAGE_BOOTSTRAP_NOT_APPROVED
+  environment_policy: staging-only
+  production_supported: false
+  production_installed: false
+source_test_commands:
+  - [corepack, pnpm, lint]
+  - [corepack, pnpm, test]
+  - [corepack, pnpm, run, smoke]
+  - [corepack, pnpm, test:e2e]
+  - [corepack, pnpm, run, gate:s14]
+  - [corepack, pnpm, run, gate:s14:integration]
+deployment_test_commands:
+  - [kubeconform, -strict, infra/portal/e2e-deployment.yaml]
+delivery_control:
+  source_ci_workflow: ci
+  candidate_build:
+    enabled: false
+    workflow_name: ci
+    artifact_name: engineering-control-artifacts
+    manifest_file: engineering-artifacts.json
+    signer_workflow: gntik-ai/llmwiki/.github/workflows/ci.yml
+    deny_self_hosted_runners: true
+    blocker: LLMWIKI_CANDIDATE_BUILD_DISABLED
+  immutable_promotion:
+    enabled: false
+    deployment_file: infra/portal/e2e-deployment.yaml
+    component_lease: llmwiki:deploy:staging
+    image_repositories:
+      portal-api: ghcr.io/gntik-ai/llmwiki-portal-api
+      portal-frontend: ghcr.io/gntik-ai/llmwiki-portal-frontend
+    digest_paths:
+      portal-api: spec.template.spec.containers.portal-api.image
+      portal-frontend: spec.template.spec.containers.portal-frontend.image
+    blocker: LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED
+dependencies:
+  falcone:
+    required: true
+    environment: staging
+    source_repository: gntik-ai/falcone
+    deployment_repository: gntik-ai/falcone-charts
+  keycloak_oidc:
+    required: true
+    client_type: public
+    flow: authorization-code-pkce
+  llmwiki_contracts:
+    required: true
+    access: read-only
+    lock: 23550da
+classification:
+  product: true
+  falcone_validation_consumer: true
+  intensive_falcone_validator: true

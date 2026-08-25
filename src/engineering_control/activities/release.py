@@ -49,6 +49,8 @@ class ReleaseActivityHandler:
             persona_root=settings.persona_config_root,
             flow_root=settings.flow_config_root,
             credential_root=settings.credential_root,
+            attestation_root=settings.credential_attestation_root,
+            browser_worker_identity=settings.browser_worker_identity,
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -111,13 +113,15 @@ class ReleaseActivityHandler:
     def _render(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = payload.get("project")
         snapshot = payload.get("snapshot")
-        if project not in {"falcone", "musematic"} or not isinstance(snapshot, dict):
+        if project not in {"falcone", "musematic", "llmwiki"} or not isinstance(snapshot, dict):
             raise ApplicationError(
                 "deployment rendering requires a project and immutable snapshot",
                 type="PolicyViolation",
                 non_retryable=True,
             )
         manifest = self.catalog.project(project)
+        if project == "llmwiki":
+            return self._render_llmwiki(payload, manifest, snapshot)
         chart_worktree_key = f"{manifest.deployment.chart_repository}_worktree"
         chart_worktree = Path(str(snapshot.get(chart_worktree_key))).resolve()
         deployment_worktree = Path(str(snapshot.get("deployment_worktree"))).resolve()
@@ -176,6 +180,72 @@ class ReleaseActivityHandler:
                     "rendered_sha256": hashlib.sha256(rendered.stdout.encode()).hexdigest(),
                     "manifest_count": len(documents),
                     "kinds": dict(sorted(kinds.items())),
+                    "rendered_content_persisted": False,
+                },
+            }
+        except (CommandFailure, OSError, ValueError, yaml.YAMLError) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "DEPLOYMENT_RENDER_FAILED",
+                "error_type": type(error).__name__,
+                "rendered_content_persisted": False,
+            }
+
+    def _render_llmwiki(
+        self, payload: dict[str, Any], manifest: Any, snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        worktree = Path(str(snapshot.get("source_worktree"))).resolve()
+        try:
+            self._bounded_worktree(worktree)
+            paths = [
+                self._bounded_render_file(worktree, relative)
+                for relative in manifest.deployment.values_paths
+            ]
+            if not paths:
+                raise ValueError("LLMWiki has no deployment manifest")
+            checks: list[dict[str, Any]] = []
+            kinds: dict[str, int] = {}
+            combined = hashlib.sha256()
+            for path in paths:
+                raw = path.read_bytes()
+                combined.update(raw)
+                documents = [item for item in yaml.safe_load_all(raw) if isinstance(item, dict)]
+                if any(item.get("kind") == "Secret" for item in documents):
+                    raise ValueError("LLMWiki manifest contains a persistent Secret object")
+                for document in documents:
+                    kind = str(document.get("kind", "Unknown"))
+                    kinds[kind] = kinds.get(kind, 0) + 1
+                result = self.runner.run(
+                    "kubeconform",
+                    ["-strict", "-summary", str(path)],
+                    cwd=worktree,
+                    timeout_seconds=300,
+                    check=False,
+                )
+                checks.append(
+                    {
+                        "path": str(path.relative_to(worktree)),
+                        "status": "PASS" if result.return_code == 0 else "FAIL",
+                    }
+                )
+            status = (
+                "DEPLOYMENT_RENDER_PASS"
+                if all(item["status"] == "PASS" for item in checks)
+                else "BLOCKED"
+            )
+            return {
+                **payload,
+                "status": status,
+                "blocker": (
+                    None if status == "DEPLOYMENT_RENDER_PASS" else "KUBERNETES_SCHEMA_INVALID"
+                ),
+                "render_evidence": {
+                    "strategy": "repo-local-manifest",
+                    "manifest_sha256": combined.hexdigest(),
+                    "checks": checks,
+                    "kinds": dict(sorted(kinds.items())),
+                    "secret_objects_present": False,
                     "rendered_content_persisted": False,
                 },
             }

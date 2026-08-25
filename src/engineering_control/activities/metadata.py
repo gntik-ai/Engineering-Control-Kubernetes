@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -24,7 +23,6 @@ from engineering_control.activities.retention import (
     PreviewNamespaceCleanupCandidate,
     cleanup_authorization_sha256,
 )
-from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.config import Settings
 from engineering_control.db.models import (
     AgentInvocation,
@@ -140,7 +138,7 @@ class DeploymentTargetRecord(BaseModel):
     enabled: bool
     project: Project
     environment: Literal["preview", "staging"]
-    strategy: Literal["helm", "argocd-gitops"]
+    strategy: Literal["helm", "argocd-gitops", "repo-local-manifest"]
     target_context: str = Field(min_length=1, max_length=160)
     target_namespace: str = Field(min_length=1, max_length=160)
     blocker: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,119}$")
@@ -148,7 +146,11 @@ class DeploymentTargetRecord(BaseModel):
 
     @model_validator(mode="after")
     def strict_project_strategy_configuration(self) -> DeploymentTargetRecord:
-        expected_strategy = "helm" if self.project is Project.FALCONE else "argocd-gitops"
+        expected_strategy = {
+            Project.FALCONE: "helm",
+            Project.MUSEMATIC: "argocd-gitops",
+            Project.LLMWIKI: "repo-local-manifest",
+        }[self.project]
         if self.strategy != expected_strategy:
             raise ValueError("deployment target strategy does not match project policy")
         if not self.enabled:
@@ -176,6 +178,7 @@ class DeploymentTargetRecord(BaseModel):
             if self.strategy == "helm"
             else {
                 "argo_application",
+                "manifest_paths",
                 "cleanup_enabled",
                 "cleanup_namespace_prefix",
                 "cleanup_kube_context",
@@ -189,6 +192,8 @@ class DeploymentTargetRecord(BaseModel):
             {"values_files", "release_name", "kube_context", "kubeconfig_path"}
             if self.strategy == "helm"
             else {"argo_application"}
+            if self.strategy == "argocd-gitops"
+            else {"manifest_paths"}
         )
         if required - set(self.configuration):
             raise ValueError("enabled deployment target configuration is incomplete")
@@ -230,7 +235,6 @@ class RuntimeTargetRecord(BaseModel):
             "revision_annotation",
             "argo_application",
             "journey_plan_path",
-            "browser_credential_file",
         }
         if set(self.configuration) - allowed:
             raise ValueError("runtime target contains non-allowlisted configuration fields")
@@ -248,7 +252,7 @@ class RuntimeTargetRecord(BaseModel):
             "observer_kubeconfig_path",
             "observed_resources",
             "journey_plan_path",
-            "revision_annotation" if self.project is Project.FALCONE else "argo_application",
+            "argo_application" if self.project is Project.MUSEMATIC else "revision_annotation",
         }
         if required - set(self.configuration):
             raise ValueError("enabled runtime target configuration is incomplete")
@@ -285,7 +289,6 @@ class MetadataActivityHandler:
             "finding.load_candidate",
             "finding.prepare_verifier",
             "finding.controls",
-            "finding.dedupe",
             "finding.finalize",
             "finding.prepare_publication",
             "finding.persist_publication",
@@ -371,8 +374,6 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._prepare_verifier, payload)
             if step == "finding.controls":
                 return await asyncio.to_thread(self._evaluate_controls, payload)
-            if step == "finding.dedupe":
-                return await asyncio.to_thread(self._dedupe_finding, payload)
             if step == "finding.finalize":
                 return await asyncio.to_thread(self._finalize_finding, payload)
             if step == "finding.prepare_publication":
@@ -1350,78 +1351,6 @@ class MetadataActivityHandler:
             "environment_valid": environment_valid,
         }
 
-    def _dedupe_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
-        controls = self._object(payload.get("controls"), "controls")
-        finding = self._object(payload.get("finding"), "finding")
-        if controls.get("disposition") != "CONFIRMED":
-            return {**payload, "status": "SKIPPED", "duplicate_issue_url": None}
-        token = self._github_token()
-        if token is None:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_DUPLICATE_SEARCH_NOT_CONFIGURED",
-                "duplicate_issue_url": None,
-            }
-        project = Project(str(finding["project"]))
-        source_repository, deployment_repository = self._project_issue_repositories(project)
-        surface = str(finding.get("repository_surface", "source"))
-        repositories = {
-            "source": [source_repository],
-            "deployment": [deployment_repository],
-            "pair": [source_repository, deployment_repository],
-            "runtime": [source_repository, deployment_repository],
-        }.get(surface)
-        if repositories is None:
-            raise ValueError("finding repository surface is invalid")
-        runner = SafeCommandRunner({"gh": self.settings.github_executable})
-        duplicate: str | None = None
-        searched: list[str] = []
-        for repository in repositories:
-            try:
-                result = runner.run(
-                    "gh",
-                    [
-                        "issue",
-                        "list",
-                        "--repo",
-                        repository,
-                        "--state",
-                        "all",
-                        "--search",
-                        f'"{finding["fingerprint"]}"',
-                        "--json",
-                        "number,title,url,state",
-                        "--limit",
-                        "100",
-                    ],
-                    cwd=self.settings.run_root,
-                    environment={"GH_TOKEN": token},
-                )
-            except CommandFailure:
-                return {
-                    **payload,
-                    "status": "BLOCKED",
-                    "blocker": "GITHUB_DUPLICATE_SEARCH_FAILED",
-                    "duplicate_issue_url": None,
-                    "searched_repositories": searched,
-                }
-            searched.append(repository)
-            matches = json.loads(result.stdout)
-            if not isinstance(matches, list):
-                raise ValueError("GitHub duplicate search returned invalid data")
-            if matches and isinstance(matches[0], dict):
-                candidate = matches[0].get("url")
-                if isinstance(candidate, str) and candidate:
-                    duplicate = candidate
-                    break
-        return {
-            **payload,
-            "status": "DUPLICATE" if duplicate else "CLEAR",
-            "duplicate_issue_url": duplicate,
-            "searched_repositories": searched,
-        }
-
     def _finalize_finding(self, payload: dict[str, Any]) -> dict[str, Any]:
         finding_payload = self._object(payload.get("finding"), "finding")
         controls = self._object(payload.get("controls"), "controls")
@@ -1575,16 +1504,23 @@ class MetadataActivityHandler:
                 "pair": "cross-repository",
                 "runtime": "cross-repository",
             }.get(surface)
+            if finding.impact_json.get("ownership_classification") == "falcone-contract-gap":
+                classification = "falcone-contract-gap"
             if classification is None:
                 raise ValueError("finding publication repository surface is invalid")
             typed_classification = cast(
-                Literal["application", "deployment", "cross-repository"],
+                Literal["application", "deployment", "cross-repository", "falcone-contract-gap"],
                 classification,
             )
             affected_repositories = {
                 "application": [source_repository],
                 "deployment": [deployment_repository],
                 "cross-repository": [source_repository, deployment_repository],
+                "falcone-contract-gap": [
+                    "gntik-ai/falcone",
+                    "gntik-ai/falcone-charts",
+                    "gntik-ai/llmwiki",
+                ],
             }[typed_classification]
             snapshot = session.scalar(
                 select(ProjectSnapshot).where(ProjectSnapshot.campaign_id == finding.campaign_id)
@@ -1626,6 +1562,11 @@ class MetadataActivityHandler:
                 fingerprint=finding.fingerprint,
                 acceptance_criteria=[finding.recommended_action],
                 cleanup_result=cleanup_result,
+                falcone_source_sha=finding.impact_json.get("falcone_source_sha"),
+                falcone_charts_sha=finding.impact_json.get("falcone_charts_sha"),
+                llmwiki_sha=finding.impact_json.get("llmwiki_sha"),
+                consumer_contract=finding.impact_json.get("consumer_contract"),
+                staging_target=finding.impact_json.get("staging_target"),
             )
         return {
             **payload,
@@ -1761,6 +1702,7 @@ class MetadataActivityHandler:
             source_repository, deployment_repository = {
                 Project.FALCONE: ("falcone", "falcone-charts"),
                 Project.MUSEMATIC: ("musematic", "musematic-deploy"),
+                Project.LLMWIKI: ("llmwiki", "llmwiki"),
             }[project]
             surface = str(finding.impact_json.get("repository_surface", "source"))
             source_issue_repository, deployment_issue_repository = self._project_issue_repositories(
@@ -1825,10 +1767,14 @@ class MetadataActivityHandler:
                 "issue_repository": issue_repository,
                 "source_repository": source_repository,
                 "source_base_sha": finding.affected_source_sha,
-                "source_base_ref": "refs/heads/main",
+                "source_base_ref": (
+                    "refs/heads/master" if project is Project.LLMWIKI else "refs/heads/main"
+                ),
                 "deployment_repository": deployment_repository,
                 "deployment_base_sha": finding.affected_deployment_sha,
-                "deployment_base_ref": "refs/heads/main",
+                "deployment_base_ref": (
+                    "refs/heads/master" if project is Project.LLMWIKI else "refs/heads/main"
+                ),
                 "issue_number": issue.number if issue else None,
                 "issue_url": issue.url if issue else None,
             }
@@ -2162,6 +2108,7 @@ class MetadataActivityHandler:
             "falcone-charts": "gntik-ai/falcone-charts",
             "musematic": "gntik-ai/musematic",
             "musematic-deploy": "gntik-ai/musematic-deploy",
+            "llmwiki": "gntik-ai/llmwiki",
         }
         if source_repository not in repositories or deployment_repository not in repositories:
             raise ValueError("publication repository is not configured")
@@ -2183,13 +2130,16 @@ class MetadataActivityHandler:
                 "working_directory": str(payload["source_worktree"]),
                 "branch": str(payload["source_branch"]),
                 "head_sha": source_head,
-                "base_branch": "main",
+                "base_branch": "master" if source_repository == "llmwiki" else "main",
                 "title": title,
                 "body": body + "\nRepository role: source\n",
             }
         ]
         deferred_deployment: dict[str, Any] | None = None
-        if int(deployment.get("changed_file_count", 0)) > 0:
+        if (
+            deployment_repository != source_repository
+            and int(deployment.get("changed_file_count", 0)) > 0
+        ):
             publications.append(
                 {
                     "repository": repositories[deployment_repository],
@@ -2202,7 +2152,7 @@ class MetadataActivityHandler:
                     "body": body + "\nRepository role: deployment\n",
                 }
             )
-        else:
+        elif deployment_repository != source_repository:
             deferred_deployment = {
                 "repository_slug": deployment_repository,
                 "branch": str(payload["deployment_branch"]),
@@ -3992,7 +3942,7 @@ class MetadataActivityHandler:
                     "argo_application": configuration.get("argo_application"),
                 },
                 "journey_plan_path": configuration["journey_plan_path"],
-                "credential_file": configuration.get("browser_credential_file"),
+                "credential_file": None,
                 "output_directory": str(output_directory),
             }
 
@@ -5678,6 +5628,8 @@ class MetadataActivityHandler:
             raise ValueError("Falcone target must use Helm")
         if project is Project.MUSEMATIC and target.strategy != "argocd-gitops":
             raise ValueError("Musematic target must use Argo CD GitOps")
+        if project is Project.LLMWIKI and target.strategy != "repo-local-manifest":
+            raise ValueError("LLMWiki target must use its bounded repository-local manifest")
         return target
 
     def _release_plan(
@@ -6112,29 +6064,6 @@ class MetadataActivityHandler:
                 "incident_required": {"type": "boolean"},
             },
         }
-
-    def _github_token(self) -> str | None:
-        path = self.settings.github_read_token_file
-        if path is None or not path.is_file():
-            return None
-        root = self.settings.credential_root.resolve()
-        resolved = path.resolve()
-        if not resolved.is_relative_to(root):
-            raise ValueError("GitHub read token escaped its credential root")
-        metadata = resolved.stat()
-        permissions = stat.S_IMODE(metadata.st_mode)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IRWXO:
-            raise ValueError("GitHub token file permissions are too broad")
-        if self.settings.environment == "production" and (
-            metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640
-        ):
-            raise ValueError("production GitHub read token ownership is invalid")
-        if self.settings.environment != "production" and permissions not in {0o600, 0o640}:
-            raise ValueError("GitHub read token permissions are invalid")
-        token = resolved.read_text(encoding="utf-8").strip()
-        if len(token) < 32:
-            raise ValueError("GitHub token file is not provisioned")
-        return token
 
     @staticmethod
     def _atomic_text(path: Path, value: str) -> None:

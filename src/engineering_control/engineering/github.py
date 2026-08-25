@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from engineering_control.engineering.models import GitSHA, RepositoryName
 
@@ -12,9 +12,9 @@ from engineering_control.engineering.models import GitSHA, RepositoryName
 class FindingPublication(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    project: Literal["falcone", "musematic"]
-    classification: Literal["application", "deployment", "cross-repository"]
-    affected_repositories: list[RepositoryName] = Field(min_length=1, max_length=2)
+    project: Literal["falcone", "musematic", "llmwiki"]
+    classification: Literal["application", "deployment", "cross-repository", "falcone-contract-gap"]
+    affected_repositories: list[RepositoryName] = Field(min_length=1, max_length=3)
     source_sha: GitSHA
     deployment_sha: GitSHA
     running_revision: str = Field(min_length=1, max_length=200)
@@ -28,9 +28,38 @@ class FindingPublication(BaseModel):
     risk: Literal["R0", "R1", "R2", "R3"]
     fingerprint: str = Field(min_length=16, max_length=128)
     acceptance_criteria: list[str] = Field(min_length=1, max_length=30)
-    cleanup_result: str = Field(min_length=1, max_length=1000)
+    cleanup_result: str = Field(
+        min_length=1,
+        max_length=1000,
+        pattern=r"^(?:PROVEN|NOT_APPLICABLE_[A-Z0-9_]+)$",
+    )
+    falcone_source_sha: GitSHA | None = None
+    falcone_charts_sha: GitSHA | None = None
+    llmwiki_sha: GitSHA | None = None
+    consumer_contract: str | None = Field(default=None, max_length=500)
+    staging_target: str | None = Field(default=None, max_length=253)
+
+    @model_validator(mode="after")
+    def consumer_binding(self) -> FindingPublication:
+        if self.classification == "falcone-contract-gap" and not all(
+            (
+                self.falcone_source_sha,
+                self.falcone_charts_sha,
+                self.llmwiki_sha,
+                self.consumer_contract,
+                self.staging_target,
+            )
+        ):
+            raise ValueError(
+                "Falcone consumer contract gaps require three immutable SHAs and target"
+            )
+        return self
 
     def primary_repository(self) -> str:
+        if self.classification == "falcone-contract-gap":
+            return "gntik-ai/falcone"
+        if self.project == "llmwiki":
+            return "gntik-ai/llmwiki"
         source = f"gntik-ai/{self.project}"
         deployment = (
             "gntik-ai/falcone-charts" if self.project == "falcone" else "gntik-ai/musematic-deploy"
@@ -61,6 +90,8 @@ class FindingPublication(BaseModel):
             f"- Flow: `{self.flow}`\n"
             f"- Severity / risk: `{self.severity}` / `{self.risk}`\n"
             f"- Fingerprint: `{self.fingerprint}`\n\n"
+            f"- Consumer contract: `{self.consumer_contract or 'not-applicable'}`\n"
+            f"- Staging target: `{self.staging_target or 'not-recorded'}`\n\n"
             f"## Expected behavior\n\n{self.expected_behavior}\n\n"
             f"## Actual behavior\n\n{self.actual_behavior}\n\n"
             f"## Minimal reproduction\n\n{reproduction}\n\n"

@@ -16,6 +16,8 @@ from engineering_control.api.schemas import (
     EnhancementDiscover,
     EnhancementRun,
     IssueLoopStart,
+    LLMWikiBootstrapExecuteRequest,
+    LLMWikiBootstrapPlanRequest,
     OperationAccepted,
     RollbackRequest,
     RuntimeVerificationStart,
@@ -31,6 +33,7 @@ from engineering_control.workflows.inputs import (
     FindingVerificationInput,
     IssueDeliveryInput,
     IssueSolutionLoopInput,
+    LLMWikiStagingBootstrapInput,
     PreviewDeploymentInput,
     RecoveryInput,
     RuntimeVerificationInput,
@@ -61,6 +64,12 @@ class ControlService(Protocol):
     ) -> OperationAccepted: ...
     async def start_enhancement_solution(
         self, enhancement_id: str, request: EnhancementRun
+    ) -> OperationAccepted: ...
+    async def start_llmwiki_bootstrap_plan(
+        self, request: LLMWikiBootstrapPlanRequest
+    ) -> OperationAccepted: ...
+    async def start_llmwiki_bootstrap(
+        self, request: LLMWikiBootstrapExecuteRequest
     ) -> OperationAccepted: ...
 
 
@@ -299,6 +308,34 @@ class TemporalControlService:
                 enhancement_id=enhancement_id,
                 **request.model_dump(mode="json"),
             ),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_llmwiki_bootstrap_plan(
+        self, request: LLMWikiBootstrapPlanRequest
+    ) -> OperationAccepted:
+        workflow_id = f"bootstrap-plan-llmwiki-staging-{uuid4()}"
+        handle = await self.client.start_workflow(
+            WorkflowName.LLMWIKI_STAGING_BOOTSTRAP.value,
+            LLMWikiStagingBootstrapInput(**request.model_dump(mode="json")),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_llmwiki_bootstrap(
+        self, request: LLMWikiBootstrapExecuteRequest
+    ) -> OperationAccepted:
+        workflow_id = f"bootstrap-llmwiki-staging-{request.approval_binding[:16]}"
+        handle = await self.client.start_workflow(
+            WorkflowName.LLMWIKI_STAGING_BOOTSTRAP.value,
+            LLMWikiStagingBootstrapInput(**request.model_dump(mode="json")),
             id=workflow_id,
             task_queue=self.task_queue,
         )

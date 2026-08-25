@@ -47,7 +47,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
 
     audit = commands.add_parser("audit")
-    audit.add_argument("project", choices=("falcone", "musematic"))
+    audit.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     audit.add_argument("--name", required=True)
     audit.add_argument("--source-sha", required=True)
     audit.add_argument("--deployment-sha", required=True)
@@ -91,6 +91,14 @@ def parser() -> argparse.ArgumentParser:
     rollback.add_argument("--execute", action="store_true")
     validation = commands.add_parser("validate-lifecycle")
     validation.add_argument("--hold-seconds", type=int, default=5)
+    bootstrap_plan = commands.add_parser("bootstrap-plan")
+    bootstrap_plan.add_argument("project", choices=("llmwiki",))
+    bootstrap_plan.add_argument("environment", choices=("staging",))
+    bootstrap = commands.add_parser("bootstrap")
+    bootstrap.add_argument("project", choices=("llmwiki",))
+    bootstrap.add_argument("environment", choices=("staging",))
+    bootstrap.add_argument("approval_binding")
+    bootstrap.add_argument("--execute", action="store_true", required=True)
     return root
 
 
@@ -190,6 +198,23 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             "POST",
             "/v1/validation/lifecycle",
             {"hold_seconds": arguments.hold_seconds},
+        )
+    if command == "bootstrap-plan":
+        return client.request(
+            "POST",
+            "/v1/bootstrap-plan",
+            {"project": arguments.project, "environment": arguments.environment},
+        )
+    if command == "bootstrap":
+        return client.request(
+            "POST",
+            "/v1/bootstrap",
+            {
+                "project": arguments.project,
+                "environment": arguments.environment,
+                "approval_binding": arguments.approval_binding,
+                "execute": True,
+            },
         )
     raise ValueError(f"unsupported command: {command}")
 

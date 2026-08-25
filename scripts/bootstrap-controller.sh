@@ -257,7 +257,6 @@ if [[ ! -f "${CONFIG_ROOT}/env/control.env" ]]; then
       "${ENGINEERING_DB_PASSWORD}"
     printf 'ENGINEERING_EVIDENCE_ROOT=%s/evidence\n' "${PLATFORM_ROOT}"
     printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
-    printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/controller-read.token\n' "${CONFIG_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
     printf 'ENGINEERING_ACCEPTANCE_ENABLED=true\n'
     printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
@@ -272,18 +271,6 @@ if ! grep -q '^ENGINEERING_AGENT_PACK_ROOT=' "${CONFIG_ROOT}/env/control.env"; t
   printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' \
     "${AGENT_PACK_INSTALL_ROOT}" >>"${CONFIG_ROOT}/env/control.env"
 fi
-if ! grep -q '^ENGINEERING_GITHUB_READ_TOKEN_FILE=' "${CONFIG_ROOT}/env/control.env"; then
-  printf 'ENGINEERING_GITHUB_READ_TOKEN_FILE=%s/credentials/github/controller-read.token\n' \
-    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/control.env"
-fi
-if [[ -f "${CONFIG_ROOT}/credentials/github/controller-read.token" ]]; then
-  chown root:engineering-control \
-    "${CONFIG_ROOT}/credentials/github/controller-read.token"
-  chmod 0640 "${CONFIG_ROOT}/credentials/github/controller-read.token"
-else
-  touch "${STATE_ROOT}/MANUAL_GITHUB_READ_CREDENTIAL_REQUIRED"
-fi
-
 for unit in engineering-infrastructure.service engineering-migrate.service \
   engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service \

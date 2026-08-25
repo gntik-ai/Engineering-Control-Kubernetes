@@ -1,0 +1,9 @@
+version: 1
+enabled: false
+project: llmwiki
+environment: preview
+strategy: repo-local-manifest
+target_context: UNCONFIGURED
+target_namespace: UNCONFIGURED
+blocker: LLMWIKI_PREVIEW_PROHIBITED
+configuration: {}
