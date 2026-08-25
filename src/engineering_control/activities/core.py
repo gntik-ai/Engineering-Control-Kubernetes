@@ -396,6 +396,11 @@ class ControlActivities:
         activity.heartbeat({"step": step, "phase": "validated"})
         if self.settings.synthetic_mode or self.worker_kind == "synthetic":
             return self._synthetic_step(step, safe_payload)
+        if (
+            step in DeliveryActivityHandler.write_capable_steps
+            and self.delivery_handler is not None
+        ):
+            return await self.delivery_handler.handle(step, safe_payload)
         if step in self._mutation_steps:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:
@@ -427,8 +432,6 @@ class ControlActivities:
                 return await self.scan_handler.handle(step, safe_payload)
             if step == "reconcile.apply_promotion" and self.scan_handler is not None:
                 return await self.scan_handler.handle(step, safe_payload)
-            if step == "reconcile.publish_promotion" and self.delivery_handler is not None:
-                return await self.delivery_handler.handle(step, safe_payload)
             if self.release_handler is not None:
                 return await self.release_handler.handle(step, safe_payload)
             raise ApplicationError(

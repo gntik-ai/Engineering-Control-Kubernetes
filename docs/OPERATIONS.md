@@ -13,6 +13,21 @@ sudo docker compose --env-file /etc/engineering-control/env/infrastructure.env \
   -f /opt/engineering-control/infrastructure/compose.yaml ps
 ```
 
+Validate disabled GitHub writes through the real Temporal queue without creating an external
+effect:
+
+```bash
+sudo -u hermes -H /opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/validate-github-write-denial.py
+```
+
+Healthy output is `PASS_DENIAL_ENFORCED`, exactly one activity start, zero retries, zero external
+commands, and zero mutation attempts. Any queue mismatch, generic activity failure, retry,
+subprocess start, or policy bypass fails validation. The operator may enable publication only in a
+separately approved change to the canonical policy and service setting. After that change, signal
+the durable workflow's fixed `retry` operation with the exact blocked activity name; do not restart
+it as an unrelated workflow merely to bypass `AWAITING_WRITE_POLICY`.
+
 Check worker:
 
 ```bash

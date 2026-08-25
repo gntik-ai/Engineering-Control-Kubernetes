@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from temporalio.exceptions import ApplicationError
 
@@ -23,6 +22,10 @@ from engineering_control.models.reconciliation import (
     CandidateArtifactManifest,
     CIReconciliationPlan,
     PromotionPublication,
+)
+from engineering_control.policy.github_write import (
+    WRITE_CAPABLE_GITHUB_STEPS,
+    GitHubWritePolicyEvaluator,
 )
 from engineering_control.security.redaction import SecretRedactor
 
@@ -113,6 +116,7 @@ class DeliveryActivityHandler:
             "delivery.publish",
         }
     )
+    write_capable_steps = WRITE_CAPABLE_GITHUB_STEPS
 
     def __init__(
         self,
@@ -133,8 +137,18 @@ class DeliveryActivityHandler:
             writes_enabled=settings.github_writes_enabled,
             authenticated_home=settings.github_authenticated_home,
         )
+        self.write_policy = GitHubWritePolicyEvaluator(
+            policy_path=settings.github_issue_write_validation_file,
+            project_config_root=settings.project_config_root,
+            production=settings.environment == "production",
+            writes_enabled=settings.github_writes_enabled and self.broker.writes_enabled,
+        )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step in self.write_capable_steps:
+            denial = self.write_policy.evaluate(lambda: self._write_repositories(step, payload))
+            if denial is not None:
+                return denial.model_dump(mode="json")
         if step == "finding.dedupe":
             return self._dedupe_finding(payload)
         if step == "enhancement.github_dedupe":
@@ -149,12 +163,6 @@ class DeliveryActivityHandler:
             return self._publish_promotion(payload)
         if step != "delivery.publish":
             raise ApplicationError("unsupported delivery activity", non_retryable=True)
-        if not self.broker.writes_enabled:
-            return {
-                **payload,
-                "status": "BLOCKED",
-                "blocker": "GITHUB_WRITES_DISABLED",
-            }
         try:
             plan = PublicationPlan.model_validate(payload.get("publication_plan"))
             self.broker.preflight(tuple(item.repository for item in plan.publications))
@@ -714,9 +722,6 @@ class DeliveryActivityHandler:
                 "blocker": "ENHANCEMENT_APPROVAL_REQUIRED",
             }
         repository = self._enhancement_repository(payload)
-        checkpoint = self._issue_write_checkpoint(repository)
-        if checkpoint is not None:
-            return {**payload, "status": "BLOCKED", "blocker": checkpoint}
         title_value = str(payload.get("proposed_outcome", "")).strip().splitlines()[0]
         title = f"Enhancement: {title_value}"[:200]
         if len(title_value) < 1:
@@ -781,9 +786,6 @@ class DeliveryActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
-        checkpoint = self._issue_write_checkpoint(repository)
-        if checkpoint is not None:
-            return {**payload, "status": "BLOCKED", "blocker": checkpoint}
         title = str(publication.get("title", ""))
         body = str(publication.get("body", ""))
         fingerprint = str(publication.get("fingerprint", ""))
@@ -878,41 +880,36 @@ class DeliveryActivityHandler:
             f"## Kill switch\n\n{payload.get('kill_switch') or 'Not applicable'}\n"
         )
 
-    def _issue_write_checkpoint(self, repository: str) -> str | None:
-        path = self.settings.github_issue_write_validation_file
-        if not path.is_file():
-            return "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
-        root = self.settings.project_config_root.resolve().parent
-        resolved = path.resolve()
-        if not resolved.is_relative_to(root):
-            raise ValueError("GitHub issue write-validation policy escaped config root")
-        metadata = resolved.stat()
-        permissions = stat.S_IMODE(metadata.st_mode)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise ValueError("GitHub issue write-validation policy permissions are unsafe")
-        if self.settings.environment == "production" and (
-            metadata.st_uid != 0 or metadata.st_gid != os.getegid() or permissions != 0o640
-        ):
-            raise ValueError("production GitHub issue write-validation ownership is invalid")
-        raw = yaml.safe_load(resolved.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-            raise ValueError("GitHub issue write-validation policy is invalid")
-        repositories = raw.get("safe_repositories")
-        if raw.get("enabled") is not True or not isinstance(repositories, list):
-            return "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
-        allowed = {
-            "gntik-ai/falcone",
-            "gntik-ai/falcone-charts",
-            "gntik-ai/musematic",
-            "gntik-ai/musematic-deploy",
-        }
-        if any(not isinstance(item, str) or item not in allowed for item in repositories) or len(
-            repositories
-        ) != len(set(repositories)):
-            raise ValueError("GitHub issue write-validation policy has an unsafe repository")
-        if repository not in repositories:
-            return "GITHUB_ISSUE_SAFE_TARGET_NOT_CONFIGURED"
-        return None
+    @staticmethod
+    def _write_repositories(step: str, payload: dict[str, Any]) -> tuple[str, ...]:
+        if step == "delivery.publish":
+            plan = payload.get("publication_plan")
+            publications = plan.get("publications") if isinstance(plan, dict) else None
+            if not isinstance(publications, list) or not 1 <= len(publications) <= 2:
+                raise ValueError("delivery publication targets are missing or unbounded")
+            return tuple(
+                str(item.get("repository", "")) if isinstance(item, dict) else ""
+                for item in publications
+            )
+        if step == "reconcile.publish_promotion":
+            promotion = payload.get("promotion_publication")
+            if not isinstance(promotion, dict):
+                raise ValueError("promotion publication target is missing")
+            return (str(promotion.get("repository", "")),)
+        if step == "enhancement.publish":
+            enhancement = payload.get("enhancement")
+            repository = (
+                enhancement.get("affected_repository")
+                if isinstance(enhancement, dict)
+                else payload.get("affected_repository")
+            )
+            return (str(repository or ""),)
+        if step == "finding.publish":
+            publication = payload.get("finding_publication")
+            if not isinstance(publication, dict):
+                raise ValueError("finding publication target is missing")
+            return (str(publication.get("repository", "")),)
+        raise ValueError("unknown GitHub write activity")
 
     def _body_file(self, plan: RepositoryPublication) -> Path:
         root = (self.settings.run_root / "delivery").resolve()

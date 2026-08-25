@@ -75,6 +75,15 @@ There are no GitHub token-file contracts. Authentication expiry pauses the bound
 `BLOCKED_BY_GH_AUTH`. Application policy restricts the operator identity to Falcone, Falcone
 Charts, Musematic, Musematic Deploy, and LLMWiki, with writes disabled by default.
 
+All four write-capable activities (`delivery.publish`, `finding.publish`,
+`enhancement.publish`, and `reconcile.publish_promotion`) share the same pre-spawn evaluator and
+canonical policy path. A denial is a secret-free `BLOCKED_BY_POLICY` business result marked
+terminal and non-retryable, with explicit evidence that no command started and no mutation was
+attempted. It is evaluated before issue/PR body creation, mutating argument construction, branch
+push, `gh` spawn, or HTTP mutation. Missing or unsafe policy fails closed. The disabled default has
+an empty repository list; the installation acceptance harness must consume a real write-capable
+activity on `engineering-github` and return `PASS_DENIAL_ENFORCED` without an external effect.
+
 Candidate provenance verification additionally requires registry authentication at
 `/etc/engineering-control/env/delivery/registry/config.json`, owned by
 `root:delivery-runner` and mode `0640`. It must be scoped to read only the configured GHCR images.

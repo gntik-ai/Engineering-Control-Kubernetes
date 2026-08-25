@@ -101,12 +101,14 @@ def test_github_systemd_contract_is_hardened_and_secret_free() -> None:
     for required in (
         "User=hermes",
         "Group=hermes",
+        "SupplementaryGroups=engineering-control",
         "WorkingDirectory=/opt/engineering-control/source",
         "EnvironmentFile=/etc/engineering-control/env/github-worker.env",
         "Environment=HOME=/home/hermes",
         "Environment=PATH=/usr/local/bin:/usr/bin:/bin",
         "Environment=ENGINEERING_WORKER_KIND=github",
         "Environment=ENGINEERING_GITHUB_WRITES_ENABLED=false",
+        "Environment=ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=/etc/engineering-control/policy/github-issue-write-validation.yaml",
         "ExecStart=/opt/engineering-control/venv/bin/engineering-role-worker",
         "Restart=on-failure",
         "NoNewPrivileges=true",
@@ -120,6 +122,7 @@ def test_github_systemd_contract_is_hardened_and_secret_free() -> None:
     ):
         assert required in unit
     assert "/home/hermes/.config/gh" in unit
+    assert "/etc/engineering-control/policy/github-issue-write-validation.yaml" in unit
     assert "/home/hermes/.codex" in unit
     assert "/home/hermes/.claude" in unit
     assert "/home/hermes/.kube" in unit
@@ -139,6 +142,8 @@ def test_controller_bootstrap_owns_github_worker_and_worker_bootstrap_does_not()
     assert "Refusing to install GitHub worker with write policy enabled" in controller
     assert "systemctl daemon-reload" in controller
     assert "github-issue-write-validation.yaml" in controller
+    assert "install -d -o root -g engineering-control -m 0750" in controller
+    assert "ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE" in controller
     assert "auth token" not in controller
     assert ".config/gh" not in controller
     assert "GITHUB_TOKEN" not in controller
@@ -167,6 +172,7 @@ def test_controller_github_bootstrap_is_source_idempotent() -> None:
     assert "systemctl restart engineering-api.service" in controller
     assert "systemctl enable --now engineering-github-worker.service" not in controller
     assert 'if [[ ! -f "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]' in controller
+    assert 'install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy"' in controller
 
 
 def test_github_runtime_validator_uses_only_typed_broker_reads() -> None:
@@ -179,3 +185,20 @@ def test_github_runtime_validator_uses_only_typed_broker_reads() -> None:
     assert "GH_TOKEN" not in script
     assert "create_issue" not in script
     assert "create_pull_request" not in script
+
+
+def test_write_denial_runtime_validator_uses_real_queue_without_write_bypass() -> None:
+    script = (ROOT / "scripts/validate-github-write-denial.py").read_text(encoding="utf-8")
+    validation = (ROOT / "src/engineering_control/validation/github_write.py").read_text(
+        encoding="utf-8"
+    )
+    controller = (ROOT / "scripts/verify-controller.sh").read_text(encoding="utf-8")
+    assert "GitHubWriteDenialAcceptanceWorkflow" in script
+    assert '"step": "finding.publish"' in validation
+    assert '"acceptance_only": True' in validation
+    assert "task_queue=GITHUB_TASK_QUEUE" in validation
+    assert "maximum_attempts=1" in validation
+    assert "validate-github-write-denial.py" in controller
+    for forbidden in ("auth token", "GITHUB_TOKEN", "GH_TOKEN", "create_issue", "git push"):
+        assert forbidden not in script
+        assert forbidden not in validation

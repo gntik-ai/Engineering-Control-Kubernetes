@@ -84,6 +84,21 @@ class FakePublicationRunner:
         raise AssertionError((executable, arguments))
 
 
+def enabled_write_policy(root: Path, repositories: tuple[str, ...]) -> tuple[Path, Path]:
+    config_root = root / "config"
+    (config_root / "projects.d").mkdir(parents=True)
+    policy = config_root / "policy/github-issue-write-validation.yaml"
+    policy.parent.mkdir()
+    policy.parent.chmod(0o700)
+    policy.write_text(
+        "schema_version: 1\nenabled: true\nsafe_repositories:\n"
+        + "".join(f"  - {repository}\n" for repository in repositories),
+        encoding="utf-8",
+    )
+    policy.chmod(0o600)
+    return config_root / "projects.d", policy
+
+
 def publication_payload(root: Path) -> tuple[dict[str, Any], str, dict[str, str]]:
     change_set_id = uuid4()
     branch = f"agent/falcone/123/{change_set_id}"
@@ -123,11 +138,16 @@ async def test_delivery_publishes_exact_heads_as_draft_prs_without_merging(
     worktree_root = tmp_path / "worktrees"
     payload, branch, heads = publication_payload(worktree_root)
     runner = FakePublicationRunner(branch, heads)
+    project_root, policy = enabled_write_policy(
+        tmp_path, ("gntik-ai/falcone", "gntik-ai/falcone-charts")
+    )
     handler = DeliveryActivityHandler(
         Settings(
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             github_writes_enabled=True,
+            project_config_root=project_root,
+            github_issue_write_validation_file=policy,
         ),
         runner,  # type: ignore[arg-type]
     )
@@ -145,13 +165,27 @@ async def test_delivery_with_writes_disabled_returns_structured_handoff(
     tmp_path: Path,
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
+    config_root = tmp_path / "config"
+    (config_root / "projects.d").mkdir(parents=True)
+    policy = config_root / "policy/github-issue-write-validation.yaml"
+    policy.parent.mkdir()
+    policy.parent.chmod(0o700)
+    policy.write_text(
+        "schema_version: 1\nenabled: false\nsafe_repositories: []\n", encoding="utf-8"
+    )
+    policy.chmod(0o600)
     handler = DeliveryActivityHandler(
-        Settings(worktree_root=tmp_path / "worktrees", run_root=tmp_path / "runs"),
+        Settings(
+            worktree_root=tmp_path / "worktrees",
+            run_root=tmp_path / "runs",
+            project_config_root=config_root / "projects.d",
+            github_issue_write_validation_file=policy,
+        ),
         FakePublicationRunner(branch, heads),  # type: ignore[arg-type]
     )
     result = await handler.handle("delivery.publish", payload)
-    assert result["status"] == "BLOCKED"
-    assert result["blocker"] == "GITHUB_WRITES_DISABLED"
+    assert result["status"] == "BLOCKED_BY_POLICY"
+    assert result["reason_code"] == "POLICY_DISABLED"
 
 
 @pytest.mark.asyncio
@@ -159,18 +193,29 @@ async def test_delivery_write_policy_blocks_before_git_push(tmp_path: Path) -> N
     worktree_root = tmp_path / "worktrees"
     payload, branch, heads = publication_payload(worktree_root)
     runner = FakePublicationRunner(branch, heads)
+    config_root = tmp_path / "config"
+    (config_root / "projects.d").mkdir(parents=True)
+    policy = config_root / "policy/github-issue-write-validation.yaml"
+    policy.parent.mkdir()
+    policy.parent.chmod(0o700)
+    policy.write_text(
+        "schema_version: 1\nenabled: false\nsafe_repositories: []\n", encoding="utf-8"
+    )
+    policy.chmod(0o600)
     handler = DeliveryActivityHandler(
         Settings(
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
+            project_config_root=config_root / "projects.d",
+            github_issue_write_validation_file=policy,
         ),
         runner,  # type: ignore[arg-type]
     )
 
     result = await handler.handle("delivery.publish", payload)
 
-    assert result["status"] == "BLOCKED"
-    assert result["blocker"] == "GITHUB_WRITES_DISABLED"
+    assert result["status"] == "BLOCKED_BY_POLICY"
+    assert result["reason_code"] == "POLICY_DISABLED"
     assert runner.pushes == []
 
 
@@ -188,11 +233,14 @@ async def test_source_only_publication_binds_deferred_deployment(tmp_path: Path)
         "reason": "AWAITING_IMMUTABLE_ARTIFACT",
     }
     runner = FakePublicationRunner(branch, heads)
+    project_root, policy = enabled_write_policy(tmp_path, ("gntik-ai/falcone",))
     handler = DeliveryActivityHandler(
         Settings(
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             github_writes_enabled=True,
+            project_config_root=project_root,
+            github_issue_write_validation_file=policy,
         ),
         runner,  # type: ignore[arg-type]
     )
@@ -234,8 +282,8 @@ async def test_finding_publication_fails_closed_without_write_validation(
         },
     )
 
-    assert result["status"] == "BLOCKED"
-    assert result["blocker"] == "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
+    assert result["status"] == "BLOCKED_BY_POLICY"
+    assert result["reason_code"] == "POLICY_MISSING"
 
 
 @pytest.mark.asyncio
@@ -246,6 +294,7 @@ async def test_enhancement_publication_honors_disabled_write_validation(
     (config_root / "projects.d").mkdir(parents=True)
     policy = config_root / "policy/github-issue-write-validation.yaml"
     policy.parent.mkdir()
+    policy.parent.chmod(0o700)
     policy.write_text(
         "schema_version: 1\nenabled: false\nsafe_repositories: []\n",
         encoding="utf-8",
@@ -269,8 +318,8 @@ async def test_enhancement_publication_honors_disabled_write_validation(
         },
     )
 
-    assert result["status"] == "BLOCKED"
-    assert result["blocker"] == "GITHUB_ISSUE_WRITE_VALIDATION_REQUIRED"
+    assert result["status"] == "BLOCKED_BY_POLICY"
+    assert result["reason_code"] == "POLICY_DISABLED"
 
 
 @pytest.mark.asyncio
@@ -281,6 +330,7 @@ async def test_finding_publication_rejects_unsafe_write_validation_target(
     (config_root / "projects.d").mkdir(parents=True)
     policy = config_root / "policy/github-issue-write-validation.yaml"
     policy.parent.mkdir()
+    policy.parent.chmod(0o700)
     policy.write_text(
         "schema_version: 1\nenabled: true\nsafe_repositories:\n  - outside/target\n",
         encoding="utf-8",
@@ -295,11 +345,12 @@ async def test_finding_publication_rejects_unsafe_write_validation_target(
         FakePublicationRunner("main", {}),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(ValueError, match="unsafe repository"):
-        await handler.handle(
-            "finding.publish",
-            {
-                "status": "PUBLICATION_READY",
-                "finding_publication": {"repository": "gntik-ai/falcone"},
-            },
-        )
+    result = await handler.handle(
+        "finding.publish",
+        {
+            "status": "PUBLICATION_READY",
+            "finding_publication": {"repository": "gntik-ai/falcone"},
+        },
+    )
+    assert result["status"] == "BLOCKED_BY_POLICY"
+    assert result["reason_code"] == "POLICY_INVALID"

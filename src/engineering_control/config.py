@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from engineering_control.policy.github_write import GITHUB_WRITE_POLICY_PATH
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
     ROLE_WORKER_REGISTRY,
@@ -81,9 +82,7 @@ class Settings(BaseSettings):
     github_writes_enabled: bool = False
     llmwiki_staging_bootstrap_enabled: bool = False
     application_data_mutation_enabled: bool = False
-    github_issue_write_validation_file: Path = Path(
-        "/etc/engineering-control/policy/github-issue-write-validation.yaml"
-    )
+    github_issue_write_validation_file: Path = GITHUB_WRITE_POLICY_PATH
     github_registry_auth_file: Path | None = None
     git_executable: Path = Path("/usr/bin/git")
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")

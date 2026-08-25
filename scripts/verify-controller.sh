@@ -46,6 +46,10 @@ runuser -u hermes -- env -i \
   HOME=/home/hermes PATH=/usr/local/bin:/usr/bin:/bin \
   /opt/engineering-control/venv/bin/python \
   /opt/engineering-control/source/scripts/validate-gh-cli-broker.py
+runuser -u hermes -- env -i \
+  HOME=/home/hermes PATH=/usr/local/bin:/usr/bin:/bin \
+  /opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/validate-github-write-denial.py
 for service in "${services[@]}"; do
   cmp -s "/etc/engineering-control/systemd/${service}.service" \
     "/etc/systemd/system/${service}.service"

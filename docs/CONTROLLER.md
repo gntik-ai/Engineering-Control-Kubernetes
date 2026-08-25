@@ -49,9 +49,21 @@ Kubernetes credentials, product credentials, and release credentials are explici
 the systemd sandbox. The controller bootstrap preserves the disabled GitHub write policy and
 refuses a GitHub-worker environment that enables writes.
 
+The one canonical write policy is
+`/etc/engineering-control/policy/github-issue-write-validation.yaml`. It is non-secret,
+`root:engineering-control` mode `0640`, beneath a `root:engineering-control` mode-`0750`
+directory. The systemd unit grants `hermes` the `engineering-control` supplementary group and
+mounts the policy read-only. Bootstrap creates the disabled, empty-allowlist default only when the
+file is absent and never overwrites operator policy content. Missing, unreadable, malformed,
+disabled, empty, or non-allowlisted policy returns a typed terminal `BLOCKED_BY_POLICY` result
+before command construction. A production workflow then waits in `AWAITING_WRITE_POLICY` for an
+explicit retry signal; Temporal does not automatically retry the denial.
+
 Validate its existing authentication without displaying a token:
 
 ```bash
 sudo -u hermes -H /opt/engineering-control/venv/bin/python \
   /opt/engineering-control/source/scripts/validate-gh-cli-broker.py
+sudo -u hermes -H /opt/engineering-control/venv/bin/python \
+  /opt/engineering-control/source/scripts/validate-github-write-denial.py
 ```

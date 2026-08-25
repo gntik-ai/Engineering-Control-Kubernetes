@@ -65,6 +65,7 @@ class ControlledWorkflow:
         self._phase = "INITIALIZING"
         self._skip_reason: str | None = None
         self._retry_step: str | None = None
+        self._write_policy_reason: str | None = None
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -100,6 +101,7 @@ class ControlledWorkflow:
             "approval_received": self._approval is not None,
             "skip_reason": self._skip_reason,
             "retry_step": self._retry_step,
+            "write_policy_reason": self._write_policy_reason,
         }
 
     async def _checkpoint(self, phase: str) -> bool:
@@ -122,6 +124,23 @@ class ControlledWorkflow:
         if not isinstance(result, dict):
             raise TypeError(f"activity {step} returned a non-object result")
         return result
+
+    async def _github_write_step(
+        self, step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
+    ) -> dict[str, Any]:
+        """Wait durably for an explicit retry signal after a terminal policy denial."""
+        self._retry_step = None
+        while True:
+            result = await self._step(step, payload, timeout_minutes=timeout_minutes)
+            if result.get("status") != "BLOCKED_BY_POLICY":
+                self._write_policy_reason = None
+                return result
+            self._phase = "AWAITING_WRITE_POLICY"
+            self._write_policy_reason = str(result.get("reason_code", "POLICY_INVALID"))[:120]
+            await workflow.wait_condition(lambda: self._cancelled or self._retry_step == step)
+            if self._cancelled:
+                return {**result, "status": "CANCELLED", "workflow_state": "CANCELLED"}
+            self._retry_step = None
 
     async def _agent_step(
         self, step: str, payload: dict[str, Any], *, timeout_minutes: int
@@ -569,7 +588,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                         {"finding_id": finding_id, "campaign_id": campaign_id},
                     )
                     if publication.get("status") == "PUBLICATION_READY":
-                        publication = await self._step(
+                        publication = await self._github_write_step(
                             "finding.publish", {**publication, "dry_run": False}
                         )
                     if publication.get("status") == "PUBLISHED":
@@ -680,7 +699,10 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             }:
                 context = await self._agent_step(step, step_payload, timeout_minutes=120)
             else:
-                context = await self._step(step, step_payload, timeout_minutes=30)
+                if step == "delivery.publish":
+                    context = await self._github_write_step(step, step_payload, timeout_minutes=30)
+                else:
+                    context = await self._step(step, step_payload, timeout_minutes=30)
             if (
                 context.get("status")
                 in {
@@ -734,7 +756,9 @@ class DeliveryReconciliationWorkflow(ControlledWorkflow):
 
         if not await self._checkpoint("RECONCILE_PUBLISH_PROMOTION"):
             return {"status": "CANCELLED", "context": context}
-        context = await self._step("reconcile.publish_promotion", context, timeout_minutes=30)
+        context = await self._github_write_step(
+            "reconcile.publish_promotion", context, timeout_minutes=30
+        )
         context = await self._step("reconcile.persist_promotion_publication", context)
         if context.get("status") != "RELEASE_REVIEW_REQUIRED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
@@ -1300,7 +1324,9 @@ class EnhancementDeliveryWorkflow(ControlledWorkflow):
         if not request.publish:
             context = await self._step("enhancement.publication_dry_run", context)
             return {"status": "DRY_RUN", "context": context}
-        context = await self._step("enhancement.publish", {**context, "dry_run": False})
+        context = await self._github_write_step(
+            "enhancement.publish", {**context, "dry_run": False}
+        )
         if context.get("status") != "PUBLISHED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
         context = await self._step("enhancement.persist_publication", context)

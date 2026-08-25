@@ -80,9 +80,10 @@ install -d -o hermes -g hermes -m 0755 \
   "${OPERATOR_ROOT}/project-config"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}" \
   "${CONFIG_ROOT}/projects.d" "${CONFIG_ROOT}/personas.d" \
-  "${CONFIG_ROOT}/flows.d" "${CONFIG_ROOT}/policies" "${CONFIG_ROOT}/policy" \
+  "${CONFIG_ROOT}/flows.d" "${CONFIG_ROOT}/policies" \
   "${CONFIG_ROOT}/targets" \
   "${CONFIG_ROOT}/runtime" "${CONFIG_ROOT}/systemd"
+install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/github"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"
@@ -285,6 +286,8 @@ if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]; then
     printf 'ENGINEERING_GITHUB_EXECUTABLE=/usr/bin/gh\n'
     printf 'ENGINEERING_GITHUB_AUTHENTICATED_HOME=/home/hermes\n'
     printf 'ENGINEERING_GITHUB_WRITES_ENABLED=false\n'
+    printf 'ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=%s/policy/github-issue-write-validation.yaml\n' \
+      "${CONFIG_ROOT}"
     printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
     printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
@@ -299,6 +302,20 @@ if ! grep -q '^ENGINEERING_GITHUB_WRITES_ENABLED=' \
   "${CONFIG_ROOT}/env/github-worker.env"; then
   printf 'ENGINEERING_GITHUB_WRITES_ENABLED=false\n' \
     >>"${CONFIG_ROOT}/env/github-worker.env"
+fi
+if ! grep -q '^ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=' \
+  "${CONFIG_ROOT}/env/github-worker.env"; then
+  printf 'ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=%s/policy/github-issue-write-validation.yaml\n' \
+    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/github-worker.env"
+fi
+github_policy_path_count=$(grep -c '^ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=' \
+  "${CONFIG_ROOT}/env/github-worker.env")
+github_policy_path=$(sed -n 's/^ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=//p' \
+  "${CONFIG_ROOT}/env/github-worker.env")
+if [[ ${github_policy_path_count} -ne 1 || \
+  ${github_policy_path} != "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]; then
+  echo "Refusing GitHub worker configuration with a noncanonical write-policy path" >&2
+  exit 1
 fi
 chown root:hermes "${CONFIG_ROOT}/env/github-worker.env"
 chmod 0640 "${CONFIG_ROOT}/env/github-worker.env"

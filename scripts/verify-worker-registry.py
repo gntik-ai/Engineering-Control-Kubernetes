@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import grp
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -13,6 +16,10 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from engineering_control.activities.core import ControlActivities  # noqa: E402
 from engineering_control.activities.delivery import DeliveryActivityHandler  # noqa: E402
 from engineering_control.activities.github import GitHubActivityHandler  # noqa: E402
+from engineering_control.policy.github_write import (  # noqa: E402
+    GITHUB_ACTIVITY_STEPS,
+    GITHUB_WRITE_POLICY_PATH,
+)
 from engineering_control.workflows.definitions import ControlledWorkflow  # noqa: E402
 from engineering_control.workflows.worker_registry import (  # noqa: E402
     GITHUB_TASK_QUEUE,
@@ -72,6 +79,10 @@ def verify_source_contract(repository_root: Path) -> None:
     _require(_unit_value(github_unit, "User") == "hermes", "GitHub worker must run as hermes")
     _require(_unit_value(github_unit, "Group") == "hermes", "GitHub worker group drifted")
     _require(
+        _unit_value(github_unit, "SupplementaryGroups") == "engineering-control",
+        "GitHub worker policy-reader group drifted",
+    )
+    _require(
         _unit_value(github_unit, "WorkingDirectory") == "/opt/engineering-control/source",
         "GitHub worker release path drifted",
     )
@@ -80,6 +91,15 @@ def verify_source_contract(repository_root: Path) -> None:
         "GitHub worker entrypoint drifted",
     )
     _require("Environment=HOME=/home/hermes" in github_unit, "GitHub worker HOME is missing")
+    _require(
+        f"Environment=ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE={GITHUB_WRITE_POLICY_PATH}"
+        in github_unit,
+        "GitHub worker policy path drifted",
+    )
+    _require(
+        str(GITHUB_WRITE_POLICY_PATH) in _unit_value(github_unit, "ReadOnlyPaths"),
+        "GitHub worker policy is not read-only",
+    )
     _require(
         "Environment=PATH=/usr/local/bin:/usr/bin:/bin" in github_unit,
         "GitHub worker PATH is not deterministic",
@@ -115,6 +135,10 @@ def verify_source_contract(repository_root: Path) -> None:
 
     github_steps = ControlActivities.steps_for_worker("github")
     _require(github_steps == GITHUB_STEPS, "GitHub activity dispatcher and typed handlers differ")
+    _require(
+        github_steps == GITHUB_ACTIVITY_STEPS,
+        "GitHub activity classification and dispatcher differ",
+    )
     for step in github_steps:
         queue = ControlledWorkflow._activity_queue(step, {})
         _require(queue == GITHUB_TASK_QUEUE, f"{step} is routed to {queue}")
@@ -141,6 +165,23 @@ def verify_write_policy(path: Path) -> None:
     _require(value.get("schema_version") == 1, "GitHub write policy schema drifted")
     _require(value.get("enabled") is False, "GitHub write policy must remain disabled")
     _require(value.get("safe_repositories") == [], "GitHub safe repository list must be empty")
+    if path == GITHUB_WRITE_POLICY_PATH:
+        _require(not path.is_symlink(), "GitHub write policy must not be a symlink")
+        metadata = path.stat()
+        parent_metadata = path.parent.stat()
+        expected_group = grp.getgrnam("engineering-control").gr_gid
+        _require(metadata.st_uid == 0, "GitHub write policy owner must be root")
+        _require(metadata.st_gid == expected_group, "GitHub write policy group drifted")
+        _require(stat.S_IMODE(metadata.st_mode) == 0o640, "GitHub write policy mode drifted")
+        _require(parent_metadata.st_uid == 0, "GitHub write policy parent owner must be root")
+        _require(
+            parent_metadata.st_gid == expected_group, "GitHub write policy parent group drifted"
+        )
+        _require(
+            stat.S_IMODE(parent_metadata.st_mode) == 0o750,
+            "GitHub write policy parent mode drifted",
+        )
+        _require(os.access(path, os.R_OK), "GitHub write policy is unreadable")
 
 
 def main() -> None:
