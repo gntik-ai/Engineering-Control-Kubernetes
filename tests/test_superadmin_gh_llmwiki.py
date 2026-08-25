@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import secrets
 from datetime import UTC, datetime
@@ -34,6 +35,20 @@ from engineering_control.models.enums import Project
 from engineering_control.security.redaction import REDACTED, SecretRedactor
 
 ROOT = Path(__file__).parents[1]
+
+
+def _synthetic_musematic_access_token(roles: list[dict[str, str] | str]) -> str:
+    def encode(value: dict[str, object]) -> str:
+        raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "RS256", "typ": "JWT"}),
+            encode({"roles": roles, "session_id": "bounded-session"}),
+            "synthetic-signature",
+        )
+    )
 
 
 def test_exact_persistent_product_credential_contracts() -> None:
@@ -300,6 +315,165 @@ async def test_falcone_logout_failure_is_a_terminal_cleanup_blocker() -> None:
     assert retained._secrets == []
     assert "Authorization" not in retained.client.headers
     assert redactor.redact_text(secret).value == secret
+
+
+@pytest.mark.asyncio
+async def test_musematic_uses_explicit_access_token_for_identity_and_logout() -> None:
+    access = _synthetic_musematic_access_token(
+        [{"role": "superadmin", "workspace_id": "bounded-workspace"}]
+    )
+    refresh = secrets.token_urlsafe(32)
+    redactor = SecretRedactor()
+    calls: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "POST" and request.url.path == "/api/v1/auth/login":
+            # Deliberately put refresh_token first: JSON traversal order must not
+            # decide which bearer authenticates the identity and logout calls.
+            return httpx.Response(
+                200,
+                json={"refresh_token": refresh, "access_token": access},
+            )
+        assert request.headers["Authorization"] == f"Bearer {access}"
+        if request.method == "GET" and request.url.path == "/api/v1/accounts/me":
+            return httpx.Response(200, json={"id": "bounded-identity"})
+        if request.method == "POST" and request.url.path == "/api/v1/auth/logout":
+            return httpx.Response(200, json={"status": "logged_out"})
+        raise AssertionError((request.method, request.url.path))
+
+    adapter = SuperadminSessionAdapter(redactor=redactor, transport=httpx.MockTransport(handler))
+    credential = SuperadminCredential(
+        project="musematic",
+        base_url="https://staging.example.invalid",
+        username="superadmin-test",
+        password=secrets.token_urlsafe(32),
+    )
+    retained = None
+    async with adapter.login(credential) as session:
+        retained = session
+        assert session.superadmin_role_valid is True
+        assert session.client.headers["Authorization"] == f"Bearer {access}"
+        assert redactor.redact_text(refresh).value == REDACTED
+        assert access not in repr(session)
+        assert access not in json.dumps(session.safe_summary())
+
+    assert retained is not None
+    assert retained._access_token is None
+    assert retained._refresh_token is None
+    assert retained._secrets == []
+    assert "Authorization" not in retained.client.headers
+    assert redactor.redact_text(refresh).value == refresh
+    assert calls == [
+        ("POST", "/api/v1/auth/login"),
+        ("GET", "/api/v1/accounts/me"),
+        ("POST", "/api/v1/auth/logout"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_musematic_rejects_non_superadmin_claim_after_server_identity_validation() -> None:
+    access = _synthetic_musematic_access_token([{"role": "platform_admin"}])
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/v1/auth/login":
+            return httpx.Response(200, json={"access_token": access})
+        assert request.headers["Authorization"] == f"Bearer {access}"
+        if request.url.path == "/api/v1/accounts/me":
+            return httpx.Response(200, json={"id": "bounded-identity"})
+        return httpx.Response(200, json={"status": "logged_out"})
+
+    adapter = SuperadminSessionAdapter(
+        redactor=SecretRedactor(), transport=httpx.MockTransport(handler)
+    )
+    credential = SuperadminCredential(
+        project="musematic",
+        base_url="https://staging.example.invalid",
+        username="platform-admin-test",
+        password=secrets.token_urlsafe(32),
+    )
+
+    with pytest.raises(ApplicationError) as error:
+        async with adapter.login(credential):
+            pass
+    assert error.value.type == "SUPERADMIN_ROLE_INVALID"
+    assert paths == [
+        "/api/v1/auth/login",
+        "/api/v1/accounts/me",
+        "/api/v1/auth/logout",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_musematic_requires_server_accepted_access_token_before_role_proof() -> None:
+    access = _synthetic_musematic_access_token([{"role": "superadmin"}])
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/v1/auth/login":
+            return httpx.Response(200, json={"access_token": access})
+        if request.url.path == "/api/v1/accounts/me":
+            return httpx.Response(401, json={"detail": "denied"})
+        return httpx.Response(200, json={"status": "logged_out"})
+
+    adapter = SuperadminSessionAdapter(
+        redactor=SecretRedactor(), transport=httpx.MockTransport(handler)
+    )
+    credential = SuperadminCredential(
+        project="musematic",
+        base_url="https://staging.example.invalid",
+        username="superadmin-test",
+        password=secrets.token_urlsafe(32),
+    )
+
+    with pytest.raises(ApplicationError) as error:
+        async with adapter.login(credential):
+            pass
+    assert error.value.type == "SUPERADMIN_AUTHENTICATION_FAILED"
+    assert paths == [
+        "/api/v1/auth/login",
+        "/api/v1/accounts/me",
+        "/api/v1/auth/logout",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_musematic_logout_failure_clears_local_material_and_blocks_readiness() -> None:
+    access = _synthetic_musematic_access_token([{"role": "superadmin"}])
+    refresh = secrets.token_urlsafe(32)
+    redactor = SecretRedactor()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/auth/login":
+            return httpx.Response(
+                200,
+                json={"refresh_token": refresh, "access_token": access},
+            )
+        if request.url.path == "/api/v1/accounts/me":
+            return httpx.Response(200, json={"id": "bounded-identity"})
+        return httpx.Response(401, json={"detail": "logout rejected"})
+
+    adapter = SuperadminSessionAdapter(redactor=redactor, transport=httpx.MockTransport(handler))
+    credential = SuperadminCredential(
+        project="musematic",
+        base_url="https://staging.example.invalid",
+        username="superadmin-test",
+        password=secrets.token_urlsafe(32),
+    )
+    retained = None
+    with pytest.raises(ApplicationError) as error:
+        async with adapter.login(credential) as session:
+            retained = session
+    assert error.value.type == "SUPERADMIN_SESSION_CLEANUP_FAILED"
+    assert retained is not None
+    assert retained._access_token is None
+    assert retained._refresh_token is None
+    assert retained._secrets == []
+    assert "Authorization" not in retained.client.headers
+    assert redactor.redact_text(refresh).value == refresh
 
 
 class _PersonaAdmin:

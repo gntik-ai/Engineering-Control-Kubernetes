@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -18,6 +21,7 @@ class EphemeralSuperadminSession:
     base_url: str
     client: httpx.AsyncClient = field(repr=False)
     session_id: str | None = field(default=None, repr=False)
+    _access_token: str | None = field(default=None, repr=False)
     _refresh_token: str | None = field(default=None, repr=False)
     _secrets: list[str] = field(default_factory=list, repr=False)
     superadmin_role_valid: bool = False
@@ -75,6 +79,7 @@ class SuperadminSessionAdapter:
                 )
             value = self._object(response)
             tokens = self._session_material(credential.project, value)
+            access_token = self._access_token(credential.project, value)
             cookies = [item for item in client.cookies.values() if item]
             material = [*tokens, *cookies]
             if not material:
@@ -86,8 +91,9 @@ class SuperadminSessionAdapter:
             for secret in material:
                 self.redactor.register_secret(secret)
                 session._secrets.append(secret)
-            if tokens:
-                client.headers["Authorization"] = f"Bearer {tokens[0]}"
+            if access_token:
+                session._access_token = access_token
+                client.headers["Authorization"] = f"Bearer {access_token}"
             session.session_id = self._session_id(value)
             session._refresh_token = self._refresh_token(value)
             if credential.project == "falcone" and (
@@ -99,7 +105,19 @@ class SuperadminSessionAdapter:
                     type="SUPERADMIN_AUTHENTICATION_FAILED",
                     non_retryable=True,
                 )
-            session.superadmin_role_valid = self._superadmin_role(value)
+            if credential.project == "musematic":
+                if session._access_token is None:
+                    raise ApplicationError(
+                        "Musematic login returned no access token",
+                        type="SUPERADMIN_AUTHENTICATION_FAILED",
+                        non_retryable=True,
+                    )
+                await self._validate_musematic_identity(session)
+                session.superadmin_role_valid = self._musematic_superadmin_role(
+                    session._access_token
+                )
+            else:
+                session.superadmin_role_valid = self._superadmin_role(value)
             if not session.superadmin_role_valid:
                 raise ApplicationError(
                     "authenticated identity is not a superadmin",
@@ -126,6 +144,7 @@ class SuperadminSessionAdapter:
                         self.redactor.unregister_secret(secret)
                     session._secrets.clear()
                     session.session_id = None
+                    session._access_token = None
                     session._refresh_token = None
                     self.redactor.unregister_secret(credential.username)
                     self.redactor.unregister_secret(credential.password)
@@ -186,6 +205,42 @@ class SuperadminSessionAdapter:
                     if key in names and isinstance(nested, str) and nested:
                         found.append(nested)
                     elif isinstance(nested, (dict, list)):
+                        walk(nested)
+            elif isinstance(item, list):
+                for nested in item:
+                    walk(nested)
+
+        walk(value)
+        return found
+
+    @classmethod
+    def _access_token(cls, project: str, value: dict[str, Any]) -> str | None:
+        names = (
+            ("accessToken", "access_token", "token")
+            if project == "falcone"
+            else ("access_token", "accessToken")
+        )
+        for name in names:
+            found = cls._named_string(value, name)
+            if found is not None:
+                return found
+        return None
+
+    @staticmethod
+    def _named_string(value: dict[str, Any], name: str) -> str | None:
+        found: str | None = None
+
+        def walk(item: Any) -> None:
+            nonlocal found
+            if found is not None:
+                return
+            if isinstance(item, dict):
+                candidate = item.get(name)
+                if isinstance(candidate, str) and candidate:
+                    found = candidate
+                    return
+                for nested in item.values():
+                    if isinstance(nested, (dict, list)):
                         walk(nested)
             elif isinstance(item, list):
                 for nested in item:
@@ -257,6 +312,42 @@ class SuperadminSessionAdapter:
             for role in roles
         )
 
+    @staticmethod
+    def _musematic_superadmin_role(access_token: str) -> bool:
+        parts = access_token.split(".")
+        if len(parts) != 3:
+            return False
+        encoded = parts[1]
+        padding = "=" * (-len(encoded) % 4)
+        try:
+            raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+            claims = json.loads(raw.decode("utf-8"))
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return False
+        if not isinstance(claims, dict):
+            return False
+        roles = claims.get("roles")
+        if not isinstance(roles, list):
+            return False
+        for item in roles:
+            role = item.get("role") if isinstance(item, dict) else item
+            if isinstance(role, str) and role.strip().lower() == "superadmin":
+                return True
+        return False
+
+    async def _validate_musematic_identity(self, session: EphemeralSuperadminSession) -> None:
+        response = await session.client.get(
+            "/api/v1/accounts/me",
+            headers={"Accept": "application/json", "Cache-Control": "no-store"},
+        )
+        if response.status_code != 200:
+            raise ApplicationError(
+                "Musematic session identity validation failed",
+                type="SUPERADMIN_AUTHENTICATION_FAILED",
+                non_retryable=True,
+            )
+        self._object(response)
+
     async def _logout(self, session: EphemeralSuperadminSession) -> None:
         response: httpx.Response | None = None
         if session.project == "falcone" and session.session_id and session._refresh_token:
@@ -266,7 +357,13 @@ class SuperadminSessionAdapter:
                 json={"refreshToken": session._refresh_token},
                 headers={"Cache-Control": "no-store"},
             )
-        elif session.project == "musematic":
-            response = await session.client.post("/api/v1/auth/logout")
+        elif session.project == "musematic" and session._access_token:
+            response = await session.client.post(
+                "/api/v1/auth/logout",
+                headers={
+                    "Authorization": f"Bearer {session._access_token}",
+                    "Cache-Control": "no-store",
+                },
+            )
         if response is not None:
             response.raise_for_status()
