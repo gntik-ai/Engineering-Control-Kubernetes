@@ -112,6 +112,23 @@ def test_bootstraps_install_only_committed_control_and_agent_pack_trees() -> Non
     assert '"${RELEASE_ROOT}/source/systemd/${unit}"' in worker
 
 
+def test_controller_bootstrap_installs_every_declared_project_manifest() -> None:
+    bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-controller.sh").read_text(
+        encoding="utf-8"
+    )
+    declared_projects = sorted(
+        path.name for path in (REPOSITORY_ROOT / "config" / "projects").glob("*.yaml")
+    )
+
+    assert declared_projects == ["falcone.yaml", "llmwiki.yaml", "musematic.yaml"]
+    assert (
+        'for project_manifest in "${RELEASE_ROOT}"/source/config/projects/*.yaml; do' in bootstrap
+    )
+    assert '"${project_manifest}" "${CONFIG_ROOT}/projects.d/${project_name}"' in bootstrap
+    for project in declared_projects:
+        assert f"config/projects/{project}" not in bootstrap
+
+
 def test_bootstraps_normalize_operator_config_systemd_and_log_directories() -> None:
     for name in ("bootstrap-controller.sh", "bootstrap-worker.sh"):
         script = (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8")

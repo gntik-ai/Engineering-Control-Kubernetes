@@ -132,10 +132,11 @@ chmod -R a+rX "${INSTALL_ROOT}/venv"
 
 install -o root -g engineering-control -m 0640 \
   "${RELEASE_ROOT}/source/config/control.yaml" "${CONFIG_ROOT}/control.yaml"
-install -o root -g engineering-control -m 0640 \
-  "${RELEASE_ROOT}/source/config/projects/falcone.yaml" "${CONFIG_ROOT}/projects.d/falcone.yaml"
-install -o root -g engineering-control -m 0640 \
-  "${RELEASE_ROOT}/source/config/projects/musematic.yaml" "${CONFIG_ROOT}/projects.d/musematic.yaml"
+for project_manifest in "${RELEASE_ROOT}"/source/config/projects/*.yaml; do
+  project_name=$(basename "${project_manifest}")
+  install -o root -g engineering-control -m 0640 \
+    "${project_manifest}" "${CONFIG_ROOT}/projects.d/${project_name}"
+done
 for persona in "${RELEASE_ROOT}"/source/config/personas/*.yaml; do
   install -o root -g engineering-control -m 0640 "${persona}" "${CONFIG_ROOT}/personas.d/"
 done
