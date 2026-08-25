@@ -91,7 +91,7 @@ def enabled_write_policy(root: Path, repositories: tuple[str, ...]) -> tuple[Pat
     policy.parent.mkdir()
     policy.parent.chmod(0o700)
     policy.write_text(
-        "schema_version: 1\nenabled: true\nsafe_repositories:\n"
+        "enabled: true\nsafe_repositories:\n"
         + "".join(f"  - {repository}\n" for repository in repositories),
         encoding="utf-8",
     )
@@ -170,9 +170,7 @@ async def test_delivery_with_writes_disabled_returns_structured_handoff(
     policy = config_root / "policy/github-issue-write-validation.yaml"
     policy.parent.mkdir()
     policy.parent.chmod(0o700)
-    policy.write_text(
-        "schema_version: 1\nenabled: false\nsafe_repositories: []\n", encoding="utf-8"
-    )
+    policy.write_text("enabled: false\nsafe_repositories: []\n", encoding="utf-8")
     policy.chmod(0o600)
     handler = DeliveryActivityHandler(
         Settings(
@@ -198,9 +196,7 @@ async def test_delivery_write_policy_blocks_before_git_push(tmp_path: Path) -> N
     policy = config_root / "policy/github-issue-write-validation.yaml"
     policy.parent.mkdir()
     policy.parent.chmod(0o700)
-    policy.write_text(
-        "schema_version: 1\nenabled: false\nsafe_repositories: []\n", encoding="utf-8"
-    )
+    policy.write_text("enabled: false\nsafe_repositories: []\n", encoding="utf-8")
     policy.chmod(0o600)
     handler = DeliveryActivityHandler(
         Settings(
@@ -296,7 +292,7 @@ async def test_enhancement_publication_honors_disabled_write_validation(
     policy.parent.mkdir()
     policy.parent.chmod(0o700)
     policy.write_text(
-        "schema_version: 1\nenabled: false\nsafe_repositories: []\n",
+        "enabled: false\nsafe_repositories: []\n",
         encoding="utf-8",
     )
     policy.chmod(0o600)
@@ -332,7 +328,7 @@ async def test_finding_publication_rejects_unsafe_write_validation_target(
     policy.parent.mkdir()
     policy.parent.chmod(0o700)
     policy.write_text(
-        "schema_version: 1\nenabled: true\nsafe_repositories:\n  - outside/target\n",
+        "enabled: true\nsafe_repositories:\n  - outside/target\n",
         encoding="utf-8",
     )
     policy.chmod(0o600)

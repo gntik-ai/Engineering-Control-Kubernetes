@@ -162,7 +162,10 @@ def verify_source_contract(repository_root: Path) -> None:
 def verify_write_policy(path: Path) -> None:
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
     _require(isinstance(value, dict), "GitHub write policy must be an object")
-    _require(value.get("schema_version") == 1, "GitHub write policy schema drifted")
+    _require(
+        set(value) == {"enabled", "safe_repositories"},
+        "GitHub write policy data keys drifted",
+    )
     _require(value.get("enabled") is False, "GitHub write policy must remain disabled")
     _require(value.get("safe_repositories") == [], "GitHub safe repository list must be empty")
     if path == GITHUB_WRITE_POLICY_PATH:

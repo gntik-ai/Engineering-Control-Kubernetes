@@ -165,12 +165,6 @@ for project in falcone musematic llmwiki; do
     install -o root -g root -m 0644 "${flow}" "${CONFIG_ROOT}/flows.d/${project}/"
   done
 done
-if [[ ! -f "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]; then
-  install -o root -g delivery-runner -m 0640 \
-    "${RELEASE_ROOT}/source/config/policy/github-issue-write-validation.yaml" \
-    "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml"
-fi
-
 AGENT_PACK_RELEASE_ID=$(git -C "${AGENT_PACK_SOURCE_ROOT}" rev-parse --verify HEAD) || {
   echo "Agent-pack bootstrap requires its independent version-controlled checkout" >&2
   exit 1

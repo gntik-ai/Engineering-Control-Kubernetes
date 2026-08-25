@@ -104,8 +104,7 @@ def policy_file(
     content = (
         "not: [valid"
         if malformed
-        else "schema_version: 1\n"
-        f"enabled: {str(enabled).lower()}\n"
+        else f"enabled: {str(enabled).lower()}\n"
         + (
             "safe_repositories:\n" + "".join(f"  - {repository}\n" for repository in repositories)
             if repositories

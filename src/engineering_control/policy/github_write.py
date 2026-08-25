@@ -48,7 +48,6 @@ class GitHubWriteDenialReason(StrEnum):
 class GitHubWritePolicyDocument(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1]
     enabled: bool
     safe_repositories: tuple[str, ...]
 

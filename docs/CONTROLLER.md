@@ -53,11 +53,14 @@ The one canonical write policy is
 `/etc/engineering-control/policy/github-issue-write-validation.yaml`. It is non-secret,
 `root:engineering-control` mode `0640`, beneath a `root:engineering-control` mode-`0750`
 directory. The systemd unit grants `hermes` the `engineering-control` supplementary group and
-mounts the policy read-only. Bootstrap creates the disabled, empty-allowlist default only when the
-file is absent and never overwrites operator policy content. Missing, unreadable, malformed,
-disabled, empty, or non-allowlisted policy returns a typed terminal `BLOCKED_BY_POLICY` result
-before command construction. A production workflow then waits in `AWAITING_WRITE_POLICY` for an
-explicit retry signal; Temporal does not automatically retry the denial.
+mounts the policy read-only. The strict policy has exactly the `enabled` and `safe_repositories`
+data keys. Bootstrap creates the disabled, empty-allowlist default only when the file is absent.
+It preserves every valid operator policy and refuses unknown invalid content. The one known
+failed-install default containing the obsolete generated `reason` key is backed up root-only and
+replaced with the strict default. Missing, unreadable, malformed, disabled, empty, or
+non-allowlisted policy returns a typed terminal `BLOCKED_BY_POLICY` result before command
+construction. A production workflow then waits in `AWAITING_WRITE_POLICY` for an explicit retry
+signal; Temporal does not automatically retry the denial.
 
 Validate its existing authentication without displaying a token:
 

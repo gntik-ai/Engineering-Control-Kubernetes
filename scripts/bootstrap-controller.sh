@@ -150,11 +150,11 @@ done
 for policy in "${RELEASE_ROOT}"/source/config/policies/*.yaml; do
   install -o root -g engineering-control -m 0640 "${policy}" "${CONFIG_ROOT}/policies/"
 done
-if [[ ! -f "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]; then
-  install -o root -g engineering-control -m 0640 \
-    "${RELEASE_ROOT}/source/config/policy/github-issue-write-validation.yaml" \
-    "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml"
-fi
+"${INSTALL_ROOT}/venv/bin/python" \
+  "${RELEASE_ROOT}/source/scripts/reconcile-github-write-policy.py" \
+  --template "${RELEASE_ROOT}/source/config/policy/github-issue-write-validation.yaml" \
+  --policy "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" \
+  --backup-root /var/backups/engineering-control/policy-migrations
 for target in "${RELEASE_ROOT}"/source/config/targets/*.yaml; do
   target_name=$(basename "${target}")
   if [[ ! -f "${CONFIG_ROOT}/targets/${target_name}" ]]; then

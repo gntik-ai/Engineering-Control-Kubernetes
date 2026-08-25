@@ -164,6 +164,7 @@ def test_registry_verifier_is_mandatory_for_both_bootstraps() -> None:
 
 def test_controller_github_bootstrap_is_source_idempotent() -> None:
     controller = (ROOT / "scripts/bootstrap-controller.sh").read_text(encoding="utf-8")
+    worker = (ROOT / "scripts/bootstrap-worker.sh").read_text(encoding="utf-8")
     assert controller.count('if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]') == 1
     assert "install -d -o hermes -g hermes -m 0700" in controller
     assert 'chown root:hermes "${CONFIG_ROOT}/env/github-worker.env"' in controller
@@ -171,7 +172,8 @@ def test_controller_github_bootstrap_is_source_idempotent() -> None:
     assert "systemctl enable engineering-api.service" in controller
     assert "systemctl restart engineering-api.service" in controller
     assert "systemctl enable --now engineering-github-worker.service" not in controller
-    assert 'if [[ ! -f "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]' in controller
+    assert "reconcile-github-write-policy.py" in controller
+    assert "policy/github-issue-write-validation.yaml" not in worker
     assert 'install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy"' in controller
 
 
