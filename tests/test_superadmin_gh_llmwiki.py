@@ -157,6 +157,7 @@ def test_gh_cli_auth_expiry_is_a_typed_workflow_blocker(tmp_path: Path) -> None:
 async def test_superadmin_session_material_is_ephemeral_and_redacted() -> None:
     secret = secrets.token_urlsafe(32)
     refresh = secrets.token_urlsafe(32)
+    logout_bodies: list[dict[str, str]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
@@ -169,6 +170,7 @@ async def test_superadmin_session_material_is_ephemeral_and_redacted() -> None:
                     "roles": ["superadmin"],
                 },
             )
+        logout_bodies.append(json.loads(request.content))
         return httpx.Response(204)
 
     redactor = SecretRedactor()
@@ -191,9 +193,11 @@ async def test_superadmin_session_material_is_ephemeral_and_redacted() -> None:
         assert session.client.headers["Authorization"] == f"Bearer {secret}"
     assert retained is not None
     assert retained.session_id is None
+    assert retained._refresh_token is None
     assert retained._secrets == []
     assert "Authorization" not in retained.client.headers
     assert redactor.redact_text(secret).value == secret
+    assert logout_bodies == [{"refreshToken": refresh}]
 
 
 @pytest.mark.asyncio
@@ -230,6 +234,7 @@ async def test_falcone_documented_platform_roles_prove_superadmin() -> None:
 @pytest.mark.asyncio
 async def test_falcone_platform_roles_reject_non_superadmin() -> None:
     secret = secrets.token_urlsafe(32)
+    refresh = secrets.token_urlsafe(32)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
@@ -237,7 +242,7 @@ async def test_falcone_platform_roles_reject_non_superadmin() -> None:
                 201,
                 json={
                     "sessionId": "bounded-session",
-                    "tokenSet": {"accessToken": secret},
+                    "tokenSet": {"accessToken": secret, "refreshToken": refresh},
                     "principal": {"platformRoles": ["tenant_admin"]},
                 },
             )
@@ -257,6 +262,44 @@ async def test_falcone_platform_roles_reject_non_superadmin() -> None:
         async with adapter.login(credential):
             pass
     assert error.value.type == "SUPERADMIN_ROLE_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_falcone_logout_failure_is_a_terminal_cleanup_blocker() -> None:
+    secret = secrets.token_urlsafe(32)
+    refresh = secrets.token_urlsafe(32)
+    redactor = SecretRedactor()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "sessionId": "bounded-session",
+                    "tokenSet": {"accessToken": secret, "refreshToken": refresh},
+                    "principal": {"platformRoles": ["superadmin"]},
+                },
+            )
+        return httpx.Response(503)
+
+    adapter = SuperadminSessionAdapter(redactor=redactor, transport=httpx.MockTransport(handler))
+    credential = SuperadminCredential(
+        project="falcone",
+        base_url="https://staging.example.invalid",
+        username="superadmin-test",
+        password=secrets.token_urlsafe(32),
+    )
+    retained = None
+    with pytest.raises(ApplicationError) as error:
+        async with adapter.login(credential) as session:
+            retained = session
+    assert error.value.type == "SUPERADMIN_SESSION_CLEANUP_FAILED"
+    assert retained is not None
+    assert retained.session_id is None
+    assert retained._refresh_token is None
+    assert retained._secrets == []
+    assert "Authorization" not in retained.client.headers
+    assert redactor.redact_text(secret).value == secret
 
 
 class _PersonaAdmin:
