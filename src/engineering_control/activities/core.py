@@ -449,6 +449,8 @@ class ControlActivities:
             and step in self.preview_cleanup_handler.supported_steps
         ):
             return await self.preview_cleanup_handler.handle(step, safe_payload)
+        if self.release_handler is not None and step in self.release_handler.supported_steps:
+            return await self.release_handler.handle(step, safe_payload)
         if self.provider_handler is not None:
             return await self.provider_handler.handle(step, safe_payload)
         if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:

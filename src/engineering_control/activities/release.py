@@ -24,6 +24,18 @@ from engineering_control.security.redaction import SecretRedactor
 class ReleaseActivityHandler:
     """Deterministic release-only dispatcher; it never accepts prompts or shell strings."""
 
+    supported_steps = frozenset(
+        {
+            "deployment.render",
+            "preview.preflight",
+            "preview.deploy",
+            "preview.verify",
+            "staging.preflight",
+            "staging.deploy",
+            "recovery.execute",
+        }
+    )
+
     def __init__(
         self,
         settings: Settings,

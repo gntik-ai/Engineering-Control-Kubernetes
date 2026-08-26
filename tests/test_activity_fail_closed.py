@@ -7,6 +7,19 @@ from engineering_control.activities.core import ControlActivities
 from engineering_control.config import Settings
 
 
+class FakeReleaseHandler:
+    supported_steps = frozenset(
+        {"deployment.render", "preview.preflight", "preview.verify", "staging.preflight"}
+    )
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def handle(self, step: str, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append(step)
+        return {**payload, "status": "RELEASE_HANDLER_REACHED", "step": step}
+
+
 @pytest.mark.asyncio
 async def test_production_activity_rejects_invalid_authoritative_metadata(
     monkeypatch: pytest.MonkeyPatch,
@@ -44,3 +57,23 @@ def test_provider_telemetry_persistence_is_controller_only() -> None:
         assert step in ControlActivities._worker_steps["controller"]
         for worker in ("scan", "codex", "claude", "browser", "delivery", "release"):
             assert step not in ControlActivities._worker_steps[worker]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "step",
+    ("deployment.render", "preview.preflight", "preview.verify", "staging.preflight"),
+)
+async def test_non_mutating_release_steps_reach_release_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    step: str,
+) -> None:
+    monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
+    activities = ControlActivities(Settings(synthetic_mode=False), "release")
+    handler = FakeReleaseHandler()
+    activities.release_handler = handler  # type: ignore[assignment]
+
+    result = await activities.execute_control_step({"step": step, "payload": {"dry_run": True}})
+
+    assert result["status"] == "RELEASE_HANDLER_REACHED"
+    assert handler.calls == [step]
