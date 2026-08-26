@@ -231,11 +231,14 @@ class BrowserActivityHandler:
                 "contract_hash": contract_hash,
                 "blocker_code": blocker,
             }
-        except ApplicationError as error:
+        except (ApplicationError, httpx.HTTPError) as error:
+            blocker_code = (
+                error.type if isinstance(error, ApplicationError) else "BLOCKED_BY_RUNTIME_HEALTH"
+            )
             return {
                 "project": project,
                 "contract_id": f"{project}-superadmin",
-                "file_present": error.type
+                "file_present": blocker_code
                 not in {f"MANUAL_{project.upper()}_SUPERADMIN_INPUT_REQUIRED"},
                 "parser_valid": False,
                 "target_valid": False,
@@ -245,7 +248,7 @@ class BrowserActivityHandler:
                 "checked_timestamp": checked,
                 "attestation_ttl_seconds": 300,
                 "contract_hash": contract_hash,
-                "blocker_code": error.type or "SUPERADMIN_PREFLIGHT_FAILED",
+                "blocker_code": blocker_code or "SUPERADMIN_PREFLIGHT_FAILED",
             }
 
     def _catalog(self) -> EngineeringCatalog:
