@@ -11,9 +11,9 @@ from engineering_control.identity.sessions import EphemeralSuperadminSession
 from engineering_control.security.redaction import SecretRedactor
 
 _BUILTIN_ROLES = {
-    "standard-user": ("viewer", "member", "workspace_developer"),
+    "standard-user": ("workspace_viewer", "viewer", "member", "workspace_developer"),
     "privileged-admin": ("workspace_admin", "tenant_admin", "admin"),
-    "platform-administrator": ("platform_admin", "superadmin"),
+    "platform-administrator": ("platform_admin", "tenant_admin", "superadmin"),
     "developer-operator": ("workspace_operator", "operator", "developer"),
 }
 
@@ -28,11 +28,15 @@ class HttpPersonaAdminClient:
         tenant_id: str | None,
         workspace_id: str | None,
         redactor: SecretRedactor,
+        identity_project: str | None = None,
+        authentication_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.session = session
         self.tenant_id = tenant_id
         self.workspace_id = workspace_id
         self.redactor = redactor
+        self.identity_project = identity_project or session.project
+        self.authentication_transport = authentication_transport
         self._persona_tokens: dict[str, str] = {}
         self._persona_passwords: dict[str, str] = {}
 
@@ -47,12 +51,16 @@ class HttpPersonaAdminClient:
             for role in roles:
                 name = str(role.get("name", role.get("slug", ""))).lower()
                 if name == preferred and role.get("builtIn", role.get("built_in", True)) is True:
-                    return str(role.get("id", name))
+                    return name if self.session.project == "falcone" else str(role.get("id", name))
         return None
 
     async def create_role(
         self, name: str, persona: str, scope: str, metadata: dict[str, str]
     ) -> str:
+        if self.session.project == "falcone":
+            # Falcone's current role API cannot attach managed metadata. Fail closed
+            # instead of creating a role that stale-resource recovery cannot identify.
+            raise NotImplementedError("Falcone custom managed roles are unsupported")
         body = {
             "name": name,
             "permissions": list(_BUILTIN_ROLES[persona][:1]),
@@ -69,26 +77,41 @@ class HttpPersonaAdminClient:
     ) -> dict[str, object] | None:
         value = self._json(await self.session.client.get(self._users_path()), {200})
         for user in self._items(value):
-            candidate_metadata = user.get("metadata")
+            candidate_metadata = (
+                user.get("attributes")
+                if self.session.project == "falcone"
+                else user.get("metadata")
+            )
             if (
                 user.get("username", user.get("email")) == name
                 and isinstance(candidate_metadata, dict)
-                and candidate_metadata.get("managed-by") == "engineering-control"
-                and candidate_metadata.get("campaign-id") == metadata["campaign-id"]
+                and self._attribute(candidate_metadata, "managed-by") == "engineering-control"
+                and self._attribute(candidate_metadata, "campaign-id") == metadata["campaign-id"]
             ):
-                return user
+                return {
+                    **user,
+                    "managed-by": "engineering-control",
+                    "campaign-id": metadata["campaign-id"],
+                }
         return None
 
     async def create_user(self, name: str, password: str, metadata: dict[str, str]) -> str:
         self.redactor.register_secret(password)
-        body = {
+        body: dict[str, Any] = {
             "username": name,
             "email": f"{name}@invalid.example",
             "password": password,
             "enabled": True,
-            "temporary": True,
-            "metadata": metadata,
+            "temporary": False,
         }
+        if self.session.project == "falcone":
+            body["attributes"] = {
+                **metadata,
+                **({"tenant_id": self.tenant_id} if self.tenant_id else {}),
+                **({"workspace_id": self.workspace_id} if self.workspace_id else {}),
+            }
+        else:
+            body["metadata"] = metadata
         try:
             value = self._json(
                 await self.session.client.post(self._users_path(), json=body), {200, 201}
@@ -104,14 +127,24 @@ class HttpPersonaAdminClient:
         return self._json(await self.session.client.get(f"{self._users_path()}/{user_id}"), {200})
 
     async def activate_user(self, user_id: str) -> None:
+        path = f"{self._users_path()}/{user_id}"
+        if self.session.project == "falcone":
+            path += "/status"
         self._json(
-            await self.session.client.patch(
-                f"{self._users_path()}/{user_id}", json={"enabled": True}
-            ),
+            await self.session.client.patch(path, json={"enabled": True}),
             {200, 204},
         )
 
     async def assign(self, user_id: str, role_id: str, scope: str) -> None:
+        if self.session.project == "falcone":
+            self._json(
+                await self.session.client.post(
+                    f"{self._users_path()}/{user_id}/role-assignments",
+                    json={"roles": [role_id]},
+                ),
+                {200, 201, 204},
+            )
+            return
         self._json(
             await self.session.client.post(
                 f"{self._users_path()}/{user_id}/roles",
@@ -126,11 +159,17 @@ class HttpPersonaAdminClient:
         )
 
     async def authenticate(self, username: str, password: str) -> str | None:
+        if self.identity_project == "llmwiki":
+            # LLMWiki must authenticate through its browser authorization-code +
+            # PKCE flow. The browser activity performs that bounded login; never
+            # substitute a password-grant token here.
+            return None
         temporary = httpx.AsyncClient(
             base_url=self.session.base_url,
             timeout=httpx.Timeout(30),
             follow_redirects=False,
             verify=True,
+            transport=self.authentication_transport,
         )
         try:
             path = (
@@ -163,6 +202,49 @@ class HttpPersonaAdminClient:
             )
 
     async def restore_user(self, user_id: str, snapshot: dict[str, object]) -> None:
+        if self.session.project == "falcone":
+            enabled = snapshot.get("enabled") is True
+            self._json(
+                await self.session.client.patch(
+                    f"{self._users_path()}/{user_id}/status", json={"enabled": enabled}
+                ),
+                {200, 204},
+            )
+            snapshot_roles = snapshot.get("realmRoles", [])
+            expected_roles = (
+                {str(item) for item in snapshot_roles if isinstance(item, str)}
+                if isinstance(snapshot_roles, list)
+                else set()
+            )
+            current_value = self._json(
+                await self.session.client.get(f"{self._users_path()}/{user_id}/roles"),
+                {200},
+            )
+            current_roles = {
+                str(item.get("name"))
+                for item in self._items(current_value)
+                if isinstance(item.get("name"), str)
+            }
+            added = sorted(expected_roles - current_roles)
+            removed = sorted(current_roles - expected_roles)
+            if added:
+                self._json(
+                    await self.session.client.post(
+                        f"{self._users_path()}/{user_id}/role-assignments",
+                        json={"roles": added},
+                    ),
+                    {200, 201, 204},
+                )
+            if removed:
+                self._json(
+                    await self.session.client.request(
+                        "DELETE",
+                        f"{self._users_path()}/{user_id}/role-assignments",
+                        json={"roles": removed},
+                    ),
+                    {200, 204},
+                )
+            return
         self._json(
             await self.session.client.put(f"{self._users_path()}/{user_id}", json=snapshot),
             {200, 204},
@@ -194,24 +276,28 @@ class HttpPersonaAdminClient:
             if response.status_code == 404:
                 continue
             for item in self._items(self._json(response, {200})):
-                metadata = item.get("metadata")
+                metadata = (
+                    item.get("attributes")
+                    if self.session.project == "falcone"
+                    else item.get("metadata")
+                )
                 name = str(item.get("username", item.get("name", "")))
                 identifier = item.get("id")
                 if (
                     not isinstance(metadata, dict)
-                    or metadata.get("managed-by") != "engineering-control"
+                    or self._attribute(metadata, "managed-by") != "engineering-control"
                     or not isinstance(identifier, str)
                     or not self._managed_name(name)
                 ):
                     continue
-                expires_at = metadata.get("expires-at")
+                expires_at = self._attribute(metadata, "expires-at")
                 try:
                     expired = isinstance(expires_at, str) and datetime.fromisoformat(
                         expires_at
                     ).astimezone(UTC) <= datetime.now(UTC)
                 except ValueError:
                     expired = False
-                campaign_id = metadata.get("campaign-id")
+                campaign_id = self._attribute(metadata, "campaign-id")
                 if expired and isinstance(campaign_id, str) and campaign_id:
                     candidates.append(
                         {
@@ -265,22 +351,31 @@ class HttpPersonaAdminClient:
     def _roles_path(self) -> str:
         if self.session.project == "musematic":
             return "/api/v1/admin/roles"
-        if not self.tenant_id:
-            raise ApplicationError(
-                "Falcone identity bootstrap requires TENANT_ID",
-                type="IDENTITY_BOOTSTRAP_SCOPE_MISSING",
-            )
-        return f"/v1/tenants/{self.tenant_id}/roles"
+        return f"/v1/iam/realms/{self._falcone_realm()}/roles"
 
     def _users_path(self) -> str:
         if self.session.project == "musematic":
             return "/api/v1/admin/users"
+        return f"/v1/iam/realms/{self._falcone_realm()}/users"
+
+    def _falcone_realm(self) -> str:
+        if self.identity_project == "falcone":
+            return "in-falcone-platform"
         if not self.tenant_id:
             raise ApplicationError(
                 "Falcone identity bootstrap requires TENANT_ID",
                 type="IDENTITY_BOOTSTRAP_SCOPE_MISSING",
             )
-        return f"/v1/tenants/{self.tenant_id}/users"
+        return self.tenant_id
+
+    @staticmethod
+    def _attribute(values: dict[str, Any], name: str) -> str | None:
+        value = values.get(name)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+            return value[0]
+        return None
 
     @staticmethod
     def _json(response: httpx.Response, allowed: set[int]) -> dict[str, Any]:
@@ -317,7 +412,7 @@ class HttpPersonaAdminClient:
     def _id(value: dict[str, Any], label: str) -> str:
         for candidate in (value, value.get("data")):
             if isinstance(candidate, dict):
-                item = candidate.get("id")
+                item = candidate.get("id", candidate.get("userId", candidate.get("roleName")))
                 if isinstance(item, str) and item:
                     return item
         raise ApplicationError(f"{label} creation returned no identifier", non_retryable=True)

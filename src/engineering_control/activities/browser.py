@@ -158,6 +158,8 @@ class BrowserActivityHandler:
                         tenant_id=credential.tenant_id,
                         workspace_id=credential.workspace_id,
                         redactor=self.redactor,
+                        identity_project=project,
+                        authentication_transport=self.api_transport,
                     )
                     try:
                         if step == "identity.inspect_stale":
@@ -313,6 +315,8 @@ class BrowserActivityHandler:
                 tenant_id=credential.tenant_id,
                 workspace_id=credential.workspace_id,
                 redactor=self.redactor,
+                identity_project=project,
+                authentication_transport=self.api_transport,
             )
             factory = EphemeralPersonaFactory(admin)
             try:

@@ -20,6 +20,7 @@ class FakeWorktreeManager:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.snapshots: list[str] = []
+        self.release_reads: list[tuple[str, Path]] = []
 
     def snapshot(self, repository: str, *, base_ref: str, expected_sha: str) -> dict[str, str]:
         self.snapshots.append(repository)
@@ -56,7 +57,7 @@ class FakeWorktreeManager:
         return {"path": str(path), "sha": expected_sha, "status": "clean"}
 
     def grant_release_read(self, repository: str, target: Path) -> None:
-        return None
+        self.release_reads.append((repository, target))
 
     def grant_delivery_read(self, repository: str, target: Path) -> None:
         return None
@@ -170,6 +171,9 @@ async def test_project_snapshot_maps_both_transaction_repositories(tmp_path: Pat
     assert result["status"] == "SNAPSHOT_VERIFIED"
     assert manager.snapshots == ["musematic", "musematic-deploy"]
     assert result["deployment_snapshot"]["sha"] == "b" * 40
+    assert manager.release_reads == [
+        ("musematic-deploy", tmp_path / "musematic-deploy" / str(result["campaign_id"]))
+    ]
 
 
 @pytest.mark.asyncio

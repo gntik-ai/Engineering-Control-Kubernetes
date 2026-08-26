@@ -911,6 +911,10 @@ class ScanActivityHandler:
                 base_ref=base_ref,
                 expected_base_sha=deployment_sha,
             )
+        self.manager.grant_release_read(
+            deployment_repository,
+            deployment_worktree.path,
+        )
         return {
             **payload,
             "status": "SNAPSHOT_VERIFIED",

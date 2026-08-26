@@ -122,10 +122,10 @@ class ReleaseActivityHandler:
         manifest = self.catalog.project(project)
         if project == "llmwiki":
             return self._render_llmwiki(payload, manifest, snapshot)
-        chart_worktree_key = f"{manifest.deployment.chart_repository}_worktree"
-        chart_worktree = Path(str(snapshot.get(chart_worktree_key))).resolve()
-        deployment_worktree = Path(str(snapshot.get("deployment_worktree"))).resolve()
         try:
+            chart_worktree_key = f"{manifest.deployment.chart_repository}_worktree"
+            chart_worktree = Path(str(snapshot.get(chart_worktree_key))).resolve()
+            deployment_worktree = Path(str(snapshot.get("deployment_worktree"))).resolve()
             self._bounded_worktree(chart_worktree)
             self._bounded_worktree(deployment_worktree)
             chart = (chart_worktree / manifest.deployment.chart_path).resolve()
