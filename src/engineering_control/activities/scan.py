@@ -961,22 +961,21 @@ class ScanActivityHandler:
         if snapshot is None:
             raise ValueError("paired snapshot requires both repository snapshots")
         manifest = self.catalog.project(project.value)
-        readiness = self.catalog.credential_readiness(manifest.deployment.observer_credential_ref)
-        if not readiness.present or not readiness.permissions_valid:
+        raw_credential = Path(manifest.deployment.observer_credential_ref.removeprefix("file:"))
+        try:
+            kubeconfig = self._observer_credential(raw_credential)
+        except (OSError, ValueError):
             return {
                 **payload,
                 "status": "BLOCKED",
                 "readiness": "BLOCKED_BY_CREDENTIAL",
                 "blocker": (
                     "KUBERNETES_OBSERVER_CREDENTIAL_MISSING"
-                    if not readiness.present
+                    if not raw_credential.is_file()
                     else "KUBERNETES_OBSERVER_CREDENTIAL_PERMISSIONS"
                 ),
-                "missing_credential_ref": readiness.reference,
+                "missing_credential_ref": manifest.deployment.observer_credential_ref,
             }
-        kubeconfig = self._observer_credential(
-            Path(manifest.deployment.observer_credential_ref.removeprefix("file:"))
-        )
         observer = KubernetesObserver(
             self.observer_runner,
             kubeconfig=kubeconfig,

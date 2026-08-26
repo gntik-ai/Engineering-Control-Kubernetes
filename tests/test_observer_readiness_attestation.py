@@ -100,6 +100,69 @@ def test_observer_file_contract_accepts_only_private_owner_or_root_group_read() 
     )
 
 
+def test_pair_snapshot_uses_same_root_group_read_observer_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    kubeconfig = credential_root / "observer.kubeconfig"
+    kubeconfig.write_text("bounded-test-fixture", encoding="utf-8")
+    kubeconfig.chmod(0o600)
+    run_root = tmp_path / "runs"
+    (run_root / "scan").mkdir(parents=True)
+
+    class SnapshotObserver:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def verify_permissions(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def identity(self) -> dict[str, str]:
+            return {
+                "context": "falcone-observer",
+                "api_server": "https://cluster.example.test",
+                "username": "system:serviceaccount:test:observer",
+            }
+
+        def get(self, *_args: Any, **_kwargs: Any) -> CommandResult:
+            return CommandResult(0, '{"items":[]}', "")
+
+    monkeypatch.setattr("engineering_control.activities.scan.KubernetesObserver", SnapshotObserver)
+    handler = ScanActivityHandler(
+        Settings(observer_credential_root=credential_root, run_root=run_root),
+        observer_runner=AttestationObserverRunner(),  # type: ignore[arg-type]
+    )
+    handler.catalog.project = lambda _project: SimpleNamespace(  # type: ignore[method-assign]
+        deployment=SimpleNamespace(
+            observer_credential_ref=f"file:{kubeconfig}",
+            kubernetes_context_ref="falcone-observer",
+            api_server_identity="https://cluster.example.test",
+            namespaces=["falcone-staging"],
+            strategy="helm",
+            argocd_application=None,
+            deployment_revision_annotation="engineering.gntik.ai/deployment-sha",
+            helm_release_revision_annotation="engineering.gntik.ai/helm-release-revision",
+        )
+    )
+    handler.catalog.credential_readiness = lambda _reference: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("pair snapshots must use the effective observer file contract")
+    )
+
+    result = handler._snapshot_pair(
+        {
+            "project": "falcone",
+            "snapshot": {
+                "source_sha": "a" * 40,
+                "deployment_sha": "b" * 40,
+            },
+        }
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "RUNTIME_DEPLOYMENT_REVISION_UNPROVEN"
+
+
 @pytest.mark.asyncio
 async def test_scan_worker_returns_only_bounded_observer_attestation(tmp_path: Path) -> None:
     credential_root = tmp_path / "credentials"
