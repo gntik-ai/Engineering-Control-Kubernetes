@@ -163,20 +163,11 @@ class ReleaseActivityHandler:
                 lint_arguments.extend(("--values", str(values_file)))
                 render_arguments.extend(("--values", str(values_file)))
             lint = self.runner.run("helm", lint_arguments, cwd=chart_worktree, timeout_seconds=900)
-            rendered = self.runner.run(
+            rendered = self.runner.run_yaml_summary(
                 "helm", render_arguments, cwd=chart_worktree, timeout_seconds=900
             )
-            documents = [document for document in yaml.safe_load_all(rendered.stdout) if document]
-            if not documents:
+            if not rendered.document_count:
                 raise ValueError("configured chart rendered no Kubernetes objects")
-            kinds: dict[str, int] = {}
-            for document in documents:
-                kind = (
-                    str(document.get("kind", "Unknown"))
-                    if isinstance(document, dict)
-                    else "Unknown"
-                )
-                kinds[kind] = kinds.get(kind, 0) + 1
             return {
                 **payload,
                 "status": "DEPLOYMENT_RENDER_PASS",
@@ -189,9 +180,9 @@ class ReleaseActivityHandler:
                         for _ in manifest.deployment.secret_bearing_values_paths
                     ],
                     "helm_lint_sha256": hashlib.sha256(lint.stdout.encode()).hexdigest(),
-                    "rendered_sha256": hashlib.sha256(rendered.stdout.encode()).hexdigest(),
-                    "manifest_count": len(documents),
-                    "kinds": dict(sorted(kinds.items())),
+                    "rendered_sha256": rendered.stdout_sha256,
+                    "manifest_count": rendered.document_count,
+                    "kinds": dict(rendered.kinds),
                     "rendered_content_persisted": False,
                 },
             }
