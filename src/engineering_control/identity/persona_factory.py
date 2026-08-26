@@ -50,7 +50,7 @@ class PersonaAdminClient(Protocol):
     async def snapshot_user(self, user_id: str) -> dict[str, object]: ...
     async def activate_user(self, user_id: str) -> None: ...
     async def assign(self, user_id: str, role_id: str, scope: str) -> None: ...
-    async def authenticate(self, username: str, password: str) -> str | None: ...
+    async def authenticate(self, user_id: str, username: str, password: str) -> str | None: ...
     async def logout_persona(self, user_id: str) -> None: ...
     async def delete_user(self, user_id: str) -> None: ...
     async def restore_user(self, user_id: str, snapshot: dict[str, object]) -> None: ...
@@ -132,7 +132,7 @@ class EphemeralPersonaFactory:
                 user_id = await self.client.create_user(name, password, metadata)
                 self._users += 1
             await self.client.assign(user_id, role_id, scope)
-            access_token = await self.client.authenticate(name, password)
+            access_token = await self.client.authenticate(user_id, name, password)
             yield EphemeralPersona(
                 resource_name=name,
                 persona=persona,
@@ -145,30 +145,40 @@ class EphemeralPersonaFactory:
                 access_token=access_token,
             )
         finally:
-            try:
-                if user_id:
+            cleanup_errors: list[Exception] = []
+            if user_id:
+                try:
                     await self.client.logout_persona(user_id)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                try:
                     if activated and snapshot is not None:
                         await self.client.restore_user(user_id, snapshot)
                     elif not activated:
                         await self.client.delete_user(user_id)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                try:
                     cleanup_complete = await self.client.prove_absent_or_restored(user_id, snapshot)
-                else:
-                    cleanup_complete = True
-                if created_role and role_id:
+                except Exception as error:
+                    cleanup_errors.append(error)
+            else:
+                cleanup_complete = True
+            if created_role and role_id:
+                try:
                     await self.client.delete_role(role_id)
-            except Exception as error:
-                raise ApplicationError(
-                    "temporary identity cleanup could not be proven",
-                    type="INCOMPLETE_IDENTITY_CLEANUP",
-                    non_retryable=True,
-                ) from error
-            if not cleanup_complete:
-                raise ApplicationError(
+                except Exception as error:
+                    cleanup_errors.append(error)
+            if cleanup_errors or not cleanup_complete:
+                cause = cleanup_errors[0] if cleanup_errors else None
+                terminal_error = ApplicationError(
                     "temporary identity cleanup could not be proven",
                     type="INCOMPLETE_IDENTITY_CLEANUP",
                     non_retryable=True,
                 )
+                if cause is not None:
+                    raise terminal_error from cause
+                raise terminal_error
 
     @staticmethod
     def _validate(project: str, campaign_id: str, persona: str) -> None:

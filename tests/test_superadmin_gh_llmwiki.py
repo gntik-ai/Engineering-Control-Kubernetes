@@ -483,11 +483,13 @@ class _PersonaAdmin:
         cleanup_complete: bool = True,
         unmanaged: bool = False,
         role_missing: bool = False,
+        logout_fails: bool = False,
     ) -> None:
         self.events: list[str] = []
         self.cleanup_complete = cleanup_complete
         self.unmanaged = unmanaged
         self.role_missing = role_missing
+        self.logout_fails = logout_fails
 
     async def discover_minimum_role(self, persona: str, scope: str) -> str | None:
         self.events.append("discover")
@@ -522,11 +524,13 @@ class _PersonaAdmin:
     async def assign(self, user_id: str, role_id: str, scope: str) -> None:
         self.events.append("assign")
 
-    async def authenticate(self, username: str, password: str) -> str | None:
+    async def authenticate(self, user_id: str, username: str, password: str) -> str | None:
         return "ephemeral-persona-token"
 
     async def logout_persona(self, user_id: str) -> None:
         self.events.append("logout")
+        if self.logout_fails:
+            raise RuntimeError("synthetic logout failure")
 
     async def delete_user(self, user_id: str) -> None:
         self.events.append("delete-user")
@@ -567,6 +571,23 @@ async def test_persona_factory_prefixes_and_cleans_after_success_and_failure() -
         ):
             raise RuntimeError("flow failed")
     assert failed.events[-3:] == ["logout", "delete-user", "prove"]
+
+
+@pytest.mark.asyncio
+async def test_persona_factory_attempts_identity_deletion_when_logout_fails() -> None:
+    admin = _PersonaAdmin(logout_fails=True)
+
+    with pytest.raises(ApplicationError) as caught:
+        async with EphemeralPersonaFactory(admin).persona(
+            project="falcone",
+            campaign_id="campaign-1",
+            persona="standard-user",
+            scope="workspace-a",
+        ):
+            pass
+
+    assert caught.value.type == "INCOMPLETE_IDENTITY_CLEANUP"
+    assert admin.events[-3:] == ["logout", "delete-user", "prove"]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,6 +17,15 @@ _BUILTIN_ROLES = {
     "platform-administrator": ("platform_admin", "tenant_admin", "superadmin"),
     "developer-operator": ("workspace_operator", "operator", "developer"),
 }
+
+
+@dataclass(repr=False)
+class _PersonaProtocolSession:
+    project: str
+    access_token: str = field(repr=False)
+    refresh_token: str | None = field(default=None, repr=False)
+    session_id: str | None = field(default=None, repr=False)
+    secrets: list[str] = field(default_factory=list, repr=False)
 
 
 class HttpPersonaAdminClient:
@@ -39,6 +49,7 @@ class HttpPersonaAdminClient:
         self.authentication_transport = authentication_transport
         self._persona_tokens: dict[str, str] = {}
         self._persona_passwords: dict[str, str] = {}
+        self._persona_sessions: dict[str, _PersonaProtocolSession] = {}
 
     async def discover_minimum_role(self, persona: str, scope: str) -> str | None:
         response = await self.session.client.get(self._roles_path())
@@ -158,7 +169,7 @@ class HttpPersonaAdminClient:
             {200, 201, 204},
         )
 
-    async def authenticate(self, username: str, password: str) -> str | None:
+    async def authenticate(self, user_id: str, username: str, password: str) -> str | None:
         if self.identity_project == "llmwiki":
             # LLMWiki must authenticate through its browser authorization-code +
             # PKCE flow. The browser activity performs that bounded login; never
@@ -182,17 +193,84 @@ class HttpPersonaAdminClient:
                 await temporary.post(path, json={key: username, "password": password}), {200, 201}
             )
             token = self._find_token(value)
-            if token:
-                self.redactor.register_secret(token)
-                self._persona_tokens[username] = token
+            refresh_token = self._find_named_string(value, ("refreshToken", "refresh_token"))
+            session_id = self._find_named_string(value, ("sessionId", "session_id"))
+            if not token:
+                raise ApplicationError(
+                    "temporary persona login returned no access token",
+                    type="EPHEMERAL_PERSONA_SESSION_INVALID",
+                    non_retryable=True,
+                )
+            if self.session.project == "falcone" and (not refresh_token or not session_id):
+                raise ApplicationError(
+                    "temporary Falcone login returned no revocable session",
+                    type="EPHEMERAL_PERSONA_SESSION_INVALID",
+                    non_retryable=True,
+                )
+            material = [token, *(item for item in (refresh_token,) if item)]
+            for secret in material:
+                self.redactor.register_secret(secret)
+            self._persona_tokens[user_id] = token
+            self._persona_sessions[user_id] = _PersonaProtocolSession(
+                project=self.session.project,
+                access_token=token,
+                refresh_token=refresh_token,
+                session_id=session_id,
+                secrets=material,
+            )
             return token
         finally:
             temporary.cookies.clear()
             await temporary.aclose()
 
     async def logout_persona(self, user_id: str) -> None:
-        # Deleting/deactivating the identity invalidates its bounded protocol sessions.
-        return None
+        material = self._persona_sessions.pop(user_id, None)
+        if material is None:
+            return
+        client = httpx.AsyncClient(
+            base_url=self.session.base_url,
+            timeout=httpx.Timeout(30),
+            follow_redirects=False,
+            verify=True,
+            transport=self.authentication_transport,
+            headers={"Authorization": f"Bearer {material.access_token}"},
+        )
+        try:
+            if material.project == "falcone":
+                if not material.session_id or not material.refresh_token:
+                    raise ApplicationError(
+                        "temporary Falcone session cannot be revoked",
+                        type="INCOMPLETE_IDENTITY_CLEANUP",
+                        non_retryable=True,
+                    )
+                response = await client.request(
+                    "DELETE",
+                    f"/v1/auth/login-sessions/{material.session_id}",
+                    json={"refreshToken": material.refresh_token},
+                    headers={"Cache-Control": "no-store"},
+                )
+            else:
+                response = await client.post(
+                    "/api/v1/auth/logout",
+                    headers={"Cache-Control": "no-store"},
+                )
+            if response.status_code not in {200, 204}:
+                raise ApplicationError(
+                    "temporary persona session logout failed",
+                    type="INCOMPLETE_IDENTITY_CLEANUP",
+                    non_retryable=True,
+                )
+        finally:
+            client.headers.pop("Authorization", None)
+            client.cookies.clear()
+            await client.aclose()
+            for secret in material.secrets:
+                self.redactor.unregister_secret(secret)
+            self._persona_tokens.pop(user_id, None)
+            material.secrets.clear()
+            material.access_token = ""
+            material.refresh_token = None
+            material.session_id = None
 
     async def delete_user(self, user_id: str) -> None:
         response = await self.session.client.delete(f"{self._users_path()}/{user_id}")
@@ -261,9 +339,9 @@ class HttpPersonaAdminClient:
         self, user_id: str, snapshot: dict[str, object] | None
     ) -> bool:
         response = await self.session.client.get(f"{self._users_path()}/{user_id}")
-        for token in self._persona_tokens.values():
+        token = self._persona_tokens.pop(user_id, None)
+        if token:
             self.redactor.unregister_secret(token)
-        self._persona_tokens.clear()
         password = self._persona_passwords.pop(user_id, None)
         if password:
             self.redactor.unregister_secret(password)
@@ -343,10 +421,23 @@ class HttpPersonaAdminClient:
         )
 
     def destroy_ephemeral_secrets(self) -> None:
-        for value in (*self._persona_tokens.values(), *self._persona_passwords.values()):
+        session_values = [
+            secret for item in self._persona_sessions.values() for secret in item.secrets
+        ]
+        for value in (
+            *self._persona_tokens.values(),
+            *self._persona_passwords.values(),
+            *session_values,
+        ):
             self.redactor.unregister_secret(value)
+        for item in self._persona_sessions.values():
+            item.secrets.clear()
+            item.access_token = ""
+            item.refresh_token = None
+            item.session_id = None
         self._persona_tokens.clear()
         self._persona_passwords.clear()
+        self._persona_sessions.clear()
 
     def _roles_path(self) -> str:
         if self.session.project == "musematic":
@@ -419,10 +510,30 @@ class HttpPersonaAdminClient:
 
     @staticmethod
     def _find_token(value: dict[str, Any]) -> str | None:
-        for candidate in (value, value.get("data"), value.get("session")):
-            if isinstance(candidate, dict):
-                for key in ("accessToken", "access_token", "token"):
-                    token = candidate.get(key)
-                    if isinstance(token, str) and token:
-                        return token
+        return HttpPersonaAdminClient._find_named_string(
+            value, ("accessToken", "access_token", "token")
+        )
+
+    @staticmethod
+    def _find_named_string(value: dict[str, Any], names: tuple[str, ...]) -> str | None:
+        def walk(item: Any, target: str) -> str | None:
+            if isinstance(item, dict):
+                for key, nested in item.items():
+                    if key == target and isinstance(nested, str) and nested:
+                        return nested
+                    if isinstance(nested, (dict, list)):
+                        found = walk(nested, target)
+                        if found is not None:
+                            return found
+            elif isinstance(item, list):
+                for nested in item:
+                    found = walk(nested, target)
+                    if found is not None:
+                        return found
+            return None
+
+        for name in names:
+            found = walk(value, name)
+            if found is not None:
+                return found
         return None

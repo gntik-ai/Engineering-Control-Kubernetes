@@ -15,11 +15,13 @@ from engineering_control.security.redaction import REDACTED, SecretRedactor
 @pytest.mark.asyncio
 async def test_falcone_persona_uses_platform_iam_contract_and_proves_cleanup() -> None:
     access_token = secrets.token_urlsafe(32)
+    refresh_token = secrets.token_urlsafe(32)
     deleted = False
+    logged_out = False
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal deleted
+        nonlocal deleted, logged_out
         body = json.loads(request.content) if request.content else None
         calls.append((request.method, request.url.path, body))
         if request.method == "GET" and request.url.path.endswith("/roles"):
@@ -39,7 +41,22 @@ async def test_falcone_persona_uses_platform_iam_contract_and_proves_cleanup() -
             assert body == {"roles": ["workspace_viewer"]}
             return httpx.Response(201, json={"assigned": ["workspace_viewer"]})
         if request.method == "POST" and request.url.path == "/v1/auth/login-sessions":
-            return httpx.Response(201, json={"accessToken": access_token})
+            return httpx.Response(
+                201,
+                json={
+                    "sessionId": "temporary-session-id",
+                    "token": "decoy-generic-token-value",
+                    "tokenSet": {
+                        "accessToken": access_token,
+                        "refreshToken": refresh_token,
+                    },
+                },
+            )
+        if request.method == "DELETE" and request.url.path.endswith("/temporary-session-id"):
+            assert request.headers["Authorization"] == f"Bearer {access_token}"
+            assert body == {"refreshToken": refresh_token}
+            logged_out = True
+            return httpx.Response(200, json={"status": "logged_out"})
         if request.method == "DELETE" and request.url.path.endswith("/temporary-user-id"):
             deleted = True
             return httpx.Response(200, json={"deleted": True})
@@ -80,7 +97,19 @@ async def test_falcone_persona_uses_platform_iam_contract_and_proves_cleanup() -
         assert redactor.redact_text(access_token).value == REDACTED
 
     assert deleted is True
+    assert logged_out is True
     assert redactor.redact_text(access_token).value == access_token
+    logout_index = next(
+        index
+        for index, (method, path, _) in enumerate(calls)
+        if method == "DELETE" and "session" in path
+    )
+    delete_index = next(
+        index
+        for index, (method, path, _) in enumerate(calls)
+        if method == "DELETE" and path.endswith("/temporary-user-id")
+    )
+    assert logout_index < delete_index
     assert calls[0][1] == "/v1/iam/realms/in-falcone-platform/roles"
     assert all("/v1/tenants/" not in path for _, path, _ in calls)
     await client.aclose()
@@ -114,7 +143,10 @@ async def test_llmwiki_persona_uses_tenant_realm_and_defers_auth_to_pkce_browser
     )
 
     assert await admin.discover_minimum_role("standard-user", "workspace") == "workspace_viewer"
-    assert await admin.authenticate("ephemeral-user", "ephemeral-password") is None
+    assert (
+        await admin.authenticate("ephemeral-user-id", "ephemeral-user", "ephemeral-password")
+        is None
+    )
     assert paths == ["/v1/iam/realms/llmwiki-realm/roles"]
     await client.aclose()
 

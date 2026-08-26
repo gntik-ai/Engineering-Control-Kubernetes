@@ -17,6 +17,17 @@ metadata behind. It records a deterministic `PROJECT_SNAPSHOT_UNAVAILABLE` block
 evidence for each cell in batches of 50, continues as new for large matrices, and terminally
 finalizes the campaign run. It never substitutes a stale SHA or an operator worktree.
 
+Blocked cells that share an upstream failure reference one deterministic root blocker. Root
+blockers use exactly one of `PRODUCT_DEFECT`, `DEPLOYMENT_DEFECT`,
+`ENGINEERING_CONTROL_DEFECT`, `TEST_HARNESS_DEFECT`, `MISSING_OPERATOR_INPUT`,
+`EXTERNAL_DEPENDENCY_FAILURE`, or `RUNTIME_PROVENANCE_GAP`. The campaign metadata owns the
+dependent-cell count; repeated cells do not create duplicate root findings. Missing operator input
+is never promoted to a product finding.
+
+Static-only campaigns render source and deployment state but do not invoke live-deployment
+comparison. `deployment.compare_live`, Kubernetes observation, and runtime correlation require the
+runtime repository surface and a passing pair snapshot.
+
 Cell states are `NOT_STARTED`, `IN_PROGRESS`, `CANDIDATE_FOUND`, `BLOCKED`, `NO_FINDING`,
 `CONFIRMED_FINDING`, `RETEST_REQUIRED`, and `VERIFIED_FIXED`. A terminal no-finding/finding/fixed
 state requires evidence. A blocker requires an explanation. An exclusion requires approval.
@@ -34,6 +45,13 @@ engineering-ctl audit falcone \
 Omit `--execute` for dry-run. Broad campaigns should be scheduled only after mirror access,
 deterministic scanners, quota snapshots, provider authentication, and required environment
 credentials pass validation. Candidate findings are not filed automatically.
+
+Authenticated personas are campaign-scoped. Nested protocol material returned by product login is
+kept in browser-worker memory, registered with the redactor, and passed only as an inherited
+in-memory bearer for a bounded request. The worker explicitly revokes the login session before it
+deletes or restores the temporary identity. A missing access token, missing revocation material, or
+failed logout becomes `INCOMPLETE_IDENTITY_CLEANUP`; identity deletion/restoration is still
+attempted and publication remains blocked.
 
 When a cell produces `CANDIDATE_FOUND`, the campaign starts a durable
 `FindingVerificationWorkflow` child bound to that finding. The child uses the opposite provider,

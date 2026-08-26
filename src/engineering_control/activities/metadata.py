@@ -57,6 +57,7 @@ from engineering_control.models.enums import (
     Project,
     Provider,
     RiskClass,
+    RootBlockerClassification,
 )
 from engineering_control.models.reconciliation import (
     CandidateArtifactManifest,
@@ -115,6 +116,16 @@ class CampaignCellRecord(BaseModel):
     flow: str = Field(default="repository-static", pattern=r"^[a-z][a-z0-9-]{0,119}$")
     lens: AuditLens
     environment: str = Field(pattern=r"^[a-z][a-z0-9-]{0,79}$")
+
+
+class RootBlockerRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    root_blocker_id: str = Field(pattern=r"^rb-[a-f0-9]{32}$")
+    classification: RootBlockerClassification
+    code: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,119}$")
+    dependent_cell_count: int = Field(default=0, ge=0)
+    root_finding_id: UUID | None = None
 
 
 class FindingCandidateRecord(BaseModel):
@@ -826,7 +837,7 @@ class MetadataActivityHandler:
         campaign_id = UUID(str(payload["campaign_id"]))
         cell = CampaignCellRecord.model_validate(payload["cell"])
         blocker = str(payload.get("blocker") or payload.get("status") or "BLOCKED")
-        if not blocker or len(blocker) > 200:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,119}", blocker):
             raise ValueError("audit cell blocker is invalid")
         deterministic_sha = str(payload.get("deterministic_evidence_sha256", ""))
         if not re.fullmatch(r"[a-f0-9]{64}", deterministic_sha):
@@ -840,6 +851,7 @@ class MetadataActivityHandler:
                 "sha256": deterministic_sha,
             }
         ]
+        self._root_blocker_classification(payload, blocker)
         with self.sessions.begin() as session:
             campaign = session.get(Campaign, campaign_id)
             coverage = session.get(CoverageCell, self._cell_id(campaign_id, cell))
@@ -853,11 +865,14 @@ class MetadataActivityHandler:
                 "status": "BLOCKED",
                 "blocker": blocker,
             }
+            roots = self._reconcile_campaign_root_blockers(session, campaign)
+            root = roots[blocker]
         return {
             **payload,
             "blocker": blocker,
             "coverage_status": "BLOCKED",
             "blocker_evidence": evidence,
+            "root_blocker": root.model_dump(mode="json"),
         }
 
     def _persist_snapshot_blockers(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -877,6 +892,7 @@ class MetadataActivityHandler:
         ):
             raise ValueError("snapshot blocker batch is invalid")
         cells = [CampaignCellRecord.model_validate(item) for item in raw_cells]
+        self._root_blocker_classification(payload, blocker)
         with self.sessions.begin() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
@@ -932,14 +948,16 @@ class MetadataActivityHandler:
                         blocker=blocker,
                         exclusion_approval_id=None,
                         evidence_json=evidence,
-                        result_json={"status": "BLOCKED", "blocker": blocker},
+                        result_json={},
                     )
                     session.add(coverage)
                 else:
                     coverage.status = "BLOCKED"
                     coverage.blocker = blocker
                     coverage.evidence_json = evidence
-                    coverage.result_json = {"status": "BLOCKED", "blocker": blocker}
+                coverage.result_json = {"status": "BLOCKED", "blocker": blocker}
+            roots = self._reconcile_campaign_root_blockers(session, campaign)
+            root = roots[blocker]
             run = session.scalar(
                 select(Run)
                 .where(Run.campaign_id == campaign_id, Run.run_type == "audit-campaign")
@@ -954,7 +972,88 @@ class MetadataActivityHandler:
             **payload,
             "status": "BLOCKED_COVERAGE_PERSISTED",
             "persisted_cells": len(cells),
+            "root_blocker": root.model_dump(mode="json"),
         }
+
+    @staticmethod
+    def _root_blocker_classification(
+        payload: dict[str, Any], blocker: str
+    ) -> RootBlockerClassification:
+        defaults = {
+            "PROJECT_SNAPSHOT_UNAVAILABLE": RootBlockerClassification.EXTERNAL_DEPENDENCY_FAILURE,
+            "BOOTSTRAP_VALIDATION_SUPERSEDED": (
+                RootBlockerClassification.ENGINEERING_CONTROL_DEFECT
+            ),
+            "PAIR_SNAPSHOT_NOT_PASSING": RootBlockerClassification.RUNTIME_PROVENANCE_GAP,
+            "KUBERNETES_EVIDENCE_MISSING": RootBlockerClassification.RUNTIME_PROVENANCE_GAP,
+            "RUNTIME_CORRELATION_MISSING": RootBlockerClassification.RUNTIME_PROVENANCE_GAP,
+            "PERSONA_CREDENTIAL_UNAVAILABLE": RootBlockerClassification.MISSING_OPERATOR_INPUT,
+            "BLOCKED_BY_CREDENTIAL": RootBlockerClassification.MISSING_OPERATOR_INPUT,
+            "BLOCKED_BY_RUNTIME_HEALTH": RootBlockerClassification.DEPLOYMENT_DEFECT,
+        }
+        prefixes = {
+            "PRODUCT_DEFECT_": RootBlockerClassification.PRODUCT_DEFECT,
+            "DEPLOYMENT_DEFECT_": RootBlockerClassification.DEPLOYMENT_DEFECT,
+            "ENGINEERING_CONTROL_DEFECT_": RootBlockerClassification.ENGINEERING_CONTROL_DEFECT,
+            "TEST_HARNESS_DEFECT_": RootBlockerClassification.TEST_HARNESS_DEFECT,
+            "MISSING_OPERATOR_INPUT_": RootBlockerClassification.MISSING_OPERATOR_INPUT,
+            "EXTERNAL_DEPENDENCY_FAILURE_": (RootBlockerClassification.EXTERNAL_DEPENDENCY_FAILURE),
+            "RUNTIME_PROVENANCE_GAP_": RootBlockerClassification.RUNTIME_PROVENANCE_GAP,
+            "MANUAL_AUTH_REQUIRED_": RootBlockerClassification.MISSING_OPERATOR_INPUT,
+        }
+        classification = defaults.get(blocker)
+        if classification is None:
+            classification = next(
+                (candidate for prefix, candidate in prefixes.items() if blocker.startswith(prefix)),
+                RootBlockerClassification.EXTERNAL_DEPENDENCY_FAILURE,
+            )
+        supplied = payload.get("root_blocker_classification")
+        if supplied is not None and RootBlockerClassification(str(supplied)) is not classification:
+            raise ValueError("root blocker classification conflicts with its authoritative code")
+        return classification
+
+    @classmethod
+    def _reconcile_campaign_root_blockers(
+        cls, session: Session, campaign: Campaign
+    ) -> dict[str, RootBlockerRecord]:
+        blocked = session.scalars(
+            select(CoverageCell).where(
+                CoverageCell.campaign_id == campaign.id,
+                CoverageCell.status == "BLOCKED",
+            )
+        ).all()
+        by_code: dict[str, list[CoverageCell]] = {}
+        for coverage in blocked:
+            code = str(coverage.blocker or "BLOCKED")
+            by_code.setdefault(code, []).append(coverage)
+        metadata = dict(campaign.metadata_json or {})
+        raw_roots = metadata.get("root_blockers", {})
+        existing_roots = dict(raw_roots) if isinstance(raw_roots, dict) else {}
+        records: dict[str, RootBlockerRecord] = {}
+        roots: dict[str, dict[str, Any]] = {}
+        for code, dependents in sorted(by_code.items()):
+            identity = "rb-" + hashlib.sha256(f"{campaign.id}:{code}".encode()).hexdigest()[:32]
+            existing = existing_roots.get(identity, {})
+            root_finding_id = (
+                existing.get("root_finding_id") if isinstance(existing, dict) else None
+            )
+            record = RootBlockerRecord(
+                root_blocker_id=identity,
+                classification=cls._root_blocker_classification({}, code),
+                code=code,
+                dependent_cell_count=len(dependents),
+                root_finding_id=root_finding_id,
+            )
+            serialized = record.model_dump(mode="json")
+            roots[identity] = serialized
+            records[code] = record
+            for dependent in dependents:
+                current = dict(dependent.result_json or {})
+                current["root_blocker"] = serialized
+                dependent.result_json = current
+        metadata["root_blockers"] = roots
+        campaign.metadata_json = metadata
+        return records
 
     def _prepare_agent_cell(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["campaign_id"]))

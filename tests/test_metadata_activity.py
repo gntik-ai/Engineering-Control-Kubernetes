@@ -239,9 +239,100 @@ async def test_campaign_snapshot_failure_persists_every_blocked_cell_and_finishe
     assert all(cell.evidence_json[0]["kind"] == "snapshot-blocker" for cell in coverage)
     assert all(len(cell.evidence_json[0]["sha256"]) == 64 for cell in coverage)
     assert len({cell.evidence_json[0]["sha256"] for cell in coverage}) == 2
+    root_references = [cell.result_json["root_blocker"] for cell in coverage]
+    assert len({item["root_blocker_id"] for item in root_references}) == 1
+    assert all(item["code"] == "PROJECT_SNAPSHOT_UNAVAILABLE" for item in root_references)
+    assert all(item["classification"] == "EXTERNAL_DEPENDENCY_FAILURE" for item in root_references)
+    assert all(item["dependent_cell_count"] == 2 for item in root_references)
+    roots = stored_campaign.metadata_json["root_blockers"]  # type: ignore[union-attr]
+    assert len(roots) == 1
+    assert next(iter(roots.values()))["dependent_cell_count"] == 2
     assert stored_campaign is not None and stored_campaign.status == "COMPLETE"
     assert run is not None and run.status == "SUCCESS" and run.finished_at is not None
     assert final["status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_root_blocker_classification_cannot_be_overridden_by_a_payload(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'root-classification.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    cell = audit_cell()
+    await handler.handle(
+        "campaign.persist_coverage",
+        {"campaign_id": str(campaign.id), "cells": [cell], "total": 1},
+    )
+
+    with pytest.raises(ApplicationError) as captured:
+        await handler.handle(
+            "campaign.persist_cell_blocker",
+            {
+                "campaign_id": str(campaign.id),
+                "cell": cell,
+                "status": "BLOCKED",
+                "blocker": "PERSONA_CREDENTIAL_UNAVAILABLE",
+                "root_blocker_classification": "PRODUCT_DEFECT",
+                "deterministic_evidence_sha256": "a" * 64,
+            },
+        )
+    assert captured.value.type == "PolicyViolation"
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert "authoritative code" in str(captured.value.__cause__)
+
+
+@pytest.mark.asyncio
+async def test_root_blocker_reconciliation_replaces_stale_roots_and_exactly_counts_cells(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'root-reconciliation.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    cell = audit_cell()
+    await handler.handle(
+        "campaign.persist_coverage",
+        {"campaign_id": str(campaign.id), "cells": [cell], "total": 1},
+    )
+    base = {
+        "campaign_id": str(campaign.id),
+        "cell": cell,
+        "status": "BLOCKED",
+        "deterministic_evidence_sha256": "b" * 64,
+    }
+
+    first = await handler.handle(
+        "campaign.persist_cell_blocker",
+        {**base, "blocker": "PERSONA_CREDENTIAL_UNAVAILABLE"},
+    )
+    repeated = await handler.handle(
+        "campaign.persist_cell_blocker",
+        {**base, "blocker": "PERSONA_CREDENTIAL_UNAVAILABLE"},
+    )
+    replacement = await handler.handle(
+        "campaign.persist_cell_blocker",
+        {**base, "blocker": "BLOCKED_BY_RUNTIME_HEALTH"},
+    )
+
+    assert first["root_blocker"]["dependent_cell_count"] == 1
+    assert repeated["root_blocker"]["dependent_cell_count"] == 1
+    assert replacement["root_blocker"]["dependent_cell_count"] == 1
+    assert replacement["root_blocker"]["classification"] == "DEPLOYMENT_DEFECT"
+    with handler.sessions() as session:
+        stored = session.get(Campaign, campaign.id)
+        coverage = session.scalar(select(CoverageCell))
+    assert stored is not None
+    roots = stored.metadata_json["root_blockers"]
+    assert len(roots) == 1
+    root = next(iter(roots.values()))
+    assert root["code"] == "BLOCKED_BY_RUNTIME_HEALTH"
+    assert root["dependent_cell_count"] == 1
+    assert coverage is not None
+    assert coverage.result_json["root_blocker"] == root
 
 
 @pytest.mark.asyncio

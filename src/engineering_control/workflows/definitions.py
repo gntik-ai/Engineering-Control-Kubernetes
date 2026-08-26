@@ -370,12 +370,14 @@ class AuditCampaignWorkflow(ControlledWorkflow):
         batch = cells[request.cell_offset : request.cell_offset + 50]
         snapshot: dict[str, Any] | None = None
         snapshot_blocker = request.snapshot_blocker
+        root_blocker_classification = request.root_blocker_classification
         if snapshot_blocker is None:
             try:
                 await self._step("github.refresh_mirrors", {"project": request.project})
                 snapshot = await self._step("project.snapshot", asdict(request))
             except ActivityError:
                 snapshot_blocker = "PROJECT_SNAPSHOT_UNAVAILABLE"
+                root_blocker_classification = "EXTERNAL_DEPENDENCY_FAILURE"
         campaign_id = request.campaign_id or (snapshot or {}).get("campaign_id")
         if not campaign_id:
             return {"status": "BLOCKED", "blocker": "PROJECT_SNAPSHOT_UNAVAILABLE"}
@@ -387,6 +389,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "cells": batch,
                     "total": len(cells),
                     "blocker": snapshot_blocker,
+                    "root_blocker_classification": root_blocker_classification,
                 },
             )
             next_offset = request.cell_offset + len(batch)
@@ -397,6 +400,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                         campaign_id=campaign_id,
                         cell_offset=next_offset,
                         snapshot_blocker=snapshot_blocker,
+                        root_blocker_classification=root_blocker_classification,
                     )
                 )
             summary = await self._step(
@@ -473,30 +477,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "environment": "staging",
                 },
             )
-        stages = [
-            "audit.static_source",
-            "audit.static_deployment",
-            "deployment.render",
-            "deployment.compare_live",
-        ]
-        if e2e:
-            stages.extend(
-                [
-                    "audit.api_flow",
-                    "audit.browser_flow",
-                    "audit.kubernetes_observe",
-                    "audit.correlate_runtime",
-                ]
-            )
-        if request.preset == "falcone-intensive":
-            stages.append("audit.llmwiki_consumer_suite")
-        stages.extend(
-            [
-                "audit.classify_candidate",
-                "audit.discover_enhancements",
-                "audit.verify_cleanup",
-            ]
-        )
+        stages = self._audit_stages(e2e=e2e, preset=request.preset)
         for stage in stages:
             if not await self._checkpoint(stage.upper().replace(".", "_")):
                 return {"status": "CANCELLED", "campaign_id": campaign_id}
@@ -625,6 +606,34 @@ class AuditCampaignWorkflow(ControlledWorkflow):
             "campaign_id": campaign_id,
             "summary": summary,
         }
+
+    @staticmethod
+    def _audit_stages(*, e2e: bool, preset: str) -> list[str]:
+        stages = [
+            "audit.static_source",
+            "audit.static_deployment",
+            "deployment.render",
+        ]
+        if e2e:
+            stages.extend(
+                [
+                    "deployment.compare_live",
+                    "audit.api_flow",
+                    "audit.browser_flow",
+                    "audit.kubernetes_observe",
+                    "audit.correlate_runtime",
+                ]
+            )
+        if preset == "falcone-intensive":
+            stages.append("audit.llmwiki_consumer_suite")
+        stages.extend(
+            [
+                "audit.classify_candidate",
+                "audit.discover_enhancements",
+                "audit.verify_cleanup",
+            ]
+        )
+        return stages
 
 
 @workflow.defn(name="FindingVerificationWorkflow")

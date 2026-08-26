@@ -24,6 +24,7 @@ class AuditCampaignInput:
     campaign_id: str | None = None
     cell_offset: int = 0
     snapshot_blocker: str | None = None
+    root_blocker_classification: str | None = None
 
 
 @dataclass
