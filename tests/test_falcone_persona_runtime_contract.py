@@ -85,12 +85,14 @@ async def test_falcone_persona_uses_platform_iam_contract_and_proves_cleanup() -
     )
     factory = EphemeralPersonaFactory(admin)
 
+    generated = None
     async with factory.persona(
         project="falcone",
         campaign_id="persona-canary",
         persona="standard-user",
         scope="workspace",
     ) as persona:
+        generated = persona
         assert persona.resource_name.startswith("e2e-falcone-persona-canary-standard-user-")
         assert persona.role_id == "workspace_viewer"
         assert persona.access_token == access_token
@@ -98,6 +100,9 @@ async def test_falcone_persona_uses_platform_iam_contract_and_proves_cleanup() -
 
     assert deleted is True
     assert logged_out is True
+    assert generated is not None
+    assert generated.password == ""
+    assert generated.access_token is None
     assert redactor.redact_text(access_token).value == access_token
     logout_index = next(
         index

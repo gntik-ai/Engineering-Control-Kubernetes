@@ -551,14 +551,19 @@ class _PersonaAdmin:
 @pytest.mark.asyncio
 async def test_persona_factory_prefixes_and_cleans_after_success_and_failure() -> None:
     success = _PersonaAdmin()
+    generated = None
     async with EphemeralPersonaFactory(success).persona(
         project="falcone",
         campaign_id="campaign-1",
         persona="standard-user",
         scope="workspace-a",
     ) as persona:
+        generated = persona
         assert persona.resource_name.startswith("e2e-falcone-campaign-1-standard-user-")
     assert success.events[-3:] == ["logout", "delete-user", "prove"]
+    assert generated is not None
+    assert generated.password == ""
+    assert generated.access_token is None
     assert "create-role" not in success.events
 
     failed = _PersonaAdmin()

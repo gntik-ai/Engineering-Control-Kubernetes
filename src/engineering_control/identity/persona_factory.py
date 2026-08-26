@@ -115,6 +115,7 @@ class EphemeralPersonaFactory:
         activated = False
         user_id = ""
         cleanup_complete = False
+        generated: EphemeralPersona | None = None
         try:
             if mode is IdentityMode.ACTIVATE_MANAGED_EXISTING:
                 found = await self.client.find_managed_user(name, metadata)
@@ -133,7 +134,7 @@ class EphemeralPersonaFactory:
                 self._users += 1
             await self.client.assign(user_id, role_id, scope)
             access_token = await self.client.authenticate(user_id, name, password)
-            yield EphemeralPersona(
+            generated = EphemeralPersona(
                 resource_name=name,
                 persona=persona,
                 username=name,
@@ -144,6 +145,7 @@ class EphemeralPersonaFactory:
                 activated_existing=activated,
                 access_token=access_token,
             )
+            yield generated
         finally:
             cleanup_errors: list[Exception] = []
             if user_id:
@@ -169,6 +171,9 @@ class EphemeralPersonaFactory:
                     await self.client.delete_role(role_id)
                 except Exception as error:
                     cleanup_errors.append(error)
+            if generated is not None:
+                generated.password = ""
+                generated.access_token = None
             if cleanup_errors or not cleanup_complete:
                 cause = cleanup_errors[0] if cleanup_errors else None
                 terminal_error = ApplicationError(
