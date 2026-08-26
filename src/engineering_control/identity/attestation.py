@@ -73,7 +73,7 @@ class ObserverReadinessAttestation(BaseModel):
     parser_valid: bool
     target_valid: bool
     permissions_valid: bool
-    secret_access_denied: bool
+    forbidden_resource_read_denied: bool
     mutation_access_denied: bool
     worker_identity: str = Field(pattern=r"^scan-runner@[A-Za-z0-9.-]{1,253}$")
     checked_timestamp: datetime
@@ -103,7 +103,7 @@ class ObserverReadinessAttestation(BaseModel):
                 self.parser_valid,
                 self.target_valid,
                 self.permissions_valid,
-                self.secret_access_denied,
+                self.forbidden_resource_read_denied,
                 self.mutation_access_denied,
                 self.blocker_code == "NONE",
             )

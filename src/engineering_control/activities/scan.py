@@ -677,7 +677,7 @@ class ScanActivityHandler:
                 "parser_valid": False,
                 "target_valid": False,
                 "permissions_valid": False,
-                "secret_access_denied": False,
+                "forbidden_resource_read_denied": False,
                 "mutation_access_denied": False,
                 "blocker_code": (
                     "OBSERVER_FILE_PERMISSIONS" if file_present else "OBSERVER_CREDENTIAL_MISSING"
@@ -707,7 +707,7 @@ class ScanActivityHandler:
                 "parser_valid": False,
                 "target_valid": False,
                 "permissions_valid": False,
-                "secret_access_denied": False,
+                "forbidden_resource_read_denied": False,
                 "mutation_access_denied": False,
                 "blocker_code": "OBSERVER_AUTHORIZATION_INVALID",
             }
@@ -721,7 +721,7 @@ class ScanActivityHandler:
             "parser_valid": True,
             "target_valid": target_valid,
             "permissions_valid": True,
-            "secret_access_denied": True,
+            "forbidden_resource_read_denied": True,
             "mutation_access_denied": True,
             "blocker_code": "NONE" if target_valid else "OBSERVER_TARGET_INVALID",
         }

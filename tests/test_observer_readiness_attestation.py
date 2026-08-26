@@ -69,7 +69,7 @@ def observer_attestation(*, project: str = "falcone") -> dict[str, Any]:
         parser_valid=True,
         target_valid=True,
         permissions_valid=True,
-        secret_access_denied=True,
+        forbidden_resource_read_denied=True,
         mutation_access_denied=True,
         worker_identity=f"scan-runner@{os.uname().nodename}",
         checked_timestamp=datetime.now(UTC),
@@ -169,6 +169,49 @@ async def test_controller_plan_consumes_worker_observer_attestation(tmp_path: Pa
         if item["reference"] == "worker-attestation:falcone-observer"
     )
     assert observer["worker_attested"] is True
+
+
+@pytest.mark.asyncio
+async def test_controller_activity_redaction_preserves_observer_denial_booleans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials = tmp_path / "credentials"
+    credentials.mkdir()
+    attestations = tmp_path / "attestations"
+    attestations.mkdir()
+    monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
+    monkeypatch.setattr(
+        "engineering_control.activities.core.MetadataActivityHandler", lambda _settings: None
+    )
+    activities = ControlActivities(
+        Settings(
+            database_url="sqlite://",
+            project_config_root=ROOT / "config/projects",
+            persona_config_root=ROOT / "config/personas",
+            flow_config_root=ROOT / "config/flows",
+            credential_root=credentials,
+            credential_attestation_root=attestations,
+            scan_worker_identity=f"scan-runner@{os.uname().nodename}",
+        ),
+        "controller",
+    )
+
+    result = await activities.execute_control_step(
+        {
+            "step": "campaign.plan",
+            "payload": {
+                "project": "falcone",
+                "preset": "snapshot",
+                "environment": "staging",
+                "observer_attestation": observer_attestation(),
+            },
+        }
+    )
+
+    assert result["blockers"] == []
+    assert result["kubernetes_readiness"] == "OPERATIONAL"
+    assert result["observer_attestation"]["forbidden_resource_read_denied"] is True
+    assert result["observer_attestation"]["mutation_access_denied"] is True
 
 
 class ExecuteWorkflowClient:
