@@ -524,6 +524,24 @@ def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogI
         return BacklogIssueType.STALE
     if any(value in label_text for value in ("invalid", "not reproducible", "wontfix")):
         return BacklogIssueType.INVALID_OR_UNREPRODUCIBLE
+    enhancement_metadata = any(
+        value in labels for value in ("enhancement", "feature", "type:modification", "type:task")
+    ) or (
+        re.search(r"(?im)^\s*kind\s*:\s*(?:enhancement|modification|feature|chore)\s*$", text)
+        is not None
+    )
+    title = text.splitlines()[0].strip()
+    independent_defect = (
+        any(value in labels for value in ("bug", "defect", "type:bug", "type:defect"))
+        or re.match(r"^(?:\[bug\]|bug(?:\([^)]*\))?:|security defect:|deployment defect:)", title)
+        is not None
+        or "independently confirmed defect" in text
+    )
+    # Explicit enhancement/OpenSpec task metadata wins unless the issue also
+    # carries independent defect evidence.  Security impact or high severity
+    # alone does not convert a feature request into a bugs-campaign item.
+    if enhancement_metadata and not independent_defect:
+        return BacklogIssueType.ENHANCEMENT
     if "security" in label_text or any(
         value in text for value in ("vulnerability", "tenant isolation", "authorization bypass")
     ):
@@ -532,9 +550,7 @@ def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogI
         value in text for value in ("needs product decision", "decision required", "proposal only")
     ):
         return BacklogIssueType.SPEC_DECISION
-    if any(value in label_text for value in ("enhancement", "type:modification", "feature")) or (
-        re.search(r"(?im)^\s*kind\s*:\s*(?:enhancement|modification)\s*$", text) is not None
-    ):
+    if enhancement_metadata:
         return BacklogIssueType.ENHANCEMENT
     if repository.endswith(("-charts", "-deploy")) or any(
         value in label_text for value in ("deployment", "helm", "argocd", "gitops")

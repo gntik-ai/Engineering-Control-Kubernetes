@@ -147,6 +147,61 @@ def test_classifier_separates_bugs_docs_enhancements_and_product_decisions() -> 
     assert decision.eligibility_reason == "NEEDS_PRODUCT_DECISION"
 
 
+def test_classifier_defers_openspec_tasks_and_security_enhancements_without_defect_evidence() -> (
+    None
+):
+    task = classify_issue(
+        issue(
+            12,
+            repository="gntik-ai/musematic",
+            title="[E8.13] Test corpus: real exports",
+            labels=("P0", "type:task"),
+            body="""openspec:
+  kind: chore
+  change_required: true
+  delta: added
+
+Objective: collect a licensed test corpus.
+""",
+        ),
+        (),
+        project="musematic",
+        import_filter="bugs-and-docs",
+        evaluated_at=NOW,
+    )
+    security_enhancement = classify_issue(
+        issue(
+            13,
+            title="enhancement: encrypt sensitive workflow payloads",
+            labels=("enhancement", "security", "severity:high"),
+            body="kind: enhancement\nAdd a new encrypted payload capability.",
+        ),
+        (),
+        project="falcone",
+        import_filter="bugs-and-docs",
+        evaluated_at=NOW,
+    )
+    confirmed_defect = classify_issue(
+        issue(
+            14,
+            title="bug(security): existing payloads leak credentials",
+            labels=("bug", "enhancement", "security"),
+            body="kind: enhancement\nIndependently confirmed defect in the current runtime.",
+        ),
+        (),
+        project="falcone",
+        import_filter="bugs-and-docs",
+        evaluated_at=NOW,
+    )
+
+    assert task.issue_type is BacklogIssueType.ENHANCEMENT
+    assert task.eligibility_reason == "ENHANCEMENT_DEFERRED"
+    assert security_enhancement.issue_type is BacklogIssueType.ENHANCEMENT
+    assert security_enhancement.eligibility_reason == "ENHANCEMENT_DEFERRED"
+    assert confirmed_defect.issue_type is BacklogIssueType.SECURITY_DEFECT
+    assert confirmed_defect.eligibility_status == "ELIGIBLE_FOR_REVALIDATION"
+
+
 def test_dependency_and_existing_pr_adoption_are_typed() -> None:
     record = classify_issue(
         issue(20, body="Blocked by falcone-charts#7"),
