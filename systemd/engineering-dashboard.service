@@ -1,0 +1,40 @@
+[Unit]
+Description=Hermes Engineering Operations Dashboard
+After=engineering-migrate.service network-online.target
+Requires=engineering-migrate.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=engineering-control
+Group=engineering-control
+WorkingDirectory=/var/lib/engineering-control
+EnvironmentFile=/etc/engineering-control/env/control.env
+Environment=ENGINEERING_DASHBOARD_HOST=127.0.0.1
+Environment=ENGINEERING_DASHBOARD_PORT=8750
+Environment=ENGINEERING_DASHBOARD_SESSION_KEY_FILE=/etc/engineering-control/dashboard/session.key
+ExecStart=/opt/engineering-control/venv/bin/engineering-dashboard
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadOnlyPaths=/etc/engineering-control/dashboard/session.key
+InaccessiblePaths=-/etc/engineering-control/env -/etc/engineering-control/credentials -/etc/engineering-control/policy -/home/hermes/.config/gh -/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.ssh -/home/hermes/.kube -/home/hermes/.hermes/.env -/home/hermes/.config/hermes-dashboard
+MemoryMax=384M
+CPUQuota=75%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

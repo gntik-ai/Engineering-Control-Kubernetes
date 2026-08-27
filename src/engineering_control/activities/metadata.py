@@ -13,7 +13,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from temporalio.exceptions import ApplicationError
@@ -33,6 +33,7 @@ from engineering_control.db.models import (
     ChangeSet,
     ComponentLease,
     CoverageCell,
+    DashboardEvent,
     Deployment,
     Finding,
     FindingVerification,
@@ -4856,6 +4857,15 @@ class MetadataActivityHandler:
             component_candidates = self._component_cleanup_candidates(session, now)
             file_candidates = self._file_cleanup_candidates(session, now)
             preview_candidates = self._preview_namespace_cleanup_candidates(session, now)
+            event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
+            dashboard_event_cleanup_count = int(
+                session.scalar(
+                    select(func.count(DashboardEvent.id)).where(
+                        DashboardEvent.occurred_at < event_cutoff
+                    )
+                )
+                or 0
+            )
         return {
             **payload,
             "status": "CLEANUP_CANDIDATES_DISCOVERED",
@@ -4863,6 +4873,7 @@ class MetadataActivityHandler:
             "component_lease_cleanup_candidates": component_candidates,
             "file_cleanup_candidates": file_candidates,
             "preview_namespace_cleanup_candidates": preview_candidates,
+            "dashboard_event_cleanup_count": dashboard_event_cleanup_count,
             "protected_count": protected_count,
         }
 
@@ -5119,6 +5130,7 @@ class MetadataActivityHandler:
         released: list[str] = []
         purged: list[str] = []
         cleaned_previews: list[str] = []
+        deleted_dashboard_events = 0
         candidate_fields = set(FileCleanupCandidate.model_fields)
         preview_fields = set(PreviewNamespaceCleanupCandidate.model_fields)
         with self.sessions.begin() as session:
@@ -5208,12 +5220,24 @@ class MetadataActivityHandler:
                     }
                 cleaned_previews.append(str(deployment.id))
 
+            event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
+            expired_events = session.scalars(
+                select(DashboardEvent)
+                .where(DashboardEvent.occurred_at < event_cutoff)
+                .order_by(DashboardEvent.id)
+                .limit(10_000)
+            ).all()
+            for event in expired_events:
+                session.delete(event)
+            deleted_dashboard_events = len(expired_events)
+
         return {
             **payload,
             "status": "METADATA_CLEANUP_EXECUTED",
             "released_component_lease_ids": sorted(released),
             "purged_artifact_ids": sorted(purged),
             "cleaned_preview_deployment_ids": sorted(cleaned_previews),
+            "deleted_dashboard_event_count": deleted_dashboard_events,
         }
 
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:

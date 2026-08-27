@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -460,6 +461,39 @@ class BacklogIssueRecord(UUIDPrimaryKey, Timestamps, Base):
     )
 
 
+class DashboardAuthentication(Base):
+    __tablename__ = "dashboard_authentication"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    password_hash: Mapped[str] = mapped_column(Text)
+    password_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    password_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (CheckConstraint("id = 1", name="singleton"),)
+
+
+class DashboardEvent(Base):
+    __tablename__ = "dashboard_events"
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    level: Mapped[str] = mapped_column(String(16), index=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    host: Mapped[str | None] = mapped_column(String(253))
+    worker_kind: Mapped[str | None] = mapped_column(String(32), index=True)
+    project: Mapped[str | None] = mapped_column(String(32), index=True)
+    workflow_id: Mapped[str | None] = mapped_column(String(240), index=True)
+    temporal_run_id: Mapped[str | None] = mapped_column(String(240))
+    issue_number: Mapped[int | None] = mapped_column(Integer)
+    campaign_id: Mapped[str | None] = mapped_column(String(240), index=True)
+    entity_type: Mapped[str | None] = mapped_column(String(64))
+    entity_id: Mapped[str | None] = mapped_column(String(240))
+    current_phase: Mapped[str | None] = mapped_column(String(120))
+    message: Mapped[str] = mapped_column(String(500))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 Index("ix_runs_active", Run.status, Run.project)
 Index("ix_change_sets_project_state", ChangeSet.project, ChangeSet.state)
 Index("ix_findings_project_disposition", Finding.project, Finding.disposition)
@@ -484,3 +518,4 @@ Index(
     postgresql_where=ApprovalCandidate.invalidated_at.is_(None),
     sqlite_where=ApprovalCandidate.invalidated_at.is_(None),
 )
+Index("ix_dashboard_events_stream", DashboardEvent.id, DashboardEvent.occurred_at)

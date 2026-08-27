@@ -335,6 +335,7 @@ for unit in engineering-infrastructure.service engineering-migrate.service \
   engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service \
   engineering-notifier.service engineering-acceptance-worker.service \
+  engineering-dashboard.service \
   engineering-github-worker.service engineering-github-policy-reconciler.service \
   engineering-github-policy-reconciler.path engineering-github-policy-expiry.service \
   engineering-github-policy-expiry.timer; do
@@ -355,6 +356,7 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-scheduler.service \
   /etc/systemd/system/engineering-notifier.service \
   /etc/systemd/system/engineering-acceptance-worker.service \
+  /etc/systemd/system/engineering-dashboard.service \
   /etc/systemd/system/engineering-github-worker.service \
   /etc/systemd/system/engineering-github-policy-reconciler.service \
   /etc/systemd/system/engineering-github-policy-reconciler.path \

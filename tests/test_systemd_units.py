@@ -20,6 +20,26 @@ def test_scheduler_registration_is_bounded_and_retries_transient_failures() -> N
     assert "RestartSec=15s" in unit
 
 
+def test_dashboard_is_loopback_only_and_cannot_read_operator_homes() -> None:
+    unit = (REPOSITORY_ROOT / "systemd" / "engineering-dashboard.service").read_text(
+        encoding="utf-8"
+    )
+
+    assert "User=engineering-control" in unit
+    assert "Group=engineering-control" in unit
+    assert "ENGINEERING_DASHBOARD_HOST=127.0.0.1" in unit
+    assert "ENGINEERING_DASHBOARD_PORT=8750" in unit
+    assert "NoNewPrivileges=true" in unit
+    assert "ProtectSystem=strict" in unit
+    assert "ProtectHome=true" in unit
+    assert "IPAddressDeny=any" in unit
+    assert "IPAddressAllow=localhost" in unit
+    assert "/home/hermes/.codex" in unit
+    assert "/home/hermes/.config/hermes-dashboard" in unit
+    assert "InaccessiblePaths=-/etc/engineering-control/env" in unit
+    assert "hetzner" not in unit.lower()
+
+
 def test_acceptance_worker_is_bounded_to_synthetic_temporary_root() -> None:
     unit = (REPOSITORY_ROOT / "systemd" / "engineering-acceptance-worker.service").read_text(
         encoding="utf-8"

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>{{ title }} · Hermes Engineering</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body data-page="{{ active }}">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div>
+      <p class="eyebrow">Hermes</p>
+      <h1>Engineering Operations</h1>
+    </div>
+    <nav aria-label="Dashboard">
+      <a href="/backlog"{% if active == "backlog" %} aria-current="page"{% endif %}>Backlog</a>
+      <a href="/activity"{% if active == "activity" %} aria-current="page"{% endif %}>Live Activity</a>
+      <a href="/audits"{% if active == "audits" %} aria-current="page"{% endif %}>Audits</a>
+      <a href="/settings"{% if active == "settings" %} aria-current="page"{% endif %}>Settings</a>
+      <form action="/logout" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="nav-button" type="submit">Logout</button>
+      </form>
+    </nav>
+  </header>
+  <main id="main" tabindex="-1">
+    {% if error %}<p class="alert error" role="alert">{{ error }}</p>{% endif %}
+    {% if notice %}<p class="alert notice" role="status">{{ notice }}</p>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer>Observational dashboard · timestamps shown in your browser timezone</footer>
+</body>
+</html>

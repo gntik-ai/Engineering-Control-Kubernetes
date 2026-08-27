@@ -159,6 +159,12 @@ def parser() -> argparse.ArgumentParser:
                     "ENHANCEMENT_DEFERRED",
                 ),
             )
+    dashboard = commands.add_parser("dashboard")
+    dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
+    for name in ("init-password", "reset-password"):
+        password = dashboard_commands.add_parser(name)
+        password.add_argument("--output-file", type=Path, required=True)
+        password.add_argument("--force-output", action="store_true")
     return root
 
 
@@ -353,12 +359,76 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
 
 def main() -> None:
     arguments = parser().parse_args()
+    if arguments.command == "dashboard":
+        try:
+            _dashboard_password_command(arguments)
+        except Exception as error:
+            print("engineering-ctl: dashboard password operation failed", file=sys.stderr)
+            raise SystemExit(1) from error
+        return
     try:
         result = dispatch(APIClient(arguments.api_url, arguments.token_file), arguments)
     except (OSError, ValueError, httpx.HTTPError) as error:
         print(f"engineering-ctl: {error}", file=sys.stderr)
         raise SystemExit(1) from error
     print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _dashboard_password_command(arguments: argparse.Namespace) -> None:
+    from engineering_control.dashboard.auth import PasswordService, stage_password_output
+    from engineering_control.dashboard.repository import DashboardRepository
+
+    output = arguments.output_file
+    passwords = PasswordService()
+    plaintext = passwords.generate()
+    staged = None
+    try:
+        staged = stage_password_output(
+            output,
+            plaintext,
+            allow_replace=bool(arguments.force_output),
+        )
+        repository = DashboardRepository(_dashboard_database_url(), password_service=passwords)
+        try:
+            if arguments.dashboard_command == "init-password":
+                repository.initialize_password_sync(plaintext)
+            elif arguments.dashboard_command == "reset-password":
+                repository.reset_password_sync(plaintext)
+            else:
+                raise ValueError("unsupported dashboard password operation")
+        finally:
+            repository.engine.dispose()
+        staged.commit()
+    except Exception:
+        if staged is not None:
+            staged.discard()
+        raise
+    staged.discard()
+    print(output)
+
+
+def _dashboard_database_url() -> str:
+    if value := os.getenv("ENGINEERING_DATABASE_URL"):
+        return value
+    environment_file = Path("/etc/engineering-control/env/control.env")
+    descriptor = os.open(environment_file, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0:
+            raise PermissionError("control environment metadata is invalid")
+        if stat.S_IMODE(metadata.st_mode) & 0o007:
+            raise PermissionError("control environment permissions are too broad")
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            descriptor = -1
+            for line in stream:
+                if line.startswith("ENGINEERING_DATABASE_URL="):
+                    value = line.partition("=")[2].strip()
+                    if value:
+                        return value
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    raise ValueError("ENGINEERING_DATABASE_URL is unavailable")
 
 
 if __name__ == "__main__":

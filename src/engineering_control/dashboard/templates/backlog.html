@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">Persisted issue state</p><h2>Backlog</h2></div>
+  <p id="last-refreshed" class="muted" aria-live="polite">Loading…</p>
+</section>
+<form id="backlog-filters" class="filters" role="search">
+  <label>Project
+    <select name="project"><option value="">All projects</option>{% for project in projects %}<option>{{ project }}</option>{% endfor %}</select>
+  </label>
+  <label>Status
+    <select name="status"><option value="">All statuses</option>{% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select>
+  </label>
+  <label>Issue or title
+    <input name="search" type="search" maxlength="200" placeholder="Search persisted backlog">
+  </label>
+  <button type="submit">Apply</button>
+</form>
+<p id="backlog-error" class="alert error hidden" role="alert" aria-live="polite"></p>
+<div class="table-shell" tabindex="0" aria-label="Backlog results">
+  <table>
+    <thead><tr>
+      <th>Issue</th><th>Title</th><th>Project</th><th>Status</th><th>Raw status</th>
+      <th>Phase</th><th>Queued</th><th>Started</th><th>Ended</th><th>Last activity</th>
+      <th>Blocker / error</th><th>Workflow ID</th>
+    </tr></thead>
+    <tbody id="backlog-rows"></tbody>
+  </table>
+</div>
+<p id="backlog-empty" class="empty hidden">No persisted backlog items match these filters.</p>
+<div class="pagination" aria-label="Backlog pages">
+  <button id="backlog-prev" type="button">Previous</button>
+  <span id="backlog-page" aria-live="polite">Page 1</span>
+  <button id="backlog-next" type="button">Next</button>
+</div>
+{% endblock %}

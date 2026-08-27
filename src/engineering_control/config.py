@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
     cleanup_expiry_grace_hours: int = Field(default=24, ge=1, le=720)
     worker_heartbeat_seconds: int = Field(default=30, ge=10, le=300)
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = Field(default=8750, ge=1024, le=65535)
+    dashboard_session_key_file: Path = Path("/etc/engineering-control/dashboard/session.key")
+    dashboard_session_hours: int = Field(default=12, ge=1, le=24)
+    dashboard_event_retention_days: int = Field(default=14, ge=1, le=365)
 
     @field_validator(
         "codex_task_queue",
@@ -131,6 +136,13 @@ class Settings(BaseSettings):
     def private_api_only(cls, value: str) -> str:
         if value in {"0.0.0.0", "::"}:  # noqa: S104 - these values are explicitly rejected
             raise ValueError("the Engineering Control API cannot bind to every interface")
+        return value
+
+    @field_validator("dashboard_host")
+    @classmethod
+    def private_dashboard_only(cls, value: str) -> str:
+        if value not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError("the dashboard must bind only to loopback")
         return value
 
     @field_validator("evidence_ingest_host")

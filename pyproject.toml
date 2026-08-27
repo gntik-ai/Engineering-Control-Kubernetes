@@ -11,8 +11,10 @@ requires-python = ">=3.12,<3.15"
 license = { text = "Proprietary" }
 dependencies = [
   "alembic>=1.16,<2",
+  "argon2-cffi>=25.1,<26",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "Jinja2>=3.1.6,<4",
   "jsonschema>=4.25,<5",
   "prometheus-client>=0.22,<1",
   "psycopg[binary]>=3.2,<4",
@@ -38,6 +40,7 @@ dev = [
 
 [project.scripts]
 engineering-api = "engineering_control.api.main:run"
+engineering-dashboard = "engineering_control.dashboard.app:run"
 engineering-worker = "engineering_control.workflows.worker:run"
 engineering-role-worker = "engineering_control.workflows.role_worker:run"
 engineering-scheduler = "engineering_control.scheduler:run"

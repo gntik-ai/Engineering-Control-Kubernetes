@@ -1,0 +1,17 @@
+ade.musematic.ai {
+	@private_api path /v1 /v1/*
+	respond @private_api 404
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=()"
+		Content-Security-Policy "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'"
+	}
+
+	reverse_proxy 127.0.0.1:8750 {
+		flush_interval -1
+	}
+}
