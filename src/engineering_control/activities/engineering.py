@@ -570,6 +570,10 @@ class EngineeringActivityHandler:
                 **counts,
             )
             session.add(campaign)
+            # The issue model carries only the campaign UUID, not an ORM
+            # relationship.  Flush the parent explicitly so PostgreSQL never
+            # schedules child inserts ahead of the campaign row.
+            session.flush([campaign])
             for record in planned:
                 session.add(
                     db.BacklogIssueRecord(

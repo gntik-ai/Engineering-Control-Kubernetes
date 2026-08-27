@@ -3,14 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import event, select
 
+from engineering_control.activities.engineering import EngineeringActivityHandler
 from engineering_control.api.schemas import BacklogApprovalCandidateRequest
+from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import GitHubBacklogCampaign
+from engineering_control.db.models import BacklogIssueRecord, GitHubBacklogCampaign
 from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.engineering.backlog import (
     BACKLOG_PROJECT_PAIRS,
@@ -30,6 +34,7 @@ from engineering_control.engineering.backlog import (
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=UTC)
+ROOT = Path(__file__).parents[1]
 
 
 def issue(
@@ -208,6 +213,65 @@ def test_models_reject_extra_or_outside_repository_input() -> None:
     value["url"] = "https://github.com/attacker/repository/issues/40"
     with pytest.raises(ValidationError):
         GitHubIssueSnapshot.model_validate(value)
+
+
+@pytest.mark.asyncio
+async def test_backlog_import_flushes_campaign_before_foreign_key_children(tmp_path) -> None:
+    credentials = tmp_path / "credentials"
+    credentials.mkdir()
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'foreign-keys.sqlite'}",
+        project_config_root=ROOT / "config/projects",
+        persona_config_root=ROOT / "config/personas",
+        flow_config_root=ROOT / "config/flows",
+        credential_root=credentials,
+    )
+    handler = EngineeringActivityHandler(settings)
+
+    @event.listens_for(handler.engine, "connect")
+    def enforce_foreign_keys(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(handler.engine)
+    campaign_id = "22222222-2222-4222-8222-222222222222"
+    snapshot = GitHubBacklogImportSnapshot(
+        project="falcone",
+        imported_at=NOW,
+        repositories=(
+            GitHubRepositoryBacklogSnapshot(
+                repository="gntik-ai/falcone",
+                default_branch="main",
+                head_sha="a" * 40,
+                issues=(issue(42),),
+                pull_requests=(),
+            ),
+            GitHubRepositoryBacklogSnapshot(
+                repository="gntik-ai/falcone-charts",
+                default_branch="main",
+                head_sha="b" * 40,
+                issues=(),
+                pull_requests=(),
+            ),
+        ),
+    )
+
+    result = await handler.handle(
+        "backlog.persist_import",
+        {
+            "backlog_campaign_id": campaign_id,
+            "project": "falcone",
+            "import_filter": "bugs-and-docs",
+            "maximum_items": 1,
+            "snapshot": snapshot.model_dump(mode="json"),
+        },
+    )
+
+    assert result["status"] == "IMPORTED"
+    with handler.sessions() as session:
+        assert session.get(GitHubBacklogCampaign, UUID(campaign_id)) is not None
+        persisted = session.scalars(select(BacklogIssueRecord)).all()
+        assert len(persisted) == 1
+        assert persisted[0].backlog_campaign_id == UUID(campaign_id)
 
 
 @pytest.mark.asyncio
