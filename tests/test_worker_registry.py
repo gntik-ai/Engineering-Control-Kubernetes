@@ -25,6 +25,7 @@ GITHUB_STEPS = frozenset(
     {
         "llmwiki.bootstrap.plan",
         "github.refresh_mirrors",
+        "backlog.github_import",
         "finding.dedupe",
         "delivery.publish",
         "reconcile.inspect_ci",
@@ -107,7 +108,7 @@ def test_github_systemd_contract_is_hardened_and_secret_free() -> None:
         "Environment=HOME=/home/hermes",
         "Environment=PATH=/usr/local/bin:/usr/bin:/bin",
         "Environment=ENGINEERING_WORKER_KIND=github",
-        "Environment=ENGINEERING_GITHUB_WRITES_ENABLED=false",
+        "Environment=ENGINEERING_GITHUB_WRITES_ENABLED=true",
         "Environment=ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=/etc/engineering-control/policy/github-issue-write-validation.yaml",
         "ExecStart=/opt/engineering-control/venv/bin/engineering-role-worker",
         "Restart=on-failure",
@@ -138,8 +139,8 @@ def test_controller_bootstrap_owns_github_worker_and_worker_bootstrap_does_not()
     assert controller.count(unit) >= 4
     assert unit not in worker
     assert 'if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]' in controller
-    assert "ENGINEERING_GITHUB_WRITES_ENABLED=false" in controller
-    assert "Refusing to install GitHub worker with write policy enabled" in controller
+    assert "ENGINEERING_GITHUB_WRITES_ENABLED=true" in controller
+    assert "GitHub broker capability" in controller
     assert "systemctl daemon-reload" in controller
     assert "github-issue-write-validation.yaml" in controller
     assert "install -d -o root -g engineering-control -m 0750" in controller
@@ -155,8 +156,8 @@ def test_registry_verifier_is_mandatory_for_both_bootstraps() -> None:
     assert "ROLE_WORKER_REGISTRY" in verifier
     assert "ControlActivities.steps_for_worker" in verifier
     assert "ControlledWorkflow._activity_queue" in verifier
-    assert "GitHub write policy must remain disabled" in verifier
-    assert "GitHub safe repository list must be empty" in verifier
+    assert "source GitHub write policy must remain disabled" in verifier
+    assert "source GitHub safe repository list must be empty" in verifier
     for bootstrap in ("bootstrap-controller.sh", "bootstrap-worker.sh"):
         content = (ROOT / "scripts" / bootstrap).read_text(encoding="utf-8")
         assert "verify-worker-registry.py" in content
@@ -175,6 +176,36 @@ def test_controller_github_bootstrap_is_source_idempotent() -> None:
     assert "reconcile-github-write-policy.py" in controller
     assert "policy/github-issue-write-validation.yaml" not in worker
     assert 'install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy"' in controller
+    assert "install -d -o engineering-control -g engineering-control -m 0700" in controller
+    assert "engineering-github-policy-reconciler.path" in controller
+    assert "engineering-github-policy-reconciler.path" not in worker
+
+
+def test_backlog_policy_reconciler_is_fixed_typed_and_secret_isolated() -> None:
+    script = (ROOT / "scripts/reconcile-backlog-github-policy.py").read_text(encoding="utf-8")
+    service = (ROOT / "systemd/engineering-github-policy-reconciler.service").read_text(
+        encoding="utf-8"
+    )
+    path = (ROOT / "systemd/engineering-github-policy-reconciler.path").read_text(encoding="utf-8")
+    for repository in (
+        "gntik-ai/falcone",
+        "gntik-ai/falcone-charts",
+        "gntik-ai/musematic",
+        "gntik-ai/musematic-deploy",
+    ):
+        assert repository in script
+    assert "GitHubWritePolicyDocument" in script
+    assert "APPROVED_POLICY_PENDING" in script
+    assert "canonical_sha256" in script
+    assert "production" in script
+    assert "gh " not in script
+    assert "subprocess" not in script
+    assert "GITHUB_TOKEN" not in script
+    assert "GH_TOKEN" not in script
+    assert "User=root" in service
+    assert "/home/hermes/.config/gh" in service
+    assert "ReadWritePaths=/etc/engineering-control/policy" in service
+    assert "PathExists=/var/lib/engineering-control/github-policy-requests/activate.json" in path
 
 
 def test_github_runtime_validator_uses_only_typed_broker_reads() -> None:

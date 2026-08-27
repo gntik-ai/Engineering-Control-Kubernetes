@@ -9,6 +9,10 @@ The control plane is deliberately independent of both products and their Kuberne
 Hermes and Telegram are clients of its narrow authenticated API; they are not the workflow engine
 and do not receive release credentials.
 
+Existing paired GitHub issue backlogs use the fixed Telegram/API/CLI contract documented in
+[`docs/EXISTING-GITHUB-BACKLOG.md`](docs/EXISTING-GITHUB-BACKLOG.md). Import and planning are
+read-only; every write remains bound to an exact expiring Telegram campaign approval.
+
 Current bootstrap status and host-specific blockers are recorded outside this repository under
 `/home/hermes/engineering-bootstrap/`. No cleanup, Kubernetes mutation, product edit, remote
 repository creation, or credential copy is performed by this repository's bootstrap scripts.

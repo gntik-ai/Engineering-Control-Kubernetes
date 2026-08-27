@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically expire GitHub backlog write-policy bindings
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=engineering-github-policy-expiry.service
+
+[Install]
+WantedBy=timers.target

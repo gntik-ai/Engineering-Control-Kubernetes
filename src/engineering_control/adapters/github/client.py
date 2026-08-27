@@ -110,6 +110,89 @@ class GhCliBroker:
         )
         return self._list(value, "issue search")
 
+    def list_open_issues(self, repository: str) -> list[dict[str, Any]]:
+        """Return the bounded structured fields required by backlog import."""
+        repository = self._batch(repository)
+        value = self._json(
+            self._run(
+                [
+                    "issue",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--state",
+                    "open",
+                    "--json",
+                    "number,title,body,labels,milestone,assignees,comments,url,state,updatedAt",
+                    "--limit",
+                    "1000",
+                ]
+            ).stdout,
+            "open issue backlog",
+        )
+        return self._list(value, "open issue backlog", maximum=1000)
+
+    def list_repository_pull_requests(self, repository: str) -> list[dict[str, Any]]:
+        """Return open PRs used for existing-work adoption without a history-wide query."""
+        repository = self._batch(repository)
+        value = self._json(
+            self._run(
+                [
+                    "pr",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--state",
+                    "open",
+                    "--json",
+                    (
+                        "number,title,body,url,state,isDraft,headRefName,headRefOid,"
+                        "baseRefName,mergeStateStatus,updatedAt,mergedAt,closedAt"
+                    ),
+                    "--limit",
+                    "100",
+                ]
+            ).stdout,
+            "pull request backlog",
+        )
+        return self._list(value, "pull request backlog", maximum=100)
+
+    def view_backlog_pull_request(self, repository: str, number: int) -> dict[str, Any]:
+        """Return bounded existing-PR linkage data using one fixed structured command."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("pull request number is invalid")
+        value = self._json(
+            self._run(
+                [
+                    "pr",
+                    "view",
+                    str(number),
+                    "--repo",
+                    repository,
+                    "--json",
+                    (
+                        "number,title,body,url,state,isDraft,headRefName,headRefOid,"
+                        "baseRefName,mergeStateStatus,updatedAt,mergedAt,closedAt,"
+                        "comments,commits"
+                    ),
+                ]
+            ).stdout,
+            "backlog pull request",
+        )
+        if not isinstance(value, dict):
+            raise GhCliPolicyError("backlog pull request response is not an object")
+        comments = value.get("comments", [])
+        commits = value.get("commits", [])
+        if (
+            not isinstance(comments, list)
+            or len(comments) > 250
+            or not isinstance(commits, list)
+            or len(commits) > 250
+        ):
+            raise GhCliPolicyError("backlog pull request nested response is unbounded")
+        return value
+
     def view_pull_request(self, repository: str, number: int) -> dict[str, Any]:
         repository = self._batch(repository)
         if number < 1:
@@ -376,8 +459,8 @@ class GhCliBroker:
             raise GhCliPolicyError(f"{label} was not valid JSON") from error
 
     @staticmethod
-    def _list(value: Any, label: str) -> list[dict[str, Any]]:
-        if not isinstance(value, list) or len(value) > 100:
+    def _list(value: Any, label: str, *, maximum: int = 100) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or len(value) > maximum:
             raise GhCliPolicyError(f"{label} response is not a bounded list")
         if any(not isinstance(item, dict) for item in value):
             raise GhCliPolicyError(f"{label} list contains a non-object")

@@ -58,3 +58,51 @@ def test_cli_finding_verification_uses_only_the_bounded_route() -> None:
         "path": "/v1/findings/verify",
         "payload": {"finding_id": finding_id},
     }
+
+
+def test_cli_backlog_import_and_start_use_only_fixed_routes() -> None:
+    class FakeClient:
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            return {"method": method, "path": path, "payload": payload or {}}
+
+    imported = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args(["backlog-import", "falcone", "bugs-and-docs", "--max-items", "1"]),
+    )
+    started = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args(
+            [
+                "backlog-start",
+                "falcone",
+                "11111111-1111-4111-8111-111111111111",
+                "R2",
+                "full-delivery",
+                "--max-items",
+                "1",
+            ]
+        ),
+    )
+    assert imported["path"] == "/v1/backlogs/import"
+    assert imported["payload"]["source"] == "github-open"
+    assert started["path"] == "/v1/loop-start"
+    assert started["payload"]["execution_mode"] == "full-delivery"
+
+
+def test_cli_backlog_parser_rejects_arbitrary_filters_repositories_and_modes() -> None:
+    with pytest.raises(SystemExit):
+        parser().parse_args(["backlog-import", "falcone", "arbitrary"])
+    with pytest.raises(SystemExit):
+        parser().parse_args(["backlog-skip", "loop", "outside", "1", "DUPLICATE"])
+    with pytest.raises(SystemExit):
+        parser().parse_args(
+            [
+                "backlog-start",
+                "falcone",
+                "11111111-1111-4111-8111-111111111111",
+                "R2",
+                "production",
+            ]
+        )

@@ -10,12 +10,15 @@ from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
     ApprovalRecord,
     AuditPlanRequest,
+    BacklogImportAccepted,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
     EnhancementDiscover,
     EnhancementRun,
+    ExistingBacklogLoopStart,
+    GitHubBacklogImportRequest,
     IssueLoopStart,
     LLMWikiBootstrapExecuteRequest,
     LLMWikiBootstrapPlanRequest,
@@ -32,7 +35,9 @@ from engineering_control.workflows.inputs import (
     DeliveryReconciliationInput,
     EnhancementDiscoveryInput,
     EnhancementSolutionLoopInput,
+    ExistingGitHubBacklogLoopInput,
     FindingVerificationInput,
+    GitHubBacklogImportInput,
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
@@ -62,6 +67,12 @@ class ControlService(Protocol):
         self, request: AcceptanceLifecycleStart, validation_root: str
     ) -> OperationAccepted: ...
     async def start_issue_loop(self, request: IssueLoopStart) -> OperationAccepted: ...
+    async def import_github_backlog(
+        self, request: GitHubBacklogImportRequest
+    ) -> BacklogImportAccepted: ...
+    async def start_existing_backlog_loop(
+        self, request: ExistingBacklogLoopStart
+    ) -> OperationAccepted: ...
     async def start_enhancement_discovery(
         self, request: EnhancementDiscover
     ) -> OperationAccepted: ...
@@ -303,6 +314,51 @@ class TemporalControlService:
         handle = await self.client.start_workflow(
             WorkflowName.ISSUE_SOLUTION_LOOP.value,
             IssueSolutionLoopInput(**request.model_dump(mode="json")),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def import_github_backlog(
+        self, request: GitHubBacklogImportRequest
+    ) -> BacklogImportAccepted:
+        campaign_id = uuid4()
+        workflow_id = f"backlog-import-{request.project}-{campaign_id}"
+        handle = await self.client.start_workflow(
+            WorkflowName.GITHUB_BACKLOG_IMPORT.value,
+            GitHubBacklogImportInput(
+                backlog_campaign_id=str(campaign_id),
+                **request.model_dump(mode="json"),
+            ),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return BacklogImportAccepted(
+            workflow_id=workflow_id,
+            run_id=handle.first_execution_run_id or "",
+            backlog_campaign_id=campaign_id,
+        )
+
+    async def start_existing_backlog_loop(
+        self, request: ExistingBacklogLoopStart
+    ) -> OperationAccepted:
+        campaign = await self.repository.get_backlog_campaign(request.backlog_campaign_id)
+        if campaign is None or campaign.get("project") != request.project:
+            raise ValueError("existing backlog campaign does not exist")
+        if campaign.get("status") not in {"APPROVED_POLICY_PENDING", "APPROVED"}:
+            raise ValueError("existing backlog campaign requires its exact Telegram approval")
+        if campaign.get("maximum_risk") != request.maximum_risk.value:
+            raise ValueError("existing backlog maximum risk changed after approval")
+        if campaign.get("delivery_mode") != request.delivery_mode:
+            raise ValueError("existing backlog delivery mode changed after approval")
+        if request.maximum_items > int(campaign.get("maximum_items") or 0):
+            raise ValueError("existing backlog item bound exceeds its approval")
+        workflow_id = f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
+        handle = await self.client.start_workflow(
+            WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,
+            ExistingGitHubBacklogLoopInput(**request.model_dump(mode="json")),
             id=workflow_id,
             task_queue=self.task_queue,
         )

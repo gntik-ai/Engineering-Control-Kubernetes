@@ -112,6 +112,54 @@ class _GhRunner:
             )
         if arguments[:2] == ["issue", "list"]:
             return CommandResult(0, "[]", "")
+        if arguments[:2] == ["pr", "list"]:
+            return CommandResult(
+                0,
+                json.dumps(
+                    [
+                        {
+                            "number": 7,
+                            "title": "Fix bounded issue",
+                            "body": "Fixes #6",
+                            "url": "https://github.com/gntik-ai/falcone/pull/7",
+                            "state": "OPEN",
+                            "isDraft": True,
+                            "headRefName": "issue-6",
+                            "headRefOid": "a" * 40,
+                            "baseRefName": "main",
+                            "mergeStateStatus": "CLEAN",
+                            "updatedAt": "2026-08-27T00:00:00Z",
+                            "mergedAt": None,
+                            "closedAt": None,
+                        }
+                    ]
+                ),
+                "",
+            )
+        if arguments[:2] == ["pr", "view"]:
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "number": 7,
+                        "title": "Fix bounded issue",
+                        "body": "Fixes #6",
+                        "url": "https://github.com/gntik-ai/falcone/pull/7",
+                        "state": "OPEN",
+                        "isDraft": True,
+                        "headRefName": "issue-6",
+                        "headRefOid": "a" * 40,
+                        "baseRefName": "main",
+                        "mergeStateStatus": "CLEAN",
+                        "updatedAt": "2026-08-27T00:00:00Z",
+                        "mergedAt": None,
+                        "closedAt": None,
+                        "comments": [{"body": "bounded"}],
+                        "commits": [{"oid": "a" * 40}],
+                    }
+                ),
+                "",
+            )
         raise AssertionError(arguments)
 
 
@@ -148,6 +196,17 @@ def test_gh_cli_writes_and_read_only_companion_are_fail_closed(tmp_path: Path) -
             body_file=body,
             change_binding="finding:12345678",
         )
+
+
+def test_gh_cli_backlog_pr_import_is_fixed_structured_and_bounded(tmp_path: Path) -> None:
+    runner = _GhRunner()
+    broker = GhCliBroker(runner, tmp_path, authenticated_home=tmp_path)
+    listed = broker.list_repository_pull_requests("gntik-ai/falcone")
+    detailed = broker.view_backlog_pull_request("gntik-ai/falcone", listed[0]["number"])
+    assert detailed["comments"] == [{"body": "bounded"}]
+    assert detailed["commits"] == [{"oid": "a" * 40}]
+    assert all(call[0] == "gh" for call in runner.calls)
+    assert not any(call[1][:2] == ["api", "graphql"] for call in runner.calls)
 
 
 def test_gh_cli_auth_expiry_is_a_typed_workflow_blocker(tmp_path: Path) -> None:

@@ -107,6 +107,24 @@ class IssueSolutionLoopInput:
 
 
 @dataclass
+class GitHubBacklogImportInput:
+    backlog_campaign_id: str
+    project: str
+    source: str = "github-open"
+    import_filter: str = "bugs"
+    maximum_items: int = 500
+
+
+@dataclass
+class ExistingGitHubBacklogLoopInput:
+    project: str
+    backlog_campaign_id: str
+    maximum_risk: str
+    delivery_mode: str
+    maximum_items: int = 1
+
+
+@dataclass
 class EnhancementDiscoveryInput:
     project: str
     campaign_id: str

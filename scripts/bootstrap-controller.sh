@@ -84,6 +84,9 @@ install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}" \
   "${CONFIG_ROOT}/targets" \
   "${CONFIG_ROOT}/runtime" "${CONFIG_ROOT}/systemd"
 install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy"
+install -d -o engineering-control -g engineering-control -m 0700 \
+  "${STATE_ROOT}/github-policy-requests"
+install -d -o root -g root -m 0700 "${STATE_ROOT}/github-policy-backups"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/github"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"
@@ -286,7 +289,7 @@ if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]; then
     printf 'ENGINEERING_TEMPORAL_NAMESPACE=engineering-control\n'
     printf 'ENGINEERING_GITHUB_EXECUTABLE=/usr/bin/gh\n'
     printf 'ENGINEERING_GITHUB_AUTHENTICATED_HOME=/home/hermes\n'
-    printf 'ENGINEERING_GITHUB_WRITES_ENABLED=false\n'
+    printf 'ENGINEERING_GITHUB_WRITES_ENABLED=true\n'
     printf 'ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=%s/policy/github-issue-write-validation.yaml\n' \
       "${CONFIG_ROOT}"
     printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
@@ -294,15 +297,23 @@ if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]; then
     printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
   } >"${CONFIG_ROOT}/env/github-worker.env"
 fi
-if grep -Eiq '^ENGINEERING_GITHUB_WRITES_ENABLED=(1|true|yes|on)$' \
-  "${CONFIG_ROOT}/env/github-worker.env"; then
-  echo "Refusing to install GitHub worker with write policy enabled" >&2
-  exit 1
-fi
 if ! grep -q '^ENGINEERING_GITHUB_WRITES_ENABLED=' \
   "${CONFIG_ROOT}/env/github-worker.env"; then
-  printf 'ENGINEERING_GITHUB_WRITES_ENABLED=false\n' \
+  printf 'ENGINEERING_GITHUB_WRITES_ENABLED=true\n' \
     >>"${CONFIG_ROOT}/env/github-worker.env"
+fi
+github_write_capability_count=$(grep -c '^ENGINEERING_GITHUB_WRITES_ENABLED=' \
+  "${CONFIG_ROOT}/env/github-worker.env")
+if [[ ${github_write_capability_count} -ne 1 ]]; then
+  echo "Refusing GitHub worker configuration with duplicate write capability" >&2
+  exit 1
+fi
+sed -i -E 's/^ENGINEERING_GITHUB_WRITES_ENABLED=(false|0|no|off)$/ENGINEERING_GITHUB_WRITES_ENABLED=true/' \
+  "${CONFIG_ROOT}/env/github-worker.env"
+if ! grep -Eq '^ENGINEERING_GITHUB_WRITES_ENABLED=true$' \
+  "${CONFIG_ROOT}/env/github-worker.env"; then
+  echo "Refusing noncanonical GitHub broker capability configuration" >&2
+  exit 1
 fi
 if ! grep -q '^ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=' \
   "${CONFIG_ROOT}/env/github-worker.env"; then
@@ -324,7 +335,9 @@ for unit in engineering-infrastructure.service engineering-migrate.service \
   engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service \
   engineering-notifier.service engineering-acceptance-worker.service \
-  engineering-github-worker.service; do
+  engineering-github-worker.service engineering-github-policy-reconciler.service \
+  engineering-github-policy-reconciler.path engineering-github-policy-expiry.service \
+  engineering-github-policy-expiry.timer; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
   install -o root -g root -m 0644 \
@@ -342,7 +355,11 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-scheduler.service \
   /etc/systemd/system/engineering-notifier.service \
   /etc/systemd/system/engineering-acceptance-worker.service \
-  /etc/systemd/system/engineering-github-worker.service
+  /etc/systemd/system/engineering-github-worker.service \
+  /etc/systemd/system/engineering-github-policy-reconciler.service \
+  /etc/systemd/system/engineering-github-policy-reconciler.path \
+  /etc/systemd/system/engineering-github-policy-expiry.service \
+  /etc/systemd/system/engineering-github-policy-expiry.timer
 "${INSTALL_ROOT}/venv/bin/python" \
   "${RELEASE_ROOT}/source/scripts/verify-worker-registry.py" --host controller \
   --write-policy "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml"
@@ -353,10 +370,13 @@ systemctl restart engineering-infrastructure.service
 systemctl restart engineering-migrate.service
 systemctl enable engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
-  engineering-acceptance-worker.service engineering-github-worker.service
+  engineering-acceptance-worker.service engineering-github-worker.service \
+  engineering-github-policy-reconciler.path engineering-github-policy-expiry.timer
 systemctl restart engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
   engineering-acceptance-worker.service engineering-github-worker.service
+systemctl restart engineering-github-policy-reconciler.path
+systemctl restart engineering-github-policy-expiry.timer
 
 "${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope controller
 

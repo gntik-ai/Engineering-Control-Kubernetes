@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 
 from engineering_control.api.main import create_app
-from engineering_control.api.schemas import OperationAccepted
+from engineering_control.api.schemas import BacklogImportAccepted, OperationAccepted
 from engineering_control.config import Settings
 from engineering_control.db.repository import EmptyMetadataRepository
 
@@ -50,6 +50,19 @@ class FakeService:
 
     async def start_acceptance(self, request: Any, validation_root: str) -> OperationAccepted:
         return OperationAccepted(workflow_id="acceptance-test", run_id="run-test")
+
+    async def import_github_backlog(self, request: Any) -> BacklogImportAccepted:
+        return BacklogImportAccepted(
+            workflow_id="backlog-import-test",
+            run_id="run-test",
+            backlog_campaign_id=UUID("11111111-1111-4111-8111-111111111111"),
+        )
+
+    async def start_issue_loop(self, request: Any) -> OperationAccepted:
+        return OperationAccepted(workflow_id="loop-test", run_id="run-test")
+
+    async def start_existing_backlog_loop(self, request: Any) -> OperationAccepted:
+        return OperationAccepted(workflow_id="backlog-loop-test", run_id="run-test")
 
 
 class FakeMetadataRepository(EmptyMetadataRepository):
@@ -218,6 +231,47 @@ def test_synthetic_validation_endpoint_is_disabled_by_default() -> None:
             json={"hold_seconds": 1},
         )
         assert response.status_code == 404
+
+
+def test_backlog_import_route_is_fixed_read_only_and_strict() -> None:
+    app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/v1/backlogs/import",
+            headers=headers,
+            json={
+                "project": "falcone",
+                "source": "github-open",
+                "import_filter": "bugs-and-docs",
+                "maximum_items": 1,
+            },
+        )
+        outside = client.post(
+            "/v1/backlogs/import",
+            headers=headers,
+            json={
+                "project": "llmwiki",
+                "source": "github-open",
+                "import_filter": "all",
+                "maximum_items": 1,
+            },
+        )
+        injected = client.post(
+            "/v1/backlogs/import",
+            headers=headers,
+            json={
+                "project": "falcone",
+                "source": "github-open",
+                "import_filter": "all",
+                "maximum_items": 1,
+                "gh_args": ["issue", "close", "1"],
+            },
+        )
+    assert accepted.status_code == 202
+    assert accepted.json()["workflow_id"] == "backlog-import-test"
+    assert outside.status_code == 422
+    assert injected.status_code == 422
 
 
 def test_general_synthetic_mode_does_not_enable_acceptance_endpoint() -> None:

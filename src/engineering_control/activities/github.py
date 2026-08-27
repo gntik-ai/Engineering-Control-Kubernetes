@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+import hashlib
+from datetime import UTC, datetime
+from typing import Any, Literal, cast
 
 from temporalio.exceptions import ApplicationError
 
@@ -8,12 +10,21 @@ from engineering_control.adapters.command import SafeCommandRunner
 from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker
 from engineering_control.adapters.llmwiki import LLMWikiBootstrapPlanner
 from engineering_control.config import Settings
+from engineering_control.engineering.backlog import (
+    BACKLOG_PROJECT_PAIRS,
+    GitHubBacklogImportSnapshot,
+    GitHubIssueSnapshot,
+    GitHubPullRequestSnapshot,
+    GitHubRepositoryBacklogSnapshot,
+)
 
 
 class GitHubActivityHandler:
     """Run only typed gh broker activities under the authenticated broker identity."""
 
-    supported_steps = frozenset({"llmwiki.bootstrap.plan", "github.refresh_mirrors"})
+    supported_steps = frozenset(
+        {"llmwiki.bootstrap.plan", "github.refresh_mirrors", "backlog.github_import"}
+    )
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -22,10 +33,13 @@ class GitHubActivityHandler:
             settings.run_root,
             writes_enabled=settings.github_writes_enabled,
             authenticated_home=settings.github_authenticated_home,
+            maximum_json_bytes=16_000_000,
         )
         self.git = SafeCommandRunner({"git": settings.git_executable})
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if step == "backlog.github_import":
+            return self._import_backlog(payload)
         if step == "github.refresh_mirrors":
             project = payload.get("project")
             mapping = {
@@ -102,3 +116,167 @@ class GitHubActivityHandler:
             "approval_binding": plan.approval_binding(),
             "blockers": list(plan.blockers),
         }
+
+    def _import_backlog(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project = str(payload.get("project", ""))
+        pair = BACKLOG_PROJECT_PAIRS.get(project)
+        maximum_items = int(payload.get("maximum_items", 500))
+        if pair is None:
+            raise ApplicationError(
+                "GitHub backlog project is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if not 1 <= maximum_items <= 500:
+            raise ApplicationError(
+                "GitHub backlog import bound is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        try:
+            self.broker.preflight(pair)
+            repositories: list[GitHubRepositoryBacklogSnapshot] = []
+            remaining = maximum_items
+            for repository in pair:
+                metadata = self.broker.repository_metadata(repository)
+                branch = metadata.get("defaultBranchRef")
+                default_branch = branch.get("name") if isinstance(branch, dict) else None
+                if default_branch != "main":
+                    raise ApplicationError(
+                        "backlog repository default branch changed",
+                        type="PolicyViolation",
+                        non_retryable=True,
+                    )
+                head = self.broker.branch_commit(repository, "main")
+                raw_issues = self.broker.list_open_issues(repository)
+                issues = tuple(
+                    self._issue_snapshot(repository, value) for value in raw_issues[:remaining]
+                )
+                remaining -= len(issues)
+                listed_pull_requests = self.broker.list_repository_pull_requests(repository)
+                pull_requests = tuple(
+                    self._pull_request_snapshot(
+                        repository,
+                        self.broker.view_backlog_pull_request(repository, int(value["number"])),
+                    )
+                    for value in listed_pull_requests
+                )
+                repositories.append(
+                    GitHubRepositoryBacklogSnapshot(
+                        repository=repository,
+                        default_branch="main",
+                        head_sha=head["sha"],
+                        issues=issues,
+                        pull_requests=pull_requests,
+                    )
+                )
+        except GhCliAuthError as error:
+            raise ApplicationError(
+                "GitHub authentication expired during backlog import",
+                type="BLOCKED_BY_GH_AUTH",
+                non_retryable=True,
+            ) from error
+        snapshot = GitHubBacklogImportSnapshot(
+            project=cast(Literal["falcone", "musematic"], project),
+            imported_at=datetime.now(UTC),
+            repositories=(repositories[0], repositories[1]),
+        )
+        return {
+            **payload,
+            "status": "IMPORTED_READ_ONLY",
+            "snapshot": snapshot.model_dump(mode="json"),
+            "issue_count": sum(len(repository.issues) for repository in snapshot.repositories),
+            "existing_pr_count": sum(
+                pull_request.state == "OPEN"
+                for repository in snapshot.repositories
+                for pull_request in repository.pull_requests
+            ),
+        }
+
+    @staticmethod
+    def _issue_snapshot(repository: str, value: dict[str, Any]) -> GitHubIssueSnapshot:
+        body = str(value.get("body") or "")
+        labels = value.get("labels")
+        assignees = value.get("assignees")
+        comments = value.get("comments")
+        milestone = value.get("milestone")
+        return GitHubIssueSnapshot(
+            repository=repository,
+            number=int(value["number"]),
+            url=str(value["url"]),
+            title=str(value["title"])[:300],
+            body_excerpt=body[:6000],
+            body_sha256=hashlib.sha256(body.encode()).hexdigest(),
+            state="OPEN",
+            labels=tuple(
+                str(item.get("name", ""))[:120]
+                for item in labels
+                if isinstance(item, dict) and item.get("name")
+            )
+            if isinstance(labels, list)
+            else (),
+            milestone=(
+                str(milestone.get("title"))[:200]
+                if isinstance(milestone, dict) and milestone.get("title")
+                else None
+            ),
+            assignees=tuple(
+                str(item.get("login", ""))[:80]
+                for item in assignees
+                if isinstance(item, dict) and item.get("login")
+            )
+            if isinstance(assignees, list)
+            else (),
+            comments=tuple(
+                str(item.get("body", ""))[:512] for item in comments[:10] if isinstance(item, dict)
+            )
+            if isinstance(comments, list)
+            else (),
+            updated_at=GitHubActivityHandler._timestamp(value["updatedAt"]),
+        )
+
+    @staticmethod
+    def _pull_request_snapshot(repository: str, value: dict[str, Any]) -> GitHubPullRequestSnapshot:
+        comments = value.get("comments")
+        commits = value.get("commits")
+        state = str(value.get("state", "CLOSED")).upper()
+        if value.get("mergedAt"):
+            state = "MERGED"
+        if state not in {"OPEN", "CLOSED", "MERGED"}:
+            state = "CLOSED"
+        return GitHubPullRequestSnapshot(
+            repository=repository,
+            number=int(value["number"]),
+            url=str(value["url"]),
+            title=str(value["title"])[:300],
+            body_excerpt=str(value.get("body") or "")[:6000],
+            state=cast(Literal["OPEN", "CLOSED", "MERGED"], state),
+            draft=bool(value.get("isDraft")),
+            head_ref=str(value.get("headRefName") or "unknown")[:240],
+            head_sha=str(value["headRefOid"]),
+            base_ref=str(value.get("baseRefName") or "main")[:120],
+            merge_state=str(value.get("mergeStateStatus") or "UNKNOWN")[:40],
+            updated_at=GitHubActivityHandler._timestamp(value["updatedAt"]),
+            merged_at=GitHubActivityHandler._optional_timestamp(value.get("mergedAt")),
+            closed_at=GitHubActivityHandler._optional_timestamp(value.get("closedAt")),
+            comments=tuple(
+                str(item.get("body", ""))[:512] for item in comments[:10] if isinstance(item, dict)
+            )
+            if isinstance(comments, list)
+            else (),
+            commits=tuple(
+                str(item.get("oid", ""))
+                for item in commits[:250]
+                if isinstance(item, dict) and item.get("oid")
+            )
+            if isinstance(commits, list)
+            else (),
+        )
+
+    @staticmethod
+    def _timestamp(value: object) -> datetime:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+    @staticmethod
+    def _optional_timestamp(value: object) -> datetime | None:
+        return GitHubActivityHandler._timestamp(value) if value else None

@@ -14,6 +14,8 @@ class WorkflowName(StrEnum):
     CLEANUP = "CleanupWorkflow"
     ACCEPTANCE_LIFECYCLE = "AcceptanceLifecycleWorkflow"
     ISSUE_SOLUTION_LOOP = "IssueSolutionLoopWorkflow"
+    GITHUB_BACKLOG_IMPORT = "GitHubBacklogImportWorkflow"
+    EXISTING_GITHUB_BACKLOG_LOOP = "ExistingGitHubBacklogLoopWorkflow"
     ENHANCEMENT_DISCOVERY = "EnhancementDiscoveryWorkflow"
     ENHANCEMENT_DELIVERY = "EnhancementDeliveryWorkflow"
     ENHANCEMENT_SOLUTION_LOOP = "EnhancementSolutionLoopWorkflow"

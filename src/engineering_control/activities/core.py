@@ -171,6 +171,19 @@ class ControlActivities:
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",
+        "backlog.github_import",
+        "backlog.persist_import",
+        "backlog.plan",
+        "backlog.approval_candidate",
+        "backlog.record_approval",
+        "backlog.record_skip",
+        "backlog.record_retry",
+        "backlog.delivery_candidate",
+        "backlog.load_execution",
+        "backlog.materialize_candidate",
+        "backlog.record_revalidation",
+        "backlog.revalidate_gate",
+        "backlog.record_loop_state",
     }
     _mutation_steps = {
         "preview.deploy",
@@ -245,6 +258,7 @@ class ControlActivities:
             "llmwiki.bootstrap.plan",
             "llmwiki.bootstrap.execute",
             "github.refresh_mirrors",
+            "backlog.github_import",
         },
         "scan": {
             "project.snapshot",
@@ -311,6 +325,7 @@ class ControlActivities:
         "github": {
             "llmwiki.bootstrap.plan",
             "github.refresh_mirrors",
+            "backlog.github_import",
             "finding.dedupe",
             "delivery.publish",
             "reconcile.inspect_ci",

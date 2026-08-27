@@ -20,6 +20,7 @@ READ_ONLY_GITHUB_STEPS = frozenset(
         "enhancement.github_dedupe",
         "finding.dedupe",
         "github.refresh_mirrors",
+        "backlog.github_import",
         "llmwiki.bootstrap.plan",
         "reconcile.inspect_ci",
     }

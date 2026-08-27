@@ -196,7 +196,31 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
             "loop",
             "plan falcone 11111111-1111-4111-8111-111111111111",
             "POST",
-            "/v1/loops",
+            "/v1/loop-plan",
+        ),
+        (
+            "loop",
+            "import falcone github-open bugs-and-docs 1",
+            "POST",
+            "/v1/backlogs/import",
+        ),
+        (
+            "loop",
+            "inventory falcone 11111111-1111-4111-8111-111111111111 20",
+            "GET",
+            "/v1/backlogs/11111111-1111-4111-8111-111111111111/issues?limit=20",
+        ),
+        (
+            "loop",
+            "approval-candidate falcone 11111111-1111-4111-8111-111111111111 full-delivery R2 1",
+            "POST",
+            "/v1/backlogs/11111111-1111-4111-8111-111111111111/approval-candidate",
+        ),
+        (
+            "loop",
+            "start falcone 11111111-1111-4111-8111-111111111111 R2 full-delivery 1",
+            "POST",
+            "/v1/loop-start",
         ),
         ("loop", "status loop-safe-id", "GET", "/v1/loops/loop-safe-id"),
         (
@@ -243,3 +267,39 @@ def test_required_telegram_commands_are_fixed_and_bounded(
 
     assert result is not None and result["decision"] == "handled"
     assert observed == [(method, path)]
+
+
+@pytest.mark.parametrize(
+    "raw_args",
+    [
+        "import falcone github-open bugs --execute",
+        "import llmwiki github-open all 1",
+        "import falcone github-open arbitrary 1",
+        "start falcone 11111111-1111-4111-8111-111111111111 R2 production 1",
+        "skip loop-id falcone 1 arbitrary-reason",
+        "skip loop-id outside-repository 1 DUPLICATE",
+        "approve falcone 11111111-1111-4111-8111-111111111111 " + "a" * 64 + " NOT_APPROVED",
+        "approve-delivery loop-id " + "a" * 64 + " NOT_APPROVED",
+        "import falcone github-open bugs 1;gh",
+    ],
+)
+def test_backlog_telegram_parser_rejects_untyped_or_unbounded_input(
+    monkeypatch: pytest.MonkeyPatch, raw_args: str
+) -> None:
+    handler = load_handler()
+    called = False
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+
+    def request(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        nonlocal called
+        called = True
+        return {"status": "UNEXPECTED"}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        "command:loop",
+        {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
+    )
+    assert result is not None and result["decision"] == "handled"
+    assert "usage" in result["message"].lower() or "invalid" in result["message"].lower()
+    assert called is False

@@ -66,6 +66,21 @@ _PRESETS = {
     "falcone-intensive",
 }
 _LOOP_MODES = {"plan-only", "source-pr", "preview", "staging"}
+_BACKLOG_PROJECTS = {"falcone", "musematic"}
+_BACKLOG_FILTERS = {"bugs", "bugs-and-docs", "security", "enhancements", "all"}
+_BACKLOG_MODES = {"source-pr", "full-delivery"}
+_BACKLOG_REPOSITORIES = {"falcone", "falcone-charts", "musematic", "musematic-deploy"}
+_BACKLOG_SKIP_REASONS = {
+    "DUPLICATE",
+    "ALREADY_FIXED",
+    "SUPERSEDED",
+    "NEEDS_PRODUCT_DECISION",
+    "BLOCKED_BY_DEPENDENCY",
+    "BLOCKED_BY_RUNTIME_BASELINE",
+    "R3_REQUIRES_OPERATOR",
+    "NOT_REPRODUCIBLE",
+    "ENHANCEMENT_DEFERRED",
+}
 
 
 def _private_api_url() -> None:
@@ -400,22 +415,128 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         )
     if command == "loop":
         if not args:
-            raise ValueError("usage: /loop <plan|start|status|pause|resume|cancel> ...")
+            raise ValueError(
+                "usage: /loop <import|inventory|plan|queue|issue|approval-candidate|approve|"
+                "start|status|pause|resume|cancel|skip|retry|delivery-candidate|"
+                "approve-delivery> ..."
+            )
         action = args[0]
-        if action == "plan":
-            if len(args) != 3 or args[1] not in _PROJECTS:
-                raise ValueError("usage: /loop plan <project> <campaign-id>")
+        if action == "import":
+            if (
+                len(args) not in {4, 5}
+                or args[1] not in _BACKLOG_PROJECTS
+                or args[2] != "github-open"
+                or args[3] not in _BACKLOG_FILTERS
+            ):
+                raise ValueError(
+                    "usage: /loop import <falcone|musematic> github-open "
+                    "<bugs|bugs-and-docs|security|enhancements|all> [max-items]"
+                )
+            maximum_items = int(args[4]) if len(args) == 5 else 500
+            if not 1 <= maximum_items <= 500:
+                raise ValueError("backlog import max-items must be between 1 and 500")
             return _request(
                 "POST",
-                "/v1/loops",
+                "/v1/backlogs/import",
                 actor,
                 {
                     "project": args[1],
-                    "campaign_id": _uuid(args[2], "campaign ID"),
-                    "maximum_risk": "R1",
-                    "maximum_items": 1,
-                    "execution_mode": "plan-only",
-                    "dry_run": True,
+                    "source": "github-open",
+                    "import_filter": args[3],
+                    "maximum_items": maximum_items,
+                },
+            )
+        if action == "inventory":
+            if len(args) not in {3, 4} or args[1] not in _BACKLOG_PROJECTS:
+                raise ValueError(
+                    "usage: /loop inventory <falcone|musematic> <backlog-campaign-id> [limit]"
+                )
+            campaign_id = _uuid(args[2], "backlog campaign ID")
+            limit = int(args[3]) if len(args) == 4 else 20
+            if not 1 <= limit <= 200:
+                raise ValueError("inventory limit must be between 1 and 200")
+            return _request("GET", f"/v1/backlogs/{campaign_id}/issues?limit={limit}", actor)
+        if action == "plan":
+            if len(args) != 3 or args[1] not in _PROJECTS:
+                raise ValueError("usage: /loop plan <project> <campaign-id>")
+            campaign_id = _uuid(args[2], "backlog campaign ID")
+            return _request(
+                "POST",
+                "/v1/loop-plan",
+                actor,
+                {"project": args[1], "campaign_id": campaign_id},
+            )
+        if action == "queue":
+            if len(args) not in {2, 3}:
+                raise ValueError("usage: /loop queue <backlog-campaign-id> [limit]")
+            campaign_id = _uuid(args[1], "backlog campaign ID")
+            limit = int(args[2]) if len(args) == 3 else 20
+            if not 1 <= limit <= 200:
+                raise ValueError("queue limit must be between 1 and 200")
+            return _request("GET", f"/v1/backlogs/{campaign_id}/issues?limit={limit}", actor)
+        if action == "issue":
+            if (
+                len(args) != 4
+                or args[2] not in _BACKLOG_REPOSITORIES
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+            ):
+                raise ValueError(
+                    "usage: /loop issue <backlog-campaign-id> <repository-short-name> "
+                    "<issue-number>"
+                )
+            campaign_id = _uuid(args[1], "backlog campaign ID")
+            return _request(
+                "GET",
+                f"/v1/backlogs/{campaign_id}/issues/{args[2]}/{int(args[3])}",
+                actor,
+            )
+        if action == "approval-candidate":
+            if (
+                len(args) not in {5, 6}
+                or args[1] not in _BACKLOG_PROJECTS
+                or args[3] not in _BACKLOG_MODES
+                or args[4] not in {"R0", "R1", "R2", "R3"}
+            ):
+                raise ValueError(
+                    "usage: /loop approval-candidate <project> <backlog-campaign-id> "
+                    "<source-pr|full-delivery> <max-risk> [max-items]"
+                )
+            campaign_id = _uuid(args[2], "backlog campaign ID")
+            maximum_items = int(args[5]) if len(args) == 6 else 1
+            if not 1 <= maximum_items <= 50:
+                raise ValueError("approval max-items must be between 1 and 50")
+            return _request(
+                "POST",
+                f"/v1/backlogs/{campaign_id}/approval-candidate",
+                actor,
+                {
+                    "project": args[1],
+                    "delivery_mode": args[3],
+                    "maximum_risk": args[4],
+                    "maximum_items": maximum_items,
+                },
+            )
+        if action == "approve":
+            if (
+                len(args) != 5
+                or args[1] not in _BACKLOG_PROJECTS
+                or not _DIGEST.fullmatch(args[3])
+                or args[4] != "APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"
+            ):
+                raise ValueError(
+                    "usage: /loop approve <project> <backlog-campaign-id> <binding-sha256> "
+                    "APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"
+                )
+            campaign_id = _uuid(args[2], "backlog campaign ID")
+            return _request(
+                "POST",
+                f"/v1/backlogs/{campaign_id}/approve",
+                actor,
+                {
+                    "project": args[1],
+                    "approval_binding": args[3],
+                    "typed_confirmation": args[4],
                 },
             )
         if action == "start":
@@ -423,18 +544,18 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 len(args) not in {5, 6}
                 or args[1] not in _PROJECTS
                 or args[3] not in {"R0", "R1", "R2", "R3"}
-                or args[4] not in _LOOP_MODES
+                or args[4] not in {*_BACKLOG_MODES, *_LOOP_MODES}
             ):
                 raise ValueError(
                     "usage: /loop start <project> <campaign-id> <max-risk> "
-                    "<plan-only|source-pr|preview|staging> [max-items]"
+                    "<source-pr|full-delivery> [max-items]"
                 )
             maximum_items = int(args[5]) if len(args) == 6 else 1
             if not 1 <= maximum_items <= 50:
                 raise ValueError("max-items must be between 1 and 50")
             return _request(
                 "POST",
-                "/v1/loops",
+                "/v1/loop-start",
                 actor,
                 {
                     "project": args[1],
@@ -442,7 +563,6 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                     "maximum_risk": args[3],
                     "maximum_items": maximum_items,
                     "execution_mode": args[4],
-                    "dry_run": args[4] == "plan-only",
                 },
             )
         if action == "status":
@@ -454,7 +574,82 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
             if len(args) != 2:
                 raise ValueError(f"usage: /loop {action} <workflow-id>")
             workflow_id = urllib.parse.quote(args[1], safe="")
-            return _request("POST", f"/v1/loops/{workflow_id}/{action}", actor, {})
+            return _request("POST", f"/v1/backlog-loops/{workflow_id}/{action}", actor, {})
+        if action == "skip":
+            if (
+                len(args) != 5
+                or args[2] not in _BACKLOG_REPOSITORIES
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+                or args[4] not in _BACKLOG_SKIP_REASONS
+            ):
+                raise ValueError(
+                    "usage: /loop skip <workflow-id> <repository-short-name> "
+                    "<issue-number> <reason-code>"
+                )
+            workflow_id = urllib.parse.quote(args[1], safe="")
+            return _request(
+                "POST",
+                f"/v1/backlog-loops/{workflow_id}/skip",
+                actor,
+                {
+                    "repository": args[2],
+                    "issue_number": int(args[3]),
+                    "reason_code": args[4],
+                },
+            )
+        if action == "retry":
+            if (
+                len(args) != 4
+                or args[2] not in _BACKLOG_REPOSITORIES
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+            ):
+                raise ValueError(
+                    "usage: /loop retry <workflow-id> <repository-short-name> <issue-number>"
+                )
+            workflow_id = urllib.parse.quote(args[1], safe="")
+            return _request(
+                "POST",
+                f"/v1/backlog-loops/{workflow_id}/retry",
+                actor,
+                {"repository": args[2], "issue_number": int(args[3])},
+            )
+        if action == "delivery-candidate":
+            if (
+                len(args) != 4
+                or args[2] not in _BACKLOG_REPOSITORIES
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+            ):
+                raise ValueError(
+                    "usage: /loop delivery-candidate <workflow-id> <repository-short-name> "
+                    "<issue-number>"
+                )
+            workflow_id = urllib.parse.quote(args[1], safe="")
+            return _request(
+                "GET",
+                f"/v1/backlog-loops/{workflow_id}/delivery-candidate?"
+                f"repository={args[2]}&issue_number={int(args[3])}",
+                actor,
+            )
+        if action == "approve-delivery":
+            if (
+                len(args) != 4
+                or not _DIGEST.fullmatch(args[2])
+                or args[3] != "APPROVE_STAGING_ISSUE_DELIVERY"
+            ):
+                raise ValueError(
+                    "usage: /loop approve-delivery <workflow-id> <binding-sha256> "
+                    "APPROVE_STAGING_ISSUE_DELIVERY"
+                )
+            workflow_id = urllib.parse.quote(args[1], safe="")
+            return _request(
+                "POST",
+                f"/v1/backlog-loops/{workflow_id}/approve-delivery",
+                actor,
+                {"approval_binding": args[2], "typed_confirmation": args[3]},
+            )
         raise ValueError("unsupported /loop action")
     if command == "enhancements":
         if not args:

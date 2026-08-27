@@ -39,8 +39,8 @@ class NoCommandRunner:
 
 
 def test_github_activity_classification_is_complete_and_disjoint() -> None:
-    assert len(GITHUB_ACTIVITY_STEPS) == 9
-    assert len(READ_ONLY_GITHUB_STEPS) == 5
+    assert len(GITHUB_ACTIVITY_STEPS) == 10
+    assert len(READ_ONLY_GITHUB_STEPS) == 6
     assert len(WRITE_CAPABLE_GITHUB_STEPS) == 4
     assert READ_ONLY_GITHUB_STEPS.isdisjoint(WRITE_CAPABLE_GITHUB_STEPS)
     assert GITHUB_ACTIVITY_STEPS == ControlActivities.steps_for_worker("github")

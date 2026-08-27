@@ -16,7 +16,9 @@ from engineering_control.workflows.inputs import (
     EnhancementDeliveryInput,
     EnhancementDiscoveryInput,
     EnhancementSolutionLoopInput,
+    ExistingGitHubBacklogLoopInput,
     FindingVerificationInput,
+    GitHubBacklogImportInput,
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
@@ -249,7 +251,7 @@ class ControlledWorkflow:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.plan":
             return GITHUB_TASK_QUEUE
-        if step == "github.refresh_mirrors":
+        if step in {"github.refresh_mirrors", "backlog.github_import"}:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.execute":
             return task_queue_for("release")
@@ -1292,6 +1294,219 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
         return {"status": finalized.get("status", "COMPLETE"), "results": results}
 
 
+@workflow.defn(name="GitHubBacklogImportWorkflow")
+class GitHubBacklogImportWorkflow(ControlledWorkflow):
+    """Read and persist one paired existing-issue backlog without any GitHub write."""
+
+    @workflow.run
+    async def run(self, request: GitHubBacklogImportInput) -> dict[str, Any]:
+        if request.project not in {"falcone", "musematic"}:
+            raise ApplicationError(
+                "existing GitHub backlog supports only Falcone and Musematic",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if request.source != "github-open" or request.import_filter not in {
+            "bugs",
+            "bugs-and-docs",
+            "security",
+            "enhancements",
+            "all",
+        }:
+            raise ApplicationError(
+                "backlog source or filter is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if not 1 <= request.maximum_items <= 500:
+            raise ValueError("backlog maximum-items bound is invalid")
+        context = asdict(request)
+        for step in ("backlog.github_import", "backlog.persist_import", "backlog.plan"):
+            if not await self._checkpoint(step.upper().replace(".", "_")):
+                return {"status": "CANCELLED", "backlog_campaign_id": request.backlog_campaign_id}
+            context = await self._step(step, context, timeout_minutes=30)
+            if context.get("status") in {"BLOCKED", "FAILED"}:
+                return context
+        return context
+
+
+@workflow.defn(name="ExistingGitHubBacklogLoopWorkflow")
+class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
+    """Durably control imported issues; fail closed until current reproduction is proven."""
+
+    @workflow.run
+    async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+        if request.project not in {"falcone", "musematic"}:
+            raise ApplicationError(
+                "existing backlog loop project is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if request.delivery_mode not in {"source-pr", "full-delivery"}:
+            raise ApplicationError(
+                "existing backlog delivery mode is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        context = await self._step("backlog.load_execution", asdict(request))
+        if context.get("status") == "BLOCKED":
+            return context
+        raw_items = context.get("items")
+        if not isinstance(raw_items, list):
+            raise TypeError("existing backlog selection must be a list")
+        results: list[dict[str, Any]] = []
+        for ordinal, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict):
+                raise TypeError("existing backlog issue must be an object")
+            while True:
+                if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
+                    await self._step(
+                        "backlog.record_loop_state",
+                        {**asdict(request), "loop_status": "CANCELLED"},
+                    )
+                    return {"status": "CANCELLED", "results": results}
+                gate = await self._step(
+                    "backlog.revalidate_gate",
+                    {**asdict(request), "item": item},
+                )
+                if gate.get("status") == "READY":
+                    break
+                blocker = str(gate.get("blocker") or gate.get("status") or "BLOCKED")
+                if blocker in {
+                    "CURRENT_SOURCE_REVALIDATION_REQUIRED",
+                    "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED",
+                }:
+                    candidate = await self._step(
+                        "backlog.materialize_candidate",
+                        {**asdict(request), "item": item},
+                    )
+                    verification = await workflow.execute_child_workflow(
+                        "FindingVerificationWorkflow",
+                        FindingVerificationInput(
+                            finding_id=str(candidate["finding_id"]),
+                            project=request.project,
+                            fresh_snapshot=True,
+                        ),
+                        id=(
+                            f"{workflow.info().workflow_id}-issue-{ordinal}-"
+                            f"revalidate-{item['issue_number']}"
+                        ),
+                        task_queue=workflow.info().task_queue,
+                        execution_timeout=timedelta(hours=4),
+                    )
+                    await self._step(
+                        "backlog.record_revalidation",
+                        {
+                            **asdict(request),
+                            "item": item,
+                            "verification": verification,
+                        },
+                    )
+                    refreshed = await self._step("backlog.load_execution", asdict(request))
+                    candidates = refreshed.get("items")
+                    if isinstance(candidates, list):
+                        item = next(
+                            (
+                                value
+                                for value in candidates
+                                if isinstance(value, dict)
+                                and value.get("repository") == item.get("repository")
+                                and value.get("issue_number") == item.get("issue_number")
+                            ),
+                            item,
+                        )
+                    if verification.get("status") == "CONFIRMED":
+                        continue
+                    blocker = f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
+                issue_ref = f"{item['repository']}#{item['issue_number']}"
+                self._phase = f"AWAITING_OPERATOR:{issue_ref}:{blocker}"
+                self._skip_reason = None
+                self._retry_step = None
+                await self._step(
+                    "backlog.record_loop_state",
+                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                )
+                await workflow.wait_condition(
+                    lambda: (
+                        self._cancelled
+                        or self._skip_reason is not None
+                        or self._retry_step is not None
+                    )
+                )
+                if self._cancelled:
+                    await self._step(
+                        "backlog.record_loop_state",
+                        {**asdict(request), "loop_status": "CANCELLED"},
+                    )
+                    return {"status": "CANCELLED", "results": results}
+                if self._skip_reason is not None:
+                    skip_value = self._skip_reason
+                    reference, separator, reason = skip_value.rpartition("|")
+                    if not separator or reference != issue_ref:
+                        self._skip_reason = None
+                        continue
+                    skipped = await self._step(
+                        "backlog.record_skip",
+                        {
+                            **asdict(request),
+                            "repository": item["repository"],
+                            "issue_number": item["issue_number"],
+                            "reason_code": reason,
+                        },
+                    )
+                    results.append(skipped)
+                    self._skip_reason = None
+                    break
+                if self._retry_step != issue_ref:
+                    self._retry_step = None
+                    continue
+                self._retry_step = None
+                refreshed = await self._step("backlog.load_execution", asdict(request))
+                candidates = refreshed.get("items")
+                if isinstance(candidates, list):
+                    item = next(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if isinstance(candidate, dict)
+                            and candidate.get("repository") == item.get("repository")
+                            and candidate.get("issue_number") == item.get("issue_number")
+                        ),
+                        item,
+                    )
+            if results and results[-1].get("status") == "SKIPPED":
+                continue
+            delivery = await workflow.execute_child_workflow(
+                "IssueDeliveryWorkflow",
+                IssueDeliveryInput(
+                    finding_id=str(gate["finding_id"]),
+                    risk_class=str(gate["risk_class"]),
+                    dry_run=False,
+                ),
+                id=f"{workflow.info().workflow_id}-issue-{ordinal}",
+                task_queue=workflow.info().task_queue,
+                execution_timeout=timedelta(hours=12),
+            )
+            results.append(delivery)
+            if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
+                await self._step(
+                    "backlog.record_loop_state",
+                    {**asdict(request), "loop_status": "PAUSED", "blocker": delivery.get("status")},
+                )
+                return {"status": "PAUSED", "results": results}
+            if request.delivery_mode == "source-pr":
+                return {"status": "AWAITING_STAGING_DELIVERY", "results": results}
+            return {
+                "status": "BLOCKED_BY_DELIVERY",
+                "blocker": "FULL_DELIVERY_REQUIRES_PROJECT_BUILD_AND_STAGING_GATES",
+                "results": results,
+            }
+        await self._step(
+            "backlog.record_loop_state", {**asdict(request), "loop_status": "COMPLETE"}
+        )
+        return {"status": "COMPLETE", "results": results}
+
+
 @workflow.defn(name="EnhancementDiscoveryWorkflow")
 class EnhancementDiscoveryWorkflow(ControlledWorkflow):
     @workflow.run
@@ -1423,6 +1638,8 @@ ALL_WORKFLOWS = [
     CleanupWorkflow,
     AcceptanceLifecycleWorkflow,
     IssueSolutionLoopWorkflow,
+    GitHubBacklogImportWorkflow,
+    ExistingGitHubBacklogLoopWorkflow,
     EnhancementDiscoveryWorkflow,
     EnhancementDeliveryWorkflow,
     EnhancementSolutionLoopWorkflow,

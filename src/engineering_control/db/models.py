@@ -374,10 +374,102 @@ class Enhancement(UUIDPrimaryKey, Timestamps, Base):
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class GitHubBacklogCampaign(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "github_backlog_campaigns"
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    source_repository: Mapped[str] = mapped_column(String(200))
+    deployment_repository: Mapped[str] = mapped_column(String(200))
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    issue_query: Mapped[str] = mapped_column(String(240))
+    import_filter: Mapped[str] = mapped_column(String(32), index=True)
+    source_default_branch: Mapped[str] = mapped_column(String(120))
+    deployment_default_branch: Mapped[str] = mapped_column(String(120))
+    source_head_at_import: Mapped[str] = mapped_column(String(40))
+    deployment_head_at_import: Mapped[str] = mapped_column(String(40))
+    issue_count: Mapped[int] = mapped_column(Integer)
+    eligible_count: Mapped[int] = mapped_column(Integer)
+    deferred_count: Mapped[int] = mapped_column(Integer)
+    duplicate_count: Mapped[int] = mapped_column(Integer)
+    stale_count: Mapped[int] = mapped_column(Integer)
+    already_fixed_count: Mapped[int] = mapped_column(Integer)
+    existing_pr_count: Mapped[int] = mapped_column(Integer)
+    blocked_count: Mapped[int] = mapped_column(Integer)
+    dependency_graph_hash: Mapped[str] = mapped_column(String(64))
+    plan_hash: Mapped[str] = mapped_column(String(64), index=True)
+    approval_binding: Mapped[str | None] = mapped_column(String(64), index=True)
+    approval_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    maximum_risk: Mapped[str | None] = mapped_column(String(8))
+    maximum_items: Mapped[int] = mapped_column(Integer)
+    maximum_concurrency: Mapped[int] = mapped_column(Integer)
+    delivery_mode: Mapped[str | None] = mapped_column(String(32))
+    include_enhancements: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(240), unique=True, index=True)
+
+
+class BacklogIssueRecord(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "backlog_issue_records"
+    backlog_campaign_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("github_backlog_campaigns.id", ondelete="CASCADE"), index=True
+    )
+    repository: Mapped[str] = mapped_column(String(200), index=True)
+    issue_number: Mapped[int] = mapped_column(Integer)
+    issue_url_reference: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(String(300))
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    labels_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    milestone: Mapped[str | None] = mapped_column(String(200))
+    issue_type: Mapped[str] = mapped_column(String(64), index=True)
+    openspec_kind: Mapped[str | None] = mapped_column(String(80))
+    severity: Mapped[str] = mapped_column(String(32), index=True)
+    calculated_risk: Mapped[str] = mapped_column(String(8), index=True)
+    component: Mapped[str] = mapped_column(String(200), index=True)
+    source_or_deployment_owner: Mapped[str] = mapped_column(String(32))
+    documentation_levels_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    dependencies_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    blocking_issues_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    issues_blocked_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    linked_prs_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    linked_branches_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    linked_commits_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    duplicate_candidates_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    current_source_reproduction: Mapped[str] = mapped_column(String(80))
+    current_runtime_reproduction: Mapped[str] = mapped_column(String(80))
+    current_runtime_required: Mapped[bool] = mapped_column(Boolean)
+    reproduction_mode: Mapped[str] = mapped_column(String(64))
+    candidate_status: Mapped[str] = mapped_column(String(80), index=True)
+    eligibility_status: Mapped[str] = mapped_column(String(80), index=True)
+    eligibility_reason: Mapped[str] = mapped_column(String(120))
+    planned_wave: Mapped[str] = mapped_column(String(8), index=True)
+    planned_order: Mapped[int] = mapped_column(Integer, index=True)
+    finding_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("findings.id"))
+    change_set_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("change_sets.id"))
+    delivery_status: Mapped[str] = mapped_column(String(80), index=True)
+    final_closure_status: Mapped[str] = mapped_column(String(80), index=True)
+    documentation_impact: Mapped[str] = mapped_column(String(80))
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    github_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    github_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    __table_args__ = (
+        UniqueConstraint(
+            "backlog_campaign_id",
+            "repository",
+            "issue_number",
+            name="uq_backlog_campaign_repository_issue",
+        ),
+    )
+
+
 Index("ix_runs_active", Run.status, Run.project)
 Index("ix_change_sets_project_state", ChangeSet.project, ChangeSet.state)
 Index("ix_findings_project_disposition", Finding.project, Finding.disposition)
 Index("ix_enhancements_project_status", Enhancement.project, Enhancement.status)
+Index(
+    "ix_backlog_issue_campaign_wave_order",
+    BacklogIssueRecord.backlog_campaign_id,
+    BacklogIssueRecord.planned_wave,
+    BacklogIssueRecord.planned_order,
+)
 Index(
     "uq_component_leases_active_key",
     ComponentLease.component_key,

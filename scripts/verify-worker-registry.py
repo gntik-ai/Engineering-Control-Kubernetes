@@ -97,6 +97,10 @@ def verify_source_contract(repository_root: Path) -> None:
         "GitHub worker policy path drifted",
     )
     _require(
+        "Environment=ENGINEERING_GITHUB_WRITES_ENABLED=true" in github_unit,
+        "GitHub broker capability must be guarded by the strict runtime policy",
+    )
+    _require(
         str(GITHUB_WRITE_POLICY_PATH) in _unit_value(github_unit, "ReadOnlyPaths"),
         "GitHub worker policy is not read-only",
     )
@@ -166,8 +170,23 @@ def verify_write_policy(path: Path) -> None:
         set(value) == {"enabled", "safe_repositories"},
         "GitHub write policy data keys drifted",
     )
-    _require(value.get("enabled") is False, "GitHub write policy must remain disabled")
-    _require(value.get("safe_repositories") == [], "GitHub safe repository list must be empty")
+    enabled = value.get("enabled")
+    repositories = value.get("safe_repositories")
+    approved = [
+        "gntik-ai/falcone",
+        "gntik-ai/falcone-charts",
+        "gntik-ai/musematic",
+        "gntik-ai/musematic-deploy",
+    ]
+    if path != GITHUB_WRITE_POLICY_PATH:
+        _require(enabled is False, "source GitHub write policy must remain disabled")
+        _require(repositories == [], "source GitHub safe repository list must be empty")
+    else:
+        _require(
+            (enabled is False and repositories == [])
+            or (enabled is True and repositories == approved),
+            "installed GitHub policy is neither disabled nor exactly backlog-approved",
+        )
     if path == GITHUB_WRITE_POLICY_PATH:
         _require(not path.is_symlink(), "GitHub write policy must not be a symlink")
         metadata = path.stat()

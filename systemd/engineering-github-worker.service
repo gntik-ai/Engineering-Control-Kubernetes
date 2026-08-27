@@ -14,7 +14,7 @@ Environment=HOME=/home/hermes
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=ENGINEERING_WORKER_KIND=github
 Environment=ENGINEERING_GITHUB_AUTHENTICATED_HOME=/home/hermes
-Environment=ENGINEERING_GITHUB_WRITES_ENABLED=false
+Environment=ENGINEERING_GITHUB_WRITES_ENABLED=true
 Environment=ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=/etc/engineering-control/policy/github-issue-write-validation.yaml
 ExecStart=/opt/engineering-control/venv/bin/engineering-role-worker
 Restart=on-failure

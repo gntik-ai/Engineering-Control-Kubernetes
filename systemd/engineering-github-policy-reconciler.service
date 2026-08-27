@@ -1,0 +1,24 @@
+[Unit]
+Description=Reconcile one typed GitHub backlog write policy approval
+After=engineering-api.service
+Requires=engineering-api.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/engineering-control/env/control.env
+WorkingDirectory=/opt/engineering-control/source
+ExecStart=/opt/engineering-control/venv/bin/python /opt/engineering-control/source/scripts/reconcile-backlog-github-policy.py
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/etc/engineering-control/policy /var/lib/engineering-control/github-policy-requests /var/lib/engineering-control/github-policy-backups
+InaccessiblePaths=-/home/hermes/.config/gh -/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.ssh -/home/hermes/.kube -/etc/engineering-control/credentials -/etc/engineering-control/env/release

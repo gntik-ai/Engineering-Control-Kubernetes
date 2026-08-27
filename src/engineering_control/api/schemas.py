@@ -126,6 +126,71 @@ class IssueLoopStart(APIModel):
         return self
 
 
+class GitHubBacklogImportRequest(APIModel):
+    project: Literal["falcone", "musematic"]
+    source: Literal["github-open"] = "github-open"
+    import_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"]
+    maximum_items: int = Field(default=500, ge=1, le=500)
+
+
+class BacklogApprovalCandidateRequest(APIModel):
+    project: Literal["falcone", "musematic"]
+    delivery_mode: Literal["source-pr", "full-delivery"]
+    maximum_risk: RiskClass
+    maximum_items: int = Field(default=1, ge=1, le=50)
+
+
+class BacklogApprovalRequest(APIModel):
+    project: Literal["falcone", "musematic"]
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    typed_confirmation: Literal["APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"]
+
+
+class ExistingBacklogLoopStart(APIModel):
+    project: Literal["falcone", "musematic"]
+    backlog_campaign_id: UUID
+    maximum_risk: RiskClass
+    delivery_mode: Literal["source-pr", "full-delivery"]
+    maximum_items: int = Field(default=1, ge=1, le=50)
+
+
+class LoopPlanDispatch(APIModel):
+    project: Project
+    campaign_id: UUID
+
+
+class LoopStartDispatch(APIModel):
+    project: Project
+    campaign_id: UUID
+    maximum_risk: RiskClass
+    execution_mode: Literal["plan-only", "source-pr", "preview", "staging", "full-delivery"]
+    maximum_items: int = Field(default=1, ge=1, le=50)
+
+
+class BacklogIssueAction(APIModel):
+    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy"]
+    issue_number: int = Field(ge=1)
+    reason_code: (
+        Literal[
+            "DUPLICATE",
+            "ALREADY_FIXED",
+            "SUPERSEDED",
+            "NEEDS_PRODUCT_DECISION",
+            "BLOCKED_BY_DEPENDENCY",
+            "BLOCKED_BY_RUNTIME_BASELINE",
+            "R3_REQUIRES_OPERATOR",
+            "NOT_REPRODUCIBLE",
+            "ENHANCEMENT_DEFERRED",
+        ]
+        | None
+    ) = None
+
+
+class BacklogDeliveryApprovalRequest(APIModel):
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    typed_confirmation: Literal["APPROVE_STAGING_ISSUE_DELIVERY"]
+
+
 class EnhancementDiscover(APIModel):
     project: Project
     campaign_id: UUID
@@ -196,6 +261,10 @@ class OperationAccepted(APIModel):
     workflow_id: str
     run_id: str
     status: str = "ACCEPTED"
+
+
+class BacklogImportAccepted(OperationAccepted):
+    backlog_campaign_id: UUID
 
 
 class RecordList(APIModel):

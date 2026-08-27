@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -11,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 
 from engineering_control.api.schemas import (
     ApprovalRecord,
+    BacklogApprovalCandidateRequest,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
@@ -23,16 +27,23 @@ from engineering_control.db.models import (
     Approval,
     ApprovalCandidate,
     Artifact,
+    BacklogIssueRecord,
     Campaign,
     ChangeSet,
     Deployment,
     Enhancement,
     Finding,
+    GitHubBacklogCampaign,
     ProviderUsage,
     QuotaSnapshot,
     Run,
     VerificationResult,
     WorkerHeartbeat,
+)
+from engineering_control.engineering.backlog import (
+    BACKLOG_APPROVAL_PHRASE,
+    approval_binding,
+    canonical_sha256,
 )
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
@@ -72,6 +83,20 @@ class MetadataRepository(Protocol):
     async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project: ...
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
+    async def list_backlog_campaigns(
+        self, project: str | None, limit: int
+    ) -> list[dict[str, Any]]: ...
+    async def get_backlog_campaign(self, campaign_id: UUID) -> dict[str, Any] | None: ...
+    async def list_backlog_issues(self, campaign_id: UUID, limit: int) -> list[dict[str, Any]]: ...
+    async def get_backlog_issue(
+        self, campaign_id: UUID, repository: str, issue_number: int
+    ) -> dict[str, Any] | None: ...
+    async def prepare_backlog_approval(
+        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+    ) -> dict[str, Any]: ...
+    async def approve_backlog_campaign(
+        self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
     async def list_findings(self, limit: int) -> list[dict[str, Any]]: ...
     async def list_enhancements(
@@ -105,7 +130,14 @@ class MetadataRepository(Protocol):
 
 
 class SQLMetadataRepository:
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        github_policy_request_root: Path = Path(
+            "/var/lib/engineering-control/github-policy-requests"
+        ),
+    ) -> None:
         self.engine = create_engine(
             database_url,
             pool_pre_ping=True,
@@ -114,6 +146,7 @@ class SQLMetadataRepository:
             connect_args={"connect_timeout": 5} if database_url.startswith("postgresql") else {},
         )
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+        self.github_policy_request_root = github_policy_request_root
 
     async def create_campaign(
         self, campaign_id: UUID, workflow_id: str, request: CampaignStart
@@ -377,6 +410,223 @@ class SQLMetadataRepository:
                 select(Campaign).order_by(Campaign.created_at.desc()).limit(limit)
             ).all()
             return [serialize_row(row) for row in rows]
+
+    async def list_backlog_campaigns(self, project: str | None, limit: int) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_backlog_campaigns, project, limit)
+
+    def _list_backlog_campaigns(self, project: str | None, limit: int) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(GitHubBacklogCampaign)
+            if project is not None:
+                query = query.where(GitHubBacklogCampaign.project == project)
+            rows = session.scalars(
+                query.order_by(GitHubBacklogCampaign.imported_at.desc()).limit(limit)
+            ).all()
+            return [self._serialize_backlog_campaign(row) for row in rows]
+
+    async def get_backlog_campaign(self, campaign_id: UUID) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_backlog_campaign, campaign_id)
+
+    def _get_backlog_campaign(self, campaign_id: UUID) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            row = session.get(GitHubBacklogCampaign, campaign_id)
+            return self._serialize_backlog_campaign(row) if row else None
+
+    async def list_backlog_issues(self, campaign_id: UUID, limit: int) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_backlog_issues, campaign_id, limit)
+
+    def _list_backlog_issues(self, campaign_id: UUID, limit: int) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(BacklogIssueRecord)
+                .where(BacklogIssueRecord.backlog_campaign_id == campaign_id)
+                .order_by(BacklogIssueRecord.planned_order)
+                .limit(limit)
+            ).all()
+            return [self._serialize_backlog_issue(row) for row in rows]
+
+    async def get_backlog_issue(
+        self, campaign_id: UUID, repository: str, issue_number: int
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._get_backlog_issue, campaign_id, repository, issue_number
+        )
+
+    def _get_backlog_issue(
+        self, campaign_id: UUID, repository: str, issue_number: int
+    ) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            row = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == campaign_id,
+                    BacklogIssueRecord.repository == repository,
+                    BacklogIssueRecord.issue_number == issue_number,
+                )
+            )
+            return self._serialize_backlog_issue(row) if row else None
+
+    async def prepare_backlog_approval(
+        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._prepare_backlog_approval, campaign_id, request)
+
+    def _prepare_backlog_approval(
+        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+    ) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            campaign = session.get(GitHubBacklogCampaign, campaign_id)
+            if campaign is None or campaign.project != request.project:
+                raise ValueError("backlog approval campaign does not exist")
+            binding = approval_binding(
+                campaign_id=str(campaign.id),
+                project=request.project,
+                import_filter=campaign.import_filter,  # type: ignore[arg-type]
+                source_head=campaign.source_head_at_import,
+                deployment_head=campaign.deployment_head_at_import,
+                dependency_plan_hash=campaign.plan_hash,
+                maximum_risk=request.maximum_risk.value,
+                maximum_items=request.maximum_items,
+                delivery_mode=request.delivery_mode,
+                include_enhancements=campaign.import_filter == "enhancements",
+            )
+            digest = binding.sha256()
+            campaign.approval_binding = digest
+            campaign.approval_json = {"binding": binding.model_dump(mode="json")}
+            campaign.maximum_risk = request.maximum_risk.value
+            campaign.maximum_items = request.maximum_items
+            campaign.maximum_concurrency = 1
+            campaign.delivery_mode = request.delivery_mode
+            campaign.include_enhancements = binding.include_enhancements
+            campaign.status = "AWAITING_APPROVAL"
+            return {
+                "status": "AWAITING_APPROVAL",
+                "backlog_campaign_id": str(campaign.id),
+                "approval_binding": digest,
+                "approval_candidate": binding.model_dump(mode="json"),
+                "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+            }
+
+    async def approve_backlog_campaign(
+        self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._approve_backlog_campaign, campaign_id, project, binding, actor
+        )
+
+    def _approve_backlog_campaign(
+        self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        if not actor.startswith("telegram:"):
+            raise ValueError("existing-backlog approval requires an allowlisted Telegram actor")
+        result: dict[str, Any]
+        request: dict[str, Any]
+        with self.sessions.begin() as session:
+            campaign = session.get(GitHubBacklogCampaign, campaign_id)
+            if (
+                campaign is None
+                or campaign.project != project
+                or campaign.approval_binding != binding
+                or campaign.status not in {"AWAITING_APPROVAL", "APPROVED_POLICY_PENDING"}
+            ):
+                raise ValueError("existing-backlog approval binding is not current")
+            other = session.scalar(
+                select(GitHubBacklogCampaign.id).where(
+                    GitHubBacklogCampaign.id != campaign.id,
+                    GitHubBacklogCampaign.status.in_(
+                        {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING", "PAUSED"}
+                    ),
+                )
+            )
+            if other is not None:
+                raise ValueError("another backlog campaign already owns GitHub write policy")
+            raw_binding = campaign.approval_json.get("binding")
+            if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
+                raise ValueError("existing-backlog approval candidate changed")
+            expires_at = datetime.fromisoformat(str(raw_binding["expires_at"]))
+            if expires_at <= datetime.now(UTC):
+                raise ValueError("existing-backlog approval candidate expired")
+            campaign.status = "APPROVED_POLICY_PENDING"
+            campaign.approval_json = {
+                "binding": raw_binding,
+                "approval": {
+                    "approved_by": actor,
+                    "approved_at": datetime.now(UTC).isoformat(),
+                    "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+                },
+            }
+            request = {
+                "action": "enable-existing-backlog",
+                "backlog_campaign_id": str(campaign.id),
+                "project": project,
+                "approval_binding": binding,
+                "safe_repositories": [
+                    "gntik-ai/falcone",
+                    "gntik-ai/falcone-charts",
+                    "gntik-ai/musematic",
+                    "gntik-ai/musematic-deploy",
+                ],
+                "requested_by": actor,
+                "requested_at": datetime.now(UTC).isoformat(),
+            }
+            result = {
+                "status": "APPROVED_POLICY_PENDING",
+                "backlog_campaign_id": str(campaign.id),
+                "approval_binding": binding,
+                "policy_activation": "QUEUED_ROOT_RECONCILER",
+            }
+        self._write_github_policy_request(request)
+        return result
+
+    def _write_github_policy_request(self, request: dict[str, Any]) -> None:
+        root = self.github_policy_request_root
+        metadata = root.stat()
+        if not root.is_dir() or metadata.st_mode & 0o022:
+            raise ValueError("GitHub policy request directory is unavailable or insecure")
+        target = root / "activate.json"
+        temporary = root / f".activate-{os.getpid()}.tmp"
+        content = json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _serialize_backlog_campaign(row: GitHubBacklogCampaign) -> dict[str, Any]:
+        value = serialize_row(row)
+        value["backlog_campaign_id"] = value.pop("id")
+        value.pop("approval_json", None)
+        return value
+
+    @staticmethod
+    def _serialize_backlog_issue(row: BacklogIssueRecord) -> dict[str, Any]:
+        value = serialize_row(row)
+        for source, target in (
+            ("labels_json", "labels"),
+            ("documentation_levels_json", "documentation_levels"),
+            ("dependencies_json", "dependencies"),
+            ("blocking_issues_json", "blocking_issues"),
+            ("issues_blocked_json", "issues_blocked"),
+            ("linked_prs_json", "linked_prs"),
+            ("linked_branches_json", "linked_branches"),
+            ("linked_commits_json", "linked_commits"),
+            ("duplicate_candidates_json", "duplicate_candidates"),
+        ):
+            value[target] = value.pop(source)
+        value["repository_short_name"] = row.repository.rsplit("/", 1)[-1]
+        value["github_updated_at"] = row.github_updated_at.astimezone(UTC).isoformat()
+        value["finding_id"] = str(row.finding_id) if row.finding_id else None
+        value["change_set_id"] = str(row.change_set_id) if row.change_set_id else None
+        value.pop("github_snapshot_json", None)
+        return value
 
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._get_finding, finding_id)
@@ -923,6 +1173,30 @@ class EmptyMetadataRepository:
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
         return []
+
+    async def list_backlog_campaigns(self, project: str | None, limit: int) -> list[dict[str, Any]]:
+        return []
+
+    async def get_backlog_campaign(self, campaign_id: UUID) -> dict[str, Any] | None:
+        return None
+
+    async def list_backlog_issues(self, campaign_id: UUID, limit: int) -> list[dict[str, Any]]:
+        return []
+
+    async def get_backlog_issue(
+        self, campaign_id: UUID, repository: str, issue_number: int
+    ) -> dict[str, Any] | None:
+        return None
+
+    async def prepare_backlog_approval(
+        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+    ) -> dict[str, Any]:
+        raise ValueError("backlog metadata store is unavailable")
+
+    async def approve_backlog_campaign(
+        self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        raise ValueError("backlog metadata store is unavailable")
 
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None:
         return None

@@ -15,6 +15,11 @@ from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
     ApprovalRecord,
     AuditPlanRequest,
+    BacklogApprovalCandidateRequest,
+    BacklogApprovalRequest,
+    BacklogDeliveryApprovalRequest,
+    BacklogImportAccepted,
+    BacklogIssueAction,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
@@ -23,10 +28,14 @@ from engineering_control.api.schemas import (
     EnhancementDiscover,
     EnhancementRejection,
     EnhancementRun,
+    ExistingBacklogLoopStart,
     FindingVerificationStart,
+    GitHubBacklogImportRequest,
     IssueLoopStart,
     LLMWikiBootstrapExecuteRequest,
     LLMWikiBootstrapPlanRequest,
+    LoopPlanDispatch,
+    LoopStartDispatch,
     OperationAccepted,
     RecordList,
     RollbackRequest,
@@ -40,7 +49,7 @@ from engineering_control.db.repository import (
     SQLMetadataRepository,
 )
 from engineering_control.logging import configure_logging
-from engineering_control.models.enums import Project
+from engineering_control.models.enums import Project, RiskClass
 from engineering_control.observability.metrics import ControlPlaneMetrics
 
 
@@ -60,7 +69,10 @@ def create_app(
             resolved_repository = (
                 EmptyMetadataRepository()
                 if service is not None
-                else SQLMetadataRepository(resolved.database_url.get_secret_value())
+                else SQLMetadataRepository(
+                    resolved.database_url.get_secret_value(),
+                    github_policy_request_root=(resolved.state_root / "github-policy-requests"),
+                )
             )
         app.state.metadata_repository = resolved_repository
         if service is None:
@@ -184,6 +196,230 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
         return await service.start_issue_loop(body)
+
+    @app.post("/v1/loop-plan")
+    async def loop_plan_dispatch(
+        body: LoopPlanDispatch,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any] | OperationAccepted:
+        backlog = await repository.get_backlog_campaign(body.campaign_id)
+        if backlog is not None:
+            if backlog.get("project") != body.project.value:
+                raise HTTPException(status_code=409, detail="backlog project binding changed")
+            return backlog
+        return await service.start_issue_loop(
+            IssueLoopStart(
+                project=body.project,
+                campaign_id=body.campaign_id,
+                maximum_risk=RiskClass.R1,
+                maximum_items=1,
+                execution_mode="plan-only",
+                dry_run=True,
+            )
+        )
+
+    @app.post("/v1/loop-start", response_model=OperationAccepted, status_code=202)
+    async def loop_start_dispatch(
+        body: LoopStartDispatch,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> OperationAccepted:
+        backlog = await repository.get_backlog_campaign(body.campaign_id)
+        if backlog is not None:
+            if body.project.value not in {"falcone", "musematic"}:
+                raise HTTPException(status_code=409, detail="backlog project is not supported")
+            if body.execution_mode not in {"source-pr", "full-delivery"}:
+                raise HTTPException(status_code=409, detail="backlog delivery mode is invalid")
+            return await service.start_existing_backlog_loop(
+                ExistingBacklogLoopStart(
+                    project=body.project.value,  # type: ignore[arg-type]
+                    backlog_campaign_id=body.campaign_id,
+                    maximum_risk=body.maximum_risk,
+                    delivery_mode=body.execution_mode,  # type: ignore[arg-type]
+                    maximum_items=body.maximum_items,
+                )
+            )
+        if body.execution_mode == "full-delivery":
+            raise HTTPException(status_code=409, detail="full-delivery requires a backlog campaign")
+        return await service.start_issue_loop(
+            IssueLoopStart(
+                project=body.project,
+                campaign_id=body.campaign_id,
+                maximum_risk=body.maximum_risk,
+                maximum_items=body.maximum_items,
+                execution_mode=body.execution_mode,
+                dry_run=body.execution_mode == "plan-only",
+            )
+        )
+
+    @app.post("/v1/backlogs/import", response_model=BacklogImportAccepted, status_code=202)
+    async def backlog_import(
+        body: GitHubBacklogImportRequest,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> BacklogImportAccepted:
+        return await service.import_github_backlog(body)
+
+    @app.get("/v1/backlogs", response_model=RecordList)
+    async def backlog_list(
+        project: str | None = Query(default=None, pattern=r"^(falcone|musematic)$"),
+        limit: int = Query(default=20, ge=1, le=100),
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> RecordList:
+        return RecordList(
+            items=await repository.list_backlog_campaigns(project, limit), next_cursor=None
+        )
+
+    @app.get("/v1/backlogs/{campaign_id}")
+    async def backlog_get(
+        campaign_id: UUID,
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        value = await repository.get_backlog_campaign(campaign_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="backlog campaign not found")
+        return value
+
+    @app.get("/v1/backlogs/{campaign_id}/issues", response_model=RecordList)
+    async def backlog_issue_list(
+        campaign_id: UUID,
+        limit: int = Query(default=20, ge=1, le=200),
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> RecordList:
+        return RecordList(
+            items=await repository.list_backlog_issues(campaign_id, limit), next_cursor=None
+        )
+
+    @app.get("/v1/backlogs/{campaign_id}/issues/{repository_short_name}/{issue_number}")
+    async def backlog_issue_get(
+        campaign_id: UUID,
+        repository_short_name: str,
+        issue_number: int,
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        if repository_short_name not in {
+            "falcone",
+            "falcone-charts",
+            "musematic",
+            "musematic-deploy",
+        }:
+            raise HTTPException(status_code=404, detail="backlog repository not found")
+        value = await repository.get_backlog_issue(
+            campaign_id, f"gntik-ai/{repository_short_name}", issue_number
+        )
+        if value is None:
+            raise HTTPException(status_code=404, detail="backlog issue not found")
+        return value
+
+    @app.post("/v1/backlogs/{campaign_id}/approval-candidate")
+    async def backlog_approval_candidate(
+        campaign_id: UUID,
+        body: BacklogApprovalCandidateRequest,
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.prepare_backlog_approval(campaign_id, body)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/backlogs/{campaign_id}/approve")
+    async def backlog_approve(
+        campaign_id: UUID,
+        body: BacklogApprovalRequest,
+        subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.approve_backlog_campaign(
+                campaign_id, body.project, body.approval_binding, subject
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post(
+        "/v1/backlogs/{campaign_id}/start",
+        response_model=OperationAccepted,
+        status_code=202,
+    )
+    async def backlog_loop_start(
+        campaign_id: UUID,
+        body: ExistingBacklogLoopStart,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        if body.backlog_campaign_id != campaign_id:
+            raise HTTPException(status_code=409, detail="backlog campaign binding changed")
+        try:
+            return await service.start_existing_backlog_loop(body)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/backlog-loops/{workflow_id}/{action}", status_code=202)
+    async def backlog_loop_control(
+        workflow_id: str,
+        action: str,
+        body: BacklogIssueAction | None = None,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> dict[str, str]:
+        if action in {"pause", "resume", "cancel"}:
+            await service.signal(workflow_id, action)
+            return {"status": "ACCEPTED"}
+        if action == "skip" and body is not None and body.reason_code is not None:
+            await service.signal(
+                workflow_id,
+                "skip",
+                f"gntik-ai/{body.repository}#{body.issue_number}|{body.reason_code}",
+            )
+            return {"status": "ACCEPTED"}
+        if action == "retry" and body is not None and body.reason_code is None:
+            await service.signal(
+                workflow_id,
+                "retry",
+                f"gntik-ai/{body.repository}#{body.issue_number}",
+            )
+            return {"status": "ACCEPTED"}
+        raise HTTPException(status_code=404, detail="unknown backlog loop action")
+
+    @app.post("/v1/backlog-loops/{workflow_id}/approve-delivery")
+    async def backlog_delivery_approve(
+        workflow_id: str,
+        body: BacklogDeliveryApprovalRequest,
+        _subject: str = auth_dependency,
+    ) -> dict[str, str]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "staging approval candidate is not yet available; the campaign remains "
+                f"bound to workflow {workflow_id}"
+            ),
+        )
+
+    @app.get("/v1/backlog-loops/{workflow_id}/delivery-candidate")
+    async def backlog_delivery_candidate(
+        workflow_id: str,
+        repository: str = Query(pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy)$"),
+        issue_number: int = Query(ge=1),
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> dict[str, Any]:
+        state = await service.get_workflow(workflow_id)
+        return {
+            "status": "BLOCKED_BY_DELIVERY",
+            "workflow_id": workflow_id,
+            "repository": f"gntik-ai/{repository}",
+            "issue_number": issue_number,
+            "blocker": "ISSUE_HAS_NOT_REACHED_AWAITING_STAGING_DELIVERY",
+            "workflow_state": state,
+        }
 
     @app.get("/v1/loops/{workflow_id}")
     async def issue_loop_get(

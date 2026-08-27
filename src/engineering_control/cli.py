@@ -99,6 +99,66 @@ def parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("environment", choices=("staging",))
     bootstrap.add_argument("approval_binding")
     bootstrap.add_argument("--execute", action="store_true", required=True)
+    backlog_import = commands.add_parser("backlog-import")
+    backlog_import.add_argument("project", choices=("falcone", "musematic"))
+    backlog_import.add_argument(
+        "import_filter",
+        choices=("bugs", "bugs-and-docs", "security", "enhancements", "all"),
+    )
+    backlog_import.add_argument("--max-items", type=int, default=500, choices=range(1, 501))
+    backlog_inventory = commands.add_parser("backlog-inventory")
+    backlog_inventory.add_argument("campaign_id")
+    backlog_inventory.add_argument("--limit", type=int, default=20, choices=range(1, 201))
+    backlog_plan = commands.add_parser("backlog-plan")
+    backlog_plan.add_argument("project", choices=("falcone", "musematic"))
+    backlog_plan.add_argument("campaign_id")
+    backlog_candidate = commands.add_parser("backlog-approval-candidate")
+    backlog_candidate.add_argument("project", choices=("falcone", "musematic"))
+    backlog_candidate.add_argument("campaign_id")
+    backlog_candidate.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
+    backlog_candidate.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
+    backlog_candidate.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
+    backlog_approve = commands.add_parser("backlog-approve")
+    backlog_approve.add_argument("project", choices=("falcone", "musematic"))
+    backlog_approve.add_argument("campaign_id")
+    backlog_approve.add_argument("approval_binding")
+    backlog_approve.add_argument(
+        "typed_confirmation", choices=("APPROVE_EXISTING_GITHUB_BACKLOG_LOOP",)
+    )
+    backlog_start = commands.add_parser("backlog-start")
+    backlog_start.add_argument("project", choices=("falcone", "musematic"))
+    backlog_start.add_argument("campaign_id")
+    backlog_start.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
+    backlog_start.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
+    backlog_start.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
+    backlog_status = commands.add_parser("backlog-status")
+    backlog_status.add_argument("workflow_id")
+    for action in ("pause", "resume", "cancel"):
+        control = commands.add_parser(f"backlog-{action}")
+        control.add_argument("workflow_id")
+    for action in ("skip", "retry"):
+        issue_action = commands.add_parser(f"backlog-{action}")
+        issue_action.add_argument("workflow_id")
+        issue_action.add_argument(
+            "repository",
+            choices=("falcone", "falcone-charts", "musematic", "musematic-deploy"),
+        )
+        issue_action.add_argument("issue_number", type=int)
+        if action == "skip":
+            issue_action.add_argument(
+                "reason_code",
+                choices=(
+                    "DUPLICATE",
+                    "ALREADY_FIXED",
+                    "SUPERSEDED",
+                    "NEEDS_PRODUCT_DECISION",
+                    "BLOCKED_BY_DEPENDENCY",
+                    "BLOCKED_BY_RUNTIME_BASELINE",
+                    "R3_REQUIRES_OPERATOR",
+                    "NOT_REPRODUCIBLE",
+                    "ENHANCEMENT_DEFERRED",
+                ),
+            )
     return root
 
 
@@ -215,6 +275,78 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "approval_binding": arguments.approval_binding,
                 "execute": True,
             },
+        )
+    if command == "backlog-import":
+        return client.request(
+            "POST",
+            "/v1/backlogs/import",
+            {
+                "project": arguments.project,
+                "source": "github-open",
+                "import_filter": arguments.import_filter,
+                "maximum_items": arguments.max_items,
+            },
+        )
+    if command == "backlog-inventory":
+        return client.request(
+            "GET", f"/v1/backlogs/{arguments.campaign_id}/issues?limit={arguments.limit}"
+        )
+    if command == "backlog-plan":
+        return client.request(
+            "POST",
+            "/v1/loop-plan",
+            {"project": arguments.project, "campaign_id": arguments.campaign_id},
+        )
+    if command == "backlog-approval-candidate":
+        return client.request(
+            "POST",
+            f"/v1/backlogs/{arguments.campaign_id}/approval-candidate",
+            {
+                "project": arguments.project,
+                "delivery_mode": arguments.delivery_mode,
+                "maximum_risk": arguments.maximum_risk,
+                "maximum_items": arguments.max_items,
+            },
+        )
+    if command == "backlog-approve":
+        return client.request(
+            "POST",
+            f"/v1/backlogs/{arguments.campaign_id}/approve",
+            {
+                "project": arguments.project,
+                "approval_binding": arguments.approval_binding,
+                "typed_confirmation": arguments.typed_confirmation,
+            },
+        )
+    if command == "backlog-start":
+        return client.request(
+            "POST",
+            "/v1/loop-start",
+            {
+                "project": arguments.project,
+                "campaign_id": arguments.campaign_id,
+                "maximum_risk": arguments.maximum_risk,
+                "execution_mode": arguments.delivery_mode,
+                "maximum_items": arguments.max_items,
+            },
+        )
+    if command == "backlog-status":
+        return client.request("GET", f"/v1/loops/{arguments.workflow_id}")
+    if command in {"backlog-pause", "backlog-resume", "backlog-cancel"}:
+        action = command.removeprefix("backlog-")
+        return client.request("POST", f"/v1/backlog-loops/{arguments.workflow_id}/{action}")
+    if command in {"backlog-skip", "backlog-retry"}:
+        action = command.removeprefix("backlog-")
+        payload = {
+            "repository": arguments.repository,
+            "issue_number": arguments.issue_number,
+        }
+        if action == "skip":
+            payload["reason_code"] = arguments.reason_code
+        return client.request(
+            "POST",
+            f"/v1/backlog-loops/{arguments.workflow_id}/{action}",
+            payload,
         )
     raise ValueError(f"unsupported command: {command}")
 
