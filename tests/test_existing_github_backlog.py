@@ -181,6 +181,19 @@ Objective: collect a licensed test corpus.
         import_filter="bugs-and-docs",
         evaluated_at=NOW,
     )
+    deployment_enhancement = classify_issue(
+        issue(
+            15,
+            repository="gntik-ai/falcone-charts",
+            title="enhancement: ship baseline alerting rules",
+            labels=(),
+            body="Add a new SLO rule capability.",
+        ),
+        (),
+        project="falcone",
+        import_filter="bugs-and-docs",
+        evaluated_at=NOW,
+    )
     confirmed_defect = classify_issue(
         issue(
             14,
@@ -198,6 +211,8 @@ Objective: collect a licensed test corpus.
     assert task.eligibility_reason == "ENHANCEMENT_DEFERRED"
     assert security_enhancement.issue_type is BacklogIssueType.ENHANCEMENT
     assert security_enhancement.eligibility_reason == "ENHANCEMENT_DEFERRED"
+    assert deployment_enhancement.issue_type is BacklogIssueType.ENHANCEMENT
+    assert deployment_enhancement.eligibility_reason == "ENHANCEMENT_DEFERRED"
     assert confirmed_defect.issue_type is BacklogIssueType.SECURITY_DEFECT
     assert confirmed_defect.eligibility_status == "ELIGIBLE_FOR_REVALIDATION"
 

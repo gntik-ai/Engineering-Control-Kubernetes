@@ -514,6 +514,7 @@ def approval_binding(
 
 def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogIssueType:
     label_text = " ".join(labels)
+    title = text.splitlines()[0].strip()
     if "duplicate" in label_text or re.search(r"(?i)\bduplicate\s+(?:of\s+)?#\d+", text):
         return BacklogIssueType.DUPLICATE
     if any(value in label_text for value in ("already-fixed", "already fixed")):
@@ -524,13 +525,20 @@ def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogI
         return BacklogIssueType.STALE
     if any(value in label_text for value in ("invalid", "not reproducible", "wontfix")):
         return BacklogIssueType.INVALID_OR_UNREPRODUCIBLE
-    enhancement_metadata = any(
-        value in labels for value in ("enhancement", "feature", "type:modification", "type:task")
-    ) or (
-        re.search(r"(?im)^\s*kind\s*:\s*(?:enhancement|modification|feature|chore)\s*$", text)
-        is not None
+    enhancement_metadata = (
+        any(
+            value in labels
+            for value in ("enhancement", "feature", "type:modification", "type:task")
+        )
+        or (
+            re.search(r"(?im)^\s*kind\s*:\s*(?:enhancement|modification|feature|chore)\s*$", text)
+            is not None
+        )
+        or (
+            re.match(r"^(?:\[enhancement\]|enhancement(?:\([^)]*\))?:|feature request:)", title)
+            is not None
+        )
     )
-    title = text.splitlines()[0].strip()
     independent_defect = (
         any(value in labels for value in ("bug", "defect", "type:bug", "type:defect"))
         or re.match(r"^(?:\[bug\]|bug(?:\([^)]*\))?:|security defect:|deployment defect:)", title)
