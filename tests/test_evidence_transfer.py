@@ -220,6 +220,27 @@ def test_delivery_worker_heartbeat_is_allowlisted(tmp_path: Path) -> None:
     assert response.json()["identity"] == "delivery-runner"
 
 
+def test_github_worker_heartbeat_is_allowlisted(tmp_path: Path) -> None:
+    repository = SQLMetadataRepository(f"sqlite:///{tmp_path / 'github-heartbeat.sqlite'}")
+    Base.metadata.create_all(repository.engine)
+    app = create_evidence_ingest_app(
+        settings=Settings(evidence_root=tmp_path / "evidence"),
+        repository=repository,
+        tokens={"github-runner": "g" * 48},
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/workers/heartbeat",
+            headers={
+                "Authorization": f"Bearer {'g' * 48}",
+                "X-Engineering-Actor": "github-runner",
+                "X-Worker-Hostname": "controller-test",
+            },
+        )
+    assert response.status_code == 202
+    assert response.json()["identity"] == "github-runner"
+
+
 def test_publisher_uses_private_origin_and_restricted_token_file(tmp_path: Path) -> None:
     evidence_root = tmp_path / "evidence"
     evidence_root.mkdir()

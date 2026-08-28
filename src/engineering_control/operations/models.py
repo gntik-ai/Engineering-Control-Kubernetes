@@ -122,7 +122,16 @@ class AdvancedAuditCommand(OperationModel):
 
 
 class WorkflowControlCommand(OperationModel):
-    action: Literal["pause", "resume", "nudge", "retry", "cancel", "skip"]
+    action: Literal[
+        "pause",
+        "pause_after_current",
+        "resume",
+        "nudge",
+        "retry",
+        "stop_after_current",
+        "cancel",
+        "skip",
+    ]
     workflow_id: str = Field(min_length=1, max_length=240, pattern=r"^[A-Za-z0-9._:-]+$")
     repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy"] | None = None
     issue_number: int | None = Field(default=None, ge=1)

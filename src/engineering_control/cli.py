@@ -140,7 +140,7 @@ def parser() -> argparse.ArgumentParser:
     backlog_start.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
     backlog_status = commands.add_parser("backlog-status")
     backlog_status.add_argument("workflow_id")
-    for action in ("pause", "resume", "cancel"):
+    for action in ("pause", "pause-after-current", "resume", "stop-after-current", "cancel"):
         control = commands.add_parser(f"backlog-{action}")
         control.add_argument("workflow_id")
     for action in ("skip", "retry"):
@@ -348,8 +348,14 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         )
     if command == "backlog-status":
         return client.request("GET", f"/v1/loops/{arguments.workflow_id}")
-    if command in {"backlog-pause", "backlog-resume", "backlog-cancel"}:
-        action = command.removeprefix("backlog-")
+    if command in {
+        "backlog-pause",
+        "backlog-pause-after-current",
+        "backlog-resume",
+        "backlog-stop-after-current",
+        "backlog-cancel",
+    }:
+        action = command.removeprefix("backlog-").replace("-", "_")
         return client.request(
             "POST", "/v1/commands", {"action": action, "workflow_id": arguments.workflow_id}
         )

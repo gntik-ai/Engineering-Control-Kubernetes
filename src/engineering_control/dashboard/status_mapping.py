@@ -164,7 +164,7 @@ _states(
     "FLAKY",
     "STALE_PR",
 )
-_states("paused", "PAUSED")
+_states("paused", "PAUSED", "PAUSED_AFTER_CURRENT")
 _states(
     "completed",
     "SUCCESS",
@@ -209,6 +209,8 @@ _states(
     "CLOSED_WITHOUT_MERGE",
     "REJECTED",
     "SUPERSEDED",
+    "STOPPED",
+    "STOPPED_AFTER_CURRENT",
 )
 _states(
     "skipped",

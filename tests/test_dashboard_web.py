@@ -53,6 +53,8 @@ def test_protected_pages_local_assets_and_observational_controls(tmp_path: Path)
             ("/logs", "Logs"),
             ("/audits", "Audits"),
             ("/commands", "Commands"),
+            ("/findings", "Findings"),
+            ("/enhancements", "Enhancements"),
             ("/connections", "Connections"),
             ("/settings", "Settings"),
         ):
@@ -90,6 +92,8 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
         assert client.get("/api/dashboard/executions").status_code == 401
         assert client.get("/api/dashboard/services").status_code == 401
         assert client.get("/api/dashboard/root-blockers").status_code == 401
+        assert client.get("/api/dashboard/findings").status_code == 401
+        assert client.get("/api/dashboard/enhancements").status_code == 401
         page = client.get("/login")
         client.post("/login", data={"csrf_token": _csrf(page.text), "password": PASSWORD})
         backlog = client.get("/api/dashboard/backlog").json()
@@ -97,12 +101,16 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
         recent = client.get("/api/dashboard/activity/recent").json()
         workflows = client.get("/api/dashboard/workflows").json()
         executions = client.get("/api/dashboard/executions").json()
+        findings = client.get("/api/dashboard/findings").json()
+        enhancements = client.get("/api/dashboard/enhancements").json()
         assert backlog["items"] == []
         assert audits["items"] == []
         assert recent["items"]
         assert recent["last_event_id"] == recent["items"][-1]["id"]
         assert workflows["items"] == []
         assert executions["items"] == []
+        assert findings["items"] == []
+        assert enhancements["items"] == []
         assert client.get("/api/dashboard/backlog?project=outside").status_code == 422
 
 

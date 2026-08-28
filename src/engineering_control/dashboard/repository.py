@@ -24,6 +24,7 @@ from engineering_control.db.models import (
     DashboardAuthentication,
     DashboardEvent,
     Deployment,
+    Enhancement,
     Finding,
     GitHubBacklogCampaign,
     Run,
@@ -815,6 +816,71 @@ class DashboardRepository:
         if not value.startswith("https://github.com/") or "/issues/" not in value:
             return None
         return value[:500]
+
+    async def list_findings_view(self, *, project: str | None, limit: int) -> dict[str, object]:
+        return await asyncio.to_thread(self._list_findings_view, project=project, limit=limit)
+
+    def _list_findings_view(self, *, project: str | None, limit: int) -> dict[str, object]:
+        with self.sessions() as session:
+            query = select(Finding)
+            if project is not None:
+                query = query.where(Finding.project == project)
+            rows = session.scalars(query.order_by(Finding.created_at.desc()).limit(limit)).all()
+            return {
+                "items": [
+                    {
+                        "finding_id": str(row.id),
+                        "campaign_id": str(row.campaign_id),
+                        "project": row.project,
+                        "domain": row.domain,
+                        "persona": row.persona,
+                        "severity": row.severity,
+                        "confidence": row.confidence,
+                        "risk_class": row.risk_class,
+                        "disposition": row.disposition,
+                        "affected_component": self._sanitize_text(row.affected_component),
+                        "recommended_action": self._sanitize_text(row.recommended_action),
+                        "created_at": _utc_iso(row.created_at),
+                        "updated_at": _utc_iso(row.updated_at),
+                    }
+                    for row in rows
+                ],
+                "observed_at": _utc_iso(datetime.now(UTC)),
+                "source": "persisted-findings-projection",
+            }
+
+    async def list_enhancements_view(self, *, project: str | None, limit: int) -> dict[str, object]:
+        return await asyncio.to_thread(self._list_enhancements_view, project=project, limit=limit)
+
+    def _list_enhancements_view(self, *, project: str | None, limit: int) -> dict[str, object]:
+        with self.sessions() as session:
+            query = select(Enhancement)
+            if project is not None:
+                query = query.where(Enhancement.project == project)
+            rows = session.scalars(query.order_by(Enhancement.created_at.desc()).limit(limit)).all()
+            return {
+                "items": [
+                    {
+                        "enhancement_id": row.enhancement_key,
+                        "project": row.project,
+                        "campaign_id": row.campaign_id,
+                        "persona": row.persona,
+                        "affected_repository": row.affected_repository,
+                        "risk_class": row.risk_class,
+                        "status": row.status,
+                        "summary": self._sanitize_text(
+                            row.payload_json.get("summary")
+                            or row.payload_json.get("title")
+                            or row.payload_json.get("description")
+                        ),
+                        "created_at": _utc_iso(row.created_at),
+                        "updated_at": _utc_iso(row.updated_at),
+                    }
+                    for row in rows
+                ],
+                "observed_at": _utc_iso(datetime.now(UTC)),
+                "source": "persisted-enhancements-projection",
+            }
 
 
 def StringType() -> Any:

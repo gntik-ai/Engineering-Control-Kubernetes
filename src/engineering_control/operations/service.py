@@ -226,7 +226,9 @@ class TypedCommandBus:
             )
         if isinstance(command, WorkflowControlCommand) and command.action in {
             "pause",
+            "pause_after_current",
             "resume",
+            "stop_after_current",
             "cancel",
         }:
             await self.control.signal(command.workflow_id, command.action)

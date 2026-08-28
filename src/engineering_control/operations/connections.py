@@ -236,7 +236,23 @@ class ConnectionHealthProjector:
             }
         )
         heartbeat_by_kind = {row.worker_kind: row for row in sources["heartbeats"]}
-        for kind in ("controller", "codex", "claude", "browser", "scan", "delivery", "github"):
+        heartbeat_age_by_kind: dict[str, int] = {}
+        self.repository._upsert_connection(
+            {
+                "component": "worker-controller",
+                "logical_target": "controller task queue",
+                "status": "NOT_INSTALLED",
+                "checked_at": now,
+                "last_success_at": None,
+                "last_failure_at": None,
+                "latency_ms": None,
+                "safe_error": "no controller role-worker task queue exists",
+                "source": "fixed-component-registry",
+                "next_action": "Use the engineering-api and Temporal connection records.",
+                "details": {"replacement_component": "engineering-api"},
+            }
+        )
+        for kind in ("codex", "claude", "browser", "scan", "delivery", "github"):
             row = heartbeat_by_kind.get(kind)
             age = (
                 int(
@@ -259,6 +275,8 @@ class ConnectionHealthProjector:
                 if row
                 else "NOT_CONFIGURED"
             )
+            if age is not None:
+                heartbeat_age_by_kind[kind] = age
             self.repository._upsert_connection(  # fixed internal projection; no external probe
                 {
                     "component": f"worker-{kind}",
@@ -398,30 +416,46 @@ class ConnectionHealthProjector:
             if github is not None
             else None
         )
+        github_worker = heartbeat_by_kind.get("github")
+        github_worker_current = heartbeat_age_by_kind.get("github", 121) <= 120
         github_status = (
             "CONNECTED"
             if github_age is not None and github_age <= 86400
             else "STALE"
             if github
+            else "DEGRADED"
+            if github_worker_current
             else "NOT_CONFIGURED"
+        )
+        github_checked = (
+            github.occurred_at
+            if github is not None
+            else github_worker.observed_at
+            if github_worker is not None
+            else now
         )
         self.repository._upsert_connection(
             {
                 "component": "github-broker",
                 "logical_target": "allowlisted GitHub application service",
                 "status": github_status,
-                "checked_at": github.occurred_at if github else now,
+                "checked_at": github_checked,
                 "last_success_at": github.occurred_at if github else None,
                 "last_failure_at": None,
                 "latency_ms": None,
                 "safe_error": None
                 if github_status == "CONNECTED"
+                else "GitHub worker is current but no recent broker operation is projected"
+                if github_status == "DEGRADED"
                 else "safe GitHub broker event is stale or absent",
-                "source": "redacted-dashboard-events",
+                "source": "redacted-dashboard-events-and-worker-heartbeats",
                 "next_action": None
                 if github_status == "CONNECTED"
                 else "Refresh the backlog through an approved channel.",
-                "details": {"last_event_type": github.event_type if github else None},
+                "details": {
+                    "last_event_type": github.event_type if github else None,
+                    "worker_heartbeat_current": github_worker_current,
+                },
             }
         )
         for project, snapshot in sources["projects"].items():

@@ -417,6 +417,75 @@ async def test_telegram_approval_queues_only_one_typed_root_policy_request(tmp_p
     assert "token" not in request and "command" not in request
 
 
+def test_backlog_stop_after_current_persists_terminal_state_and_policy_deactivation(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    policy_root = state_root / "github-policy-requests"
+    policy_root.mkdir(parents=True, mode=0o700)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'stop-after.sqlite'}",
+        state_root=state_root,
+        project_config_root=ROOT / "config/projects",
+        persona_config_root=ROOT / "config/personas",
+        flow_config_root=ROOT / "config/flows",
+        credential_root=tmp_path / "credentials",
+    )
+    handler = EngineeringActivityHandler(settings)
+    Base.metadata.create_all(handler.engine)
+    campaign_id = UUID("33333333-3333-4333-8333-333333333333")
+    with handler.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=campaign_id,
+                project="falcone",
+                source_repository="gntik-ai/falcone",
+                deployment_repository="gntik-ai/falcone-charts",
+                imported_at=NOW,
+                issue_query="state:open",
+                import_filter="bugs-and-docs",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=2,
+                eligible_count=2,
+                deferred_count=0,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                approval_binding="e" * 64,
+                approval_json={"approval": {"approved_by": "dashboard:reauthenticated"}},
+                maximum_risk="R2",
+                maximum_items=2,
+                maximum_concurrency=1,
+                delivery_mode="source-pr",
+                include_enhancements=False,
+                status="RUNNING",
+                workflow_id="backlog-loop-stop-after-test",
+            )
+        )
+
+    result = handler._record_backlog_loop_state(
+        {
+            "backlog_campaign_id": str(campaign_id),
+            "loop_status": "STOPPED",
+            "control_state": "STOPPED_AFTER_CURRENT",
+        }
+    )
+
+    assert result["status"] == "STOPPED"
+    with handler.sessions() as session:
+        assert session.get(GitHubBacklogCampaign, campaign_id).status == "STOPPED"
+    policy = json.loads((policy_root / "activate.json").read_text(encoding="utf-8"))
+    assert policy["action"] == "disable-existing-backlog"
+    assert policy["requested_by"] == "dashboard:reauthenticated"
+
+
 def test_synthetic_existing_backlog_lifecycle_covers_terminal_cases() -> None:
     existing_pr = classify_issue(
         issue(50),

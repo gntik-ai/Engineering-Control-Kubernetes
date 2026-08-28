@@ -394,6 +394,30 @@ def create_app(
             context=page_context(request, authenticated, title="Commands", active="commands"),
         )
 
+    @app.get("/findings", response_class=HTMLResponse)
+    async def findings_page(request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return templates.TemplateResponse(
+            request=request,
+            name="findings.html",
+            context=page_context(request, authenticated, title="Findings", active="findings"),
+        )
+
+    @app.get("/enhancements", response_class=HTMLResponse)
+    async def enhancements_page(request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return templates.TemplateResponse(
+            request=request,
+            name="enhancements.html",
+            context=page_context(
+                request, authenticated, title="Enhancements", active="enhancements"
+            ),
+        )
+
     @app.get("/connections", response_class=HTMLResponse)
     async def connections_page(request: Request) -> Response:
         authenticated = await require_session(request)
@@ -713,6 +737,30 @@ def create_app(
         if isinstance(authenticated, Response):
             return authenticated
         return JSONResponse({"items": COMMAND_REGISTRY})
+
+    @app.get("/api/dashboard/findings")
+    async def findings_api(
+        request: Request,
+        project: str | None = None,
+        limit: int = Query(default=100, ge=1, le=200),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        _validate_filters(project, None)
+        return JSONResponse(await service(request).findings(project=project, limit=limit))
+
+    @app.get("/api/dashboard/enhancements")
+    async def enhancements_api(
+        request: Request,
+        project: str | None = None,
+        limit: int = Query(default=100, ge=1, le=200),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        _validate_filters(project, None)
+        return JSONResponse(await service(request).enhancements(project=project, limit=limit))
 
     @app.post("/api/dashboard/actions/candidates")
     async def action_candidate_api(request: Request) -> Response:

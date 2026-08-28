@@ -92,6 +92,32 @@ def test_cli_backlog_import_and_start_use_only_fixed_routes() -> None:
     assert started["payload"]["delivery_mode"] == "full-delivery"
 
 
+@pytest.mark.parametrize(
+    ("command", "action"),
+    [
+        ("backlog-pause-after-current", "pause_after_current"),
+        ("backlog-stop-after-current", "stop_after_current"),
+    ],
+)
+def test_cli_backlog_boundary_controls_use_the_typed_command_bus(command: str, action: str) -> None:
+    class FakeClient:
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            return {"method": method, "path": path, "payload": payload or {}}
+
+    result = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args([command, "backlog-loop-synthetic"]),
+    )
+
+    assert result == {
+        "method": "POST",
+        "path": "/v1/commands",
+        "payload": {"action": action, "workflow_id": "backlog-loop-synthetic"},
+    }
+
+
 def test_cli_advanced_audit_uses_the_shared_typed_command_bus() -> None:
     class FakeClient:
         def request(

@@ -16,6 +16,7 @@ from engineering_control.db.models import (
     BacklogIssueRecord,
     Campaign,
     CoverageCell,
+    Enhancement,
     Finding,
     GitHubBacklogCampaign,
     Run,
@@ -142,6 +143,8 @@ def test_all_normalized_statuses_are_reachable() -> None:
     assert {normalize_status(value) for value in raw.values()} == set(NORMALIZED_STATUSES)
     assert map_status("UNKNOWN_STATE").normalized == "blocked"
     assert map_status("UNKNOWN_STATE").blocker_code == "UNKNOWN_STATUS_MAPPING"
+    assert normalize_status("PAUSED_AFTER_CURRENT") == "paused"
+    assert normalize_status("STOPPED_AFTER_CURRENT") == "cancelled"
 
 
 def test_every_persisted_status_enum_has_an_explicit_non_unknown_mapping() -> None:
@@ -176,6 +179,87 @@ def test_every_persisted_status_enum_has_an_explicit_non_unknown_mapping() -> No
 )
 def test_ambiguous_running_state_uses_phase(phase: str, expected: str) -> None:
     assert normalize_status("RUNNING", phase=phase) == expected
+
+
+@pytest.mark.asyncio
+async def test_read_only_finding_and_enhancement_views_are_bounded_and_redacted(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with repository.sessions.begin() as session:
+        campaign = Campaign(
+            project="falcone",
+            name="safe-list",
+            status="COMPLETED",
+            required_cells=1,
+            metadata_json={},
+            source_sha=None,
+            deployment_sha=None,
+        )
+        session.add(campaign)
+        session.flush()
+        cell = CoverageCell(
+            campaign_id=campaign.id,
+            repository_surface="source",
+            domain="api",
+            persona="operator",
+            flow="read",
+            lens="security",
+            environment="staging",
+            status="CONFIRMED_FINDING",
+            blocker=None,
+            exclusion_approval_id=None,
+            evidence_json=[],
+            result_json={},
+        )
+        session.add(cell)
+        session.flush()
+        session.add_all(
+            [
+                Finding(
+                    campaign_id=campaign.id,
+                    coverage_cell_id=cell.id,
+                    fingerprint="finding-list-" + "f" * 52,
+                    project="falcone",
+                    domain="api",
+                    persona="operator",
+                    severity="medium",
+                    confidence=0.9,
+                    risk_class="R1",
+                    disposition="CONFIRMED",
+                    expected_behavior="expected",
+                    actual_behavior="actual",
+                    evidence_json=[],
+                    minimal_reproduction=[],
+                    affected_source_sha="a" * 40,
+                    affected_deployment_sha=None,
+                    affected_image_digest=None,
+                    affected_component="gateway",
+                    impact_json={},
+                    recommended_action="remove sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+                ),
+                Enhancement(
+                    enhancement_key="enh-safe-list",
+                    project="falcone",
+                    campaign_id=str(campaign.id),
+                    persona="operator",
+                    affected_repository="gntik-ai/falcone",
+                    risk_class="R1",
+                    status="CANDIDATE_ENHANCEMENT",
+                    fingerprint="enhancement-list-" + "e" * 48,
+                    approval_binding_sha256=None,
+                    payload_json={"summary": "rotate sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"},
+                ),
+            ]
+        )
+
+    findings = await repository.list_findings_view(project="falcone", limit=1)
+    enhancements = await repository.list_enhancements_view(project="falcone", limit=1)
+
+    assert findings["items"][0]["recommended_action"] == "remove [REDACTED]"
+    assert enhancements["items"][0]["summary"] == "rotate [REDACTED]"
+    assert "payload_json" not in enhancements["items"][0]
+    assert "evidence_json" not in findings["items"][0]
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,8 @@ class ControlledWorkflow:
     def __init__(self) -> None:
         self._paused = False
         self._cancelled = False
+        self._pause_after_current = False
+        self._stop_after_current = False
         self._approval: dict[str, Any] | None = None
         self._phase = "INITIALIZING"
         self._skip_reason: str | None = None
@@ -77,11 +79,25 @@ class ControlledWorkflow:
     @workflow.signal(name="resume")
     async def resume(self) -> None:
         self._paused = False
+        self._pause_after_current = False
 
     @workflow.signal(name="cancel")
     async def cancel(self) -> None:
         self._cancelled = True
         self._paused = False
+        self._pause_after_current = False
+        self._stop_after_current = False
+
+    @workflow.signal(name="pause_after_current")
+    async def pause_after_current(self) -> None:
+        if not self._cancelled and not self._stop_after_current:
+            self._pause_after_current = True
+
+    @workflow.signal(name="stop_after_current")
+    async def stop_after_current(self) -> None:
+        if not self._cancelled:
+            self._stop_after_current = True
+            self._pause_after_current = False
 
     @workflow.signal(name="approval")
     async def approval(self, payload: dict[str, Any]) -> None:
@@ -101,6 +117,8 @@ class ControlledWorkflow:
             "phase": self._phase,
             "paused": self._paused,
             "cancelled": self._cancelled,
+            "pause_after_current": self._pause_after_current,
+            "stop_after_current": self._stop_after_current,
             "approval_received": self._approval is not None,
             "skip_reason": self._skip_reason,
             "retry_step": self._retry_step,
@@ -1388,6 +1406,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             )
         register_child_runs = workflow.patched("existing-backlog-register-child-runs-v1")
         sequential_source_pr = workflow.patched("existing-backlog-sequential-source-pr-v1")
+        after_current_controls = workflow.patched("existing-backlog-after-current-controls-v1")
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
             return context
@@ -1542,6 +1561,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         item,
                     )
             if continue_to_next_issue or (results and results[-1].get("status") == "SKIPPED"):
+                boundary = await self._after_issue_boundary(
+                    request,
+                    results,
+                    enabled=after_current_controls,
+                    has_more=ordinal < len(raw_items),
+                )
+                if boundary is not None:
+                    return boundary
                 continue
             delivery: dict[str, Any]
             if sequential_source_pr:
@@ -1605,6 +1632,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     and request.continue_after_blocked_issue
                     and not self._requires_operator_pause(blocker)
                 ):
+                    boundary = await self._after_issue_boundary(
+                        request,
+                        results,
+                        enabled=after_current_controls,
+                        has_more=ordinal < len(raw_items),
+                    )
+                    if boundary is not None:
+                        return boundary
                     continue
                 await self._step(
                     "backlog.record_loop_state",
@@ -1623,6 +1658,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 return {"status": "PAUSED", "results": results}
             if request.delivery_mode == "source-pr":
                 if sequential_source_pr:
+                    boundary = await self._after_issue_boundary(
+                        request,
+                        results,
+                        enabled=after_current_controls,
+                        has_more=ordinal < len(raw_items),
+                    )
+                    if boundary is not None:
+                        return boundary
                     continue
                 return {"status": "AWAITING_STAGING_DELIVERY", "results": results}
             return {
@@ -1634,6 +1677,51 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             "backlog.record_loop_state", {**asdict(request), "loop_status": "COMPLETE"}
         )
         return {"status": "COMPLETE", "results": results}
+
+    async def _after_issue_boundary(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        results: list[dict[str, Any]],
+        *,
+        enabled: bool,
+        has_more: bool,
+    ) -> dict[str, Any] | None:
+        """Apply campaign controls only between issues, never during provider work."""
+        if not enabled or not has_more:
+            return None
+        if self._stop_after_current:
+            self._stop_after_current = False
+            self._phase = "STOPPED_AFTER_CURRENT"
+            await self._step(
+                "backlog.record_loop_state",
+                {
+                    **asdict(request),
+                    "loop_status": "STOPPED",
+                    "control_state": "STOPPED_AFTER_CURRENT",
+                },
+            )
+            return {"status": "STOPPED", "results": results}
+        if not self._pause_after_current:
+            return None
+        self._pause_after_current = False
+        self._paused = True
+        self._phase = "PAUSED_AFTER_CURRENT"
+        await self._step(
+            "backlog.record_loop_state",
+            {
+                **asdict(request),
+                "loop_status": "PAUSED",
+                "control_state": "PAUSED_AFTER_CURRENT",
+            },
+        )
+        await workflow.wait_condition(lambda: not self._paused or self._cancelled)
+        if not self._cancelled:
+            return None
+        await self._step(
+            "backlog.record_loop_state",
+            {**asdict(request), "loop_status": "CANCELLED"},
+        )
+        return {"status": "CANCELLED", "results": results}
 
     @staticmethod
     def _requires_operator_pause(blocker: str) -> bool:

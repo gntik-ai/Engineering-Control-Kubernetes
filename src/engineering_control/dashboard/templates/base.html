@@ -22,7 +22,7 @@
       <a href="/workflows"{% if active == "workflows" %} aria-current="page"{% endif %}>Workflows</a>
       <a href="/audits"{% if active == "audits" %} aria-current="page"{% endif %}>Audits</a>
       <a href="/logs"{% if active == "logs" %} aria-current="page"{% endif %}>Logs</a>
-      <a href="/commands"{% if active == "commands" %} aria-current="page"{% endif %}>Commands</a>
+      <a href="/commands"{% if active in ("commands", "findings", "enhancements") %} aria-current="page"{% endif %}>Commands</a>
       <a href="/connections"{% if active == "connections" %} aria-current="page"{% endif %}>Connections</a>
       <a href="/settings"{% if active == "settings" %} aria-current="page"{% endif %}>Settings</a>
       <form action="/logout" method="post">

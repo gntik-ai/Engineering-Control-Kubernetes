@@ -144,3 +144,9 @@ class DashboardService:
             cursor=cursor,
             limit=limit,
         )
+
+    async def findings(self, *, project: str | None, limit: int) -> dict[str, object]:
+        return await self.repository.list_findings_view(project=project, limit=limit)
+
+    async def enhancements(self, *, project: str | None, limit: int) -> dict[str, object]:
+        return await self.repository.list_enhancements_view(project=project, limit=limit)

@@ -51,7 +51,17 @@ from engineering_control.security.redaction import SecretRedactor
 
 _ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNNING"})
 _TERMINAL_WORKFLOW_STATES = frozenset(
-    {"COMPLETE", "COMPLETED", "SUCCESS", "FAILED", "CANCELLED", "SKIPPED", "TIMED_OUT"}
+    {
+        "COMPLETE",
+        "COMPLETED",
+        "SUCCESS",
+        "FAILED",
+        "CANCELLED",
+        "SKIPPED",
+        "STOPPED",
+        "STOPPED_AFTER_CURRENT",
+        "TIMED_OUT",
+    }
 )
 
 
@@ -349,8 +359,21 @@ class OperationsRepository:
                 blockers.append("WORKFLOW_IS_TERMINAL")
             elif command.action == "resume" and state.upper() not in {"PAUSED", "BLOCKED"}:
                 blockers.append("WORKFLOW_IS_NOT_PAUSED")
-            elif command.action == "pause" and state.upper() in {"PAUSED", "BLOCKED"}:
+            elif command.action in {"pause", "pause_after_current"} and state.upper() in {
+                "PAUSED",
+                "BLOCKED",
+            }:
                 blockers.append("WORKFLOW_ALREADY_PAUSED")
+            elif command.action == "stop_after_current" and state.upper() in {
+                "PAUSED",
+                "BLOCKED",
+            }:
+                blockers.append("WORKFLOW_IS_NOT_RUNNING")
+            elif command.action in {"pause_after_current", "stop_after_current"} and not (
+                command.workflow_id.startswith("backlog-loop-")
+                or command.workflow_id.startswith("synthetic-backlog")
+            ):
+                blockers.append("CONTROL_REQUIRES_BACKLOG_CAMPAIGN")
         elif isinstance(command, RefreshConnectionsCommand):
             binding = {"scope": command.scope, "probe_policy": "BOUNDED_READ_ONLY"}
         elif isinstance(

@@ -19,12 +19,15 @@ from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
     BacklogIssueRecord,
+    ConnectionSnapshot,
     GitHubBacklogCampaign,
     OperationRequest,
     QuotaSnapshot,
     ReauthenticationBinding,
     Run,
+    WorkerHeartbeat,
 )
+from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.models import (
     AuditStartCommand,
     SolveBacklogCommand,
@@ -433,6 +436,33 @@ async def test_connection_snapshot_reports_freshness_without_sensitive_probe_out
     assert values[0].details == {"authentication_status": "READY"}
 
 
+def test_connection_projection_reports_github_worker_without_inventing_broker_success(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with repository.sessions.begin() as session:
+        session.add(
+            WorkerHeartbeat(
+                identity="github-runner",
+                hostname="controller-test",
+                worker_kind="github",
+                observed_at=datetime.now(UTC),
+            )
+        )
+
+    ConnectionHealthProjector(repository)._persisted(datetime.now(UTC))
+
+    with repository.sessions() as session:
+        values = {row.component: row for row in session.scalars(select(ConnectionSnapshot)).all()}
+    assert values["worker-github"].status == "CONNECTED"
+    assert values["github-broker"].status == "DEGRADED"
+    assert values["github-broker"].detail_json == {
+        "last_event_type": None,
+        "worker_heartbeat_current": True,
+    }
+    assert values["worker-controller"].status == "NOT_INSTALLED"
+
+
 @pytest.mark.asyncio
 async def test_cli_and_telegram_share_one_command_bus_and_workflow_identity(
     tmp_path: Path,
@@ -473,9 +503,11 @@ async def test_state_dependent_workflow_controls_use_only_typed_signals(
     now = datetime.now(UTC)
     states = {
         "pause-workflow": ("RUNNING", "pause"),
+        "backlog-loop-pause-after": ("RUNNING", "pause_after_current"),
         "resume-workflow": ("PAUSED", "resume"),
         "nudge-workflow": ("RUNNING", "nudge"),
         "retry-workflow": ("FAILED", "retry"),
+        "backlog-loop-stop-after": ("RUNNING", "stop_after_current"),
         "cancel-workflow": ("RUNNING", "cancel"),
     }
     with repository.sessions.begin() as session:
@@ -507,7 +539,10 @@ async def test_state_dependent_workflow_controls_use_only_typed_signals(
         )
         assert result.status == "STARTED"
         assert result.workflow_id == workflow_id
-    assert control.signal.await_count == 5
+    assert control.signal.await_count == 7
+    signals = [call.args for call in control.signal.await_args_list]
+    assert ("backlog-loop-pause-after", "pause_after_current") in signals
+    assert ("backlog-loop-stop-after", "stop_after_current") in signals
 
 
 @pytest.mark.asyncio
@@ -617,6 +652,133 @@ async def test_source_pr_backlog_is_sequential_and_continues_after_independent_b
         "synthetic-backlog-issue-3-attempt-1",
     ]
     assert state_calls[-1]["loop_status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_backlog_stop_after_current_ends_at_the_next_issue_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = ExistingGitHubBacklogLoopWorkflow()
+    instance._stop_after_current = True
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    state_calls: list[dict[str, object]] = []
+    items = [{"repository": "gntik-ai/falcone", "issue_number": number} for number in (201, 202)]
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if name == "backlog.load_execution":
+            return {"status": "READY", "items": items}
+        if name == "backlog.revalidate_gate":
+            return {
+                "status": "READY",
+                "finding_id": "00000000-0000-4000-8000-000000000201",
+                "risk_class": "R1",
+            }
+        if name == "backlog.record_loop_state":
+            state_calls.append(payload)
+        return {"status": "REGISTERED"}
+
+    instance._step = step  # type: ignore[method-assign]
+    attempts: list[str] = []
+
+    async def child(_name: str, _input: object, *, id: str, **_kwargs: object) -> dict[str, object]:
+        attempts.append(id)
+        return {"status": "SOURCE_PR"}
+
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="synthetic-backlog", task_queue="engineering"),
+    )
+    monkeypatch.setattr(workflow_definitions.workflow, "execute_child_workflow", child)
+
+    result = await instance.run(
+        ExistingGitHubBacklogLoopInput(
+            project="falcone",
+            backlog_campaign_id=str(CAMPAIGN_ID),
+            maximum_risk="R2",
+            delivery_mode="source-pr",
+            maximum_items=2,
+            continue_after_blocked_issue=True,
+            correction_limit=1,
+        )
+    )
+
+    assert result["status"] == "STOPPED"
+    assert attempts == ["synthetic-backlog-issue-1-attempt-1"]
+    assert state_calls[-1]["loop_status"] == "STOPPED"
+    assert state_calls[-1]["control_state"] == "STOPPED_AFTER_CURRENT"
+
+
+@pytest.mark.asyncio
+async def test_backlog_pause_after_current_waits_then_resumes_at_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = ExistingGitHubBacklogLoopWorkflow()
+    instance._pause_after_current = True
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    state_calls: list[dict[str, object]] = []
+    items = [{"repository": "gntik-ai/falcone", "issue_number": number} for number in (301, 302)]
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if name == "backlog.load_execution":
+            return {"status": "READY", "items": items}
+        if name == "backlog.revalidate_gate":
+            item = payload["item"]
+            assert isinstance(item, dict)
+            return {
+                "status": "READY",
+                "finding_id": f"00000000-0000-4000-8000-{int(item['issue_number']):012d}",
+                "risk_class": "R1",
+            }
+        if name == "backlog.record_loop_state":
+            state_calls.append(payload)
+        return {"status": "REGISTERED"}
+
+    instance._step = step  # type: ignore[method-assign]
+    attempts: list[str] = []
+
+    async def child(_name: str, _input: object, *, id: str, **_kwargs: object) -> dict[str, object]:
+        attempts.append(id)
+        return {"status": "SOURCE_PR"}
+
+    async def wait_condition(predicate: object) -> None:
+        assert callable(predicate)
+        assert instance._phase == "PAUSED_AFTER_CURRENT"
+        assert instance._paused
+        await instance.resume()
+
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="synthetic-backlog", task_queue="engineering"),
+    )
+    monkeypatch.setattr(workflow_definitions.workflow, "execute_child_workflow", child)
+    monkeypatch.setattr(workflow_definitions.workflow, "wait_condition", wait_condition)
+
+    result = await instance.run(
+        ExistingGitHubBacklogLoopInput(
+            project="falcone",
+            backlog_campaign_id=str(CAMPAIGN_ID),
+            maximum_risk="R2",
+            delivery_mode="source-pr",
+            maximum_items=2,
+            continue_after_blocked_issue=True,
+            correction_limit=1,
+        )
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert attempts == [
+        "synthetic-backlog-issue-1-attempt-1",
+        "synthetic-backlog-issue-2-attempt-1",
+    ]
+    assert [call["loop_status"] for call in state_calls] == [
+        "PAUSED",
+        "COMPLETE",
+    ]
+    assert state_calls[0]["control_state"] == "PAUSED_AFTER_CURRENT"
 
 
 def test_operator_pause_classification_is_fail_closed_for_high_impact_blockers() -> None:

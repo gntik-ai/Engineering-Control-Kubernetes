@@ -1105,7 +1105,7 @@ class EngineeringActivityHandler:
     def _record_backlog_loop_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
         status = str(payload.get("loop_status", "PAUSED"))
-        if status not in {"PAUSED", "CANCELLED", "COMPLETE", "RUNNING"}:
+        if status not in {"PAUSED", "CANCELLED", "COMPLETE", "RUNNING", "STOPPED"}:
             raise ValueError("backlog loop status is not allowlisted")
         deactivation: dict[str, Any] | None = None
         with self.sessions.begin() as session:
@@ -1113,7 +1113,7 @@ class EngineeringActivityHandler:
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
             campaign.status = status
-            if status in {"CANCELLED", "COMPLETE"}:
+            if status in {"CANCELLED", "COMPLETE", "STOPPED"}:
                 approval = campaign.approval_json.get("approval")
                 actor = approval.get("approved_by") if isinstance(approval, dict) else None
                 if not isinstance(actor, str) or not (

@@ -835,6 +835,7 @@ class SQLMetadataRepository:
             "scan-runner": "scan",
             "delivery-runner": "delivery",
             "release-runner": "release",
+            "github-runner": "github",
         }
         worker_kind = allowed.get(identity)
         if worker_kind is None:
