@@ -37,7 +37,7 @@ def main() -> None:
         raise SystemExit("GH_CLI_MISSING")
     if not args.working_directory.is_dir():
         raise SystemExit("GITHUB_WORKER_STATE_MISSING")
-    if set(REQUIRED_REPOSITORIES) - ALLOWED_REPOSITORIES:
+    if set(REQUIRED_REPOSITORIES) != ALLOWED_REPOSITORIES:
         raise SystemExit("GITHUB_REPOSITORY_ALLOWLIST_MISMATCH")
     runner = SafeCommandRunner({"gh": args.gh})
     version = runner.run(

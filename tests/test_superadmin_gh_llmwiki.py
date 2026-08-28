@@ -185,7 +185,7 @@ def test_gh_cli_broker_requires_auth_identity_and_allowlisted_repository(tmp_pat
         broker._run(["auth", "token"])
 
 
-def test_gh_cli_writes_and_read_only_companion_are_fail_closed(tmp_path: Path) -> None:
+def test_gh_cli_writes_and_unlisted_companion_are_fail_closed(tmp_path: Path) -> None:
     broker = GhCliBroker(_GhRunner(), tmp_path, authenticated_home=tmp_path)
     body = tmp_path / "body.md"
     body.write_text("bounded", encoding="utf-8")
@@ -218,7 +218,7 @@ def test_gh_cli_auth_expiry_is_a_typed_workflow_blocker(tmp_path: Path) -> None:
     write_broker = GhCliBroker(
         _GhRunner(), tmp_path, authenticated_home=tmp_path, writes_enabled=True
     )
-    with pytest.raises(GhCliPolicyError, match="read-only"):
+    with pytest.raises(GhCliPolicyError, match="outside"):
         write_broker.create_issue(
             repository="gntik-ai/llmwiki-contracts",
             title="candidate",

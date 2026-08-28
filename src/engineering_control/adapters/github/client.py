@@ -17,10 +17,9 @@ ALLOWED_REPOSITORIES = frozenset(
         "gntik-ai/musematic",
         "gntik-ai/musematic-deploy",
         "gntik-ai/llmwiki",
-        "gntik-ai/llmwiki-contracts",
     }
 )
-READ_ONLY_REPOSITORIES = frozenset({"gntik-ai/llmwiki-contracts"})
+READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'-]{1,500}$")
 
 
