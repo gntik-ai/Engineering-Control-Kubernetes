@@ -114,9 +114,10 @@ dialog::backdrop { background: rgb(0 0 0 / 70%); }
 .operation-binding { max-height: 18rem; overflow: auto; padding: .75rem; color: #d8e7f5; background: #070b10; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; }
 .mutation-banner { padding: .75rem; border-left: .3rem solid var(--focus); background: #242115; }
 .dialog-actions { justify-content: flex-end; }
-.command-groups { display: grid; gap: 1rem; }
-.command-group { display: grid; gap: .8rem; }
-.command-form { display: flex; flex-wrap: wrap; align-items: end; gap: .65rem; padding-top: .8rem; border-top: 1px solid var(--line); }
+.command-groups { display: grid; gap: 1rem; min-width: 0; }
+.command-group { display: grid; gap: .8rem; min-width: 0; }
+.command-form { display: flex; flex-wrap: wrap; align-items: end; gap: .65rem; min-width: 0; max-width: 100%; padding-top: .8rem; border-top: 1px solid var(--line); }
+.command-form .muted { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .command-heading { flex: 1 0 100%; justify-content: space-between; }
 @media (max-width: 850px) {
   .site-header { align-items: flex-start; flex-direction: column; padding: 1rem; }

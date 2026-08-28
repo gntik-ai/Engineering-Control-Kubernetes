@@ -138,3 +138,6 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         assert "activity/stream?after_id=" in javascript
         assert "requestAnimationFrame" in javascript
         assert ".page-heading .muted" in stylesheet
+        assert ".command-group { display: grid; gap: .8rem; min-width: 0; }" in stylesheet
+        assert ".command-form .muted" in stylesheet
+        assert "overflow-wrap: anywhere" in stylesheet
