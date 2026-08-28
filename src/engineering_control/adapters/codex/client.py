@@ -75,6 +75,8 @@ class CodexCLIAdapter:
                 "--output-last-message",
                 str(final_path),
             ]
+            if request.skip_git_repository_check:
+                command.append("--skip-git-repo-check")
             if request.model:
                 command.extend(("--model", request.model))
             if request.effort:

@@ -123,6 +123,8 @@ class ScanActivityHandler:
             "cleanup.protect_active",
             "cleanup.execute",
             "reconcile.apply_promotion",
+            "observability.prepare_workspace",
+            "observability.cleanup_workspace",
         }
     )
     _repositories = {
@@ -208,6 +210,10 @@ class ScanActivityHandler:
                 return self._apply_promotion(payload)
             if step == "delivery.validate_changeset":
                 return self._validate_changeset(payload)
+            if step == "observability.prepare_workspace":
+                return self._prepare_observability_workspace(payload)
+            if step == "observability.cleanup_workspace":
+                return self._cleanup_observability_workspace(payload)
         except PermissionError as error:
             raise ApplicationError(
                 "runtime observer credential violates least-privilege policy",
@@ -219,7 +225,7 @@ class ScanActivityHandler:
                 "runtime observation command failed",
                 type="RuntimeObservationUnavailable",
             ) from error
-        except (ValueError, ValidationError, WorktreeError) as error:
+        except (OSError, ValueError, ValidationError, WorktreeError) as error:
             message = str(error)
             error_type = "DirtyWorktree" if "dirty" in message.lower() else "PolicyViolation"
             raise ApplicationError(message, type=error_type, non_retryable=True) from error
@@ -228,6 +234,46 @@ class ScanActivityHandler:
             type="NotConfigured",
             non_retryable=True,
         )
+
+    def _observability_workspace(self, payload: dict[str, Any]) -> tuple[Path, Path]:
+        workspace_id = UUID(str(payload["workspace_id"]))
+        root = self.settings.worktree_root.resolve(strict=True)
+        parent = root / "observability-canary"
+        target = parent / str(workspace_id)
+        if target.parent != parent or parent.parent != root:
+            raise ValueError("observability workspace escaped its fixed boundary")
+        return parent, target
+
+    def _prepare_observability_workspace(self, payload: dict[str, Any]) -> dict[str, Any]:
+        parent, target = self._observability_workspace(payload)
+        parent.mkdir(mode=0o755, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError("observability workspace parent is unsafe")
+        if target.exists():
+            if target.is_symlink() or not target.is_dir() or any(target.iterdir()):
+                raise ValueError("observability workspace is not an empty real directory")
+        else:
+            target.mkdir(mode=0o755)
+        # Provider workers have distinct Unix identities and require traverse-only
+        # access to this empty, read-only canary boundary.
+        os.chmod(parent, 0o755)  # noqa: S103
+        os.chmod(target, 0o755)  # noqa: S103
+        return {
+            **payload,
+            "workspace": str(target),
+            "workspace_status": "READY",
+            "status": "PREPARING",
+        }
+
+    def _cleanup_observability_workspace(self, payload: dict[str, Any]) -> dict[str, Any]:
+        parent, target = self._observability_workspace(payload)
+        if target.exists():
+            if target.is_symlink() or not target.is_dir() or any(target.iterdir()):
+                raise ValueError("observability workspace cleanup requires an empty real directory")
+            target.rmdir()
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError("observability workspace parent is unsafe")
+        return {**payload, "workspace_cleanup_status": "COMPLETE"}
 
     def _apply_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = PromotionPlan.model_validate(payload.get("promotion_plan"))

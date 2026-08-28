@@ -13,7 +13,7 @@ class DashboardModel(BaseModel):
 class ActivityEventInput(DashboardModel):
     level: str = Field(pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     event_type: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_.-]+$")
-    source: str = Field(pattern=r"^(controller|worker|dashboard)$")
+    source: str = Field(pattern=r"^(controller|worker|dashboard|hermes)$")
     host: str | None = Field(default=None, max_length=253)
     worker_kind: str | None = Field(default=None, max_length=32)
     project: str | None = Field(default=None, pattern=r"^(falcone|musematic|llmwiki|platform)$")

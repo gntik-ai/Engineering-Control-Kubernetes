@@ -46,8 +46,11 @@ def test_protected_pages_local_assets_and_observational_controls(tmp_path: Path)
     client, repository = _authenticated_client(tmp_path)
     try:
         for path, heading in (
+            ("/overview", "Overview"),
             ("/backlog", "Backlog"),
-            ("/activity", "Live Activity"),
+            ("/activity", "Logs"),
+            ("/workflows", "Workflows"),
+            ("/logs", "Logs"),
             ("/audits", "Audits"),
             ("/settings", "Settings"),
         ):
@@ -80,12 +83,51 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
     )
     with TestClient(app, base_url="https://testserver") as client:
         assert client.get("/api/dashboard/backlog").status_code == 401
+        assert client.get("/api/dashboard/overview").status_code == 401
+        assert client.get("/api/dashboard/workflows").status_code == 401
+        assert client.get("/api/dashboard/executions").status_code == 401
+        assert client.get("/api/dashboard/services").status_code == 401
+        assert client.get("/api/dashboard/root-blockers").status_code == 401
         page = client.get("/login")
         client.post("/login", data={"csrf_token": _csrf(page.text), "password": PASSWORD})
         backlog = client.get("/api/dashboard/backlog").json()
         audits = client.get("/api/dashboard/audits").json()
         recent = client.get("/api/dashboard/activity/recent").json()
+        workflows = client.get("/api/dashboard/workflows").json()
+        executions = client.get("/api/dashboard/executions").json()
         assert backlog["items"] == []
         assert audits["items"] == []
         assert recent["items"]
+        assert recent["last_event_id"] == recent["items"][-1]["id"]
+        assert workflows["items"] == []
+        assert executions["items"] == []
         assert client.get("/api/dashboard/backlog?project=outside").status_code == 422
+
+
+def test_dashboard_exposes_no_operational_mutation_or_raw_journal_route(tmp_path: Path) -> None:
+    repository = DashboardRepository(f"sqlite+pysqlite:///{tmp_path / 'routes.db'}")
+    Base.metadata.create_all(repository.engine)
+    repository.initialize_password_sync(PASSWORD)
+    app = create_app(
+        settings=Settings(database_url=str(repository.engine.url)),
+        repository=repository,
+        session_key=b"r" * 48,
+    )
+    post_routes = {route.path for route in app.routes if "POST" in getattr(route, "methods", set())}
+    assert post_routes == {"/login", "/logout", "/settings/password"}
+    paths = {route.path for route in app.routes}
+    assert not any("journal" in path or "shell" in path or "command" in path for path in paths)
+    assert not any(
+        action in path
+        for path in paths
+        for action in ("start", "pause", "resume", "cancel", "retry")
+    )
+
+    with TestClient(app, base_url="https://testserver") as client:
+        login = client.get("/login")
+        client.post("/login", data={"csrf_token": _csrf(login.text), "password": PASSWORD})
+        javascript = client.get("/static/dashboard.js").text
+        stylesheet = client.get("/static/dashboard.css").text
+        assert "activity/stream?after_id=" in javascript
+        assert "requestAnimationFrame" in javascript
+        assert ".page-heading .muted" in stylesheet

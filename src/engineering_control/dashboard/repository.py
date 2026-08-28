@@ -6,22 +6,30 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import create_engine, func, or_, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.auth import PasswordService
+from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.schemas import ActivityEventInput
-from engineering_control.dashboard.status_mapping import TERMINAL_STATUSES, normalize_status
+from engineering_control.dashboard.status_mapping import (
+    TERMINAL_STATUSES,
+    map_status,
+)
 from engineering_control.db.models import (
+    AgentExecution,
     BacklogIssueRecord,
     Campaign,
     ChangeSet,
     CoverageCell,
     DashboardAuthentication,
     DashboardEvent,
+    Deployment,
     Finding,
     GitHubBacklogCampaign,
     Run,
     SolutionLoop,
+    Step,
+    VerificationResult,
 )
 from engineering_control.security.redaction import SecretRedactor
 
@@ -36,6 +44,7 @@ _EVENT_METADATA_KEYS = frozenset(
         "finding_disposition",
         "operation",
         "provider",
+        "role",
         "result",
         "status",
         "step",
@@ -62,6 +71,19 @@ def _latest(*values: datetime | None) -> datetime | None:
     return max(present) if present else None
 
 
+def _freshness(value: datetime | None, *, stale_seconds: int = 120) -> dict[str, Any]:
+    observed = value if value is None or value.tzinfo else value.replace(tzinfo=UTC)
+    if observed is None:
+        return {"observed_at": None, "freshness": "unknown", "stale": True}
+    age = max(0, int((datetime.now(UTC) - observed).total_seconds()))
+    return {
+        "observed_at": _utc_iso(observed),
+        "freshness": "stale" if age > stale_seconds else "fresh",
+        "stale": age > stale_seconds,
+        "age_seconds": age,
+    }
+
+
 class DashboardRepository:
     def __init__(
         self, database_url: str, *, password_service: PasswordService | None = None
@@ -76,6 +98,7 @@ class DashboardRepository:
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         self.passwords = password_service or PasswordService()
         self.redactor = SecretRedactor()
+        self.observability = DashboardObservabilityProjection(self.sessions, self.redactor)
 
     async def ping(self) -> bool:
         return await asyncio.to_thread(self._ping)
@@ -226,12 +249,23 @@ class DashboardRepository:
                     or issue.delivery_status
                     or issue.candidate_status
                 )
-                normalized = normalize_status(raw_status)
+                workflow_id = run.workflow_id if run else campaign.workflow_id
+                context = self._backlog_execution_context(
+                    session, workflow_id=workflow_id, run=run, change_set=change_set
+                )
+                mapped = map_status(
+                    raw_status, phase=context["current_phase"], entity_type="backlog"
+                )
+                normalized = mapped.normalized
                 if status and normalized != status:
                     continue
                 blocker = None
                 if normalized in {"blocked", "failed"}:
-                    blocker = (run.error_code if run else None) or issue.eligibility_reason
+                    blocker = (
+                        (run.error_code if run else None)
+                        or mapped.blocker_code
+                        or issue.eligibility_reason
+                    )
                 last = _latest(
                     issue.updated_at,
                     campaign.updated_at,
@@ -246,13 +280,16 @@ class DashboardRepository:
                         "project": campaign.project,
                         "normalized_status": normalized,
                         "raw_status": raw_status,
-                        "current_phase": change_set.state if change_set else issue.delivery_status,
+                        "current_phase": context["current_phase"],
                         "queued_at": _utc_iso(run.created_at if run else campaign.created_at),
                         "started_at": _utc_iso(run.started_at if run else None),
                         "ended_at": _utc_iso(run.finished_at if run else None),
                         "last_activity_at": _utc_iso(last),
                         "blocker": self._sanitize_text(blocker),
-                        "workflow_id": run.workflow_id if run else campaign.workflow_id,
+                        "workflow_id": workflow_id,
+                        "source": "backlog_issue_records/change_sets/runs/agent_executions",
+                        **_freshness(last),
+                        **context,
                     }
                 )
             loop_query = select(SolutionLoop).order_by(SolutionLoop.updated_at.desc()).limit(1000)
@@ -262,7 +299,16 @@ class DashboardRepository:
                 state = loop.state_json if isinstance(loop.state_json, dict) else {}
                 number = state.get("issue_number")
                 title = str(state.get("issue_title") or state.get("title") or "Solution loop")[:300]
-                normalized = normalize_status(loop.status)
+                context = self._backlog_execution_context(
+                    session, workflow_id=loop.workflow_id, run=None, change_set=None
+                )
+                context["current_phase"] = (
+                    context["current_phase"] or str(state.get("phase") or loop.status)[:120]
+                )
+                mapped = map_status(
+                    loop.status, phase=context["current_phase"], entity_type="solution_loop"
+                )
+                normalized = mapped.normalized
                 if status and normalized != status:
                     continue
                 if search and search.lower() not in f"{number or ''} {title}".lower():
@@ -280,7 +326,7 @@ class DashboardRepository:
                         "project": loop.project,
                         "normalized_status": normalized,
                         "raw_status": loop.status,
-                        "current_phase": str(state.get("phase") or loop.status)[:120],
+                        "current_phase": context["current_phase"],
                         "queued_at": _utc_iso(loop.created_at),
                         "started_at": _utc_iso(loop.created_at if normalized != "queued" else None),
                         "ended_at": _utc_iso(
@@ -288,9 +334,12 @@ class DashboardRepository:
                         ),
                         "last_activity_at": _utc_iso(loop.updated_at),
                         "blocker": self._sanitize_text(
-                            state.get("blocker") or state.get("last_error")
+                            state.get("blocker") or state.get("last_error") or mapped.blocker_code
                         ),
                         "workflow_id": loop.workflow_id,
+                        "source": "solution_loops/agent_executions",
+                        **_freshness(loop.updated_at),
+                        **context,
                     }
                 )
         records.sort(
@@ -316,6 +365,98 @@ class DashboardRepository:
             "refreshed_at": _utc_iso(datetime.now(UTC)),
         }
 
+    def _backlog_execution_context(
+        self,
+        session: Session,
+        *,
+        workflow_id: str | None,
+        run: Run | None,
+        change_set: ChangeSet | None,
+    ) -> dict[str, Any]:
+        execution = (
+            session.scalar(
+                select(AgentExecution)
+                .where(AgentExecution.workflow_id == workflow_id)
+                .order_by(AgentExecution.updated_at.desc())
+                .limit(1)
+            )
+            if workflow_id
+            else None
+        )
+        steps = (
+            list(
+                session.scalars(
+                    select(Step).where(Step.run_id == run.id).order_by(Step.ordinal)
+                ).all()
+            )
+            if run
+            else []
+        )
+        deployments = (
+            list(
+                session.scalars(
+                    select(Deployment)
+                    .where(Deployment.change_set_id == change_set.id)
+                    .order_by(Deployment.updated_at.desc())
+                    .limit(1)
+                ).all()
+            )
+            if change_set
+            else []
+        )
+        verification = (
+            session.scalar(
+                select(VerificationResult)
+                .where(VerificationResult.run_id == run.id)
+                .order_by(VerificationResult.updated_at.desc())
+                .limit(1)
+            )
+            if run
+            else None
+        )
+        start = execution.started_at if execution else run.started_at if run else None
+        end = execution.ended_at if execution else run.finished_at if run else None
+        now = datetime.now(UTC)
+        start_utc = start if start is None or start.tzinfo else start.replace(tzinfo=UTC)
+        end_utc = end if end is None or end.tzinfo else end.replace(tzinfo=UTC)
+        duration = int(((end_utc or now) - start_utc).total_seconds()) if start_utc else None
+        recovery = change_set.recovery_json if change_set else {}
+        recovery = recovery if isinstance(recovery, dict) else {}
+        return {
+            "active_provider": execution.provider if execution else None,
+            "provider_role": execution.role if execution else None,
+            "worker": execution.worker_kind if execution else run.worker if run else None,
+            "last_heartbeat": _utc_iso(execution.last_heartbeat_at if execution else None),
+            "duration_seconds": max(0, duration) if duration is not None else None,
+            "attempt": execution.attempt if execution else 1,
+            "max_attempts": execution.max_attempts if execution else 1,
+            "execution_id": str(execution.id) if execution else None,
+            "current_phase": (
+                execution.phase
+                if execution and execution.phase
+                else steps[-1].name
+                if steps
+                else change_set.state
+                if change_set
+                else None
+            ),
+            "pr_state": "linked" if change_set and change_set.source_pr_url else None,
+            "ci_state": recovery.get("ci_status"),
+            "build_state": recovery.get("build_status")
+            or ("artifact recorded" if change_set and change_set.chart_version else None),
+            "deployment_state": deployments[0].status if deployments else None,
+            "verification_state": verification.status if verification else None,
+            "timeline": [
+                {
+                    "phase": step.name,
+                    "status": map_status(
+                        step.status, phase=step.name, entity_type="step"
+                    ).normalized,
+                }
+                for step in steps
+            ],
+        }
+
     async def list_audits(
         self, *, project: str | None, status: str | None, limit: int = 200
     ) -> dict[str, Any]:
@@ -328,7 +469,8 @@ class DashboardRepository:
             if project:
                 query = query.where(Campaign.project == project)
             for campaign in session.scalars(query).all():
-                normalized = normalize_status(campaign.status)
+                campaign_mapping = map_status(campaign.status, entity_type="campaign")
+                normalized = campaign_mapping.normalized
                 if status and normalized != status:
                     continue
                 cells = session.scalars(
@@ -391,6 +533,35 @@ class DashboardRepository:
                 metadata = (
                     campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
                 )
+                raw_root_values = metadata.get("root_blockers")
+                root_values = (
+                    cast(dict[str, Any], raw_root_values)
+                    if isinstance(raw_root_values, dict)
+                    else {}
+                )
+                root_codes = {
+                    str(value.get("code") or identity)
+                    for identity, value in root_values.items()
+                    if isinstance(value, dict)
+                }
+                blocked_by_root = sum(
+                    cell.status.upper() == "BLOCKED" and str(cell.blocker) in root_codes
+                    for cell in cells
+                )
+                current_result = (
+                    current.result_json
+                    if current is not None and isinstance(current.result_json, dict)
+                    else {}
+                )
+                execution = session.scalar(
+                    select(AgentExecution)
+                    .where(
+                        AgentExecution.campaign_id == campaign.id,
+                        AgentExecution.workflow_id == (run.workflow_id if run else ""),
+                    )
+                    .order_by(AgentExecution.updated_at.desc())
+                    .limit(1)
+                )
                 blocker = next((cell.blocker for cell in cells if cell.blocker), None)
                 last = _latest(
                     campaign.updated_at,
@@ -417,6 +588,9 @@ class DashboardRepository:
                         "running_cells": running,
                         "passed_cells": passed,
                         "blocked_cells": blocked,
+                        "blocked_by_root": blocked_by_root,
+                        "independently_blocked": max(0, blocked - blocked_by_root),
+                        "runnable_cells": max(0, total - skipped),
                         "failed_cells": failed,
                         "skipped_cells": skipped,
                         "completion_percentage": completion,
@@ -425,6 +599,62 @@ class DashboardRepository:
                         "persona": current.persona if current else None,
                         "flow": current.flow if current else None,
                         "lens": current.lens if current else None,
+                        "route_operation": current_result.get("route")
+                        or current_result.get("operation"),
+                        "provider": execution.provider if execution else None,
+                        "provider_role": execution.role if execution else None,
+                        "worker": execution.worker_kind
+                        if execution
+                        else (run.worker if run else None),
+                        "execution_id": str(execution.id) if execution else None,
+                        "cell_started_at": _utc_iso(current.created_at if current else None),
+                        "cell_ended_at": _utc_iso(
+                            current.updated_at
+                            if current
+                            and current.status.upper()
+                            in {
+                                "NO_FINDING",
+                                "VERIFIED_FIXED",
+                                "PASS",
+                                "PASSED",
+                                "BLOCKED",
+                                "FAILED",
+                                "ERROR",
+                                "TIMED_OUT",
+                                "SKIPPED",
+                                "EXCLUDED",
+                                "CANDIDATE_FOUND",
+                                "CONFIRMED_FINDING",
+                            }
+                            else None
+                        ),
+                        "cell_result": current.status if current else None,
+                        "persona_lifecycle": self._safe_persona_lifecycle(current_result),
+                        "root_blockers": [
+                            {
+                                "code": str(code)[:120],
+                                "classification": (
+                                    value.get("classification") if isinstance(value, dict) else None
+                                ),
+                                "summary": self._sanitize_text(
+                                    value.get("summary") if isinstance(value, dict) else code
+                                ),
+                                "dependent_cell_count": sum(
+                                    str(cell.blocker) == str(code) for cell in cells
+                                ),
+                                "resolution_state": (
+                                    value.get("resolution_state")
+                                    if isinstance(value, dict)
+                                    else "open"
+                                ),
+                            }
+                            for identity, value in root_values.items()
+                            for code in [
+                                str(value.get("code") or identity)
+                                if isinstance(value, dict)
+                                else str(identity)
+                            ]
+                        ],
                         "candidate_findings": sum(
                             value.disposition == "CANDIDATE" for value in findings
                         ),
@@ -436,9 +666,13 @@ class DashboardRepository:
                             for value in findings
                         ),
                         "blocker": self._sanitize_text(
-                            blocker or (run.error_code if run else None)
+                            blocker
+                            or (run.error_code if run else None)
+                            or campaign_mapping.blocker_code
                         ),
                         "last_activity_at": _utc_iso(last),
+                        "source": "campaigns/coverage_cells/runs/findings/agent_executions",
+                        **_freshness(last),
                     }
                 )
         active = [item for item in items if item["normalized_status"] not in TERMINAL_STATUSES]
@@ -448,6 +682,18 @@ class DashboardRepository:
         return {
             "items": active + terminal_items,
             "refreshed_at": _utc_iso(datetime.now(UTC)),
+        }
+
+    @staticmethod
+    def _safe_persona_lifecycle(result: dict[str, Any]) -> dict[str, str] | None:
+        raw = result.get("persona_lifecycle")
+        if not isinstance(raw, dict):
+            return None
+        allowed = {"requested", "activated", "authenticated", "cleaned", "restored", "cleanup"}
+        return {
+            str(key): str(value)[:80]
+            for key, value in raw.items()
+            if key in allowed and isinstance(value, (str, bool, int))
         }
 
     async def record_event(self, event: ActivityEventInput) -> int:

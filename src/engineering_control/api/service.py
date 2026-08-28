@@ -22,6 +22,7 @@ from engineering_control.api.schemas import (
     IssueLoopStart,
     LLMWikiBootstrapExecuteRequest,
     LLMWikiBootstrapPlanRequest,
+    ObservabilityAcceptanceStart,
     OperationAccepted,
     RollbackRequest,
     RuntimeVerificationStart,
@@ -41,6 +42,7 @@ from engineering_control.workflows.inputs import (
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
+    ObservabilityAcceptanceInput,
     PreviewDeploymentInput,
     RecoveryInput,
     RuntimeVerificationInput,
@@ -65,6 +67,9 @@ class ControlService(Protocol):
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
     async def start_acceptance(
         self, request: AcceptanceLifecycleStart, validation_root: str
+    ) -> OperationAccepted: ...
+    async def start_observability_acceptance(
+        self, request: ObservabilityAcceptanceStart
     ) -> OperationAccepted: ...
     async def start_issue_loop(self, request: IssueLoopStart) -> OperationAccepted: ...
     async def import_github_backlog(
@@ -302,6 +307,23 @@ class TemporalControlService:
                 hold_seconds=request.hold_seconds,
                 activity_task_queue=self.acceptance_activity_task_queue,
             ),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_observability_acceptance(
+        self, request: ObservabilityAcceptanceStart
+    ) -> OperationAccepted:
+        if request.confirm_read_only is not True:
+            raise ValueError("observability acceptance requires the read-only contract")
+        workspace_id = uuid4()
+        workflow_id = f"observability-acceptance-{workspace_id}"
+        handle = await self.client.start_workflow(
+            WorkflowName.OBSERVABILITY_ACCEPTANCE.value,
+            ObservabilityAcceptanceInput(workspace_id=str(workspace_id)),
             id=workflow_id,
             task_queue=self.task_queue,
         )

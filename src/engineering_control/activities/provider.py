@@ -6,6 +6,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import UUID
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -14,11 +15,19 @@ from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
+from engineering_control.adapters.process import subscription_only_environment
 from engineering_control.agents.instructions import AgentInstructionPack, InstructionBundle
 from engineering_control.config import Settings
 from engineering_control.handoff.store import HandoffStore
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import Provider, RunStatus
+from engineering_control.observability.agent import (
+    AgentTranscriptRecorder,
+    ExecutionFinishInput,
+    ExecutionStartInput,
+    local_worker_host,
+    normalize_agent_role,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -43,7 +52,7 @@ class InstructionPack(Protocol):
 class ProviderActivityHandler:
     """Execute a normalized native-CLI request within one assigned worktree."""
 
-    _heartbeat_interval_seconds = 30.0
+    _heartbeat_interval_seconds = 10.0
 
     _request_keys = {
         "audit.agent_cell": "agent_request",
@@ -56,6 +65,8 @@ class ProviderActivityHandler:
         "runtime.independent_review": "runtime_review_request",
         "enhancement.discover": "discovery_request",
         "enhancement.product_review": "product_review_request",
+        "observability.invoke_codex": "maker_request",
+        "observability.invoke_claude": "checker_request",
     }
 
     def __init__(
@@ -113,9 +124,53 @@ class ProviderActivityHandler:
                 runtime_payload, f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}"
             )
         if not authenticated:
-            return self._blocked(
+            blocked = self._blocked(
                 runtime_payload, f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}"
             )
+            return blocked
+
+        orchestration = payload.get("orchestration")
+        context = orchestration if isinstance(orchestration, dict) else {}
+        workflow_id = str(
+            context.get("workflow_id") or payload.get("workflow_id") or f"provider-{request.run_id}"
+        )[:240]
+        phase = step[:120]
+        attempt = self._positive_int(context.get("attempt"), default=1)
+        max_attempts = max(
+            attempt, self._positive_int(payload.get("max_attempts"), default=attempt)
+        )
+        recorder = AgentTranscriptRecorder(
+            self.settings,
+            request.run_id,
+            self.provider.value,
+        )
+        try:
+            await recorder.start(
+                ExecutionStartInput(
+                    workflow_id=workflow_id,
+                    temporal_run_id=self._optional_text(context.get("workflow_run_id"), 240),
+                    activity_id=self._optional_text(context.get("activity_id"), 240),
+                    provider=self.provider.value,
+                    role=normalize_agent_role(request.role),
+                    host=local_worker_host(),
+                    worker_kind=self.provider.value,
+                    task_queue=self._optional_text(context.get("task_queue"), 120)
+                    or (
+                        self.settings.codex_task_queue
+                        if self.provider is Provider.CODEX
+                        else self.settings.claude_task_queue
+                    ),
+                    phase=phase,
+                    selection_reason=self._selection_reason(payload, request.role),
+                    cli_path_identifier=self.provider.value,
+                    cli_version=await self._cli_version(),
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    started_at=datetime.now(UTC),
+                )
+            )
+        except Exception:  # noqa: BLE001 - observability cannot change provider work
+            recorder.transcript_incomplete = True
 
         sequence = 0
 
@@ -123,6 +178,8 @@ class ProviderActivityHandler:
             nonlocal sequence
             sequence += 1
             safe = self.redactor.redact(event).value
+            if not isinstance(safe, dict):
+                safe = {"type": "provider.event"}
             activity.heartbeat(
                 {
                     "provider": self.provider.value,
@@ -131,6 +188,10 @@ class ProviderActivityHandler:
                     "event_type": safe.get("type", "provider.event"),
                 }
             )
+            try:
+                await recorder.event(safe)
+            except Exception:  # noqa: BLE001 - observability cannot change provider work
+                recorder.transcript_incomplete = True
 
         async def heartbeat_keepalive() -> None:
             while True:
@@ -143,14 +204,50 @@ class ProviderActivityHandler:
                         "event_type": "provider.keepalive",
                     }
                 )
+                try:
+                    await recorder.heartbeat(phase)
+                except Exception:  # noqa: BLE001 - observability cannot change provider work
+                    recorder.transcript_incomplete = True
 
         keepalive = asyncio.create_task(heartbeat_keepalive())
         try:
             result = await self.adapter.execute(request, heartbeat_event)
+        except BaseException as error:
+            try:
+                await recorder.finish(
+                    ExecutionFinishInput(
+                        status="FAILED",
+                        phase=phase,
+                        ended_at=datetime.now(UTC),
+                        retryable=True,
+                        blocker_code="PROVIDER_ACTIVITY_FAILED",
+                        error_summary=type(error).__name__,
+                        transcript_incomplete=True,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - original provider failure remains authoritative
+                recorder.transcript_incomplete = True
+            raise
         finally:
             keepalive.cancel()
             with suppress(asyncio.CancelledError):
                 await keepalive
+        try:
+            await recorder.finish(
+                ExecutionFinishInput(
+                    status=result.status.value,
+                    phase=phase,
+                    ended_at=result.finished_at,
+                    exit_code=result.exit_code,
+                    retryable=result.status is RunStatus.RATE_LIMITED,
+                    blocker_code=result.error_code,
+                    error_summary=(
+                        result.summary if result.status is not RunStatus.SUCCESS else None
+                    ),
+                )
+            )
+        except Exception:  # noqa: BLE001 - provider result remains authoritative
+            recorder.transcript_incomplete = True
         if result.status is RunStatus.SUCCESS:
             self._validate_result_schema(request, result)
 
@@ -159,6 +256,11 @@ class ProviderActivityHandler:
             "provider": self.provider.value,
             "status": result.status.value,
             "agent_result": result.model_dump(mode="json"),
+            "observability": {
+                "execution_id": str(request.run_id),
+                "transcript_incomplete": recorder.transcript_incomplete,
+                "output_truncated": recorder.output_truncated,
+            },
         }
         if result.status is RunStatus.RATE_LIMITED:
             response["handoff_hashes"] = self._persist_handoff(request, result, runtime_payload)
@@ -166,6 +268,46 @@ class ProviderActivityHandler:
         if not isinstance(safe, dict):
             raise TypeError("redacted provider response must remain an object")
         return safe
+
+    async def _cli_version(self) -> str | None:
+        executable = getattr(self.adapter, "executable", None)
+        if not isinstance(executable, str) or not executable:
+            return None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                "--version",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=subscription_only_environment(self.provider.value),
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except (OSError, TimeoutError):
+            return None
+        if process.returncode != 0:
+            return None
+        safe = self.redactor.redact_text(stdout.decode("utf-8", errors="replace").strip())
+        return str(safe.value)[:120] or None
+
+    def _selection_reason(self, payload: dict[str, Any], role: str) -> str:
+        for key in ("provider_selection_reason", "selection_reason", "routing_reason"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return str(self.redactor.redact_text(value).value)[:500]
+        return f"workflow routing selected {self.provider.value} for {role}"[:500]
+
+    @staticmethod
+    def _optional_text(value: Any, limit: int) -> str | None:
+        return str(value)[:limit] if value not in (None, "") else None
+
+    @staticmethod
+    def _positive_int(value: Any, *, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
 
     def _blocked(
         self, payload: dict[str, Any], blocker: str, *, detail: str | None = None
@@ -252,6 +394,26 @@ class ProviderActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        if request.skip_git_repository_check:
+            try:
+                UUID(worktree.name)
+            except ValueError as error:
+                raise ApplicationError(
+                    "non-Git execution requires the fixed observability canary boundary",
+                    type="PolicyViolation",
+                    non_retryable=True,
+                ) from error
+            if (
+                step != "observability.invoke_codex"
+                or request.provider is not Provider.CODEX
+                or request.writable
+                or worktree.parent != root / "observability-canary"
+            ):
+                raise ApplicationError(
+                    "non-Git execution requires the fixed observability canary boundary",
+                    type="PolicyViolation",
+                    non_retryable=True,
+                )
         if (
             step in {"delivery.invoke_maker", "delivery.invoke_deployment_maker"}
             and not request.writable

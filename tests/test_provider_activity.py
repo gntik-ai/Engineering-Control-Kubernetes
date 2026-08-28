@@ -111,9 +111,49 @@ async def test_provider_activity_executes_only_in_bounded_worktree(
     )
 
     assert result["status"] == "SUCCESS"
+    assert result["observability"]["transcript_incomplete"] is False
     assert result["provider"] == "codex"
     assert result["agent_result"]["structured_result"] == {"summary": "ok"}
     assert result["instruction_bundle"]["sha256"] == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_observability_persistence_failure_does_not_fail_provider_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.activity.heartbeat", lambda _: None
+    )
+
+    async def unavailable(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("observability unavailable")
+
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.AgentTranscriptRecorder.start", unavailable
+    )
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.AgentTranscriptRecorder.event", unavailable
+    )
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.AgentTranscriptRecorder.finish", unavailable
+    )
+    worktree_root = tmp_path / "worktrees"
+    worktree = worktree_root / "falcone" / "change-set"
+    worktree.mkdir(parents=True)
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
+        "codex",
+        FakeAdapter(),
+        FakeInstructionPack(),
+    )
+
+    result = await handler.handle(
+        "delivery.invoke_maker",
+        {"maker_request": request_for(worktree).model_dump(mode="json")},
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["observability"]["transcript_incomplete"] is True
 
 
 @pytest.mark.asyncio
@@ -179,6 +219,30 @@ async def test_provider_activity_rejects_worktree_escape(tmp_path: Path) -> None
         await handler.handle(
             "delivery.invoke_maker",
             {"maker_request": request_for(outside).model_dump(mode="json")},
+        )
+
+
+@pytest.mark.asyncio
+async def test_provider_activity_rejects_non_git_capability_outside_canary(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "worktrees"
+    worktree = allowed / "falcone" / "change-set"
+    worktree.mkdir(parents=True)
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=allowed, run_root=tmp_path / "runs"),
+        "codex",
+        FakeAdapter(),
+        FakeInstructionPack(),
+    )
+    request = request_for(worktree, writable=False).model_copy(
+        update={"skip_git_repository_check": True}
+    )
+
+    with pytest.raises(ApplicationError, match="fixed observability canary"):
+        await handler.handle(
+            "observability.invoke_codex",
+            {"maker_request": request.model_dump(mode="json")},
         )
 
 

@@ -109,7 +109,12 @@ class Settings(BaseSettings):
     dashboard_port: int = Field(default=8750, ge=1024, le=65535)
     dashboard_session_key_file: Path = Path("/etc/engineering-control/dashboard/session.key")
     dashboard_session_hours: int = Field(default=12, ge=1, le=24)
-    dashboard_event_retention_days: int = Field(default=14, ge=1, le=365)
+    dashboard_event_retention_days: int = Field(default=30, ge=1, le=365)
+    dashboard_agent_log_retention_days: int = Field(default=7, ge=1, le=90)
+    dashboard_agent_execution_retention_days: int = Field(default=90, ge=7, le=730)
+    dashboard_transcript_max_bytes: int = Field(default=5 * 1024 * 1024, ge=65_536, le=20_971_520)
+    dashboard_transcript_line_max_bytes: int = Field(default=16 * 1024, ge=1024, le=65_536)
+    dashboard_transcript_chunk_bytes: int = Field(default=64 * 1024, ge=4096, le=262_144)
 
     @field_validator(
         "codex_task_queue",

@@ -22,6 +22,7 @@ from engineering_control.workflows.inputs import (
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
+    ObservabilityAcceptanceInput,
     PreviewDeploymentInput,
     QuotaRefreshInput,
     RecoveryInput,
@@ -221,6 +222,8 @@ class ControlledWorkflow:
             "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
+            "observability.prepare_workspace",
+            "observability.cleanup_workspace",
         }:
             return task_queue_for("scan")
         if step == "finding.reproduce":
@@ -275,6 +278,10 @@ class ControlledWorkflow:
             return provider_task_queue(
                 cls._nested_value(payload, "checker_provider", "claude"), default="claude"
             )
+        if step == "observability.invoke_codex":
+            return provider_task_queue("codex", default="codex")
+        if step == "observability.invoke_claude":
+            return provider_task_queue("claude", default="claude")
         if step == "reconcile.invoke_release_reviewer":
             return provider_task_queue(
                 cls._nested_value(payload, "release_review_provider", "claude"),
@@ -1169,6 +1176,37 @@ class AcceptanceLifecycleWorkflow(ControlledWorkflow):
         return context
 
 
+@workflow.defn(name="ObservabilityAcceptanceWorkflow")
+class ObservabilityAcceptanceWorkflow(ControlledWorkflow):
+    """Read-only native Codex then Claude canary with no product or repository mutation."""
+
+    @workflow.run
+    async def run(self, request: ObservabilityAcceptanceInput) -> dict[str, Any]:
+        context: dict[str, Any] = asdict(request)
+        context = await self._step("observability.register", context)
+        context = await self._step("observability.prepare_workspace", context)
+        try:
+            context = await self._step("observability.prepare_codex", context)
+            context = await self._agent_step(
+                "observability.invoke_codex", context, timeout_minutes=10
+            )
+            if context.get("status") != "SUCCESS":
+                return await self._step(
+                    "observability.finalize",
+                    {**context, "terminal_status": "FAILED", "blocker": context.get("blocker")},
+                )
+            context = await self._step("observability.prepare_claude", context)
+            context = await self._agent_step(
+                "observability.invoke_claude", context, timeout_minutes=10
+            )
+            terminal = "COMPLETED" if context.get("status") == "SUCCESS" else "FAILED"
+            return await self._step(
+                "observability.finalize", {**context, "terminal_status": terminal}
+            )
+        finally:
+            await self._step("observability.cleanup_workspace", context)
+
+
 @workflow.defn(name="IssueSolutionLoopWorkflow")
 class IssueSolutionLoopWorkflow(ControlledWorkflow):
     """Durable one-issue-at-a-time solution loop; production mode is intentionally absent."""
@@ -1637,6 +1675,7 @@ ALL_WORKFLOWS = [
     QuotaRefreshWorkflow,
     CleanupWorkflow,
     AcceptanceLifecycleWorkflow,
+    ObservabilityAcceptanceWorkflow,
     IssueSolutionLoopWorkflow,
     GitHubBacklogImportWorkflow,
     ExistingGitHubBacklogLoopWorkflow,

@@ -51,6 +51,9 @@ class FakeService:
     async def start_acceptance(self, request: Any, validation_root: str) -> OperationAccepted:
         return OperationAccepted(workflow_id="acceptance-test", run_id="run-test")
 
+    async def start_observability_acceptance(self, request: Any) -> OperationAccepted:
+        return OperationAccepted(workflow_id="observability-acceptance-test", run_id="run-test")
+
     async def import_github_backlog(self, request: Any) -> BacklogImportAccepted:
         return BacklogImportAccepted(
             workflow_id="backlog-import-test",
@@ -304,6 +307,37 @@ def test_synthetic_validation_endpoint_requires_explicit_acceptance_enablement(
             json={"hold_seconds": 1},
         )
         assert response.status_code == 202
+
+
+def test_observability_acceptance_is_authenticated_gated_and_read_only() -> None:
+    app = create_app(
+        settings=Settings(acceptance_enabled=True),
+        service=FakeService(),
+        token="x" * 32,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+    with TestClient(app) as client:
+        unauthorized = client.post("/v1/validation/observability", json={"confirm_read_only": True})
+        accepted = client.post(
+            "/v1/validation/observability",
+            headers=headers,
+            json={"confirm_read_only": True},
+        )
+        rejected = client.post(
+            "/v1/validation/observability",
+            headers=headers,
+            json={"confirm_read_only": False},
+        )
+        injected = client.post(
+            "/v1/validation/observability",
+            headers=headers,
+            json={"confirm_read_only": True, "command": "shell"},
+        )
+    assert unauthorized.status_code == 401
+    assert accepted.status_code == 202
+    assert accepted.json()["workflow_id"] == "observability-acceptance-test"
+    assert rejected.status_code == 422
+    assert injected.status_code == 422
 
 
 def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:

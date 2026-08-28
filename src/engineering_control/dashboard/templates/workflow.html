@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">Durable workflow state</p><h2>Workflow detail</h2></div>
+  <a href="/workflows">Back to workflows</a>
+</section>
+<div id="workflow-detail" data-workflow-id="{{ workflow_id }}">
+  <p id="workflow-detail-error" class="alert error hidden" role="alert"></p>
+  <section id="workflow-identity" class="panel"></section>
+  <section class="section-heading"><h3>State timeline</h3></section>
+  <div id="workflow-timeline" class="timeline"></div>
+  <section class="section-heading"><h3>Provider executions</h3></section>
+  <div id="workflow-executions" class="table-shell"></div>
+  <section class="section-heading"><h3>Outcomes and blocker</h3></section>
+  <div class="two-column"><section id="workflow-outcomes" class="panel"></section><section id="workflow-blocker" class="panel"></section></div>
+</div>
+{% endblock %}

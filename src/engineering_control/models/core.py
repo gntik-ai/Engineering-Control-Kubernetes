@@ -68,6 +68,7 @@ class AgentRequest(StrictModel):
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|xhigh|max)$")
     model: str | None = None
     writable: bool = False
+    skip_git_repository_check: bool = False
     allowed_tools: tuple[str, ...] = ()
     instruction_bundle_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     instruction_bundle_sources: tuple[str, ...] = Field(default=(), max_length=20)

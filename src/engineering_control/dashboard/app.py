@@ -5,9 +5,11 @@ import hmac
 import ipaddress
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs
+from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -32,7 +34,7 @@ from engineering_control.dashboard.auth import (
     read_session_key,
 )
 from engineering_control.dashboard.dependencies import AuthenticatedSession
-from engineering_control.dashboard.events import sse_events
+from engineering_control.dashboard.events import sse_events, transcript_sse
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import ActivityEventInput, PasswordChangeInput
 from engineering_control.dashboard.service import DashboardService
@@ -176,9 +178,13 @@ def create_app(
     async def login_page(request: Request) -> Response:
         if request.query_params.get("asset") == "css":
             return FileResponse(STATIC_ROOT / "dashboard.css", media_type="text/css")
+        if request.query_params.get("asset") == "icon":
+            return Response(status_code=204)
         if await current_session(request) is not None:
-            return RedirectResponse("/backlog", status_code=303)
-        csrf = sessions.create_login_csrf()
+            return RedirectResponse("/overview", status_code=303)
+        csrf = request.cookies.get(LOGIN_CSRF_COOKIE, "")
+        if not csrf or not sessions.verify_login_csrf(csrf):
+            csrf = sessions.create_login_csrf()
         next_path = _safe_next(request.query_params.get("next"))
         response = templates.TemplateResponse(
             request=request,
@@ -230,7 +236,7 @@ def create_app(
             return response
         login_limiter.success(address)
         token = sessions.create(version)
-        redirect = RedirectResponse(next_path or "/backlog", status_code=303)
+        redirect = RedirectResponse(next_path or "/overview", status_code=303)
         _set_cookie(
             redirect, SESSION_COOKIE, token, max_age=resolved.dashboard_session_hours * 3600
         )
@@ -263,7 +269,18 @@ def create_app(
         authenticated = await require_session(request)
         if isinstance(authenticated, Response):
             return authenticated
-        return RedirectResponse("/backlog", status_code=303)
+        return RedirectResponse("/overview", status_code=303)
+
+    @app.get("/overview", response_class=HTMLResponse)
+    async def overview_page(request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return templates.TemplateResponse(
+            request=request,
+            name="overview.html",
+            context=page_context(request, authenticated, title="Overview", active="overview"),
+        )
 
     @app.get("/backlog", response_class=HTMLResponse)
     async def backlog_page(request: Request) -> Response:
@@ -276,15 +293,63 @@ def create_app(
             context=page_context(request, authenticated, title="Backlog", active="backlog"),
         )
 
-    @app.get("/activity", response_class=HTMLResponse)
+    @app.get("/activity")
     async def activity_page(request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return RedirectResponse("/logs", status_code=303)
+
+    @app.get("/logs", response_class=HTMLResponse)
+    async def logs_page(request: Request) -> Response:
         authenticated = await require_session(request)
         if isinstance(authenticated, Response):
             return authenticated
         return templates.TemplateResponse(
             request=request,
-            name="activity.html",
-            context=page_context(request, authenticated, title="Live Activity", active="activity"),
+            name="logs.html",
+            context=page_context(request, authenticated, title="Logs", active="logs"),
+        )
+
+    @app.get("/workflows", response_class=HTMLResponse)
+    async def workflows_page(request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return templates.TemplateResponse(
+            request=request,
+            name="workflows.html",
+            context=page_context(request, authenticated, title="Workflows", active="workflows"),
+        )
+
+    @app.get("/workflows/{workflow_id}", response_class=HTMLResponse)
+    async def workflow_page(workflow_id: str, request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        if not 1 <= len(workflow_id) <= 240:
+            raise HTTPException(status_code=404, detail="workflow not found")
+        return templates.TemplateResponse(
+            request=request,
+            name="workflow.html",
+            context={
+                **page_context(request, authenticated, title="Workflow detail", active="workflows"),
+                "workflow_id": workflow_id,
+            },
+        )
+
+    @app.get("/executions/{execution_id}", response_class=HTMLResponse)
+    async def execution_page(execution_id: UUID, request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return templates.TemplateResponse(
+            request=request,
+            name="execution.html",
+            context={
+                **page_context(request, authenticated, title="Execution", active="logs"),
+                "execution_id": str(execution_id),
+            },
         )
 
     @app.get("/audits", response_class=HTMLResponse)
@@ -405,6 +470,191 @@ def create_app(
         )
         return JSONResponse(result)
 
+    @app.get("/api/dashboard/overview")
+    async def overview_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).overview())
+
+    @app.get("/api/dashboard/workflows")
+    async def workflows_api(
+        request: Request,
+        project: str | None = None,
+        workflow_type: str | None = Query(default=None, max_length=80),
+        status: str | None = None,
+        provider: str | None = None,
+        role: str | None = Query(default=None, max_length=80),
+        worker: str | None = Query(default=None, max_length=32),
+        search: str | None = Query(default=None, max_length=200),
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        cursor: str | None = Query(default=None, max_length=1000),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        _validate_observability_filters(project, status, provider)
+        try:
+            value = await service(request).workflows(
+                project=project,
+                workflow_type=workflow_type,
+                status=status,
+                provider=provider,
+                role=role,
+                worker=worker,
+                search=search,
+                date_from=date_from,
+                date_to=date_to,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return JSONResponse(value)
+
+    @app.get("/api/dashboard/workflows/{workflow_id}")
+    async def workflow_api(workflow_id: str, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        if not 1 <= len(workflow_id) <= 240:
+            raise HTTPException(status_code=404, detail="workflow not found")
+        value = await service(request).workflow(workflow_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="workflow not found")
+        return JSONResponse(value)
+
+    @app.get("/api/dashboard/executions")
+    async def executions_api(
+        request: Request,
+        project: str | None = None,
+        workflow_id: str | None = Query(default=None, max_length=240),
+        issue_number: int | None = Query(default=None, ge=1),
+        campaign_id: UUID | None = None,
+        provider: str | None = None,
+        role: str | None = Query(default=None, max_length=80),
+        status: str | None = None,
+        worker: str | None = Query(default=None, max_length=32),
+        host: str | None = Query(default=None, max_length=253),
+        phase: str | None = Query(default=None, max_length=120),
+        search: str | None = Query(default=None, max_length=200),
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        cursor: str | None = Query(default=None, max_length=1000),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        _validate_observability_filters(project, status, provider)
+        try:
+            value = await service(request).executions(
+                project=project,
+                workflow_id=workflow_id,
+                issue_number=issue_number,
+                campaign_id=campaign_id,
+                provider=provider,
+                role=role,
+                status=status,
+                worker=worker,
+                host=host,
+                phase=phase,
+                search=search,
+                date_from=date_from,
+                date_to=date_to,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return JSONResponse(value)
+
+    @app.get("/api/dashboard/executions/{execution_id}")
+    async def execution_api(execution_id: UUID, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        value = await service(request).execution(execution_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="execution not found")
+        return JSONResponse(value)
+
+    @app.get("/api/dashboard/executions/{execution_id}/logs")
+    async def execution_logs_api(
+        execution_id: UUID,
+        request: Request,
+        limit: int = Query(default=200, ge=1, le=500),
+        before_sequence: int | None = Query(default=None, ge=1),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        value = await service(request).execution_logs(
+            execution_id,
+            limit=limit,
+            before_sequence=before_sequence,
+        )
+        if value is None:
+            raise HTTPException(status_code=404, detail="execution not found")
+        return JSONResponse(value)
+
+    @app.get("/api/dashboard/executions/{execution_id}/stream")
+    async def execution_stream_api(execution_id: UUID, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        if await service(request).execution(execution_id) is None:
+            raise HTTPException(status_code=404, detail="execution not found")
+        raw_id = request.headers.get("last-event-id", "0")
+        try:
+            after_sequence = max(0, int(raw_id))
+        except ValueError:
+            after_sequence = 0
+        response = StreamingResponse(
+            transcript_sse(
+                repo(request).observability,
+                execution_id,
+                after_sequence=after_sequence,
+                disconnected=request.is_disconnected,
+            ),
+            media_type="text/event-stream",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
+
+    @app.get("/api/dashboard/services")
+    async def services_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse(await service(request).services())
+
+    @app.get("/api/dashboard/root-blockers")
+    async def root_blockers_api(
+        request: Request,
+        project: str | None = None,
+        campaign_id: UUID | None = None,
+        cursor: str | None = Query(default=None, max_length=1000),
+        limit: int = Query(default=100, ge=1, le=100),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        _validate_filters(project, None)
+        try:
+            value = await service(request).root_blockers(
+                project=project,
+                campaign_id=campaign_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return JSONResponse(value)
+
     @app.get("/api/dashboard/audits")
     async def audits_api(
         request: Request, project: str | None = None, status: str | None = None
@@ -422,14 +672,15 @@ def create_app(
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        return JSONResponse({"items": await repo(request).recent_events(limit=limit)})
+        items = await repo(request).recent_events(limit=limit)
+        return JSONResponse({"items": items, "last_event_id": int(items[-1]["id"]) if items else 0})
 
     @app.get("/api/dashboard/activity/stream")
-    async def activity_stream(request: Request) -> Response:
+    async def activity_stream(request: Request, after_id: int = Query(default=0, ge=0)) -> Response:
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
-        raw_id = request.headers.get("last-event-id", "0")
+        raw_id = request.headers.get("last-event-id", str(after_id))
         try:
             after_id = max(0, int(raw_id))
         except ValueError:
@@ -510,9 +761,17 @@ def _valid_csrf(authenticated: AuthenticatedSession, supplied: str | None) -> bo
 
 
 def _safe_next(value: str | None) -> str:
-    if value in {"/backlog", "/activity", "/audits", "/settings"}:
+    if value in {
+        "/overview",
+        "/backlog",
+        "/workflows",
+        "/activity",
+        "/logs",
+        "/audits",
+        "/settings",
+    }:
         return value
-    return "/backlog"
+    return "/overview"
 
 
 def _client_address(request: Request) -> str:
@@ -537,6 +796,14 @@ def _validate_filters(project: str | None, status: str | None) -> None:
         raise HTTPException(status_code=422, detail="invalid status filter")
 
 
+def _validate_observability_filters(
+    project: str | None, status: str | None, provider: str | None
+) -> None:
+    _validate_filters(project, status)
+    if provider is not None and provider not in {"codex", "claude"}:
+        raise HTTPException(status_code=422, detail="invalid provider filter")
+
+
 async def _record_safely(repository: DashboardRepository, event: ActivityEventInput) -> None:
     try:
         await repository.record_event(event)
@@ -552,6 +819,7 @@ def run() -> None:
         host=settings.dashboard_host,
         port=settings.dashboard_port,
         access_log=False,
+        server_header=False,
     )
 
 

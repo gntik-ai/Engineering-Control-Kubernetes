@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">Engineering Control and Temporal projection</p><h2>Workflows</h2></div>
+  <p id="workflow-refreshed" class="muted" aria-live="polite">Loading…</p>
+</section>
+<form id="workflow-filters" class="filters" role="search">
+  <label>Project<select name="project"><option value="">All projects</option>{% for project in projects %}<option>{{ project }}</option>{% endfor %}</select></label>
+  <label>Type<input name="workflow_type" maxlength="80"></label>
+  <label>Status<select name="status"><option value="">All statuses</option>{% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select></label>
+  <label>Provider<select name="provider"><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
+  <label>Role<input name="role" maxlength="80"></label>
+  <label>Worker<select name="worker"><option value="">All workers</option><option>controller</option><option>worker</option></select></label>
+  <label>From<input name="date_from" type="datetime-local"></label>
+  <label>To<input name="date_to" type="datetime-local"></label>
+  <label>Search<input name="search" type="search" maxlength="200"></label>
+  <button type="submit">Apply</button>
+</form>
+<p id="workflow-error" class="alert error hidden" role="alert" aria-live="polite"></p>
+<div class="table-shell" tabindex="0" aria-label="Workflow results">
+  <table><thead><tr><th>Workflow</th><th>Project</th><th>Issue / campaign</th><th>Type</th><th>Status</th><th>Phase</th><th>Provider / role</th><th>Worker</th><th>Started</th><th>Last activity</th><th>Duration</th><th>Retry</th><th>Blocker</th></tr></thead><tbody id="workflow-rows"></tbody></table>
+</div>
+<p id="workflow-empty" class="empty hidden">No persisted workflows match these filters.</p>
+<div class="pagination"><button id="workflow-reset" type="button">First page</button><button id="workflow-next" type="button">Next</button></div>
+{% endblock %}

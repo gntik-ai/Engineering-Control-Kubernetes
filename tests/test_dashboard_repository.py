@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from engineering_control.dashboard.repository import DashboardRepository
-from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES, normalize_status
+from engineering_control.dashboard.status_mapping import (
+    NORMALIZED_STATUSES,
+    map_status,
+    normalize_status,
+)
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
     BacklogIssueRecord,
@@ -16,6 +20,13 @@ from engineering_control.db.models import (
     GitHubBacklogCampaign,
     Run,
     SolutionLoop,
+)
+from engineering_control.engineering.models import EnhancementStatus
+from engineering_control.models.enums import (
+    ChangeSetState,
+    CoverageStatus,
+    FindingDisposition,
+    RunStatus,
 )
 
 
@@ -107,15 +118,21 @@ def _issue(campaign_id: object, number: int, title: str, status: str) -> Backlog
 
 def test_all_normalized_statuses_are_reachable() -> None:
     raw = {
-        "backlog": "UNKNOWN_STATE",
+        "backlog": "BACKLOG",
+        "eligible": "ELIGIBLE",
         "queued": "QUEUED",
         "preparing": "PREPARING",
-        "running": "RUNNING",
-        "paused": "PAUSED",
+        "implementing": "IMPLEMENTING",
+        "reviewing": "REVIEWING",
+        "reworking": "REWORKING",
+        "testing": "TESTING",
+        "awaiting_ci": "AWAITING_CI",
         "awaiting_approval": "AWAITING_APPROVAL",
-        "blocked": "BLOCKED",
-        "verifying": "VERIFYING",
+        "building": "BUILDING",
         "deploying": "DEPLOYING",
+        "verifying": "VERIFYING",
+        "blocked": "BLOCKED",
+        "paused": "PAUSED",
         "completed": "COMPLETED",
         "failed": "FAILED",
         "cancelled": "CANCELLED",
@@ -123,6 +140,42 @@ def test_all_normalized_statuses_are_reachable() -> None:
     }
     assert tuple(raw) == NORMALIZED_STATUSES
     assert {normalize_status(value) for value in raw.values()} == set(NORMALIZED_STATUSES)
+    assert map_status("UNKNOWN_STATE").normalized == "blocked"
+    assert map_status("UNKNOWN_STATE").blocker_code == "UNKNOWN_STATUS_MAPPING"
+
+
+def test_every_persisted_status_enum_has_an_explicit_non_unknown_mapping() -> None:
+    values = [
+        *((value.value, "run") for value in RunStatus),
+        *((value.value, "coverage_cell") for value in CoverageStatus),
+        *((value.value, "change_set") for value in ChangeSetState),
+        *((value.value, "finding") for value in FindingDisposition),
+        *((value.value, "enhancement") for value in EnhancementStatus),
+        ("VERIFIED", "verification_result"),
+        ("PASSED", "coverage_cell"),
+        ("EXCLUDED", "coverage_cell"),
+    ]
+    for raw, entity_type in values:
+        assert map_status(raw, entity_type=entity_type).blocker_code != "UNKNOWN_STATUS_MAPPING", (
+            raw
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        ("prepare worktree", "preparing"),
+        ("maker", "implementing"),
+        ("checker review", "reviewing"),
+        ("correction", "reworking"),
+        ("test source", "testing"),
+        ("build artifact", "building"),
+        ("deployment", "deploying"),
+        ("runtime verify", "verifying"),
+    ],
+)
+def test_ambiguous_running_state_uses_phase(phase: str, expected: str) -> None:
+    assert normalize_status("RUNNING", phase=phase) == expected
 
 
 @pytest.mark.asyncio

@@ -274,3 +274,7 @@ class RecordList(APIModel):
 
 class AcceptanceLifecycleStart(APIModel):
     hold_seconds: int = Field(default=5, ge=1, le=30)
+
+
+class ObservabilityAcceptanceStart(APIModel):
+    confirm_read_only: Literal[True] = True

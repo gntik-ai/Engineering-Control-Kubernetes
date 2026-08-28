@@ -125,6 +125,8 @@ for repository in falcone falcone-charts musematic musematic-deploy llmwiki \
   install -d -o scan-runner -g scan-runner -m 0730 \
     "${PLATFORM_ROOT}/worktrees/${repository}"
 done
+install -d -o scan-runner -g scan-runner -m 0755 \
+  "${PLATFORM_ROOT}/worktrees/observability-canary"
 for kind in codex claude browser scan delivery release; do
   owner="${kind}-runner"
   install -d -o "${owner}" -g "${owner}" -m 0750 "${STATE_ROOT}/workers/${kind}"

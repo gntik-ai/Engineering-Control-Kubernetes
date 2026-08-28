@@ -36,6 +36,7 @@ from engineering_control.api.schemas import (
     LLMWikiBootstrapPlanRequest,
     LoopPlanDispatch,
     LoopStartDispatch,
+    ObservabilityAcceptanceStart,
     OperationAccepted,
     RecordList,
     RollbackRequest,
@@ -50,6 +51,10 @@ from engineering_control.db.repository import (
 )
 from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project, RiskClass
+from engineering_control.observability.agent import (
+    AgentObservabilityRepository,
+    GatewayEventInput,
+)
 from engineering_control.observability.metrics import ControlPlaneMetrics
 
 
@@ -59,6 +64,7 @@ def create_app(
     service: ControlService | None = None,
     repository: MetadataRepository | None = None,
     token: str | None = None,
+    gateway_repository: AgentObservabilityRepository | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
 
@@ -75,6 +81,10 @@ def create_app(
                 )
             )
         app.state.metadata_repository = resolved_repository
+        app.state.gateway_repository = gateway_repository or AgentObservabilityRepository(
+            resolved.database_url.get_secret_value(),
+            maximum_transcript_bytes=resolved.dashboard_transcript_max_bytes,
+        )
         if service is None:
             client = await Client.connect(
                 resolved.temporal_target, namespace=resolved.temporal_namespace
@@ -85,6 +95,8 @@ def create_app(
         else:
             app.state.control_service = service
         yield
+        if gateway_repository is None:
+            cast(AgentObservabilityRepository, app.state.gateway_repository).engine.dispose()
 
     app = FastAPI(
         title="Engineering Control API",
@@ -103,6 +115,9 @@ def create_app(
 
     def metadata(request: Request) -> MetadataRepository:
         return cast(MetadataRepository, request.app.state.metadata_repository)
+
+    def gateway_events(request: Request) -> AgentObservabilityRepository:
+        return cast(AgentObservabilityRepository, request.app.state.gateway_repository)
 
     control_dependency = Depends(control)
     metadata_dependency = Depends(metadata)
@@ -677,6 +692,16 @@ def create_app(
             response[provider] = value
         return response
 
+    @app.post("/v1/observability/gateway-events", status_code=202)
+    async def gateway_event(
+        request: Request,
+        body: GatewayEventInput,
+        subject: str = auth_dependency,
+    ) -> dict[str, object]:
+        if subject != "hermes-gateway":
+            raise HTTPException(status_code=403, detail="gateway event identity required")
+        return await gateway_events(request).gateway_event(subject, body)
+
     @app.get("/v1/evidence/{artifact_id}")
     async def evidence_get(
         artifact_id: UUID,
@@ -697,6 +722,23 @@ def create_app(
         if not resolved.acceptance_enabled:
             raise HTTPException(status_code=404, detail="synthetic validation is disabled")
         return await service.start_acceptance(body, str(resolved.acceptance_root))
+
+    @app.post(
+        "/v1/validation/observability",
+        response_model=OperationAccepted,
+        status_code=202,
+    )
+    async def validation_observability(
+        body: ObservabilityAcceptanceStart,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        if not resolved.acceptance_enabled:
+            raise HTTPException(status_code=404, detail="synthetic validation is disabled")
+        try:
+            return await service.start_observability_acceptance(body)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/internal/metrics", include_in_schema=False)
     async def internal_metrics(

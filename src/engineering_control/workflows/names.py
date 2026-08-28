@@ -13,6 +13,7 @@ class WorkflowName(StrEnum):
     QUOTA_REFRESH = "QuotaRefreshWorkflow"
     CLEANUP = "CleanupWorkflow"
     ACCEPTANCE_LIFECYCLE = "AcceptanceLifecycleWorkflow"
+    OBSERVABILITY_ACCEPTANCE = "ObservabilityAcceptanceWorkflow"
     ISSUE_SOLUTION_LOOP = "IssueSolutionLoopWorkflow"
     GITHUB_BACKLOG_IMPORT = "GitHubBacklogImportWorkflow"
     EXISTING_GITHUB_BACKLOG_LOOP = "ExistingGitHubBacklogLoopWorkflow"

@@ -125,11 +125,29 @@ async def run_jsonl_process(
 
     async def consume_stderr() -> None:
         nonlocal stderr_size
+        pending = ""
+
+        async def emit_visible(value: str) -> None:
+            report = redactor.redact_text(value.rstrip("\r\n"))
+            if on_event is not None and str(report.value):
+                await on_event({"type": "provider.stderr", "text": str(report.value)})
+
         while chunk := await stderr_stream.read(8192):
             remaining = max_stderr_bytes - stderr_size
             if remaining > 0:
                 stderr_chunks.append(chunk[:remaining])
                 stderr_size += min(len(chunk), remaining)
+            pending += chunk.decode("utf-8", errors="replace")
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                await emit_visible(line)
+            while len(pending.encode("utf-8")) > 16_384:
+                encoded = pending.encode("utf-8")
+                segment = encoded[:16_384].decode("utf-8", errors="ignore")
+                await emit_visible(segment)
+                pending = pending[len(segment) :]
+        if pending:
+            await emit_visible(pending)
 
     timed_out = False
     readers = asyncio.gather(consume_stdout(), consume_stderr())

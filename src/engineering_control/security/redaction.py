@@ -25,6 +25,16 @@ class SecretRedactor:
             rf"\1{REDACTED}",
         ),
         (
+            "basic_authorization",
+            re.compile(r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{12,}"),
+            rf"\1{REDACTED}",
+        ),
+        (
+            "cookie",
+            re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)[^\r\n]{4,}"),
+            rf"\1{REDACTED}",
+        ),
+        (
             "jwt",
             re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
             REDACTED,
@@ -32,6 +42,11 @@ class SecretRedactor:
         (
             "github_token",
             re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+            REDACTED,
+        ),
+        (
+            "provider_token",
+            re.compile(r"\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}|hcloud_[A-Za-z0-9_-]{20,})\b"),
             REDACTED,
         ),
         ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), REDACTED),
@@ -55,9 +70,21 @@ class SecretRedactor:
             re.compile(r"(?i)(https?://[^\s:/@]+:)[^\s/@]+(@)"),
             rf"\1{REDACTED}\2",
         ),
+        (
+            "url_query_credential",
+            re.compile(
+                r"(?i)([?&](?:access[_-]?token|auth|authorization|key|password|passwd|secret|session|signature|token)=)[^&#\s]+"
+            ),
+            rf"\1{REDACTED}",
+        ),
+        (
+            "kubeconfig_credential",
+            re.compile(r"(?im)^(\s*(?:token|client-key-data|password)\s*:\s*)[^\r\n]+$"),
+            rf"\1{REDACTED}",
+        ),
     )
     _sensitive_keys = re.compile(
-        r"(?i)(password|passwd|secret|token|api.?key|access.?key|client.?secret|private.?key|encryption.?key|credential|kubeconfig)"
+        r"(?i)(authorization|cookie|password|passwd|secret|session|token|api.?key|access.?key|client.?secret|private.?key|encryption.?key|credential|kubeconfig)"
     )
     _safe_reference_keys = re.compile(r"(?i)(?:_path|_file|_filename|_ref|_reference|_id|_sha256)$")
     _usage_counter_keys = frozenset(
@@ -84,7 +111,7 @@ class SecretRedactor:
     def redact_text(self, value: str) -> RedactionReport:
         replacements = 0
         categories: list[str] = []
-        redacted = value
+        redacted = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", value)
         for secret in sorted(self._runtime_secrets, key=len, reverse=True):
             redacted, count = redacted.replace(secret, REDACTED), redacted.count(secret)
             if count:

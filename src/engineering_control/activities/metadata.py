@@ -25,7 +25,9 @@ from engineering_control.activities.retention import (
 )
 from engineering_control.config import Settings
 from engineering_control.db.models import (
+    AgentExecution,
     AgentInvocation,
+    AgentLogChunk,
     Approval,
     ApprovalCandidate,
     Artifact,
@@ -67,9 +69,11 @@ from engineering_control.models.reconciliation import (
     PromotionPlan,
     PromotionPublication,
 )
+from engineering_control.observability.agent import normalize_agent_role
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
+from engineering_control.security.redaction import SecretRedactor
 
 
 class QuotaSnapshotRecord(BaseModel):
@@ -288,6 +292,8 @@ class MetadataActivityHandler:
         "runtime.independent_review": "runtime_review_request",
         "enhancement.discover": "discovery_request",
         "enhancement.product_review": "product_review_request",
+        "observability.invoke_codex": "maker_request",
+        "observability.invoke_claude": "checker_request",
     }
 
     supported_steps = frozenset(
@@ -351,11 +357,16 @@ class MetadataActivityHandler:
             "cleanup.execute_metadata",
             "cleanup.finalize",
             "quota.persist",
+            "observability.register",
+            "observability.prepare_codex",
+            "observability.prepare_claude",
+            "observability.finalize",
         }
     )
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.redactor = SecretRedactor()
         database_url = settings.database_url.get_secret_value()
         self.engine = create_engine(
             database_url,
@@ -513,6 +524,14 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._finalize_cleanup, payload)
             if step == "quota.persist":
                 return await self._quota(payload)
+            if step == "observability.register":
+                return await asyncio.to_thread(self._register_observability, payload)
+            if step == "observability.prepare_codex":
+                return self._prepare_observability_codex(payload)
+            if step == "observability.prepare_claude":
+                return self._prepare_observability_claude(payload)
+            if step == "observability.finalize":
+                return await asyncio.to_thread(self._finalize_observability, payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
             raise ApplicationError(
                 f"invalid metadata activity input for {step}",
@@ -556,11 +575,262 @@ class MetadataActivityHandler:
                 run.started_at = now
             if run.status == "QUEUED":
                 run.status = "RUNNING"
+            execution = session.get(AgentExecution, request.run_id)
+            if execution is None:
+                orchestration = payload.get("orchestration")
+                context = orchestration if isinstance(orchestration, dict) else {}
+                repository_full_name: str | None = None
+                issue_number: int | None = None
+                if run.change_set_id is not None:
+                    change_set = session.get(ChangeSet, run.change_set_id)
+                    if change_set is not None:
+                        repository_full_name = change_set.source_repository
+                        if change_set.issue_id is not None:
+                            issue = session.get(Issue, change_set.issue_id)
+                            if issue is not None:
+                                issue_number = issue.number
+                                repository_full_name = issue.repository or repository_full_name
+                raw_issue = payload.get("issue_number")
+                if issue_number is None and isinstance(raw_issue, int) and raw_issue > 0:
+                    issue_number = raw_issue
+                attempt = int(context.get("attempt", 1))
+                execution = AgentExecution(
+                    id=request.run_id,
+                    workflow_id=workflow_id,
+                    temporal_run_id=str(context.get("workflow_run_id") or "") or None,
+                    activity_id=str(context.get("activity_id") or "") or None,
+                    project=request.project.value,
+                    repository_full_name=repository_full_name,
+                    issue_number=issue_number,
+                    campaign_id=request.campaign_id or run.campaign_id,
+                    change_set_id=request.change_set_id or run.change_set_id,
+                    provider=request.provider.value,
+                    role=normalize_agent_role(request.role),
+                    host=None,
+                    worker_kind=request.provider.value,
+                    task_queue=None,
+                    status="QUEUED",
+                    phase=str(payload["provider_step"])[:120],
+                    selection_reason="workflow routing decision",
+                    cli_path_identifier=request.provider.value,
+                    cli_version=None,
+                    attempt=max(1, attempt),
+                    max_attempts=max(1, attempt),
+                    started_at=None,
+                    last_heartbeat_at=None,
+                    ended_at=None,
+                    exit_code=None,
+                    retryable=None,
+                    blocker_code=None,
+                    error_summary=None,
+                    output_truncated=False,
+                    transcript_incomplete=False,
+                    total_log_bytes=0,
+                    redaction_count=0,
+                )
+                session.add(execution)
+            elif (
+                execution.workflow_id != workflow_id
+                or execution.provider != request.provider.value
+                or execution.role != normalize_agent_role(request.role)
+            ):
+                raise ValueError("agent execution identity conflicts with controller registration")
         return {
             **payload,
             "agent_invocation_id": str(request.run_id),
             "agent_invocation_status": "RUNNING",
         }
+
+    def _observability_workspace(self, payload: dict[str, Any]) -> Path:
+        workspace_id = UUID(str(payload["workspace_id"]))
+        expected = self.settings.worktree_root / "observability-canary" / str(workspace_id)
+        workspace = Path(str(payload["workspace"]))
+        if not workspace.is_absolute() or workspace != expected or ".." in workspace.parts:
+            raise ValueError("observability canary workspace identity is invalid")
+        return workspace
+
+    def _register_observability(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = UUID(str(payload["workspace_id"]))
+        workflow_id = self._workflow_id(payload)
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(Run)
+                .where(Run.workflow_id == workflow_id)
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if run is None:
+                run = Run(
+                    id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
+                    workflow_id=workflow_id,
+                    run_type="synthetic-observability",
+                    status="QUEUED",
+                    project=Project.FALCONE.value,
+                    worker="controller",
+                )
+                session.add(run)
+            elif run.run_type != "synthetic-observability" or run.project != "falcone":
+                raise ValueError("observability workflow identity conflicts with a control run")
+            queued = session.scalar(
+                select(DashboardEvent.id)
+                .where(
+                    DashboardEvent.workflow_id == workflow_id,
+                    DashboardEvent.event_type == "workflow.queued",
+                )
+                .limit(1)
+            )
+            if queued is None:
+                session.add(
+                    DashboardEvent(
+                        occurred_at=now,
+                        level="INFO",
+                        event_type="workflow.queued",
+                        source="controller",
+                        worker_kind="controller",
+                        project="falcone",
+                        workflow_id=workflow_id,
+                        entity_type="synthetic_observability_acceptance",
+                        entity_id=str(workspace_id),
+                        current_phase="queued",
+                        message="Native provider observability canary queued",
+                        metadata_json={"status": "QUEUED"},
+                    )
+                )
+        return {**payload, "status": "QUEUED"}
+
+    @staticmethod
+    def _observability_schema(provider: str) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision", "provider", "summary"],
+            "properties": {
+                "decision": {"type": "string", "const": "PASS"},
+                "provider": {"type": "string", "const": provider},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 240},
+            },
+        }
+
+    def _prepare_observability_codex(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace = self._observability_workspace(payload)
+        workflow_id = self._workflow_id(payload)
+        request = AgentRequest(
+            run_id=uuid5(NAMESPACE_URL, f"observability-codex:{workflow_id}"),
+            project=Project.FALCONE,
+            role="implementer",
+            provider=Provider.CODEX,
+            model_class=ModelClass.WORKER,
+            prompt=(
+                "This is a read-only Engineering Control observability canary. Do not call tools, "
+                "read files, modify files, access credentials, or make external requests. Return "
+                "only the required JSON with decision PASS, provider codex, and a short safe "
+                "summary confirming visible-output streaming."
+            ),
+            working_directory=str(workspace),
+            output_schema=self._observability_schema("codex"),
+            timeout_seconds=300,
+            effort="low",
+            writable=False,
+            skip_git_repository_check=True,
+            allowed_tools=("Read", "Glob", "Grep"),
+        )
+        return {
+            **payload,
+            "status": "PREPARING",
+            "maker_provider": "codex",
+            "provider_selection_reason": "read-only canary routes maker to native Codex CLI",
+            "maker_request": request.model_dump(mode="json"),
+        }
+
+    def _prepare_observability_claude(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace = self._observability_workspace(payload)
+        raw_codex = payload.get("agent_result")
+        codex_result = AgentResult.model_validate(raw_codex)
+        if (
+            codex_result.status.value != "SUCCESS"
+            or codex_result.structured_result.get("decision") != "PASS"
+            or codex_result.structured_result.get("provider") != "codex"
+        ):
+            raise ValueError("Codex canary result did not satisfy its immutable contract")
+        workflow_id = self._workflow_id(payload)
+        request = AgentRequest(
+            run_id=uuid5(NAMESPACE_URL, f"observability-claude:{workflow_id}"),
+            project=Project.FALCONE,
+            role="code-reviewer",
+            provider=Provider.CLAUDE,
+            model_class=ModelClass.JUDGE,
+            prompt=(
+                "This is an independent read-only Engineering Control observability canary. Do "
+                "not call tools, read files, modify files, access credentials, or make external "
+                "requests. Return only the required JSON with decision PASS, provider claude, "
+                "and a short safe summary confirming checker visible-output streaming."
+            ),
+            working_directory=str(workspace),
+            output_schema=self._observability_schema("claude"),
+            timeout_seconds=300,
+            effort="low",
+            writable=False,
+            allowed_tools=("Read", "Glob", "Grep"),
+        )
+        return {
+            **payload,
+            "status": "PREPARING",
+            "codex_result": codex_result.model_dump(mode="json"),
+            "checker_provider": "claude",
+            "provider_selection_reason": "read-only canary routes checker to native Claude CLI",
+            "checker_request": request.model_dump(mode="json"),
+        }
+
+    def _finalize_observability(self, payload: dict[str, Any]) -> dict[str, Any]:
+        terminal = str(payload.get("terminal_status", "FAILED"))
+        if terminal not in {"COMPLETED", "FAILED"}:
+            raise ValueError("observability canary terminal status is invalid")
+        workflow_id = self._workflow_id(payload)
+        if terminal == "COMPLETED":
+            claude = AgentResult.model_validate(payload.get("agent_result"))
+            codex = AgentResult.model_validate(payload.get("codex_result"))
+            if (
+                codex.provider is not Provider.CODEX
+                or claude.provider is not Provider.CLAUDE
+                or codex.structured_result.get("decision") != "PASS"
+                or claude.structured_result.get("decision") != "PASS"
+                or claude.structured_result.get("provider") != "claude"
+            ):
+                raise ValueError("observability canary provider independence is incomplete")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(Run).where(Run.workflow_id == workflow_id).order_by(Run.created_at.desc())
+            )
+            if run is None:
+                raise ValueError("observability canary control run is missing")
+            run.status = terminal
+            run.finished_at = now
+            run.error_code = str(payload.get("blocker") or "")[:120] or None
+            session.add(
+                DashboardEvent(
+                    occurred_at=now,
+                    level="INFO" if terminal == "COMPLETED" else "ERROR",
+                    event_type=(
+                        "workflow.completed" if terminal == "COMPLETED" else "workflow.failed"
+                    ),
+                    source="controller",
+                    worker_kind="controller",
+                    project=run.project,
+                    workflow_id=workflow_id,
+                    entity_type="synthetic_observability_acceptance",
+                    entity_id=str(payload["workspace_id"]),
+                    current_phase="observability.finalize",
+                    message=(
+                        "Native provider observability canary completed"
+                        if terminal == "COMPLETED"
+                        else "Native provider observability canary failed"
+                    ),
+                    metadata_json={"status": terminal},
+                )
+            )
+        return {**payload, "status": terminal}
 
     def _persist_agent_result(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = self._agent_request(payload)
@@ -643,6 +913,61 @@ class MetadataActivityHandler:
                     run.error_code = result.error_code or result.status.value
                     if result.status.value != "RATE_LIMITED":
                         run.finished_at = result.finished_at
+                execution = session.get(AgentExecution, request.run_id)
+                if execution is not None:
+                    observability = payload.get("observability")
+                    observation = observability if isinstance(observability, dict) else {}
+                    execution.status = result.status.value
+                    execution.started_at = execution.started_at or result.started_at
+                    execution.last_heartbeat_at = result.finished_at
+                    execution.ended_at = result.finished_at
+                    execution.exit_code = result.exit_code
+                    execution.retryable = result.status.value == "RATE_LIMITED"
+                    execution.blocker_code = result.error_code
+                    execution.error_summary = (
+                        str(self.redactor.redact_text(result.summary).value)[:4000]
+                        if result.status.value != "SUCCESS" and result.summary
+                        else None
+                    )
+                    if execution.host is None:
+                        execution.transcript_incomplete = True
+                    execution.transcript_incomplete = bool(
+                        execution.transcript_incomplete
+                        or observation.get("transcript_incomplete") is True
+                    )
+                    execution.output_truncated = bool(
+                        execution.output_truncated or observation.get("output_truncated") is True
+                    )
+                    incomplete_event = session.scalar(
+                        select(DashboardEvent.id)
+                        .where(
+                            DashboardEvent.event_type == "provider.observability_incomplete",
+                            DashboardEvent.entity_id == str(execution.id),
+                        )
+                        .limit(1)
+                    )
+                    if execution.transcript_incomplete and incomplete_event is None:
+                        session.add(
+                            DashboardEvent(
+                                occurred_at=now,
+                                level="WARNING",
+                                event_type="provider.observability_incomplete",
+                                source="controller",
+                                worker_kind="controller",
+                                project=run.project,
+                                workflow_id=run.workflow_id,
+                                campaign_id=str(run.campaign_id) if run.campaign_id else None,
+                                entity_type="agent_execution",
+                                entity_id=str(execution.id),
+                                current_phase=execution.phase,
+                                message="Provider transcript observability is incomplete",
+                                metadata_json={
+                                    "provider": execution.provider,
+                                    "role": execution.role,
+                                    "status": execution.status,
+                                },
+                            )
+                        )
             else:
                 status = str(payload.get("status", "BLOCKED"))
                 blocker = str(payload.get("blocker", status))
@@ -662,6 +987,16 @@ class MetadataActivityHandler:
                 run.error_code = blocker
                 if status != "RATE_LIMITED":
                     run.finished_at = now
+                execution = session.get(AgentExecution, request.run_id)
+                if execution is not None:
+                    execution.status = status
+                    execution.last_heartbeat_at = now
+                    execution.ended_at = now
+                    execution.retryable = status == "RATE_LIMITED"
+                    execution.blocker_code = blocker
+                    execution.error_summary = blocker
+                    if execution.host is None:
+                        execution.transcript_incomplete = True
         return {
             **payload,
             "agent_invocation_id": str(request.run_id),
@@ -740,6 +1075,8 @@ class MetadataActivityHandler:
             return "issue-delivery"
         if provider_step.startswith("runtime."):
             return "runtime-verification"
+        if provider_step.startswith("observability."):
+            return "synthetic-observability"
         raise ValueError("provider telemetry step has no bounded run type")
 
     @staticmethod
@@ -4866,6 +5203,27 @@ class MetadataActivityHandler:
                 )
                 or 0
             )
+            log_cutoff = now - timedelta(days=self.settings.dashboard_agent_log_retention_days)
+            execution_cutoff = now - timedelta(
+                days=self.settings.dashboard_agent_execution_retention_days
+            )
+            agent_log_cleanup_count = int(
+                session.scalar(
+                    select(func.count(AgentLogChunk.id)).where(
+                        AgentLogChunk.created_at < log_cutoff
+                    )
+                )
+                or 0
+            )
+            agent_execution_cleanup_count = int(
+                session.scalar(
+                    select(func.count(AgentExecution.id)).where(
+                        AgentExecution.updated_at < execution_cutoff,
+                        AgentExecution.ended_at.is_not(None),
+                    )
+                )
+                or 0
+            )
         return {
             **payload,
             "status": "CLEANUP_CANDIDATES_DISCOVERED",
@@ -4874,6 +5232,8 @@ class MetadataActivityHandler:
             "file_cleanup_candidates": file_candidates,
             "preview_namespace_cleanup_candidates": preview_candidates,
             "dashboard_event_cleanup_count": dashboard_event_cleanup_count,
+            "agent_log_cleanup_count": agent_log_cleanup_count,
+            "agent_execution_cleanup_count": agent_execution_cleanup_count,
             "protected_count": protected_count,
         }
 
@@ -5131,6 +5491,8 @@ class MetadataActivityHandler:
         purged: list[str] = []
         cleaned_previews: list[str] = []
         deleted_dashboard_events = 0
+        deleted_agent_logs = 0
+        deleted_agent_executions = 0
         candidate_fields = set(FileCleanupCandidate.model_fields)
         preview_fields = set(PreviewNamespaceCleanupCandidate.model_fields)
         with self.sessions.begin() as session:
@@ -5231,6 +5593,33 @@ class MetadataActivityHandler:
                 session.delete(event)
             deleted_dashboard_events = len(expired_events)
 
+            log_cutoff = now - timedelta(days=self.settings.dashboard_agent_log_retention_days)
+            expired_logs = session.scalars(
+                select(AgentLogChunk)
+                .where(AgentLogChunk.created_at < log_cutoff)
+                .order_by(AgentLogChunk.id)
+                .limit(10_000)
+            ).all()
+            for chunk in expired_logs:
+                session.delete(chunk)
+            deleted_agent_logs = len(expired_logs)
+
+            execution_cutoff = now - timedelta(
+                days=self.settings.dashboard_agent_execution_retention_days
+            )
+            expired_executions = session.scalars(
+                select(AgentExecution)
+                .where(
+                    AgentExecution.updated_at < execution_cutoff,
+                    AgentExecution.ended_at.is_not(None),
+                )
+                .order_by(AgentExecution.updated_at)
+                .limit(10_000)
+            ).all()
+            for execution in expired_executions:
+                session.delete(execution)
+            deleted_agent_executions = len(expired_executions)
+
         return {
             **payload,
             "status": "METADATA_CLEANUP_EXECUTED",
@@ -5238,6 +5627,8 @@ class MetadataActivityHandler:
             "purged_artifact_ids": sorted(purged),
             "cleaned_preview_deployment_ids": sorted(cleaned_previews),
             "deleted_dashboard_event_count": deleted_dashboard_events,
+            "deleted_agent_log_count": deleted_agent_logs,
+            "deleted_agent_execution_count": deleted_agent_executions,
         }
 
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:

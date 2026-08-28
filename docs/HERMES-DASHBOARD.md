@@ -9,17 +9,66 @@ proxies the `ade.musematic.ai` virtual host to that loopback address. The existi
 
 The dashboard is observational. It reads existing PostgreSQL solution loops, GitHub backlog
 campaigns, ChangeSets, Runs, campaigns, coverage cells and findings. It has no workflow, GitHub,
-provider, deployment, shell or Kubernetes mutation route. Migration `0010` adds only:
+provider, deployment, shell or Kubernetes mutation route. The authenticated navigation is:
+
+- **Overview** — current work, queue/blocker summaries and persisted service/provider health;
+- **Backlog** — issues and their current workflow/provider state;
+- **Workflows** — cursor-paginated workflow summaries and durable detail timelines;
+- **Audits** — campaigns, current cells and grouped root blockers;
+- **Logs** — redacted operational events and native-agent execution transcripts;
+- **Settings** — dashboard password change only.
+
+Legacy `/activity` bookmarks redirect to `/logs`; the authenticated root redirects to `/overview`.
+Migration `0010` adds only:
 
 - the singleton `dashboard_authentication` row, containing an Argon2id hash and password version;
 - `dashboard_events`, a bounded redacted activity projection with monotonically increasing IDs;
 - fail-open PostgreSQL projection triggers whose insertion failures cannot change workflow writes.
 
-The backlog preserves raw Hermes state while mapping it to `backlog`, `queued`, `preparing`,
-`running`, `paused`, `awaiting_approval`, `blocked`, `verifying`, `deploying`, `completed`, `failed`,
-`cancelled` or `skipped`. Active items sort first. Audit completion is terminal coverage cells divided
-by total cells; a zero-cell campaign reports zero percent. Event streaming uses authenticated SSE,
-bounded PostgreSQL reads, `Last-Event-ID`, heartbeats and a 1,000-row browser cap.
+Additive migration `0011` adds `agent_executions` and `agent_log_chunks`. It preserves the
+dashboard password hash/version, session key, all prior dashboard events, workflow state, backlog,
+campaign, finding and evidence data. Each execution summary correlates workflow/run/activity,
+project, issue/campaign/ChangeSet, provider, canonical role, host, worker, task queue, phase,
+attempts, heartbeat and blocker. Transcript chunks contain only bounded, already CLI-visible,
+redacted text; they never contain hidden model reasoning.
+
+Raw state remains visible. The canonical normalized states are `backlog`, `eligible`, `queued`,
+`preparing`, `implementing`, `reviewing`, `reworking`, `testing`, `awaiting_ci`,
+`awaiting_approval`, `building`, `deploying`, `verifying`, `blocked`, `paused`, `completed`,
+`failed`, `cancelled` and `skipped`. Unknown raw states fail closed as `blocked` with
+`UNKNOWN_STATUS_MAPPING`. Roles normalize to maker, checker, auditor, reviewer or verifier while
+their raw role remains durable metadata. Audit completion uses terminal coverage cells divided by
+total cells; zero-cell campaigns report zero percent and indeterminate work never receives a false
+percentage.
+
+Operational-event and transcript streams use authenticated SSE, ordered event IDs,
+`Last-Event-ID`, bounded PostgreSQL reads, approximately 15-second heartbeats and clean disconnect
+handling. Event pages retain at most 1,000 rows; transcript pages retain at most 1,500 rendered
+lines. Browser filters survive refresh and use URL query parameters where appropriate.
+
+## Native-agent transcript and redaction contract
+
+Only the native Codex CLI and native Claude Code CLI are provider executions. The provider worker
+creates an execution before spawn, reports a roughly ten-second heartbeat, incrementally normalizes
+visible output, and closes the execution in a `finally` boundary. Persistence failures do not alter
+provider results; instead the summary is marked `transcript_incomplete`. Transcript text is capped
+at 5 MiB per execution, normalized lines at 16 KiB and persisted chunks at approximately 64 KiB.
+Excess output sets `output_truncated` once while execution continues.
+
+The canonical redactor runs before database insertion, SSE and HTML. It removes credential fields,
+authorization headers, cookies, JWTs, private-key blocks, provider token forms, password/secret
+assignments, kubeconfig credential material, credential-bearing URLs and ANSI-obscured variants.
+Git commit SHAs and ordinary long operational identifiers remain visible. Original unredacted text
+is never retained next to a redacted value. Raw prompts, unrestricted tool results, environment
+values and raw journals remain SSH/operator-only.
+
+Provider roles mean:
+
+- **maker** — bounded implementation activity (raw roles such as `implementer`);
+- **checker** — independent code or outcome review;
+- **auditor** — a coverage-cell/domain assessment;
+- **reviewer** — release or plan review;
+- **verifier** — finding or runtime verification.
 
 ## Authentication and password files
 
@@ -90,28 +139,61 @@ filesystem sandbox, loopback-only network access and explicit inaccessible opera
 paths. It receives neither the Hetzner token nor product, GitHub, registry, Kubernetes, Codex,
 Claude or Telegram credentials.
 
-Dashboard events default to 14-day retention. The existing authorized metadata cleanup activity
-counts expired events during discovery and deletes at most 10,000 per execution only after the
-normal cleanup authorization and execution switch. Evidence artifacts are not dashboard events and
-are unaffected.
+Dashboard operational events default to 30-day retention, transcript chunks to 7 days and agent
+execution summaries to 90 days. These non-secret settings are validated configuration. The existing
+authorized metadata cleanup activity counts expired rows during discovery and deletes at most
+10,000 per execution only after normal cleanup authorization and the execution switch. Summary rows
+are removed only when their expired chunks are already gone. Audit, finding, deployment and other
+evidence artifacts are not transcript rows and are unaffected.
+
+Overview health is a persisted, bounded snapshot, never a probe of provider credential stores. Each
+entry names its source, observation time, freshness and stale state. `unknown` means no safe probe
+has been persisted; it is not treated as healthy. The dashboard service remains unable to read
+Codex, Claude, GitHub, Kubernetes or operator authentication directories.
+
+## Read-only observability acceptance
+
+When the existing acceptance feature flag is enabled, the authenticated private API exposes one
+strict synthetic canary at `POST /v1/validation/observability` with the literal
+`{"confirm_read_only": true}` contract. It creates an empty bounded workspace, records a queued
+workflow, runs native Codex as a read-only maker, runs native Claude as an independent read-only
+checker, persists their bounded visible transcripts, finalizes the workflow and removes the empty
+workspace. It cannot accept a repository, command, prompt, provider or tool argument and performs
+no product, GitHub, Kubernetes, deployment or repository mutation.
+
+Troubleshooting checks:
+
+```bash
+curl --fail http://127.0.0.1:8750/health/ready
+systemctl status engineering-dashboard.service
+journalctl -u engineering-dashboard.service --since '30 minutes ago'
+```
+
+For a missing transcript, inspect the execution's `transcript_incomplete`, worker heartbeat and
+persisted service-health source. Do not grant the dashboard access to provider auth stores and do
+not expose `journalctl` through a web route.
 
 ## Backup, upgrade and rollback
 
-Before installation, take fresh root-owned runtime and PostgreSQL backups. Install only the exact
-committed tree using the existing commit-addressed controller bootstrap. Migration `0010` is
-additive; upgrade readers remain compatible with the existing tables.
+Before installation, take fresh root-owned runtime, configuration and PostgreSQL backups. Install
+only the exact committed tree using the existing commit-addressed controller bootstrap. Because
+provider adapters and worker instrumentation are part of this release, controller and worker must
+run the exact same committed tree. Apply migration `0011` only after the database backup, then
+restart only the affected controller, provider, scan, evidence-ingest and dashboard services.
+Preserve the current password hash/version, session key, DNS, Caddy and TLS state.
 
 Normal rollback:
 
-1. Stop and disable `engineering-dashboard.service`.
-2. Remove only the independent `ade.musematic.ai` Caddy site and validate/reload Caddy.
-3. Switch `/opt/engineering-control/source` to the recorded previous release and restart the
-   pre-existing services.
-4. Downgrade `0010` to `0009` only after stopping dashboard/event writers and backing up PostgreSQL;
-   this removes dashboard password/session state and dashboard events only.
-5. Remove the dashboard session-key file and directory only after the service is stopped.
-6. If DNS rollback is explicitly requested, run the fixed helper's `rollback` operation as
-   `hermes`; it restores the exact pre-change `ade A` RRSet backup and nothing else.
+1. Stop the affected new-release dashboard/controller/provider writers.
+2. Switch controller and worker `/opt/engineering-control/source` links to their recorded previous
+   commit-addressed releases.
+3. Restart the previous controller, worker and dashboard services in controlled order.
+4. Leave `agent_executions` and `agent_log_chunks` in place by default; the previous release ignores
+   additive tables.
+5. If a database downgrade is explicitly required, back up PostgreSQL again, stop all writers, and
+   downgrade `0011` to `0010`; this removes only the new execution/transcript projection.
+6. Preserve the dashboard password row/version and `/etc/engineering-control/dashboard/session.key`.
+7. Do not change DNS, Caddy or TLS for a normal observability rollback.
 
 Rollback never deletes campaigns, findings, issue-loop state, audit evidence or product data, and
 never changes product repositories, Kubernetes, Helm, Argo or production.

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">What Hermes is doing now</p><h2>Overview</h2></div>
+  <p id="overview-freshness" class="muted" aria-live="polite">Loading current state…</p>
+</section>
+<p id="overview-error" class="alert error hidden" role="alert" aria-live="polite"></p>
+<section id="summary-cards" class="summary-cards" aria-label="Operational summary"></section>
+<section class="section-heading"><div><p class="eyebrow">Current ownership</p><h3>Active work</h3></div></section>
+<div id="active-work" class="work-card-list"></div>
+<section id="idle-state" class="idle-panel hidden" aria-live="polite">
+  <h3>Hermes is idle</h3>
+  <p>No persisted workflow is currently active. This does not infer activity from processes.</p>
+  <dl id="idle-details" class="detail-grid"></dl>
+</section>
+<section class="section-heading"><div><p class="eyebrow">Persisted probes</p><h3>Services and providers</h3></div></section>
+<div id="health-cards" class="health-grid"></div>
+{% endblock %}

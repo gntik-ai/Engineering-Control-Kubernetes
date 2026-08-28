@@ -38,6 +38,8 @@ class AgentInstructionPack:
         "runtime.independent_review": "verify-runtime",
         "enhancement.discover": "discover-enhancements",
         "enhancement.product_review": "review-enhancement",
+        "observability.invoke_codex": "implement-issue",
+        "observability.invoke_claude": "review-change",
     }
 
     def __init__(self, root: Path) -> None:
@@ -160,7 +162,10 @@ class AgentInstructionPack:
         if request.writable:
             if request.role != "implementer" or not write_tools.issubset(tools):
                 raise ValueError("only the implementer may receive write tools")
-        elif tools.intersection(write_tools):
+        effective_tools = set(request.allowed_tools) if request.allowed_tools else tools
+        if not effective_tools.issubset(tools):
+            raise ValueError("request tools exceed the canonical role boundary")
+        if not request.writable and effective_tools.intersection(write_tools):
             raise ValueError("read-only invocation role contains write tools")
 
     @staticmethod

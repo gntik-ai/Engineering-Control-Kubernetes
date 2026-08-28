@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from engineering_control.api.schemas import AcceptanceLifecycleStart
+from engineering_control.api.schemas import AcceptanceLifecycleStart, ObservabilityAcceptanceStart
 from engineering_control.api.service import TemporalControlService
 from engineering_control.db.repository import EmptyMetadataRepository
 
@@ -115,3 +115,35 @@ async def test_acceptance_service_binds_private_activity_and_control_queues() ->
     assert accepted.run_id == "started-run-id"
     assert client.task_queue == "engineering-acceptance-control-validation-bounded"
     assert client.workflow_input.activity_task_queue == activity_queue
+
+
+@pytest.mark.asyncio
+async def test_observability_acceptance_binds_native_canary_to_control_queue() -> None:
+    client = _StartClient()
+    service = TemporalControlService(
+        client,  # type: ignore[arg-type]
+        "engineering-control",
+        EmptyMetadataRepository(),
+    )
+
+    accepted = await service.start_observability_acceptance(
+        ObservabilityAcceptanceStart(confirm_read_only=True)
+    )
+
+    assert accepted.workflow_id.startswith("observability-acceptance-")
+    assert accepted.run_id == "started-run-id"
+    assert client.task_queue == "engineering-control"
+    assert client.workflow_input.workspace_id in accepted.workflow_id
+
+
+@pytest.mark.asyncio
+async def test_observability_acceptance_rejects_non_read_only_contract() -> None:
+    service = TemporalControlService(
+        _StartClient(),  # type: ignore[arg-type]
+        "engineering-control",
+        EmptyMetadataRepository(),
+    )
+    with pytest.raises(ValueError, match="read-only contract"):
+        await service.start_observability_acceptance(
+            ObservabilityAcceptanceStart.model_construct(confirm_read_only=False)  # type: ignore[arg-type]
+        )

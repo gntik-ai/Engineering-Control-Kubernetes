@@ -184,6 +184,14 @@ class ControlActivities:
         "backlog.record_revalidation",
         "backlog.revalidate_gate",
         "backlog.record_loop_state",
+        "observability.register",
+        "observability.prepare_workspace",
+        "observability.prepare_codex",
+        "observability.invoke_codex",
+        "observability.prepare_claude",
+        "observability.invoke_claude",
+        "observability.finalize",
+        "observability.cleanup_workspace",
     }
     _mutation_steps = {
         "preview.deploy",
@@ -259,6 +267,10 @@ class ControlActivities:
             "llmwiki.bootstrap.execute",
             "github.refresh_mirrors",
             "backlog.github_import",
+            "observability.prepare_workspace",
+            "observability.invoke_codex",
+            "observability.invoke_claude",
+            "observability.cleanup_workspace",
         },
         "scan": {
             "project.snapshot",
@@ -278,6 +290,8 @@ class ControlActivities:
             "cleanup.protect_active",
             "cleanup.execute",
             "reconcile.apply_promotion",
+            "observability.prepare_workspace",
+            "observability.cleanup_workspace",
         },
         "codex": {
             "audit.agent_cell",
@@ -293,6 +307,7 @@ class ControlActivities:
             "cleanup.execute_codex_files",
             "enhancement.discover",
             "enhancement.product_review",
+            "observability.invoke_codex",
         },
         "claude": {
             "audit.agent_cell",
@@ -306,6 +321,7 @@ class ControlActivities:
             "runtime.independent_review",
             "enhancement.discover",
             "enhancement.product_review",
+            "observability.invoke_claude",
         },
         "browser": {
             "runtime.browser_checks",

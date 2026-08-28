@@ -184,6 +184,61 @@ class AgentInvocation(UUIDPrimaryKey, Timestamps, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AgentExecution(UUIDPrimaryKey, Timestamps, Base):
+    __tablename__ = "agent_executions"
+    workflow_id: Mapped[str] = mapped_column(String(240), index=True)
+    temporal_run_id: Mapped[str | None] = mapped_column(String(240))
+    activity_id: Mapped[str | None] = mapped_column(String(240))
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    repository_full_name: Mapped[str | None] = mapped_column(String(200))
+    issue_number: Mapped[int | None] = mapped_column(Integer)
+    campaign_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("campaigns.id"))
+    change_set_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("change_sets.id"))
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    role: Mapped[str] = mapped_column(String(80), index=True)
+    host: Mapped[str | None] = mapped_column(String(253))
+    worker_kind: Mapped[str | None] = mapped_column(String(32), index=True)
+    task_queue: Mapped[str | None] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    phase: Mapped[str | None] = mapped_column(String(120), index=True)
+    selection_reason: Mapped[str | None] = mapped_column(String(500))
+    cli_path_identifier: Mapped[str | None] = mapped_column(String(80))
+    cli_version: Mapped[str | None] = mapped_column(String(120))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=1)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    retryable: Mapped[bool | None] = mapped_column(Boolean)
+    blocker_code: Mapped[str | None] = mapped_column(String(120))
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    output_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    transcript_incomplete: Mapped[bool] = mapped_column(Boolean, default=False)
+    total_log_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    redaction_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AgentLogChunk(Base):
+    __tablename__ = "agent_log_chunks"
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    execution_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("agent_executions.id", ondelete="CASCADE"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    stream: Mapped[str] = mapped_column(String(16), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    redacted_text: Mapped[str] = mapped_column(Text)
+    byte_count: Mapped[int] = mapped_column(Integer)
+    redaction_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    __table_args__ = (
+        UniqueConstraint("execution_id", "sequence", name="uq_agent_log_execution_sequence"),
+    )
+
+
 class WorktreeLease(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "worktree_leases"
     change_set_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("change_sets.id"), index=True)
@@ -519,3 +574,7 @@ Index(
     sqlite_where=ApprovalCandidate.invalidated_at.is_(None),
 )
 Index("ix_dashboard_events_stream", DashboardEvent.id, DashboardEvent.occurred_at)
+Index("ix_agent_executions_project_status", AgentExecution.project, AgentExecution.status)
+Index("ix_agent_executions_provider_started", AgentExecution.provider, AgentExecution.started_at)
+Index("ix_agent_executions_last_heartbeat", AgentExecution.last_heartbeat_at)
+Index("ix_agent_log_chunks_execution_sequence", AgentLogChunk.execution_id, AgentLogChunk.sequence)

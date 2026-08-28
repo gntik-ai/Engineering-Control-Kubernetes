@@ -127,6 +127,26 @@ def test_valid_invalid_login_csrf_cookie_and_tamper(tmp_path: Path) -> None:
         assert client.get("/backlog", follow_redirects=False).status_code == 303
 
 
+def test_login_csrf_survives_browser_asset_and_repeated_page_requests(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with _client(repository) as client:
+        first_page = client.get("/login")
+        csrf = _csrf(first_page.text)
+        assert client.cookies.get("engineering_dashboard_login_csrf") == csrf
+
+        assert client.get("/login?asset=icon").status_code == 204
+        second_page = client.get("/login")
+        assert _csrf(second_page.text) == csrf
+        assert client.cookies.get("engineering_dashboard_login_csrf") == csrf
+
+        accepted = client.post(
+            "/login",
+            data={"csrf_token": csrf, "password": PASSWORD},
+            follow_redirects=False,
+        )
+        assert accepted.status_code == 303
+
+
 def test_login_failure_rate_limit_expires() -> None:
     limiter = LoginFailureLimiter(maximum_failures=2, window_seconds=10)
     limiter.failure("192.0.2.1", now=100)

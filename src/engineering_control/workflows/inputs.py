@@ -95,6 +95,11 @@ class AcceptanceLifecycleInput:
 
 
 @dataclass
+class ObservabilityAcceptanceInput:
+    workspace_id: str
+
+
+@dataclass
 class IssueSolutionLoopInput:
     project: str
     campaign_id: str

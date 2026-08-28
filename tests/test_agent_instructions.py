@@ -119,3 +119,16 @@ def test_instruction_pack_rejects_skill_role_drift(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="not bound"):
         AgentInstructionPack(source).enrich(request(tmp_path / "worktree"), "delivery.invoke_maker")
+
+
+def test_instruction_pack_allows_explicitly_narrowed_read_only_maker(tmp_path: Path) -> None:
+    source = build_pack(tmp_path)
+    narrowed = request(tmp_path / "worktree").model_copy(
+        update={"writable": False, "allowed_tools": ("Read", "Glob", "Grep")}
+    )
+
+    enriched, bundle = AgentInstructionPack(source).enrich(narrowed, "observability.invoke_codex")
+
+    assert enriched.writable is False
+    assert enriched.allowed_tools == ("Read", "Glob", "Grep")
+    assert bundle.allowed_tools == ("Read", "Glob", "Grep")

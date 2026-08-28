@@ -97,6 +97,41 @@ def test_every_role_kind_has_a_queue_activity_set_and_service() -> None:
             assert (ROOT / "systemd" / spec.service).is_file()
 
 
+def test_observability_canary_routes_each_step_to_one_bounded_worker() -> None:
+    expected = {
+        "observability.register": "controller",
+        "observability.prepare_workspace": "scan",
+        "observability.prepare_codex": "controller",
+        "observability.invoke_codex": "codex",
+        "observability.prepare_claude": "controller",
+        "observability.invoke_claude": "claude",
+        "observability.finalize": "controller",
+        "observability.cleanup_workspace": "scan",
+    }
+    for step, owner in expected.items():
+        owners = {
+            kind
+            for kind in (
+                "controller",
+                "scan",
+                "codex",
+                "claude",
+                "browser",
+                "delivery",
+                "release",
+                "github",
+            )
+            if step in ControlActivities.steps_for_worker(kind)
+        }
+        assert owners == {owner}
+
+
+def test_observability_canary_workspace_parent_is_owned_by_scan_runner() -> None:
+    worker = (ROOT / "scripts/bootstrap-worker.sh").read_text(encoding="utf-8")
+    assert "install -d -o scan-runner -g scan-runner -m 0755" in worker
+    assert '"${PLATFORM_ROOT}/worktrees/observability-canary"' in worker
+
+
 def test_github_systemd_contract_is_hardened_and_secret_free() -> None:
     unit = (ROOT / "systemd/engineering-github-worker.service").read_text(encoding="utf-8")
     for required in (

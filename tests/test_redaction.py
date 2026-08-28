@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from engineering_control.security.redaction import REDACTED, SecretRedactor
 
 
@@ -65,3 +67,40 @@ def test_preserves_numeric_usage_counters_but_redacts_token_strings() -> None:
     }
     assert report.value["input_tokens"] == REDACTED
     assert report.value["auth_token"] == REDACTED
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "password=" + bytes(range(65, 91)).decode(),
+        "token=" + "x" * 30,
+        "Authorization: Bearer " + "y" * 32,
+        "Cookie: dashboard_session=" + "z" * 32,
+        "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12,
+        "https://example.invalid/path?access_token=" + "d" * 32 + "&safe=yes",
+        "token: " + "e" * 32 + "\nclient-key-data: " + "f" * 64,
+        "\x1b[31mAuthorization: Bearer " + "g" * 32 + "\x1b[0m",
+        "sk-" + "h" * 32,
+    ],
+)
+def test_adversarial_visible_output_is_redacted(value: str) -> None:
+    report = SecretRedactor().redact_text(value)
+    assert REDACTED in report.value
+    assert value not in report.value
+    assert report.replacements >= 1
+
+
+def test_nested_json_secret_is_redacted_without_original_retention() -> None:
+    original = "nested-value-" + "i" * 24
+    report = SecretRedactor().redact_json_line(
+        json.dumps({"safe": "visible", "nested": {"client_secret": original}})
+    )
+    assert original not in report.value
+    assert REDACTED in report.value
+
+
+def test_git_commit_sha_remains_visible() -> None:
+    sha = "a1" * 20
+    report = SecretRedactor().redact_text(f"commit {sha} completed")
+    assert sha in report.value
+    assert report.replacements == 0

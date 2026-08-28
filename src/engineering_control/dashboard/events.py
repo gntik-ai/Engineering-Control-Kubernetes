@@ -5,7 +5,9 @@ import json
 import socket
 from collections.abc import AsyncIterator
 from typing import Any
+from uuid import UUID
 
+from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import ActivityEventInput
 
@@ -108,6 +110,47 @@ async def sse_events(
                 cursor = int(event["id"])
                 payload = json.dumps(event, separators=(",", ":"), sort_keys=True)
                 yield f"id: {cursor}\nevent: activity\ndata: {payload}\n\n"
+            since_heartbeat = 0.0
+        elif since_heartbeat >= heartbeat_seconds:
+            yield ": heartbeat\n\n"
+            since_heartbeat = 0.0
+        iterations += 1
+        await asyncio.sleep(poll_seconds)
+        since_heartbeat += poll_seconds
+
+
+async def transcript_sse(
+    projection: DashboardObservabilityProjection,
+    execution_id: UUID,
+    *,
+    after_sequence: int,
+    disconnected: Any,
+    poll_seconds: float = 1.0,
+    heartbeat_seconds: float = 15.0,
+    maximum_iterations: int | None = None,
+) -> AsyncIterator[str]:
+    cursor = max(0, after_sequence)
+    since_heartbeat = 0.0
+    iterations = 0
+    while maximum_iterations is None or iterations < maximum_iterations:
+        if await disconnected():
+            return
+        result = await asyncio.to_thread(
+            projection.execution_logs,
+            execution_id,
+            limit=100,
+            after_sequence=cursor,
+        )
+        if result is None:
+            return
+        items = result["items"]
+        if isinstance(items, list) and items:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                cursor = int(item["sequence"])
+                payload = json.dumps(item, separators=(",", ":"), sort_keys=True)
+                yield f"id: {cursor}\nevent: transcript\ndata: {payload}\n\n"
             since_heartbeat = 0.0
         elif since_heartbeat >= heartbeat_seconds:
             yield ": heartbeat\n\n"

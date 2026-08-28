@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import cast
+from typing import Any, TypeVar, cast
+from uuid import UUID
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -15,12 +16,24 @@ from engineering_control.db.repository import MetadataRepository, SQLMetadataRep
 from engineering_control.evidence.store import LocalEvidenceStore
 from engineering_control.evidence.transfer import EvidenceEnvelope, EvidenceIngestService
 from engineering_control.logging import configure_logging
+from engineering_control.observability.agent import (
+    AgentObservabilityRepository,
+    ExecutionFinishInput,
+    ExecutionHeartbeatInput,
+    ExecutionStartInput,
+    GatewayEventInput,
+    LogBatchInput,
+    ObservabilityModel,
+)
+
+ObservabilityValue = TypeVar("ObservabilityValue", bound=ObservabilityModel)
 
 
 def create_evidence_ingest_app(
     *,
     settings: Settings | None = None,
     repository: MetadataRepository | None = None,
+    observability_repository: AgentObservabilityRepository | None = None,
     tokens: dict[str, str] | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
@@ -29,6 +42,13 @@ def create_evidence_ingest_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.metadata_repository = repository or SQLMetadataRepository(
             resolved.database_url.get_secret_value()
+        )
+        app.state.observability_repository = (
+            observability_repository
+            or AgentObservabilityRepository(
+                resolved.database_url.get_secret_value(),
+                maximum_transcript_bytes=resolved.dashboard_transcript_max_bytes,
+            )
         )
         yield
 
@@ -93,6 +113,83 @@ def create_evidence_ingest_app(
             "identity": stored["identity"],
             "observed_at": stored["observed_at"],
         }
+
+    def execution_repository(request: Request) -> AgentObservabilityRepository:
+        return cast(AgentObservabilityRepository, request.app.state.observability_repository)
+
+    async def observability_body(
+        request: Request, model: type[ObservabilityValue]
+    ) -> ObservabilityValue:
+        body = await request.body()
+        if not body or len(body) > 512 * 1024:
+            raise HTTPException(status_code=413, detail="observability body exceeds size bound")
+        try:
+            return model.model_validate_json(body)
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail="invalid observability payload") from error
+
+    async def execute_observability(
+        operation: Any,
+    ) -> dict[str, object]:
+        try:
+            result = await operation
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return cast(dict[str, object], result)
+
+    @app.post("/v1/observability/executions/{execution_id}/start", status_code=202)
+    async def execution_start(
+        execution_id: UUID,
+        request: Request,
+        subject: str = Depends(authenticated),
+    ) -> dict[str, object]:
+        values = await observability_body(request, ExecutionStartInput)
+        return await execute_observability(
+            execution_repository(request).start(subject, execution_id, values)
+        )
+
+    @app.post("/v1/observability/executions/{execution_id}/heartbeat", status_code=202)
+    async def execution_heartbeat(
+        execution_id: UUID,
+        request: Request,
+        subject: str = Depends(authenticated),
+    ) -> dict[str, object]:
+        values = await observability_body(request, ExecutionHeartbeatInput)
+        return await execute_observability(
+            execution_repository(request).heartbeat(subject, execution_id, values)
+        )
+
+    @app.post("/v1/observability/executions/{execution_id}/logs", status_code=202)
+    async def execution_logs(
+        execution_id: UUID,
+        request: Request,
+        subject: str = Depends(authenticated),
+    ) -> dict[str, object]:
+        values = await observability_body(request, LogBatchInput)
+        return await execute_observability(
+            execution_repository(request).append_logs(subject, execution_id, values)
+        )
+
+    @app.post("/v1/observability/executions/{execution_id}/finish", status_code=202)
+    async def execution_finish(
+        execution_id: UUID,
+        request: Request,
+        subject: str = Depends(authenticated),
+    ) -> dict[str, object]:
+        values = await observability_body(request, ExecutionFinishInput)
+        return await execute_observability(
+            execution_repository(request).finish(subject, execution_id, values)
+        )
+
+    @app.post("/v1/observability/gateway-events", status_code=202)
+    async def gateway_event(
+        request: Request,
+        subject: str = Depends(authenticated),
+    ) -> dict[str, object]:
+        values = await observability_body(request, GatewayEventInput)
+        return await execute_observability(
+            execution_repository(request).gateway_event(subject, values)
+        )
 
     return app
 

@@ -151,6 +151,71 @@ def _request(
         raise RuntimeError("Engineering API is unavailable on loopback") from error
 
 
+def _gateway_event(
+    event_type: str,
+    command: str,
+    *,
+    raw_args: str = "",
+    result: Any = None,
+    outcome: str | None = None,
+) -> None:
+    """Best-effort safe event; command text, actor identity, and credentials never leave memory."""
+    try:
+        _private_api_url()
+        token = _read_protected(TOKEN_FILE)
+        if len(token) < 32:
+            return
+        try:
+            args = shlex.split(raw_args)
+        except ValueError:
+            args = []
+        project = next((value for value in args[:3] if value in _PROJECTS), None)
+        mode = next(
+            (
+                value
+                for value in args[:6]
+                if value in (_LOOP_MODES | _BACKLOG_MODES | {"full-delivery"})
+            ),
+            None,
+        )
+        issue_number = next(
+            (int(value) for value in args[:6] if value.isdigit() and int(value) > 0),
+            None,
+        )
+        result_value = result if isinstance(result, dict) else {}
+        workflow_id = next(
+            (
+                value
+                for key in ("workflow_id", "temporal_workflow_id")
+                if isinstance((value := result_value.get(key)), str) and value
+            ),
+            None,
+        )
+        payload = {
+            "event_type": event_type,
+            "command": command if command in COMMANDS else "unknown",
+            "outcome": outcome,
+            "project": project,
+            "issue_number": issue_number,
+            "mode": mode,
+            "workflow_id": workflow_id,
+        }
+        request = urllib.request.Request(  # noqa: S310 - loopback URL is validated above
+            f"{API_URL}/v1/observability/gateway-events",
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-Engineering-Actor": "hermes-gateway",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:  # noqa: S310
+            response.read(4096)
+    except (OSError, RuntimeError, ValueError, urllib.error.URLError):
+        return
+
+
 def _uuid(value: str, label: str) -> str:
     try:
         return str(UUID(value))
@@ -773,9 +838,13 @@ def handle(event_type: str, context: dict[str, Any]) -> dict[str, str] | None:
     command = event_type.removeprefix("command:").replace("_", "-")
     if command not in COMMANDS:
         if event_type.startswith("command:"):
+            _gateway_event("telegram.command_rejected", "unknown", outcome="UNKNOWN_COMMAND")
             return {"decision": "deny", "message": "Unknown engineering command denied."}
         return None
+    _gateway_event("telegram.command_received", command)
+    _gateway_event("telegram.command_recognized", command)
     if context.get("platform") != "telegram":
+        _gateway_event("telegram.command_rejected", command, outcome="INVALID_PLATFORM")
         return {
             "decision": "deny",
             "message": "Engineering Control chat commands are restricted to Telegram.",
@@ -783,10 +852,26 @@ def handle(event_type: str, context: dict[str, Any]) -> dict[str, str] | None:
     user_id = str(context.get("user_id", ""))
     try:
         if not _authorized(user_id):
+            _gateway_event("telegram.command_rejected", command, outcome="ACCESS_DENIED")
             return {"decision": "deny", "message": "Engineering Control access denied."}
         raw_args = str(context.get("raw_args", ""))
+        _gateway_event("engineering.request_accepted", command, raw_args=raw_args)
+        _gateway_event("engineering.api_request_started", command, raw_args=raw_args)
         result = _dispatch(command, raw_args, f"telegram:{user_id}")
+        _gateway_event(
+            "engineering.api_response_completed",
+            command,
+            raw_args=raw_args,
+            result=result,
+            outcome="COMPLETED",
+        )
+        if isinstance(result, dict) and isinstance(result.get("workflow_id"), str):
+            _gateway_event(
+                "engineering.workflow_returned", command, raw_args=raw_args, result=result
+            )
         _record_acceptance(command, raw_args, result)
+        _gateway_event("telegram.response_delivered", command, raw_args=raw_args, result=result)
         return {"decision": "handled", "message": _format(result)}
     except (OSError, RuntimeError, ValueError) as error:
+        _gateway_event("telegram.response_delivery_failed", command, outcome="REQUEST_FAILED")
         return {"decision": "handled", "message": _redact(f"Engineering Control: {error}")}

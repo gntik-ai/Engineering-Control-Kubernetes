@@ -23,6 +23,7 @@ async def test_codex_adapter_uses_deterministic_per_run_temp_parent(
     observed: dict[str, Any] = {}
 
     async def fake_run(command: list[str], **kwargs: Any) -> ProcessResult:
+        observed["command"] = command
         schema_path = Path(command[command.index("--output-schema") + 1])
         final_path = Path(command[command.index("--output-last-message") + 1])
         observed["attempt_root"] = schema_path.parent
@@ -41,6 +42,7 @@ async def test_codex_adapter_uses_deterministic_per_run_temp_parent(
         prompt="perform a bounded synthetic task",
         working_directory=str(working_directory),
         output_schema={"type": "object"},
+        skip_git_repository_check=True,
     )
     result = await CodexCLIAdapter(temp_root=str(temp_root)).execute(request)
 
@@ -49,6 +51,7 @@ async def test_codex_adapter_uses_deterministic_per_run_temp_parent(
     assert run_root.is_dir()
     assert stat.S_IMODE(run_root.stat().st_mode) == 0o700
     assert observed["attempt_root"].parent == run_root
+    assert "--skip-git-repo-check" in observed["command"]
     assert list(run_root.iterdir()) == []
 
 
