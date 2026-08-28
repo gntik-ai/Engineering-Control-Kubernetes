@@ -11,6 +11,7 @@ from typing import Any, cast
 import httpx
 
 from engineering_control.operations.repository import OperationsRepository
+from engineering_control.workflows.worker_registry import ROLE_TASK_QUEUES
 
 
 class ConnectionHealthProjector:
@@ -252,7 +253,8 @@ class ConnectionHealthProjector:
                 "details": {"replacement_component": "engineering-api"},
             }
         )
-        for kind in ("codex", "claude", "browser", "scan", "delivery", "github"):
+        for registered_kind, task_queue in ROLE_TASK_QUEUES.items():
+            kind = str(registered_kind)
             row = heartbeat_by_kind.get(kind)
             age = (
                 int(
@@ -280,7 +282,7 @@ class ConnectionHealthProjector:
             self.repository._upsert_connection(  # fixed internal projection; no external probe
                 {
                     "component": f"worker-{kind}",
-                    "logical_target": f"engineering-{kind}-task-queue",
+                    "logical_target": task_queue,
                     "status": status,
                     "checked_at": now,
                     "last_success_at": row.observed_at if row is not None else None,
