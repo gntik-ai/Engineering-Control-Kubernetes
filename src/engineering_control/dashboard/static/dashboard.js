@@ -61,13 +61,91 @@ const timestampCell = (value) => {
   result.append(time); return result;
 };
 
+const csrfToken = () => document.body.dataset.csrfToken || "";
+let pendingCandidate = null;
+
+const actionEffect = (action) => {
+  if (["refresh_connections", "audit_plan"].includes(action)) return "Read-only probe or metadata plan; no product mutation.";
+  if (["pause", "resume", "nudge", "retry", "cancel", "skip"].includes(action)) return "Durable workflow signal; no shell or arbitrary command execution.";
+  if (action === "solve_issue" || action === "solve_backlog") return "Source, GitHub, build, staging, and runtime effects remain subject to immutable Engineering Control gates. Production is prohibited.";
+  return "Typed Engineering Control operation; current policy and capability gates remain authoritative.";
+};
+
+async function prepareAction(command, errorTarget = null) {
+  try {
+    const response = await fetch("/api/dashboard/actions/candidates", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({csrf_token: csrfToken(), command}),
+    });
+    const candidate = await response.json();
+    if (!response.ok) throw new Error(candidate.detail || "Unable to prepare operation.");
+    if (candidate.capability.status === "RUNNING" && candidate.operation_binding?.resolved?.existing_workflow_id) {
+      location.assign(`/workflows/${encodeURIComponent(candidate.operation_binding.resolved.existing_workflow_id)}`);
+      return;
+    }
+    if (candidate.capability.status !== "AVAILABLE") {
+      throw new Error((candidate.capability.blockers || []).join(" · ") || `Capability is ${candidate.capability.status}.`);
+    }
+    pendingCandidate = candidate;
+    byId("action-effect").textContent = actionEffect(command.action);
+    byId("action-binding").textContent = JSON.stringify(candidate.operation_binding, null, 2);
+    byId("action-password").value = ""; byId("action-phrase").value = "";
+    const phrase = candidate.confirmation_phrase || "";
+    byId("action-phrase-field").classList.toggle("hidden", !phrase);
+    byId("action-phrase").required = Boolean(phrase);
+    byId("action-phrase-help").textContent = phrase ? `Required phrase: ${phrase}` : "This operation is bound to the displayed SHA-256 digest.";
+    setError("action-blockers"); byId("action-dialog").showModal(); byId("action-password").focus();
+    if (errorTarget) setError(errorTarget);
+  } catch (error) {
+    if (errorTarget) setError(errorTarget, error.message); else window.alert(error.message);
+  }
+}
+
+async function confirmAction(event) {
+  event.preventDefault(); if (!pendingCandidate) return;
+  const execute = byId("action-execute"); execute.disabled = true;
+  try {
+    const reauth = await fetch("/api/dashboard/actions/reauthenticate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, current_password: byId("action-password").value}),
+    });
+    const authorized = await reauth.json();
+    if (!reauth.ok) throw new Error(authorized.detail || "Unable to authorize operation.");
+    byId("action-password").value = "";
+    const response = await fetch("/api/dashboard/actions/execute", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, reauthentication_token: authorized.reauthentication_token, confirmation_phrase: byId("action-phrase").value || null}),
+    });
+    let operation = await response.json();
+    if (!response.ok) throw new Error(operation.detail || "Operation was not accepted.");
+    for (let attempt = 0; attempt < 20 && ["PENDING", "DISPATCHING"].includes(operation.status); attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      const poll = await fetch(`/api/dashboard/operations/${operation.operation_id}`, {cache: "no-store"});
+      if (poll.ok) operation = await poll.json();
+    }
+    if (["FAILED", "BLOCKED"].includes(operation.status)) throw new Error(operation.safe_error || `Operation ${operation.status.toLowerCase()}.`);
+    byId("action-dialog").close(); pendingCandidate = null;
+    if (operation.workflow_id) location.assign(`/workflows/${encodeURIComponent(operation.workflow_id)}`); else location.reload();
+  } catch (error) { setError("action-blockers", error.message); }
+  finally { execute.disabled = false; }
+}
+
+function setupActionDialog() {
+  const form = byId("action-confirmation"); if (!form) return;
+  form.addEventListener("submit", confirmAction);
+  byId("action-cancel").addEventListener("click", () => { pendingCandidate = null; byId("action-password").value = ""; byId("action-dialog").close(); });
+}
+
 function setupOverview() {
   if (!byId("summary-cards")) return;
   const load = async () => {
     try {
-      const response = await fetch("/api/dashboard/overview", {cache: "no-store"});
-      if (!response.ok) throw new Error("Overview data is temporarily unavailable.");
-      const data = await response.json();
+      const [response, connectionResponse] = await Promise.all([
+        fetch("/api/dashboard/overview", {cache: "no-store"}),
+        fetch("/api/dashboard/connections", {cache: "no-store"}),
+      ]);
+      if (!response.ok || !connectionResponse.ok) throw new Error("Overview data is temporarily unavailable.");
+      const data = await response.json(); const connections = await connectionResponse.json();
       const labels = [["active_workflows", "Active workflows"], ["queued_issues", "Queued issues"], ["blocked_workflows", "Blocked workflows"], ["failed_24h", "Failed in 24h"], ["active_audits", "Active audits"]];
       byId("summary-cards").replaceChildren(...labels.map(([key, label]) => {
         const card = node("article", "summary-card"); card.append(node("p", "muted", label), node("strong", "summary-value", show(data.summary[key]))); return card;
@@ -86,7 +164,12 @@ function setupOverview() {
       const health = [...(data.services || []), ...(data.providers || [])].map((item) => {
         const card = node("article", `health-card${item.stale ? " stale" : ""}`); card.append(node("h4", "", item.name || item.provider), status(item.status || item.capacity_status || (item.available ? "ready" : "unknown")), list([["Kind", item.kind || "provider"], ["CLI", item.cli_version], ["Authentication", item.authentication_status], ["Active", item.active_executions], ["Queue", item.queue_depth], ["Last success", localTime(item.last_success)], ["Last failure", localTime(item.last_failure)], ["Observed", localTime(item.observed_at)], ["Freshness", item.freshness], ["Source", item.source]])); return card;
       });
-      byId("health-cards").replaceChildren(...health); byId("overview-freshness").textContent = `Observed ${localTime(data.observed_at)} · ${data.source}`; setError("overview-error");
+      byId("health-cards").replaceChildren(...health);
+      const priority = ["engineering-dashboard", "hermes-gateway", "telegram", "engineering-api", "engineering-cli", "provider-codex", "provider-claude"];
+      const connectionCards = priority.map((component) => connections.items.find((item) => item.component === component)).filter(Boolean).map((item) => {
+        const card = node("article", `health-card${item.status === "STALE" ? " stale" : ""}`); card.append(node("h4", "", item.component), status(item.status), list([["Checked", localTime(item.checked_at)], ["Freshness", elapsed(item.freshness_seconds)], ["Source", item.source], ["Next action", item.next_action]])); return card;
+      });
+      byId("overview-connections").replaceChildren(...connectionCards); byId("overview-freshness").textContent = `Observed ${localTime(data.observed_at)} · ${data.source}`; setError("overview-error");
     } catch (error) { setError("overview-error", error.message); }
   };
   load(); window.setInterval(load, 5000);
@@ -94,16 +177,21 @@ function setupOverview() {
 
 function setupBacklog() {
   const form = byId("backlog-filters"); if (!form) return;
-  restoreForm(form); let page = 1; let pages = 1; const expanded = new Set();
+  const deliveryMode = () => byId("backlog-delivery-mode").value;
+  restoreForm(form); let page = 1; let pages = 1; let currentItems = []; const expanded = new Set();
   const load = async () => {
     const query = queryFrom(form); query.set("page", page); query.set("page_size", "50");
     try {
       const response = await fetch(`/api/dashboard/backlog?${query}`, {cache: "no-store"}); if (!response.ok) throw new Error("Backlog data is temporarily unavailable."); const data = await response.json(); const rows = [];
+      currentItems = data.items;
       for (const item of data.items) {
         const key = `${item.project}:${item.issue_number || item.workflow_id}`; const row = node("tr", "expandable-row"); row.tabIndex = 0; row.setAttribute("aria-expanded", expanded.has(key));
         const issue = node("td"); if (item.issue_url && item.issue_number) issue.append(link(item.issue_url, `#${item.issue_number}`, true)); else issue.textContent = item.issue_number ? `#${item.issue_number}` : "—";
-        const state = node("td"); state.append(status(item.normalized_status)); row.append(issue, cell(item.title), cell(item.project), state, cell(item.raw_status), cell(item.current_phase), cell(item.active_provider), cell(item.provider_role), cell(item.worker), timestampCell(item.last_heartbeat), cell(elapsed(item.duration_seconds)), cell(`${show(item.attempt)} / ${show(item.max_attempts)}`), cell(item.pr_state), cell(item.ci_state), cell(item.build_state), cell(item.deployment_state), cell(item.verification_state), cell(item.blocker));
-        const detailRow = node("tr", `row-detail${expanded.has(key) ? "" : " hidden"}`); const detail = node("td"); detail.colSpan = 18; const links = node("p", "card-links"); if (item.workflow_id) links.append(link(`/workflows/${encodeURIComponent(item.workflow_id)}`, "Workflow")); if (item.execution_id) links.append(" · ", link(`/executions/${item.execution_id}`, "Provider execution"));
+        const actions = node("td");
+        if (item.backlog_campaign_id && item.repository && item.issue_number) { const solve = node("button", "compact", "Solve"); solve.type = "button"; const eligible = item.issue_state === "OPEN" && ["READY", "ELIGIBLE_FOR_REVALIDATION", "ELIGIBLE_FOR_RUNTIME_REVALIDATION"].includes(item.eligibility_status) && !["preparing", "implementing", "reviewing", "reworking", "testing", "awaiting_ci", "awaiting_approval", "building", "deploying", "verifying"].includes(item.normalized_status); solve.disabled = !eligible; solve.title = eligible ? "Prepare an immutable solve candidate" : `Unavailable: ${item.blocker || item.eligibility_status || item.issue_state}`; solve.addEventListener("click", (event) => { event.stopPropagation(); prepareAction({action: "solve_issue", project: item.project, backlog_campaign_id: item.backlog_campaign_id, repository: item.repository, issue_number: item.issue_number, maximum_risk: "R2", delivery_mode: deliveryMode(), correction_limit: 2, production: false}, "backlog-error"); }); actions.append(solve); }
+        if (item.workflow_id) actions.append(" ", link(`/workflows/${encodeURIComponent(item.workflow_id)}`, "View"));
+        const state = node("td"); state.append(status(item.normalized_status)); row.append(issue, cell(item.title), cell(item.project), state, cell(item.raw_status), cell(item.current_phase), cell(item.active_provider), cell(item.provider_role), cell(item.worker), timestampCell(item.last_heartbeat), cell(elapsed(item.duration_seconds)), cell(`${show(item.attempt)} / ${show(item.max_attempts)}`), cell(item.pr_state), cell(item.ci_state), cell(item.build_state), cell(item.deployment_state), cell(item.verification_state), cell(item.blocker), actions);
+        const detailRow = node("tr", `row-detail${expanded.has(key) ? "" : " hidden"}`); const detail = node("td"); detail.colSpan = 19; const links = node("p", "card-links"); if (item.workflow_id) links.append(link(`/workflows/${encodeURIComponent(item.workflow_id)}`, "Workflow")); if (item.execution_id) links.append(" · ", link(`/executions/${item.execution_id}`, "Provider execution"));
         detail.append(list([["Workflow", item.workflow_id], ["Queued", localTime(item.queued_at)], ["Started", localTime(item.started_at)], ["Ended", localTime(item.ended_at)], ["Last activity", localTime(item.last_activity_at)], ["Freshness", `${item.freshness}${has(item.age_seconds) ? ` · ${elapsed(item.age_seconds)} old` : ""}`], ["Data source", item.source], ["Timeline", (item.timeline || []).map((step) => `${step.phase}: ${step.status}`).join(" · ") || "No persisted timeline"]]), links); detailRow.append(detail);
         const toggle = () => { expanded.has(key) ? expanded.delete(key) : expanded.add(key); row.setAttribute("aria-expanded", expanded.has(key)); detailRow.classList.toggle("hidden", !expanded.has(key)); };
         row.addEventListener("click", (event) => { if (!event.target.closest("a")) toggle(); }); row.addEventListener("keydown", (event) => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); toggle(); } }); rows.push(row, detailRow);
@@ -111,6 +199,7 @@ function setupBacklog() {
       byId("backlog-rows").replaceChildren(...rows); pages = data.pages; byId("backlog-page").textContent = `Page ${page} of ${pages} · ${data.total} items`; byId("backlog-prev").disabled = page <= 1; byId("backlog-next").disabled = page >= pages; byId("backlog-empty").classList.toggle("hidden", data.items.length !== 0); byId("last-refreshed").textContent = `Last refreshed ${localTime(data.refreshed_at)}`; setError("backlog-error");
     } catch (error) { setError("backlog-error", error.message); }
   };
+  byId("solve-backlog").addEventListener("click", () => { const project = form.elements.project.value; const item = currentItems.find((value) => value.backlog_campaign_id && (!project || value.project === project)); if (!item) { setError("backlog-error", "No persisted campaign is available for the selected project."); return; } prepareAction({action: "solve_backlog", project: item.project, backlog_campaign_id: item.backlog_campaign_id, issue_filter: null, maximum_risk: "R2", delivery_mode: deliveryMode(), maximum_items: 10, continue_after_blocked_issue: true, include_enhancements: false, correction_limit: 2, concurrency: 1, deployment_concurrency: 1, production: false}, "backlog-error"); });
   form.addEventListener("submit", (event) => { event.preventDefault(); page = 1; persistForm(form); load(); }); byId("backlog-prev").addEventListener("click", () => { if (page > 1) { page -= 1; load(); } }); byId("backlog-next").addEventListener("click", () => { if (page < pages) { page += 1; load(); } }); load(); window.setInterval(load, 5000);
 }
 
@@ -133,8 +222,12 @@ function setupWorkflowDetail() {
     const heading = node("div", "work-card-heading"); heading.append(node("h3", "breakable", item.workflow_id), status(item.normalized_status)); byId("workflow-identity").replaceChildren(heading, list([["Temporal run", item.temporal_run_id], ["Project", item.project], ["Repository", item.repository], ["Issue", item.issue_number], ["Campaign", item.campaign_id], ["ChangeSet", item.change_set_id], ["Deployment", item.deployment_id], ["Raw status", item.raw_status], ["Phase", item.current_phase], ["Provider / role", `${show(item.active_provider)} / ${show(item.active_role)}`], ["Host / worker", `${show(item.host)} / ${show(item.worker)}`], ["Task queue", item.task_queue], ["Source", item.source], ["Freshness", item.freshness]]));
     byId("workflow-timeline").replaceChildren(...(item.timeline || []).map((step) => { const card = node("article", "timeline-step"); const title = node("div", "work-card-heading"); title.append(node("h4", "", step.phase), status(step.status)); card.append(title, list([["Raw", step.raw_status], ["Start", localTime(step.started_at)], ["End", localTime(step.ended_at)], ["Duration", elapsed(step.duration_seconds)], ["Attempt", step.attempt], ["Provider", step.provider], ["Evidence", step.evidence_reference], ["Blocker", step.blocker]])); return card; }));
     const table = node("table"); const head = node("thead"); const headRow = node("tr"); ["Execution", "Provider", "Role", "Phase", "Status", "Host / worker", "Task queue", "CLI", "Attempt", "Heartbeat", "Transcript"].forEach((label) => headRow.append(node("th", "", label))); head.append(headRow); const body = node("tbody"); for (const execution of item.executions || []) { const row = node("tr"); const executionId = node("td"); executionId.append(link(`/executions/${execution.execution_id}`, execution.execution_id)); row.append(executionId, cell(execution.provider), cell(execution.role), cell(execution.phase), cell(execution.normalized_status), cell(`${show(execution.host)} / ${show(execution.worker_kind)}`), cell(execution.task_queue), cell(execution.cli_version), cell(`${execution.attempt}/${execution.max_attempts}`), timestampCell(execution.last_heartbeat), cell(execution.transcript_complete ? "complete" : "incomplete")); body.append(row); } table.append(head, body); byId("workflow-executions").replaceChildren(table);
+    const actionStates = {pause: !["paused", "blocked", "completed", "failed", "cancelled", "skipped"].includes(item.normalized_status), resume: ["paused", "blocked"].includes(item.normalized_status), nudge: !["completed", "failed", "cancelled", "skipped"].includes(item.normalized_status), retry: ["paused", "blocked", "failed"].includes(item.normalized_status), cancel: !["completed", "failed", "cancelled", "skipped"].includes(item.normalized_status)};
+    document.querySelectorAll("[data-workflow-action]").forEach((button) => { button.disabled = !actionStates[button.dataset.workflowAction]; button.title = button.disabled ? `Unavailable while workflow is ${item.normalized_status}` : `Prepare typed ${button.dataset.workflowAction} candidate`; });
     const printable = (value) => typeof value === "object" ? JSON.stringify(value) : value; byId("workflow-outcomes").replaceChildren(node("h4", "", "Outcomes"), list(Object.entries(item.outcomes || {}).map(([key, value]) => [key.replaceAll("_", " "), printable(value)]))); byId("workflow-blocker").replaceChildren(node("h4", "", "Blocker explanation"), list(Object.entries(item.blocker_explanation || {}).map(([key, value]) => [key.replaceAll("_", " "), printable(value)]))); setError("workflow-detail-error");
-  }).catch((error) => setError("workflow-detail-error", error.message)); load(); window.setInterval(load, 5000);
+  }).catch((error) => setError("workflow-detail-error", error.message));
+  document.querySelectorAll("[data-workflow-action]").forEach((button) => button.addEventListener("click", () => prepareAction({action: button.dataset.workflowAction, workflow_id: id}, "workflow-detail-error")));
+  load(); window.setInterval(load, 5000);
 }
 
 function setupLogs() {
@@ -162,15 +255,37 @@ function setupExecution() {
 
 function setupAudits() {
   const form = byId("audit-filters"); if (!form) return; restoreForm(form); const expanded = new Set();
-  const load = async () => { try { const response = await fetch(`/api/dashboard/audits?${queryFrom(form)}`, {cache: "no-store"}); if (!response.ok) throw new Error("Audit data is temporarily unavailable."); const data = await response.json(); const cards = data.items.map((item) => { const details = node("details", "audit"); details.open = expanded.has(item.campaign_id); details.addEventListener("toggle", () => details.open ? expanded.add(item.campaign_id) : expanded.delete(item.campaign_id)); const summary = node("summary"); summary.append(node("span", "", `${item.project} · ${item.preset || item.name} · ${item.campaign_id}`), status(item.normalized_status)); details.append(summary); if (item.total_cells > 0) { const progress = node("progress"); progress.max = 100; progress.value = item.completion_percentage; progress.setAttribute("aria-label", `${item.completion_percentage}% complete`); details.append(progress); } else details.append(node("p", "muted", "Progress is indeterminate: no coverage cells are persisted.")); details.append(node("p", "", `${item.completion_percentage}% · ${item.total_cells} cells · last activity ${localTime(item.last_activity_at)}`), list([["Workflow", item.workflow_id], ["Environment", item.environment], ["Raw status", item.raw_status], ["Freshness", `${item.freshness}${has(item.age_seconds) ? ` · ${elapsed(item.age_seconds)} old` : ""}`], ["Data source", item.source], ["Runnable", item.runnable_cells], ["Queued", item.queued_cells], ["Running", item.running_cells], ["Passed", item.passed_cells], ["Confirmed findings", item.confirmed_findings], ["Blocked by root", item.blocked_by_root], ["Independently blocked", item.independently_blocked], ["Failed", item.failed_cells], ["Skipped", item.skipped_cells], ["Surface", item.repository_surface], ["Domain", item.domain], ["Route / operation", item.route_operation], ["Persona", item.persona], ["Flow", item.flow], ["Lens", item.lens], ["Provider / role", `${show(item.provider)} / ${show(item.provider_role)}`], ["Worker", item.worker], ["Execution", item.execution_id], ["Cell start", localTime(item.cell_started_at)], ["Cell end", localTime(item.cell_ended_at)], ["Result", item.cell_result], ["Blocker", item.blocker], ["Persona lifecycle", item.persona_lifecycle ? JSON.stringify(item.persona_lifecycle) : null], ["Root blockers", (item.root_blockers || []).map((root) => `${root.code}: ${root.dependent_cell_count} dependent cells`).join(" · ")]])); return details; }); byId("audit-list").replaceChildren(...cards); byId("audit-empty").classList.toggle("hidden", cards.length !== 0); byId("audit-refreshed").textContent = `Last refreshed ${localTime(data.refreshed_at)}`; setError("audit-error"); } catch (error) { setError("audit-error", error.message); } };
+  const load = async () => { try { const response = await fetch(`/api/dashboard/audits?${queryFrom(form)}`, {cache: "no-store"}); if (!response.ok) throw new Error("Audit data is temporarily unavailable."); const data = await response.json(); const cards = data.items.map((item) => { const details = node("details", "audit"); details.open = expanded.has(item.campaign_id); details.addEventListener("toggle", () => details.open ? expanded.add(item.campaign_id) : expanded.delete(item.campaign_id)); const summary = node("summary"); summary.append(node("span", "", `${item.project} · ${item.preset || item.name} · ${item.campaign_id}`), status(item.normalized_status)); details.append(summary); if (item.total_cells > 0) { const progress = node("progress"); progress.max = 100; progress.value = item.completion_percentage; progress.setAttribute("aria-label", `${item.completion_percentage}% complete`); details.append(progress); } else details.append(node("p", "muted", "Progress is indeterminate: no coverage cells are persisted.")); const discover = node("button", "compact", "Discover enhancements"); discover.type = "button"; discover.addEventListener("click", () => prepareAction({action: "enhancement_discover", project: item.project, campaign_id: item.campaign_id, dry_run: true}, "audit-error")); details.append(node("p", "", `${item.completion_percentage}% · ${item.total_cells} cells · last activity ${localTime(item.last_activity_at)}`), discover, list([["Workflow", item.workflow_id], ["Environment", item.environment], ["Raw status", item.raw_status], ["Freshness", `${item.freshness}${has(item.age_seconds) ? ` · ${elapsed(item.age_seconds)} old` : ""}`], ["Data source", item.source], ["Runnable", item.runnable_cells], ["Queued", item.queued_cells], ["Running", item.running_cells], ["Passed", item.passed_cells], ["Confirmed findings", item.confirmed_findings], ["Blocked by root", item.blocked_by_root], ["Independently blocked", item.independently_blocked], ["Failed", item.failed_cells], ["Skipped", item.skipped_cells], ["Surface", item.repository_surface], ["Domain", item.domain], ["Route / operation", item.route_operation], ["Persona", item.persona], ["Flow", item.flow], ["Lens", item.lens], ["Provider / role", `${show(item.provider)} / ${show(item.provider_role)}`], ["Worker", item.worker], ["Execution", item.execution_id], ["Cell start", localTime(item.cell_started_at)], ["Cell end", localTime(item.cell_ended_at)], ["Result", item.cell_result], ["Blocker", item.blocker], ["Persona lifecycle", item.persona_lifecycle ? JSON.stringify(item.persona_lifecycle) : null], ["Root blockers", (item.root_blockers || []).map((root) => `${root.code}: ${root.dependent_cell_count} dependent cells`).join(" · ")]])); return details; }); byId("audit-list").replaceChildren(...cards); byId("audit-empty").classList.toggle("hidden", cards.length !== 0); byId("audit-refreshed").textContent = `Last refreshed ${localTime(data.refreshed_at)}`; setError("audit-error"); } catch (error) { setError("audit-error", error.message); } };
   form.addEventListener("submit", (event) => { event.preventDefault(); persistForm(form); load(); }); load(); window.setInterval(load, 5000);
+  const actionForm = byId("audit-action-form");
+  const auditCommand = (action, presetOverride = null) => ({action, project: actionForm.elements.action_project.value, preset: presetOverride || actionForm.elements.preset.value, environment: actionForm.elements.environment.value, personas: [], lenses: [], documentation_level: "all", publish_findings: action === "audit_start" ? actionForm.elements.publish_findings.checked : false, ...(action === "audit_start" ? {production: false} : {})});
+  byId("plan-audit").addEventListener("click", () => prepareAction(auditCommand("audit_plan"), "audit-error"));
+  byId("start-audit").addEventListener("click", () => prepareAction(auditCommand("audit_start"), "audit-error"));
+  byId("documentation-audit").addEventListener("click", () => prepareAction(auditCommand("audit_plan", "documentation"), "audit-error"));
+}
+
+function setupCommands() {
+  const root = byId("command-groups"); if (!root) return;
+  fetch("/api/dashboard/commands", {cache: "no-store"}).then((response) => response.ok ? response.json() : Promise.reject()).then((data) => {
+    const groups = new Map(); for (const item of data.items) { if (!groups.has(item.category)) groups.set(item.category, []); groups.get(item.category).push(item); }
+    root.replaceChildren(...[...groups.entries()].map(([category, items]) => { const section = node("section", "panel command-group"); section.append(node("h3", "", category)); for (const item of items) { const form = node("form", "command-form"); const heading = node("div", "command-heading"); heading.append(node("strong", "", item.label), badge(item.effect), status(item.status)); form.append(heading); for (const field of item.fields) { const label = node("label", "", field.name.replaceAll("_", " ")); let input; if (field.type === "select") { input = node("select"); for (const option of field.values) { const value = node("option", "", option); value.value = option; input.append(value); } } else { input = node("input"); input.type = field.type === "uuid" ? "text" : field.type; if (field.maxlength) input.maxLength = field.maxlength; if (field.value !== undefined) { if (field.type === "checkbox") input.checked = Boolean(field.value); else input.value = field.value; } } input.name = field.name; label.append(input); form.append(label); } const button = node("button", "", item.label); button.type = "submit"; button.disabled = item.status !== "AVAILABLE"; form.append(button); if (item.blockers.length) form.append(node("p", "muted", item.blockers.join(" · "))); form.addEventListener("submit", (event) => { event.preventDefault(); const command = {action: item.action}; for (const field of item.fields) { const input = form.elements[field.name]; command[field.name] = field.type === "checkbox" ? input.checked : input.value; } prepareAction(command, "commands-error"); }); section.append(form); } return section; }));
+  }).catch(() => setError("commands-error", "Command registry is temporarily unavailable."));
+}
+
+function setupConnections() {
+  const root = byId("connection-cards"); if (!root) return;
+  const load = () => fetch("/api/dashboard/connections", {cache: "no-store"}).then((response) => response.ok ? response.json() : Promise.reject()).then((data) => { root.replaceChildren(...data.items.map((item) => { const card = node("article", `health-card${item.status === "STALE" ? " stale" : ""}`); card.append(node("h3", "", item.component), status(item.status), list([["Target", item.logical_target], ["Checked", localTime(item.checked_at)], ["Freshness", elapsed(item.freshness_seconds)], ["Latency", has(item.latency_ms) ? `${item.latency_ms}ms` : null], ["Last success", localTime(item.last_success_at)], ["Last failure", localTime(item.last_failure_at)], ["Source", item.source], ["Error", item.safe_error], ["Next action", item.next_action]])); return card; })); byId("connections-empty").classList.toggle("hidden", data.items.length !== 0); byId("connections-freshness").textContent = `${data.items.length} redacted connection snapshots`; setError("connections-error"); }).catch(() => setError("connections-error", "Connection snapshots are temporarily unavailable."));
+  byId("recheck-connections").addEventListener("click", () => prepareAction({action: "refresh_connections", scope: "all"}, "connections-error")); load(); window.setInterval(load, 10000);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  setupActionDialog();
   const page = document.body.dataset.page;
   if (page === "overview") setupOverview();
   if (page === "backlog") setupBacklog();
   if (page === "workflows") { setupWorkflows(); setupWorkflowDetail(); }
   if (page === "logs") { setupLogs(); setupExecution(); }
   if (page === "audits") setupAudits();
+  if (page === "commands") setupCommands();
+  if (page === "connections") setupConnections();
 });

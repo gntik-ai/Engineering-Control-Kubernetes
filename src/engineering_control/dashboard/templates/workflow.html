@@ -6,6 +6,13 @@
 </section>
 <div id="workflow-detail" data-workflow-id="{{ workflow_id }}">
   <p id="workflow-detail-error" class="alert error hidden" role="alert"></p>
+  <div id="workflow-actions" class="action-row" aria-label="Typed workflow controls">
+    <button type="button" data-workflow-action="pause">Pause</button>
+    <button type="button" data-workflow-action="resume">Resume</button>
+    <button type="button" data-workflow-action="nudge">Nudge</button>
+    <button type="button" data-workflow-action="retry">Retry</button>
+    <button type="button" data-workflow-action="cancel" class="danger">Cancel</button>
+  </div>
   <section id="workflow-identity" class="panel"></section>
   <section class="section-heading"><h3>State timeline</h3></section>
   <div id="workflow-timeline" class="timeline"></div>

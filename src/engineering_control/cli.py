@@ -7,6 +7,7 @@ import stat
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -21,12 +22,18 @@ class APIClient:
         token = token_file.read_text(encoding="utf-8").strip()
         self.client = httpx.Client(
             base_url=base_url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Engineering-Actor": "engineering-ctl",
+            },
             timeout=30,
         )
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
-        response = self.client.request(method, path, json=payload)
+        headers = (
+            {"Idempotency-Key": f"engineering-ctl-{uuid4()}"} if path == "/v1/commands" else None
+        )
+        response = self.client.request(method, path, json=payload, headers=headers)
         response.raise_for_status()
         return SecretRedactor().redact(response.json()).value
 
@@ -173,8 +180,9 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
     if command == "audit":
         return client.request(
             "POST",
-            "/v1/campaigns",
+            "/v1/commands",
             {
+                "action": "audit_campaign",
                 "project": arguments.project,
                 "name": arguments.name,
                 "source_sha": arguments.source_sha,
@@ -183,17 +191,18 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "personas": arguments.personas,
                 "lenses": arguments.lenses,
                 "environments": arguments.environments,
-                "dry_run": not arguments.execute,
+                "execute": arguments.execute,
+                "production": False,
             },
         )
     if command in {"campaigns", "findings"}:
         return client.request("GET", f"/v1/{command}?limit={arguments.limit}")
     if command in {"status", "run"}:
         return client.request("GET", f"/v1/runs/{arguments.workflow_id}")
-    if command in {"pause", "resume"}:
-        return client.request("POST", f"/v1/campaigns/{arguments.workflow_id}/{command}")
-    if command == "cancel":
-        return client.request("POST", f"/v1/runs/{arguments.workflow_id}/cancel")
+    if command in {"pause", "resume", "cancel"}:
+        return client.request(
+            "POST", "/v1/commands", {"action": command, "workflow_id": arguments.workflow_id}
+        )
     if command == "usage":
         return client.request("GET", "/v1/usage")
     if command == "evidence":
@@ -327,12 +336,13 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
     if command == "backlog-start":
         return client.request(
             "POST",
-            "/v1/loop-start",
+            "/v1/commands",
             {
+                "action": "solve_backlog",
                 "project": arguments.project,
-                "campaign_id": arguments.campaign_id,
+                "backlog_campaign_id": arguments.campaign_id,
                 "maximum_risk": arguments.maximum_risk,
-                "execution_mode": arguments.delivery_mode,
+                "delivery_mode": arguments.delivery_mode,
                 "maximum_items": arguments.max_items,
             },
         )
@@ -340,20 +350,20 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         return client.request("GET", f"/v1/loops/{arguments.workflow_id}")
     if command in {"backlog-pause", "backlog-resume", "backlog-cancel"}:
         action = command.removeprefix("backlog-")
-        return client.request("POST", f"/v1/backlog-loops/{arguments.workflow_id}/{action}")
+        return client.request(
+            "POST", "/v1/commands", {"action": action, "workflow_id": arguments.workflow_id}
+        )
     if command in {"backlog-skip", "backlog-retry"}:
         action = command.removeprefix("backlog-")
         payload = {
+            "action": action,
+            "workflow_id": arguments.workflow_id,
             "repository": arguments.repository,
             "issue_number": arguments.issue_number,
         }
         if action == "skip":
             payload["reason_code"] = arguments.reason_code
-        return client.request(
-            "POST",
-            f"/v1/backlog-loops/{arguments.workflow_id}/{action}",
-            payload,
-        )
+        return client.request("POST", "/v1/commands", payload)
     raise ValueError(f"unsupported command: {command}")
 
 

@@ -7,15 +7,21 @@ server-rendered Jinja2, local CSS and vanilla JavaScript. Caddy is the only publ
 proxies the `ade.musematic.ai` virtual host to that loopback address. The existing private API at
 `127.0.0.1:8740` is never proxied.
 
-The dashboard is observational. It reads existing PostgreSQL solution loops, GitHub backlog
-campaigns, ChangeSets, Runs, campaigns, coverage cells and findings. It has no workflow, GitHub,
-provider, deployment, shell or Kubernetes mutation route. The authenticated navigation is:
+The dashboard reads existing PostgreSQL solution loops, GitHub backlog campaigns, ChangeSets,
+Runs, campaigns, coverage cells and findings. It also exposes a small controlled-operation surface:
+immutable typed candidates, current-password reauthentication, one-use five-minute action
+bindings, and state-dependent workflow signals. The dashboard never accepts a command line,
+provider invocation, shell string, repository argument outside the catalog, production target, or
+arbitrary Engineering Control argument. All accepted operations use the same application command
+bus as Telegram and `engineering-ctl`. The authenticated navigation is:
 
 - **Overview** — current work, queue/blocker summaries and persisted service/provider health;
 - **Backlog** — issues and their current workflow/provider state;
 - **Workflows** — cursor-paginated workflow summaries and durable detail timelines;
 - **Audits** — campaigns, current cells and grouped root blockers;
 - **Logs** — redacted operational events and native-agent execution transcripts;
+- **Commands** — allowlisted typed forms with explicit disabled/runtime-blocked capabilities;
+- **Connections** — fixed read-only probes and redacted persisted health snapshots;
 - **Settings** — dashboard password change only.
 
 Legacy `/activity` bookmarks redirect to `/logs`; the authenticated root redirects to `/overview`.
@@ -31,6 +37,29 @@ campaign, finding and evidence data. Each execution summary correlates workflow/
 project, issue/campaign/ChangeSet, provider, canonical role, host, worker, task queue, phase,
 attempts, heartbeat and blocker. Transcript chunks contain only bounded, already CLI-visible,
 redacted text; they never contain hidden model reasoning.
+
+Additive migration `0012` adds `action_candidates`, `reauthentication_bindings`,
+`operation_requests`, and `connection_snapshots`. Candidate and reauthentication records contain
+only hashes, typed non-secret payloads, expiry and session-binding digests; no password, cookie,
+API token, or provider credential is stored. Operation requests durably correlate Dashboard,
+Telegram and CLI submissions to one workflow/run identity. Connection snapshots contain safe
+status names and bounded error summaries published by the component that already owns any needed
+credential; the dashboard receives no Telegram, GitHub, Codex, Claude, Kubernetes or product
+credential.
+
+Every dashboard mutation requires CSRF plus the current dashboard password. A successful
+reauthentication token is HMAC/session bound, action-candidate bound, expires after five minutes,
+and is consumed exactly once. High-impact backlog and full/security audit candidates require a
+server-generated typed phrase bound to the candidate digest. Capability preflight is repeated in
+the API dispatcher immediately before starting or signaling a workflow. Production is a literal
+`false` field in the typed schemas. R3 actions fail closed for operator handling.
+
+The current complete-delivery backend has no reviewed final GitHub merge/comment/issue-close
+application service. Consequently `full-delivery` candidates report
+`FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED` and remain disabled. Source-PR mode uses the
+existing gated issue-delivery workflow and now registers its child finding-verification and
+delivery Runs durably before child start. This distinction prevents the console from advertising a
+complete solve path that the current runtime cannot finish.
 
 Raw state remains visible. The canonical normalized states are `backlog`, `eligible`, `queued`,
 `preparing`, `implementing`, `reviewing`, `reworking`, `testing`, `awaiting_ci`,
@@ -75,7 +104,9 @@ Provider roles mean:
 There is one password and no username. Sessions are HMAC signed for 12 hours and use Secure,
 HttpOnly, SameSite=Strict cookies. The signed value includes `password_version`; a password change
 or reset invalidates all older sessions. Login failures are limited in memory per public client IP.
-All state-changing forms use CSRF validation.
+All state-changing forms use CSRF validation. Controlled operations additionally require the same
+password again; the password value is verified in memory and never enters an operation record,
+event, log, report, or URL.
 
 Initialize only when no authentication row exists:
 
@@ -151,6 +182,27 @@ entry names its source, observation time, freshness and stale state. `unknown` m
 has been persisted; it is not treated as healthy. The dashboard service remains unable to read
 Codex, Claude, GitHub, Kubernetes or operator authentication directories.
 
+## Controlled operations and safe acceptance
+
+Backlog Solve, backlog campaign, audit and workflow-control buttons first create an immutable
+preflight candidate. Solve is enabled only for an open persisted issue whose eligibility and active
+workflow state permit a new candidate. Duplicate issue/campaign submissions return the existing
+operation/workflow identity. Backlog concurrency and deployment concurrency are fixed to one.
+Audit Start requires a matching completed audit-plan operation from the preceding hour, and
+`publish_findings` defaults to false. Pause, resume, nudge, retry and cancel are enabled only for
+compatible persisted workflow states.
+
+`POST /v1/commands` accepts only strict discriminated request models and only the authenticated
+`engineering-ctl` or `telegram:*` actor classes. Dashboard requests reach the same bus through the
+durable `operation_requests` queue; the dashboard process never receives the private API token or a
+Temporal client. A started dashboard operation creates a bounded Telegram notification outbox
+record containing only project, target, workflow and phase.
+
+Connections refresh executes only fixed loopback/public HTTP, DNS, TLS and Temporal TCP probes.
+Privileged components publish safe heartbeat/quota/event/project snapshots into PostgreSQL. A
+missing or old snapshot becomes `NOT_CONFIGURED` or `STALE`; source code presence alone never
+produces `CONNECTED`.
+
 ## Read-only observability acceptance
 
 When the existing acceptance feature flag is enabled, the authenticated private API exposes one
@@ -178,9 +230,11 @@ not expose `journalctl` through a web route.
 Before installation, take fresh root-owned runtime, configuration and PostgreSQL backups. Install
 only the exact committed tree using the existing commit-addressed controller bootstrap. Because
 provider adapters and worker instrumentation are part of this release, controller and worker must
-run the exact same committed tree. Apply migration `0011` only after the database backup, then
+run the exact same committed tree. Apply migrations through `0012` only after the database backup, then
 restart only the affected controller, provider, scan, evidence-ingest and dashboard services.
-Preserve the current password hash/version, session key, DNS, Caddy and TLS state.
+Preserve the current password hash/version, session key, DNS, Caddy and TLS state. Apply migration
+`0012` after `0011`; it is additive and does not alter authentication, workflow, campaign, finding,
+ChangeSet, evidence, transcript or session-key state.
 
 Normal rollback:
 
@@ -191,7 +245,8 @@ Normal rollback:
 4. Leave `agent_executions` and `agent_log_chunks` in place by default; the previous release ignores
    additive tables.
 5. If a database downgrade is explicitly required, back up PostgreSQL again, stop all writers, and
-   downgrade `0011` to `0010`; this removes only the new execution/transcript projection.
+   downgrade `0012` to `0011`; this removes only candidates, one-use reauthentication bindings,
+   operation correlation, and connection snapshots. Leave `0011` transcript data in place.
 6. Preserve the dashboard password row/version and `/etc/engineering-control/dashboard/session.key`.
 7. Do not change DNS, Caddy or TLS for a normal observability rollback.
 

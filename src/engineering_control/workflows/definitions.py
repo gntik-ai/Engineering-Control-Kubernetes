@@ -1386,6 +1386,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        register_child_runs = workflow.patched("existing-backlog-register-child-runs-v1")
+        sequential_source_pr = workflow.patched("existing-backlog-sequential-source-pr-v1")
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
             return context
@@ -1396,6 +1398,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         for ordinal, item in enumerate(raw_items, start=1):
             if not isinstance(item, dict):
                 raise TypeError("existing backlog issue must be an object")
+            continue_to_next_issue = False
             while True:
                 if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
                     await self._step(
@@ -1418,6 +1421,20 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         "backlog.materialize_candidate",
                         {**asdict(request), "item": item},
                     )
+                    verification_workflow_id = (
+                        f"{workflow.info().workflow_id}-issue-{ordinal}-"
+                        f"revalidate-{item['issue_number']}"
+                    )
+                    if register_child_runs:
+                        await self._step(
+                            "backlog.register_child_run",
+                            {
+                                **asdict(request),
+                                "child_kind": "finding-verification",
+                                "child_workflow_id": verification_workflow_id,
+                                "finding_id": str(candidate["finding_id"]),
+                            },
+                        )
                     verification = await workflow.execute_child_workflow(
                         "FindingVerificationWorkflow",
                         FindingVerificationInput(
@@ -1425,10 +1442,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             project=request.project,
                             fresh_snapshot=True,
                         ),
-                        id=(
-                            f"{workflow.info().workflow_id}-issue-{ordinal}-"
-                            f"revalidate-{item['issue_number']}"
-                        ),
+                        id=verification_workflow_id,
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=4),
                     )
@@ -1457,6 +1471,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         continue
                     blocker = f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
                 issue_ref = f"{item['repository']}#{item['issue_number']}"
+                if (
+                    sequential_source_pr
+                    and request.continue_after_blocked_issue
+                    and not self._requires_operator_pause(blocker)
+                ):
+                    results.append(
+                        {
+                            "status": "BLOCKED",
+                            "blocker": blocker,
+                            "repository": item["repository"],
+                            "issue_number": item["issue_number"],
+                        }
+                    )
+                    continue_to_next_issue = True
+                    break
                 self._phase = f"AWAITING_OPERATOR:{issue_ref}:{blocker}"
                 self._skip_reason = None
                 self._retry_step = None
@@ -1512,27 +1541,89 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         ),
                         item,
                     )
-            if results and results[-1].get("status") == "SKIPPED":
+            if continue_to_next_issue or (results and results[-1].get("status") == "SKIPPED"):
                 continue
-            delivery = await workflow.execute_child_workflow(
-                "IssueDeliveryWorkflow",
-                IssueDeliveryInput(
-                    finding_id=str(gate["finding_id"]),
-                    risk_class=str(gate["risk_class"]),
-                    dry_run=False,
-                ),
-                id=f"{workflow.info().workflow_id}-issue-{ordinal}",
-                task_queue=workflow.info().task_queue,
-                execution_timeout=timedelta(hours=12),
-            )
-            results.append(delivery)
+            delivery: dict[str, Any]
+            if sequential_source_pr:
+                delivery = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
+                for attempt in range(1, request.correction_limit + 2):
+                    delivery_workflow_id = (
+                        f"{workflow.info().workflow_id}-issue-{ordinal}-attempt-{attempt}"
+                    )
+                    if register_child_runs:
+                        await self._step(
+                            "backlog.register_child_run",
+                            {
+                                **asdict(request),
+                                "child_kind": "issue-delivery",
+                                "child_workflow_id": delivery_workflow_id,
+                                "finding_id": str(gate["finding_id"]),
+                            },
+                        )
+                    delivery = await workflow.execute_child_workflow(
+                        "IssueDeliveryWorkflow",
+                        IssueDeliveryInput(
+                            finding_id=str(gate["finding_id"]),
+                            risk_class=str(gate["risk_class"]),
+                            dry_run=False,
+                        ),
+                        id=delivery_workflow_id,
+                        task_queue=workflow.info().task_queue,
+                        execution_timeout=timedelta(hours=12),
+                    )
+                    results.append({**delivery, "attempt": attempt})
+                    if delivery.get("status") != "REQUEST_CHANGES":
+                        break
+            else:
+                delivery_workflow_id = f"{workflow.info().workflow_id}-issue-{ordinal}"
+                if register_child_runs:
+                    await self._step(
+                        "backlog.register_child_run",
+                        {
+                            **asdict(request),
+                            "child_kind": "issue-delivery",
+                            "child_workflow_id": delivery_workflow_id,
+                            "finding_id": str(gate["finding_id"]),
+                        },
+                    )
+                delivery = await workflow.execute_child_workflow(
+                    "IssueDeliveryWorkflow",
+                    IssueDeliveryInput(
+                        finding_id=str(gate["finding_id"]),
+                        risk_class=str(gate["risk_class"]),
+                        dry_run=False,
+                    ),
+                    id=delivery_workflow_id,
+                    task_queue=workflow.info().task_queue,
+                    execution_timeout=timedelta(hours=12),
+                )
+                results.append(delivery)
             if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
+                blocker = str(delivery.get("blocker") or delivery.get("status"))
+                if (
+                    sequential_source_pr
+                    and request.continue_after_blocked_issue
+                    and not self._requires_operator_pause(blocker)
+                ):
+                    continue
                 await self._step(
                     "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": delivery.get("status")},
+                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                )
+                return {"status": "PAUSED", "results": results}
+            if sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
+                await self._step(
+                    "backlog.record_loop_state",
+                    {
+                        **asdict(request),
+                        "loop_status": "PAUSED",
+                        "blocker": "CORRECTION_LIMIT_EXHAUSTED",
+                    },
                 )
                 return {"status": "PAUSED", "results": results}
             if request.delivery_mode == "source-pr":
+                if sequential_source_pr:
+                    continue
                 return {"status": "AWAITING_STAGING_DELIVERY", "results": results}
             return {
                 "status": "BLOCKED_BY_DELIVERY",
@@ -1543,6 +1634,25 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             "backlog.record_loop_state", {**asdict(request), "loop_status": "COMPLETE"}
         )
         return {"status": "COMPLETE", "results": results}
+
+    @staticmethod
+    def _requires_operator_pause(blocker: str) -> bool:
+        normalized = blocker.upper()
+        return any(
+            marker in normalized
+            for marker in (
+                "R3",
+                "MIGRATION",
+                "SECRET",
+                "CREDENTIAL",
+                "CROSS_TENANT",
+                "CROSS-TENANT",
+                "PRODUCTION",
+                "EXTERNAL_DRIFT",
+                "REVISION_DRIFT",
+                "APPROVAL",
+            )
+        )
 
 
 @workflow.defn(name="EnhancementDiscoveryWorkflow")

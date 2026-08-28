@@ -184,6 +184,7 @@ class ControlActivities:
         "backlog.record_revalidation",
         "backlog.revalidate_gate",
         "backlog.record_loop_state",
+        "backlog.register_child_run",
         "observability.register",
         "observability.prepare_workspace",
         "observability.prepare_codex",

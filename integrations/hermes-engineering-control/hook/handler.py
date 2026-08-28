@@ -13,7 +13,7 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 COMMANDS = {
     "audit",
@@ -137,6 +137,7 @@ def _request(
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "X-Engineering-Actor": actor,
+            **({"Idempotency-Key": f"telegram-{uuid4()}"} if path == "/v1/commands" else {}),
         },
     )
     try:
@@ -365,16 +366,10 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if len(args) != 1:
             raise ValueError("usage: /evidence <artifact-id>")
         return _request("GET", f"/v1/evidence/{urllib.parse.quote(args[0], safe='')}", actor)
-    if command in {"pause", "resume"}:
+    if command in {"pause", "resume", "cancel"}:
         if len(args) != 1:
             raise ValueError(f"usage: /{command} <workflow-id>")
-        workflow_id = urllib.parse.quote(args[0], safe="")
-        return _request("POST", f"/v1/campaigns/{workflow_id}/{command}", actor, {})
-    if command == "cancel":
-        if len(args) != 1:
-            raise ValueError("usage: /cancel <workflow-id>")
-        workflow_id = urllib.parse.quote(args[0], safe="")
-        return _request("POST", f"/v1/runs/{workflow_id}/cancel", actor, {})
+        return _request("POST", "/v1/commands", actor, {"action": command, "workflow_id": args[0]})
     if command == "run":
         if len(args) not in {2, 3} or args[1] not in {"R0", "R1", "R2", "R3"}:
             raise ValueError("usage: /run <finding-uuid> <R0|R1|R2|R3> [--execute]")
@@ -399,9 +394,14 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
             raise ValueError("falcone-intensive is bound to Falcone")
         return _request(
             "POST",
-            "/v1/audit-plan",
+            "/v1/commands",
             actor,
-            {"project": args[0], "preset": args[1], "environment": args[2]},
+            {
+                "action": "audit_plan",
+                "project": args[0],
+                "preset": args[1],
+                "environment": args[2],
+            },
         )
     if command == "audit":
         if 3 <= len(args) <= 5 and args[0] in _PROJECTS and args[1] in _PRESETS:
@@ -416,14 +416,13 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 raise ValueError("falcone-intensive is bound to Falcone")
             return _request(
                 "POST",
-                "/v1/campaigns",
+                "/v1/commands",
                 actor,
                 {
+                    "action": "audit_start" if "--execute" in flags else "audit_plan",
                     "project": args[0],
-                    "name": f"{args[1]}-{args[2]}",
                     "preset": args[1],
                     "environment": args[2],
-                    "dry_run": "--execute" not in flags,
                     "publish_findings": "--publish-findings" in flags,
                 },
             )
@@ -620,14 +619,15 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 raise ValueError("max-items must be between 1 and 50")
             return _request(
                 "POST",
-                "/v1/loop-start",
+                "/v1/commands",
                 actor,
                 {
+                    "action": "solve_backlog",
                     "project": args[1],
-                    "campaign_id": _uuid(args[2], "campaign ID"),
+                    "backlog_campaign_id": _uuid(args[2], "campaign ID"),
                     "maximum_risk": args[3],
                     "maximum_items": maximum_items,
-                    "execution_mode": args[4],
+                    "delivery_mode": args[4],
                 },
             )
         if action == "status":
@@ -638,8 +638,9 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if action in {"pause", "resume", "cancel"}:
             if len(args) != 2:
                 raise ValueError(f"usage: /loop {action} <workflow-id>")
-            workflow_id = urllib.parse.quote(args[1], safe="")
-            return _request("POST", f"/v1/backlog-loops/{workflow_id}/{action}", actor, {})
+            return _request(
+                "POST", "/v1/commands", actor, {"action": action, "workflow_id": args[1]}
+            )
         if action == "skip":
             if (
                 len(args) != 5
@@ -652,12 +653,13 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                     "usage: /loop skip <workflow-id> <repository-short-name> "
                     "<issue-number> <reason-code>"
                 )
-            workflow_id = urllib.parse.quote(args[1], safe="")
             return _request(
                 "POST",
-                f"/v1/backlog-loops/{workflow_id}/skip",
+                "/v1/commands",
                 actor,
                 {
+                    "action": "skip",
+                    "workflow_id": args[1],
                     "repository": args[2],
                     "issue_number": int(args[3]),
                     "reason_code": args[4],
@@ -673,12 +675,16 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 raise ValueError(
                     "usage: /loop retry <workflow-id> <repository-short-name> <issue-number>"
                 )
-            workflow_id = urllib.parse.quote(args[1], safe="")
             return _request(
                 "POST",
-                f"/v1/backlog-loops/{workflow_id}/retry",
+                "/v1/commands",
                 actor,
-                {"repository": args[2], "issue_number": int(args[3])},
+                {
+                    "action": "retry",
+                    "workflow_id": args[1],
+                    "repository": args[2],
+                    "issue_number": int(args[3]),
+                },
             )
         if action == "delivery-candidate":
             if (

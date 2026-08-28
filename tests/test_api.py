@@ -1,4 +1,6 @@
+from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
@@ -7,6 +9,7 @@ from engineering_control.api.main import create_app
 from engineering_control.api.schemas import BacklogImportAccepted, OperationAccepted
 from engineering_control.config import Settings
 from engineering_control.db.repository import EmptyMetadataRepository
+from engineering_control.operations.models import OperationView
 
 
 class FakeService:
@@ -131,6 +134,68 @@ def test_api_requires_bearer_auth() -> None:
         assert response.status_code == 401
         response = client.get("/v1/campaigns", headers={"Authorization": f"Bearer {'x' * 32}"})
         assert response.status_code == 200
+
+
+def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    bus.submit = AsyncMock(
+        return_value=OperationView(
+            operation_id=uuid4(),
+            action="refresh_connections",
+            target_type="connections",
+            target_id="all",
+            source_channel="cli",
+            status="COMPLETED",
+            workflow_id=None,
+            temporal_run_id=None,
+            binding_hash="a" * 64,
+            safe_error=None,
+            created_at=datetime.now(UTC),
+        )
+    )
+    app = create_app(
+        settings=Settings(),
+        service=FakeService(),
+        token="x" * 32,
+        operations_repository=Mock(),
+        command_bus=bus,
+    )
+    base = {
+        "Authorization": f"Bearer {'x' * 32}",
+        "Idempotency-Key": str(uuid4()),
+    }
+    with TestClient(app) as client:
+        default_actor = client.post(
+            "/v1/commands", headers=base, json={"action": "refresh_connections"}
+        )
+        dashboard_actor = client.post(
+            "/v1/commands",
+            headers={**base, "X-Engineering-Actor": "dashboard"},
+            json={"action": "refresh_connections"},
+        )
+        cli_actor = client.post(
+            "/v1/commands",
+            headers={**base, "X-Engineering-Actor": "engineering-ctl"},
+            json={"action": "refresh_connections"},
+        )
+        telegram_actor = client.post(
+            "/v1/commands",
+            headers={**base, "X-Engineering-Actor": "telegram:allowlisted"},
+            json={"action": "refresh_connections"},
+        )
+        arbitrary = client.post(
+            "/v1/commands",
+            headers={**base, "X-Engineering-Actor": "engineering-ctl"},
+            json={"action": "shell", "command": "id"},
+        )
+    assert default_actor.status_code == 403
+    assert dashboard_actor.status_code == 403
+    assert cli_actor.status_code == 202
+    assert telegram_actor.status_code == 202
+    assert arbitrary.status_code == 409
+    assert bus.submit.await_args_list[0].kwargs["source_channel"] == "cli"
+    assert bus.submit.await_args_list[1].kwargs["source_channel"] == "telegram"
 
 
 def test_internal_metrics_expose_named_control_plane_families() -> None:

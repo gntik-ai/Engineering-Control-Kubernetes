@@ -182,8 +182,8 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("command", "raw_args", "method", "path"),
     [
-        ("audit-plan", "falcone e2e-smoke staging", "POST", "/v1/audit-plan"),
-        ("audit", "falcone e2e-smoke staging --execute", "POST", "/v1/campaigns"),
+        ("audit-plan", "falcone e2e-smoke staging", "POST", "/v1/commands"),
+        ("audit", "falcone e2e-smoke staging --execute", "POST", "/v1/commands"),
         ("campaigns", "", "GET", "/v1/campaigns?limit=20"),
         ("findings", "", "GET", "/v1/findings?limit=20"),
         (
@@ -220,7 +220,7 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
             "loop",
             "start falcone 11111111-1111-4111-8111-111111111111 R2 full-delivery 1",
             "POST",
-            "/v1/loop-start",
+            "/v1/commands",
         ),
         ("loop", "status loop-safe-id", "GET", "/v1/loops/loop-safe-id"),
         (
@@ -233,9 +233,9 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
         ("status", "workflow-safe-id", "GET", "/v1/runs/workflow-safe-id"),
         ("evidence", "artifact-safe-id", "GET", "/v1/evidence/artifact-safe-id"),
         ("usage", "", "GET", "/v1/usage"),
-        ("pause", "workflow-safe-id", "POST", "/v1/campaigns/workflow-safe-id/pause"),
-        ("resume", "workflow-safe-id", "POST", "/v1/campaigns/workflow-safe-id/resume"),
-        ("cancel", "workflow-safe-id", "POST", "/v1/runs/workflow-safe-id/cancel"),
+        ("pause", "workflow-safe-id", "POST", "/v1/commands"),
+        ("resume", "workflow-safe-id", "POST", "/v1/commands"),
+        ("cancel", "workflow-safe-id", "POST", "/v1/commands"),
     ],
 )
 def test_required_telegram_commands_are_fixed_and_bounded(

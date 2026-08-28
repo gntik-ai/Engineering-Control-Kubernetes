@@ -52,6 +52,8 @@ def test_protected_pages_local_assets_and_observational_controls(tmp_path: Path)
             ("/workflows", "Workflows"),
             ("/logs", "Logs"),
             ("/audits", "Audits"),
+            ("/commands", "Commands"),
+            ("/connections", "Connections"),
             ("/settings", "Settings"),
         ):
             response = client.get(path)
@@ -104,7 +106,9 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
         assert client.get("/api/dashboard/backlog?project=outside").status_code == 422
 
 
-def test_dashboard_exposes_no_operational_mutation_or_raw_journal_route(tmp_path: Path) -> None:
+def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
+    tmp_path: Path,
+) -> None:
     repository = DashboardRepository(f"sqlite+pysqlite:///{tmp_path / 'routes.db'}")
     Base.metadata.create_all(repository.engine)
     repository.initialize_password_sync(PASSWORD)
@@ -114,14 +118,17 @@ def test_dashboard_exposes_no_operational_mutation_or_raw_journal_route(tmp_path
         session_key=b"r" * 48,
     )
     post_routes = {route.path for route in app.routes if "POST" in getattr(route, "methods", set())}
-    assert post_routes == {"/login", "/logout", "/settings/password"}
+    assert post_routes == {
+        "/login",
+        "/logout",
+        "/settings/password",
+        "/api/dashboard/actions/candidates",
+        "/api/dashboard/actions/reauthenticate",
+        "/api/dashboard/actions/execute",
+    }
     paths = {route.path for route in app.routes}
-    assert not any("journal" in path or "shell" in path or "command" in path for path in paths)
-    assert not any(
-        action in path
-        for path in paths
-        for action in ("start", "pause", "resume", "cancel", "retry")
-    )
+    assert not any("journal" in path or "shell" in path or "terminal" in path for path in paths)
+    assert not any("codex" in path or "claude" in path for path in paths)
 
     with TestClient(app, base_url="https://testserver") as client:
         login = client.get("/login")

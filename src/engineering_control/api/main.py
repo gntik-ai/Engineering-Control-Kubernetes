@@ -7,7 +7,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from temporalio.client import Client
 
 from engineering_control.api.auth import bearer_auth
@@ -56,6 +56,9 @@ from engineering_control.observability.agent import (
     GatewayEventInput,
 )
 from engineering_control.observability.metrics import ControlPlaneMetrics
+from engineering_control.operations.models import parse_command
+from engineering_control.operations.repository import OperationsRepository
+from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
 
 
 def create_app(
@@ -65,6 +68,8 @@ def create_app(
     repository: MetadataRepository | None = None,
     token: str | None = None,
     gateway_repository: AgentObservabilityRepository | None = None,
+    operations_repository: OperationsRepository | None = None,
+    command_bus: TypedCommandBus | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
 
@@ -94,9 +99,32 @@ def create_app(
             )
         else:
             app.state.control_service = service
+        resolved_operations = operations_repository
+        if resolved_operations is None and (service is None or command_bus is not None):
+            resolved_operations = OperationsRepository(resolved.database_url.get_secret_value())
+        app.state.operations_repository = resolved_operations
+        resolved_bus = command_bus
+        if resolved_bus is None and resolved_operations is not None:
+            resolved_bus = TypedCommandBus(
+                cast(ControlService, app.state.control_service),
+                resolved_repository,
+                resolved_operations,
+            )
+        app.state.command_bus = resolved_bus
+        stop = asyncio.Event()
+        dispatcher = (
+            asyncio.create_task(operation_dispatch_loop(resolved_bus, stop))
+            if resolved_bus is not None
+            else None
+        )
         yield
+        stop.set()
+        if dispatcher is not None:
+            await dispatcher
         if gateway_repository is None:
             cast(AgentObservabilityRepository, app.state.gateway_repository).engine.dispose()
+        if operations_repository is None and resolved_operations is not None:
+            resolved_operations.engine.dispose()
 
     app = FastAPI(
         title="Engineering Control API",
@@ -119,9 +147,56 @@ def create_app(
     def gateway_events(request: Request) -> AgentObservabilityRepository:
         return cast(AgentObservabilityRepository, request.app.state.gateway_repository)
 
+    def operations(request: Request) -> OperationsRepository:
+        value = request.app.state.operations_repository
+        if value is None:
+            raise HTTPException(status_code=503, detail="operation repository unavailable")
+        return cast(OperationsRepository, value)
+
+    def commands(request: Request) -> TypedCommandBus:
+        value = request.app.state.command_bus
+        if value is None:
+            raise HTTPException(status_code=503, detail="typed command bus unavailable")
+        return cast(TypedCommandBus, value)
+
     control_dependency = Depends(control)
     metadata_dependency = Depends(metadata)
+    operations_dependency = Depends(operations)
+    commands_dependency = Depends(commands)
     control_metrics = ControlPlaneMetrics()
+
+    @app.post("/v1/commands", status_code=202)
+    async def typed_command(
+        body: dict[str, Any],
+        subject: str = auth_dependency,
+        idempotency_key: str = Header(alias="Idempotency-Key", min_length=16, max_length=128),
+        bus: TypedCommandBus = commands_dependency,
+    ) -> dict[str, Any]:
+        try:
+            if subject != "engineering-ctl" and not subject.startswith("telegram:"):
+                raise HTTPException(status_code=403, detail="typed command channel is not allowed")
+            command = parse_command(body)
+            source_channel = "telegram" if subject.startswith("telegram:") else "cli"
+            result = await bus.submit(
+                command,
+                source_channel=source_channel,  # type: ignore[arg-type]
+                operator_class=subject,
+                idempotency_key=idempotency_key,
+            )
+            return result.model_dump(mode="json")
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/v1/operations/{operation_id}")
+    async def operation_get(
+        operation_id: UUID,
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        value = await repository.operation(operation_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="operation not found")
+        return value.model_dump(mode="json")
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

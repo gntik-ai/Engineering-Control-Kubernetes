@@ -66,6 +66,7 @@ class EngineeringActivityHandler:
             "backlog.record_revalidation",
             "backlog.revalidate_gate",
             "backlog.record_loop_state",
+            "backlog.register_child_run",
             "enhancement.load_evidence",
             "enhancement.prepare_discovery",
             "enhancement.validate_evidence",
@@ -196,6 +197,8 @@ class EngineeringActivityHandler:
             return self._backlog_revalidate_gate(payload)
         if step == "backlog.record_loop_state":
             return self._record_backlog_loop_state(payload)
+        if step == "backlog.register_child_run":
+            return self._register_backlog_child_run(payload)
         if step == "enhancement.load_evidence":
             return self._load_enhancement_evidence(payload)
         if step == "enhancement.dedupe":
@@ -811,11 +814,30 @@ class EngineeringActivityHandler:
                 )
                 .order_by(db.BacklogIssueRecord.planned_order)
             ).all()
+            target_repository = payload.get("target_repository")
+            target_issue_number = payload.get("target_issue_number")
+            if target_repository is not None or target_issue_number is not None:
+                if not isinstance(target_repository, str) or not isinstance(
+                    target_issue_number, int
+                ):
+                    raise ValueError("direct issue selection binding is incomplete")
+                rows = [
+                    row
+                    for row in rows
+                    if row.repository == target_repository
+                    and row.issue_number == target_issue_number
+                ]
             selected = [
                 self._serialize_backlog_issue(row)
                 for row in rows
                 if risk_rank.get(row.calculated_risk, 99) <= maximum
             ][: int(payload.get("maximum_items", 1))]
+            if target_repository is not None and not selected:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE",
+                }
             campaign.status = "RUNNING"
         return self._envelope(
             "backlog.load_execution",
@@ -1094,7 +1116,11 @@ class EngineeringActivityHandler:
             if status in {"CANCELLED", "COMPLETE"}:
                 approval = campaign.approval_json.get("approval")
                 actor = approval.get("approved_by") if isinstance(approval, dict) else None
-                if not isinstance(actor, str) or not actor.startswith("telegram:"):
+                if not isinstance(actor, str) or not (
+                    actor.startswith("telegram:")
+                    or actor == "dashboard:reauthenticated"
+                    or actor == "cli:engineering-ctl"
+                ):
                     raise ValueError("terminal backlog campaign approval evidence is missing")
                 deactivation = {
                     "action": "disable-existing-backlog",
@@ -1108,6 +1134,51 @@ class EngineeringActivityHandler:
         if deactivation is not None:
             self._write_policy_request(deactivation)
         return self._envelope("backlog.record_loop_state", payload, status)
+
+    def _register_backlog_child_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        child_kind = str(payload.get("child_kind", ""))
+        child_workflow_id = str(payload.get("child_workflow_id", ""))
+        if child_kind not in {"finding-verification", "issue-delivery"}:
+            raise ValueError("backlog child run kind is not allowlisted")
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", child_workflow_id):
+            raise ValueError("backlog child workflow identity is invalid")
+        finding_id = UUID(str(payload.get("finding_id", "")))
+        with self.sessions.begin() as session:
+            finding = session.get(db.Finding, finding_id)
+            if finding is None:
+                raise ValueError("backlog child finding is missing")
+            if child_kind == "issue-delivery" and finding.disposition != "CONFIRMED":
+                raise ValueError("backlog delivery child requires a confirmed finding")
+            existing = session.scalar(select(db.Run).where(db.Run.workflow_id == child_workflow_id))
+            if existing is not None:
+                if (
+                    existing.run_type != child_kind
+                    or existing.project != finding.project
+                    or (
+                        child_kind == "finding-verification" and existing.summary != str(finding.id)
+                    )
+                ):
+                    raise ValueError("backlog child run idempotency binding changed")
+                return self._envelope(
+                    "backlog.register_child_run",
+                    {**payload, "run_id": str(existing.id)},
+                    "REGISTERED",
+                )
+            run = db.Run(
+                campaign_id=(finding.campaign_id if child_kind == "finding-verification" else None),
+                workflow_id=child_workflow_id,
+                run_type=child_kind,
+                status="QUEUED",
+                project=finding.project,
+                summary=(str(finding.id) if child_kind == "finding-verification" else None),
+            )
+            session.add(run)
+            session.flush()
+            return self._envelope(
+                "backlog.register_child_run",
+                {**payload, "run_id": str(run.id)},
+                "REGISTERED",
+            )
 
     def _write_policy_request(self, request: dict[str, Any]) -> None:
         root = self.settings.state_root / "github-policy-requests"

@@ -118,6 +118,12 @@ class SignedSessionManager:
             return False
         return current - 900 <= issued <= current + 60 and len(nonce) >= 20
 
+    def binding_digest(self, token: str) -> str:
+        """Return a non-reversible session binding without persisting cookie material."""
+        return hmac.new(
+            self.key, b"dashboard-action-binding\0" + token.encode(), hashlib.sha256
+        ).hexdigest()
+
     def _sign(self, payload: dict[str, Any]) -> str:
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         encoded = base64.urlsafe_b64encode(raw).rstrip(b"=")

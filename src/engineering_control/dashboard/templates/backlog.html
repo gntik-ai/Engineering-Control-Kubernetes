@@ -2,7 +2,16 @@
 {% block content %}
 <section class="page-heading">
   <div><p class="eyebrow">Persisted issue state</p><h2>Backlog</h2></div>
-  <p id="last-refreshed" class="muted" aria-live="polite">Loading…</p>
+  <div class="backlog-actions">
+    <label>Delivery mode
+      <select id="backlog-delivery-mode">
+        <option value="full-delivery">Full delivery (gated)</option>
+        <option value="source-pr">Source PR</option>
+      </select>
+    </label>
+    <button id="solve-backlog" type="button">Solve backlog</button>
+    <p id="last-refreshed" class="muted" aria-live="polite">Loading…</p>
+  </div>
 </section>
 <form id="backlog-filters" class="filters" role="search">
   <label>Project
@@ -23,7 +32,7 @@
       <th>Issue</th><th>Title</th><th>Project</th><th>Status</th><th>Raw status</th>
       <th>Phase</th><th>Provider</th><th>Role</th><th>Worker</th><th>Heartbeat</th>
       <th>Duration</th><th>Attempt</th><th>PR</th><th>CI</th><th>Build</th>
-      <th>Deployment</th><th>Verification</th><th>Blocker / error</th>
+      <th>Deployment</th><th>Verification</th><th>Blocker / error</th><th>Actions</th>
     </tr></thead>
     <tbody id="backlog-rows"></tbody>
   </table>

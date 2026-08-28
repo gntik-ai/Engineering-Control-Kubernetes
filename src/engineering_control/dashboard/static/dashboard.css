@@ -106,6 +106,18 @@ progress { width: 100%; height: 1rem; accent-color: var(--accent); }
 .breakable { overflow-wrap: anywhere; }
 .expandable-row { cursor: pointer; }
 .row-detail td { background: #0e1721; }
+.action-row, .dialog-actions, .command-heading { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }
+.danger { border-color: #9d5049; color: var(--danger); }
+.compact { padding: .25rem .5rem; font-size: .82rem; }
+dialog { width: min(94vw, 52rem); max-height: 90vh; overflow: auto; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: .7rem; }
+dialog::backdrop { background: rgb(0 0 0 / 70%); }
+.operation-binding { max-height: 18rem; overflow: auto; padding: .75rem; color: #d8e7f5; background: #070b10; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; }
+.mutation-banner { padding: .75rem; border-left: .3rem solid var(--focus); background: #242115; }
+.dialog-actions { justify-content: flex-end; }
+.command-groups { display: grid; gap: 1rem; }
+.command-group { display: grid; gap: .8rem; }
+.command-form { display: flex; flex-wrap: wrap; align-items: end; gap: .65rem; padding-top: .8rem; border-top: 1px solid var(--line); }
+.command-heading { flex: 1 0 100%; justify-content: space-between; }
 @media (max-width: 850px) {
   .site-header { align-items: flex-start; flex-direction: column; padding: 1rem; }
   main { padding: 1rem; }

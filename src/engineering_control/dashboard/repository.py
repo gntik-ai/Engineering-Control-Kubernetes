@@ -274,10 +274,15 @@ class DashboardRepository:
                 )
                 records.append(
                     {
+                        "backlog_campaign_id": str(campaign.id),
+                        "repository": issue.repository,
                         "issue_number": issue.issue_number,
                         "issue_url": self._safe_issue_url(issue.issue_url_reference),
                         "title": issue.title,
                         "project": campaign.project,
+                        "issue_state": issue.state,
+                        "risk": issue.calculated_risk,
+                        "eligibility_status": issue.eligibility_status,
                         "normalized_status": normalized,
                         "raw_status": raw_status,
                         "current_phase": context["current_phase"],

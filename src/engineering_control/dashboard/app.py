@@ -3,6 +3,7 @@ from __future__ import annotations
 import grp
 import hmac
 import ipaddress
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -36,10 +37,19 @@ from engineering_control.dashboard.auth import (
 from engineering_control.dashboard.dependencies import AuthenticatedSession
 from engineering_control.dashboard.events import sse_events, transcript_sse
 from engineering_control.dashboard.repository import DashboardRepository
-from engineering_control.dashboard.schemas import ActivityEventInput, PasswordChangeInput
+from engineering_control.dashboard.schemas import (
+    ActionCandidateInput,
+    ActionExecuteInput,
+    ActionReauthenticationInput,
+    ActivityEventInput,
+    PasswordChangeInput,
+)
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
 from engineering_control.logging import configure_logging
+from engineering_control.operations.models import parse_command
+from engineering_control.operations.registry import COMMAND_REGISTRY
+from engineering_control.operations.repository import OperationsRepository
 
 PACKAGE_ROOT = Path(__file__).parent
 TEMPLATE_ROOT = PACKAGE_ROOT / "templates"
@@ -53,6 +63,7 @@ def create_app(
     repository: DashboardRepository | None = None,
     session_key: bytes | None = None,
     limiter: LoginFailureLimiter | None = None,
+    operations_repository: OperationsRepository | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     key = session_key
@@ -74,9 +85,15 @@ def create_app(
         )
         app.state.dashboard_repository = resolved_repository
         app.state.dashboard_service = DashboardService(resolved_repository)
+        resolved_operations = operations_repository or OperationsRepository(
+            resolved.database_url.get_secret_value()
+        )
+        app.state.operations_repository = resolved_operations
         yield
         if repository is None:
             resolved_repository.engine.dispose()
+        if operations_repository is None:
+            resolved_operations.engine.dispose()
 
     app = FastAPI(
         title="Hermes Engineering Operations Dashboard",
@@ -109,6 +126,9 @@ def create_app(
 
     def service(request: Request) -> DashboardService:
         return cast(DashboardService, request.app.state.dashboard_service)
+
+    def operations(request: Request) -> OperationsRepository:
+        return cast(OperationsRepository, request.app.state.operations_repository)
 
     async def current_session(request: Request) -> AuthenticatedSession | None:
         token = request.cookies.get(SESSION_COOKIE)
@@ -361,6 +381,28 @@ def create_app(
             request=request,
             name="audits.html",
             context=page_context(request, authenticated, title="Audits", active="audits"),
+        )
+
+    @app.get("/commands", response_class=HTMLResponse)
+    async def commands_page(request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return templates.TemplateResponse(
+            request=request,
+            name="commands.html",
+            context=page_context(request, authenticated, title="Commands", active="commands"),
+        )
+
+    @app.get("/connections", response_class=HTMLResponse)
+    async def connections_page(request: Request) -> Response:
+        authenticated = await require_session(request)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return templates.TemplateResponse(
+            request=request,
+            name="connections.html",
+            context=page_context(request, authenticated, title="Connections", active="connections"),
         )
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -665,6 +707,95 @@ def create_app(
         _validate_filters(project, status)
         return JSONResponse(await service(request).audits(project=project, status=status))
 
+    @app.get("/api/dashboard/commands")
+    async def commands_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        return JSONResponse({"items": COMMAND_REGISTRY})
+
+    @app.post("/api/dashboard/actions/candidates")
+    async def action_candidate_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            body = ActionCandidateInput.model_validate(await _json(request))
+            if not _valid_csrf(authenticated, body.csrf_token):
+                return JSONResponse({"detail": "invalid request"}, status_code=403)
+            command = parse_command(body.command)
+            value = await operations(request).candidate(
+                command, sessions.binding_digest(authenticated.token)
+            )
+            return JSONResponse(value.model_dump(mode="json"))
+        except ValueError as error:
+            return JSONResponse({"detail": str(error)}, status_code=409)
+        except Exception:  # noqa: BLE001 - never reflect form or password values
+            return JSONResponse({"detail": "unable to prepare action"}, status_code=400)
+
+    @app.post("/api/dashboard/actions/reauthenticate")
+    async def action_reauthenticate_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        address = _client_address(request)
+        if login_limiter.blocked(f"reauth:{address}"):
+            return JSONResponse({"detail": "unable to authorize action"}, status_code=429)
+        try:
+            body = ActionReauthenticationInput.model_validate(await _json(request))
+            if not _valid_csrf(authenticated, body.csrf_token):
+                return JSONResponse({"detail": "invalid request"}, status_code=403)
+            version = await repo(request).verify_password(body.current_password)
+            if version != authenticated.data.password_version:
+                login_limiter.failure(f"reauth:{address}")
+                return JSONResponse({"detail": "unable to authorize action"}, status_code=401)
+            token = await operations(request).create_reauthentication(
+                body.candidate_id, sessions.binding_digest(authenticated.token)
+            )
+            login_limiter.success(f"reauth:{address}")
+            return JSONResponse({"reauthentication_token": token, "expires_in": 300})
+        except Exception:  # noqa: BLE001 - never reflect password values
+            return JSONResponse({"detail": "unable to authorize action"}, status_code=400)
+
+    @app.post("/api/dashboard/actions/execute", status_code=202)
+    async def action_execute_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            body = ActionExecuteInput.model_validate(await _json(request))
+            if not _valid_csrf(authenticated, body.csrf_token):
+                return JSONResponse({"detail": "invalid request"}, status_code=403)
+            value = await operations(request).queue_candidate(
+                body.candidate_id,
+                body.reauthentication_token,
+                sessions.binding_digest(authenticated.token),
+                body.confirmation_phrase,
+            )
+            return JSONResponse(value.model_dump(mode="json"), status_code=202)
+        except ValueError as error:
+            return JSONResponse({"detail": str(error)}, status_code=409)
+        except Exception:  # noqa: BLE001 - safe action boundary
+            return JSONResponse({"detail": "unable to execute action"}, status_code=400)
+
+    @app.get("/api/dashboard/operations/{operation_id}")
+    async def dashboard_operation_api(operation_id: UUID, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        value = await operations(request).operation(operation_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="operation not found")
+        return JSONResponse(value.model_dump(mode="json"))
+
+    @app.get("/api/dashboard/connections")
+    async def connections_api(request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        items = await operations(request).connections()
+        return JSONResponse({"items": [item.model_dump(mode="json") for item in items]})
+
     @app.get("/api/dashboard/activity/recent")
     async def recent_activity(
         request: Request, limit: int = Query(default=500, ge=1, le=500)
@@ -744,6 +875,22 @@ async def _form(request: Request) -> dict[str, str]:
     return {key: items[0] for key, items in values.items()}
 
 
+async def _json(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="unsupported JSON encoding")
+    body = await request.body()
+    if len(body) > 32_768:
+        raise HTTPException(status_code=413, detail="request is too large")
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=400, detail="invalid JSON") from error
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="JSON object required")
+    return value
+
+
 def _set_cookie(response: Response, name: str, value: str, *, max_age: int) -> None:
     response.set_cookie(
         name,
@@ -768,6 +915,8 @@ def _safe_next(value: str | None) -> str:
         "/activity",
         "/logs",
         "/audits",
+        "/commands",
+        "/connections",
         "/settings",
     }:
         return value

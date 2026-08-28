@@ -87,8 +87,47 @@ def test_cli_backlog_import_and_start_use_only_fixed_routes() -> None:
     )
     assert imported["path"] == "/v1/backlogs/import"
     assert imported["payload"]["source"] == "github-open"
-    assert started["path"] == "/v1/loop-start"
-    assert started["payload"]["execution_mode"] == "full-delivery"
+    assert started["path"] == "/v1/commands"
+    assert started["payload"]["action"] == "solve_backlog"
+    assert started["payload"]["delivery_mode"] == "full-delivery"
+
+
+def test_cli_advanced_audit_uses_the_shared_typed_command_bus() -> None:
+    class FakeClient:
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            return {"method": method, "path": path, "payload": payload or {}}
+
+    result = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args(
+            [
+                "audit",
+                "falcone",
+                "--name",
+                "bounded-audit",
+                "--source-sha",
+                "a" * 40,
+                "--deployment-sha",
+                "b" * 40,
+                "--domains",
+                "gateway",
+                "--personas",
+                "tenant-admin",
+                "--lenses",
+                "correctness",
+                "--environments",
+                "staging",
+                "--execute",
+            ]
+        ),
+    )
+
+    assert result["path"] == "/v1/commands"
+    assert result["payload"]["action"] == "audit_campaign"
+    assert result["payload"]["execute"] is True
+    assert result["payload"]["production"] is False
 
 
 def test_cli_backlog_parser_rejects_arbitrary_filters_repositories_and_modes() -> None:

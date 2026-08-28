@@ -516,8 +516,12 @@ class SQLMetadataRepository:
     def _approve_backlog_campaign(
         self, campaign_id: UUID, project: str, binding: str, actor: str
     ) -> dict[str, Any]:
-        if not actor.startswith("telegram:"):
-            raise ValueError("existing-backlog approval requires an allowlisted Telegram actor")
+        if not (
+            actor.startswith("telegram:")
+            or actor == "dashboard:reauthenticated"
+            or actor == "cli:engineering-ctl"
+        ):
+            raise ValueError("existing-backlog approval requires a reauthenticated operator")
         result: dict[str, Any]
         request: dict[str, Any]
         with self.sessions.begin() as session:

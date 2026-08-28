@@ -127,6 +127,10 @@ class ExistingGitHubBacklogLoopInput:
     maximum_risk: str
     delivery_mode: str
     maximum_items: int = 1
+    target_repository: str | None = None
+    target_issue_number: int | None = None
+    continue_after_blocked_issue: bool = True
+    correction_limit: int = 2
 
 
 @dataclass

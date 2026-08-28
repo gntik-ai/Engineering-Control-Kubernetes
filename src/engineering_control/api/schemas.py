@@ -152,6 +152,26 @@ class ExistingBacklogLoopStart(APIModel):
     maximum_risk: RiskClass
     delivery_mode: Literal["source-pr", "full-delivery"]
     maximum_items: int = Field(default=1, ge=1, le=50)
+    target_repository: (
+        Literal[
+            "gntik-ai/falcone",
+            "gntik-ai/falcone-charts",
+            "gntik-ai/musematic",
+            "gntik-ai/musematic-deploy",
+        ]
+        | None
+    ) = None
+    target_issue_number: int | None = Field(default=None, ge=1)
+    continue_after_blocked_issue: bool = True
+    correction_limit: int = Field(default=2, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def exact_issue_binding(self) -> ExistingBacklogLoopStart:
+        if (self.target_repository is None) != (self.target_issue_number is None):
+            raise ValueError("target repository and issue number must be supplied together")
+        if self.target_repository is not None and self.maximum_items != 1:
+            raise ValueError("a direct issue operation must remain bound to one item")
+        return self
 
 
 class LoopPlanDispatch(APIModel):
