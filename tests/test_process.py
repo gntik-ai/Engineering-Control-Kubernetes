@@ -27,13 +27,38 @@ class _FakeProcess:
 def test_subscription_environment_removes_api_paid_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "fake")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "fake")
+    forbidden = {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OMNIROUTE_URL",
+        "OMNIROUTE_BASE_URL",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_BASE_URL",
+        "LLM_BASE_URL",
+        "MODEL_GATEWAY",
+        "MODEL_ROUTER",
+        "AWS_ACCESS_KEY_ID",
+    }
+    for key in forbidden:
+        monkeypatch.setenv(key, "fake")
     environment = subscription_only_environment("codex")
-    assert "OPENAI_API_KEY" not in environment
-    assert "ANTHROPIC_API_KEY" not in environment
-    assert "AWS_ACCESS_KEY_ID" not in environment
+    assert forbidden.isdisjoint(environment)
+
+
+def test_subscription_environment_rejects_every_forbidden_override() -> None:
+    for key in (
+        "OPENROUTER_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OMNIROUTE_URL",
+        "OMNIROUTE_BASE_URL",
+        "LLM_BASE_URL",
+        "MODEL_GATEWAY",
+        "MODEL_ROUTER",
+    ):
+        with pytest.raises(ValueError, match="forbidden"):
+            subscription_only_environment("claude", {key: "fake"})
 
 
 @pytest.mark.asyncio
