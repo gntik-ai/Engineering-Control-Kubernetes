@@ -161,6 +161,23 @@ def test_cli_direct_issue_and_operator_surfaces_use_only_typed_routes() -> None:
     assert full_delivery.delivery_mode == "full-delivery"
 
 
+def test_campaign_reconcile_bounds_have_bounded_help_and_errors(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        parser().parse_args(["campaign-reconcile", "--help"])
+    help_output = capsys.readouterr().out
+    assert len(help_output) < 2_000
+    assert "1-200" in help_output
+    assert "0-10000" in help_output
+
+    with pytest.raises(SystemExit):
+        parser().parse_args(["campaign-reconcile", "--offset", "10001"])
+    error_output = capsys.readouterr().err
+    assert len(error_output) < 2_000
+    assert "must be between 0 and 10000" in error_output
+
+
 @pytest.mark.parametrize(
     ("command", "action"),
     [

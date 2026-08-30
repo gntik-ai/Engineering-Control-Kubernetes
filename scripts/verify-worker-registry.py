@@ -19,6 +19,7 @@ from engineering_control.activities.github import GitHubActivityHandler  # noqa:
 from engineering_control.policy.github_write import (  # noqa: E402
     GITHUB_ACTIVITY_STEPS,
     GITHUB_WRITE_POLICY_PATH,
+    WRITE_REPOSITORIES,
 )
 from engineering_control.workflows.definitions import ControlledWorkflow  # noqa: E402
 from engineering_control.workflows.worker_registry import (  # noqa: E402
@@ -187,19 +188,18 @@ def verify_write_policy(path: Path) -> None:
     )
     enabled = value.get("enabled")
     repositories = value.get("safe_repositories")
-    approved = [
-        "gntik-ai/falcone",
-        "gntik-ai/falcone-charts",
-        "gntik-ai/musematic",
-        "gntik-ai/musematic-deploy",
-    ]
     if path != GITHUB_WRITE_POLICY_PATH:
         _require(enabled is False, "source GitHub write policy must remain disabled")
         _require(repositories == [], "source GitHub safe repository list must be empty")
     else:
         _require(
             (enabled is False and repositories == [])
-            or (enabled is True and repositories == approved),
+            or (
+                enabled is True
+                and isinstance(repositories, list)
+                and len(repositories) == len(WRITE_REPOSITORIES)
+                and set(repositories) == WRITE_REPOSITORIES
+            ),
             "installed GitHub policy is neither disabled nor exactly backlog-approved",
         )
     if path == GITHUB_WRITE_POLICY_PATH:

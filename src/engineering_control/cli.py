@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -12,6 +13,19 @@ from uuid import uuid4
 import httpx
 
 from engineering_control.security.redaction import SecretRedactor
+
+
+def _bounded_integer(minimum: int, maximum: int) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("must be an integer") from error
+        if not minimum <= parsed <= maximum:
+            raise argparse.ArgumentTypeError(f"must be between {minimum} and {maximum}")
+        return parsed
+
+    return parse
 
 
 class APIClient:
@@ -124,8 +138,12 @@ def parser() -> argparse.ArgumentParser:
     nudge.add_argument("workflow_id")
     commands.add_parser("recheck-connections")
     campaign_reconcile = commands.add_parser("campaign-reconcile")
-    campaign_reconcile.add_argument("--limit", type=int, default=100, choices=range(1, 201))
-    campaign_reconcile.add_argument("--offset", type=int, default=0, choices=range(0, 10_001))
+    campaign_reconcile.add_argument(
+        "--limit", type=_bounded_integer(1, 200), default=100, metavar="1-200"
+    )
+    campaign_reconcile.add_argument(
+        "--offset", type=_bounded_integer(0, 10_000), default=0, metavar="0-10000"
+    )
     for action in ("locate", "start"):
         issue = commands.add_parser(f"issue-{action}")
         issue.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
