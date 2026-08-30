@@ -813,22 +813,14 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
             )
         if action in {"r3-candidate", "approve-r3"}:
             expected = 6 if action == "approve-r3" else 4
-            if (
-                len(args) != expected
-                or args[1] not in _PROJECTS
-                or args[2] not in {"source", "deployment"}
-                or not args[3].isdigit()
-                or int(args[3]) < 1
-            ):
+            if len(args) != expected or args[1:4] != ["musematic", "source", "1119"]:
                 suffix = " <binding> <confirmation-phrase>" if action == "approve-r3" else ""
-                raise ValueError(
-                    f"usage: /loop {action} <project> <source|deployment> <issue-number>{suffix}"
-                )
+                raise ValueError(f"usage: /loop {action} musematic source 1119{suffix}")
             if action == "r3-candidate":
                 query = urllib.parse.urlencode(
                     {"project": args[1], "surface": args[2], "issue_number": int(args[3])}
                 )
-                return _request("GET", f"/v1/r3-issues/candidate?{query}", actor)
+                return _request("POST", f"/v1/r3-issues/candidate?{query}", actor)
             if not _DIGEST.fullmatch(args[4]) or not re.fullmatch(
                 r"APPROVE_R3_[A-Z]+_[1-9][0-9]*_[A-F0-9]{16}", args[5]
             ):

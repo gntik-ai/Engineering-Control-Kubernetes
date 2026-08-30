@@ -350,7 +350,7 @@ def test_backlog_import_route_is_fixed_read_only_and_strict() -> None:
                 "maximum_items": 1,
             },
         )
-        outside = client.post(
+        llmwiki = client.post(
             "/v1/backlogs/import",
             headers=headers,
             json={
@@ -373,7 +373,7 @@ def test_backlog_import_route_is_fixed_read_only_and_strict() -> None:
         )
     assert accepted.status_code == 202
     assert accepted.json()["workflow_id"] == "backlog-import-test"
-    assert outside.status_code == 202
+    assert llmwiki.status_code == 202
     assert injected.status_code == 422
 
 

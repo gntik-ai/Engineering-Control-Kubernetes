@@ -112,13 +112,13 @@ def parser() -> argparse.ArgumentParser:
         issue.add_argument("surface", choices=("source", "deployment"))
         issue.add_argument("issue_number", type=int)
     r3_candidate = commands.add_parser("r3-candidate")
-    r3_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
-    r3_candidate.add_argument("surface", choices=("source", "deployment"))
-    r3_candidate.add_argument("issue_number", type=int)
+    r3_candidate.add_argument("project", choices=("musematic",))
+    r3_candidate.add_argument("surface", choices=("source",))
+    r3_candidate.add_argument("issue_number", type=int, choices=(1119,))
     r3_approve = commands.add_parser("r3-approve")
-    r3_approve.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
-    r3_approve.add_argument("surface", choices=("source", "deployment"))
-    r3_approve.add_argument("issue_number", type=int)
+    r3_approve.add_argument("project", choices=("musematic",))
+    r3_approve.add_argument("surface", choices=("source",))
+    r3_approve.add_argument("issue_number", type=int, choices=(1119,))
     r3_approve.add_argument("binding")
     r3_approve.add_argument("confirmation_phrase")
     commands.add_parser("findings").add_argument("--limit", type=int, default=50)
@@ -351,7 +351,7 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "issue_number": arguments.issue_number,
             }
         )
-        return client.request("GET", f"/v1/r3-issues/candidate?{query}")
+        return client.request("POST", f"/v1/r3-issues/candidate?{query}")
     if command == "r3-approve":
         return client.request(
             "POST",

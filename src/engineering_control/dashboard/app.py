@@ -43,6 +43,7 @@ from engineering_control.dashboard.schemas import (
     ActionReauthenticationInput,
     ActivityEventInput,
     PasswordChangeInput,
+    R3CandidateCreateInput,
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
@@ -743,16 +744,37 @@ def create_app(
     @app.get("/api/dashboard/r3-issues/candidate")
     async def dashboard_r3_issue_candidate_api(
         request: Request,
-        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
-        surface: str = Query(pattern=r"^(source|deployment)$"),
-        issue_number: int = Query(ge=1),
+        project: str = Query(pattern=r"^musematic$"),
+        surface: str = Query(pattern=r"^source$"),
+        issue_number: int = Query(ge=1119, le=1119),
     ) -> Response:
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
         try:
             return JSONResponse(
-                await operations(request).r3_issue_candidate(project, surface, issue_number)
+                await operations(request).r3_issue_candidate_status(project, surface, issue_number)
+            )
+        except ValueError as error:
+            return JSONResponse({"detail": str(error)}, status_code=404)
+
+    @app.post("/api/dashboard/r3-issues/candidate", status_code=201)
+    async def dashboard_r3_issue_candidate_create_api(
+        request: Request,
+        project: str = Query(pattern=r"^musematic$"),
+        surface: str = Query(pattern=r"^source$"),
+        issue_number: int = Query(ge=1119, le=1119),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            body = R3CandidateCreateInput.model_validate(await _json(request))
+            if not _valid_csrf(authenticated, body.csrf_token):
+                return JSONResponse({"detail": "invalid request"}, status_code=403)
+            return JSONResponse(
+                await operations(request).r3_issue_candidate(project, surface, issue_number),
+                status_code=201,
             )
         except ValueError as error:
             return JSONResponse({"detail": str(error)}, status_code=409)

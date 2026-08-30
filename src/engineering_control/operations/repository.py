@@ -35,7 +35,11 @@ from engineering_control.db.models import (
     SolutionLoop,
     WorkerHeartbeat,
 )
-from engineering_control.engineering.backlog import canonical_sha256
+from engineering_control.engineering.backlog import (
+    BACKLOG_APPROVAL_PHRASE,
+    BacklogApprovalBinding,
+    canonical_sha256,
+)
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditPlanCommand,
@@ -77,6 +81,52 @@ _TERMINAL_WORKFLOW_STATES = frozenset(
         "TIMED_OUT",
     }
 )
+
+
+def _global_inventory_approval_current(
+    campaign: GitHubBacklogCampaign,
+    *,
+    project: str,
+    now: datetime,
+) -> bool:
+    delivery_mode = "source-pr" if project == "llmwiki" else "full-delivery"
+    if (
+        campaign.project != project
+        or campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING"}
+        or campaign.delivery_mode != delivery_mode
+        or campaign.maximum_risk != "R2"
+        or not campaign.approval_binding
+        or not isinstance(campaign.approval_json, dict)
+    ):
+        return False
+    approval = campaign.approval_json
+    if (
+        approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
+        or not isinstance(approval.get("approved_by"), str)
+        or not approval.get("approved_at")
+    ):
+        return False
+    try:
+        binding = BacklogApprovalBinding.model_validate(
+            {field: approval.get(field) for field in BacklogApprovalBinding.model_fields}
+        )
+    except ValueError:
+        return False
+    expires_at = (
+        binding.expires_at
+        if binding.expires_at.tzinfo is not None
+        else binding.expires_at.replace(tzinfo=UTC)
+    )
+    return (
+        binding.sha256() == campaign.approval_binding
+        and binding.backlog_campaign_id == str(campaign.id)
+        and binding.source_head == campaign.source_head_at_import
+        and binding.deployment_head == campaign.deployment_head_at_import
+        and binding.dependency_plan_hash == campaign.plan_hash
+        and binding.delivery_mode == delivery_mode
+        and binding.maximum_risk == "R2"
+        and expires_at > now
+    )
 
 
 def command_target(command: Command) -> tuple[str, str, str | None]:
@@ -157,9 +207,32 @@ class OperationsRepository:
     async def r3_issue_candidate(
         self, project: str, surface: str, issue_number: int
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self._r3_issue_candidate, project, surface, issue_number)
+        return await asyncio.to_thread(
+            self._r3_issue_candidate,
+            project,
+            surface,
+            issue_number,
+            True,
+        )
 
-    def _r3_issue_candidate(self, project: str, surface: str, issue_number: int) -> dict[str, Any]:
+    async def r3_issue_candidate_status(
+        self, project: str, surface: str, issue_number: int
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._r3_issue_candidate,
+            project,
+            surface,
+            issue_number,
+            False,
+        )
+
+    def _r3_issue_candidate(
+        self,
+        project: str,
+        surface: str,
+        issue_number: int,
+        create: bool = True,
+    ) -> dict[str, Any]:
         if (project, surface, issue_number) != ("musematic", "source", 1119):
             raise ValueError("R3 approval route is bound to musematic source issue 1119")
         now = datetime.now(UTC)
@@ -236,7 +309,6 @@ class OperationsRepository:
                     ActionCandidate.expires_at > now,
                 )
                 .order_by(desc(ActionCandidate.created_at))
-                .limit(10)
             ).all()
             for existing in existing_rows:
                 stored = existing.payload_json
@@ -254,6 +326,8 @@ class OperationsRepository:
                             f"{existing.binding_hash} {existing.confirmation_phrase}"
                         ),
                     }
+            if not create:
+                raise ValueError("R3 approval candidate has not been created")
             expires_at = now + timedelta(hours=24)
             payload = {**immutable_payload, "expires_at": expires_at.isoformat()}
             binding = canonical_sha256(payload)
@@ -329,7 +403,7 @@ class OperationsRepository:
             or actor == "dashboard:reauthenticated"
         ):
             raise ValueError("R3 approval requires an allowlisted operator channel")
-        candidate = self._r3_issue_candidate(project, surface, issue_number)
+        candidate = self._r3_issue_candidate(project, surface, issue_number, False)
         if candidate["binding"] != binding or candidate["confirmation_phrase"] != phrase:
             raise ValueError("R3 approval binding or phrase changed")
         now = datetime.now(UTC)
@@ -478,6 +552,16 @@ class OperationsRepository:
                 campaign = session.get(GitHubBacklogCampaign, campaign_id)
                 if campaign is None or campaign.project != project:
                     blockers.append(f"{project.upper()}_BACKLOG_INVENTORY_INVALID")
+                elif not _global_inventory_approval_current(
+                    campaign,
+                    project=project,
+                    now=now,
+                ):
+                    blockers.append(f"{project.upper()}_BACKLOG_APPROVAL_NOT_CURRENT")
+                else:
+                    binding.setdefault("inventory_approval_bindings", {})[project] = (
+                        campaign.approval_binding
+                    )
             policy = session.get(GitHubBacklogCampaign, command.policy_campaign_id)
             if policy is None or policy.status not in {"APPROVED", "RUNNING"}:
                 blockers.append("GITHUB_WRITE_POLICY_NOT_ACTIVE")

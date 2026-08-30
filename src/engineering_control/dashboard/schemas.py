@@ -41,6 +41,10 @@ class ActionCandidateInput(DashboardModel):
     command: dict[str, Any]
 
 
+class R3CandidateCreateInput(DashboardModel):
+    csrf_token: str = Field(min_length=20, max_length=200)
+
+
 class ActionReauthenticationInput(DashboardModel):
     csrf_token: str = Field(min_length=20, max_length=200)
     candidate_id: UUID

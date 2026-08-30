@@ -91,6 +91,9 @@ class MetadataRepository(Protocol):
     async def get_backlog_issue(
         self, campaign_id: UUID, repository: str, issue_number: int
     ) -> dict[str, Any] | None: ...
+    async def locate_backlog_issue(
+        self, project: str, surface: str, issue_number: int
+    ) -> dict[str, Any] | None: ...
     async def prepare_backlog_approval(
         self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
     ) -> dict[str, Any]: ...
@@ -469,6 +472,45 @@ class SQLMetadataRepository:
                 )
             )
             return self._serialize_backlog_issue(row) if row else None
+
+    async def locate_backlog_issue(
+        self, project: str, surface: str, issue_number: int
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._locate_backlog_issue,
+            project,
+            surface,
+            issue_number,
+        )
+
+    def _locate_backlog_issue(
+        self, project: str, surface: str, issue_number: int
+    ) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            row = session.execute(
+                select(BacklogIssueRecord, GitHubBacklogCampaign.id)
+                .join(
+                    GitHubBacklogCampaign,
+                    GitHubBacklogCampaign.id == BacklogIssueRecord.backlog_campaign_id,
+                )
+                .where(
+                    GitHubBacklogCampaign.project == project,
+                    BacklogIssueRecord.source_or_deployment_owner == surface,
+                    BacklogIssueRecord.issue_number == issue_number,
+                )
+                .order_by(GitHubBacklogCampaign.imported_at.desc())
+                .limit(1)
+            ).first()
+            if row is None:
+                return None
+            issue, campaign_id = row
+            return {
+                "status": "FOUND",
+                "project": project,
+                "surface": surface,
+                "backlog_campaign_id": str(campaign_id),
+                "issue": self._serialize_backlog_issue(issue),
+            }
 
     async def prepare_backlog_approval(
         self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
@@ -1215,6 +1257,11 @@ class EmptyMetadataRepository:
 
     async def get_backlog_issue(
         self, campaign_id: UUID, repository: str, issue_number: int
+    ) -> dict[str, Any] | None:
+        return None
+
+    async def locate_backlog_issue(
+        self, project: str, surface: str, issue_number: int
     ) -> dict[str, Any] | None:
         return None
 

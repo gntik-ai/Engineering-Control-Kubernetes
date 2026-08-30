@@ -396,29 +396,29 @@ def create_app(
         _subject: str = auth_dependency,
         repository: MetadataRepository = metadata_dependency,
     ) -> dict[str, Any]:
-        campaigns = await repository.list_backlog_campaigns(project, 100)
-        for campaign in campaigns:
-            campaign_id = UUID(str(campaign["backlog_campaign_id"]))
-            issues = await repository.list_backlog_issues(campaign_id, 200)
-            for issue in issues:
-                if (
-                    int(issue["issue_number"]) == issue_number
-                    and issue["source_or_deployment_owner"] == surface
-                ):
-                    return {
-                        "status": "FOUND",
-                        "project": project,
-                        "surface": surface,
-                        "backlog_campaign_id": str(campaign_id),
-                        "issue": issue,
-                    }
+        located = await repository.locate_backlog_issue(project, surface, issue_number)
+        if located is not None:
+            return located
         raise HTTPException(status_code=404, detail="issue is not in a current backlog inventory")
 
     @app.get("/v1/r3-issues/candidate")
     async def r3_issue_candidate_get(
-        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
-        surface: str = Query(pattern=r"^(source|deployment)$"),
-        issue_number: int = Query(ge=1),
+        project: str = Query(pattern=r"^musematic$"),
+        surface: str = Query(pattern=r"^source$"),
+        issue_number: int = Query(ge=1119, le=1119),
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.r3_issue_candidate_status(project, surface, issue_number)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/v1/r3-issues/candidate", status_code=201)
+    async def r3_issue_candidate_create(
+        project: str = Query(pattern=r"^musematic$"),
+        surface: str = Query(pattern=r"^source$"),
+        issue_number: int = Query(ge=1119, le=1119),
         _subject: str = auth_dependency,
         repository: OperationsRepository = operations_dependency,
     ) -> dict[str, Any]:
