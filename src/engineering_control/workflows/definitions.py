@@ -298,9 +298,9 @@ class ControlledWorkflow:
             return provider_task_queue(
                 cls._nested_value(payload, "checker_provider", "claude"), default="claude"
             )
-        if step == "observability.invoke_codex":
+        if step in {"observability.invoke_codex", "observability.invoke_codex_checker"}:
             return provider_task_queue("codex", default="codex")
-        if step == "observability.invoke_claude":
+        if step in {"observability.invoke_claude", "observability.invoke_claude_maker"}:
             return provider_task_queue("claude", default="claude")
         if step == "reconcile.invoke_release_reviewer":
             return provider_task_queue(

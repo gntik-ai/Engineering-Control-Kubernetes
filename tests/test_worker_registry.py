@@ -13,6 +13,7 @@ from engineering_control.workflows import worker_registry
 from engineering_control.workflows.definitions import ControlledWorkflow
 from engineering_control.workflows.role_worker import QUEUES
 from engineering_control.workflows.worker_registry import (
+    CONTROL_TASK_QUEUE,
     GITHUB_TASK_QUEUE,
     ROLE_WORKER_REGISTRY,
     provider_task_queue,
@@ -95,6 +96,23 @@ def test_every_role_kind_has_a_queue_activity_set_and_service() -> None:
             assert spec.service == f"engineering-worker@{kind}.service"
         else:
             assert (ROOT / "systemd" / spec.service).is_file()
+
+
+def test_every_registered_activity_routes_to_a_worker_that_owns_it() -> None:
+    worker_kinds = ("controller", *ROLE_WORKER_REGISTRY)
+    queue_owners = {
+        CONTROL_TASK_QUEUE: "controller",
+        **{spec.task_queue: kind for kind, spec in ROLE_WORKER_REGISTRY.items()},
+    }
+    activity_steps = set().union(
+        *(ControlActivities.steps_for_worker(kind) for kind in worker_kinds)
+    )
+
+    for step in activity_steps:
+        queue = ControlledWorkflow._activity_queue(step, {})
+        owner = queue_owners.get(queue)
+        owners = {kind for kind in worker_kinds if step in ControlActivities.steps_for_worker(kind)}
+        assert owner in owners, f"{step} routes to {queue}, owners={sorted(owners)}"
 
 
 def test_observability_canary_routes_each_step_to_one_bounded_worker() -> None:

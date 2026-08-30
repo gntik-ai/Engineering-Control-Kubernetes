@@ -22,6 +22,7 @@ from engineering_control.policy.github_write import (  # noqa: E402
 )
 from engineering_control.workflows.definitions import ControlledWorkflow  # noqa: E402
 from engineering_control.workflows.worker_registry import (  # noqa: E402
+    CONTROL_TASK_QUEUE,
     GITHUB_TASK_QUEUE,
     ROLE_WORKER_REGISTRY,
 )
@@ -136,6 +137,20 @@ def verify_source_contract(repository_root: Path) -> None:
             )
             _require(spec.host == "controller", "GitHub worker host drifted")
             _require(spec.unix_user == "hermes", "GitHub worker identity drifted")
+
+    worker_kinds = ("controller", *ROLE_WORKER_REGISTRY)
+    queue_owners = {
+        CONTROL_TASK_QUEUE: "controller",
+        **{spec.task_queue: kind for kind, spec in ROLE_WORKER_REGISTRY.items()},
+    }
+    activity_steps = set().union(
+        *(ControlActivities.steps_for_worker(kind) for kind in worker_kinds)
+    )
+    for step in activity_steps:
+        queue = ControlledWorkflow._activity_queue(step, {})
+        owner = queue_owners.get(queue)
+        owners = {kind for kind in worker_kinds if step in ControlActivities.steps_for_worker(kind)}
+        _require(owner in owners, f"{step} is routed to {queue} but owned by {sorted(owners)}")
 
     github_steps = ControlActivities.steps_for_worker("github")
     _require(github_steps == GITHUB_STEPS, "GitHub activity dispatcher and typed handlers differ")
