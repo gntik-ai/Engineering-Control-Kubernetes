@@ -10,7 +10,7 @@ import stat
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -21,6 +21,13 @@ COMMANDS = {
     "bootstrap-plan",
     "bootstrap",
     "campaigns",
+    "campaign",
+    "ready",
+    "connections",
+    "temporal",
+    "providers",
+    "workers",
+    "channel-check",
     "findings",
     "loop",
     "enhancements",
@@ -66,10 +73,16 @@ _PRESETS = {
     "falcone-intensive",
 }
 _LOOP_MODES = {"plan-only", "source-pr", "preview", "staging"}
-_BACKLOG_PROJECTS = {"falcone", "musematic"}
+_BACKLOG_PROJECTS = {"falcone", "musematic", "llmwiki"}
 _BACKLOG_FILTERS = {"bugs", "bugs-and-docs", "security", "enhancements", "all"}
 _BACKLOG_MODES = {"source-pr", "full-delivery"}
-_BACKLOG_REPOSITORIES = {"falcone", "falcone-charts", "musematic", "musematic-deploy"}
+_BACKLOG_REPOSITORIES = {
+    "falcone",
+    "falcone-charts",
+    "musematic",
+    "musematic-deploy",
+    "llmwiki",
+}
 _BACKLOG_SKIP_REASONS = {
     "DUPLICATE",
     "ALREADY_FIXED",
@@ -81,6 +94,9 @@ _BACKLOG_SKIP_REASONS = {
     "NOT_REPRODUCIBLE",
     "ENHANCEMENT_DEFERRED",
 }
+_MESSAGE_LIMIT = 3500
+_PAGE_PAYLOAD_LIMIT = 3100
+_PAGE_CACHE: dict[str, tuple[datetime, str, str, list[Any]]] = {}
 
 
 def _private_api_url() -> None:
@@ -115,7 +131,17 @@ def _redact(value: str) -> str:
         r"\1\2[REDACTED]",
         value,
     )
-    return value[:3500]
+    return value
+
+
+def _safe_error(value: str) -> str:
+    redacted = _redact(value)
+    if len(redacted) <= _MESSAGE_LIMIT:
+        return redacted
+    return (
+        "Engineering Control request failed; the bounded error is available by digest "
+        f"{hashlib.sha256(redacted.encode()).hexdigest()}."
+    )
 
 
 def _request(
@@ -224,8 +250,118 @@ def _uuid(value: str, label: str) -> str:
         raise ValueError(f"{label} must be a UUID") from error
 
 
-def _format(value: Any) -> str:
-    return _redact(json.dumps(value, indent=2, sort_keys=True, default=str))
+def _page_token() -> str:
+    return hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+
+
+def _bounded_record(value: Any) -> Any:
+    serialized = _redact(json.dumps(value, sort_keys=True, default=str))
+    if len(serialized) <= _PAGE_PAYLOAD_LIMIT:
+        return value
+    if isinstance(value, dict):
+        bounded = {
+            key: (
+                {
+                    "omitted": True,
+                    "sha256": hashlib.sha256(str(item).encode()).hexdigest(),
+                    "rendered_characters": len(str(item)),
+                }
+                if len(str(item)) > 500
+                else item
+            )
+            for key, item in value.items()
+        }
+        candidate = _redact(json.dumps(bounded, sort_keys=True, default=str))
+        if len(candidate) <= _PAGE_PAYLOAD_LIMIT:
+            return bounded
+    return {
+        "oversized_record": True,
+        "sha256": hashlib.sha256(serialized.encode()).hexdigest(),
+        "rendered_characters": len(serialized),
+    }
+
+
+def _page_payloads(value: Any) -> list[Any]:
+    if isinstance(value, dict):
+        list_key = next((key for key, item in value.items() if isinstance(item, list)), None)
+        if list_key is not None:
+            base = {key: item for key, item in value.items() if key != list_key}
+            records = value[list_key]
+            if not records:
+                return [value]
+            pages: list[Any] = []
+            current: list[Any] = []
+            for record in records:
+                bounded = _bounded_record(record)
+                candidate = {**base, list_key: [*current, bounded]}
+                rendered = _redact(json.dumps(candidate, sort_keys=True, default=str))
+                if current and len(rendered) > _PAGE_PAYLOAD_LIMIT:
+                    pages.append({**base, list_key: current})
+                    current = [bounded]
+                else:
+                    current.append(bounded)
+            pages.append({**base, list_key: current})
+            return pages
+    if isinstance(value, list):
+        return _page_payloads({"items": value})
+    return [_bounded_record(value)]
+
+
+def _render_page(
+    payload: Any,
+    *,
+    command: str,
+    actor: str,
+    remaining: list[Any],
+) -> str:
+    cursor = None
+    if remaining:
+        cursor = _page_token()
+        _PAGE_CACHE[cursor] = (
+            datetime.now(UTC) + timedelta(minutes=10),
+            command,
+            actor,
+            remaining,
+        )
+    envelope = {"payload": payload, "next_cursor": cursor}
+    rendered = _redact(json.dumps(envelope, indent=2, sort_keys=True, default=str))
+    if len(rendered) > _MESSAGE_LIMIT:
+        raise ValueError("bounded Telegram page unexpectedly exceeds 3500 characters")
+    return rendered
+
+
+def _format(value: Any, *, command: str, actor: str) -> str:
+    now = datetime.now(UTC)
+    for key, (expires_at, _command, _actor, _pages) in list(_PAGE_CACHE.items()):
+        if expires_at <= now:
+            _PAGE_CACHE.pop(key, None)
+    pages = _page_payloads(value)
+    return _render_page(pages[0], command=command, actor=actor, remaining=pages[1:])
+
+
+def _cursor_page(token: str, *, command: str, actor: str) -> str:
+    cached = _PAGE_CACHE.pop(token, None)
+    if cached is None:
+        raise ValueError("pagination cursor is invalid or expired")
+    expires_at, expected_command, expected_actor, pages = cached
+    if (
+        expires_at <= datetime.now(UTC)
+        or expected_command != command
+        or expected_actor != actor
+        or not pages
+    ):
+        raise ValueError("pagination cursor is invalid or expired")
+    return _render_page(pages[0], command=command, actor=actor, remaining=pages[1:])
+
+
+def _split_cursor(raw_args: str) -> tuple[str, str | None]:
+    args = shlex.split(raw_args)
+    if "--cursor" not in args:
+        return raw_args, None
+    index = args.index("--cursor")
+    if index + 2 != len(args) or not re.fullmatch(r"[a-f0-9]{32}", args[index + 1]):
+        raise ValueError("pagination cursor is malformed")
+    return shlex.join(args[:index]), args[index + 1]
 
 
 def _acceptance_summary(command: str, raw_args: str, result: Any) -> dict[str, Any] | None:
@@ -337,6 +473,34 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
         return _request("GET", f"/v1/{command}?limit={limit}", actor)
+    if command == "campaign":
+        if len(args) != 1:
+            raise ValueError("usage: /campaign <campaign-id>")
+        return _request("GET", f"/v1/campaign-detail/{_uuid(args[0], 'campaign ID')}", actor)
+    if command == "ready":
+        if len(args) != 1 or args[0] not in {"core", "all"}:
+            raise ValueError("usage: /ready <core|all>")
+        return _request("GET", f"/v1/readiness/{args[0]}", actor)
+    if command == "connections":
+        if args != ["all"]:
+            raise ValueError("usage: /connections all")
+        return _request("GET", "/v1/connections?scope=all", actor)
+    if command == "temporal":
+        if args != ["summary"]:
+            raise ValueError("usage: /temporal summary")
+        return _request("GET", "/v1/temporal/summary", actor)
+    if command == "providers":
+        if args:
+            raise ValueError("usage: /providers")
+        return _request("GET", "/v1/providers", actor)
+    if command == "workers":
+        if args != ["all"]:
+            raise ValueError("usage: /workers all")
+        return _request("GET", "/v1/workers", actor)
+    if command == "channel-check":
+        if args:
+            raise ValueError("usage: /channel-check")
+        return _request("GET", "/v1/channel-check", actor)
     if command == "usage":
         if args:
             raise ValueError("usage: /usage")
@@ -485,6 +649,151 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 "approve-delivery> ..."
             )
         action = args[0]
+        if action == "global-start":
+            if len(args) != 7 or args[6] != "START_GLOBAL_STAGING_R2_BACKLOG":
+                raise ValueError(
+                    "usage: /loop global-start <global-campaign-id> <policy-campaign-id> "
+                    "<falcone-campaign-id> <musematic-campaign-id> <llmwiki-campaign-id> "
+                    "START_GLOBAL_STAGING_R2_BACKLOG"
+                )
+            values = [_uuid(value, "campaign ID") for value in args[1:6]]
+            return _request(
+                "POST",
+                "/v1/commands",
+                actor,
+                {
+                    "action": "start_autonomous_backlog",
+                    "campaign_id": values[0],
+                    "policy_campaign_id": values[1],
+                    "backlog_campaign_ids": {
+                        "falcone": values[2],
+                        "musematic": values[3],
+                        "llmwiki": values[4],
+                    },
+                    "environment": "staging",
+                    "maximum_risk": "R2",
+                    "global_active_issues": 1,
+                    "global_deployments": 1,
+                    "implementation_correction_limit": 5,
+                    "deployment_correction_limit": 3,
+                    "production": False,
+                    "typed_confirmation": args[6],
+                },
+            )
+        if action in {"issue-locate", "issue-start"}:
+            if (
+                len(args) != 4
+                or args[1] not in _PROJECTS
+                or args[2] not in {"source", "deployment"}
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+            ):
+                raise ValueError(
+                    f"usage: /loop {action} <project> <source|deployment> <issue-number>"
+                )
+            query = urllib.parse.urlencode(
+                {"project": args[1], "surface": args[2], "issue_number": int(args[3])}
+            )
+            located = _request("GET", f"/v1/backlogs/locate?{query}", actor)
+            if action == "issue-locate":
+                return located
+            issue = located.get("issue") if isinstance(located, dict) else None
+            if not isinstance(issue, dict):
+                raise ValueError("located issue projection is invalid")
+            return _request(
+                "POST",
+                "/v1/commands",
+                actor,
+                {
+                    "action": "solve_issue",
+                    "project": args[1],
+                    "backlog_campaign_id": located["backlog_campaign_id"],
+                    "repository": issue["repository"],
+                    "issue_number": int(args[3]),
+                    "maximum_risk": "R2",
+                    "delivery_mode": "full-delivery",
+                    "correction_limit": 5,
+                    "production": False,
+                },
+            )
+        if action in {"diagnose", "tail", "nudge"}:
+            expected = 3 if action == "tail" else 2
+            if len(args) != expected:
+                suffix = " <1-100>" if action == "tail" else ""
+                raise ValueError(f"usage: /loop {action} <workflow-id>{suffix}")
+            if action == "diagnose":
+                return _request("GET", f"/v1/runs/{urllib.parse.quote(args[1], safe='')}", actor)
+            if action == "tail":
+                limit = int(args[2])
+                if not 1 <= limit <= 100:
+                    raise ValueError("tail limit must be between 1 and 100")
+                workflow_id = urllib.parse.quote(args[1], safe="")
+                return _request("GET", f"/v1/workflows/{workflow_id}/tail?limit={limit}", actor)
+            return _request(
+                "POST", "/v1/commands", actor, {"action": "nudge", "workflow_id": args[1]}
+            )
+        if action == "retry-issue":
+            if (
+                len(args) != 5
+                or args[2] not in _PROJECTS
+                or args[3] not in {"source", "deployment"}
+                or not args[4].isdigit()
+                or int(args[4]) < 1
+            ):
+                raise ValueError(
+                    "usage: /loop retry-issue <workflow-id> <project> "
+                    "<source|deployment> <issue-number>"
+                )
+            query = urllib.parse.urlencode(
+                {"project": args[2], "surface": args[3], "issue_number": int(args[4])}
+            )
+            located = _request("GET", f"/v1/backlogs/locate?{query}", actor)
+            repository = str(located["issue"]["repository"]).removeprefix("gntik-ai/")
+            return _request(
+                "POST",
+                "/v1/commands",
+                actor,
+                {
+                    "action": "retry",
+                    "workflow_id": args[1],
+                    "repository": repository,
+                    "issue_number": int(args[4]),
+                },
+            )
+        if action in {"r3-candidate", "approve-r3"}:
+            expected = 6 if action == "approve-r3" else 4
+            if (
+                len(args) != expected
+                or args[1] not in _PROJECTS
+                or args[2] not in {"source", "deployment"}
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+            ):
+                suffix = " <binding> <confirmation-phrase>" if action == "approve-r3" else ""
+                raise ValueError(
+                    f"usage: /loop {action} <project> <source|deployment> <issue-number>{suffix}"
+                )
+            if action == "r3-candidate":
+                query = urllib.parse.urlencode(
+                    {"project": args[1], "surface": args[2], "issue_number": int(args[3])}
+                )
+                return _request("GET", f"/v1/r3-issues/candidate?{query}", actor)
+            if not _DIGEST.fullmatch(args[4]) or not re.fullmatch(
+                r"APPROVE_R3_[A-Z]+_[1-9][0-9]*_[A-F0-9]{16}", args[5]
+            ):
+                raise ValueError("R3 approval binding or confirmation phrase is malformed")
+            return _request(
+                "POST",
+                "/v1/r3-issues/approve",
+                actor,
+                {
+                    "project": args[1],
+                    "surface": args[2],
+                    "issue_number": int(args[3]),
+                    "binding": args[4],
+                    "confirmation_phrase": args[5],
+                },
+            )
         if action == "import":
             if (
                 len(args) not in {4, 5}
@@ -493,7 +802,7 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 or args[3] not in _BACKLOG_FILTERS
             ):
                 raise ValueError(
-                    "usage: /loop import <falcone|musematic> github-open "
+                    "usage: /loop import <falcone|musematic|llmwiki> github-open "
                     "<bugs|bugs-and-docs|security|enhancements|all> [max-items]"
                 )
             maximum_items = int(args[4]) if len(args) == 5 else 500
@@ -513,7 +822,8 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if action == "inventory":
             if len(args) not in {3, 4} or args[1] not in _BACKLOG_PROJECTS:
                 raise ValueError(
-                    "usage: /loop inventory <falcone|musematic> <backlog-campaign-id> [limit]"
+                    "usage: /loop inventory <falcone|musematic|llmwiki> "
+                    "<backlog-campaign-id> [limit]"
                 )
             campaign_id = _uuid(args[2], "backlog campaign ID")
             limit = int(args[3]) if len(args) == 4 else 20
@@ -860,7 +1170,12 @@ def handle(event_type: str, context: dict[str, Any]) -> dict[str, str] | None:
         if not _authorized(user_id):
             _gateway_event("telegram.command_rejected", command, outcome="ACCESS_DENIED")
             return {"decision": "deny", "message": "Engineering Control access denied."}
-        raw_args = str(context.get("raw_args", ""))
+        raw_args, cursor = _split_cursor(str(context.get("raw_args", "")))
+        if cursor is not None:
+            return {
+                "decision": "handled",
+                "message": _cursor_page(cursor, command=command, actor=f"telegram:{user_id}"),
+            }
         _gateway_event("engineering.request_accepted", command, raw_args=raw_args)
         _gateway_event("engineering.api_request_started", command, raw_args=raw_args)
         result = _dispatch(command, raw_args, f"telegram:{user_id}")
@@ -877,7 +1192,13 @@ def handle(event_type: str, context: dict[str, Any]) -> dict[str, str] | None:
             )
         _record_acceptance(command, raw_args, result)
         _gateway_event("telegram.response_delivered", command, raw_args=raw_args, result=result)
-        return {"decision": "handled", "message": _format(result)}
+        return {
+            "decision": "handled",
+            "message": _format(result, command=command, actor=f"telegram:{user_id}"),
+        }
     except (OSError, RuntimeError, ValueError) as error:
         _gateway_event("telegram.response_delivery_failed", command, outcome="REQUEST_FAILED")
-        return {"decision": "handled", "message": _redact(f"Engineering Control: {error}")}
+        return {
+            "decision": "handled",
+            "message": _safe_error(f"Engineering Control: {error}"),
+        }

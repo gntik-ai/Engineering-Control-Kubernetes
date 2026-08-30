@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -9,6 +10,7 @@ from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.db.base import Base
+from engineering_control.db.models import DashboardEvent, Run
 
 PASSWORD = "correct horse battery staple"  # noqa: S105 - deterministic test fixture
 
@@ -112,6 +114,53 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
         assert findings["items"] == []
         assert enhancements["items"] == []
         assert client.get("/api/dashboard/backlog?project=outside").status_code == 422
+
+
+def test_dashboard_workflow_detail_returns_projection_and_safe_unknown_404(
+    tmp_path: Path,
+) -> None:
+    client, repository = _authenticated_client(tmp_path)
+    now = datetime.now(UTC)
+    try:
+        with repository.sessions.begin() as session:
+            session.add(
+                Run(
+                    workflow_id="known-workflow",
+                    run_type="synthetic-control",
+                    status="RUNNING",
+                    project="platform",
+                    worker="controller",
+                    started_at=now,
+                    summary="Bounded synthetic projection",
+                )
+            )
+            session.add(
+                DashboardEvent(
+                    occurred_at=now,
+                    level="INFO",
+                    event_type="workflow.phase_changed",
+                    source="controller",
+                    worker_kind="controller",
+                    project="platform",
+                    workflow_id="known-workflow",
+                    temporal_run_id="known-temporal-run",
+                    current_phase="CURRENT_STATE_REVALIDATION",
+                    message="Synthetic workflow phase is projected",
+                    metadata_json={"status": "RUNNING"},
+                )
+            )
+        assert client.get("/workflows/known-workflow").status_code == 200
+        detail = client.get("/api/dashboard/workflows/known-workflow")
+        assert detail.status_code == 200
+        assert detail.json()["workflow_id"] == "known-workflow"
+        assert detail.json()["temporal_run_id"] == "known-temporal-run"
+        assert detail.json()["current_phase"] == "CURRENT_STATE_REVALIDATION"
+        missing = client.get("/api/dashboard/workflows/unknown-workflow")
+        assert missing.status_code == 404
+        assert "traceback" not in missing.text.lower()
+    finally:
+        client.__exit__(None, None, None)
+        repository.engine.dispose()
 
 
 def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(

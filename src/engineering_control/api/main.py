@@ -38,6 +38,7 @@ from engineering_control.api.schemas import (
     LoopStartDispatch,
     ObservabilityAcceptanceStart,
     OperationAccepted,
+    R3IssueApprovalRequest,
     RecordList,
     RollbackRequest,
     RuntimeVerificationStart,
@@ -208,6 +209,227 @@ def create_app(
             raise HTTPException(status_code=503, detail="control service unavailable")
         return {"status": "ready"}
 
+    @app.get("/v1/readiness/{scope}")
+    async def readiness_get(
+        scope: str,
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        if scope not in {"core", "all"}:
+            raise HTTPException(status_code=404, detail="readiness scope not found")
+        value = await repository.operator_snapshot("readiness")
+        return {**value, "scope": scope}
+
+    @app.get("/v1/connections")
+    async def connections_get(
+        scope: str = Query(default="all", pattern=r"^all$"),
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        values = await repository.connections()
+        return {
+            "scope": scope,
+            "items": [value.model_dump(mode="json") for value in values],
+            "next_cursor": None,
+        }
+
+    @app.get("/v1/workers")
+    async def workers_get(
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        return await repository.operator_snapshot("workers")
+
+    @app.get("/v1/providers")
+    async def providers_get(
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        return await repository.operator_snapshot("providers")
+
+    @app.get("/v1/channel-check")
+    async def channel_check_get(
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        return await repository.operator_snapshot("channel")
+
+    @app.get("/v1/temporal/summary")
+    async def temporal_summary_get(
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        return await repository.operator_snapshot("temporal")
+
+    @app.post("/v1/campaigns/reconcile")
+    async def campaigns_reconcile(
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        terminal = {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
+        awaiting = {"AWAITING_APPROVAL", "AWAITING_HUMAN", "PAUSED"}
+        external_wait = {"EXTERNAL_WAIT", "AWAITING_CI", "AWAITING_ARGO", "AWAITING_BUILD"}
+        candidates = await repository.campaign_reconciliation_candidates()
+        active_canary_counts: dict[str, int] = {}
+        for candidate in candidates:
+            run_type = str(candidate.get("run_type") or "")
+            name = str(candidate.get("name") or "").lower()
+            if "canary" in name or "acceptance" in run_type:
+                if candidate["status"] not in {"COMPLETE", "COMPLETED", "FAILED", "CANCELLED"}:
+                    active_canary_counts[run_type] = active_canary_counts.get(run_type, 0) + 1
+        for candidate in candidates:
+            workflow_id = candidate.get("workflow_id")
+            if not isinstance(workflow_id, str):
+                results.append({**candidate, "classification": "ORPHANED_CAMPAIGN"})
+                continue
+            try:
+                observed = await service.get_workflow(workflow_id)
+            except Exception:  # noqa: BLE001 - only a fixed safe classification leaves this API
+                results.append({**candidate, "classification": "TEMPORAL_WORKFLOW_MISSING"})
+                continue
+            temporal_status = str(observed.get("status") or "UNKNOWN")
+            projected_terminal = candidate["status"] in {
+                "COMPLETE",
+                "COMPLETED",
+                "FAILED",
+                "CANCELLED",
+            }
+            run_type = str(candidate.get("run_type") or "")
+            if active_canary_counts.get(run_type, 0) > 1:
+                changed = False
+                classification = "DUPLICATE_CANARY"
+            elif temporal_status in terminal and not projected_terminal:
+                changed = await repository.reconcile_terminal_campaign(
+                    UUID(str(candidate["campaign_id"])), workflow_id, temporal_status
+                )
+                classification = "TERMINAL_NOT_RECONCILED"
+            elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"} and projected_terminal:
+                changed = False
+                classification = "INCONSISTENT_STATE"
+            elif candidate["status"] in awaiting:
+                changed = False
+                classification = "AWAITING_HUMAN"
+            elif candidate["status"] in external_wait:
+                changed = False
+                classification = "EXTERNAL_WAIT"
+            elif candidate.get("blocker") == "WORKER_POLLER_MISSING":
+                changed = False
+                classification = "WORKER_POLLER_MISSING"
+            elif (
+                candidate["status"] in {"QUEUED", "PLANNED"}
+                and int(candidate.get("age_seconds") or 0) > 900
+            ):
+                changed = False
+                classification = "STALE_QUEUE"
+            elif (
+                temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}
+                and int(candidate.get("age_seconds") or 0) > 1800
+            ):
+                changed = False
+                classification = "STALE_ACTIVITY"
+            elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}:
+                changed = False
+                classification = "RUNNING_HEALTHY"
+            else:
+                changed = False
+                classification = "QUEUED_VALID"
+            results.append(
+                {
+                    **candidate,
+                    "temporal_status": temporal_status,
+                    "classification": classification,
+                    "projection_repaired": changed,
+                }
+            )
+        return {"status": "COMPLETE", "items": results, "deleted": 0}
+
+    @app.get("/v1/campaign-detail/{campaign_id}")
+    async def campaign_detail_get(
+        campaign_id: UUID,
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+        metadata_repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        backlog = await metadata_repository.get_backlog_campaign(campaign_id)
+        if backlog is not None:
+            return backlog
+        campaign = await repository.campaign_detail(campaign_id)
+        if campaign is None:
+            raise HTTPException(status_code=404, detail="campaign not found")
+        return campaign
+
+    @app.get("/v1/workflows/{workflow_id}/tail")
+    async def workflow_tail_get(
+        workflow_id: str,
+        limit: int = Query(default=50, ge=1, le=100),
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        return {
+            "workflow_id": workflow_id,
+            "items": await repository.workflow_tail(workflow_id, limit),
+            "next_cursor": None,
+        }
+
+    @app.get("/v1/backlogs/locate")
+    async def backlog_issue_locate(
+        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        surface: str = Query(pattern=r"^(source|deployment)$"),
+        issue_number: int = Query(ge=1),
+        _subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        campaigns = await repository.list_backlog_campaigns(project, 100)
+        for campaign in campaigns:
+            campaign_id = UUID(str(campaign["backlog_campaign_id"]))
+            issues = await repository.list_backlog_issues(campaign_id, 200)
+            for issue in issues:
+                if (
+                    int(issue["issue_number"]) == issue_number
+                    and issue["source_or_deployment_owner"] == surface
+                ):
+                    return {
+                        "status": "FOUND",
+                        "project": project,
+                        "surface": surface,
+                        "backlog_campaign_id": str(campaign_id),
+                        "issue": issue,
+                    }
+        raise HTTPException(status_code=404, detail="issue is not in a current backlog inventory")
+
+    @app.get("/v1/r3-issues/candidate")
+    async def r3_issue_candidate_get(
+        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        surface: str = Query(pattern=r"^(source|deployment)$"),
+        issue_number: int = Query(ge=1),
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.r3_issue_candidate(project, surface, issue_number)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/r3-issues/approve")
+    async def r3_issue_approve(
+        body: R3IssueApprovalRequest,
+        subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.approve_r3_issue(
+                body.project,
+                body.surface,
+                body.issue_number,
+                body.binding,
+                body.confirmation_phrase,
+                subject,
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     @app.post("/v1/campaigns", response_model=OperationAccepted, status_code=202)
     async def campaign_start(
         body: CampaignStart,
@@ -319,13 +541,13 @@ def create_app(
     ) -> OperationAccepted:
         backlog = await repository.get_backlog_campaign(body.campaign_id)
         if backlog is not None:
-            if body.project.value not in {"falcone", "musematic"}:
+            if body.project.value not in {"falcone", "musematic", "llmwiki"}:
                 raise HTTPException(status_code=409, detail="backlog project is not supported")
             if body.execution_mode not in {"source-pr", "full-delivery"}:
                 raise HTTPException(status_code=409, detail="backlog delivery mode is invalid")
             return await service.start_existing_backlog_loop(
                 ExistingBacklogLoopStart(
-                    project=body.project.value,  # type: ignore[arg-type]
+                    project=body.project.value,
                     backlog_campaign_id=body.campaign_id,
                     maximum_risk=body.maximum_risk,
                     delivery_mode=body.execution_mode,  # type: ignore[arg-type]
@@ -355,7 +577,7 @@ def create_app(
 
     @app.get("/v1/backlogs", response_model=RecordList)
     async def backlog_list(
-        project: str | None = Query(default=None, pattern=r"^(falcone|musematic)$"),
+        project: str | None = Query(default=None, pattern=r"^(falcone|musematic|llmwiki)$"),
         limit: int = Query(default=20, ge=1, le=100),
         _subject: str = auth_dependency,
         repository: MetadataRepository = metadata_dependency,
@@ -399,6 +621,7 @@ def create_app(
             "falcone-charts",
             "musematic",
             "musematic-deploy",
+            "llmwiki",
         }:
             raise HTTPException(status_code=404, detail="backlog repository not found")
         value = await repository.get_backlog_issue(
@@ -496,7 +719,9 @@ def create_app(
     @app.get("/v1/backlog-loops/{workflow_id}/delivery-candidate")
     async def backlog_delivery_candidate(
         workflow_id: str,
-        repository: str = Query(pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy)$"),
+        repository: str = Query(
+            pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
+        ),
         issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
@@ -812,6 +1037,23 @@ def create_app(
             raise HTTPException(status_code=404, detail="synthetic validation is disabled")
         try:
             return await service.start_observability_acceptance(body)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post(
+        "/v1/validation/observability/reverse",
+        response_model=OperationAccepted,
+        status_code=202,
+    )
+    async def validation_observability_reverse(
+        body: ObservabilityAcceptanceStart,
+        _subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+    ) -> OperationAccepted:
+        if not resolved.acceptance_enabled:
+            raise HTTPException(status_code=404, detail="synthetic validation is disabled")
+        try:
+            return await service.start_reverse_observability_acceptance(body)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 

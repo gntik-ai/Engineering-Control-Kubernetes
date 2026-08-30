@@ -29,6 +29,7 @@ SAFE_REPOSITORIES = (
     "gntik-ai/falcone-charts",
     "gntik-ai/musematic",
     "gntik-ai/musematic-deploy",
+    "gntik-ai/llmwiki",
 )
 REQUEST_KEYS = frozenset(
     {
@@ -82,7 +83,7 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
         "disable-existing-backlog",
     }:
         raise ValueError("GitHub policy action is not allowlisted")
-    if value["project"] not in {"falcone", "musematic"}:
+    if value["project"] not in {"falcone", "musematic", "llmwiki"}:
         raise ValueError("GitHub policy project is invalid")
     expected_repositories = (
         SAFE_REPOSITORIES if value["action"] == "enable-existing-backlog" else ()
@@ -136,6 +137,7 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
     expected_pair = {
         "falcone": ["gntik-ai/falcone", "gntik-ai/falcone-charts"],
         "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
+        "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
     }[campaign.project]
     if binding.get("paired_repositories") != expected_pair:
         raise ValueError("GitHub campaign pair changed")

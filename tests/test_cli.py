@@ -92,6 +92,55 @@ def test_cli_backlog_import_and_start_use_only_fixed_routes() -> None:
     assert started["payload"]["delivery_mode"] == "full-delivery"
 
 
+def test_cli_direct_issue_and_operator_surfaces_use_only_typed_routes() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            self.calls.append((method, path, payload))
+            if path.startswith("/v1/backlogs/locate?"):
+                return {
+                    "backlog_campaign_id": "11111111-1111-4111-8111-111111111111",
+                    "issue": {"repository": "gntik-ai/falcone"},
+                }
+            return {"status": "ACCEPTED"}
+
+    client = FakeClient()
+    result = dispatch(  # type: ignore[arg-type]
+        client,
+        parser().parse_args(["issue-start", "falcone", "source", "953"]),
+    )
+    dispatch(client, parser().parse_args(["audit-plan", "llmwiki", "documentation", "staging"]))  # type: ignore[arg-type]
+    dispatch(client, parser().parse_args(["recheck-connections"]))  # type: ignore[arg-type]
+
+    assert result == {"status": "ACCEPTED"}
+    assert client.calls[1][1:] == (
+        "/v1/commands",
+        {
+            "action": "solve_issue",
+            "project": "falcone",
+            "backlog_campaign_id": "11111111-1111-4111-8111-111111111111",
+            "repository": "gntik-ai/falcone",
+            "issue_number": 953,
+            "maximum_risk": "R2",
+            "delivery_mode": "full-delivery",
+            "correction_limit": 5,
+            "production": False,
+        },
+    )
+    assert client.calls[2][2] == {
+        "action": "audit_plan",
+        "project": "llmwiki",
+        "preset": "documentation",
+        "environment": "staging",
+        "publish_findings": False,
+    }
+    assert client.calls[3][2] == {"action": "refresh_connections", "scope": "all"}
+
+
 @pytest.mark.parametrize(
     ("command", "action"),
     [

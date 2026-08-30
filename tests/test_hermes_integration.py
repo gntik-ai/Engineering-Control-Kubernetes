@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -185,6 +186,19 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
         ("audit-plan", "falcone e2e-smoke staging", "POST", "/v1/commands"),
         ("audit", "falcone e2e-smoke staging --execute", "POST", "/v1/commands"),
         ("campaigns", "", "GET", "/v1/campaigns?limit=20"),
+        (
+            "campaign",
+            "11111111-1111-4111-8111-111111111111",
+            "GET",
+            "/v1/campaign-detail/11111111-1111-4111-8111-111111111111",
+        ),
+        ("ready", "core", "GET", "/v1/readiness/core"),
+        ("ready", "all", "GET", "/v1/readiness/all"),
+        ("connections", "all", "GET", "/v1/connections?scope=all"),
+        ("temporal", "summary", "GET", "/v1/temporal/summary"),
+        ("providers", "", "GET", "/v1/providers"),
+        ("workers", "all", "GET", "/v1/workers"),
+        ("channel-check", "", "GET", "/v1/channel-check"),
         ("findings", "", "GET", "/v1/findings?limit=20"),
         (
             "verify",
@@ -223,6 +237,20 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
             "/v1/commands",
         ),
         ("loop", "status loop-safe-id", "GET", "/v1/loops/loop-safe-id"),
+        (
+            "loop",
+            "issue-locate musematic source 1119",
+            "GET",
+            "/v1/backlogs/locate?project=musematic&surface=source&issue_number=1119",
+        ),
+        ("loop", "diagnose loop-safe-id", "GET", "/v1/runs/loop-safe-id"),
+        (
+            "loop",
+            "tail loop-safe-id 50",
+            "GET",
+            "/v1/workflows/loop-safe-id/tail?limit=50",
+        ),
+        ("loop", "nudge loop-safe-id", "POST", "/v1/commands"),
         (
             "enhancements",
             "discover musematic 11111111-1111-4111-8111-111111111111",
@@ -273,7 +301,7 @@ def test_required_telegram_commands_are_fixed_and_bounded(
     "raw_args",
     [
         "import falcone github-open bugs --execute",
-        "import llmwiki github-open all 1",
+        "import outside github-open all 1",
         "import falcone github-open arbitrary 1",
         "start falcone 11111111-1111-4111-8111-111111111111 R2 production 1",
         "skip loop-id falcone 1 arbitrary-reason",
@@ -303,3 +331,37 @@ def test_backlog_telegram_parser_rejects_untyped_or_unbounded_input(
     assert result is not None and result["decision"] == "handled"
     assert "usage" in result["message"].lower() or "invalid" in result["message"].lower()
     assert called is False
+
+
+def test_telegram_pagination_preserves_record_boundaries_and_opaque_cursor() -> None:
+    handler = load_handler()
+    actor = "telegram:42"
+    records = [
+        {"record": ordinal, "unicode": "Διαδρομή", "value": "x" * 900} for ordinal in range(1, 9)
+    ]
+
+    rendered = handler._format({"items": records}, command="campaigns", actor=actor)
+    observed: list[int] = []
+    cursors: list[str] = []
+    while True:
+        assert len(rendered) <= 3500
+        envelope = json.loads(rendered)
+        observed.extend(item["record"] for item in envelope["payload"]["items"])
+        cursor = envelope["next_cursor"]
+        if cursor is None:
+            break
+        assert len(cursor) == 32 and cursor.isalnum()
+        cursors.append(cursor)
+        rendered = handler._cursor_page(cursor, command="campaigns", actor=actor)
+
+    assert observed == list(range(1, 9))
+    with pytest.raises(ValueError, match="invalid or expired"):
+        handler._cursor_page(cursors[0], command="campaigns", actor=actor)
+
+
+def test_telegram_oversized_error_is_replaced_by_digest_not_truncated() -> None:
+    handler = load_handler()
+    rendered = handler._safe_error("failure: " + "λ" * 4000)
+    assert len(rendered) < 3500
+    assert "available by digest" in rendered
+    assert "λ" not in rendered

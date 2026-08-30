@@ -6,18 +6,27 @@ and a gateway command hook for authenticated execution. Vendor source is not pat
 The bootstrap explicitly enables the `engineering-control` plugin, and the policy verifier rejects
 a missing or disabled registration so configured commands cannot degrade into Hermes's
 unknown-command path.
-The controller verifier also loads Hermes's real runtime registry and requires all 15 bounded
-commands to resolve before reporting healthy.
+The controller verifier also loads Hermes's real runtime registry and requires the complete fixed
+command set to resolve before reporting healthy.
 
-Supported commands are `/audit`, `/campaigns`, `/findings`, `/verify`, `/run`, `/status`,
-`/evidence`, `/approve`, `/reject`, `/pause`, `/resume`, `/cancel`, `/usage`, `/validate`, and
-`/rollback`. `/verify <finding-uuid>` starts only the independent read-only verification workflow;
+The original safe commands remain supported: `/audit`, `/campaigns`, `/findings`, `/verify`,
+`/run`, `/status`, `/evidence`, `/approve`, `/reject`, `/pause`, `/resume`, `/cancel`, `/usage`,
+`/validate`, and `/rollback`. The operations projection adds `/ready`, `/connections`,
+`/temporal`, `/providers`, `/workers`, `/channel-check`, `/campaign`, and the fixed `/loop`
+subcommands documented in `EXISTING-GITHUB-BACKLOG.md`. `/verify <finding-uuid>` starts only the
+independent read-only verification workflow;
 it cannot file an issue or deliver a change unless the finding later reaches `CONFIRMED`.
 `/validate [hold-seconds]` starts only the bounded local synthetic lifecycle; it has no product,
 model, GitHub, or deployment access. The hook accepts only Telegram events, checks the numeric
 sender against
 `/etc/engineering-control/env/telegram-allowlist`, and calls only fixed Engineering API routes.
 There is no shell, SSH, kubectl, or Helm passthrough.
+
+Every response is a valid JSON envelope. Rendered Telegram messages are limited to 3,500
+characters and paginated only between complete records. A record too large for one page is
+replaced by a bounded digest record; raw bytes are never split through Unicode, Markdown entities,
+JSON tokens, or code fences. Continuation cursors are opaque, actor/command-bound, expire after ten
+minutes, and are consumed once.
 
 Provision the allowlist without sending tokens through Telegram:
 

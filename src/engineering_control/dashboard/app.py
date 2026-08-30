@@ -738,6 +738,23 @@ def create_app(
             return authenticated
         return JSONResponse({"items": COMMAND_REGISTRY})
 
+    @app.get("/api/dashboard/r3-issues/candidate")
+    async def dashboard_r3_issue_candidate_api(
+        request: Request,
+        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        surface: str = Query(pattern=r"^(source|deployment)$"),
+        issue_number: int = Query(ge=1),
+    ) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        try:
+            return JSONResponse(
+                await operations(request).r3_issue_candidate(project, surface, issue_number)
+            )
+        except ValueError as error:
+            return JSONResponse({"detail": str(error)}, status_code=409)
+
     @app.get("/api/dashboard/findings")
     async def findings_api(
         request: Request,

@@ -534,11 +534,25 @@ class DashboardObservabilityProjection:
             ),
             steps[-1] if steps else None,
         )
+        events = list(
+            session.scalars(
+                select(DashboardEvent)
+                .where(DashboardEvent.workflow_id == run.workflow_id)
+                .order_by(DashboardEvent.id.desc())
+                .limit(200)
+            ).all()
+        )
+        event_phase = next(
+            (event.current_phase for event in events if event.current_phase),
+            None,
+        )
         phase = (
             active_execution.phase
             if active_execution
             else active_step.name
             if active_step
+            else event_phase
+            if event_phase
             else run.status
         )
         mapped = map_status(run.status, phase=phase, entity_type=run.run_type)
@@ -567,14 +581,6 @@ class DashboardObservabilityProjection:
                 .where(VerificationResult.run_id == run.id)
                 .order_by(VerificationResult.updated_at.desc())
                 .limit(20)
-            ).all()
-        )
-        events = list(
-            session.scalars(
-                select(DashboardEvent)
-                .where(DashboardEvent.workflow_id == run.workflow_id)
-                .order_by(DashboardEvent.id.desc())
-                .limit(200)
             ).all()
         )
         temporal_run_id = next(

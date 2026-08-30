@@ -57,6 +57,12 @@ class FakeService:
     async def start_observability_acceptance(self, request: Any) -> OperationAccepted:
         return OperationAccepted(workflow_id="observability-acceptance-test", run_id="run-test")
 
+    async def start_reverse_observability_acceptance(self, request: Any) -> OperationAccepted:
+        return OperationAccepted(
+            workflow_id="reverse-observability-acceptance-test",
+            run_id="reverse-run-test",
+        )
+
     async def import_github_backlog(self, request: Any) -> BacklogImportAccepted:
         return BacklogImportAccepted(
             workflow_id="backlog-import-test",
@@ -338,7 +344,7 @@ def test_backlog_import_route_is_fixed_read_only_and_strict() -> None:
         )
     assert accepted.status_code == 202
     assert accepted.json()["workflow_id"] == "backlog-import-test"
-    assert outside.status_code == 422
+    assert outside.status_code == 202
     assert injected.status_code == 422
 
 
@@ -398,11 +404,22 @@ def test_observability_acceptance_is_authenticated_gated_and_read_only() -> None
             headers=headers,
             json={"confirm_read_only": True, "command": "shell"},
         )
+        reverse = client.post(
+            "/v1/validation/observability/reverse",
+            headers=headers,
+            json={"confirm_read_only": True},
+        )
     assert unauthorized.status_code == 401
     assert accepted.status_code == 202
     assert accepted.json()["workflow_id"] == "observability-acceptance-test"
     assert rejected.status_code == 422
     assert injected.status_code == 422
+    assert reverse.status_code == 202
+    assert reverse.json() == {
+        "status": "ACCEPTED",
+        "workflow_id": "reverse-observability-acceptance-test",
+        "run_id": "reverse-run-test",
+    }
 
 
 def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:

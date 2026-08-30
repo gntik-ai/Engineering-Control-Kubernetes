@@ -54,12 +54,15 @@ server-generated typed phrase bound to the candidate digest. Capability prefligh
 the API dispatcher immediately before starting or signaling a workflow. Production is a literal
 `false` field in the typed schemas. R3 actions fail closed for operator handling.
 
-The current complete-delivery backend has no reviewed final GitHub merge/comment/issue-close
-application service. Consequently `full-delivery` candidates report
-`FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED` and remain disabled. Source-PR mode uses the
-existing gated issue-delivery workflow and now registers its child finding-verification and
-delivery Runs durably before child start. This distinction prevents the console from advertising a
-complete solve path that the current runtime cannot finish.
+The current complete-delivery backend has no reviewed exact-final-merge build/deploy/verify and
+GitHub merge/comment/issue-close application service. Consequently ordinary `full-delivery`
+candidates report `FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED` and remain disabled.
+Source-PR mode uses the existing gated issue-delivery workflow and registers its child
+finding-verification and delivery Runs durably before child start. The global campaign may drive a
+candidate through immutable reconciliation, staging, and runtime verification, but stops at
+`FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED`; it never treats candidate-only evidence as final
+closure. This distinction prevents the console from advertising a complete solve path that the
+current runtime cannot finish.
 
 Raw state remains visible. The canonical normalized states are `backlog`, `eligible`, `queued`,
 `preparing`, `implementing`, `reviewing`, `reworking`, `testing`, `awaiting_ci`,

@@ -63,8 +63,64 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--lenses", nargs="+", required=True)
     audit.add_argument("--environments", nargs="+", required=True)
     audit.add_argument("--execute", action="store_true")
+    for action in ("plan", "start"):
+        bounded_audit = commands.add_parser(f"audit-{action}")
+        bounded_audit.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+        bounded_audit.add_argument(
+            "preset",
+            choices=(
+                "snapshot",
+                "static-full",
+                "e2e-smoke",
+                "full-e2e",
+                "security",
+                "ux",
+                "deployment",
+                "documentation",
+                "falcone-intensive",
+            ),
+        )
+        bounded_audit.add_argument("environment", choices=("staging",))
+        if action == "start":
+            bounded_audit.add_argument("--publish-findings", action="store_true")
 
     commands.add_parser("campaigns").add_argument("--limit", type=int, default=50)
+    campaign = commands.add_parser("campaign")
+    campaign.add_argument("campaign_id")
+    ready = commands.add_parser("ready")
+    ready.add_argument("scope", choices=("core", "all"))
+    connections = commands.add_parser("connections")
+    connections.add_argument("scope", choices=("all",))
+    temporal = commands.add_parser("temporal")
+    temporal.add_argument("view", choices=("summary",))
+    workers = commands.add_parser("workers")
+    workers.add_argument("scope", choices=("all",))
+    commands.add_parser("providers")
+    commands.add_parser("channel-check")
+    diagnose = commands.add_parser("diagnose")
+    diagnose.add_argument("workflow_id")
+    tail = commands.add_parser("tail")
+    tail.add_argument("workflow_id")
+    tail.add_argument("limit", nargs="?", type=int, default=50, choices=range(1, 101))
+    nudge = commands.add_parser("nudge")
+    nudge.add_argument("workflow_id")
+    commands.add_parser("recheck-connections")
+    commands.add_parser("campaign-reconcile")
+    for action in ("locate", "start"):
+        issue = commands.add_parser(f"issue-{action}")
+        issue.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+        issue.add_argument("surface", choices=("source", "deployment"))
+        issue.add_argument("issue_number", type=int)
+    r3_candidate = commands.add_parser("r3-candidate")
+    r3_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    r3_candidate.add_argument("surface", choices=("source", "deployment"))
+    r3_candidate.add_argument("issue_number", type=int)
+    r3_approve = commands.add_parser("r3-approve")
+    r3_approve.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    r3_approve.add_argument("surface", choices=("source", "deployment"))
+    r3_approve.add_argument("issue_number", type=int)
+    r3_approve.add_argument("binding")
+    r3_approve.add_argument("confirmation_phrase")
     commands.add_parser("findings").add_argument("--limit", type=int, default=50)
     for name in ("status", "run"):
         commands.add_parser(name).add_argument("workflow_id")
@@ -107,7 +163,7 @@ def parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("approval_binding")
     bootstrap.add_argument("--execute", action="store_true", required=True)
     backlog_import = commands.add_parser("backlog-import")
-    backlog_import.add_argument("project", choices=("falcone", "musematic"))
+    backlog_import.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     backlog_import.add_argument(
         "import_filter",
         choices=("bugs", "bugs-and-docs", "security", "enhancements", "all"),
@@ -117,29 +173,36 @@ def parser() -> argparse.ArgumentParser:
     backlog_inventory.add_argument("campaign_id")
     backlog_inventory.add_argument("--limit", type=int, default=20, choices=range(1, 201))
     backlog_plan = commands.add_parser("backlog-plan")
-    backlog_plan.add_argument("project", choices=("falcone", "musematic"))
+    backlog_plan.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     backlog_plan.add_argument("campaign_id")
     backlog_candidate = commands.add_parser("backlog-approval-candidate")
-    backlog_candidate.add_argument("project", choices=("falcone", "musematic"))
+    backlog_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     backlog_candidate.add_argument("campaign_id")
     backlog_candidate.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
     backlog_candidate.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
     backlog_candidate.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
     backlog_approve = commands.add_parser("backlog-approve")
-    backlog_approve.add_argument("project", choices=("falcone", "musematic"))
+    backlog_approve.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     backlog_approve.add_argument("campaign_id")
     backlog_approve.add_argument("approval_binding")
     backlog_approve.add_argument(
         "typed_confirmation", choices=("APPROVE_EXISTING_GITHUB_BACKLOG_LOOP",)
     )
     backlog_start = commands.add_parser("backlog-start")
-    backlog_start.add_argument("project", choices=("falcone", "musematic"))
+    backlog_start.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     backlog_start.add_argument("campaign_id")
     backlog_start.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
     backlog_start.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
     backlog_start.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
     backlog_status = commands.add_parser("backlog-status")
     backlog_status.add_argument("workflow_id")
+    global_backlog = commands.add_parser("global-backlog-start")
+    global_backlog.add_argument("campaign_id")
+    global_backlog.add_argument("policy_campaign_id")
+    global_backlog.add_argument("falcone_campaign_id")
+    global_backlog.add_argument("musematic_campaign_id")
+    global_backlog.add_argument("llmwiki_campaign_id")
+    global_backlog.add_argument("typed_confirmation", choices=("START_GLOBAL_STAGING_R2_BACKLOG",))
     for action in ("pause", "pause-after-current", "resume", "stop-after-current", "cancel"):
         control = commands.add_parser(f"backlog-{action}")
         control.add_argument("workflow_id")
@@ -148,7 +211,13 @@ def parser() -> argparse.ArgumentParser:
         issue_action.add_argument("workflow_id")
         issue_action.add_argument(
             "repository",
-            choices=("falcone", "falcone-charts", "musematic", "musematic-deploy"),
+            choices=(
+                "falcone",
+                "falcone-charts",
+                "musematic",
+                "musematic-deploy",
+                "llmwiki",
+            ),
         )
         issue_action.add_argument("issue_number", type=int)
         if action == "skip":
@@ -195,8 +264,103 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "production": False,
             },
         )
+    if command in {"audit-plan", "audit-start"}:
+        return client.request(
+            "POST",
+            "/v1/commands",
+            {
+                "action": command.replace("-", "_"),
+                "project": arguments.project,
+                "preset": arguments.preset,
+                "environment": arguments.environment,
+                "publish_findings": (
+                    arguments.publish_findings if command == "audit-start" else False
+                ),
+                **({"production": False} if command == "audit-start" else {}),
+            },
+        )
     if command in {"campaigns", "findings"}:
         return client.request("GET", f"/v1/{command}?limit={arguments.limit}")
+    if command == "campaign":
+        return client.request("GET", f"/v1/campaign-detail/{arguments.campaign_id}")
+    if command == "ready":
+        return client.request("GET", f"/v1/readiness/{arguments.scope}")
+    if command == "connections":
+        return client.request("GET", "/v1/connections?scope=all")
+    if command == "temporal":
+        return client.request("GET", "/v1/temporal/summary")
+    if command == "workers":
+        return client.request("GET", "/v1/workers")
+    if command == "providers":
+        return client.request("GET", "/v1/providers")
+    if command == "channel-check":
+        return client.request("GET", "/v1/channel-check")
+    if command == "diagnose":
+        return client.request("GET", f"/v1/runs/{arguments.workflow_id}")
+    if command == "tail":
+        return client.request(
+            "GET", f"/v1/workflows/{arguments.workflow_id}/tail?limit={arguments.limit}"
+        )
+    if command == "nudge":
+        return client.request(
+            "POST", "/v1/commands", {"action": "nudge", "workflow_id": arguments.workflow_id}
+        )
+    if command == "recheck-connections":
+        return client.request(
+            "POST", "/v1/commands", {"action": "refresh_connections", "scope": "all"}
+        )
+    if command == "campaign-reconcile":
+        return client.request("POST", "/v1/campaigns/reconcile", {})
+    if command in {"issue-locate", "issue-start"}:
+        query = httpx.QueryParams(
+            {
+                "project": arguments.project,
+                "surface": arguments.surface,
+                "issue_number": arguments.issue_number,
+            }
+        )
+        located = client.request("GET", f"/v1/backlogs/locate?{query}")
+        if command == "issue-locate":
+            return located
+        issue = located.get("issue") if isinstance(located, dict) else None
+        if not isinstance(issue, dict):
+            raise ValueError("located issue projection is invalid")
+        return client.request(
+            "POST",
+            "/v1/commands",
+            {
+                "action": "solve_issue",
+                "project": arguments.project,
+                "backlog_campaign_id": located["backlog_campaign_id"],
+                "repository": issue["repository"],
+                "issue_number": arguments.issue_number,
+                "maximum_risk": "R2",
+                "delivery_mode": "full-delivery",
+                "correction_limit": 5,
+                "production": False,
+            },
+        )
+    if command == "r3-candidate":
+        query = httpx.QueryParams(
+            {
+                "project": arguments.project,
+                "surface": arguments.surface,
+                "issue_number": arguments.issue_number,
+            }
+        )
+        return client.request("GET", f"/v1/r3-issues/candidate?{query}")
+    if command == "r3-approve":
+        return client.request(
+            "POST",
+            "/v1/r3-issues/approve",
+            {
+                "project": arguments.project,
+                "surface": arguments.surface,
+                "issue_number": arguments.issue_number,
+                "binding": arguments.binding,
+                "confirmation_phrase": arguments.confirmation_phrase,
+            },
+        )
     if command in {"status", "run"}:
         return client.request("GET", f"/v1/runs/{arguments.workflow_id}")
     if command in {"pause", "resume", "cancel"}:
@@ -348,6 +512,29 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         )
     if command == "backlog-status":
         return client.request("GET", f"/v1/loops/{arguments.workflow_id}")
+    if command == "global-backlog-start":
+        return client.request(
+            "POST",
+            "/v1/commands",
+            {
+                "action": "start_autonomous_backlog",
+                "campaign_id": arguments.campaign_id,
+                "policy_campaign_id": arguments.policy_campaign_id,
+                "backlog_campaign_ids": {
+                    "falcone": arguments.falcone_campaign_id,
+                    "musematic": arguments.musematic_campaign_id,
+                    "llmwiki": arguments.llmwiki_campaign_id,
+                },
+                "environment": "staging",
+                "maximum_risk": "R2",
+                "global_active_issues": 1,
+                "global_deployments": 1,
+                "implementation_correction_limit": 5,
+                "deployment_correction_limit": 3,
+                "production": False,
+                "typed_confirmation": arguments.typed_confirmation,
+            },
+        )
     if command in {
         "backlog-pause",
         "backlog-pause-after-current",

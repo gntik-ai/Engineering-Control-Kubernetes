@@ -189,10 +189,26 @@ function setupBacklog() {
         const issue = node("td"); if (item.issue_url && item.issue_number) issue.append(link(item.issue_url, `#${item.issue_number}`, true)); else issue.textContent = item.issue_number ? `#${item.issue_number}` : "—";
         const actions = node("td");
         if (item.backlog_campaign_id && item.repository && item.issue_number) { const solve = node("button", "compact", "Solve"); solve.type = "button"; const eligible = item.issue_state === "OPEN" && ["READY", "ELIGIBLE_FOR_REVALIDATION", "ELIGIBLE_FOR_RUNTIME_REVALIDATION"].includes(item.eligibility_status) && !["preparing", "implementing", "reviewing", "reworking", "testing", "awaiting_ci", "awaiting_approval", "building", "deploying", "verifying"].includes(item.normalized_status); solve.disabled = !eligible; solve.title = eligible ? "Prepare an immutable solve candidate" : `Unavailable: ${item.blocker || item.eligibility_status || item.issue_state}`; solve.addEventListener("click", (event) => { event.stopPropagation(); prepareAction({action: "solve_issue", project: item.project, backlog_campaign_id: item.backlog_campaign_id, repository: item.repository, issue_number: item.issue_number, maximum_risk: "R2", delivery_mode: deliveryMode(), correction_limit: 2, production: false}, "backlog-error"); }); actions.append(solve); }
+        const r3Detail = node("div", "hidden");
+        if (item.risk === "R3" && item.issue_number) {
+          const approval = node("button", "compact", "R3 binding"); approval.type = "button";
+          approval.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            try {
+              const surface = item.repository.endsWith("-deploy") || item.repository.endsWith("-charts") ? "deployment" : "source";
+              const query = new URLSearchParams({project: item.project, surface, issue_number: item.issue_number});
+              const response = await fetch(`/api/dashboard/r3-issues/candidate?${query}`, {cache: "no-store"});
+              const candidate = await response.json(); if (!response.ok) throw new Error(candidate.detail || "R3 candidate is unavailable.");
+              const command = node("code", "breakable", candidate.telegram_command);
+              r3Detail.replaceChildren(node("h4", "", "Immutable R3 approval candidate"), list([["Status", candidate.status], ["Binding", candidate.binding], ["Expires", localTime(candidate.candidate.expires_at)], ["Production", candidate.candidate.production]]), node("p", "", "Exact Telegram command: "), command);
+              r3Detail.classList.remove("hidden"); detailRow.classList.remove("hidden"); expanded.add(key); row.setAttribute("aria-expanded", "true");
+            } catch (error) { setError("backlog-error", error.message); }
+          }); actions.append(" ", approval);
+        }
         if (item.workflow_id) actions.append(" ", link(`/workflows/${encodeURIComponent(item.workflow_id)}`, "View"));
         const state = node("td"); state.append(status(item.normalized_status)); row.append(issue, cell(item.title), cell(item.project), state, cell(item.raw_status), cell(item.current_phase), cell(item.active_provider), cell(item.provider_role), cell(item.worker), timestampCell(item.last_heartbeat), cell(elapsed(item.duration_seconds)), cell(`${show(item.attempt)} / ${show(item.max_attempts)}`), cell(item.pr_state), cell(item.ci_state), cell(item.build_state), cell(item.deployment_state), cell(item.verification_state), cell(item.blocker), actions);
         const detailRow = node("tr", `row-detail${expanded.has(key) ? "" : " hidden"}`); const detail = node("td"); detail.colSpan = 19; const links = node("p", "card-links"); if (item.workflow_id) links.append(link(`/workflows/${encodeURIComponent(item.workflow_id)}`, "Workflow")); if (item.execution_id) links.append(" · ", link(`/executions/${item.execution_id}`, "Provider execution"));
-        detail.append(list([["Workflow", item.workflow_id], ["Queued", localTime(item.queued_at)], ["Started", localTime(item.started_at)], ["Ended", localTime(item.ended_at)], ["Last activity", localTime(item.last_activity_at)], ["Freshness", `${item.freshness}${has(item.age_seconds) ? ` · ${elapsed(item.age_seconds)} old` : ""}`], ["Data source", item.source], ["Timeline", (item.timeline || []).map((step) => `${step.phase}: ${step.status}`).join(" · ") || "No persisted timeline"]]), links); detailRow.append(detail);
+        detail.append(list([["Workflow", item.workflow_id], ["Queued", localTime(item.queued_at)], ["Started", localTime(item.started_at)], ["Ended", localTime(item.ended_at)], ["Last activity", localTime(item.last_activity_at)], ["Freshness", `${item.freshness}${has(item.age_seconds) ? ` · ${elapsed(item.age_seconds)} old` : ""}`], ["Data source", item.source], ["Timeline", (item.timeline || []).map((step) => `${step.phase}: ${step.status}`).join(" · ") || "No persisted timeline"]]), links, r3Detail); detailRow.append(detail);
         const toggle = () => { expanded.has(key) ? expanded.delete(key) : expanded.add(key); row.setAttribute("aria-expanded", expanded.has(key)); detailRow.classList.toggle("hidden", !expanded.has(key)); };
         row.addEventListener("click", (event) => { if (!event.target.closest("a")) toggle(); }); row.addEventListener("keydown", (event) => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); toggle(); } }); rows.push(row, detailRow);
       }
