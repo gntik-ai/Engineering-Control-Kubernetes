@@ -107,7 +107,12 @@ class MetadataRepository(Protocol):
         self, enhancement_id: str, binding: str, actor: str
     ) -> dict[str, Any]: ...
     async def reject_enhancement(
-        self, enhancement_id: str, reason: str, actor: str
+        self,
+        enhancement_id: str,
+        reason: str,
+        actor: str,
+        *,
+        expected_binding: str | None = None,
     ) -> dict[str, Any]: ...
     async def get_artifact(self, artifact_id: UUID) -> dict[str, Any] | None: ...
     async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None: ...
@@ -702,11 +707,28 @@ class SQLMetadataRepository:
             return serialize_row(row)
 
     async def reject_enhancement(
-        self, enhancement_id: str, reason: str, actor: str
+        self,
+        enhancement_id: str,
+        reason: str,
+        actor: str,
+        *,
+        expected_binding: str | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self._reject_enhancement, enhancement_id, reason, actor)
+        return await asyncio.to_thread(
+            self._reject_enhancement,
+            enhancement_id,
+            reason,
+            actor,
+            expected_binding,
+        )
 
-    def _reject_enhancement(self, enhancement_id: str, reason: str, actor: str) -> dict[str, Any]:
+    def _reject_enhancement(
+        self,
+        enhancement_id: str,
+        reason: str,
+        actor: str,
+        expected_binding: str | None,
+    ) -> dict[str, Any]:
         with self.sessions.begin() as session:
             row = session.scalar(
                 select(Enhancement)
@@ -717,6 +739,8 @@ class SQLMetadataRepository:
                 raise ValueError("enhancement not found")
             if row.status not in {"CANDIDATE_ENHANCEMENT", "APPROVED"}:
                 raise ValueError("enhancement cannot be rejected from its current state")
+            if expected_binding is not None and row.approval_binding_sha256 != expected_binding:
+                raise ValueError("enhancement approval binding changed")
             row.status = "REJECTED"
             row.payload_json = {
                 **row.payload_json,
@@ -1223,7 +1247,12 @@ class EmptyMetadataRepository:
         raise ValueError("enhancement metadata store is unavailable")
 
     async def reject_enhancement(
-        self, enhancement_id: str, reason: str, actor: str
+        self,
+        enhancement_id: str,
+        reason: str,
+        actor: str,
+        *,
+        expected_binding: str | None = None,
     ) -> dict[str, Any]:
         raise ValueError("enhancement metadata store is unavailable")
 

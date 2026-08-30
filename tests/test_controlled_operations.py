@@ -20,6 +20,7 @@ from engineering_control.db.base import Base
 from engineering_control.db.models import (
     BacklogIssueRecord,
     ConnectionSnapshot,
+    Enhancement,
     GitHubBacklogCampaign,
     OperationRequest,
     QuotaSnapshot,
@@ -27,15 +28,20 @@ from engineering_control.db.models import (
     Run,
     WorkerHeartbeat,
 )
+from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.models import (
     AuditStartCommand,
+    EnhancementApproveCommand,
+    EnhancementRejectCommand,
+    EnhancementRunCommand,
     RefreshConnectionsCommand,
     SolveBacklogCommand,
     SolveIssueCommand,
     WorkflowControlCommand,
     parse_command,
 )
+from engineering_control.operations.registry import COMMAND_REGISTRY
 from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.service import TypedCommandBus
 from engineering_control.workflows import definitions as workflow_definitions
@@ -166,6 +172,26 @@ def _idempotency_fixture(channel: str, ordinal: int) -> str:
     return f"{channel}-test-{ordinal:012d}"
 
 
+def _seed_enhancement(repository: OperationsRepository, *, ordinal: int = 1) -> str:
+    key = f"enh-{ordinal:032x}"
+    with repository.sessions.begin() as session:
+        session.add(
+            Enhancement(
+                enhancement_key=key,
+                project="falcone",
+                campaign_id=str(CAMPAIGN_ID),
+                persona="operator",
+                affected_repository="gntik-ai/falcone",
+                risk_class="R1",
+                status="CANDIDATE_ENHANCEMENT",
+                fingerprint=f"sha256:{ordinal:064x}",
+                approval_binding_sha256=f"{ordinal:064x}",
+                payload_json={"summary": "bounded synthetic enhancement"},
+            )
+        )
+    return key
+
+
 def test_command_models_deny_production_and_arbitrary_arguments() -> None:
     with pytest.raises(ValidationError):
         parse_command(
@@ -186,6 +212,20 @@ def test_command_models_deny_production_and_arbitrary_arguments() -> None:
             project="falcone",
             backlog_campaign_id=CAMPAIGN_ID,
             concurrency=2,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        EnhancementRejectCommand(
+            project="falcone",
+            enhancement_id="enh-" + "1" * 32,
+            reason_code="arbitrary operator text",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        EnhancementRunCommand(
+            project="falcone",
+            enhancement_id="enh-" + "1" * 32,
+            risk="R1",
+            execution_mode="source-pr",
+            dry_run=True,
         )
 
 
@@ -487,6 +527,113 @@ def test_connection_projection_reports_github_worker_without_inventing_broker_su
         "worker_heartbeat_current": True,
     }
     assert values["worker-controller"].status == "NOT_INSTALLED"
+
+
+@pytest.mark.asyncio
+async def test_enhancement_actions_use_immutable_binding_and_typed_services(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    enhancement_id = _seed_enhancement(repository)
+    rejected_id = _seed_enhancement(repository, ordinal=2)
+    metadata = SQLMetadataRepository(str(repository.engine.url))
+    control = Mock()
+    control.start_enhancement_solution = AsyncMock(
+        return_value=OperationAccepted(
+            workflow_id="enhance-solution-synthetic",
+            run_id="enhance-run-1",
+        )
+    )
+    bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
+
+    approve = EnhancementApproveCommand(
+        project="falcone",
+        enhancement_id=enhancement_id,
+    )
+    candidate = await repository.candidate(approve, SESSION_A)
+    assert candidate.capability.status == "AVAILABLE"
+    assert candidate.confirmation_phrase is not None
+    assert candidate.operation_binding["payload"]["approval_binding"] == "1".zfill(64)
+    assert candidate.operation_binding["resolved"] == {
+        "enhancement_id": enhancement_id,
+        "project": "falcone",
+        "campaign_id": str(CAMPAIGN_ID),
+        "persona": "operator",
+        "affected_repository": "gntik-ai/falcone",
+        "risk": "R1",
+        "status": "CANDIDATE_ENHANCEMENT",
+        "fingerprint": "sha256:" + "1".zfill(64),
+        "approval_binding_sha256": "1".zfill(64),
+    }
+    changed = await repository.capability(
+        EnhancementApproveCommand(
+            project="falcone",
+            enhancement_id=enhancement_id,
+            approval_binding="f" * 64,
+        )
+    )
+    assert changed.status == "BLOCKED"
+    assert "ENHANCEMENT_APPROVAL_BINDING_CHANGED" in changed.blockers
+    approved = await bus.submit(
+        approve,
+        source_channel="cli",
+        operator_class="engineering-ctl",
+        idempotency_key=_idempotency_fixture("enhancement-approve", 1),
+    )
+    assert approved.status == "COMPLETED"
+    approved_record = await metadata.get_enhancement(enhancement_id)
+    assert approved_record is not None
+    assert approved_record["status"] == "APPROVED"
+
+    run = EnhancementRunCommand(
+        project="falcone",
+        enhancement_id=enhancement_id,
+        risk="R2",
+        execution_mode="source-pr",
+        dry_run=False,
+    )
+    run_candidate = await repository.candidate(run, SESSION_A)
+    assert run_candidate.capability.status == "AVAILABLE"
+    assert run_candidate.confirmation_phrase is not None
+    started = await bus.submit(
+        run,
+        source_channel="telegram",
+        operator_class="telegram:allowlisted",
+        idempotency_key=_idempotency_fixture("enhancement-run", 1),
+    )
+    assert started.workflow_id == "enhance-solution-synthetic"
+    request = control.start_enhancement_solution.await_args.args[1]
+    assert request.approval_binding == "1".zfill(64)
+    assert request.execution_mode == "source-pr"
+    assert request.dry_run is False
+
+    rejected = await bus.submit(
+        EnhancementRejectCommand(
+            project="falcone",
+            enhancement_id=rejected_id,
+            reason_code="OUT_OF_SCOPE",
+        ),
+        source_channel="cli",
+        operator_class="engineering-ctl",
+        idempotency_key=_idempotency_fixture("enhancement-reject", 1),
+    )
+    assert rejected.status == "COMPLETED"
+    rejected_record = await metadata.get_enhancement(rejected_id)
+    assert rejected_record is not None
+    assert rejected_record["status"] == "REJECTED"
+    assert rejected_record["payload_json"]["rejection"]["reason"] == "OUT_OF_SCOPE"
+
+    registry = {item["action"]: item for item in COMMAND_REGISTRY}
+    assert registry["enhancement_approve"]["status"] == "AVAILABLE"
+    assert registry["enhancement_reject"]["status"] == "AVAILABLE"
+    assert registry["enhancement_run"]["status"] == "AVAILABLE"
+    assert not any(
+        field["name"] in {"command", "args", "argv", "shell"}
+        for action in ("enhancement_approve", "enhancement_reject", "enhancement_run")
+        for field in registry[action]["fields"]
+    )
+    metadata.engine.dispose()
 
 
 @pytest.mark.asyncio

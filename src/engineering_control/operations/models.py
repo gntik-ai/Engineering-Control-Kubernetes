@@ -158,6 +158,45 @@ class EnhancementDiscoverCommand(OperationModel):
     dry_run: bool = True
 
 
+class EnhancementApproveCommand(OperationModel):
+    action: Literal["enhancement_approve"] = "enhancement_approve"
+    project: Project
+    enhancement_id: str = Field(pattern=r"^enh-[a-f0-9]{32}$")
+    approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    production: Literal[False] = False
+
+
+class EnhancementRejectCommand(OperationModel):
+    action: Literal["enhancement_reject"] = "enhancement_reject"
+    project: Project
+    enhancement_id: str = Field(pattern=r"^enh-[a-f0-9]{32}$")
+    approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    reason_code: Literal[
+        "DUPLICATE",
+        "NOT_ACTIONABLE",
+        "OUT_OF_SCOPE",
+        "POLICY_BLOCKED",
+    ]
+    production: Literal[False] = False
+
+
+class EnhancementRunCommand(OperationModel):
+    action: Literal["enhancement_run"] = "enhancement_run"
+    project: Project
+    enhancement_id: str = Field(pattern=r"^enh-[a-f0-9]{32}$")
+    approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    risk: RiskClass
+    execution_mode: Literal["plan-only", "source-pr", "preview", "staging"] = "plan-only"
+    dry_run: bool = True
+    production: Literal[False] = False
+
+    @model_validator(mode="after")
+    def execution_requires_confirmation(self) -> EnhancementRunCommand:
+        if self.execution_mode != "plan-only" and self.dry_run:
+            raise ValueError("enhancement execution requires dry_run=false")
+        return self
+
+
 class FindingVerifyCommand(OperationModel):
     action: Literal["finding_verify"] = "finding_verify"
     finding_id: UUID
@@ -178,6 +217,9 @@ type Command = Annotated[
     | WorkflowControlCommand
     | RefreshConnectionsCommand
     | EnhancementDiscoverCommand
+    | EnhancementApproveCommand
+    | EnhancementRejectCommand
+    | EnhancementRunCommand
     | FindingVerifyCommand
     | LLMWikiBootstrapPlanCommand,
     Field(discriminator="action"),
