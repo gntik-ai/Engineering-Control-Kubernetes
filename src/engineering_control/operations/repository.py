@@ -69,6 +69,7 @@ from engineering_control.operations.models import (
 from engineering_control.security.redaction import SecretRedactor
 
 _ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNNING"})
+_CAMPAIGN_EXPORT_COLLECTIONS = ("root_blockers", "findings", "runs", "artifacts")
 _TERMINAL_WORKFLOW_STATES = frozenset(
     {
         "COMPLETE",
@@ -1703,7 +1704,10 @@ class OperationsRepository:
         report = self.redactor.redact(content)
         if not isinstance(report.value, dict):
             raise ValueError("operation export did not produce an object")
-        encoded = self._encode_export(report.value)
+        export_value = report.value
+        if isinstance(command, EvidenceExportCampaignCommand):
+            export_value = self._bounded_campaign_export(export_value)
+        encoded = self._encode_export(export_value)
         if not encoded or len(encoded) > self.export_max_bytes:
             raise ValueError("operation export exceeds the configured size bound")
         digest = hashlib.sha256(encoded).hexdigest()
@@ -1736,7 +1740,7 @@ class OperationsRepository:
                     operation_id=operation_id,
                     export_kind=export_kind,
                     target_id=target_id,
-                    content_json=report.value,
+                    content_json=export_value,
                     content_sha256=digest,
                     size_bytes=len(encoded),
                     created_at=now,
@@ -1786,6 +1790,12 @@ class OperationsRepository:
                     .limit(501)
                 ).all()
             )
+            finding_total = int(
+                session.scalar(
+                    select(func.count(Finding.id)).where(Finding.campaign_id == campaign_id)
+                )
+                or 0
+            )
             run_rows = list(
                 session.scalars(
                     select(Run)
@@ -1794,6 +1804,10 @@ class OperationsRepository:
                     .limit(501)
                 ).all()
             )
+            run_total = int(
+                session.scalar(select(func.count(Run.id)).where(Run.campaign_id == campaign_id))
+                or 0
+            )
             artifact_rows = list(
                 session.scalars(
                     select(Artifact)
@@ -1801,6 +1815,12 @@ class OperationsRepository:
                     .order_by(desc(Artifact.created_at))
                     .limit(501)
                 ).all()
+            )
+            artifact_total = int(
+                session.scalar(
+                    select(func.count(Artifact.id)).where(Artifact.campaign_id == campaign_id)
+                )
+                or 0
             )
             metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
             raw_blockers = metadata.get("root_blockers")
@@ -1910,9 +1930,27 @@ class OperationsRepository:
                 ],
                 "truncated": {
                     "root_blockers": len(blockers) > 200,
-                    "findings": len(finding_rows) > 500,
-                    "runs": len(run_rows) > 500,
-                    "artifacts": len(artifact_rows) > 500,
+                    "findings": finding_total > 500,
+                    "runs": run_total > 500,
+                    "artifacts": artifact_total > 500,
+                },
+                "collection_counts": {
+                    "root_blockers": {
+                        "available": len(blockers),
+                        "included": min(len(blockers), 200),
+                    },
+                    "findings": {
+                        "available": finding_total,
+                        "included": min(finding_total, 500),
+                    },
+                    "runs": {
+                        "available": run_total,
+                        "included": min(run_total, 500),
+                    },
+                    "artifacts": {
+                        "available": artifact_total,
+                        "included": min(artifact_total, 500),
+                    },
                 },
                 "exclusions": [
                     "raw evidence content",
@@ -1953,6 +1991,50 @@ class OperationsRepository:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+
+    def _bounded_campaign_export(self, value: dict[str, Any]) -> dict[str, Any]:
+        """Proportionally retain collection prefixes until the redacted export fits."""
+        if len(self._encode_export(value)) <= self.export_max_bytes:
+            return value
+        collections = {
+            key: list(value.get(key, []))
+            for key in _CAMPAIGN_EXPORT_COLLECTIONS
+            if isinstance(value.get(key), list)
+        }
+        counts = value.get("collection_counts")
+        if not isinstance(counts, dict):
+            counts = {}
+            value["collection_counts"] = counts
+        truncated = value.get("truncated")
+        if not isinstance(truncated, dict):
+            truncated = {}
+            value["truncated"] = truncated
+        available: dict[str, int] = {}
+        for key, rows in collections.items():
+            raw = counts.get(key)
+            count = raw.get("available") if isinstance(raw, dict) else None
+            available[key] = count if isinstance(count, int) and count >= len(rows) else len(rows)
+
+        def apply_ratio(parts_per_million: int) -> None:
+            for key, rows in collections.items():
+                included = (len(rows) * parts_per_million) // 1_000_000
+                value[key] = rows[:included]
+                counts[key] = {"available": available[key], "included": included}
+                truncated[key] = available[key] > included
+
+        low = 0
+        high = 1_000_000
+        best: int | None = None
+        while low <= high:
+            midpoint = (low + high) // 2
+            apply_ratio(midpoint)
+            if len(self._encode_export(value)) <= self.export_max_bytes:
+                best = midpoint
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        apply_ratio(best if best is not None else 0)
+        return value
 
     @classmethod
     def _valid_export(cls, export: OperationExport | None, now: datetime) -> bool:

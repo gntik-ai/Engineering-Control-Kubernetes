@@ -721,7 +721,7 @@ async def test_bounded_evidence_exports_are_typed_redacted_expiring_and_cross_ch
 
 
 @pytest.mark.asyncio
-async def test_evidence_export_fails_closed_before_persistence_when_projection_is_too_large(
+async def test_evidence_export_truncates_collection_prefixes_to_configured_size(
     tmp_path: Path,
 ) -> None:
     database_url = f"sqlite+pysqlite:///{tmp_path / 'bounded-export.sqlite'}"
@@ -748,10 +748,15 @@ async def test_evidence_export_fails_closed_before_persistence_when_projection_i
         operator_class="engineering-ctl",
         idempotency_key=_idempotency_fixture("oversized-campaign-export", 1),
     )
-    assert operation.status == "BLOCKED"
-    assert operation.safe_error == "operation export exceeds the configured size bound"
+    assert operation.status == "COMPLETED"
+    export = await repository.export_content(operation.operation_id)
+    assert export is not None
+    assert export["truncated"]["root_blockers"] is True
+    assert export["collection_counts"]["root_blockers"]["available"] == 200
+    assert export["collection_counts"]["root_blockers"]["included"] < 200
+    assert len(repository._encode_export(export)) <= repository.export_max_bytes
     with repository.sessions() as session:
-        assert session.scalar(select(func.count(OperationExport.id))) == 0
+        assert session.scalar(select(func.count(OperationExport.id))) == 1
 
 
 @pytest.mark.asyncio
