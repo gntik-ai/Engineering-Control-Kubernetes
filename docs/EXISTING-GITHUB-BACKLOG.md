@@ -33,7 +33,7 @@ The Telegram surface accepts only fixed values:
 /loop retry-issue <workflow-id> <falcone|musematic|llmwiki> <source|deployment> <issue-number>
 /loop r3-candidate musematic source 1119
 /loop approve-r3 musematic source 1119 <binding> <exact-confirmation-phrase>
-/loop global-start <global-campaign-id> <policy-campaign-id> <falcone-campaign-id> <musematic-campaign-id> <llmwiki-campaign-id>
+/loop global-start <global-campaign-id> <policy-campaign-id> <falcone-campaign-id> <musematic-campaign-id> <llmwiki-campaign-id> START_GLOBAL_STAGING_R2_BACKLOG
 ```
 
 The same `/loop plan` and `/loop start` grammar remains compatible with audit campaigns: the API
@@ -57,9 +57,16 @@ checker reconciliation.
 The global `AutonomousBacklogCampaignWorkflow` accepts exactly the three projects, all five
 allowlisted repositories, staging, maximum automatic risk R2, one active issue, one deployment,
 five implementation corrections, three deployment corrections, and `production=false`. It
+requires a current, unexpired, immutable approval binding for each of the three project
+inventories; the platform confirmation never substitutes for an inventory's head, plan-hash, or
+delivery-mode binding. Falcone and Musematic are bound to full delivery. LLMWiki is bound to
+source-PR-only execution until its staging origin, image, pull authorization, and runtime binding
+are resolved; requesting LLMWiki full delivery fails closed instead of approving a placeholder
+target. It
 selects one child issue workflow at a time, durably records completed, blocked and skipped issues,
-retries temporary blockers after fifteen minutes, and continues with independent work. It
-continues as new after 25 issue boundaries.
+retries only classified temporary blockers with bounded exponential backoff, stops retrying after
+five attempts, and never re-drives a candidate stopped by the final-merge service boundary. It
+continues with independent work and continues as new after 25 issue or wait boundaries.
 
 Full delivery composes the existing immutable CI/artifact reconciliation, staging deployment, and
 runtime verification workflows. It remains fail-closed when candidate build, provenance, staging

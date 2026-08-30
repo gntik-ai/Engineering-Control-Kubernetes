@@ -11,6 +11,7 @@ from engineering_control.activities.engineering import EngineeringActivityHandle
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
 from engineering_control.db.models import BacklogIssueRecord, GitHubBacklogCampaign
+from engineering_control.engineering.backlog import BACKLOG_APPROVAL_PHRASE, approval_binding
 from engineering_control.operations.repository import OperationsRepository
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
@@ -27,6 +28,27 @@ def _campaign(campaign_id: UUID, project: str, *, status: str) -> GitHubBacklogC
         "llmwiki": ("gntik-ai/llmwiki", "gntik-ai/llmwiki", "master"),
     }
     source, deployment, branch = repositories[project]
+    source_head = {"falcone": "a", "musematic": "b", "llmwiki": "c"}[project] * 40
+    deployment_head = {"falcone": "d", "musematic": "e", "llmwiki": "f"}[project] * 40
+    plan_hash = {"falcone": "1", "musematic": "2", "llmwiki": "3"}[project] * 64
+    delivery_mode = "source-pr" if project == "llmwiki" else "full-delivery"
+    binding = (
+        approval_binding(
+            campaign_id=str(campaign_id),
+            project=project,  # type: ignore[arg-type]
+            import_filter="all",
+            source_head=source_head,
+            deployment_head=deployment_head,
+            dependency_plan_hash=plan_hash,
+            maximum_risk="R2",
+            maximum_items=50,
+            delivery_mode=delivery_mode,  # type: ignore[arg-type]
+            include_enhancements=False,
+            now=datetime.now(UTC),
+        )
+        if status == "APPROVED"
+        else None
+    )
     return GitHubBacklogCampaign(
         id=campaign_id,
         project=project,
@@ -37,8 +59,8 @@ def _campaign(campaign_id: UUID, project: str, *, status: str) -> GitHubBacklogC
         import_filter="all",
         source_default_branch=branch,
         deployment_default_branch=branch,
-        source_head_at_import=(project[0] * 40),
-        deployment_head_at_import=(project[-1] * 40),
+        source_head_at_import=source_head,
+        deployment_head_at_import=deployment_head,
         issue_count=3,
         eligible_count=3,
         deferred_count=0,
@@ -48,13 +70,22 @@ def _campaign(campaign_id: UUID, project: str, *, status: str) -> GitHubBacklogC
         existing_pr_count=0,
         blocked_count=0,
         dependency_graph_hash=(project[0] * 64),
-        plan_hash=(project[-1] * 64),
-        approval_binding=None,
-        approval_json={},
+        plan_hash=plan_hash,
+        approval_binding=binding.sha256() if binding is not None else None,
+        approval_json=(
+            {
+                **binding.model_dump(mode="json"),
+                "approved_by": "telegram:42",
+                "approved_at": datetime.now(UTC).isoformat(),
+                "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+            }
+            if binding is not None
+            else {}
+        ),
         maximum_risk="R2" if status == "APPROVED" else None,
-        maximum_items=500,
+        maximum_items=50,
         maximum_concurrency=1,
-        delivery_mode="full-delivery" if status == "APPROVED" else None,
+        delivery_mode=delivery_mode if status == "APPROVED" else None,
         include_enhancements=False,
         status=status,
         workflow_id=f"backlog-import-{project}",
@@ -123,9 +154,9 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
     with operations.sessions.begin() as session:
         session.add_all(
             [
-                _campaign(FALCONE_ID, "falcone", status="PLANNED"),
+                _campaign(FALCONE_ID, "falcone", status="APPROVED"),
                 _campaign(MUSEMATIC_ID, "musematic", status="APPROVED"),
-                _campaign(LLMWIKI_ID, "llmwiki", status="PLANNED"),
+                _campaign(LLMWIKI_ID, "llmwiki", status="APPROVED"),
                 _issue(
                     MUSEMATIC_ID,
                     "gntik-ai/musematic",
@@ -153,7 +184,11 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
             ]
         )
 
+    with pytest.raises(ValueError, match="has not been created"):
+        await operations.r3_issue_candidate_status("musematic", "source", 1119)
     candidate = await operations.r3_issue_candidate("musematic", "source", 1119)
+    current_candidate = await operations.r3_issue_candidate_status("musematic", "source", 1119)
+    assert current_candidate["candidate_id"] == candidate["candidate_id"]
     same_candidate = await operations.r3_issue_candidate("musematic", "source", 1119)
     assert same_candidate["candidate_id"] == candidate["candidate_id"]
     assert same_candidate["binding"] == candidate["binding"]
@@ -164,6 +199,8 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
         )
         assert issue is not None
         issue.body_sha256 = "f" * 64
+    with pytest.raises(ValueError, match="has not been created"):
+        await operations.r3_issue_candidate_status("musematic", "source", 1119)
     replaced = await operations.r3_issue_candidate("musematic", "source", 1119)
     assert replaced["binding"] != candidate["binding"]
 
@@ -237,3 +274,75 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
     )
     assert authorized["status"] == "SELECTED"
     assert authorized["items"][0]["issue_number"] == 1119
+
+    terminal = handler._record_global_backlog_result(
+        {
+            **context,
+            "item": third["item"],
+            "result": {
+                "status": "BLOCKED",
+                "blocker": "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED",
+            },
+        }
+    )["last_result"]
+    assert terminal["retryable"] is False
+    assert terminal["retry_after"] is None
+
+    exhausted = None
+    for _attempt in range(4):
+        exhausted = handler._record_global_backlog_result(
+            {
+                **context,
+                "item": first["item"],
+                "result": {"status": "BLOCKED", "blocker": "TRANSIENT_CI_FAILURE"},
+            }
+        )["last_result"]
+    assert exhausted is not None
+    assert exhausted["attempt"] == 5
+    assert exhausted["retryable"] is False
+    assert exhausted["retry_exhausted"] is True
+    assert handler._select_global_backlog_issue(context)["status"] == "EMPTY"
+
+
+def test_global_campaign_requires_every_current_inventory_approval(tmp_path: Path) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'approval.db'}"
+    operations = OperationsRepository(database_url)
+    Base.metadata.create_all(operations.engine)
+    with operations.sessions.begin() as session:
+        session.add_all(
+            [
+                _campaign(FALCONE_ID, "falcone", status="PLANNED"),
+                _campaign(MUSEMATIC_ID, "musematic", status="APPROVED"),
+                _campaign(LLMWIKI_ID, "llmwiki", status="APPROVED"),
+            ]
+        )
+    handler = EngineeringActivityHandler(Settings(database_url=database_url))
+    with pytest.raises(ValueError, match="current immutable approval for every inventory"):
+        handler._register_global_backlog(
+            {
+                "campaign_id": str(GLOBAL_ID),
+                "backlog_campaign_ids": {
+                    "falcone": str(FALCONE_ID),
+                    "musematic": str(MUSEMATIC_ID),
+                    "llmwiki": str(LLMWIKI_ID),
+                },
+                "policy_campaign_id": str(MUSEMATIC_ID),
+                "orchestration": {"workflow_id": "approval-denied"},
+            }
+        )
+
+
+def test_llmwiki_full_delivery_approval_fails_closed_until_inputs_exist() -> None:
+    with pytest.raises(ValueError, match="LLMWIKI_FULL_DELIVERY_INPUTS_UNRESOLVED"):
+        approval_binding(
+            campaign_id=str(LLMWIKI_ID),
+            project="llmwiki",
+            import_filter="all",
+            source_head="c" * 40,
+            deployment_head="f" * 40,
+            dependency_plan_hash="3" * 64,
+            maximum_risk="R2",
+            maximum_items=50,
+            delivery_mode="full-delivery",
+            include_enhancements=False,
+        )

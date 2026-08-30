@@ -17,6 +17,7 @@ from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_PROJECT_PAIRS,
     BACKLOG_SKIP_REASONS,
+    BacklogApprovalBinding,
     BacklogIssueRecord,
     BacklogIssueType,
     GitHubBacklogImportSnapshot,
@@ -39,6 +40,64 @@ from engineering_control.models.enums import ModelClass, Project, Provider
 
 def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+_GLOBAL_BACKLOG_RETRY_LIMIT = 5
+_GLOBAL_BACKLOG_RETRY_BASE_MINUTES = 15
+_TERMINAL_GLOBAL_BLOCKERS = frozenset(
+    {
+        "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED",
+        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
+        "LLMWIKI_FULL_DELIVERY_INPUTS_UNRESOLVED",
+        "BLOCKED_AUTONOMOUS_REPAIR_EXHAUSTED",
+        "CORRECTION_LIMIT_EXHAUSTED",
+        "NEEDS_PRODUCT_DECISION",
+    }
+)
+
+
+def _current_backlog_approval(
+    campaign: db.GitHubBacklogCampaign | None,
+    *,
+    delivery_mode: str,
+    maximum_risk: str,
+    now: datetime,
+) -> BacklogApprovalBinding | None:
+    if (
+        campaign is None
+        or campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING"}
+        or campaign.delivery_mode != delivery_mode
+        or campaign.maximum_risk != maximum_risk
+        or not campaign.approval_binding
+        or not isinstance(campaign.approval_json, dict)
+    ):
+        return None
+    approval = campaign.approval_json
+    if (
+        approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
+        or not isinstance(approval.get("approved_by"), str)
+        or not approval.get("approved_at")
+    ):
+        return None
+    try:
+        binding = BacklogApprovalBinding.model_validate(
+            {field: approval.get(field) for field in BacklogApprovalBinding.model_fields}
+        )
+    except ValueError:
+        return None
+    if (
+        binding.sha256() != campaign.approval_binding
+        or binding.backlog_campaign_id != str(campaign.id)
+        or binding.project != campaign.project
+        or binding.source_head != campaign.source_head_at_import
+        or binding.deployment_head != campaign.deployment_head_at_import
+        or binding.dependency_plan_hash != campaign.plan_hash
+        or binding.delivery_mode != delivery_mode
+        or binding.maximum_risk != maximum_risk
+        or _as_utc(binding.expires_at) <= now
+    ):
+        return None
+    return binding
 
 
 class EngineeringActivityHandler:
@@ -899,17 +958,18 @@ class EngineeringActivityHandler:
                 int(payload.get("target_issue_number") or 0),
                 str(payload.get("r3_approval_binding") or ""),
             )
+            base_maximum_risk = "R2" if global_campaign is not None else maximum_risk
+            approval = _current_backlog_approval(
+                campaign,
+                delivery_mode=str(payload.get("delivery_mode")),
+                maximum_risk=base_maximum_risk,
+                now=datetime.now(UTC),
+            )
             if (
                 campaign is None
                 or campaign.project != payload.get("project")
-                or (
-                    not globally_authorized
-                    and (
-                        campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING"}
-                        or campaign.delivery_mode != payload.get("delivery_mode")
-                        or campaign.maximum_risk != maximum_risk
-                    )
-                )
+                or approval is None
+                or (global_campaign is not None and not globally_authorized)
             ):
                 return {
                     **payload,
@@ -993,15 +1053,42 @@ class EngineeringActivityHandler:
             return False
         metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
         ids = metadata.get("backlog_campaign_ids")
+        delivery_modes = metadata.get("delivery_modes")
+        approval_bindings = metadata.get("inventory_approval_bindings")
+        project = (
+            next(
+                (
+                    str(name)
+                    for name, value in ids.items()
+                    if str(value) == str(backlog_campaign_id)
+                ),
+                None,
+            )
+            if isinstance(ids, dict)
+            else None
+        )
+        backlog = session.get(db.GitHubBacklogCampaign, backlog_campaign_id)
+        current_approval = _current_backlog_approval(
+            backlog,
+            delivery_mode=delivery_mode,
+            maximum_risk="R2",
+            now=datetime.now(UTC),
+        )
         return (
             metadata.get("kind") == "autonomous-global-backlog"
             and metadata.get("environment") == "staging"
             and metadata.get("maximum_risk") == "R2"
             and maximum_risk in {"R2", "R3"}
-            and metadata.get("delivery_mode") == delivery_mode == "full-delivery"
+            and project in {"falcone", "musematic", "llmwiki"}
+            and isinstance(delivery_modes, dict)
+            and delivery_modes.get(project) == delivery_mode
+            and delivery_mode in {"source-pr", "full-delivery"}
+            and isinstance(approval_bindings, dict)
+            and current_approval is not None
+            and approval_bindings.get(project) == current_approval.sha256()
             and metadata.get("production") is False
             and isinstance(ids, dict)
-            and str(backlog_campaign_id) in {str(value) for value in ids.values()}
+            and str(ids.get(project)) == str(backlog_campaign_id)
             and (
                 maximum_risk == "R2"
                 or (
@@ -1076,6 +1163,24 @@ class EngineeringActivityHandler:
                 for project, campaign in backlogs.items()
             ):
                 raise ValueError("global backlog inventory binding is invalid")
+            delivery_modes = {
+                "falcone": "full-delivery",
+                "musematic": "full-delivery",
+                "llmwiki": "source-pr",
+            }
+            approvals = {
+                project: _current_backlog_approval(
+                    backlog,
+                    delivery_mode=delivery_modes[project],
+                    maximum_risk="R2",
+                    now=now,
+                )
+                for project, backlog in backlogs.items()
+            }
+            if any(binding is None for binding in approvals.values()):
+                raise ValueError(
+                    "global backlog requires a current immutable approval for every inventory"
+                )
             policy_campaign = session.get(db.GitHubBacklogCampaign, policy_campaign_id)
             if (
                 policy_campaign is None
@@ -1128,7 +1233,12 @@ class EngineeringActivityHandler:
                         "policy_campaign_id": str(policy_campaign_id),
                         "environment": "staging",
                         "maximum_risk": "R2",
-                        "delivery_mode": "full-delivery",
+                        "delivery_modes": delivery_modes,
+                        "inventory_approval_bindings": {
+                            project: binding.sha256()
+                            for project, binding in approvals.items()
+                            if binding is not None
+                        },
                         "production": False,
                         "global_active_issues": 1,
                         "global_deployments": 1,
@@ -1211,9 +1321,10 @@ class EngineeringActivityHandler:
             metadata = dict(campaign.metadata_json)
             processed = {
                 str(item.get("reference"))
-                for key in ("completed_issues", "skipped_issues")
+                for key in ("completed_issues", "skipped_issues", "blocked_issues")
                 for item in metadata.get(key, [])
                 if isinstance(item, dict)
+                and (key != "blocked_issues" or item.get("retryable") is False)
             }
             now = datetime.now(UTC)
             blocked_until = {
@@ -1232,6 +1343,7 @@ class EngineeringActivityHandler:
                 rows = session.scalars(
                     select(db.BacklogIssueRecord).where(
                         db.BacklogIssueRecord.backlog_campaign_id == UUID(str(raw_id)),
+                        db.BacklogIssueRecord.delivery_status.in_({"NOT_STARTED", "RETRY_PENDING"}),
                         db.BacklogIssueRecord.eligibility_status.in_(
                             {
                                 "ELIGIBLE_FOR_REVALIDATION",
@@ -1301,6 +1413,9 @@ class EngineeringActivityHandler:
                 "reference": f"{row.repository}#{row.issue_number}",
                 "risk": row.calculated_risk,
                 "wave": row.planned_wave,
+                "delivery_mode": str(
+                    (metadata.get("delivery_modes") or {}).get(project) or "source-pr"
+                ),
             }
             if row.calculated_risk == "R3":
                 r3_candidate = self._valid_r3_candidate(session, row)
@@ -1343,6 +1458,7 @@ class EngineeringActivityHandler:
         if not isinstance(item, dict) or not isinstance(result, dict):
             raise ValueError("global backlog result binding is invalid")
         status = str(result.get("status") or "FAILED")
+        blocker = str(result.get("blocker") or "")[:120] or None
         terminal_bucket = (
             "completed_issues"
             if status in {"COMPLETE", "COMPLETED", "SUCCESS", "FIXED"}
@@ -1350,22 +1466,52 @@ class EngineeringActivityHandler:
             if status == "SKIPPED"
             else "blocked_issues"
         )
-        record = {
-            "reference": str(item["reference"]),
-            "status": status,
-            "blocker": str(result.get("blocker") or "")[:120] or None,
-            "recorded_at": datetime.now(UTC).isoformat(),
-            "retry_after": (
-                (datetime.now(UTC) + timedelta(minutes=15)).isoformat()
-                if terminal_bucket == "blocked_issues"
-                else None
-            ),
-        }
+        permanent_blocker = (
+            blocker in _TERMINAL_GLOBAL_BLOCKERS
+            or bool(blocker and blocker.startswith("FINAL_"))
+            or status in {"BLOCKED_AUTONOMOUS_REPAIR_EXHAUSTED", "NEEDS_PRODUCT_DECISION"}
+        )
+        now = datetime.now(UTC)
         with self.sessions.begin() as session:
             campaign = session.get(db.Campaign, campaign_id)
             if campaign is None:
                 raise ValueError("global backlog campaign disappeared")
             metadata = dict(campaign.metadata_json)
+            prior = next(
+                (
+                    existing
+                    for existing in metadata.get("blocked_issues", [])
+                    if isinstance(existing, dict)
+                    and existing.get("reference") == str(item["reference"])
+                ),
+                None,
+            )
+            attempt = int((prior or {}).get("attempt") or 0) + 1
+            retryable = (
+                terminal_bucket == "blocked_issues"
+                and not permanent_blocker
+                and attempt < _GLOBAL_BACKLOG_RETRY_LIMIT
+            )
+            retry_minutes = min(
+                _GLOBAL_BACKLOG_RETRY_BASE_MINUTES * (2 ** max(0, attempt - 1)),
+                360,
+            )
+            record = {
+                "reference": str(item["reference"]),
+                "status": status,
+                "blocker": blocker,
+                "recorded_at": now.isoformat(),
+                "attempt": attempt if terminal_bucket == "blocked_issues" else 0,
+                "retryable": retryable if terminal_bucket == "blocked_issues" else False,
+                "retry_after": (
+                    (now + timedelta(minutes=retry_minutes)).isoformat() if retryable else None
+                ),
+                "retry_exhausted": (
+                    terminal_bucket == "blocked_issues"
+                    and not permanent_blocker
+                    and attempt >= _GLOBAL_BACKLOG_RETRY_LIMIT
+                ),
+            }
             for other_bucket in (
                 "completed_issues",
                 "blocked_issues",
@@ -1393,6 +1539,19 @@ class EngineeringActivityHandler:
             metadata["current_issue"] = None
             metadata["notification_watermark"] = record["recorded_at"]
             campaign.metadata_json = metadata
+            issue = session.scalar(
+                select(db.BacklogIssueRecord).where(
+                    db.BacklogIssueRecord.backlog_campaign_id
+                    == UUID(str(item["backlog_campaign_id"])),
+                    db.BacklogIssueRecord.repository == str(item["repository"]),
+                    db.BacklogIssueRecord.issue_number == int(item["issue_number"]),
+                )
+            )
+            if issue is not None and blocker == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED":
+                issue.delivery_status = "CANDIDATE_VERIFIED_FINAL_SERVICE_BLOCKED"
+                issue.final_closure_status = "BLOCKED_FINAL_SERVICE"
+            elif issue is not None and retryable:
+                issue.delivery_status = "RETRY_PENDING"
             run = session.scalar(select(db.Run).where(db.Run.campaign_id == campaign_id).limit(1))
             if run is not None:
                 run.status = "RUNNING"

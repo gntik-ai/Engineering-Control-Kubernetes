@@ -472,6 +472,8 @@ def approval_binding(
 ) -> BacklogApprovalBinding:
     if not _SHA.fullmatch(source_head) or not _SHA.fullmatch(deployment_head):
         raise ValueError("backlog approval requires immutable repository heads")
+    if project == "llmwiki" and delivery_mode == "full-delivery":
+        raise ValueError("LLMWIKI_FULL_DELIVERY_INPUTS_UNRESOLVED")
     operations: tuple[str, ...] = (
         "issue-comment",
         "bounded-branch-push",
@@ -485,7 +487,7 @@ def approval_binding(
         if project == "falcone"
         else ("musematic-platform", "platform-data", "argocd:musematic-platform")
         if project == "musematic"
-        else ("llmwiki-staging-inputs-unresolved",)
+        else ()
     )
     build_workflows = (
         (".github/workflows/release-images.yml",)

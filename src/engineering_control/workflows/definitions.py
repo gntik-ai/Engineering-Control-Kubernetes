@@ -1967,7 +1967,7 @@ class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
                 non_retryable=True,
             )
         context = await self._step("global_backlog.register", asdict(request))
-        processed_this_run = 0
+        iterations_this_run = 0
         while not self._cancelled:
             if not await self._checkpoint("GLOBAL_ISSUE_SELECTION"):
                 break
@@ -1980,6 +1980,9 @@ class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
                 )
                 self._phase = "WAITING_FOR_BLOCKED_ISSUE_RETRY"
                 await workflow.sleep(timedelta(seconds=wait_seconds))
+                iterations_this_run += 1
+                if iterations_this_run >= 25:
+                    workflow.continue_as_new(request)
                 continue
             if item is None:
                 return await self._step(
@@ -2002,7 +2005,7 @@ class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
                     project=project,
                     backlog_campaign_id=str(item["backlog_campaign_id"]),
                     maximum_risk=str(item.get("execution_maximum_risk", "R2")),
-                    delivery_mode="full-delivery",
+                    delivery_mode=str(item["delivery_mode"]),
                     maximum_items=1,
                     target_repository=str(item["repository"]),
                     target_issue_number=int(item["issue_number"]),
@@ -2022,7 +2025,7 @@ class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
             context = await self._step(
                 "global_backlog.record_result", {**context, "item": item, "result": result}
             )
-            processed_this_run += 1
+            iterations_this_run += 1
             if self._pause_after_current:
                 self._pause_after_current = False
                 self._paused = True
@@ -2032,7 +2035,7 @@ class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
                 )
             if self._paused:
                 await workflow.wait_condition(lambda: not self._paused or self._cancelled)
-            if processed_this_run >= 25:
+            if iterations_this_run >= 25:
                 workflow.continue_as_new(request)
         return await self._step(
             "global_backlog.finalize", {**context, "terminal_status": "CANCELLED"}
