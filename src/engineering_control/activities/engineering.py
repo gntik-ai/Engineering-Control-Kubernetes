@@ -1186,9 +1186,16 @@ class EngineeringActivityHandler:
                     "global backlog requires a current immutable approval for every inventory"
                 )
             policy_campaign = session.get(db.GitHubBacklogCampaign, policy_campaign_id)
+            owner_ids = {
+                backlog.id
+                for backlog in backlogs.values()
+                if backlog is not None
+                and backlog.approval_json.get("policy_role") in {None, "owner"}
+            }
             if (
                 policy_campaign is None
                 or policy_campaign_id not in campaign_ids.values()
+                or owner_ids != {policy_campaign_id}
                 or policy_campaign.status not in {"APPROVED", "RUNNING"}
                 or policy_campaign.approval_json.get("policy_role") not in {None, "owner"}
             ):

@@ -61,6 +61,9 @@ def _campaign(campaign_id: UUID, project: str, *, status: str) -> GitHubBacklogC
         if status == "APPROVED"
         else None
     )
+    effective_status = (
+        "APPROVED_INVENTORY" if status == "APPROVED" and project != "falcone" else status
+    )
     return GitHubBacklogCampaign(
         id=campaign_id,
         project=project,
@@ -87,7 +90,7 @@ def _campaign(campaign_id: UUID, project: str, *, status: str) -> GitHubBacklogC
         approval_json=(
             {
                 **binding.model_dump(mode="json"),
-                "policy_role": "owner",
+                "policy_role": "owner" if project == "falcone" else "inventory",
                 "approved_by": "telegram:42",
                 "approved_at": datetime.now(UTC).isoformat(),
                 "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
@@ -100,7 +103,7 @@ def _campaign(campaign_id: UUID, project: str, *, status: str) -> GitHubBacklogC
         maximum_concurrency=1,
         delivery_mode=delivery_mode if status == "APPROVED" else None,
         include_enhancements=False,
-        status=status,
+        status=effective_status,
         workflow_id=f"backlog-import-{project}",
     )
 
@@ -241,28 +244,41 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
     state_root = tmp_path / "state"
     (state_root / "github-policy-requests").mkdir(parents=True, mode=0o700)
     handler = EngineeringActivityHandler(Settings(database_url=database_url, state_root=state_root))
-    context = handler._register_global_backlog(
-        {
-            "campaign_id": str(GLOBAL_ID),
-            "backlog_campaign_ids": {
-                "falcone": str(FALCONE_ID),
-                "musematic": str(MUSEMATIC_ID),
-                "llmwiki": str(LLMWIKI_ID),
-            },
-            "policy_campaign_id": str(MUSEMATIC_ID),
-            "environment": "staging",
-            "maximum_risk": "R2",
-            "global_active_issues": 1,
-            "global_deployments": 1,
-            "implementation_correction_limit": 5,
-            "deployment_correction_limit": 3,
-            "production": False,
-            "orchestration": {
-                "workflow_id": "autonomous-backlog-staging",
-                "workflow_run_id": "temporal-global-run",
-            },
-        }
-    )
+    registration = {
+        "campaign_id": str(GLOBAL_ID),
+        "backlog_campaign_ids": {
+            "falcone": str(FALCONE_ID),
+            "musematic": str(MUSEMATIC_ID),
+            "llmwiki": str(LLMWIKI_ID),
+        },
+        "policy_campaign_id": str(FALCONE_ID),
+        "environment": "staging",
+        "maximum_risk": "R2",
+        "global_active_issues": 1,
+        "global_deployments": 1,
+        "implementation_correction_limit": 5,
+        "deployment_correction_limit": 3,
+        "production": False,
+        "orchestration": {
+            "workflow_id": "autonomous-backlog-staging",
+            "workflow_run_id": "temporal-global-run",
+        },
+    }
+    with operations.sessions.begin() as session:
+        conflicting = session.get(GitHubBacklogCampaign, MUSEMATIC_ID)
+        assert conflicting is not None
+        approval = dict(conflicting.approval_json)
+        approval["policy_role"] = "owner"
+        conflicting.approval_json = approval
+    with pytest.raises(ValueError, match="one active exact GitHub write policy"):
+        handler._register_global_backlog(registration)
+    with operations.sessions.begin() as session:
+        inventory = session.get(GitHubBacklogCampaign, MUSEMATIC_ID)
+        assert inventory is not None
+        approval = dict(inventory.approval_json)
+        approval["policy_role"] = "inventory"
+        inventory.approval_json = approval
+    context = handler._register_global_backlog(registration)
 
     preserved = handler._record_backlog_loop_state(
         {
@@ -393,7 +409,7 @@ def test_global_campaign_requires_every_current_inventory_approval(tmp_path: Pat
                     "musematic": str(MUSEMATIC_ID),
                     "llmwiki": str(LLMWIKI_ID),
                 },
-                "policy_campaign_id": str(MUSEMATIC_ID),
+                "policy_campaign_id": str(FALCONE_ID),
                 "orchestration": {"workflow_id": "approval-denied"},
             }
         )

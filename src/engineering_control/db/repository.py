@@ -670,14 +670,14 @@ class SQLMetadataRepository:
                     GitHubBacklogCampaign.status.in_({"APPROVED", "RUNNING", "PAUSED"}),
                 )
             ).all()
-            active_owner = next(
-                (
-                    candidate.id
-                    for candidate in active_campaigns
-                    if candidate.approval_json.get("policy_role") in {None, "owner"}
-                ),
-                None,
-            )
+            active_owners = [
+                candidate.id
+                for candidate in active_campaigns
+                if candidate.approval_json.get("policy_role") in {None, "owner"}
+            ]
+            if len(active_owners) > 1:
+                raise ValueError("multiple backlog campaigns claim GitHub write policy ownership")
+            active_owner = active_owners[0] if active_owners else None
             raw_binding = campaign.approval_json.get("binding")
             if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
                 raise ValueError("existing-backlog approval candidate changed")

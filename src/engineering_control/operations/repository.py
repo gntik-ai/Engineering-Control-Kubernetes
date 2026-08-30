@@ -619,8 +619,18 @@ class OperationsRepository:
                         campaign.approval_binding
                     )
             policy = session.get(GitHubBacklogCampaign, command.policy_campaign_id)
+            owner_ids = {
+                campaign.id
+                for campaign in (
+                    session.get(GitHubBacklogCampaign, campaign_id)
+                    for campaign_id in command.backlog_campaign_ids.values()
+                )
+                if campaign is not None
+                and campaign.approval_json.get("policy_role") in {None, "owner"}
+            }
             if (
                 policy is None
+                or owner_ids != {command.policy_campaign_id}
                 or policy.status not in {"APPROVED", "RUNNING"}
                 or policy.approval_json.get("policy_role") not in {None, "owner"}
             ):
