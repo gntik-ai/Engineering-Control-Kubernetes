@@ -197,7 +197,7 @@ setfacl -m u:hermes:r-- "${CONFIG_ROOT}/env/api.token"
 
 install -d -o root -g engineering-control -m 0750 \
   "${CONFIG_ROOT}/env/evidence-uploaders"
-for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner; do
+for identity in codex-runner claude-runner browser-runner scan-runner delivery-runner release-runner github-runner; do
   token_path="${CONFIG_ROOT}/env/evidence-uploaders/${identity}.token"
   if [[ ! -f "${token_path}" ]]; then
     openssl rand -hex 48 >"${token_path}"
@@ -293,6 +293,9 @@ if [[ ! -f "${CONFIG_ROOT}/env/github-worker.env" ]]; then
     printf 'ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=%s/policy/github-issue-write-validation.yaml\n' \
       "${CONFIG_ROOT}"
     printf 'ENGINEERING_AGENT_PACK_ROOT=%s/source\n' "${AGENT_PACK_INSTALL_ROOT}"
+    printf 'ENGINEERING_EVIDENCE_INGEST_URL=http://10.10.0.2:8750/v1/evidence\n'
+    printf 'ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE=%s/env/evidence-uploaders/github-runner.token\n' \
+      "${CONFIG_ROOT}"
     printf 'ENGINEERING_SYNTHETIC_MODE=false\n'
     printf 'ENGINEERING_CLEANUP_EXECUTION_ENABLED=false\n'
   } >"${CONFIG_ROOT}/env/github-worker.env"
@@ -327,6 +330,29 @@ github_policy_path=$(sed -n 's/^ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE=/
 if [[ ${github_policy_path_count} -ne 1 || \
   ${github_policy_path} != "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml" ]]; then
   echo "Refusing GitHub worker configuration with a noncanonical write-policy path" >&2
+  exit 1
+fi
+if ! grep -q '^ENGINEERING_EVIDENCE_INGEST_URL=' \
+  "${CONFIG_ROOT}/env/github-worker.env"; then
+  printf 'ENGINEERING_EVIDENCE_INGEST_URL=http://10.10.0.2:8750/v1/evidence\n' \
+    >>"${CONFIG_ROOT}/env/github-worker.env"
+fi
+if ! grep -q '^ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE=' \
+  "${CONFIG_ROOT}/env/github-worker.env"; then
+  printf 'ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE=%s/env/evidence-uploaders/github-runner.token\n' \
+    "${CONFIG_ROOT}" >>"${CONFIG_ROOT}/env/github-worker.env"
+fi
+github_evidence_url_count=$(grep -c '^ENGINEERING_EVIDENCE_INGEST_URL=' \
+  "${CONFIG_ROOT}/env/github-worker.env")
+github_evidence_token_count=$(grep -c '^ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE=' \
+  "${CONFIG_ROOT}/env/github-worker.env")
+if [[ ${github_evidence_url_count} -ne 1 || ${github_evidence_token_count} -ne 1 ]] || \
+  ! grep -Eq '^ENGINEERING_EVIDENCE_INGEST_URL=http://10\.10\.0\.2:8750/v1/evidence$' \
+    "${CONFIG_ROOT}/env/github-worker.env" || \
+  ! grep -Fqx \
+    "ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE=${CONFIG_ROOT}/env/evidence-uploaders/github-runner.token" \
+    "${CONFIG_ROOT}/env/github-worker.env"; then
+  echo "Refusing noncanonical GitHub worker evidence-ingest configuration" >&2
   exit 1
 fi
 chown root:hermes "${CONFIG_ROOT}/env/github-worker.env"
