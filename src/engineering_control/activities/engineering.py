@@ -972,6 +972,7 @@ class EngineeringActivityHandler:
                 campaign is None
                 or campaign.project != payload.get("project")
                 or approval is None
+                or (global_campaign is None and campaign.status == "APPROVED_INVENTORY")
                 or (global_campaign is not None and not globally_authorized)
             ):
                 return {
@@ -1189,7 +1190,7 @@ class EngineeringActivityHandler:
                 policy_campaign is None
                 or policy_campaign_id not in campaign_ids.values()
                 or policy_campaign.status not in {"APPROVED", "RUNNING"}
-                or policy_campaign.approval_json.get("policy_role") != "owner"
+                or policy_campaign.approval_json.get("policy_role") not in {None, "owner"}
             ):
                 raise ValueError("global backlog requires one active exact GitHub write policy")
             inventory: list[dict[str, Any]] = []
@@ -1584,7 +1585,7 @@ class EngineeringActivityHandler:
                 policy_campaign is None
                 or str(policy_campaign.id)
                 not in {str(value) for value in raw_inventory_ids.values()}
-                or policy_campaign.approval_json.get("policy_role") != "owner"
+                or policy_campaign.approval_json.get("policy_role") not in {None, "owner"}
             ):
                 raise ValueError("global backlog policy campaign is invalid")
             raw_approval = policy_campaign.approval_json.get("approval")

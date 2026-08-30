@@ -75,6 +75,7 @@ from engineering_control.models.enums import (
 from engineering_control.models.final_closure import (
     FinalArtifactPlan,
     FinalClosurePlan,
+    FinalDeploymentMergePlan,
     FinalIssueMutationPlan,
     ProtectedMergeResult,
     ProtectedPullRequestBinding,
@@ -2719,7 +2720,7 @@ class MetadataActivityHandler:
             writable=True,
             change_set_id=change_set_id,
         )
-        response = {
+        response: dict[str, Any] = {
             **payload,
             "status": f"{target.upper()}_MAKER_READY",
             request_key: request.model_dump(mode="json"),
@@ -3104,7 +3105,7 @@ class MetadataActivityHandler:
                 raise ValueError("final closure campaign, issue, or ChangeSet binding is missing")
             if (
                 campaign.delivery_mode != "full-delivery"
-                or campaign.status not in {"APPROVED", "RUNNING"}
+                or campaign.status not in {"APPROVED_INVENTORY", "APPROVED", "RUNNING"}
                 or not campaign.approval_binding
                 or not isinstance(campaign.approval_json, dict)
             ):
@@ -3131,8 +3132,27 @@ class MetadataActivityHandler:
                 or _as_utc(approval.expires_at) <= now
             ):
                 raise ValueError("final closure approval is absent, expired, or changed")
-            if change_set.state != ChangeSetState.RUNTIME_VERIFIED.value:
-                raise ValueError("final closure requires candidate runtime verification")
+            if (
+                change_set.state == ChangeSetState.ISSUE_CLOSED.value
+                and issue.state == "CLOSED"
+                and issue.final_closure_status == "FIXED_CLOSURE_COMPLETE"
+            ):
+                return {
+                    **payload,
+                    "status": "FIXED",
+                    "change_set_id": str(change_set.id),
+                }
+            closure_states = {
+                ChangeSetState.RUNTIME_VERIFIED.value,
+                ChangeSetState.SOURCE_MERGED.value,
+                ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+                ChangeSetState.DEPLOY_PR.value,
+                ChangeSetState.AWAITING_STAGING_APPROVAL.value,
+                ChangeSetState.STAGING_APPROVED.value,
+                ChangeSetState.STAGING_DEPLOYED.value,
+            }
+            if change_set.state not in closure_states:
+                raise ValueError("final closure is not in a resumable verified state")
             if (
                 issue.state != "OPEN"
                 or issue.documentation_impact
@@ -3140,31 +3160,24 @@ class MetadataActivityHandler:
             ):
                 raise ValueError("issue is not eligible for final closure")
             recovery = dict(change_set.recovery_json)
+            existing_closure_value = recovery.get("final_closure")
+            existing_closure = (
+                dict(existing_closure_value) if isinstance(existing_closure_value, dict) else {}
+            )
             chain = self._object(recovery.get("provider_chain"), "provider chain")
             release_evidence = self._object(
                 recovery.get("release_evidence", {}), "release evidence"
             )
-            independent = release_evidence.get("independent_review_sha256")
+            independent = existing_closure.get(
+                "independent_review_sha256",
+                release_evidence.get("independent_review_sha256"),
+            )
             if not self._is_digest(independent):
                 raise ValueError("final closure independent review evidence is missing")
             maker = str(chain.get("maker", ""))
             checker = str(chain.get("checker", ""))
             if maker not in {"codex", "claude"} or checker not in {"codex", "claude"}:
                 raise ValueError("final closure provider chain is incomplete")
-            source = self._final_pr_binding(
-                repository=f"gntik-ai/{change_set.source_repository}",
-                url=change_set.source_pr_url,
-                branch=change_set.source_branch,
-                head_sha=change_set.source_head_sha,
-                base_branch=approval.source_branch,
-            )
-            deployment = self._final_pr_binding(
-                repository=f"gntik-ai/{change_set.deployment_repository}",
-                url=change_set.deployment_pr_url,
-                branch=change_set.deployment_branch,
-                head_sha=change_set.deployment_head_sha,
-                base_branch=approval.deployment_branch,
-            )
             run_id = uuid5(NAMESPACE_URL, f"final-closure:{workflow_id}:{change_set.id}")
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
@@ -3190,24 +3203,78 @@ class MetadataActivityHandler:
             ):
                 raise ValueError("final closure workflow idempotency binding changed")
             policy = self._delivery_control_policy(project)
-            plan = FinalClosurePlan(
-                change_set_id=change_set.id,
-                run_id=run.id,
-                workflow_id=workflow_id,
-                backlog_campaign_id=campaign.id,
-                approval_binding_sha256=campaign.approval_binding,
-                project=project,
-                issue_repository=issue.repository,
-                issue_number=issue.issue_number,
-                source=source,
-                deployment=deployment,
-                maker_provider=cast(Literal["codex", "claude"], maker),
-                checker_provider=cast(Literal["codex", "claude"], checker),
-                documentation_impact=DocumentationImpact(issue.documentation_impact),
-                policy=policy,
-                production=False,
-            )
+            stored_plan = existing_closure.get("plan")
+            if stored_plan is not None:
+                plan = FinalClosurePlan.model_validate(stored_plan)
+                if (
+                    plan.change_set_id != change_set.id
+                    or plan.run_id != run.id
+                    or plan.workflow_id != workflow_id
+                    or plan.backlog_campaign_id != campaign.id
+                    or plan.approval_binding_sha256 != campaign.approval_binding
+                    or plan.project is not project
+                    or plan.issue_repository != issue.repository
+                    or plan.issue_number != issue.issue_number
+                    or plan.maker_provider != maker
+                    or plan.checker_provider != checker
+                    or plan.documentation_impact.value != issue.documentation_impact
+                    or plan.policy != policy
+                ):
+                    raise ValueError("persisted final closure plan binding changed")
+            else:
+                if change_set.state != ChangeSetState.RUNTIME_VERIFIED.value:
+                    raise ValueError("final closure plan is missing after irreversible progress")
+                source = self._final_pr_binding(
+                    repository=f"gntik-ai/{change_set.source_repository}",
+                    url=change_set.source_pr_url,
+                    branch=change_set.source_branch,
+                    head_sha=change_set.source_head_sha,
+                    base_branch=approval.source_branch,
+                )
+                deployment = self._final_pr_binding(
+                    repository=f"gntik-ai/{change_set.deployment_repository}",
+                    url=change_set.deployment_pr_url,
+                    branch=change_set.deployment_branch,
+                    head_sha=change_set.deployment_head_sha,
+                    base_branch=approval.deployment_branch,
+                )
+                plan = FinalClosurePlan(
+                    change_set_id=change_set.id,
+                    run_id=run.id,
+                    workflow_id=workflow_id,
+                    backlog_campaign_id=campaign.id,
+                    approval_binding_sha256=campaign.approval_binding,
+                    project=project,
+                    issue_repository=issue.repository,
+                    issue_number=issue.issue_number,
+                    source=source,
+                    deployment=deployment,
+                    maker_provider=cast(Literal["codex", "claude"], maker),
+                    checker_provider=cast(Literal["codex", "claude"], checker),
+                    documentation_impact=DocumentationImpact(issue.documentation_impact),
+                    policy=policy,
+                    production=False,
+                )
+                existing_closure["plan"] = plan.model_dump(mode="json")
+                existing_closure["independent_review_sha256"] = independent
+                recovery["final_closure"] = existing_closure
+                change_set.recovery_json = recovery
+            run.status = "RUNNING"
+            run.error_code = None
+            run.finished_at = None
             issue.final_closure_status = "FINAL_CLOSURE_RUNNING"
+            stored_issue_plan = existing_closure.get("final_issue_plan")
+            if stored_issue_plan is not None:
+                issue_plan = FinalIssueMutationPlan.model_validate(stored_issue_plan)
+                if issue_plan.closure != plan:
+                    raise ValueError("persisted final issue plan binding changed")
+                return {
+                    **payload,
+                    "status": "FINAL_ISSUE_CLOSE_READY",
+                    "final_closure_plan": plan.model_dump(mode="json"),
+                    "final_issue_plan": issue_plan.model_dump(mode="json"),
+                    "independent_review_sha256": independent,
+                }
         return {
             **payload,
             "status": "FINAL_CLOSURE_READY",
@@ -3299,6 +3366,10 @@ class MetadataActivityHandler:
                     ChangeSetState.SOURCE_MERGED.value,
                     ChangeSetState.FINAL_ARTIFACT_BUILT.value,
                     ChangeSetState.DEPLOY_PR.value,
+                    ChangeSetState.AWAITING_STAGING_APPROVAL.value,
+                    ChangeSetState.STAGING_APPROVED.value,
+                    ChangeSetState.STAGING_DEPLOYED.value,
+                    ChangeSetState.RUNTIME_VERIFIED.value,
                 }
             ):
                 raise ValueError("final artifact persistence binding is missing")
@@ -3321,6 +3392,10 @@ class MetadataActivityHandler:
                 in {
                     ChangeSetState.FINAL_ARTIFACT_BUILT.value,
                     ChangeSetState.DEPLOY_PR.value,
+                    ChangeSetState.AWAITING_STAGING_APPROVAL.value,
+                    ChangeSetState.STAGING_APPROVED.value,
+                    ChangeSetState.STAGING_DEPLOYED.value,
+                    ChangeSetState.RUNTIME_VERIFIED.value,
                 }
             )
             if not already_persisted:
@@ -3358,12 +3433,16 @@ class MetadataActivityHandler:
 
     def _persist_final_deployment_merge(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+        deployment_plan = FinalDeploymentMergePlan.model_validate(
+            payload.get("final_deployment_merge_plan")
+        )
         merge = ProtectedMergeResult.model_validate(payload.get("deployment_merge"))
         if (
             payload.get("status") != "DEPLOYMENT_MERGED"
-            or merge.repository != plan.deployment.repository
-            or merge.pull_request_number != plan.deployment.number
-            or merge.head_sha != str(payload.get("deployment_sha"))
+            or deployment_plan.closure != plan
+            or merge.repository != deployment_plan.deployment.repository
+            or merge.pull_request_number != deployment_plan.deployment.number
+            or merge.head_sha != deployment_plan.deployment.head_sha
         ):
             raise ValueError("final deployment merge is not bound to its reviewed PR head")
         with self.sessions.begin() as session:
@@ -3461,7 +3540,6 @@ class MetadataActivityHandler:
                 session.scalars(
                     select(WorktreeLease).where(
                         WorktreeLease.change_set_id == change_set.id,
-                        WorktreeLease.released_at.is_(None),
                     )
                 ).all()
                 if change_set is not None
@@ -3492,7 +3570,7 @@ class MetadataActivityHandler:
             if lease_repositories != expected_lease_repositories:
                 raise ValueError("final worktree cleanup lease binding is incomplete")
             for lease in worktree_leases:
-                lease.released_at = now
+                lease.released_at = lease.released_at or now
             recovery = dict(change_set.recovery_json)
             closure = self._object(recovery.get("final_closure"), "final closure")
             artifact = self._object(closure.get("final_artifact"), "final artifact")
@@ -3539,8 +3617,15 @@ class MetadataActivityHandler:
             )
             closure["evidence"] = evidence_value
             closure["evidence_sha256"] = evidence_sha
+            closure["final_issue_plan"] = issue_plan.model_dump(mode="json")
+            prior_cleanup = closure.get("worktree_cleanup")
+            cleanup_released_at = (
+                str(prior_cleanup.get("released_at"))
+                if isinstance(prior_cleanup, dict) and prior_cleanup.get("released_at")
+                else now.isoformat()
+            )
             closure["worktree_cleanup"] = {
-                "released_at": now.isoformat(),
+                "released_at": cleanup_released_at,
                 "repositories": sorted(lease_repositories),
                 "retention_cleanup_pending": True,
             }
@@ -3916,11 +4001,6 @@ class MetadataActivityHandler:
             change_set = session.get(ChangeSet, plan.change_set_id)
             if run is None or change_set is None or run.change_set_id != change_set.id:
                 raise ValueError("promotion metadata binding is missing")
-            if change_set.state not in {
-                ChangeSetState.CANDIDATE_BUILT.value,
-                ChangeSetState.FINAL_ARTIFACT_BUILT.value,
-            }:
-                raise ValueError("immutable promotion requires a verified candidate build")
             if dry_run:
                 run.status = "SUCCESS"
                 run.summary = (
@@ -3943,14 +4023,47 @@ class MetadataActivityHandler:
                 return {**payload, "status": "BLOCKED", "blocker": blocker}
             recovery = dict(change_set.recovery_json)
             existing_promotion = recovery.get("promotion")
-            if isinstance(existing_promotion, dict) and (
-                existing_promotion.get("promoted_head_sha") == change_set.deployment_head_sha
+            closure_value = recovery.get("final_closure")
+            closure = closure_value if isinstance(closure_value, dict) else {}
+            stored_merge_plan_value = closure.get("final_deployment_merge_plan")
+            stored_merge_plan = (
+                FinalDeploymentMergePlan.model_validate(stored_merge_plan_value)
+                if stored_merge_plan_value is not None
+                else None
+            )
+            expected_promoted_head = (
+                stored_merge_plan.deployment.head_sha
+                if stored_merge_plan is not None
+                else change_set.deployment_head_sha
+            )
+            exact_promotion = (
+                isinstance(existing_promotion, dict)
                 and existing_promotion.get("source_sha") == change_set.source_head_sha
                 and existing_promotion.get("image_digests") == change_set.image_digests
+            )
+            legacy_candidate_promotion = (
+                isinstance(existing_promotion, dict)
+                and change_set.state == ChangeSetState.CANDIDATE_BUILT.value
+                and "source_sha" not in existing_promotion
+                and "image_digests" not in existing_promotion
+            )
+            if (
+                isinstance(existing_promotion, dict)
+                and existing_promotion.get("promoted_head_sha") == expected_promoted_head
+                and (exact_promotion or legacy_candidate_promotion)
                 and re.fullmatch(
                     r"[a-f0-9]{40}", str(existing_promotion.get("promoted_head_sha", ""))
                 )
             ):
+                if stored_merge_plan is not None:
+                    return {
+                        **payload,
+                        "status": "DEPLOY_PR",
+                        "final_deployment_merge_plan": stored_merge_plan.model_dump(mode="json"),
+                        "release_evidence": self._object(
+                            recovery.get("release_evidence"), "release evidence"
+                        ),
+                    }
                 publication = self._promotion_publication(
                     change_set, str(existing_promotion["promoted_head_sha"])
                 )
@@ -3959,6 +4072,12 @@ class MetadataActivityHandler:
                     "status": "PROMOTION_PUBLICATION_READY",
                     "promotion_publication": publication.model_dump(mode="json"),
                 }
+            if change_set.state not in {
+                ChangeSetState.CANDIDATE_BUILT.value,
+                ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+                ChangeSetState.DEPLOY_PR.value,
+            }:
+                raise ValueError("immutable promotion requires a verified candidate build")
             lease = session.scalar(
                 select(WorktreeLease).where(
                     WorktreeLease.change_set_id == change_set.id,
@@ -4197,6 +4316,7 @@ class MetadataActivityHandler:
         result = AgentResult.model_validate(payload.get("agent_result"))
         structured = result.structured_result
         decision = str(structured.get("decision", ""))
+        final_deployment_merge_plan: FinalDeploymentMergePlan | None = None
         with self.sessions.begin() as session:
             change_set = session.get(ChangeSet, change_set_id)
             run = session.scalar(
@@ -4300,16 +4420,44 @@ class MetadataActivityHandler:
             recovery["rollback_plan"] = rollback_plan
             recovery["release_evidence"] = release_evidence
             change_set.recovery_json = recovery
+            if run.run_type == "final-closure":
+                closure_plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+                if closure_plan.change_set_id != change_set.id:
+                    raise ValueError("final release review ChangeSet binding changed")
+                deployment_binding = self._final_pr_binding(
+                    repository=f"gntik-ai/{change_set.deployment_repository}",
+                    url=change_set.deployment_pr_url,
+                    branch=change_set.deployment_branch,
+                    head_sha=change_set.deployment_head_sha,
+                    base_branch=closure_plan.deployment.base_branch,
+                )
+                final_deployment_merge_plan = FinalDeploymentMergePlan(
+                    closure=closure_plan,
+                    deployment=deployment_binding,
+                    independent_review_sha256=combined_review_sha,
+                )
+                closure_value = recovery.get("final_closure")
+                closure = dict(closure_value) if isinstance(closure_value, dict) else {}
+                closure["final_deployment_merge_plan"] = final_deployment_merge_plan.model_dump(
+                    mode="json"
+                )
+                recovery["final_closure"] = closure
+                change_set.recovery_json = recovery
             run.status = "RUNNING" if run.run_type == "final-closure" else "SUCCESS"
             run.error_code = None
             run.summary = "immutable release and recovery plan independently reviewed"
             run.finished_at = None if run.run_type == "final-closure" else datetime.now(UTC)
             self._release_reconciliation_component(session, change_set, run)
-        return {
+        response = {
             **payload,
             "status": "DEPLOY_PR",
             "release_evidence": release_evidence,
         }
+        if final_deployment_merge_plan is not None:
+            response["final_deployment_merge_plan"] = final_deployment_merge_plan.model_dump(
+                mode="json"
+            )
+        return response
 
     def _promotion_publication(
         self, change_set: ChangeSet, promoted_head: str

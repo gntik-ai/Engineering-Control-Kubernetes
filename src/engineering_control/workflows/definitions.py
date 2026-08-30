@@ -979,7 +979,17 @@ class FinalClosureWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: FinalClosureInput) -> dict[str, Any]:
         context: dict[str, Any] = asdict(request)
-        for step in ("final.prepare", "final.merge_source", "final.persist_source_merge"):
+        if not await self._checkpoint("FINAL_PREPARE"):
+            return {"status": "CANCELLED", "context": context}
+        context = await self._step("final.prepare", context, timeout_minutes=30)
+        if context.get("status") == "FIXED":
+            return {"status": "FIXED", "context": context}
+        if context.get("status") == "FINAL_ISSUE_CLOSE_READY":
+            return await self._resume_final_issue_close(context)
+        if context.get("status") != "FINAL_CLOSURE_READY":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
+
+        for step in ("final.merge_source", "final.persist_source_merge"):
             if not await self._checkpoint(step.upper().replace(".", "_")):
                 return {"status": "CANCELLED", "context": context}
             context = (
@@ -990,7 +1000,28 @@ class FinalClosureWorkflow(ControlledWorkflow):
             if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
                 return {"status": context["status"], "context": context}
 
-        context = await self._step("final.inspect_artifact", context, timeout_minutes=30)
+        for _attempt in range(120):
+            if not await self._checkpoint("FINAL_WAIT_FOR_BUILD"):
+                return {"status": "CANCELLED", "context": context}
+            context = await self._step("final.inspect_artifact", context, timeout_minutes=30)
+            if context.get("status") == "FINAL_ARTIFACT_VERIFIED":
+                break
+            if (
+                context.get("status") != "AWAITING_FINAL_BUILD"
+                or context.get("blocker") != "FINAL_BUILD_NOT_YET_AVAILABLE"
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "blocker": context.get("blocker", "FINAL_BUILD_RECONCILIATION_FAILED"),
+                    "context": context,
+                }
+            await workflow.sleep(timedelta(minutes=1))
+        else:
+            return {
+                "status": "BLOCKED",
+                "blocker": "FINAL_BUILD_WAIT_EXHAUSTED",
+                "context": context,
+            }
         if context.get("status") != "FINAL_ARTIFACT_VERIFIED":
             return {
                 "status": "BLOCKED",
@@ -1002,29 +1033,32 @@ class FinalClosureWorkflow(ControlledWorkflow):
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
         context = await self._step("reconcile.prepare_promotion", context)
-        if context.get("status") == "PROMOTION_READY":
-            context = await self._step("reconcile.apply_promotion", context, timeout_minutes=60)
-            context = await self._step("reconcile.persist_promotion", context)
-        if context.get("status") != "PROMOTION_PUBLICATION_READY":
-            return {"status": context.get("status", "BLOCKED"), "context": context}
-        context = await self._github_write_step(
-            "reconcile.publish_promotion", context, timeout_minutes=30
-        )
-        context = await self._step("reconcile.persist_promotion_publication", context)
-        if context.get("status") != "RELEASE_REVIEW_REQUIRED":
-            return {"status": context.get("status", "BLOCKED"), "context": context}
-        context = await self._step("reconcile.prepare_release_review", context)
-        if context.get("status") != "RELEASE_REVIEW_READY":
-            return {"status": context.get("status", "BLOCKED"), "context": context}
-        context = await self._agent_step(
-            "reconcile.invoke_release_reviewer", context, timeout_minutes=90
-        )
-        if context.get("agent_invocation_status") != "SUCCESS":
-            return {"status": context.get("status", "BLOCKED"), "context": context}
-        context = await self._step("reconcile.persist_release_review", context)
+        if context.get("status") != "DEPLOY_PR":
+            if context.get("status") == "PROMOTION_READY":
+                context = await self._step("reconcile.apply_promotion", context, timeout_minutes=60)
+                context = await self._step("reconcile.persist_promotion", context)
+            if context.get("status") != "PROMOTION_PUBLICATION_READY":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
+            context = await self._github_write_step(
+                "reconcile.publish_promotion", context, timeout_minutes=30
+            )
+            context = await self._step("reconcile.persist_promotion_publication", context)
+            if context.get("status") != "RELEASE_REVIEW_REQUIRED":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
+            context = await self._step("reconcile.prepare_release_review", context)
+            if context.get("status") != "RELEASE_REVIEW_READY":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
+            context = await self._agent_step(
+                "reconcile.invoke_release_reviewer", context, timeout_minutes=90
+            )
+            if context.get("agent_invocation_status") != "SUCCESS":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
+            context = await self._step("reconcile.persist_release_review", context)
         if context.get("status") != "DEPLOY_PR":
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
+        if not await self._checkpoint("FINAL_MERGE_DEPLOYMENT"):
+            return {"status": "CANCELLED", "context": context}
         context = await self._github_write_step(
             "final.merge_deployment", context, timeout_minutes=30
         )
@@ -1033,12 +1067,23 @@ class FinalClosureWorkflow(ControlledWorkflow):
         context = await self._step("final.persist_deployment_merge", context)
         if context.get("status") != "FINAL_DEPLOYMENT_MERGE_PERSISTED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
+        return await self._resume_after_final_deployment_merge(request, context)
+
+    async def _resume_after_final_deployment_merge(
+        self,
+        request: FinalClosureInput,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not await self._checkpoint("FINAL_SYNC_WORKTREES"):
+            return {"status": "CANCELLED", "context": context}
         context = await self._step("final.sync_worktrees", context, timeout_minutes=30)
         if context.get("status") != "FINAL_WORKTREES_SYNCHRONIZED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
         task_queue = workflow.info().task_queue
         staging_id = f"{workflow.info().workflow_id}-final-staging"
+        if not await self._checkpoint("FINAL_STAGING_DEPLOYMENT"):
+            return {"status": "CANCELLED", "context": context}
         await self._step(
             "backlog.register_child_run",
             {
@@ -1073,6 +1118,8 @@ class FinalClosureWorkflow(ControlledWorkflow):
         if not deployment_id:
             return {"status": "BLOCKED", "blocker": "FINAL_DEPLOYMENT_BINDING_MISSING"}
         verification_id = f"{workflow.info().workflow_id}-final-runtime"
+        if not await self._checkpoint("FINAL_RUNTIME_VERIFICATION"):
+            return {"status": "CANCELLED", "context": context}
         await self._step(
             "backlog.register_child_run",
             {
@@ -1095,17 +1142,26 @@ class FinalClosureWorkflow(ControlledWorkflow):
                 "blocker": verified.get("blocker") or verified.get("status"),
                 "context": context,
             }
+        if not await self._checkpoint("FINAL_PREPARE_ISSUE_CLOSE"):
+            return {"status": "CANCELLED", "context": context}
         context = await self._step(
             "final.prepare_issue_close", {**context, "deployment_id": deployment_id}
         )
         if context.get("status") != "FINAL_ISSUE_CLOSE_READY":
             return {"status": context.get("status", "BLOCKED"), "context": context}
+        return await self._resume_final_issue_close(context)
+
+    async def _resume_final_issue_close(self, context: dict[str, Any]) -> dict[str, Any]:
+        if not await self._checkpoint("FINAL_COMMENT_ISSUE"):
+            return {"status": "CANCELLED", "context": context}
         context = await self._github_write_step("final.comment_issue", context)
         if context.get("status") != "FINAL_EVIDENCE_COMMENTED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
         context = await self._step("final.persist_comment", context)
         if context.get("status") != "FINAL_EVIDENCE_PERSISTED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
+        if not await self._checkpoint("FINAL_CLOSE_ISSUE"):
+            return {"status": "CANCELLED", "context": context}
         context = await self._github_write_step("final.close_issue", context)
         if context.get("status") != "ISSUE_CLOSED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
@@ -1733,6 +1789,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         sequential_source_pr = workflow.patched("existing-backlog-sequential-source-pr-v1")
         after_current_controls = workflow.patched("existing-backlog-after-current-controls-v1")
         final_closure_enabled = workflow.patched("existing-backlog-final-closure-v1")
+        global_child_blocker_return = workflow.patched("global-backlog-child-blocker-return-v1")
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
             return context
@@ -1816,7 +1873,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         continue
                     blocker = f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
                 issue_ref = f"{item['repository']}#{item['issue_number']}"
-                if request.global_campaign_id is not None:
+                if global_child_blocker_return and request.global_campaign_id is not None:
                     results.append(
                         {
                             "status": "BLOCKED",
@@ -1967,7 +2024,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 results.append(delivery)
             if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
                 blocker = str(delivery.get("blocker") or delivery.get("status"))
-                if request.global_campaign_id is not None:
+                if global_child_blocker_return and request.global_campaign_id is not None:
                     await self._step(
                         "backlog.record_loop_state",
                         {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
@@ -1993,7 +2050,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 return {"status": "PAUSED", "results": results}
             if sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
-                if request.global_campaign_id is not None:
+                if global_child_blocker_return and request.global_campaign_id is not None:
                     return {
                         "status": "BLOCKED",
                         "blocker": "CORRECTION_LIMIT_EXHAUSTED",
@@ -2049,11 +2106,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     "results": results,
                 }
             if not final_closure_enabled:
-                return {
-                    "status": "BLOCKED_BY_DELIVERY",
-                    "blocker": "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED",
-                    "results": results,
-                }
+                blocker = "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
+                await self._step(
+                    "backlog.record_loop_state",
+                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                )
+                return {"status": "BLOCKED", "blocker": blocker, "results": results}
             closure_id = f"{workflow.info().workflow_id}-issue-{ordinal}-final-closure"
             closure = await workflow.execute_child_workflow(
                 "FinalClosureWorkflow",

@@ -622,7 +622,7 @@ class OperationsRepository:
             if (
                 policy is None
                 or policy.status not in {"APPROVED", "RUNNING"}
-                or policy.approval_json.get("policy_role") != "owner"
+                or policy.approval_json.get("policy_role") not in {None, "owner"}
             ):
                 blockers.append("GITHUB_WRITE_POLICY_NOT_ACTIVE")
             active = session.scalar(

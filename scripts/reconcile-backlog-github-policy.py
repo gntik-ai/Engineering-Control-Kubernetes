@@ -123,13 +123,11 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
         )
         if other is not None:
             raise ValueError("another backlog campaign already owns GitHub write policy")
-    binding = campaign.approval_json.get("binding")
-    approval = campaign.approval_json.get("approval")
-    if (
-        not isinstance(binding, dict)
-        or not isinstance(approval, dict)
-        or campaign.approval_json.get("policy_role") != "owner"
-    ):
+    raw_binding = campaign.approval_json.get("binding")
+    binding = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
+    raw_approval = campaign.approval_json.get("approval")
+    approval = raw_approval if isinstance(raw_approval, dict) else campaign.approval_json
+    if campaign.approval_json.get("policy_role") not in {None, "owner"}:
         raise ValueError("GitHub campaign approval evidence is incomplete")
     if canonical_sha256(binding) != request["approval_binding"]:
         raise ValueError("GitHub campaign approval binding changed")

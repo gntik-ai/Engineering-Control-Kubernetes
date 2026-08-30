@@ -29,7 +29,7 @@ class ProtectedPullRequestBinding(FinalClosureModel):
         pattern=r"^agent/(falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}$"
     )
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
-    base_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
+    base_branch: Literal["main", "master"] = "main"
 
     @model_validator(mode="after")
     def url_matches_repository_and_number(self) -> ProtectedPullRequestBinding:
@@ -108,6 +108,24 @@ class FinalArtifactPlan(FinalClosureModel):
     def unchanged_policy(self) -> FinalArtifactPlan:
         if self.policy != self.closure.policy:
             raise ValueError("final artifact policy changed after source merge")
+        return self
+
+
+class FinalDeploymentMergePlan(FinalClosureModel):
+    closure: FinalClosurePlan
+    deployment: ProtectedPullRequestBinding
+    independent_review_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def exact_reviewed_deployment(self) -> FinalDeploymentMergePlan:
+        if (
+            self.deployment.repository != self.closure.deployment.repository
+            or self.deployment.number != self.closure.deployment.number
+            or self.deployment.url != self.closure.deployment.url
+            or self.deployment.head_branch != self.closure.deployment.head_branch
+            or self.deployment.base_branch != self.closure.deployment.base_branch
+        ):
+            raise ValueError("final deployment merge plan changed its protected binding")
         return self
 
 

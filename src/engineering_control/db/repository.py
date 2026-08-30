@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
-from sqlalchemy import case, create_engine, func, or_, select
+from sqlalchemy import case, create_engine, func, or_, select, text
 from sqlalchemy.orm import sessionmaker
 
 from engineering_control.api.schemas import (
@@ -646,6 +646,8 @@ class SQLMetadataRepository:
         result: dict[str, Any]
         request: dict[str, Any] | None = None
         with self.sessions.begin() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
             campaign = session.get(GitHubBacklogCampaign, campaign_id)
             if (
                 campaign is None
@@ -672,7 +674,7 @@ class SQLMetadataRepository:
                 (
                     candidate.id
                     for candidate in active_campaigns
-                    if candidate.approval_json.get("policy_role") == "owner"
+                    if candidate.approval_json.get("policy_role") in {None, "owner"}
                 ),
                 None,
             )

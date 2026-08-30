@@ -1477,6 +1477,77 @@ async def test_full_delivery_owns_candidate_pipeline_and_preserves_final_merge_g
 
 
 @pytest.mark.asyncio
+async def test_final_closure_patch_false_preserves_the_prior_terminal_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = ExistingGitHubBacklogLoopWorkflow()
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    state_calls: list[dict[str, object]] = []
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if name == "backlog.load_execution":
+            return {
+                "status": "READY",
+                "items": [{"repository": "gntik-ai/falcone", "issue_number": 953}],
+            }
+        if name == "backlog.revalidate_gate":
+            return {
+                "status": "READY",
+                "finding_id": "00000000-0000-4000-8000-000000000953",
+                "risk_class": "R2",
+            }
+        if name == "backlog.record_loop_state":
+            state_calls.append(payload)
+        return {"status": "REGISTERED"}
+
+    async def child(name: str, _input: object, **_kwargs: object) -> dict[str, object]:
+        if name == "IssueDeliveryWorkflow":
+            return {
+                "status": "SOURCE_PR",
+                "context": {"change_set_id": "00000000-0000-4000-8000-000000000001"},
+            }
+        if name == "DeliveryReconciliationWorkflow":
+            return {"status": "DEPLOY_PR", "context": {}}
+        if name == "StagingDeploymentWorkflow":
+            return {
+                "status": "STAGING_DEPLOYED",
+                "context": {"deployment_id": "00000000-0000-4000-8000-000000000002"},
+            }
+        assert name == "RuntimeVerificationWorkflow"
+        return {"status": "RUNTIME_VERIFIED", "context": {}}
+
+    instance._step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "patched",
+        lambda name: name != "existing-backlog-final-closure-v1",
+    )
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="synthetic-replay", task_queue="engineering"),
+    )
+    monkeypatch.setattr(workflow_definitions.workflow, "execute_child_workflow", child)
+
+    result = await instance.run(
+        ExistingGitHubBacklogLoopInput(
+            project="falcone",
+            backlog_campaign_id=str(CAMPAIGN_ID),
+            maximum_risk="R2",
+            delivery_mode="full-delivery",
+            maximum_items=1,
+            continue_after_blocked_issue=False,
+            correction_limit=1,
+        )
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
+    assert state_calls[-1]["loop_status"] == "PAUSED"
+    assert state_calls[-1]["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
+
+
+@pytest.mark.asyncio
 async def test_full_delivery_stops_at_exact_candidate_build_blocker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

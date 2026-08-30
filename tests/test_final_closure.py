@@ -9,7 +9,7 @@ import pytest
 from engineering_control.adapters.command import CommandResult
 from engineering_control.adapters.github.client import GhCliBroker, GhCliPolicyError
 from engineering_control.engineering.backlog import DocumentationImpact
-from engineering_control.models.final_closure import FinalClosurePlan
+from engineering_control.models.final_closure import FinalClosurePlan, FinalDeploymentMergePlan
 from engineering_control.models.reconciliation import DeliveryControlPolicy
 from engineering_control.workflows import definitions as workflow_definitions
 from engineering_control.workflows.definitions import FinalClosureWorkflow
@@ -76,6 +76,23 @@ def test_final_closure_plan_rejects_provider_or_repository_drift() -> None:
     value["checker_provider"] = "codex"
     with pytest.raises(ValueError, match="opposite native providers"):
         FinalClosurePlan.model_validate(value)
+
+
+def test_final_deployment_merge_plan_binds_the_reviewed_pr_identity() -> None:
+    closure = closure_plan()
+    promoted = {**closure["deployment"], "head_sha": "d" * 40}
+    plan = FinalDeploymentMergePlan(
+        closure=closure,
+        deployment=promoted,
+        independent_review_sha256="e" * 64,
+    )
+    assert plan.deployment.head_sha == "d" * 40
+
+    changed_pr = plan.model_dump(mode="json")
+    changed_pr["deployment"]["number"] = 12
+    changed_pr["deployment"]["url"] = "https://github.com/gntik-ai/falcone-charts/pull/12"
+    with pytest.raises(ValueError, match="protected binding"):
+        FinalDeploymentMergePlan.model_validate(changed_pr)
 
     value = closure_plan()
     value["deployment"]["repository"] = "gntik-ai/musematic-deploy"
@@ -168,6 +185,11 @@ def test_broker_rejects_changed_base_before_merge(tmp_path: Any, monkeypatch: An
         )
 
 
+def test_broker_rejects_leading_option_in_typed_value() -> None:
+    with pytest.raises(GhCliPolicyError, match="forbidden"):
+        GhCliBroker._value("--repo", "workflow name", maximum=160)
+
+
 @pytest.mark.asyncio
 async def test_final_closure_workflow_requires_final_build_before_other_mutations(
     monkeypatch: pytest.MonkeyPatch,
@@ -188,6 +210,7 @@ async def test_final_closure_workflow_requires_final_build_before_other_mutation
 
     instance._step = step  # type: ignore[method-assign]
     instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "sleep", lambda _delay: _true())
     result = await instance.run(
         FinalClosureInput(
             backlog_campaign_id=str(uuid4()),
@@ -199,14 +222,56 @@ async def test_final_closure_workflow_requires_final_build_before_other_mutation
         )
     )
     assert result["status"] == "BLOCKED"
-    assert steps == [
+    assert result["blocker"] == "FINAL_BUILD_WAIT_EXHAUSTED"
+    assert steps[:3] == [
         "final.prepare",
         "final.merge_source",
         "final.persist_source_merge",
-        "final.inspect_artifact",
     ]
+    assert steps.count("final.inspect_artifact") == 120
     assert "final.merge_deployment" not in steps
     assert "final.close_issue" not in steps
+
+
+@pytest.mark.asyncio
+async def test_final_closure_resumes_only_bounded_issue_comment_and_close() -> None:
+    instance = FinalClosureWorkflow()
+    instance._checkpoint = lambda _phase: _true()  # type: ignore[method-assign]
+    steps: list[str] = []
+
+    async def step(name: str, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        statuses = {
+            "final.prepare": "FINAL_ISSUE_CLOSE_READY",
+            "final.comment_issue": "FINAL_EVIDENCE_COMMENTED",
+            "final.persist_comment": "FINAL_EVIDENCE_PERSISTED",
+            "final.close_issue": "ISSUE_CLOSED",
+            "final.persist_issue_close": "FIXED",
+        }
+        return {**payload, "status": statuses[name]}
+
+    instance._step = step  # type: ignore[method-assign]
+    instance._github_write_step = step  # type: ignore[method-assign]
+
+    result = await instance.run(
+        FinalClosureInput(
+            backlog_campaign_id=str(uuid4()),
+            change_set_id=str(uuid4()),
+            finding_id=str(uuid4()),
+            project="falcone",
+            issue_repository="gntik-ai/falcone",
+            issue_number=42,
+        )
+    )
+
+    assert result["status"] == "FIXED"
+    assert steps == [
+        "final.prepare",
+        "final.comment_issue",
+        "final.persist_comment",
+        "final.close_issue",
+        "final.persist_issue_close",
+    ]
 
 
 @pytest.mark.asyncio
@@ -280,6 +345,46 @@ async def test_final_closure_orders_verification_before_comment_and_close(
     assert result["status"] == "FIXED"
     assert steps.index("RuntimeVerificationWorkflow") < steps.index("final.comment_issue")
     assert steps.index("final.persist_comment") < steps.index("final.close_issue")
+
+
+@pytest.mark.asyncio
+async def test_final_closure_resumes_persisted_issue_plan_without_repeating_delivery() -> None:
+    instance = FinalClosureWorkflow()
+    instance._checkpoint = lambda _phase: _true()  # type: ignore[method-assign]
+    steps: list[str] = []
+
+    async def step(name: str, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        statuses = {
+            "final.prepare": "FINAL_ISSUE_CLOSE_READY",
+            "final.comment_issue": "FINAL_EVIDENCE_COMMENTED",
+            "final.persist_comment": "FINAL_EVIDENCE_PERSISTED",
+            "final.close_issue": "ISSUE_CLOSED",
+            "final.persist_issue_close": "FIXED",
+        }
+        return {**payload, "status": statuses[name]}
+
+    instance._step = step  # type: ignore[method-assign]
+    instance._github_write_step = step  # type: ignore[method-assign]
+    result = await instance.run(
+        FinalClosureInput(
+            backlog_campaign_id=str(uuid4()),
+            change_set_id=str(uuid4()),
+            finding_id=str(uuid4()),
+            project="falcone",
+            issue_repository="gntik-ai/falcone",
+            issue_number=42,
+        )
+    )
+
+    assert result["status"] == "FIXED"
+    assert steps == [
+        "final.prepare",
+        "final.comment_issue",
+        "final.persist_comment",
+        "final.close_issue",
+        "final.persist_issue_close",
+    ]
 
 
 async def _true() -> bool:

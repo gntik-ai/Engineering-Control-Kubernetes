@@ -677,7 +677,7 @@ class GhCliBroker:
 
     @staticmethod
     def _value(value: str, label: str, *, maximum: int = 500) -> str:
-        if len(value) > maximum or not _SAFE_VALUE.fullmatch(value):
+        if value.startswith("-") or len(value) > maximum or not _SAFE_VALUE.fullmatch(value):
             raise GhCliPolicyError(f"{label} contains forbidden shell or control characters")
         if any(marker in value for marker in ("$(`", "$(", "${", ";", "&&", "||", "\n", "\r")):
             raise GhCliPolicyError(f"{label} contains shell metacharacters")

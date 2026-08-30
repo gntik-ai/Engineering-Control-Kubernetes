@@ -33,3 +33,16 @@ global selector from continuing with an independent issue.
   only when its binding, heads, dependency plan, delivery mode, risk, actor, and expiry remain exact.
 - A blocked global child returns `BLOCKED` immediately and preserves its inventory approval.
 - Global terminal handling emits one bounded disable request with no repository mutation payload.
+
+## Upgrade and rollback
+
+This change is schema-neutral: `policy_role` is stored inside the existing bounded approval JSON.
+Pre-upgrade approvals without that key are interpreted as the sole owner only while no explicit
+owner exists. An already active multi-inventory campaign must be reconciled and re-approved before
+registration so that exactly one row is the owner and every additional row is an inventory.
+
+Rollback is allowed only after the root reconciler has disabled the shared GitHub write policy and
+the global Temporal workflow is terminal. Convert any remaining `APPROVED_INVENTORY` rows back to
+`AWAITING_APPROVAL`; do not delete their approval or inventory evidence. A previous release may then
+activate at most one newly approved inventory. No database downgrade or operational-data deletion is
+required.

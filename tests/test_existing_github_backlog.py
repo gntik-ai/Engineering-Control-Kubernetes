@@ -513,6 +513,9 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
         owner = session.get(GitHubBacklogCampaign, falcone_id)
         assert owner is not None
         owner.status = "APPROVED"
+        owner.approval_json = {
+            key: value for key, value in owner.approval_json.items() if key != "policy_role"
+        }
 
     musematic_candidate = await repository.prepare_backlog_approval(
         musematic_id,
@@ -536,6 +539,23 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
     with repository.sessions() as session:
         assert session.get(GitHubBacklogCampaign, falcone_id).status == "APPROVED"
         assert session.get(GitHubBacklogCampaign, musematic_id).status == "APPROVED_INVENTORY"
+    handler = EngineeringActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'metadata.sqlite'}",
+            state_root=tmp_path,
+        )
+    )
+    standalone = handler._load_backlog_execution(
+        {
+            "project": "musematic",
+            "backlog_campaign_id": str(musematic_id),
+            "maximum_risk": "R2",
+            "delivery_mode": "full-delivery",
+            "maximum_items": 1,
+        }
+    )
+    assert standalone["status"] == "BLOCKED"
+    assert standalone["blocker"] == "CURRENT_BACKLOG_APPROVAL_REQUIRED"
 
 
 def test_backlog_stop_after_current_persists_terminal_state_and_policy_deactivation(

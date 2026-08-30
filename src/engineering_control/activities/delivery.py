@@ -21,6 +21,7 @@ from engineering_control.models.enums import RedactionStatus
 from engineering_control.models.final_closure import (
     FinalArtifactPlan,
     FinalClosurePlan,
+    FinalDeploymentMergePlan,
     FinalIssueMutationPlan,
     ProtectedMergeResult,
 )
@@ -482,7 +483,7 @@ class DeliveryActivityHandler:
                 source_base_branch=plan.closure.source.base_branch,
                 candidate_build_run_id=run_id,
                 policy=plan.policy,
-                independent_review_sha256=str(payload.get("independent_review_sha256") or "0" * 64),
+                independent_review_sha256=str(payload["independent_review_sha256"]),
                 independent_review_provider=plan.closure.checker_provider,
                 maker_provider=plan.closure.maker_provider,
             )
@@ -522,8 +523,16 @@ class DeliveryActivityHandler:
     def _merge_bound_pull_request(self, payload: dict[str, Any], *, source: bool) -> dict[str, Any]:
         try:
             plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
-            binding = plan.source if source else plan.deployment
-            expected_head = binding.head_sha if source else str(payload.get("deployment_sha") or "")
+            if source:
+                binding = plan.source
+            else:
+                deployment_plan = FinalDeploymentMergePlan.model_validate(
+                    payload.get("final_deployment_merge_plan")
+                )
+                if deployment_plan.closure != plan:
+                    raise ValueError("final deployment merge closure binding changed")
+                binding = deployment_plan.deployment
+            expected_head = binding.head_sha
             result = self.broker.merge_pull_request(
                 repository=binding.repository,
                 number=binding.number,
@@ -565,9 +574,12 @@ class DeliveryActivityHandler:
                     plan.deployment.repository.rsplit("/", 1)[-1],
                 ),
             ):
-                worktree = (self.settings.worktree_root / slug / str(plan.change_set_id)).resolve()
+                unresolved = self.settings.worktree_root / slug / str(plan.change_set_id)
+                if unresolved.is_symlink():
+                    raise ValueError("final synchronization rejects symlinked worktrees")
+                worktree = unresolved.resolve()
                 expected = self.settings.worktree_root.resolve() / slug / str(plan.change_set_id)
-                if worktree != expected or not worktree.is_dir() or worktree.is_symlink():
+                if worktree != expected or not worktree.is_dir():
                     raise ValueError("final synchronization escaped its ChangeSet worktree")
                 status = self.runner.run(
                     "git",
