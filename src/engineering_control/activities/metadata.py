@@ -295,6 +295,8 @@ class MetadataActivityHandler:
         "enhancement.product_review": "product_review_request",
         "observability.invoke_codex": "maker_request",
         "observability.invoke_claude": "checker_request",
+        "observability.invoke_claude_maker": "maker_request",
+        "observability.invoke_codex_checker": "checker_request",
     }
 
     supported_steps = frozenset(

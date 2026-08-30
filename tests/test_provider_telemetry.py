@@ -35,6 +35,63 @@ def telemetry_payload(run_id: str, workflow_id: str) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_step", "request_key", "provider", "role", "model_class"),
+    (
+        (
+            "observability.invoke_claude_maker",
+            "maker_request",
+            "claude",
+            "implementer",
+            "worker",
+        ),
+        (
+            "observability.invoke_codex_checker",
+            "checker_request",
+            "codex",
+            "code-reviewer",
+            "judge",
+        ),
+    ),
+)
+async def test_reverse_canary_provider_steps_are_allowlisted_for_telemetry(
+    tmp_path: Path,
+    provider_step: str,
+    request_key: str,
+    provider: str,
+    role: str,
+    model_class: str,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'reverse-provider-telemetry.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    provider_run_id = uuid4()
+    payload = telemetry_payload(str(provider_run_id), f"reverse-observability-{uuid4()}")
+    request = payload.pop("maker_request")
+    assert isinstance(request, dict)
+    request.update(
+        {
+            "provider": provider,
+            "role": role,
+            "model_class": model_class,
+            "writable": False,
+        }
+    )
+    payload.update({"provider_step": provider_step, request_key: request})
+
+    started = await handler.handle("agent.record_start", payload)
+
+    assert started["agent_invocation_id"] == str(provider_run_id)
+    assert started["agent_invocation_status"] == "RUNNING"
+    with handler.sessions() as session:
+        invocation = session.get(AgentInvocation, provider_run_id)
+    assert invocation is not None
+    assert invocation.provider == provider
+    assert invocation.role == role
+
+
+@pytest.mark.asyncio
 async def test_provider_invocation_and_usage_are_durable_and_idempotent(tmp_path: Path) -> None:
     database = tmp_path / "provider-telemetry.sqlite"
     handler = MetadataActivityHandler(Settings(database_url=f"sqlite:///{database}"))
