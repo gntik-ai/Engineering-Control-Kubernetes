@@ -362,6 +362,8 @@ class MetadataActivityHandler:
             "observability.register",
             "observability.prepare_codex",
             "observability.prepare_claude",
+            "observability.prepare_claude_maker",
+            "observability.prepare_codex_checker",
             "observability.finalize",
         }
     )

@@ -370,6 +370,13 @@ async def test_native_canary_registers_queue_and_prepares_read_only_independent_
     assert not list(workspace.parent.iterdir())
 
 
+def test_reverse_canary_preparation_steps_are_registered_for_dispatch() -> None:
+    assert {
+        "observability.prepare_claude_maker",
+        "observability.prepare_codex_checker",
+    } <= MetadataActivityHandler.supported_steps
+
+
 @pytest.mark.asyncio
 async def test_reverse_native_canary_uses_claude_maker_and_codex_checker(
     tmp_path: Path,
