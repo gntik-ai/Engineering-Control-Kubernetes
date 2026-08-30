@@ -15,7 +15,20 @@ branch_labels = None
 depends_on = None
 
 
+def _current_bootstrap_schema_present() -> bool:
+    inspector = sa.inspect(op.get_bind())
+    expected = {"github_backlog_campaigns", "backlog_issue_records"}
+    present = expected.intersection(inspector.get_table_names())
+    if present == expected:
+        return True
+    if present:
+        raise RuntimeError("revision 0009 found a partial bootstrap schema")
+    return False
+
+
 def upgrade() -> None:
+    if _current_bootstrap_schema_present():
+        return
     op.create_table(
         "github_backlog_campaigns",
         sa.Column("project", sa.String(length=32), nullable=False),

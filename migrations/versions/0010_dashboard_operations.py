@@ -15,7 +15,22 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+def _current_bootstrap_schema_present() -> bool:
+    inspector = sa.inspect(op.get_bind())
+    expected = {"dashboard_authentication", "dashboard_events"}
+    present = expected.intersection(inspector.get_table_names())
+    if present == expected:
+        return True
+    if present:
+        raise RuntimeError("revision 0010 found a partial bootstrap schema")
+    return False
+
+
 def upgrade() -> None:
+    if _current_bootstrap_schema_present():
+        if op.get_bind().dialect.name == "postgresql":
+            _create_projection_triggers()
+        return
     op.create_table(
         "dashboard_authentication",
         sa.Column("id", sa.Integer(), nullable=False),

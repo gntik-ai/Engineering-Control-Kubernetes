@@ -15,7 +15,30 @@ branch_labels = None
 depends_on = None
 
 
+def _current_bootstrap_schema_present() -> bool:
+    """Recognize revision 0001's historical create-all bootstrap safely.
+
+    Revision 0001 intentionally creates the model metadata shipped with the
+    installed release.  On a fresh database that can already include this
+    revision's complete shape.  An all-or-none guard keeps a fresh install
+    replayable without concealing a partial or inconsistent migration.
+    """
+    inspector = sa.inspect(op.get_bind())
+    tables = {"project_snapshots", "solution_loops", "enhancements"}
+    existing_tables = tables.intersection(inspector.get_table_names())
+    coverage_columns = {str(column["name"]) for column in inspector.get_columns("coverage_cells")}
+    expected_columns = {"repository_surface", "flow"}
+    present_columns = expected_columns.intersection(coverage_columns)
+    if existing_tables == tables and present_columns == expected_columns:
+        return True
+    if existing_tables or present_columns:
+        raise RuntimeError("revision 0008 found a partial bootstrap schema")
+    return False
+
+
 def upgrade() -> None:
+    if _current_bootstrap_schema_present():
+        return
     op.alter_column("campaigns", "source_sha", existing_type=sa.String(length=40), nullable=True)
     op.alter_column(
         "campaigns", "deployment_sha", existing_type=sa.String(length=40), nullable=True

@@ -15,7 +15,25 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+def _current_bootstrap_schema_present() -> bool:
+    inspector = sa.inspect(op.get_bind())
+    expected = {
+        "action_candidates",
+        "reauthentication_bindings",
+        "operation_requests",
+        "connection_snapshots",
+    }
+    present = expected.intersection(inspector.get_table_names())
+    if present == expected:
+        return True
+    if present:
+        raise RuntimeError("revision 0012 found a partial bootstrap schema")
+    return False
+
+
 def upgrade() -> None:
+    if _current_bootstrap_schema_present():
+        return
     op.create_table(
         "action_candidates",
         sa.Column("id", sa.Uuid(), nullable=False),
