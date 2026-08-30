@@ -28,6 +28,7 @@ def _entry(
 
 _PROJECT = {"name": "project", "type": "select", "values": ["falcone", "musematic", "llmwiki"]}
 _WORKFLOW = {"name": "workflow_id", "type": "text", "maxlength": 240}
+_ENHANCEMENT = {"name": "enhancement_id", "type": "text", "maxlength": 80}
 
 COMMAND_REGISTRY: list[dict[str, Any]] = [
     _entry(
@@ -266,9 +267,43 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Enhancements",
         "enhancement_approve",
         "Approve enhancement",
-        available=False,
+        available=True,
+        effect="metadata-mutation",
+        fields=[_PROJECT, _ENHANCEMENT],
+    ),
+    _entry(
+        "Enhancements",
+        "enhancement_reject",
+        "Reject enhancement",
+        available=True,
+        effect="metadata-mutation",
+        fields=[
+            _PROJECT,
+            _ENHANCEMENT,
+            {
+                "name": "reason_code",
+                "type": "select",
+                "values": ["DUPLICATE", "NOT_ACTIONABLE", "OUT_OF_SCOPE", "POLICY_BLOCKED"],
+            },
+        ],
+    ),
+    _entry(
+        "Enhancements",
+        "enhancement_run",
+        "Run approved enhancement",
+        available=True,
         effect="source-mutation",
-        blocker="IMMUTABLE_ENHANCEMENT_BINDING_FORM_NOT_YET_EXPOSED",
+        fields=[
+            _PROJECT,
+            _ENHANCEMENT,
+            {"name": "risk", "type": "select", "values": ["R0", "R1", "R2", "R3"]},
+            {
+                "name": "execution_mode",
+                "type": "select",
+                "values": ["plan-only", "source-pr", "preview", "staging"],
+            },
+            {"name": "dry_run", "type": "checkbox", "value": True},
+        ],
     ),
     _entry(
         "LLMWiki",

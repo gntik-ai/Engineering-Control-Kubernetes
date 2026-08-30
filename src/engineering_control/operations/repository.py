@@ -18,6 +18,7 @@ from engineering_control.db.models import (
     Campaign,
     ConnectionSnapshot,
     DashboardEvent,
+    Enhancement,
     GitHubBacklogCampaign,
     NotificationOutbox,
     OperationRequest,
@@ -38,7 +39,10 @@ from engineering_control.operations.models import (
     CapabilityResult,
     Command,
     ConnectionView,
+    EnhancementApproveCommand,
     EnhancementDiscoverCommand,
+    EnhancementRejectCommand,
+    EnhancementRunCommand,
     FindingVerifyCommand,
     LLMWikiBootstrapPlanCommand,
     OperationView,
@@ -92,6 +96,11 @@ def command_target(command: Command) -> tuple[str, str, str | None]:
         return "connections", command.scope, None
     if isinstance(command, EnhancementDiscoverCommand):
         return "enhancement_campaign", str(command.campaign_id), command.project.value
+    if isinstance(
+        command,
+        (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
+    ):
+        return "enhancement", command.enhancement_id, command.project.value
     if isinstance(command, FindingVerifyCommand):
         return "finding", str(command.finding_id), None
     if isinstance(command, LLMWikiBootstrapPlanCommand):
@@ -323,6 +332,11 @@ class OperationsRepository:
         payload = command.model_dump(mode="json")
         with self.sessions.begin() as session:
             capability, binding = self._capability(session, command, now)
+            if isinstance(
+                command,
+                (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
+            ) and isinstance(binding.get("approval_binding_sha256"), str):
+                payload["approval_binding"] = binding["approval_binding_sha256"]
             immutable = {
                 "action": command.action,
                 "target_type": target_type,
@@ -408,6 +422,12 @@ class OperationsRepository:
             )
         elif isinstance(command, EnhancementDiscoverCommand):
             project_name = command.project.value
+        elif isinstance(
+            command,
+            (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
+        ):
+            project_name = command.project.value
+            mode = command.execution_mode if isinstance(command, EnhancementRunCommand) else None
         elif isinstance(command, LLMWikiBootstrapPlanCommand):
             project_name = command.project
 
@@ -611,6 +631,68 @@ class OperationsRepository:
             binding = {"scope": command.scope, "probe_policy": "BOUNDED_READ_ONLY"}
         elif isinstance(
             command,
+            (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
+        ):
+            enhancement = session.scalar(
+                select(Enhancement).where(Enhancement.enhancement_key == command.enhancement_id)
+            )
+            if enhancement is None:
+                blockers.append("ENHANCEMENT_NOT_FOUND")
+            else:
+                binding = {
+                    "enhancement_id": enhancement.enhancement_key,
+                    "project": enhancement.project,
+                    "campaign_id": enhancement.campaign_id,
+                    "persona": enhancement.persona,
+                    "affected_repository": enhancement.affected_repository,
+                    "risk": enhancement.risk_class,
+                    "status": enhancement.status,
+                    "fingerprint": enhancement.fingerprint,
+                    "approval_binding_sha256": enhancement.approval_binding_sha256,
+                }
+                if enhancement.project != command.project.value:
+                    blockers.append("ENHANCEMENT_PROJECT_BINDING_CHANGED")
+                if enhancement.approval_binding_sha256 is None:
+                    blockers.append("ENHANCEMENT_APPROVAL_BINDING_MISSING")
+                if (
+                    command.approval_binding is not None
+                    and command.approval_binding != enhancement.approval_binding_sha256
+                ):
+                    blockers.append("ENHANCEMENT_APPROVAL_BINDING_CHANGED")
+                if isinstance(command, EnhancementApproveCommand) and enhancement.status != (
+                    "CANDIDATE_ENHANCEMENT"
+                ):
+                    blockers.append("ENHANCEMENT_IS_NOT_A_CANDIDATE")
+                if isinstance(command, EnhancementRejectCommand) and enhancement.status not in {
+                    "CANDIDATE_ENHANCEMENT",
+                    "APPROVED",
+                }:
+                    blockers.append("ENHANCEMENT_IS_NOT_REJECTABLE")
+                if isinstance(command, EnhancementRunCommand):
+                    if enhancement.status != "APPROVED":
+                        blockers.append("ENHANCEMENT_APPROVAL_REQUIRED")
+                    risk_rank = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+                    if risk_rank.get(enhancement.risk_class, 99) > risk_rank[command.risk.value]:
+                        blockers.append("ENHANCEMENT_RISK_EXCEEDS_BOUND")
+                    active = self._active_operation(
+                        session,
+                        command.action,
+                        command.enhancement_id,
+                        exclude_operation_id=exclude_operation_id,
+                    )
+                    if active is not None:
+                        blockers.append("ENHANCEMENT_WORKFLOW_ALREADY_ACTIVE")
+                        binding.update(
+                            {
+                                "existing_operation_id": str(active.id),
+                                "existing_workflow_id": active.workflow_id,
+                            }
+                        )
+                    if command.execution_mode != "plan-only":
+                        required_credentials.extend(["native-codex", "native-claude"])
+                        blockers.extend(self._provider_blockers(session))
+        elif isinstance(
+            command,
             (EnhancementDiscoverCommand, FindingVerifyCommand, LLMWikiBootstrapPlanCommand),
         ):
             binding = {"typed_application_service": True}
@@ -620,7 +702,12 @@ class OperationsRepository:
             "AVAILABLE"
             if not blockers
             else "RUNNING"
-            if blockers in (["ISSUE_WORKFLOW_ALREADY_ACTIVE"], ["BACKLOG_CAMPAIGN_ALREADY_ACTIVE"])
+            if blockers
+            in (
+                ["ISSUE_WORKFLOW_ALREADY_ACTIVE"],
+                ["BACKLOG_CAMPAIGN_ALREADY_ACTIVE"],
+                ["ENHANCEMENT_WORKFLOW_ALREADY_ACTIVE"],
+            )
             else "BLOCKED"
         )
         return (
@@ -690,6 +777,12 @@ class OperationsRepository:
             "security",
         }:
             return f"START AUDIT {binding_hash[:8].upper()}"
+        if isinstance(command, EnhancementApproveCommand):
+            return f"APPROVE ENHANCEMENT {binding_hash[:8].upper()}"
+        if isinstance(command, EnhancementRejectCommand):
+            return f"REJECT ENHANCEMENT {binding_hash[:8].upper()}"
+        if isinstance(command, EnhancementRunCommand) and command.execution_mode != "plan-only":
+            return f"RUN ENHANCEMENT {binding_hash[:8].upper()}"
         return None
 
     def _active_target(
@@ -1109,9 +1202,21 @@ class OperationsRepository:
             raise ValueError("idempotency key is invalid")
         target_type, target_id, project = command_target(command)
         payload = command.model_dump(mode="json")
-        binding_hash = canonical_sha256(payload)
         digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
         with self.sessions.begin() as session:
+            if (
+                isinstance(
+                    command,
+                    (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
+                )
+                and command.approval_binding is None
+            ):
+                enhancement = session.scalar(
+                    select(Enhancement).where(Enhancement.enhancement_key == command.enhancement_id)
+                )
+                if enhancement is not None and isinstance(enhancement.approval_binding_sha256, str):
+                    payload["approval_binding"] = enhancement.approval_binding_sha256
+            binding_hash = canonical_sha256(payload)
             existing = session.scalar(
                 select(OperationRequest).where(OperationRequest.idempotency_key == digest)
             )

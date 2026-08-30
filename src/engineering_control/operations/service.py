@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 from typing import Any
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from engineering_control.api.schemas import (
     BacklogApprovalCandidateRequest,
     CampaignStart,
     EnhancementDiscover,
+    EnhancementRun,
     ExistingBacklogLoopStart,
     LLMWikiBootstrapPlanRequest,
     OperationAccepted,
@@ -23,7 +25,10 @@ from engineering_control.operations.models import (
     AuditStartCommand,
     AutonomousBacklogCommand,
     Command,
+    EnhancementApproveCommand,
     EnhancementDiscoverCommand,
+    EnhancementRejectCommand,
+    EnhancementRunCommand,
     FindingVerifyCommand,
     LLMWikiBootstrapPlanCommand,
     OperationView,
@@ -117,7 +122,7 @@ class TypedCommandBus:
                     operation_id,
                     event_type="operation.completed",
                     level="INFO",
-                    message="Typed read-only operation completed",
+                    message="Typed operation completed without starting a workflow",
                 )
             else:
                 await self.operations.finish(
@@ -270,6 +275,37 @@ class TypedCommandBus:
                     dry_run=command.dry_run,
                 )
             )
+        if isinstance(command, EnhancementApproveCommand):
+            enhancement = await self.metadata.get_enhancement(command.enhancement_id)
+            binding = self._enhancement_binding(enhancement, command.approval_binding)
+            await self.metadata.approve_enhancement(
+                command.enhancement_id,
+                binding,
+                self._approval_actor(operator_class),
+            )
+            return None
+        if isinstance(command, EnhancementRejectCommand):
+            enhancement = await self.metadata.get_enhancement(command.enhancement_id)
+            binding = self._enhancement_binding(enhancement, command.approval_binding)
+            await self.metadata.reject_enhancement(
+                command.enhancement_id,
+                command.reason_code,
+                self._approval_actor(operator_class),
+                expected_binding=binding,
+            )
+            return None
+        if isinstance(command, EnhancementRunCommand):
+            enhancement = await self.metadata.get_enhancement(command.enhancement_id)
+            binding = self._enhancement_binding(enhancement, command.approval_binding)
+            return await self.control.start_enhancement_solution(
+                command.enhancement_id,
+                EnhancementRun(
+                    approval_binding=binding,
+                    risk=command.risk,
+                    execution_mode=command.execution_mode,
+                    dry_run=command.dry_run,
+                ),
+            )
         if isinstance(command, FindingVerifyCommand):
             return await self.control.start_finding_verification(command.finding_id)
         if isinstance(command, LLMWikiBootstrapPlanCommand):
@@ -284,7 +320,24 @@ class TypedCommandBus:
             return operator_class
         if operator_class == "engineering-ctl":
             return "cli:engineering-ctl"
-        raise ValueError("backlog approval requires an allowlisted operator channel")
+        raise ValueError("operation requires an allowlisted operator channel")
+
+    @staticmethod
+    def _enhancement_binding(
+        enhancement: dict[str, Any] | None, expected_binding: str | None
+    ) -> str:
+        if enhancement is None:
+            raise ValueError("enhancement not found")
+        binding = enhancement.get("approval_binding_sha256")
+        if (
+            not isinstance(binding, str)
+            or len(binding) != 64
+            or any(character not in "0123456789abcdef" for character in binding)
+        ):
+            raise ValueError("enhancement approval binding is unavailable")
+        if expected_binding is None or not secrets.compare_digest(binding, expected_binding):
+            raise ValueError("enhancement approval binding changed")
+        return binding
 
     @staticmethod
     def _audit_preset(value: str) -> Any:

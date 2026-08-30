@@ -64,6 +64,15 @@ candidate through immutable reconciliation, staging, and runtime verification, b
 closure. This distinction prevents the console from advertising a complete solve path that the
 current runtime cannot finish.
 
+Enhancement candidates use their existing `approval_binding_sha256` as the authoritative immutable
+binding. Commands exposes typed approve, reject, and run forms: the server resolves and injects the
+binding into the durable operation, repeats project/status/risk/provider preflight immediately
+before dispatch, and the metadata repository compares the binding again under its row lock.
+Rejection accepts only a fixed reason code. Non-plan execution requires `dry_run=false`, native
+Codex/Claude readiness, a bounded risk, and a server-generated confirmation phrase. These controls
+call the existing enhancement repository and solution workflow; they do not add a GitHub or shell
+bypass.
+
 Raw state remains visible. The canonical normalized states are `backlog`, `eligible`, `queued`,
 `preparing`, `implementing`, `reviewing`, `reworking`, `testing`, `awaiting_ci`,
 `awaiting_approval`, `building`, `deploying`, `verifying`, `blocked`, `paused`, `completed`,
