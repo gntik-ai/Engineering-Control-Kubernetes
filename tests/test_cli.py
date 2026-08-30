@@ -115,6 +115,10 @@ def test_cli_direct_issue_and_operator_surfaces_use_only_typed_routes() -> None:
     )
     dispatch(client, parser().parse_args(["audit-plan", "llmwiki", "documentation", "staging"]))  # type: ignore[arg-type]
     dispatch(client, parser().parse_args(["recheck-connections"]))  # type: ignore[arg-type]
+    dispatch(  # type: ignore[arg-type]
+        client,
+        parser().parse_args(["campaign-reconcile", "--limit", "20", "--offset", "40"]),
+    )
 
     assert result == {"status": "ACCEPTED"}
     assert client.calls[1][1:] == (
@@ -139,6 +143,10 @@ def test_cli_direct_issue_and_operator_surfaces_use_only_typed_routes() -> None:
         "publish_findings": False,
     }
     assert client.calls[3][2] == {"action": "refresh_connections", "scope": "all"}
+    assert client.calls[4][1:] == (
+        "/v1/campaigns/reconcile?limit=20&offset=40",
+        {},
+    )
 
     full_delivery = parser().parse_args(
         [

@@ -142,6 +142,47 @@ def test_api_requires_bearer_auth() -> None:
         assert response.status_code == 200
 
 
+def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> None:
+    operations = Mock()
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    operations.campaign_reconciliation_candidates = AsyncMock(
+        return_value=[
+            {
+                "campaign_id": str(uuid4()),
+                "project": "falcone",
+                "name": f"campaign-{ordinal}",
+                "status": "PLANNED",
+                "workflow_id": f"workflow-{ordinal}",
+                "run_type": "audit",
+                "run_status": "RUNNING",
+                "blocker": None,
+                "age_seconds": 10,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+            for ordinal in range(3)
+        ]
+    )
+    app = create_app(
+        settings=Settings(),
+        service=FakeService(),
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/campaigns/reconcile?limit=2&offset=0", headers=headers)
+        assert response.status_code == 200
+        assert len(response.json()["items"]) == 2
+        assert response.json()["has_more"] is True
+        assert response.json()["next_offset"] == 2
+        assert client.post("/v1/campaigns/reconcile?limit=201", headers=headers).status_code == 422
+
+    operations.campaign_reconciliation_candidates.assert_awaited_once_with(3, 0)
+
+
 def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
     bus = Mock()
     bus.dispatch_pending = AsyncMock(return_value=False)

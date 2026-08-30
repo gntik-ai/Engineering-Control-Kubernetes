@@ -423,11 +423,41 @@ class OperationsRepository:
             )
             if row is None or _utc(row.expires_at) <= now:
                 raise ValueError("R3 approval candidate expired")
-            row.used_at = row.used_at or now
+            if row.binding_hash != binding or row.confirmation_phrase != phrase:
+                raise ValueError("R3 approval candidate changed before persistence")
+            if row.used_at is None:
+                row.used_at = now
+                row.payload_json = {
+                    **row.payload_json,
+                    "approved_by": actor,
+                    "approved_at": now.isoformat(),
+                }
+                session.add(
+                    DashboardEvent(
+                        occurred_at=now,
+                        level="WARNING",
+                        event_type="r3_issue_approved",
+                        source="controller",
+                        host=None,
+                        worker_kind="controller",
+                        project=project,
+                        workflow_id=None,
+                        temporal_run_id=None,
+                        issue_number=issue_number,
+                        campaign_id=None,
+                        entity_type="action_candidate",
+                        entity_id=str(row.id),
+                        current_phase="R3_APPROVED",
+                        message="Immutable R3 issue approval accepted",
+                        metadata_json={"approved_by": actor, "binding": binding},
+                    )
+                )
+            approved_by = row.payload_json.get("approved_by")
         return {
             "status": "R3_APPROVED",
             "binding": binding,
             "target": f"{candidate['candidate']['repository']}#{issue_number}",
+            "approved_by": approved_by,
             "production": False,
         }
 
@@ -2125,13 +2155,22 @@ class OperationsRepository:
                 "projects": projects,
             }
 
-    async def campaign_reconciliation_candidates(self) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._campaign_reconciliation_candidates)
+    async def campaign_reconciliation_candidates(
+        self, limit: int = 100, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._campaign_reconciliation_candidates, limit, offset)
 
-    def _campaign_reconciliation_candidates(self) -> list[dict[str, Any]]:
+    def _campaign_reconciliation_candidates(
+        self, limit: int = 100, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 201 or not 0 <= offset <= 10_000:
+            raise ValueError("campaign reconciliation page is outside its safety bound")
         with self.sessions() as session:
             campaigns = session.scalars(
-                select(Campaign).order_by(desc(Campaign.updated_at)).limit(1000)
+                select(Campaign)
+                .order_by(desc(Campaign.updated_at), desc(Campaign.id))
+                .offset(offset)
+                .limit(limit)
             ).all()
             values: list[dict[str, Any]] = []
             now = datetime.now(UTC)

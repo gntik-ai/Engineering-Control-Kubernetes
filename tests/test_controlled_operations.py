@@ -760,6 +760,33 @@ async def test_evidence_export_truncates_collection_prefixes_to_configured_size(
 
 
 @pytest.mark.asyncio
+async def test_campaign_reconciliation_candidate_page_is_bounded(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with repository.sessions.begin() as session:
+        for ordinal in range(3):
+            session.add(
+                Campaign(
+                    id=UUID(f"00000000-0000-4000-8000-{ordinal + 1:012d}"),
+                    project="falcone",
+                    name=f"reconciliation-{ordinal}",
+                    status="PLANNED",
+                    source_sha="a" * 40,
+                    deployment_sha="b" * 40,
+                    required_cells=1,
+                    metadata_json={},
+                )
+            )
+
+    first = await repository.campaign_reconciliation_candidates(limit=2, offset=0)
+    second = await repository.campaign_reconciliation_candidates(limit=2, offset=2)
+
+    assert len(first) == 2
+    assert len(second) == 1
+    with pytest.raises(ValueError, match="outside its safety bound"):
+        await repository.campaign_reconciliation_candidates(limit=202, offset=0)
+
+
+@pytest.mark.asyncio
 async def test_enhancement_actions_use_immutable_binding_and_typed_services(
     tmp_path: Path,
 ) -> None:

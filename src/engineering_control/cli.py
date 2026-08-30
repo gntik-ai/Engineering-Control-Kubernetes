@@ -123,7 +123,9 @@ def parser() -> argparse.ArgumentParser:
     nudge = commands.add_parser("nudge")
     nudge.add_argument("workflow_id")
     commands.add_parser("recheck-connections")
-    commands.add_parser("campaign-reconcile")
+    campaign_reconcile = commands.add_parser("campaign-reconcile")
+    campaign_reconcile.add_argument("--limit", type=int, default=100, choices=range(1, 201))
+    campaign_reconcile.add_argument("--offset", type=int, default=0, choices=range(0, 10_001))
     for action in ("locate", "start"):
         issue = commands.add_parser(f"issue-{action}")
         issue.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
@@ -352,7 +354,8 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             "POST", "/v1/commands", {"action": "refresh_connections", "scope": "all"}
         )
     if command == "campaign-reconcile":
-        return client.request("POST", "/v1/campaigns/reconcile", {})
+        query = httpx.QueryParams({"limit": arguments.limit, "offset": arguments.offset})
+        return client.request("POST", f"/v1/campaigns/reconcile?{query}", {})
     if command in {"issue-locate", "issue-start"}:
         query = httpx.QueryParams(
             {

@@ -278,6 +278,8 @@ def create_app(
 
     @app.post("/v1/campaigns/reconcile")
     async def campaigns_reconcile(
+        limit: int = Query(default=100, ge=1, le=200),
+        offset: int = Query(default=0, ge=0, le=10_000),
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
         repository: OperationsRepository = operations_dependency,
@@ -286,7 +288,9 @@ def create_app(
         terminal = {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
         awaiting = {"AWAITING_APPROVAL", "AWAITING_HUMAN", "PAUSED"}
         external_wait = {"EXTERNAL_WAIT", "AWAITING_CI", "AWAITING_ARGO", "AWAITING_BUILD"}
-        candidates = await repository.campaign_reconciliation_candidates()
+        candidates = await repository.campaign_reconciliation_candidates(limit + 1, offset)
+        has_more = len(candidates) > limit
+        candidates = candidates[:limit]
         active_canary_counts: dict[str, int] = {}
         for candidate in candidates:
             run_type = str(candidate.get("run_type") or "")
@@ -358,7 +362,13 @@ def create_app(
                     "projection_repaired": changed,
                 }
             )
-        return {"status": "COMPLETE", "items": results, "deleted": 0}
+        return {
+            "status": "COMPLETE",
+            "items": results,
+            "deleted": 0,
+            "has_more": has_more,
+            "next_offset": offset + limit if has_more else None,
+        }
 
     @app.get("/v1/campaign-detail/{campaign_id}")
     async def campaign_detail_get(

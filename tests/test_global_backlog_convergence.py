@@ -10,7 +10,12 @@ from sqlalchemy import select
 from engineering_control.activities.engineering import EngineeringActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import BacklogIssueRecord, GitHubBacklogCampaign
+from engineering_control.db.models import (
+    ActionCandidate,
+    BacklogIssueRecord,
+    DashboardEvent,
+    GitHubBacklogCampaign,
+)
 from engineering_control.engineering.backlog import BACKLOG_APPROVAL_PHRASE, approval_binding
 from engineering_control.operations.repository import OperationsRepository
 
@@ -252,6 +257,17 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
         "telegram:42",
     )
     assert approved["status"] == "R3_APPROVED"
+    assert approved["approved_by"] == "telegram:42"
+    with operations.sessions() as session:
+        approved_candidate = session.get(ActionCandidate, UUID(replaced["candidate_id"]))
+        assert approved_candidate is not None
+        assert approved_candidate.payload_json["approved_by"] == "telegram:42"
+        assert approved_candidate.payload_json["approved_at"]
+        approval_event = session.scalar(
+            select(DashboardEvent).where(DashboardEvent.event_type == "r3_issue_approved")
+        )
+        assert approval_event is not None
+        assert approval_event.metadata_json["approved_by"] == "telegram:42"
     third = handler._select_global_backlog_issue(context)
     assert third["item"]["issue_number"] == 1119
     assert third["item"]["execution_maximum_risk"] == "R3"
