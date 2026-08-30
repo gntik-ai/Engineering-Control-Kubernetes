@@ -196,6 +196,13 @@ def test_controller_bootstrap_owns_github_worker_and_worker_bootstrap_does_not()
     assert "github-issue-write-validation.yaml" in controller
     assert "install -d -o root -g engineering-control -m 0750" in controller
     assert "ENGINEERING_GITHUB_ISSUE_WRITE_VALIDATION_FILE" in controller
+    assert "github-runner.token" in controller
+    assert "ENGINEERING_EVIDENCE_INGEST_URL=http://10.10.0.2:8750/v1/evidence" in controller
+    assert (
+        "ENGINEERING_EVIDENCE_INGEST_TOKEN_FILE=%s/env/evidence-uploaders/github-runner.token"
+        in controller
+    )
+    assert "release-runner github-runner" in controller
     assert "auth token" not in controller
     assert ".config/gh" not in controller
     assert "GITHUB_TOKEN" not in controller
