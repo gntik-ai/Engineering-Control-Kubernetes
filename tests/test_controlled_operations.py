@@ -648,6 +648,46 @@ async def test_connection_snapshot_reports_freshness_without_sensitive_probe_out
     assert values[0].details == {"authentication_status": "READY"}
 
 
+@pytest.mark.asyncio
+async def test_readiness_scopes_exclude_only_non_runtime_sentinels_from_core(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    now = datetime.now(UTC)
+    for component, status in (
+        ("engineering-api", "CONNECTED"),
+        ("temporal", "CONNECTED"),
+        ("worker-controller", "NOT_INSTALLED"),
+        ("project-falcone", "STALE"),
+        ("project-musematic", "NOT_CONFIGURED"),
+    ):
+        await repository.upsert_connection(
+            {
+                "component": component,
+                "logical_target": component,
+                "status": status,
+                "checked_at": now,
+                "last_success_at": now if status == "CONNECTED" else None,
+                "last_failure_at": None,
+                "latency_ms": None,
+                "safe_error": None,
+                "source": "readiness-scope-regression",
+                "next_action": None,
+                "details": {},
+            }
+        )
+
+    core = await repository.operator_snapshot("readiness-core")
+    all_connections = await repository.operator_snapshot("readiness-all")
+
+    assert core["status"] == "READY"
+    assert core["connection_count"] == 2
+    assert core["connected_count"] == 2
+    assert all_connections["status"] == "DEGRADED"
+    assert all_connections["connection_count"] == 4
+    assert all_connections["connected_count"] == 2
+
+
 def test_connection_projection_reports_github_worker_without_inventing_broker_success(
     tmp_path: Path,
 ) -> None:

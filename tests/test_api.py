@@ -142,6 +142,32 @@ def test_api_requires_bearer_auth() -> None:
         assert response.status_code == 200
 
 
+def test_readiness_api_preserves_the_validated_scope() -> None:
+    operations = Mock()
+    operations.operator_snapshot = AsyncMock(return_value={"status": "READY"})
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    app = create_app(
+        settings=Settings(),
+        service=FakeService(),
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        core = client.get("/v1/readiness/core", headers=headers)
+        all_connections = client.get("/v1/readiness/all", headers=headers)
+
+    assert core.json() == {"status": "READY", "scope": "core"}
+    assert all_connections.json() == {"status": "READY", "scope": "all"}
+    assert [value.args for value in operations.operator_snapshot.await_args_list] == [
+        ("readiness-core",),
+        ("readiness-all",),
+    ]
+
+
 def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> None:
     operations = Mock()
     bus = Mock()

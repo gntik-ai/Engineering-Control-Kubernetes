@@ -1626,7 +1626,15 @@ class OperationsRepository:
         return await asyncio.to_thread(self._operator_snapshot, surface)
 
     def _operator_snapshot(self, surface: str) -> dict[str, Any]:
-        if surface not in {"readiness", "workers", "providers", "channel", "temporal"}:
+        if surface not in {
+            "readiness",
+            "readiness-all",
+            "readiness-core",
+            "workers",
+            "providers",
+            "channel",
+            "temporal",
+        }:
             raise ValueError("operator snapshot surface is not allowlisted")
         now = datetime.now(UTC)
         with self.sessions() as session:
@@ -1751,12 +1759,18 @@ class OperationsRepository:
                 "recent_workflow_projections": len(runs),
                 "worker_heartbeat_count": len(heartbeats),
             }
-        statuses = [row.status for row in connections]
+        required_connections = [
+            row
+            for row in connections
+            if row.component != "worker-controller"
+            and (surface != "readiness-core" or not row.component.startswith("project-"))
+        ]
+        statuses = [row.status for row in required_connections]
         return {
             "status": "READY"
             if statuses and all(value == "CONNECTED" for value in statuses)
             else "DEGRADED",
-            "connection_count": len(connections),
+            "connection_count": len(required_connections),
             "connected_count": sum(value == "CONNECTED" for value in statuses),
             "worker_count": len(heartbeats),
             "checked_at": now.isoformat(),

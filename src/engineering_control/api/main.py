@@ -233,7 +233,7 @@ def create_app(
     ) -> dict[str, Any]:
         if scope not in {"core", "all"}:
             raise HTTPException(status_code=404, detail="readiness scope not found")
-        value = await repository.operator_snapshot("readiness")
+        value = await repository.operator_snapshot(f"readiness-{scope}")
         return {**value, "scope": scope}
 
     @app.get("/v1/connections")
