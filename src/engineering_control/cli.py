@@ -129,6 +129,12 @@ def parser() -> argparse.ArgumentParser:
         issue.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
         issue.add_argument("surface", choices=("source", "deployment"))
         issue.add_argument("issue_number", type=int)
+        if action == "start":
+            issue.add_argument(
+                "--delivery-mode",
+                choices=("source-pr", "full-delivery"),
+                default="source-pr",
+            )
     r3_candidate = commands.add_parser("r3-candidate")
     r3_candidate.add_argument("project", choices=("musematic",))
     r3_candidate.add_argument("surface", choices=("source",))
@@ -371,7 +377,7 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "repository": issue["repository"],
                 "issue_number": arguments.issue_number,
                 "maximum_risk": "R2",
-                "delivery_mode": "full-delivery",
+                "delivery_mode": arguments.delivery_mode,
                 "correction_limit": 5,
                 "production": False,
             },

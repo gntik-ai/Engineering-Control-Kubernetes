@@ -26,7 +26,7 @@ The Telegram surface accepts only fixed values:
 /loop delivery-candidate <workflow-id> <repository-short-name> <issue-number>
 /loop approve-delivery <workflow-id> <binding-sha256> APPROVE_STAGING_ISSUE_DELIVERY
 /loop issue-locate <falcone|musematic|llmwiki> <source|deployment> <issue-number>
-/loop issue-start <falcone|musematic|llmwiki> <source|deployment> <issue-number>
+/loop issue-start <falcone|musematic|llmwiki> <source|deployment> <issue-number> [source-pr|full-delivery]
 /loop diagnose <workflow-id>
 /loop tail <workflow-id> [limit]
 /loop nudge <workflow-id>
@@ -35,6 +35,10 @@ The Telegram surface accepts only fixed values:
 /loop approve-r3 musematic source 1119 <binding> <exact-confirmation-phrase>
 /loop global-start <global-campaign-id> <policy-campaign-id> <falcone-campaign-id> <musematic-campaign-id> <llmwiki-campaign-id> START_GLOBAL_STAGING_R2_BACKLOG
 ```
+
+`issue-start` defaults to the currently dispatchable `source-pr` mode. The explicit
+`full-delivery` mode remains fail-closed until its final-merge delivery service and project staging
+capability are available.
 
 The same `/loop plan` and `/loop start` grammar remains compatible with audit campaigns: the API
 resolves the UUID to a backlog campaign first and otherwise dispatches the existing audit finding

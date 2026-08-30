@@ -126,7 +126,7 @@ def test_cli_direct_issue_and_operator_surfaces_use_only_typed_routes() -> None:
             "repository": "gntik-ai/falcone",
             "issue_number": 953,
             "maximum_risk": "R2",
-            "delivery_mode": "full-delivery",
+            "delivery_mode": "source-pr",
             "correction_limit": 5,
             "production": False,
         },
@@ -139,6 +139,18 @@ def test_cli_direct_issue_and_operator_surfaces_use_only_typed_routes() -> None:
         "publish_findings": False,
     }
     assert client.calls[3][2] == {"action": "refresh_connections", "scope": "all"}
+
+    full_delivery = parser().parse_args(
+        [
+            "issue-start",
+            "musematic",
+            "source",
+            "1119",
+            "--delivery-mode",
+            "full-delivery",
+        ]
+    )
+    assert full_delivery.delivery_mode == "full-delivery"
 
 
 @pytest.mark.parametrize(

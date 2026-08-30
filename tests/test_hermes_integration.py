@@ -336,6 +336,41 @@ def test_telegram_export_commands_reject_untyped_targets(
 
 
 @pytest.mark.parametrize(
+    ("raw_args", "delivery_mode"),
+    [
+        ("issue-start falcone source 953", "source-pr"),
+        ("issue-start musematic source 1119 full-delivery", "full-delivery"),
+    ],
+)
+def test_telegram_issue_start_uses_explicit_typed_delivery_mode(
+    monkeypatch: pytest.MonkeyPatch, raw_args: str, delivery_mode: str
+) -> None:
+    handler = load_handler()
+    observed: list[tuple[str, str, Any]] = []
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+    monkeypatch.setattr(handler, "_record_acceptance", lambda *_args: None)
+
+    def request(method: str, path: str, _actor: str, payload: Any = None) -> dict[str, Any]:
+        observed.append((method, path, payload))
+        if method == "GET":
+            return {
+                "backlog_campaign_id": "11111111-1111-4111-8111-111111111111",
+                "issue": {"repository": "gntik-ai/falcone"},
+            }
+        return {"status": "ACCEPTED"}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        "command:loop",
+        {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
+    )
+
+    assert result is not None and result["decision"] == "handled"
+    assert observed[-1][0:2] == ("POST", "/v1/commands")
+    assert observed[-1][2]["delivery_mode"] == delivery_mode
+
+
+@pytest.mark.parametrize(
     "raw_args",
     [
         "start snapshot production",
@@ -378,6 +413,8 @@ def test_telegram_all_project_audit_rejects_untyped_targets(
         "approve falcone 11111111-1111-4111-8111-111111111111 " + "a" * 64 + " NOT_APPROVED",
         "approve-delivery loop-id " + "a" * 64 + " NOT_APPROVED",
         "import falcone github-open bugs 1;gh",
+        "issue-locate falcone source 953 source-pr",
+        "issue-start falcone source 953 arbitrary-mode",
     ],
 )
 def test_backlog_telegram_parser_rejects_untyped_or_unbounded_input(
@@ -453,6 +490,20 @@ def test_telegram_pagination_measures_rendered_small_records() -> None:
         rendered = handler._cursor_page(cursor, command="campaigns", actor=actor)
 
     assert observed == list(range(1, 41))
+
+
+def test_telegram_pagination_digests_record_that_only_fits_without_page_context() -> None:
+    handler = load_handler()
+    record = {f"field-{index:02d}": "x" * 40 for index in range(56)}
+    value = {"campaign": "x" * 60, "items": [record, record]}
+
+    assert handler._page_fits(record, has_next=True)
+    assert not handler._page_fits({"campaign": "x" * 60, "items": [record]}, has_next=True)
+    rendered = handler._format(value, command="campaigns", actor="telegram:42")
+
+    assert len(rendered) <= 3500
+    envelope = json.loads(rendered)
+    assert envelope["payload"]["items"][0]["oversized_record"] is True
 
 
 def test_telegram_cursor_cache_is_bounded_and_cursor_survives_render_failure(

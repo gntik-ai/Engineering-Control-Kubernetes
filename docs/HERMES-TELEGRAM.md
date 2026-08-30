@@ -14,7 +14,8 @@ The original safe commands remain supported: `/audit`, `/campaigns`, `/findings`
 `/validate`, and `/rollback`. The operations projection adds `/ready`, `/connections`,
 `/temporal`, `/providers`, `/workers`, `/channel-check`, `/campaign`, and the fixed `/loop`
 subcommands documented in `EXISTING-GITHUB-BACKLOG.md`. `/verify <finding-uuid>` starts only the
-independent read-only verification workflow;
+independent read-only verification workflow. Bounded evidence summaries are available through
+`/export-campaign <campaign-uuid>` and `/export-workflow <workflow-id>`;
 it cannot file an issue or deliver a change unless the finding later reaches `CONFIRMED`.
 `/validate [hold-seconds]` starts only the bounded local synthetic lifecycle; it has no product,
 model, GitHub, or deployment access. The hook accepts only Telegram events, checks the numeric

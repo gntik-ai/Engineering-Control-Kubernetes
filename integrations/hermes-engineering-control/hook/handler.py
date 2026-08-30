@@ -275,8 +275,16 @@ def _page_fits(payload: Any, *, has_next: bool) -> bool:
     return len(_rendered_page(payload, cursor)) <= _MESSAGE_LIMIT
 
 
-def _bounded_record(value: Any) -> Any:
+def _oversized_record(value: Any) -> dict[str, Any]:
     serialized = _redact(json.dumps(value, indent=2, sort_keys=True, default=str))
+    return {
+        "oversized_record": True,
+        "sha256": hashlib.sha256(serialized.encode()).hexdigest(),
+        "rendered_characters": len(serialized),
+    }
+
+
+def _bounded_record(value: Any) -> Any:
     if _page_fits(value, has_next=True):
         return value
     if isinstance(value, dict):
@@ -294,11 +302,7 @@ def _bounded_record(value: Any) -> Any:
         }
         if _page_fits(bounded, has_next=True):
             return bounded
-    return {
-        "oversized_record": True,
-        "sha256": hashlib.sha256(serialized.encode()).hexdigest(),
-        "rendered_characters": len(serialized),
-    }
+    return _oversized_record(value)
 
 
 def _page_payloads(value: Any) -> list[Any]:
@@ -309,10 +313,18 @@ def _page_payloads(value: Any) -> list[Any]:
             records = value[list_key]
             if not records:
                 return [value]
+            if not _page_fits({**base, list_key: []}, has_next=True):
+                return [_oversized_record(value)]
             pages: list[Any] = []
             current: list[Any] = []
             for index, record in enumerate(records):
                 bounded = _bounded_record(record)
+                singleton = {**base, list_key: [bounded]}
+                if not _page_fits(singleton, has_next=True):
+                    bounded = _oversized_record(record)
+                    singleton = {**base, list_key: [bounded]}
+                if not _page_fits(singleton, has_next=True):
+                    return [_oversized_record(value)]
                 candidate = {**base, list_key: [*current, bounded]}
                 has_next = index < len(records) - 1
                 if current and not _page_fits(candidate, has_next=has_next):
@@ -758,14 +770,21 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
             )
         if action in {"issue-locate", "issue-start"}:
             if (
-                len(args) != 4
+                (action == "issue-locate" and len(args) != 4)
+                or (action == "issue-start" and len(args) not in {4, 5})
                 or args[1] not in _PROJECTS
                 or args[2] not in {"source", "deployment"}
                 or not args[3].isdigit()
                 or int(args[3]) < 1
+                or (
+                    action == "issue-start"
+                    and len(args) == 5
+                    and args[4] not in {"source-pr", "full-delivery"}
+                )
             ):
                 raise ValueError(
                     f"usage: /loop {action} <project> <source|deployment> <issue-number>"
+                    + (" [source-pr|full-delivery]" if action == "issue-start" else "")
                 )
             query = urllib.parse.urlencode(
                 {"project": args[1], "surface": args[2], "issue_number": int(args[3])}
@@ -787,7 +806,7 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                     "repository": issue["repository"],
                     "issue_number": int(args[3]),
                     "maximum_risk": "R2",
-                    "delivery_mode": "full-delivery",
+                    "delivery_mode": args[4] if len(args) == 5 else "source-pr",
                     "correction_limit": 5,
                     "production": False,
                 },
