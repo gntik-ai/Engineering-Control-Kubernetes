@@ -133,6 +133,8 @@ class OperationsRepository:
                 "resolved": binding,
                 "production": False,
             }
+            if isinstance(command, RefreshConnectionsCommand):
+                immutable["candidate_nonce"] = secrets.token_hex(16)
             binding_hash = canonical_sha256(immutable)
             phrase = self._confirmation_phrase(command, binding_hash)
             existing = session.scalar(

@@ -30,6 +30,7 @@ from engineering_control.db.models import (
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.models import (
     AuditStartCommand,
+    RefreshConnectionsCommand,
     SolveBacklogCommand,
     SolveIssueCommand,
     WorkflowControlCommand,
@@ -263,6 +264,31 @@ async def test_backlog_requires_server_phrase_and_prevents_duplicate_active_oper
     )
     with repository.sessions() as session:
         assert len(session.scalars(select(OperationRequest)).all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_connection_refresh_can_be_run_again(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    command = RefreshConnectionsCommand(scope="all")
+
+    first_candidate = await repository.candidate(command, SESSION_A)
+    first_token = await repository.create_reauthentication(first_candidate.candidate_id, SESSION_A)
+    first = await repository.queue_candidate(
+        first_candidate.candidate_id, first_token, SESSION_A, None
+    )
+    await repository.finish(first.operation_id, status="COMPLETED")
+
+    second_candidate = await repository.candidate(command, SESSION_A)
+    second_token = await repository.create_reauthentication(
+        second_candidate.candidate_id, SESSION_A
+    )
+    second = await repository.queue_candidate(
+        second_candidate.candidate_id, second_token, SESSION_A, None
+    )
+
+    assert second.operation_id != first.operation_id
+    with repository.sessions() as session:
+        assert len(session.scalars(select(OperationRequest)).all()) == 2
 
 
 @pytest.mark.asyncio
