@@ -302,22 +302,24 @@ def create_app(
             "TERMINATED",
             "TIMED_OUT",
         }
+
         # Campaign names are the persisted operator-defined campaign identity. Per-run
         # uniqueness belongs to workflow_id, so project/name/run_type is the narrowest
         # stable identity available for legacy canaries.
-        active_projection_statuses = {"QUEUED", "PLANNED", "RUNNING", "IN_PROGRESS"}
-
         def canary_key(candidate: dict[str, Any]) -> tuple[str, str, str] | None:
-            run_type = str(candidate.get("run_type") or "")
+            run_type = str(candidate.get("run_type") or "").strip().lower()
             name = str(candidate.get("name") or "").strip().lower()
             if "canary" not in name and "acceptance" not in run_type:
                 return None
-            return (str(candidate.get("project") or ""), name, run_type)
+            return (str(candidate.get("project") or "").strip().lower(), name, run_type)
 
         def is_active_canary(candidate: dict[str, Any], temporal_status: str) -> bool:
+            projection_status = str(candidate["status"])
             return (
                 canary_key(candidate) is not None
-                and candidate["status"] in active_projection_statuses
+                and projection_status not in projected_terminal_statuses
+                and projection_status not in awaiting
+                and projection_status not in external_wait
                 and temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}
             )
 
@@ -367,15 +369,20 @@ def create_app(
             temporal_status = str(observed.get("status") or "UNKNOWN")
             projected_terminal = candidate["status"] in projected_terminal_statuses
             candidate_canary_key = canary_key(candidate)
-            if temporal_status in terminal and not projected_terminal:
-                changed = await repository.reconcile_terminal_campaign(
-                    UUID(str(candidate["campaign_id"])), workflow_id, temporal_status
-                )
-                classification = "TERMINAL_NOT_RECONCILED"
-            elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"} and projected_terminal:
+            if workflow_binding_counts.get(workflow_id, 0) > 1:
                 changed = False
                 classification = "INCONSISTENT_STATE"
-            elif workflow_binding_counts.get(workflow_id, 0) > 1:
+            elif temporal_status in terminal and not projected_terminal:
+                try:
+                    changed = await repository.reconcile_terminal_campaign(
+                        UUID(str(candidate["campaign_id"])), workflow_id, temporal_status
+                    )
+                except ValueError:
+                    changed = False
+                    classification = "INCONSISTENT_STATE"
+                else:
+                    classification = "TERMINAL_NOT_RECONCILED"
+            elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"} and projected_terminal:
                 changed = False
                 classification = "INCONSISTENT_STATE"
             elif (

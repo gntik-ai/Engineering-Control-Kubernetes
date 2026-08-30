@@ -351,6 +351,98 @@ def test_campaign_reconciliation_distinguishes_missing_from_unavailable_temporal
     assert unavailable.json() == {"detail": "Temporal visibility is temporarily unavailable"}
 
 
+def test_campaign_reconciliation_never_repairs_a_shared_terminal_workflow_binding() -> None:
+    campaign_ids = [uuid4(), uuid4()]
+    candidates = [
+        {
+            "campaign_id": str(campaign_id),
+            "project": "falcone",
+            "name": "provider-canary",
+            "status": "PLANNED",
+            "workflow_id": "shared-terminal-canary",
+            "run_type": "provider_acceptance",
+            "run_status": "RUNNING",
+            "blocker": None,
+            "age_seconds": 10,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        for campaign_id in campaign_ids
+    ]
+    operations = Mock()
+    operations.campaign_reconciliation_candidates = AsyncMock(return_value=candidates)
+    operations.reconcile_terminal_campaign = AsyncMock(return_value=True)
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    service = FakeService()
+    service.get_workflow = AsyncMock(
+        return_value={"workflow_id": "shared-terminal-canary", "status": "COMPLETED"}
+    )
+    app = create_app(
+        settings=Settings(),
+        service=service,
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/campaigns/reconcile", headers=headers)
+
+    assert response.status_code == 200
+    assert [item["classification"] for item in response.json()["items"]] == [
+        "INCONSISTENT_STATE",
+        "INCONSISTENT_STATE",
+    ]
+    assert [item["projection_repaired"] for item in response.json()["items"]] == [
+        False,
+        False,
+    ]
+    service.get_workflow.assert_awaited_once_with("shared-terminal-canary")
+    operations.reconcile_terminal_campaign.assert_not_awaited()
+
+
+def test_campaign_reconciliation_maps_a_concurrent_rebind_to_inconsistent_state() -> None:
+    candidate = {
+        "campaign_id": str(uuid4()),
+        "project": "falcone",
+        "name": "provider-canary",
+        "status": "PLANNED",
+        "workflow_id": "rebound-terminal-canary",
+        "run_type": "provider_acceptance",
+        "run_status": "RUNNING",
+        "blocker": None,
+        "age_seconds": 10,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    operations = Mock()
+    operations.campaign_reconciliation_candidates = AsyncMock(return_value=[candidate])
+    operations.reconcile_terminal_campaign = AsyncMock(
+        side_effect=ValueError("campaign workflow binding changed during reconciliation")
+    )
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    service = FakeService()
+    service.get_workflow = AsyncMock(
+        return_value={"workflow_id": "rebound-terminal-canary", "status": "COMPLETED"}
+    )
+    app = create_app(
+        settings=Settings(),
+        service=service,
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/campaigns/reconcile", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["classification"] == "INCONSISTENT_STATE"
+    assert response.json()["items"][0]["projection_repaired"] is False
+
+
 def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
     bus = Mock()
     bus.dispatch_pending = AsyncMock(return_value=False)
