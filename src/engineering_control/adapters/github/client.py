@@ -524,6 +524,15 @@ class GhCliBroker:
             r"<!-- engineering-control-final-closure:[a-f0-9-]{36} -->", marker
         ):
             raise GhCliPolicyError("issue comment binding is invalid")
+        bounded_body = self._bounded_file(body_file)
+        if bounded_body.stat().st_size > 12_000:
+            raise GhCliPolicyError("issue comment body exceeded the bounded size")
+        try:
+            body = bounded_body.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise GhCliPolicyError("issue comment body is unreadable") from error
+        if body.count(marker) != 1:
+            raise GhCliPolicyError("issue comment body is missing its exact binding marker")
         issue = self.view_issue(repository, number)
         matches = [
             comment
@@ -544,7 +553,7 @@ class GhCliBroker:
                 "--repo",
                 repository,
                 "--body-file",
-                str(self._bounded_file(body_file)),
+                str(bounded_body),
             ]
         ).stdout.strip()
         if not re.fullmatch(r"https://github\.com/[^\s]+#issuecomment-[1-9][0-9]*", url):

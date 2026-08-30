@@ -244,6 +244,28 @@ def test_broker_refuses_issue_close_without_persisted_marker(
     assert calls == []
 
 
+def test_broker_refuses_issue_comment_body_without_exact_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broker = GhCliBroker(object(), tmp_path, writes_enabled=True)  # type: ignore[arg-type]
+    body = tmp_path / "evidence.md"
+    body.write_text("final evidence without its binding\n", encoding="utf-8")
+    marker = f"<!-- engineering-control-final-closure:{uuid4()} -->"
+    calls: list[list[str]] = []
+    monkeypatch.setattr(broker, "_write", lambda repository, _binding: repository)
+    monkeypatch.setattr(broker, "_run", lambda arguments: calls.append(arguments))
+
+    with pytest.raises(GhCliPolicyError, match="exact binding marker"):
+        broker.comment_issue(
+            repository="gntik-ai/falcone",
+            number=42,
+            body_file=body,
+            marker=marker,
+            change_binding=f"changeset:{uuid4()}",
+        )
+    assert calls == []
+
+
 def test_final_worktree_sync_rejects_symlink_before_git(
     tmp_path: Path,
 ) -> None:
@@ -594,6 +616,25 @@ def test_final_closure_database_gates_require_runtime_and_persisted_comment(
         {**fake_close, "final_issue_plan": resumed["final_issue_plan"]}
     )
     assert fixed["status"] == "FIXED"
+    with handler.sessions.begin() as session:
+        campaign = session.get(GitHubBacklogCampaign, campaign_id)
+        assert campaign is not None
+        approval_json = dict(campaign.approval_json)
+        approval_value = dict(approval_json["binding"])
+        approval_value["expires_at"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        approval_json["binding"] = approval_value
+        campaign.approval_json = approval_json
+    completed = handler._prepare_final_closure(
+        {
+            "backlog_campaign_id": str(campaign_id),
+            "change_set_id": str(change_set_id),
+            "project": "falcone",
+            "issue_repository": "gntik-ai/falcone",
+            "issue_number": 42,
+            "orchestration": {"workflow_id": workflow_id},
+        }
+    )
+    assert completed["status"] == "FIXED"
 
 
 @pytest.mark.asyncio
@@ -682,6 +723,72 @@ async def test_final_closure_resumes_only_bounded_issue_comment_and_close(
         "final.close_issue",
         "final.persist_issue_close",
     ]
+
+
+@pytest.mark.asyncio
+async def test_final_closure_resumes_after_persisted_source_merge_without_remerging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = FinalClosureWorkflow()
+    instance._checkpoint = lambda _phase: _true()  # type: ignore[method-assign]
+    steps: list[str] = []
+
+    async def step(name: str, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        statuses = {
+            "final.prepare": "FINAL_SOURCE_MERGE_PERSISTED",
+            "final.inspect_artifact": "FINAL_ARTIFACT_VERIFIED",
+            "final.persist_artifact": "FINAL_ARTIFACT_BUILT",
+            "reconcile.prepare_promotion": "DEPLOY_PR",
+            "final.authorize_deployment_merge": "FINAL_DEPLOYMENT_MERGE_AUTHORIZED",
+            "final.merge_deployment": "DEPLOYMENT_MERGED",
+            "final.persist_deployment_merge": "FINAL_DEPLOYMENT_MERGE_PERSISTED",
+            "final.sync_worktrees": "FINAL_WORKTREES_SYNCHRONIZED",
+            "backlog.register_child_run": "REGISTERED",
+            "final.prepare_issue_close": "FINAL_ISSUE_CLOSE_READY",
+            "final.comment_issue": "FINAL_EVIDENCE_COMMENTED",
+            "final.persist_comment": "FINAL_EVIDENCE_PERSISTED",
+            "final.close_issue": "ISSUE_CLOSED",
+            "final.persist_issue_close": "FIXED",
+        }
+        return {**payload, "status": statuses[name]}
+
+    async def child(name: str, _input: object, **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        if name == "StagingDeploymentWorkflow":
+            return {
+                "status": "STAGING_DEPLOYED",
+                "context": {"deployment_id": str(uuid4())},
+            }
+        assert name == "RuntimeVerificationWorkflow"
+        return {"status": "RUNTIME_VERIFIED", "context": {}}
+
+    instance._step = step  # type: ignore[method-assign]
+    instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="resume-source", task_queue="engineering"),
+    )
+    monkeypatch.setattr(workflow_definitions.workflow, "execute_child_workflow", child)
+
+    result = await instance.run(
+        FinalClosureInput(
+            backlog_campaign_id=str(uuid4()),
+            change_set_id=str(uuid4()),
+            finding_id=str(uuid4()),
+            project="falcone",
+            issue_repository="gntik-ai/falcone",
+            issue_number=42,
+        )
+    )
+
+    assert result["status"] == "FIXED"
+    assert "final.merge_source" not in steps
+    assert "final.persist_source_merge" not in steps
+    assert "final.inspect_artifact" in steps
+    assert "final.merge_deployment" in steps
 
 
 @pytest.mark.asyncio

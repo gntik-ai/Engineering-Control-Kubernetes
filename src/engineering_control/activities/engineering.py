@@ -1900,6 +1900,24 @@ class EngineeringActivityHandler:
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
             raw_global_id = payload.get("global_campaign_id")
+            linked_global_ids = {
+                candidate.id
+                for candidate in session.scalars(
+                    select(db.Campaign).where(
+                        db.Campaign.project == "platform",
+                        db.Campaign.status.in_({"RUNNING", "PAUSED"}),
+                    )
+                ).all()
+                if isinstance(candidate.metadata_json, dict)
+                and candidate.metadata_json.get("kind") == "autonomous-global-backlog"
+                and isinstance(candidate.metadata_json.get("backlog_campaign_ids"), dict)
+                and str(campaign_id)
+                in {
+                    str(value) for value in candidate.metadata_json["backlog_campaign_ids"].values()
+                }
+            }
+            if raw_global_id is None and linked_global_ids:
+                raise ValueError("global child backlog requires its persisted parent binding")
             if raw_global_id is not None:
                 global_campaign = session.get(db.Campaign, UUID(str(raw_global_id)))
                 metadata = global_campaign.metadata_json if global_campaign is not None else None
@@ -1913,6 +1931,7 @@ class EngineeringActivityHandler:
                     or metadata.get("kind") != "autonomous-global-backlog"
                     or not isinstance(inventory_ids, dict)
                     or str(campaign_id) not in {str(value) for value in inventory_ids.values()}
+                    or global_campaign.id not in linked_global_ids
                 ):
                     raise ValueError("global child backlog binding is invalid")
                 return self._envelope(

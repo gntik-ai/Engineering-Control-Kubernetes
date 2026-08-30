@@ -3109,6 +3109,16 @@ class MetadataActivityHandler:
             ):
                 raise ValueError("final closure campaign, issue, or ChangeSet binding is missing")
             if (
+                change_set.state == ChangeSetState.ISSUE_CLOSED.value
+                and issue.state == "CLOSED"
+                and issue.final_closure_status == "FIXED_CLOSURE_COMPLETE"
+            ):
+                return {
+                    **payload,
+                    "status": "FIXED",
+                    "change_set_id": str(change_set.id),
+                }
+            if (
                 campaign.delivery_mode != "full-delivery"
                 or campaign.status not in {"APPROVED_INVENTORY", "APPROVED", "RUNNING"}
                 or not campaign.approval_binding
@@ -3137,16 +3147,6 @@ class MetadataActivityHandler:
                 or _as_utc(approval.expires_at) <= now
             ):
                 raise ValueError("final closure approval is absent, expired, or changed")
-            if (
-                change_set.state == ChangeSetState.ISSUE_CLOSED.value
-                and issue.state == "CLOSED"
-                and issue.final_closure_status == "FIXED_CLOSURE_COMPLETE"
-            ):
-                return {
-                    **payload,
-                    "status": "FIXED",
-                    "change_set_id": str(change_set.id),
-                }
             closure_states = {
                 ChangeSetState.RUNTIME_VERIFIED.value,
                 ChangeSetState.SOURCE_MERGED.value,
@@ -3334,6 +3334,42 @@ class MetadataActivityHandler:
                     "deployment_merge": deployment_merge.model_dump(mode="json"),
                     "independent_review_sha256": independent,
                 }
+            stored_source_merge = existing_closure.get("source_merge")
+            if stored_source_merge is not None:
+                source_merge = ProtectedMergeResult.model_validate(stored_source_merge)
+                if (
+                    source_merge.repository != plan.source.repository
+                    or source_merge.pull_request_number != plan.source.number
+                    or source_merge.head_sha != plan.source.head_sha
+                    or change_set.source_head_sha != source_merge.merge_sha
+                    or change_set.state
+                    not in {
+                        ChangeSetState.SOURCE_MERGED.value,
+                        ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+                        ChangeSetState.DEPLOY_PR.value,
+                        ChangeSetState.AWAITING_STAGING_APPROVAL.value,
+                        ChangeSetState.STAGING_APPROVED.value,
+                        ChangeSetState.STAGING_DEPLOYED.value,
+                        ChangeSetState.RUNTIME_VERIFIED.value,
+                    }
+                ):
+                    raise ValueError("persisted final source merge resume binding changed")
+                artifact = FinalArtifactPlan(
+                    closure=plan,
+                    final_source_sha=source_merge.merge_sha,
+                    policy=plan.policy,
+                )
+                issue.final_closure_status = "FINAL_CLOSURE_RUNNING"
+                return {
+                    **payload,
+                    "status": "FINAL_SOURCE_MERGE_PERSISTED",
+                    "final_closure_plan": plan.model_dump(mode="json"),
+                    "source_merge": source_merge.model_dump(mode="json"),
+                    "final_artifact_plan": artifact.model_dump(mode="json"),
+                    "independent_review_sha256": independent,
+                }
+            if change_set.state != ChangeSetState.RUNTIME_VERIFIED.value:
+                raise ValueError("persisted final source merge evidence is missing")
             issue.final_closure_status = "FINAL_CLOSURE_RUNNING"
         return {
             **payload,
@@ -3676,23 +3712,22 @@ class MetadataActivityHandler:
         ):
             raise ValueError("final clean-worktree evidence is missing")
         synchronization = {
-            str(item.get("repository")): item
+            (str(item.get("repository")), str(item.get("merge_sha"))): item
             for item in raw_synchronization
             if isinstance(item, dict)
         }
         expected_synchronization = {
-            source.repository: (source.merge_sha, source.merge_tree_sha),
-            deployment_merge.repository: (
+            (source.repository, source.merge_sha): source.merge_tree_sha,
+            (
+                deployment_merge.repository,
                 deployment_merge.merge_sha,
-                deployment_merge.merge_tree_sha,
-            ),
+            ): deployment_merge.merge_tree_sha,
         }
         if len(synchronization) != len(expected_synchronization) or any(
-            not isinstance(item := synchronization.get(repository), dict)
-            or item.get("merge_sha") != merge_sha
+            not isinstance(item := synchronization.get(binding), dict)
             or item.get("merge_tree_sha") != tree_sha
             or item.get("clean") is not True
-            for repository, (merge_sha, tree_sha) in expected_synchronization.items()
+            for binding, tree_sha in expected_synchronization.items()
         ):
             raise ValueError("final clean-worktree evidence changed")
         now = datetime.now(UTC)

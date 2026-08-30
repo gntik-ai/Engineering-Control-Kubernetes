@@ -524,6 +524,41 @@ def test_prepare_final_closure_resumes_after_persisted_deployment_merge(
     assert resumed["deployment_merge"]["merge_sha"] == deployment_merge.merge_sha
 
 
+def test_prepare_final_closure_resumes_after_persisted_source_merge(
+    tmp_path: Path,
+) -> None:
+    handler, payload, _campaign = _seed_prepare(tmp_path)
+    prepared = handler._prepare_final_closure(payload)
+    plan = FinalClosurePlan.model_validate(prepared["final_closure_plan"])
+    source_merge = _merge(plan, source=True)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, plan.change_set_id)
+        assert change_set is not None
+        recovery = dict(change_set.recovery_json)
+        closure = dict(recovery["final_closure"])
+        closure["source_merge"] = source_merge.model_dump(mode="json")
+        recovery["final_closure"] = closure
+        change_set.recovery_json = recovery
+        change_set.source_head_sha = source_merge.merge_sha
+        change_set.state = ChangeSetState.SOURCE_MERGED.value
+
+    resumed = handler._prepare_final_closure(payload)
+    assert resumed["status"] == "FINAL_SOURCE_MERGE_PERSISTED"
+    assert resumed["source_merge"]["merge_sha"] == source_merge.merge_sha
+    assert resumed["final_artifact_plan"]["final_source_sha"] == source_merge.merge_sha
+
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, plan.change_set_id)
+        assert change_set is not None
+        recovery = dict(change_set.recovery_json)
+        closure = dict(recovery["final_closure"])
+        closure.pop("source_merge")
+        recovery["final_closure"] = closure
+        change_set.recovery_json = recovery
+    with pytest.raises(ValueError, match="persisted final source merge evidence is missing"):
+        handler._prepare_final_closure(payload)
+
+
 @pytest.mark.parametrize(
     ("variant", "error"),
     [

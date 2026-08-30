@@ -1602,9 +1602,10 @@ async def test_final_closure_patch_false_preserves_the_prior_terminal_sequence(
         )
     )
 
-    assert result["status"] == "BLOCKED_BY_DELIVERY"
+    assert result["status"] == "BLOCKED"
     assert result["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
-    assert state_calls == []
+    assert state_calls[-1]["loop_status"] == "PAUSED"
+    assert state_calls[-1]["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
 
 
 @pytest.mark.asyncio

@@ -995,21 +995,25 @@ class FinalClosureWorkflow(ControlledWorkflow):
                 context,
                 hardened_recovery=hardened_recovery,
             )
-        if context.get("status") != "FINAL_CLOSURE_READY":
+        source_merge_persisted = context.get("status") == "FINAL_SOURCE_MERGE_PERSISTED"
+        if not source_merge_persisted and context.get("status") != "FINAL_CLOSURE_READY":
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
-        if not await self._checkpoint("FINAL_MERGE_SOURCE"):
-            return {"status": "CANCELLED", "context": context}
-        context = await self._github_write_step("final.merge_source", context, timeout_minutes=30)
-        if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
-            return {"status": context["status"], "context": context}
-        # A protected merge is irreversible. New histories must persist its exact result
-        # before honoring cancellation; the patch-false branch preserves old histories.
-        if not hardened_recovery and not await self._checkpoint("FINAL_PERSIST_SOURCE_MERGE"):
-            return {"status": "CANCELLED", "context": context}
-        context = await self._step("final.persist_source_merge", context, timeout_minutes=30)
-        if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
-            return {"status": context["status"], "context": context}
+        if not source_merge_persisted:
+            if not await self._checkpoint("FINAL_MERGE_SOURCE"):
+                return {"status": "CANCELLED", "context": context}
+            context = await self._github_write_step(
+                "final.merge_source", context, timeout_minutes=30
+            )
+            if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
+                return {"status": context["status"], "context": context}
+            # A protected merge is irreversible. New histories must persist its exact result
+            # before honoring cancellation; the patch-false branch preserves old histories.
+            if not hardened_recovery and not await self._checkpoint("FINAL_PERSIST_SOURCE_MERGE"):
+                return {"status": "CANCELLED", "context": context}
+            context = await self._step("final.persist_source_merge", context, timeout_minutes=30)
+            if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
+                return {"status": context["status"], "context": context}
 
         for attempt in range(120):
             if hardened_recovery and not await self._checkpoint("FINAL_WAIT_FOR_BUILD"):
@@ -2142,12 +2146,6 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 }
             if not final_closure_enabled:
                 blocker = "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
-                if not global_child_blocker_return:
-                    return {
-                        "status": "BLOCKED_BY_DELIVERY",
-                        "blocker": blocker,
-                        "results": results,
-                    }
                 await self._step(
                     "backlog.record_loop_state",
                     {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},

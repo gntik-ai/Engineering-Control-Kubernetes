@@ -290,6 +290,15 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
         inventory.approval_json = approval
     context = handler._register_global_backlog(registration)
 
+    with pytest.raises(ValueError, match="persisted parent binding"):
+        handler._record_backlog_loop_state(
+            {
+                "backlog_campaign_id": str(MUSEMATIC_ID),
+                "loop_status": "PAUSED",
+                "blocker": "MISSING_GLOBAL_PARENT",
+            }
+        )
+
     preserved = handler._record_backlog_loop_state(
         {
             "backlog_campaign_id": str(FALCONE_ID),
