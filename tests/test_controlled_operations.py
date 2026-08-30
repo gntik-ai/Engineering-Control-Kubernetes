@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from engineering_control.api.schemas import OperationAccepted
 from engineering_control.config import Settings
@@ -19,9 +19,12 @@ from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
     BacklogIssueRecord,
+    Campaign,
     ConnectionSnapshot,
+    CoverageCell,
     Enhancement,
     GitHubBacklogCampaign,
+    OperationExport,
     OperationRequest,
     QuotaSnapshot,
     ReauthenticationBinding,
@@ -35,6 +38,8 @@ from engineering_control.operations.models import (
     EnhancementApproveCommand,
     EnhancementRejectCommand,
     EnhancementRunCommand,
+    EvidenceExportCampaignCommand,
+    EvidenceExportWorkflowCommand,
     RefreshConnectionsCommand,
     SolveBacklogCommand,
     SolveIssueCommand,
@@ -49,6 +54,7 @@ from engineering_control.workflows.definitions import ExistingGitHubBacklogLoopW
 from engineering_control.workflows.inputs import ExistingGitHubBacklogLoopInput
 
 CAMPAIGN_ID = UUID("11111111-1111-4111-8111-111111111111")
+AUDIT_CAMPAIGN_ID = UUID("22222222-2222-4222-8222-222222222222")
 SESSION_A = "a" * 64
 SESSION_B = "b" * 64
 PASSWORD = "bounded dashboard fixture password"  # noqa: S105
@@ -192,6 +198,80 @@ def _seed_enhancement(repository: OperationsRepository, *, ordinal: int = 1) -> 
     return key
 
 
+def _seed_export_targets(repository: OperationsRepository) -> str:
+    now = datetime.now(UTC)
+    workflow_id = "audit-falcone-export-fixture"
+    with repository.sessions.begin() as session:
+        session.add(
+            Campaign(
+                id=AUDIT_CAMPAIGN_ID,
+                project="falcone",
+                name="bounded export fixture",
+                status="COMPLETE",
+                source_sha="a" * 40,
+                deployment_sha="b" * 40,
+                required_cells=2,
+                metadata_json={
+                    "root_blockers": {
+                        "rb-safe": {
+                            "code": "DEPENDENCY_UNAVAILABLE",
+                            "summary": "Authorization: Bearer must-not-persist",
+                            "resolution_state": "open",
+                        }
+                    }
+                },
+            )
+        )
+        session.add_all(
+            [
+                CoverageCell(
+                    campaign_id=AUDIT_CAMPAIGN_ID,
+                    repository_surface="source",
+                    domain="api",
+                    persona="operator",
+                    flow="repository-static",
+                    lens="correctness",
+                    environment="staging",
+                    status="PASS",
+                    blocker=None,
+                    exclusion_approval_id=None,
+                    evidence_json=[{"raw": "not exported"}],
+                    result_json={"password": "must-not-persist"},
+                ),
+                CoverageCell(
+                    campaign_id=AUDIT_CAMPAIGN_ID,
+                    repository_surface="deployment",
+                    domain="runtime",
+                    persona="viewer",
+                    flow="e2e",
+                    lens="security",
+                    environment="staging",
+                    status="BLOCKED",
+                    blocker="DEPENDENCY_UNAVAILABLE",
+                    exclusion_approval_id=None,
+                    evidence_json=[],
+                    result_json={},
+                ),
+            ]
+        )
+        session.add(
+            Run(
+                campaign_id=AUDIT_CAMPAIGN_ID,
+                change_set_id=None,
+                workflow_id=workflow_id,
+                run_type="audit",
+                status="COMPLETE",
+                project="falcone",
+                worker="controller",
+                started_at=now - timedelta(minutes=2),
+                finished_at=now,
+                error_code=None,
+                summary="cookie=session-secret-value",
+            )
+        )
+    return workflow_id
+
+
 def test_command_models_deny_production_and_arbitrary_arguments() -> None:
     with pytest.raises(ValidationError):
         parse_command(
@@ -226,6 +306,22 @@ def test_command_models_deny_production_and_arbitrary_arguments() -> None:
             risk="R1",
             execution_mode="source-pr",
             dry_run=True,
+        )
+    with pytest.raises(ValidationError):
+        parse_command(
+            {
+                "action": "evidence_export_workflow",
+                "workflow_id": "safe-workflow",
+                "format": "zip",
+            }
+        )
+    with pytest.raises(ValidationError):
+        parse_command(
+            {
+                "action": "evidence_export_campaign",
+                "campaign_id": str(AUDIT_CAMPAIGN_ID),
+                "path": "/outside/arbitrary",
+            }
         )
 
 
@@ -527,6 +623,127 @@ def test_connection_projection_reports_github_worker_without_inventing_broker_su
         "worker_heartbeat_current": True,
     }
     assert values["worker-controller"].status == "NOT_INSTALLED"
+
+
+@pytest.mark.asyncio
+async def test_bounded_evidence_exports_are_typed_redacted_expiring_and_cross_channel(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    workflow_id = _seed_export_targets(repository)
+    bus = TypedCommandBus(Mock(), Mock(), repository)  # type: ignore[arg-type]
+
+    campaign_command = EvidenceExportCampaignCommand(campaign_id=AUDIT_CAMPAIGN_ID)
+    campaign_candidate = await repository.candidate(campaign_command, SESSION_A)
+    assert campaign_candidate.capability.status == "AVAILABLE"
+    assert campaign_candidate.project == "falcone"
+    assert campaign_candidate.operation_binding["project"] == "falcone"
+    assert campaign_candidate.operation_binding["resolved"]["coverage_cells"] == 2
+    campaign_operation = await bus.submit(
+        campaign_command,
+        source_channel="cli",
+        operator_class="engineering-ctl",
+        idempotency_key=_idempotency_fixture("campaign-export", 1),
+    )
+    assert campaign_operation.status == "COMPLETED"
+    assert campaign_operation.result_available is True
+    campaign_export = await repository.export_content(campaign_operation.operation_id)
+    assert campaign_export is not None
+    assert campaign_export["campaign"]["campaign_id"] == str(AUDIT_CAMPAIGN_ID)
+    assert campaign_export["coverage"]["status_counts"] == {"BLOCKED": 1, "PASS": 1}
+    assert "raw coverage results" in campaign_export["exclusions"]
+    serialized = str(campaign_export)
+    assert "must-not-persist" not in serialized
+    assert "not exported" not in serialized
+
+    workflow_operation = await bus.submit(
+        EvidenceExportWorkflowCommand(workflow_id=workflow_id),
+        source_channel="telegram",
+        operator_class="telegram:allowlisted",
+        idempotency_key=_idempotency_fixture("workflow-export", 1),
+    )
+    assert workflow_operation.status == "COMPLETED"
+    workflow_export = await repository.export_content(workflow_operation.operation_id)
+    assert workflow_export is not None
+    assert workflow_export["workflow"]["workflow_id"] == workflow_id
+    assert "agent transcript content" in workflow_export["exclusions"]
+    assert "session-secret-value" not in str(workflow_export)
+
+    with repository.sessions.begin() as session:
+        exports = list(session.scalars(select(OperationExport)).all())
+        assert len(exports) == 2
+        assert all(row.size_bytes <= repository.export_max_bytes for row in exports)
+        assert "must-not-persist" not in str(exports[0].content_json)
+        operations = list(
+            session.scalars(
+                select(OperationRequest).where(
+                    OperationRequest.id.in_(
+                        [campaign_operation.operation_id, workflow_operation.operation_id]
+                    )
+                )
+            ).all()
+        )
+        assert {row.project for row in operations} == {"falcone"}
+        exports[0].expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert await repository.export_content(campaign_operation.operation_id) is None
+    expired_operation = await repository.operation(campaign_operation.operation_id)
+    assert expired_operation is not None
+    assert expired_operation.result_available is False
+
+    with repository.sessions.begin() as session:
+        workflow_row = session.scalar(
+            select(OperationExport).where(
+                OperationExport.operation_id == workflow_operation.operation_id
+            )
+        )
+        assert workflow_row is not None
+        workflow_row.content_json = {"tampered": True}
+    assert await repository.export_content(workflow_operation.operation_id) is None
+    tampered_operation = await repository.operation(workflow_operation.operation_id)
+    assert tampered_operation is not None
+    assert tampered_operation.result_available is False
+
+    registry = {item["action"]: item for item in COMMAND_REGISTRY}
+    for action in ("evidence_export_campaign", "evidence_export_workflow"):
+        assert registry[action]["status"] == "AVAILABLE"
+        assert not any(
+            field["name"] in {"command", "args", "argv", "shell", "path"}
+            for field in registry[action]["fields"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_evidence_export_fails_closed_before_persistence_when_projection_is_too_large(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'bounded-export.sqlite'}"
+    repository = OperationsRepository(database_url, export_max_bytes=65_536)
+    Base.metadata.create_all(repository.engine)
+    _seed_export_targets(repository)
+    with repository.sessions.begin() as session:
+        campaign = session.get(Campaign, AUDIT_CAMPAIGN_ID)
+        assert campaign is not None
+        campaign.metadata_json = {
+            "root_blockers": {
+                f"root-{index:03d}": {
+                    "code": "BOUNDED_EXPORT_TEST",
+                    "summary": "x" * 500,
+                    "resolution_state": "open",
+                }
+                for index in range(200)
+            }
+        }
+    bus = TypedCommandBus(Mock(), Mock(), repository)  # type: ignore[arg-type]
+    operation = await bus.submit(
+        EvidenceExportCampaignCommand(campaign_id=AUDIT_CAMPAIGN_ID),
+        source_channel="cli",
+        operator_class="engineering-ctl",
+        idempotency_key=_idempotency_fixture("oversized-campaign-export", 1),
+    )
+    assert operation.status == "BLOCKED"
+    assert operation.safe_error == "operation export exceeds the configured size bound"
+    with repository.sessions() as session:
+        assert session.scalar(select(func.count(OperationExport.id))) == 0
 
 
 @pytest.mark.asyncio

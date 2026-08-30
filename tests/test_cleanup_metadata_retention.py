@@ -11,7 +11,96 @@ from sqlalchemy import select
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import AgentInvocation, ChangeSet, Deployment, Run
+from engineering_control.db.models import (
+    AgentInvocation,
+    ChangeSet,
+    Deployment,
+    OperationExport,
+    OperationRequest,
+    Run,
+)
+
+
+@pytest.mark.asyncio
+async def test_expired_operation_exports_are_bounded_cleanup_metadata(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'operation-exports.sqlite'}",
+            cleanup_execution_enabled=True,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    now = datetime.now(UTC)
+    operation_ids = [uuid4(), uuid4()]
+    with handler.sessions.begin() as session:
+        for index, operation_id in enumerate(operation_ids):
+            session.add(
+                OperationRequest(
+                    id=operation_id,
+                    action="evidence_export_workflow",
+                    project="falcone",
+                    target_type="workflow",
+                    target_id=f"workflow-{index}",
+                    payload_json={},
+                    source_channel="dashboard",
+                    operator_class="password-reauthenticated-operator",
+                    idempotency_key=f"{index + 1:064x}",
+                    binding_hash=f"{index + 3:064x}",
+                    workflow_id=None,
+                    temporal_run_id=None,
+                    status="COMPLETED",
+                    safe_error=None,
+                    created_at=now,
+                    confirmed_at=now,
+                    started_at=now,
+                    completed_at=now,
+                )
+            )
+            session.add(
+                OperationExport(
+                    operation_id=operation_id,
+                    export_kind="workflow",
+                    target_id=f"workflow-{index}",
+                    content_json={"safe": True},
+                    content_sha256=f"{index + 5:064x}",
+                    size_bytes=13,
+                    created_at=now,
+                    expires_at=now + timedelta(days=-1 if index == 0 else 1),
+                )
+            )
+    discovered = await handler.handle(
+        "cleanup.discover",
+        {
+            "dry_run": False,
+            "retention_policy": "standard",
+            "orchestration": {"workflow_id": "operation-export-cleanup-test"},
+        },
+    )
+    assert discovered["operation_export_cleanup_count"] == 1
+    authorized = await handler.handle(
+        "cleanup.authorize",
+        {
+            **discovered,
+            "eligible_candidates": [],
+            "inspected_file_candidates": [],
+            "inspected_preview_namespace_candidates": [],
+        },
+    )
+    executed = await handler.handle(
+        "cleanup.execute_metadata",
+        {
+            **authorized,
+            "removed_file_candidate_ids": [],
+            "absent_file_candidate_ids": [],
+            "removed_preview_namespace_candidate_ids": [],
+            "absent_preview_namespace_candidate_ids": [],
+        },
+    )
+    assert executed["deleted_operation_export_count"] == 1
+    with handler.sessions() as session:
+        remaining = list(session.scalars(select(OperationExport)).all())
+    assert len(remaining) == 1
+    assert remaining[0].operation_id == operation_ids[1]
 
 
 @pytest.mark.asyncio

@@ -204,6 +204,35 @@ def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
     assert bus.submit.await_args_list[1].kwargs["source_channel"] == "telegram"
 
 
+def test_private_operation_export_requires_api_auth_and_returns_only_stored_projection() -> None:
+    operation_id = uuid4()
+    operations = Mock()
+    operations.export_content = AsyncMock(
+        side_effect=lambda value: (
+            {"schema_version": 1, "workflow": {"workflow_id": "safe-workflow"}}
+            if value == operation_id
+            else None
+        )
+    )
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    app = create_app(
+        settings=Settings(),
+        service=FakeService(),
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+    with TestClient(app) as client:
+        assert client.get(f"/v1/operations/{operation_id}/export").status_code == 401
+        response = client.get(f"/v1/operations/{operation_id}/export", headers=headers)
+        missing = client.get(f"/v1/operations/{uuid4()}/export", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["workflow"]["workflow_id"] == "safe-workflow"
+    assert missing.status_code == 404
+
+
 def test_internal_metrics_expose_named_control_plane_families() -> None:
     app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
     with TestClient(app) as client:

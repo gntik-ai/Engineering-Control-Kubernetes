@@ -606,6 +606,23 @@ class OperationRequest(UUIDPrimaryKey, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class OperationExport(UUIDPrimaryKey, Base):
+    __tablename__ = "operation_exports"
+    operation_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("operation_requests.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    export_kind: Mapped[str] = mapped_column(String(32), index=True)
+    target_id: Mapped[str] = mapped_column(String(240))
+    content_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class ConnectionSnapshot(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "connection_snapshots"
     component: Mapped[str] = mapped_column(String(80), unique=True, index=True)

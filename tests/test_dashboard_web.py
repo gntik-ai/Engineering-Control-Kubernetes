@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 
@@ -10,7 +13,13 @@ from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.db.base import Base
-from engineering_control.db.models import DashboardEvent, Run
+from engineering_control.db.models import (
+    DashboardEvent,
+    OperationExport,
+    OperationRequest,
+    Run,
+)
+from engineering_control.operations.repository import OperationsRepository
 
 PASSWORD = "correct horse battery staple"  # noqa: S105 - deterministic test fixture
 
@@ -161,6 +170,86 @@ def test_dashboard_workflow_detail_returns_projection_and_safe_unknown_404(
     finally:
         client.__exit__(None, None, None)
         repository.engine.dispose()
+
+
+def test_dashboard_operation_export_requires_session_and_returns_bounded_attachment(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'export.db'}"
+    repository = DashboardRepository(database_url)
+    operations = OperationsRepository(database_url)
+    Base.metadata.create_all(repository.engine)
+    repository.initialize_password_sync(PASSWORD)
+    operation_id = UUID("33333333-3333-4333-8333-333333333333")
+    now = datetime.now(UTC)
+    export_content = {"schema_version": 1, "workflow": {"status": "completed"}}
+    encoded_export = json.dumps(
+        export_content,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    with operations.sessions.begin() as session:
+        session.add(
+            OperationRequest(
+                id=operation_id,
+                action="evidence_export_workflow",
+                project="falcone",
+                target_type="workflow",
+                target_id="bounded-workflow",
+                payload_json={
+                    "action": "evidence_export_workflow",
+                    "workflow_id": "bounded-workflow",
+                    "format": "json",
+                },
+                source_channel="dashboard",
+                operator_class="password-reauthenticated-operator",
+                idempotency_key="a" * 64,
+                binding_hash="b" * 64,
+                workflow_id=None,
+                temporal_run_id=None,
+                status="COMPLETED",
+                safe_error=None,
+                created_at=now,
+                confirmed_at=now,
+                started_at=now,
+                completed_at=now,
+            )
+        )
+        session.add(
+            OperationExport(
+                operation_id=operation_id,
+                export_kind="workflow",
+                target_id="bounded-workflow",
+                content_json=export_content,
+                content_sha256=hashlib.sha256(encoded_export).hexdigest(),
+                size_bytes=len(encoded_export),
+                created_at=now,
+                expires_at=now + timedelta(days=7),
+            )
+        )
+    app = create_app(
+        settings=Settings(database_url=database_url),
+        repository=repository,
+        operations_repository=operations,
+        session_key=b"e" * 48,
+    )
+    path = f"/api/dashboard/operations/{operation_id}/export"
+    with TestClient(app, base_url="https://testserver") as client:
+        assert client.get(path).status_code == 401
+        login = client.get("/login")
+        client.post("/login", data={"csrf_token": _csrf(login.text), "password": PASSWORD})
+        operation = client.get(f"/api/dashboard/operations/{operation_id}")
+        assert operation.json()["result_available"] is True
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/json"
+        assert response.headers["content-disposition"] == (
+            f'attachment; filename="engineering-control-export-{operation_id}.json"'
+        )
+        assert response.json()["workflow"]["status"] == "completed"
+    repository.engine.dispose()
+    operations.engine.dispose()
 
 
 def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(

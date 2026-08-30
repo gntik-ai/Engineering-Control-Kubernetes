@@ -128,6 +128,9 @@ def parser() -> argparse.ArgumentParser:
         commands.add_parser(name).add_argument("workflow_id")
     commands.add_parser("usage")
     commands.add_parser("evidence").add_argument("artifact_id")
+    commands.add_parser("export-campaign").add_argument("campaign_id")
+    commands.add_parser("export-workflow").add_argument("workflow_id")
+    commands.add_parser("operation-export").add_argument("operation_id")
     commands.add_parser("verify-finding").add_argument("finding_id")
     delivery = commands.add_parser("delivery")
     delivery.add_argument("finding_id")
@@ -371,6 +374,28 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         return client.request("GET", "/v1/usage")
     if command == "evidence":
         return client.request("GET", f"/v1/evidence/{arguments.artifact_id}")
+    if command == "export-campaign":
+        return client.request(
+            "POST",
+            "/v1/commands",
+            {
+                "action": "evidence_export_campaign",
+                "campaign_id": arguments.campaign_id,
+                "format": "json",
+            },
+        )
+    if command == "export-workflow":
+        return client.request(
+            "POST",
+            "/v1/commands",
+            {
+                "action": "evidence_export_workflow",
+                "workflow_id": arguments.workflow_id,
+                "format": "json",
+            },
+        )
+    if command == "operation-export":
+        return client.request("GET", f"/v1/operations/{arguments.operation_id}/export")
     if command == "verify-finding":
         return client.request("POST", "/v1/findings/verify", {"finding_id": arguments.finding_id})
     if command == "delivery":

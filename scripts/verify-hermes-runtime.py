@@ -13,6 +13,8 @@ ENGINEERING_COMMANDS = frozenset(
         "run",
         "status",
         "evidence",
+        "export-campaign",
+        "export-workflow",
         "approve",
         "reject",
         "pause",

@@ -102,7 +102,11 @@ def create_app(
             app.state.control_service = service
         resolved_operations = operations_repository
         if resolved_operations is None and (service is None or command_bus is not None):
-            resolved_operations = OperationsRepository(resolved.database_url.get_secret_value())
+            resolved_operations = OperationsRepository(
+                resolved.database_url.get_secret_value(),
+                export_retention_days=resolved.dashboard_operation_export_retention_days,
+                export_max_bytes=resolved.dashboard_operation_export_max_bytes,
+            )
         app.state.operations_repository = resolved_operations
         resolved_bus = command_bus
         if resolved_bus is None and resolved_operations is not None:
@@ -198,6 +202,17 @@ def create_app(
         if value is None:
             raise HTTPException(status_code=404, detail="operation not found")
         return value.model_dump(mode="json")
+
+    @app.get("/v1/operations/{operation_id}/export")
+    async def operation_export_get(
+        operation_id: UUID,
+        _subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        value = await repository.export_content(operation_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="operation export not found")
+        return value
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

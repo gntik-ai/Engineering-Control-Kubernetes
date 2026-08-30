@@ -32,6 +32,7 @@ def test_metadata_contains_required_tables() -> None:
         "enhancements",
         "github_backlog_campaigns",
         "backlog_issue_records",
+        "operation_exports",
     }
     assert required.issubset(Base.metadata.tables)
     quota_columns = Base.metadata.tables["quota_snapshots"].columns

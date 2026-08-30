@@ -26,6 +26,8 @@ COMMANDS = {
     "run": "Start delivery for one confirmed finding.",
     "status": "Show a workflow run.",
     "evidence": "Show redacted evidence metadata.",
+    "export-campaign": "Create a bounded redacted campaign summary export.",
+    "export-workflow": "Create a bounded redacted workflow summary export.",
     "approve": "Inspect or approve an immutable deployment candidate.",
     "reject": "Reject an immutable deployment candidate.",
     "pause": "Pause a campaign at its next checkpoint.",
