@@ -3488,6 +3488,11 @@ class MetadataActivityHandler:
                 raise ValueError("final deployment merge persistence binding is missing")
             recovery = dict(change_set.recovery_json)
             closure = dict(self._object(recovery.get("final_closure"), "final closure"))
+            persisted_deployment_plan = FinalDeploymentMergePlan.model_validate(
+                closure.get("final_deployment_merge_plan")
+            )
+            if persisted_deployment_plan != deployment_plan:
+                raise ValueError("persisted final deployment merge plan changed")
             value = merge.model_dump(mode="json")
             prior = closure.get("deployment_merge")
             if prior is not None and prior != value:
@@ -4078,7 +4083,10 @@ class MetadataActivityHandler:
                     ChangeSetState.DEPLOY_PR.value,
                 }
                 if run.run_type == "final-closure"
-                else {ChangeSetState.CANDIDATE_BUILT.value}
+                else {
+                    ChangeSetState.CANDIDATE_BUILT.value,
+                    ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+                }
             )
             if change_set.state not in allowed_states:
                 raise ValueError("immutable promotion requires a verified candidate build")

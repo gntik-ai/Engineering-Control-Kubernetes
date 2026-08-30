@@ -978,6 +978,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: FinalClosureInput) -> dict[str, Any]:
+        hardened_recovery = workflow.patched("final-closure-recovery-v2")
         context: dict[str, Any] = asdict(request)
         if not await self._checkpoint("FINAL_PREPARE"):
             return {"status": "CANCELLED", "context": context}
@@ -985,27 +986,37 @@ class FinalClosureWorkflow(ControlledWorkflow):
         if context.get("status") == "FIXED":
             return {"status": "FIXED", "context": context}
         if context.get("status") == "FINAL_ISSUE_CLOSE_READY":
-            return await self._resume_final_issue_close(context)
+            return await self._resume_final_issue_close(
+                context, hardened_recovery=hardened_recovery
+            )
         if context.get("status") != "FINAL_CLOSURE_READY":
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
-        for step in ("final.merge_source", "final.persist_source_merge"):
-            if not await self._checkpoint(step.upper().replace(".", "_")):
-                return {"status": "CANCELLED", "context": context}
-            context = (
-                await self._github_write_step(step, context, timeout_minutes=30)
-                if step == "final.merge_source"
-                else await self._step(step, context, timeout_minutes=30)
-            )
-            if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
-                return {"status": context["status"], "context": context}
+        if not await self._checkpoint("FINAL_MERGE_SOURCE"):
+            return {"status": "CANCELLED", "context": context}
+        context = await self._github_write_step("final.merge_source", context, timeout_minutes=30)
+        if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
+            return {"status": context["status"], "context": context}
+        # A protected merge is irreversible. New histories must persist its exact result
+        # before honoring cancellation; the patch-false branch preserves old histories.
+        if not hardened_recovery and not await self._checkpoint("FINAL_PERSIST_SOURCE_MERGE"):
+            return {"status": "CANCELLED", "context": context}
+        context = await self._step("final.persist_source_merge", context, timeout_minutes=30)
+        if context.get("status") in {"BLOCKED", "FAILED", "CANCELLED"}:
+            return {"status": context["status"], "context": context}
 
-        for _attempt in range(120):
-            if not await self._checkpoint("FINAL_WAIT_FOR_BUILD"):
+        for attempt in range(120):
+            if hardened_recovery and not await self._checkpoint("FINAL_WAIT_FOR_BUILD"):
                 return {"status": "CANCELLED", "context": context}
             context = await self._step("final.inspect_artifact", context, timeout_minutes=30)
             if context.get("status") == "FINAL_ARTIFACT_VERIFIED":
                 break
+            if not hardened_recovery:
+                return {
+                    "status": "BLOCKED",
+                    "blocker": context.get("blocker", "FINAL_BUILD_NOT_YET_AVAILABLE"),
+                    "context": context,
+                }
             if (
                 context.get("status") != "AWAITING_FINAL_BUILD"
                 or context.get("blocker") != "FINAL_BUILD_NOT_YET_AVAILABLE"
@@ -1015,7 +1026,8 @@ class FinalClosureWorkflow(ControlledWorkflow):
                     "blocker": context.get("blocker", "FINAL_BUILD_RECONCILIATION_FAILED"),
                     "context": context,
                 }
-            await workflow.sleep(timedelta(minutes=1))
+            if attempt < 119:
+                await workflow.sleep(timedelta(minutes=1))
         else:
             return {
                 "status": "BLOCKED",
@@ -1057,7 +1069,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
         if context.get("status") != "DEPLOY_PR":
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
-        if not await self._checkpoint("FINAL_MERGE_DEPLOYMENT"):
+        if hardened_recovery and not await self._checkpoint("FINAL_MERGE_DEPLOYMENT"):
             return {"status": "CANCELLED", "context": context}
         context = await self._github_write_step(
             "final.merge_deployment", context, timeout_minutes=30
@@ -1067,14 +1079,18 @@ class FinalClosureWorkflow(ControlledWorkflow):
         context = await self._step("final.persist_deployment_merge", context)
         if context.get("status") != "FINAL_DEPLOYMENT_MERGE_PERSISTED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
-        return await self._resume_after_final_deployment_merge(request, context)
+        return await self._resume_after_final_deployment_merge(
+            request, context, hardened_recovery=hardened_recovery
+        )
 
     async def _resume_after_final_deployment_merge(
         self,
         request: FinalClosureInput,
         context: dict[str, Any],
+        *,
+        hardened_recovery: bool,
     ) -> dict[str, Any]:
-        if not await self._checkpoint("FINAL_SYNC_WORKTREES"):
+        if hardened_recovery and not await self._checkpoint("FINAL_SYNC_WORKTREES"):
             return {"status": "CANCELLED", "context": context}
         context = await self._step("final.sync_worktrees", context, timeout_minutes=30)
         if context.get("status") != "FINAL_WORKTREES_SYNCHRONIZED":
@@ -1082,7 +1098,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
 
         task_queue = workflow.info().task_queue
         staging_id = f"{workflow.info().workflow_id}-final-staging"
-        if not await self._checkpoint("FINAL_STAGING_DEPLOYMENT"):
+        if hardened_recovery and not await self._checkpoint("FINAL_STAGING_DEPLOYMENT"):
             return {"status": "CANCELLED", "context": context}
         await self._step(
             "backlog.register_child_run",
@@ -1118,7 +1134,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
         if not deployment_id:
             return {"status": "BLOCKED", "blocker": "FINAL_DEPLOYMENT_BINDING_MISSING"}
         verification_id = f"{workflow.info().workflow_id}-final-runtime"
-        if not await self._checkpoint("FINAL_RUNTIME_VERIFICATION"):
+        if hardened_recovery and not await self._checkpoint("FINAL_RUNTIME_VERIFICATION"):
             return {"status": "CANCELLED", "context": context}
         await self._step(
             "backlog.register_child_run",
@@ -1142,17 +1158,19 @@ class FinalClosureWorkflow(ControlledWorkflow):
                 "blocker": verified.get("blocker") or verified.get("status"),
                 "context": context,
             }
-        if not await self._checkpoint("FINAL_PREPARE_ISSUE_CLOSE"):
+        if hardened_recovery and not await self._checkpoint("FINAL_PREPARE_ISSUE_CLOSE"):
             return {"status": "CANCELLED", "context": context}
         context = await self._step(
             "final.prepare_issue_close", {**context, "deployment_id": deployment_id}
         )
         if context.get("status") != "FINAL_ISSUE_CLOSE_READY":
             return {"status": context.get("status", "BLOCKED"), "context": context}
-        return await self._resume_final_issue_close(context)
+        return await self._resume_final_issue_close(context, hardened_recovery=hardened_recovery)
 
-    async def _resume_final_issue_close(self, context: dict[str, Any]) -> dict[str, Any]:
-        if not await self._checkpoint("FINAL_COMMENT_ISSUE"):
+    async def _resume_final_issue_close(
+        self, context: dict[str, Any], *, hardened_recovery: bool
+    ) -> dict[str, Any]:
+        if hardened_recovery and not await self._checkpoint("FINAL_COMMENT_ISSUE"):
             return {"status": "CANCELLED", "context": context}
         context = await self._github_write_step("final.comment_issue", context)
         if context.get("status") != "FINAL_EVIDENCE_COMMENTED":
@@ -1160,7 +1178,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
         context = await self._step("final.persist_comment", context)
         if context.get("status") != "FINAL_EVIDENCE_PERSISTED":
             return {"status": context.get("status", "BLOCKED"), "context": context}
-        if not await self._checkpoint("FINAL_CLOSE_ISSUE"):
+        if hardened_recovery and not await self._checkpoint("FINAL_CLOSE_ISSUE"):
             return {"status": "CANCELLED", "context": context}
         context = await self._github_write_step("final.close_issue", context)
         if context.get("status") != "ISSUE_CLOSED":
@@ -2107,6 +2125,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 }
             if not final_closure_enabled:
                 blocker = "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
+                if not global_child_blocker_return:
+                    return {
+                        "status": "BLOCKED_BY_DELIVERY",
+                        "blocker": blocker,
+                        "results": results,
+                    }
                 await self._step(
                     "backlog.record_loop_state",
                     {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},

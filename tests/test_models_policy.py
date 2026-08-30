@@ -142,6 +142,20 @@ def test_change_set_policy_declares_the_complete_final_closure_path() -> None:
     item = ChangeSetPolicy.transition(
         item,
         ChangeSetState.ISSUE_CLOSED,
-        TransitionEvidence(issue_closed=True, runtime_verified=True),
+        TransitionEvidence(
+            issue_closed=True,
+            runtime_verified=True,
+            final_merged_revision_verified=True,
+        ),
     )
     assert item.state is ChangeSetState.ISSUE_CLOSED
+
+
+def test_issue_close_requires_final_merged_revision_verification() -> None:
+    item = change_set().model_copy(update={"state": ChangeSetState.RUNTIME_VERIFIED})
+    with pytest.raises(ValueError, match="final_merged_revision_verified"):
+        ChangeSetPolicy.transition(
+            item,
+            ChangeSetState.ISSUE_CLOSED,
+            TransitionEvidence(issue_closed=True, runtime_verified=True),
+        )

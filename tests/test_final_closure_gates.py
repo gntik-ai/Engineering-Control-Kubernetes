@@ -598,6 +598,27 @@ def test_final_persistence_rejects_invalid_source_artifact_and_deployment_states
             }
         )
 
+    changed_review = deployment_plan.model_copy(update={"independent_review_sha256": "6" * 64})
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, plan.change_set_id)
+        assert change_set is not None
+        change_set.state = ChangeSetState.DEPLOY_PR.value
+        change_set.recovery_json = {
+            **change_set.recovery_json,
+            "final_closure": {
+                "final_deployment_merge_plan": changed_review.model_dump(mode="json")
+            },
+        }
+    with pytest.raises(ValueError, match="persisted final deployment merge plan changed"):
+        handler._persist_final_deployment_merge(
+            {
+                "status": "DEPLOYMENT_MERGED",
+                "final_closure_plan": plan.model_dump(mode="json"),
+                "final_deployment_merge_plan": deployment_plan.model_dump(mode="json"),
+                "deployment_merge": deployment_merge.model_dump(mode="json"),
+            }
+        )
+
 
 class _DirtyRunner:
     def run(self, *_args: Any, **_kwargs: Any) -> Any:

@@ -191,3 +191,50 @@ def test_expiry_keeps_policy_for_current_owner_and_expires_inventory(
     with Session(engine) as session:
         assert session.get(GitHubBacklogCampaign, owner_id).status == "APPROVED"
         assert session.get(GitHubBacklogCampaign, inventory_id).status == "EXPIRED"
+
+
+def test_expiry_keeps_policy_while_current_owner_activation_is_pending(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'expiry-pending-owner.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    owner_id = UUID("11111111-1111-4111-8111-111111111111")
+    with Session(engine) as session, session.begin():
+        session.add(
+            campaign(
+                owner_id,
+                project="falcone",
+                status="APPROVED_POLICY_PENDING",
+                role="owner",
+                now=now,
+            )
+        )
+    with Session(engine) as session, session.begin():
+        assert EXPIRE_CAMPAIGNS(session, now) is False
+    with Session(engine) as session:
+        assert session.get(GitHubBacklogCampaign, owner_id).status == "APPROVED_POLICY_PENDING"
+
+
+def test_disable_accepts_expired_terminal_owner_for_fail_safe_policy_removal(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'expired-disable.sqlite'}")
+    Base.metadata.create_all(engine)
+    campaign_id = UUID("11111111-1111-4111-8111-111111111111")
+    owner = campaign(
+        campaign_id,
+        project="falcone",
+        status="STOPPED",
+        role="owner",
+        now=datetime.now(UTC) - timedelta(days=2),
+    )
+    request = {
+        "action": "disable-existing-backlog",
+        "backlog_campaign_id": str(campaign_id),
+        "project": "falcone",
+        "approval_binding": owner.approval_binding,
+        "requested_by": "telegram:42",
+    }
+    with Session(engine) as session, session.begin():
+        session.add(owner)
+    with Session(engine) as session:
+        assert VALIDATE_CAMPAIGN(session, request).id == campaign_id

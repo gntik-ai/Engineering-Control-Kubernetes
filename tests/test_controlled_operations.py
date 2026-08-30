@@ -1520,7 +1520,13 @@ async def test_final_closure_patch_false_preserves_the_prior_terminal_sequence(
     monkeypatch.setattr(
         workflow_definitions.workflow,
         "patched",
-        lambda name: name != "existing-backlog-final-closure-v1",
+        lambda name: (
+            name
+            not in {
+                "existing-backlog-final-closure-v1",
+                "global-backlog-child-blocker-return-v1",
+            }
+        ),
     )
     monkeypatch.setattr(
         workflow_definitions.workflow,
@@ -1541,10 +1547,9 @@ async def test_final_closure_patch_false_preserves_the_prior_terminal_sequence(
         )
     )
 
-    assert result["status"] == "BLOCKED"
+    assert result["status"] == "BLOCKED_BY_DELIVERY"
     assert result["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
-    assert state_calls[-1]["loop_status"] == "PAUSED"
-    assert state_calls[-1]["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
+    assert state_calls == []
 
 
 @pytest.mark.asyncio

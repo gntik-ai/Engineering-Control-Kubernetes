@@ -603,6 +603,7 @@ async def test_final_closure_workflow_requires_final_build_before_other_mutation
 
     instance._step = step  # type: ignore[method-assign]
     instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
     monkeypatch.setattr(workflow_definitions.workflow, "sleep", lambda _delay: _true())
     result = await instance.run(
         FinalClosureInput(
@@ -627,7 +628,9 @@ async def test_final_closure_workflow_requires_final_build_before_other_mutation
 
 
 @pytest.mark.asyncio
-async def test_final_closure_resumes_only_bounded_issue_comment_and_close() -> None:
+async def test_final_closure_resumes_only_bounded_issue_comment_and_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     instance = FinalClosureWorkflow()
     instance._checkpoint = lambda _phase: _true()  # type: ignore[method-assign]
     steps: list[str] = []
@@ -645,6 +648,7 @@ async def test_final_closure_resumes_only_bounded_issue_comment_and_close() -> N
 
     instance._step = step  # type: ignore[method-assign]
     instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
 
     result = await instance.run(
         FinalClosureInput(
@@ -717,6 +721,7 @@ async def test_final_closure_orders_verification_before_comment_and_close(
     instance._step = step  # type: ignore[method-assign]
     instance._github_write_step = step  # type: ignore[method-assign]
     instance._agent_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
     monkeypatch.setattr(
         workflow_definitions.workflow,
         "info",
@@ -738,6 +743,103 @@ async def test_final_closure_orders_verification_before_comment_and_close(
     assert result["status"] == "FIXED"
     assert steps.index("RuntimeVerificationWorkflow") < steps.index("final.comment_issue")
     assert steps.index("final.persist_comment") < steps.index("final.close_issue")
+
+
+@pytest.mark.asyncio
+async def test_final_closure_patch_false_preserves_installed_one_shot_build_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = FinalClosureWorkflow()
+    checkpoints: list[str] = []
+    steps: list[str] = []
+
+    async def checkpoint(phase: str) -> bool:
+        checkpoints.append(phase)
+        return True
+
+    async def step(name: str, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        statuses = {
+            "final.prepare": "FINAL_CLOSURE_READY",
+            "final.merge_source": "SOURCE_MERGED",
+            "final.persist_source_merge": "AWAITING_FINAL_BUILD",
+            "final.inspect_artifact": "AWAITING_FINAL_BUILD",
+        }
+        return {**payload, "status": statuses[name], "blocker": "FINAL_BUILD_NOT_YET_AVAILABLE"}
+
+    instance._checkpoint = checkpoint  # type: ignore[method-assign]
+    instance._step = step  # type: ignore[method-assign]
+    instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: False)
+
+    result = await instance.run(
+        FinalClosureInput(
+            backlog_campaign_id=str(uuid4()),
+            change_set_id=str(uuid4()),
+            finding_id=str(uuid4()),
+            project="falcone",
+            issue_repository="gntik-ai/falcone",
+            issue_number=42,
+        )
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "FINAL_BUILD_NOT_YET_AVAILABLE"
+    assert steps == [
+        "final.prepare",
+        "final.merge_source",
+        "final.persist_source_merge",
+        "final.inspect_artifact",
+    ]
+    assert checkpoints == [
+        "FINAL_PREPARE",
+        "FINAL_MERGE_SOURCE",
+        "FINAL_PERSIST_SOURCE_MERGE",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_closure_patch_true_persists_irreversible_source_merge_before_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = FinalClosureWorkflow()
+    checkpoints: list[str] = []
+    steps: list[str] = []
+
+    async def checkpoint(phase: str) -> bool:
+        checkpoints.append(phase)
+        return phase != "FINAL_PERSIST_SOURCE_MERGE"
+
+    async def step(name: str, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        statuses = {
+            "final.prepare": "FINAL_CLOSURE_READY",
+            "final.merge_source": "SOURCE_MERGED",
+            "final.persist_source_merge": "AWAITING_FINAL_BUILD",
+            "final.inspect_artifact": "FAILED",
+        }
+        return {**payload, "status": statuses[name], "blocker": "SYNTHETIC_BUILD_FAILURE"}
+
+    instance._checkpoint = checkpoint  # type: ignore[method-assign]
+    instance._step = step  # type: ignore[method-assign]
+    instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+
+    result = await instance.run(
+        FinalClosureInput(
+            backlog_campaign_id=str(uuid4()),
+            change_set_id=str(uuid4()),
+            finding_id=str(uuid4()),
+            project="falcone",
+            issue_repository="gntik-ai/falcone",
+            issue_number=42,
+        )
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "SYNTHETIC_BUILD_FAILURE"
+    assert "final.persist_source_merge" in steps
+    assert "FINAL_PERSIST_SOURCE_MERGE" not in checkpoints
 
 
 async def _true() -> bool:

@@ -153,7 +153,7 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
     expires_at = exact_binding.expires_at
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
-    if expires_at <= datetime.now(UTC):
+    if request["action"] == "enable-existing-backlog" and expires_at <= datetime.now(UTC):
         raise ValueError("GitHub campaign approval expired")
     expected_pair = {
         "falcone": ["gntik-ai/falcone", "gntik-ai/falcone-charts"],
@@ -172,7 +172,13 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     active = session.scalars(
         select(GitHubBacklogCampaign).where(
             GitHubBacklogCampaign.status.in_(
-                {"APPROVED_INVENTORY", "APPROVED", "RUNNING", "PAUSED"}
+                {
+                    "APPROVED_POLICY_PENDING",
+                    "APPROVED_INVENTORY",
+                    "APPROVED",
+                    "RUNNING",
+                    "PAUSED",
+                }
             )
         )
     ).all()
@@ -189,9 +195,12 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
         if expires_at is None or expires_at <= now:
             campaign.status = "EXPIRED"
             continue
-        if campaign.status in {"APPROVED", "RUNNING", "PAUSED"} and campaign.approval_json.get(
-            "policy_role"
-        ) in {None, "owner"}:
+        if campaign.status in {
+            "APPROVED_POLICY_PENDING",
+            "APPROVED",
+            "RUNNING",
+            "PAUSED",
+        } and campaign.approval_json.get("policy_role") in {None, "owner"}:
             unexpired_owner = True
     return not unexpired_owner
 
