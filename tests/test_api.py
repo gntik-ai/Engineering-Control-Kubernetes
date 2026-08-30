@@ -402,6 +402,52 @@ def test_campaign_reconciliation_never_repairs_a_shared_terminal_workflow_bindin
     operations.reconcile_terminal_campaign.assert_not_awaited()
 
 
+def test_shared_projection_rows_do_not_make_a_distinct_canary_look_duplicate() -> None:
+    workflow_ids = ["shared-running-canary", "shared-running-canary", "distinct-running-canary"]
+    candidates = [
+        {
+            "campaign_id": str(uuid4()),
+            "project": "falcone",
+            "name": "provider-canary",
+            "status": "PLANNED",
+            "workflow_id": workflow_id,
+            "run_type": "provider_acceptance",
+            "run_status": "RUNNING",
+            "blocker": None,
+            "age_seconds": 10,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        for workflow_id in workflow_ids
+    ]
+    operations = Mock()
+    operations.campaign_reconciliation_candidates = AsyncMock(return_value=candidates)
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    service = FakeService()
+    service.get_workflow = AsyncMock(
+        side_effect=lambda workflow_id: {"workflow_id": workflow_id, "status": "RUNNING"}
+    )
+    app = create_app(
+        settings=Settings(),
+        service=service,
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/campaigns/reconcile", headers=headers)
+
+    assert response.status_code == 200
+    assert [item["classification"] for item in response.json()["items"]] == [
+        "INCONSISTENT_STATE",
+        "INCONSISTENT_STATE",
+        "RUNNING_HEALTHY",
+    ]
+    assert service.get_workflow.await_count == 2
+
+
 def test_campaign_reconciliation_maps_a_concurrent_rebind_to_inconsistent_state() -> None:
     candidate = {
         "campaign_id": str(uuid4()),

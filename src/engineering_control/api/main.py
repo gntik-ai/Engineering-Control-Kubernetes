@@ -345,18 +345,27 @@ def create_app(
                     status_code=503, detail="Temporal visibility is temporarily unavailable"
                 ) from error
 
-        active_canary_counts: dict[tuple[str, str, str], int] = {}
         workflow_binding_counts: dict[str, int] = {}
         for candidate in candidates:
             workflow_id = candidate.get("workflow_id")
             if not isinstance(workflow_id, str) or workflow_id in missing_workflows:
                 continue
-            temporal_status = str(observed_by_workflow[workflow_id].get("status") or "UNKNOWN")
             workflow_binding_counts[workflow_id] = workflow_binding_counts.get(workflow_id, 0) + 1
+
+        active_canary_workflows: dict[tuple[str, str, str], set[str]] = {}
+        for candidate in candidates:
+            workflow_id = candidate.get("workflow_id")
+            if (
+                not isinstance(workflow_id, str)
+                or workflow_id in missing_workflows
+                or workflow_binding_counts.get(workflow_id, 0) != 1
+            ):
+                continue
+            temporal_status = str(observed_by_workflow[workflow_id].get("status") or "UNKNOWN")
             if is_active_canary(candidate, temporal_status):
                 key = canary_key(candidate)
-                assert key is not None
-                active_canary_counts[key] = active_canary_counts.get(key, 0) + 1
+                if key is not None:
+                    active_canary_workflows.setdefault(key, set()).add(workflow_id)
         for candidate in candidates:
             workflow_id = candidate.get("workflow_id")
             if not isinstance(workflow_id, str):
@@ -388,7 +397,7 @@ def create_app(
             elif (
                 is_active_canary(candidate, temporal_status)
                 and candidate_canary_key is not None
-                and active_canary_counts.get(candidate_canary_key, 0) > 1
+                and len(active_canary_workflows.get(candidate_canary_key, set())) > 1
             ):
                 changed = False
                 classification = "DUPLICATE_CANARY"
