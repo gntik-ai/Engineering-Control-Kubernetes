@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
+from temporalio.service import RPCError, RPCStatusCode
 
 from engineering_control.api.main import create_app
 from engineering_control.api.schemas import BacklogImportAccepted, OperationAccepted
@@ -202,6 +203,12 @@ def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> No
         response = client.post("/v1/campaigns/reconcile?limit=2&offset=0", headers=headers)
         assert response.status_code == 200
         assert len(response.json()["items"]) == 2
+        assert response.json()["classification_scope"] == {
+            "kind": "BOUNDED_PAGE",
+            "offset": 0,
+            "candidate_count": 2,
+            "canary_identity_fields": ["project", "name", "run_type"],
+        }
         assert response.json()["has_more"] is True
         assert response.json()["next_offset"] == 2
         assert client.post("/v1/campaigns/reconcile?limit=201", headers=headers).status_code == 422
@@ -212,7 +219,7 @@ def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> No
 def test_campaign_reconciliation_repairs_terminal_before_scoping_duplicate_canaries() -> None:
     terminal_campaign_id = uuid4()
     active_campaign_ids = [uuid4(), uuid4()]
-    unrelated_campaign_id = uuid4()
+    unrelated_campaign_ids = [uuid4(), uuid4()]
     candidates = [
         {
             "campaign_id": str(terminal_campaign_id),
@@ -242,11 +249,23 @@ def test_campaign_reconciliation_repairs_terminal_before_scoping_duplicate_canar
             for ordinal, campaign_id in enumerate(active_campaign_ids)
         ],
         {
-            "campaign_id": str(unrelated_campaign_id),
+            "campaign_id": str(unrelated_campaign_ids[0]),
             "project": "musematic",
+            "name": "provider-canary",
+            "status": "PLANNED",
+            "workflow_id": "different-project-canary",
+            "run_type": "provider_acceptance",
+            "run_status": "RUNNING",
+            "blocker": None,
+            "age_seconds": 10,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        {
+            "campaign_id": str(unrelated_campaign_ids[1]),
+            "project": "falcone",
             "name": "different-provider-canary",
             "status": "PLANNED",
-            "workflow_id": "unrelated-canary",
+            "workflow_id": "different-name-canary",
             "run_type": "provider_acceptance",
             "run_status": "RUNNING",
             "blocker": None,
@@ -284,10 +303,52 @@ def test_campaign_reconciliation_repairs_terminal_before_scoping_duplicate_canar
     assert items["terminal-canary"]["projection_repaired"] is True
     assert items["active-canary-0"]["classification"] == "DUPLICATE_CANARY"
     assert items["active-canary-1"]["classification"] == "DUPLICATE_CANARY"
-    assert items["unrelated-canary"]["classification"] == "RUNNING_HEALTHY"
+    assert items["different-project-canary"]["classification"] == "RUNNING_HEALTHY"
+    assert items["different-name-canary"]["classification"] == "RUNNING_HEALTHY"
     operations.reconcile_terminal_campaign.assert_awaited_once_with(
         terminal_campaign_id, "terminal-canary", "COMPLETED"
     )
+
+
+def test_campaign_reconciliation_distinguishes_missing_from_unavailable_temporal() -> None:
+    candidate = {
+        "campaign_id": str(uuid4()),
+        "project": "falcone",
+        "name": "provider-canary",
+        "status": "PLANNED",
+        "workflow_id": "missing-canary",
+        "run_type": "provider_acceptance",
+        "run_status": "RUNNING",
+        "blocker": None,
+        "age_seconds": 10,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    operations = Mock()
+    operations.campaign_reconciliation_candidates = AsyncMock(return_value=[candidate])
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    service = FakeService()
+    service.get_workflow = AsyncMock(
+        side_effect=RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+    )
+    app = create_app(
+        settings=Settings(),
+        service=service,
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        missing = client.post("/v1/campaigns/reconcile", headers=headers)
+        service.get_workflow.side_effect = RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
+        unavailable = client.post("/v1/campaigns/reconcile", headers=headers)
+
+    assert missing.status_code == 200
+    assert missing.json()["items"][0]["classification"] == "TEMPORAL_WORKFLOW_MISSING"
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {"detail": "Temporal visibility is temporarily unavailable"}
 
 
 def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:

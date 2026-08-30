@@ -9,6 +9,7 @@ from uuid import UUID
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from temporalio.client import Client
+from temporalio.service import RPCError, RPCStatusCode
 
 from engineering_control.api.auth import bearer_auth
 from engineering_control.api.schemas import (
@@ -301,32 +302,58 @@ def create_app(
             "TERMINATED",
             "TIMED_OUT",
         }
-        active_projection_statuses = {"QUEUED", "PLANNED", "RUNNING", "ACTIVE"}
+        # Campaign names are the persisted operator-defined campaign identity. Per-run
+        # uniqueness belongs to workflow_id, so project/name/run_type is the narrowest
+        # stable identity available for legacy canaries.
+        active_projection_statuses = {"QUEUED", "PLANNED", "RUNNING", "IN_PROGRESS"}
+
+        def canary_key(candidate: dict[str, Any]) -> tuple[str, str, str] | None:
+            run_type = str(candidate.get("run_type") or "")
+            name = str(candidate.get("name") or "").strip().lower()
+            if "canary" not in name and "acceptance" not in run_type:
+                return None
+            return (str(candidate.get("project") or ""), name, run_type)
+
+        def is_active_canary(candidate: dict[str, Any], temporal_status: str) -> bool:
+            return (
+                canary_key(candidate) is not None
+                and candidate["status"] in active_projection_statuses
+                and temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}
+            )
+
         observed_by_workflow: dict[str, dict[str, Any]] = {}
         missing_workflows: set[str] = set()
-        for candidate in candidates:
-            workflow_id = candidate.get("workflow_id")
-            if not isinstance(workflow_id, str):
-                continue
+        workflow_ids = {
+            workflow_id
+            for candidate in candidates
+            if isinstance((workflow_id := candidate.get("workflow_id")), str)
+        }
+        for workflow_id in workflow_ids:
             try:
                 observed_by_workflow[workflow_id] = await service.get_workflow(workflow_id)
-            except Exception:  # noqa: BLE001 - only a fixed safe classification leaves this API
-                missing_workflows.add(workflow_id)
+            except RPCError as error:
+                if error.status == RPCStatusCode.NOT_FOUND:
+                    missing_workflows.add(workflow_id)
+                    continue
+                raise HTTPException(
+                    status_code=503, detail="Temporal visibility is temporarily unavailable"
+                ) from error
+            except Exception as error:  # noqa: BLE001 - boundary returns one fixed safe error
+                raise HTTPException(
+                    status_code=503, detail="Temporal visibility is temporarily unavailable"
+                ) from error
 
         active_canary_counts: dict[tuple[str, str, str], int] = {}
+        workflow_binding_counts: dict[str, int] = {}
         for candidate in candidates:
             workflow_id = candidate.get("workflow_id")
             if not isinstance(workflow_id, str) or workflow_id in missing_workflows:
                 continue
-            run_type = str(candidate.get("run_type") or "")
-            name = str(candidate.get("name") or "").strip().lower()
             temporal_status = str(observed_by_workflow[workflow_id].get("status") or "UNKNOWN")
-            if (
-                ("canary" in name or "acceptance" in run_type)
-                and candidate["status"] in active_projection_statuses
-                and temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}
-            ):
-                key = (str(candidate.get("project") or ""), name, run_type)
+            workflow_binding_counts[workflow_id] = workflow_binding_counts.get(workflow_id, 0) + 1
+            if is_active_canary(candidate, temporal_status):
+                key = canary_key(candidate)
+                assert key is not None
                 active_canary_counts[key] = active_canary_counts.get(key, 0) + 1
         for candidate in candidates:
             workflow_id = candidate.get("workflow_id")
@@ -339,9 +366,7 @@ def create_app(
             observed = observed_by_workflow[workflow_id]
             temporal_status = str(observed.get("status") or "UNKNOWN")
             projected_terminal = candidate["status"] in projected_terminal_statuses
-            run_type = str(candidate.get("run_type") or "")
-            name = str(candidate.get("name") or "").strip().lower()
-            canary_key = (str(candidate.get("project") or ""), name, run_type)
+            candidate_canary_key = canary_key(candidate)
             if temporal_status in terminal and not projected_terminal:
                 changed = await repository.reconcile_terminal_campaign(
                     UUID(str(candidate["campaign_id"])), workflow_id, temporal_status
@@ -350,10 +375,13 @@ def create_app(
             elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"} and projected_terminal:
                 changed = False
                 classification = "INCONSISTENT_STATE"
+            elif workflow_binding_counts.get(workflow_id, 0) > 1:
+                changed = False
+                classification = "INCONSISTENT_STATE"
             elif (
-                candidate["status"] in active_projection_statuses
-                and temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}
-                and active_canary_counts.get(canary_key, 0) > 1
+                is_active_canary(candidate, temporal_status)
+                and candidate_canary_key is not None
+                and active_canary_counts.get(candidate_canary_key, 0) > 1
             ):
                 changed = False
                 classification = "DUPLICATE_CANARY"
@@ -396,6 +424,12 @@ def create_app(
             "status": "COMPLETE",
             "items": results,
             "deleted": 0,
+            "classification_scope": {
+                "kind": "BOUNDED_PAGE",
+                "offset": offset,
+                "candidate_count": len(candidates),
+                "canary_identity_fields": ["project", "name", "run_type"],
+            },
             "has_more": has_more,
             "next_offset": offset + limit if has_more else None,
         }
