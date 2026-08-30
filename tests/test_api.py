@@ -209,6 +209,87 @@ def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> No
     operations.campaign_reconciliation_candidates.assert_awaited_once_with(3, 0)
 
 
+def test_campaign_reconciliation_repairs_terminal_before_scoping_duplicate_canaries() -> None:
+    terminal_campaign_id = uuid4()
+    active_campaign_ids = [uuid4(), uuid4()]
+    unrelated_campaign_id = uuid4()
+    candidates = [
+        {
+            "campaign_id": str(terminal_campaign_id),
+            "project": "falcone",
+            "name": "provider-canary",
+            "status": "PLANNED",
+            "workflow_id": "terminal-canary",
+            "run_type": "provider_acceptance",
+            "run_status": "RUNNING",
+            "blocker": None,
+            "age_seconds": 10,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        *[
+            {
+                "campaign_id": str(campaign_id),
+                "project": "falcone",
+                "name": "provider-canary",
+                "status": "PLANNED",
+                "workflow_id": f"active-canary-{ordinal}",
+                "run_type": "provider_acceptance",
+                "run_status": "RUNNING",
+                "blocker": None,
+                "age_seconds": 10,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+            for ordinal, campaign_id in enumerate(active_campaign_ids)
+        ],
+        {
+            "campaign_id": str(unrelated_campaign_id),
+            "project": "musematic",
+            "name": "different-provider-canary",
+            "status": "PLANNED",
+            "workflow_id": "unrelated-canary",
+            "run_type": "provider_acceptance",
+            "run_status": "RUNNING",
+            "blocker": None,
+            "age_seconds": 10,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+    ]
+    operations = Mock()
+    operations.campaign_reconciliation_candidates = AsyncMock(return_value=candidates)
+    operations.reconcile_terminal_campaign = AsyncMock(return_value=True)
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    service = FakeService()
+    service.get_workflow = AsyncMock(
+        side_effect=lambda workflow_id: {
+            "workflow_id": workflow_id,
+            "status": "COMPLETED" if workflow_id == "terminal-canary" else "RUNNING",
+        }
+    )
+    app = create_app(
+        settings=Settings(),
+        service=service,
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/campaigns/reconcile", headers=headers)
+
+    assert response.status_code == 200
+    items = {item["workflow_id"]: item for item in response.json()["items"]}
+    assert items["terminal-canary"]["classification"] == "TERMINAL_NOT_RECONCILED"
+    assert items["terminal-canary"]["projection_repaired"] is True
+    assert items["active-canary-0"]["classification"] == "DUPLICATE_CANARY"
+    assert items["active-canary-1"]["classification"] == "DUPLICATE_CANARY"
+    assert items["unrelated-canary"]["classification"] == "RUNNING_HEALTHY"
+    operations.reconcile_terminal_campaign.assert_awaited_once_with(
+        terminal_campaign_id, "terminal-canary", "COMPLETED"
+    )
+
+
 def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
     bus = Mock()
     bus.dispatch_pending = AsyncMock(return_value=False)

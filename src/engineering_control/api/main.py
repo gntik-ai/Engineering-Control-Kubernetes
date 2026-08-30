@@ -292,35 +292,57 @@ def create_app(
         candidates = await repository.campaign_reconciliation_candidates(limit + 1, offset)
         has_more = len(candidates) > limit
         candidates = candidates[:limit]
-        active_canary_counts: dict[str, int] = {}
+        projected_terminal_statuses = {
+            "COMPLETE",
+            "COMPLETED",
+            "FAILED",
+            "CANCELED",
+            "CANCELLED",
+            "TERMINATED",
+            "TIMED_OUT",
+        }
+        active_projection_statuses = {"QUEUED", "PLANNED", "RUNNING", "ACTIVE"}
+        observed_by_workflow: dict[str, dict[str, Any]] = {}
+        missing_workflows: set[str] = set()
         for candidate in candidates:
+            workflow_id = candidate.get("workflow_id")
+            if not isinstance(workflow_id, str):
+                continue
+            try:
+                observed_by_workflow[workflow_id] = await service.get_workflow(workflow_id)
+            except Exception:  # noqa: BLE001 - only a fixed safe classification leaves this API
+                missing_workflows.add(workflow_id)
+
+        active_canary_counts: dict[tuple[str, str, str], int] = {}
+        for candidate in candidates:
+            workflow_id = candidate.get("workflow_id")
+            if not isinstance(workflow_id, str) or workflow_id in missing_workflows:
+                continue
             run_type = str(candidate.get("run_type") or "")
-            name = str(candidate.get("name") or "").lower()
-            if "canary" in name or "acceptance" in run_type:
-                if candidate["status"] not in {"COMPLETE", "COMPLETED", "FAILED", "CANCELLED"}:
-                    active_canary_counts[run_type] = active_canary_counts.get(run_type, 0) + 1
+            name = str(candidate.get("name") or "").strip().lower()
+            temporal_status = str(observed_by_workflow[workflow_id].get("status") or "UNKNOWN")
+            if (
+                ("canary" in name or "acceptance" in run_type)
+                and candidate["status"] in active_projection_statuses
+                and temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}
+            ):
+                key = (str(candidate.get("project") or ""), name, run_type)
+                active_canary_counts[key] = active_canary_counts.get(key, 0) + 1
         for candidate in candidates:
             workflow_id = candidate.get("workflow_id")
             if not isinstance(workflow_id, str):
                 results.append({**candidate, "classification": "ORPHANED_CAMPAIGN"})
                 continue
-            try:
-                observed = await service.get_workflow(workflow_id)
-            except Exception:  # noqa: BLE001 - only a fixed safe classification leaves this API
+            if workflow_id in missing_workflows:
                 results.append({**candidate, "classification": "TEMPORAL_WORKFLOW_MISSING"})
                 continue
+            observed = observed_by_workflow[workflow_id]
             temporal_status = str(observed.get("status") or "UNKNOWN")
-            projected_terminal = candidate["status"] in {
-                "COMPLETE",
-                "COMPLETED",
-                "FAILED",
-                "CANCELLED",
-            }
+            projected_terminal = candidate["status"] in projected_terminal_statuses
             run_type = str(candidate.get("run_type") or "")
-            if active_canary_counts.get(run_type, 0) > 1:
-                changed = False
-                classification = "DUPLICATE_CANARY"
-            elif temporal_status in terminal and not projected_terminal:
+            name = str(candidate.get("name") or "").strip().lower()
+            canary_key = (str(candidate.get("project") or ""), name, run_type)
+            if temporal_status in terminal and not projected_terminal:
                 changed = await repository.reconcile_terminal_campaign(
                     UUID(str(candidate["campaign_id"])), workflow_id, temporal_status
                 )
@@ -328,6 +350,13 @@ def create_app(
             elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"} and projected_terminal:
                 changed = False
                 classification = "INCONSISTENT_STATE"
+            elif (
+                candidate["status"] in active_projection_statuses
+                and temporal_status in {"RUNNING", "CONTINUED_AS_NEW"}
+                and active_canary_counts.get(canary_key, 0) > 1
+            ):
+                changed = False
+                classification = "DUPLICATE_CANARY"
             elif candidate["status"] in awaiting:
                 changed = False
                 classification = "AWAITING_HUMAN"
