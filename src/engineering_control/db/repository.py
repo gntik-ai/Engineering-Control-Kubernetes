@@ -568,6 +568,7 @@ class SQLMetadataRepository:
                     "gntik-ai/falcone-charts",
                     "gntik-ai/musematic",
                     "gntik-ai/musematic-deploy",
+                    "gntik-ai/llmwiki",
                 ],
                 "requested_by": actor,
                 "requested_at": datetime.now(UTC).isoformat(),

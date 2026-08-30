@@ -149,6 +149,19 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         href="/logs",
     ),
     _entry(
+        "Issues",
+        "r3_candidate",
+        "R3 approval binding",
+        available=True,
+        effect="read-only",
+        fields=[
+            _PROJECT,
+            {"name": "surface", "type": "select", "values": ["source", "deployment"]},
+            {"name": "issue_number", "type": "integer", "min": 1},
+        ],
+        href="/backlog",
+    ),
+    _entry(
         "Audits",
         "audit_plan",
         "Plan audit",

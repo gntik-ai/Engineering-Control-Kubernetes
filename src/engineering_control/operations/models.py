@@ -38,6 +38,7 @@ class SolveIssueCommand(OperationModel):
         "gntik-ai/falcone-charts",
         "gntik-ai/musematic",
         "gntik-ai/musematic-deploy",
+        "gntik-ai/llmwiki",
     ]
     issue_number: int = Field(ge=1)
     maximum_risk: RiskClass = RiskClass.R2
@@ -48,7 +49,7 @@ class SolveIssueCommand(OperationModel):
 
 class SolveBacklogCommand(OperationModel):
     action: Literal["solve_backlog"] = "solve_backlog"
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     backlog_campaign_id: UUID
     issue_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"] | None = None
     maximum_risk: RiskClass = RiskClass.R2
@@ -60,6 +61,29 @@ class SolveBacklogCommand(OperationModel):
     concurrency: Literal[1] = 1
     deployment_concurrency: Literal[1] = 1
     production: Literal[False] = False
+
+
+class AutonomousBacklogCommand(OperationModel):
+    action: Literal["start_autonomous_backlog"] = "start_autonomous_backlog"
+    campaign_id: UUID
+    backlog_campaign_ids: dict[str, UUID]
+    policy_campaign_id: UUID
+    environment: Literal["staging"] = "staging"
+    maximum_risk: Literal[RiskClass.R2] = RiskClass.R2
+    global_active_issues: Literal[1] = 1
+    global_deployments: Literal[1] = 1
+    implementation_correction_limit: Literal[5] = 5
+    deployment_correction_limit: Literal[3] = 3
+    production: Literal[False] = False
+    typed_confirmation: Literal["START_GLOBAL_STAGING_R2_BACKLOG"]
+
+    @model_validator(mode="after")
+    def exact_project_set(self) -> AutonomousBacklogCommand:
+        if set(self.backlog_campaign_ids) != {"falcone", "musematic", "llmwiki"}:
+            raise ValueError("global backlog requires exactly Falcone, Musematic, and LLMWiki")
+        if self.policy_campaign_id not in set(self.backlog_campaign_ids.values()):
+            raise ValueError("policy campaign must be one of the exact imported inventories")
+        return self
 
 
 AuditPreset = Literal[
@@ -133,7 +157,9 @@ class WorkflowControlCommand(OperationModel):
         "skip",
     ]
     workflow_id: str = Field(min_length=1, max_length=240, pattern=r"^[A-Za-z0-9._:-]+$")
-    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy"] | None = None
+    repository: (
+        Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"] | None
+    ) = None
     issue_number: int | None = Field(default=None, ge=1)
     reason_code: str | None = Field(default=None, min_length=3, max_length=120)
 
@@ -172,6 +198,7 @@ class LLMWikiBootstrapPlanCommand(OperationModel):
 type Command = Annotated[
     SolveIssueCommand
     | SolveBacklogCommand
+    | AutonomousBacklogCommand
     | AuditPlanCommand
     | AuditStartCommand
     | AdvancedAuditCommand

@@ -134,20 +134,24 @@ class GitHubActivityHandler:
                 non_retryable=True,
             )
         try:
-            self.broker.preflight(pair)
+            repositories_for_project = tuple(dict.fromkeys(pair))
+            self.broker.preflight(repositories_for_project)
             repositories: list[GitHubRepositoryBacklogSnapshot] = []
             remaining = maximum_items
-            for repository in pair:
+            for repository in repositories_for_project:
                 metadata = self.broker.repository_metadata(repository)
                 branch = metadata.get("defaultBranchRef")
                 default_branch = branch.get("name") if isinstance(branch, dict) else None
-                if default_branch != "main":
+                expected_branch: Literal["main", "master"] = (
+                    "master" if project == "llmwiki" else "main"
+                )
+                if default_branch != expected_branch:
                     raise ApplicationError(
                         "backlog repository default branch changed",
                         type="PolicyViolation",
                         non_retryable=True,
                     )
-                head = self.broker.branch_commit(repository, "main")
+                head = self.broker.branch_commit(repository, expected_branch)
                 raw_issues = self.broker.list_open_issues(repository)
                 issues = tuple(
                     self._issue_snapshot(repository, value) for value in raw_issues[:remaining]
@@ -164,7 +168,7 @@ class GitHubActivityHandler:
                 repositories.append(
                     GitHubRepositoryBacklogSnapshot(
                         repository=repository,
-                        default_branch="main",
+                        default_branch=expected_branch,
                         head_sha=head["sha"],
                         issues=issues,
                         pull_requests=pull_requests,
@@ -177,9 +181,9 @@ class GitHubActivityHandler:
                 non_retryable=True,
             ) from error
         snapshot = GitHubBacklogImportSnapshot(
-            project=cast(Literal["falcone", "musematic"], project),
+            project=cast(Literal["falcone", "musematic", "llmwiki"], project),
             imported_at=datetime.now(UTC),
-            repositories=(repositories[0], repositories[1]),
+            repositories=tuple(repositories),
         )
         return {
             **payload,

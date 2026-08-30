@@ -530,6 +530,10 @@ class MetadataActivityHandler:
                 return self._prepare_observability_codex(payload)
             if step == "observability.prepare_claude":
                 return self._prepare_observability_claude(payload)
+            if step == "observability.prepare_claude_maker":
+                return self._prepare_observability_claude_maker(payload)
+            if step == "observability.prepare_codex_checker":
+                return self._prepare_observability_codex_checker(payload)
             if step == "observability.finalize":
                 return await asyncio.to_thread(self._finalize_observability, payload)
         except (KeyError, TypeError, ValueError, ValidationError) as error:
@@ -782,19 +786,99 @@ class MetadataActivityHandler:
             "checker_request": request.model_dump(mode="json"),
         }
 
+    def _prepare_observability_claude_maker(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace = self._observability_workspace(payload)
+        workflow_id = self._workflow_id(payload)
+        request = AgentRequest(
+            run_id=uuid5(NAMESPACE_URL, f"observability-claude-maker:{workflow_id}"),
+            project=Project.FALCONE,
+            role="implementer",
+            provider=Provider.CLAUDE,
+            model_class=ModelClass.WORKER,
+            prompt=(
+                "This is a read-only Engineering Control reverse observability canary. Do not "
+                "call tools, read files, modify files, access credentials, or make external "
+                "requests. Return only the required JSON with decision PASS, provider claude, "
+                "and a short safe summary confirming maker visible-output streaming."
+            ),
+            working_directory=str(workspace),
+            output_schema=self._observability_schema("claude"),
+            timeout_seconds=300,
+            effort="low",
+            writable=False,
+            allowed_tools=("Read", "Glob", "Grep"),
+        )
+        return {
+            **payload,
+            "status": "PREPARING",
+            "maker_provider": "claude",
+            "provider_selection_reason": (
+                "read-only reverse canary routes maker to native Claude CLI"
+            ),
+            "maker_request": request.model_dump(mode="json"),
+        }
+
+    def _prepare_observability_codex_checker(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace = self._observability_workspace(payload)
+        claude_result = AgentResult.model_validate(payload.get("agent_result"))
+        if (
+            claude_result.status.value != "SUCCESS"
+            or claude_result.structured_result.get("decision") != "PASS"
+            or claude_result.structured_result.get("provider") != "claude"
+        ):
+            raise ValueError("Claude canary result did not satisfy its immutable contract")
+        workflow_id = self._workflow_id(payload)
+        request = AgentRequest(
+            run_id=uuid5(NAMESPACE_URL, f"observability-codex-checker:{workflow_id}"),
+            project=Project.FALCONE,
+            role="code-reviewer",
+            provider=Provider.CODEX,
+            model_class=ModelClass.JUDGE,
+            prompt=(
+                "This is an independent read-only Engineering Control reverse observability "
+                "canary. Do not call tools, read files, modify files, access credentials, or "
+                "make external requests. Return only the required JSON with decision PASS, "
+                "provider codex, and a short safe summary confirming checker "
+                "visible-output streaming."
+            ),
+            working_directory=str(workspace),
+            output_schema=self._observability_schema("codex"),
+            timeout_seconds=300,
+            effort="low",
+            writable=False,
+            skip_git_repository_check=True,
+            allowed_tools=("Read", "Glob", "Grep"),
+        )
+        return {
+            **payload,
+            "status": "PREPARING",
+            "claude_result": claude_result.model_dump(mode="json"),
+            "checker_provider": "codex",
+            "provider_selection_reason": (
+                "read-only reverse canary routes checker to native Codex CLI"
+            ),
+            "checker_request": request.model_dump(mode="json"),
+        }
+
     def _finalize_observability(self, payload: dict[str, Any]) -> dict[str, Any]:
         terminal = str(payload.get("terminal_status", "FAILED"))
         if terminal not in {"COMPLETED", "FAILED"}:
             raise ValueError("observability canary terminal status is invalid")
         workflow_id = self._workflow_id(payload)
         if terminal == "COMPLETED":
-            claude = AgentResult.model_validate(payload.get("agent_result"))
-            codex = AgentResult.model_validate(payload.get("codex_result"))
+            reverse = payload.get("provider_direction") == "claude-to-codex"
+            claude = AgentResult.model_validate(
+                payload.get("claude_result") if reverse else payload.get("agent_result")
+            )
+            codex = AgentResult.model_validate(
+                payload.get("agent_result") if reverse else payload.get("codex_result")
+            )
             if (
                 codex.provider is not Provider.CODEX
                 or claude.provider is not Provider.CLAUDE
                 or codex.structured_result.get("decision") != "PASS"
                 or claude.structured_result.get("decision") != "PASS"
+                or codex.structured_result.get("provider") != "codex"
                 or claude.structured_result.get("provider") != "claude"
             ):
                 raise ValueError("observability canary provider independence is incomplete")

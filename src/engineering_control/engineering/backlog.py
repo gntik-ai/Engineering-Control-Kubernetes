@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 BACKLOG_PROJECT_PAIRS: dict[str, tuple[str, str]] = {
     "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
     "musematic": ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
+    "llmwiki": ("gntik-ai/llmwiki", "gntik-ai/llmwiki"),
 }
 BACKLOG_REPOSITORIES = frozenset(
     repository for repositories in BACKLOG_PROJECT_PAIRS.values() for repository in repositories
@@ -35,12 +36,12 @@ BACKLOG_APPROVAL_PHRASE = "APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"
 BACKLOG_DELIVERY_APPROVAL_PHRASE = "APPROVE_STAGING_ISSUE_DELIVERY"
 
 _SHA = re.compile(r"^[a-f0-9]{40}$")
-_REPOSITORY = re.compile(r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy)$")
+_REPOSITORY = re.compile(r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$")
 _ISSUE_URL = re.compile(
-    r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy)/issues/[1-9][0-9]*$"
+    r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)/issues/[1-9][0-9]*$"
 )
 _REFERENCE = re.compile(
-    r"(?:(?:gntik-ai/)?(?P<repo>falcone|falcone-charts|musematic|musematic-deploy))?#(?P<number>[1-9][0-9]*)"
+    r"(?:(?:gntik-ai/)?(?P<repo>falcone|falcone-charts|musematic|musematic-deploy|llmwiki))?#(?P<number>[1-9][0-9]*)"
 )
 _DEPENDENCY = re.compile(
     r"(?i)(?:blocked\s+by|depends\s+on|dependency|requires)\s*[:#-]?\s*([^\n]{0,240})"
@@ -143,7 +144,7 @@ class GitHubPullRequestSnapshot(BacklogModel):
 
 class GitHubRepositoryBacklogSnapshot(BacklogModel):
     repository: str
-    default_branch: Literal["main"]
+    default_branch: Literal["main", "master"]
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     issues: tuple[GitHubIssueSnapshot, ...] = Field(max_length=1000)
     pull_requests: tuple[GitHubPullRequestSnapshot, ...] = Field(max_length=1000)
@@ -157,13 +158,13 @@ class GitHubRepositoryBacklogSnapshot(BacklogModel):
 
 
 class GitHubBacklogImportSnapshot(BacklogModel):
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     imported_at: datetime
-    repositories: tuple[GitHubRepositoryBacklogSnapshot, GitHubRepositoryBacklogSnapshot]
+    repositories: tuple[GitHubRepositoryBacklogSnapshot, ...] = Field(min_length=1, max_length=2)
 
     @model_validator(mode="after")
     def exact_pair(self) -> GitHubBacklogImportSnapshot:
-        expected = BACKLOG_PROJECT_PAIRS[self.project]
+        expected = tuple(dict.fromkeys(BACKLOG_PROJECT_PAIRS[self.project]))
         if tuple(repository.repository for repository in self.repositories) != expected:
             raise ValueError("GitHub import did not return the authoritative repository pair")
         return self
@@ -227,10 +228,10 @@ class BacklogIssueRecord(BacklogModel):
 
 class BacklogApprovalBinding(BacklogModel):
     backlog_campaign_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     paired_repositories: tuple[str, str]
-    source_branch: Literal["main"] = "main"
-    deployment_branch: Literal["main"] = "main"
+    source_branch: Literal["main", "master"] = "main"
+    deployment_branch: Literal["main", "master"] = "main"
     source_head: str = Field(pattern=r"^[a-f0-9]{40}$")
     deployment_head: str = Field(pattern=r"^[a-f0-9]{40}$")
     issue_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"]
@@ -458,7 +459,7 @@ def plan_records(records: list[BacklogIssueRecord]) -> tuple[list[BacklogIssueRe
 def approval_binding(
     *,
     campaign_id: str,
-    project: Literal["falcone", "musematic"],
+    project: Literal["falcone", "musematic", "llmwiki"],
     import_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"],
     source_head: str,
     deployment_head: str,
@@ -483,6 +484,8 @@ def approval_binding(
         ("in-falcone-staging", "helm:falcone")
         if project == "falcone"
         else ("musematic-platform", "platform-data", "argocd:musematic-platform")
+        if project == "musematic"
+        else ("llmwiki-staging-inputs-unresolved",)
     )
     build_workflows = (
         (".github/workflows/release-images.yml",)
@@ -493,6 +496,8 @@ def approval_binding(
         backlog_campaign_id=campaign_id,
         project=project,
         paired_repositories=BACKLOG_PROJECT_PAIRS[project],
+        source_branch="master" if project == "llmwiki" else "main",
+        deployment_branch="master" if project == "llmwiki" else "main",
         source_head=source_head,
         deployment_head=deployment_head,
         issue_filter=import_filter,

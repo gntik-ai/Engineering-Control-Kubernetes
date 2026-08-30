@@ -412,6 +412,7 @@ async def test_telegram_approval_queues_only_one_typed_root_policy_request(tmp_p
         "gntik-ai/falcone-charts",
         "gntik-ai/musematic",
         "gntik-ai/musematic-deploy",
+        "gntik-ai/llmwiki",
     ]
     assert (request_root / "activate.json").stat().st_mode & 0o777 == 0o600
     assert "token" not in request and "command" not in request

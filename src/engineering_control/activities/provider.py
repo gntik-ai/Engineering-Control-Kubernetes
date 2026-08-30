@@ -67,6 +67,8 @@ class ProviderActivityHandler:
         "enhancement.product_review": "product_review_request",
         "observability.invoke_codex": "maker_request",
         "observability.invoke_claude": "checker_request",
+        "observability.invoke_claude_maker": "maker_request",
+        "observability.invoke_codex_checker": "checker_request",
     }
 
     def __init__(
@@ -404,7 +406,7 @@ class ProviderActivityHandler:
                     non_retryable=True,
                 ) from error
             if (
-                step != "observability.invoke_codex"
+                step not in {"observability.invoke_codex", "observability.invoke_codex_checker"}
                 or request.provider is not Provider.CODEX
                 or request.writable
                 or worktree.parent != root / "observability-canary"

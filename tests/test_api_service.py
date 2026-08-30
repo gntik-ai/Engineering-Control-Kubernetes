@@ -54,11 +54,13 @@ class _StartedHandle:
 class _StartClient:
     def __init__(self) -> None:
         self.workflow_input: Any = None
+        self.workflow_name = ""
         self.task_queue = ""
 
     async def start_workflow(
         self, _workflow_type: str, workflow_input: Any, *, task_queue: str, **_kwargs: Any
     ) -> _StartedHandle:
+        self.workflow_name = _workflow_type
         self.workflow_input = workflow_input
         self.task_queue = task_queue
         return _StartedHandle()
@@ -147,3 +149,22 @@ async def test_observability_acceptance_rejects_non_read_only_contract() -> None
         await service.start_observability_acceptance(
             ObservabilityAcceptanceStart.model_construct(confirm_read_only=False)  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_reverse_observability_acceptance_binds_claude_maker_workflow() -> None:
+    client = _StartClient()
+    service = TemporalControlService(
+        client,  # type: ignore[arg-type]
+        "engineering-control",
+        EmptyMetadataRepository(),
+    )
+
+    accepted = await service.start_reverse_observability_acceptance(
+        ObservabilityAcceptanceStart(confirm_read_only=True)
+    )
+
+    assert accepted.workflow_id.startswith("reverse-observability-acceptance-")
+    assert accepted.run_id == "started-run-id"
+    assert client.workflow_name == "ReverseObservabilityAcceptanceWorkflow"
+    assert client.task_queue == "engineering-control"

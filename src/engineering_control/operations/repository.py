@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from engineering_control.db.models import (
     ActionCandidate,
     BacklogIssueRecord,
+    Campaign,
     ConnectionSnapshot,
     DashboardEvent,
     GitHubBacklogCampaign,
@@ -32,6 +33,7 @@ from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditPlanCommand,
     AuditStartCommand,
+    AutonomousBacklogCommand,
     CandidateView,
     CapabilityResult,
     Command,
@@ -70,6 +72,8 @@ def command_target(command: Command) -> tuple[str, str, str | None]:
         return "github_issue", f"{command.repository}#{command.issue_number}", command.project.value
     if isinstance(command, SolveBacklogCommand):
         return "backlog_campaign", str(command.backlog_campaign_id), command.project
+    if isinstance(command, AutonomousBacklogCommand):
+        return "global_backlog", str(command.campaign_id), "platform"
     if isinstance(command, (AuditPlanCommand, AuditStartCommand, AdvancedAuditCommand)):
         if isinstance(command, AdvancedAuditCommand):
             return (
@@ -115,6 +119,201 @@ class OperationsRepository:
 
     async def candidate(self, command: Command, session_binding_hash: str) -> CandidateView:
         return await asyncio.to_thread(self._candidate, command, session_binding_hash)
+
+    async def r3_issue_candidate(
+        self, project: str, surface: str, issue_number: int
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._r3_issue_candidate, project, surface, issue_number)
+
+    def _r3_issue_candidate(self, project: str, surface: str, issue_number: int) -> dict[str, Any]:
+        if (project, surface, issue_number) != ("musematic", "source", 1119):
+            raise ValueError("R3 approval route is bound to musematic source issue 1119")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            issue = session.scalar(
+                select(BacklogIssueRecord)
+                .join(
+                    GitHubBacklogCampaign,
+                    GitHubBacklogCampaign.id == BacklogIssueRecord.backlog_campaign_id,
+                )
+                .where(
+                    GitHubBacklogCampaign.project == project,
+                    BacklogIssueRecord.source_or_deployment_owner == surface,
+                    BacklogIssueRecord.issue_number == issue_number,
+                    BacklogIssueRecord.state == "OPEN",
+                )
+                .order_by(desc(GitHubBacklogCampaign.imported_at))
+                .limit(1)
+            )
+            if issue is None or issue.calculated_risk != "R3":
+                raise ValueError("current backlog issue is not an approval-bound R3 issue")
+            if issue.repository != "gntik-ai/musematic":
+                raise ValueError("R3 approval issue repository binding changed")
+            campaign = session.get(GitHubBacklogCampaign, issue.backlog_campaign_id)
+            if campaign is None:
+                raise ValueError("R3 backlog campaign disappeared")
+            target_id = f"{issue.repository}#{issue_number}"
+            immutable_payload = {
+                "project": project,
+                "repository": issue.repository,
+                "issue_number": issue.issue_number,
+                "issue_updated_at": issue.github_updated_at.isoformat(),
+                "issue_body_sha256": issue.body_sha256,
+                "source_repository": campaign.source_repository,
+                "deployment_repository": campaign.deployment_repository,
+                "source_branch": campaign.source_default_branch,
+                "deployment_branch": campaign.deployment_default_branch,
+                "source_head": campaign.source_head_at_import,
+                "deployment_head": campaign.deployment_head_at_import,
+                "execution_mode": "W0_BASELINE_REPAIR",
+                "possible_migration_or_backfill_scope": "issue-specific-additive-only",
+                "tenant_safety": [
+                    "canonical-principal-invariant-required",
+                    "idempotent-repair-required",
+                    "cross-tenant-repair-prohibited-without-proven-ownership",
+                ],
+                "github_operations": [
+                    "issue-comment",
+                    "bounded-branch-push",
+                    "pr-create-or-adopt",
+                    "ci-inspect",
+                    "protected-merge-after-gates",
+                ],
+                "build_workflow": "gntik-ai/musematic/.github/workflows/deploy.yml",
+                "build_contract_state": "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
+                "environment": "staging",
+                "delivery_adapter": "argocd:musematic-platform",
+                "verification": [
+                    "Argo-Synced-and-Healthy",
+                    "identity-endpoint-200",
+                    "negative-tenant-controls",
+                    "final-provenance",
+                ],
+                "rollback": "revert-protected-GitOps-change-and-reconcile",
+                "implementation_correction_limit": 5,
+                "deployment_correction_limit": 3,
+                "production": False,
+            }
+            existing_rows = session.scalars(
+                select(ActionCandidate)
+                .where(
+                    ActionCandidate.action == "r3_issue_approval",
+                    ActionCandidate.target_id == target_id,
+                    ActionCandidate.expires_at > now,
+                )
+                .order_by(desc(ActionCandidate.created_at))
+                .limit(10)
+            ).all()
+            for existing in existing_rows:
+                stored = existing.payload_json
+                if all(stored.get(key) == value for key, value in immutable_payload.items()):
+                    return {
+                        "status": (
+                            "AWAITING_R3_APPROVAL" if existing.used_at is None else "R3_APPROVED"
+                        ),
+                        "candidate_id": str(existing.id),
+                        "binding": existing.binding_hash,
+                        "confirmation_phrase": existing.confirmation_phrase,
+                        "candidate": stored,
+                        "telegram_command": (
+                            f"/loop approve-r3 {project} {surface} {issue_number} "
+                            f"{existing.binding_hash} {existing.confirmation_phrase}"
+                        ),
+                    }
+            expires_at = now + timedelta(hours=24)
+            payload = {**immutable_payload, "expires_at": expires_at.isoformat()}
+            binding = canonical_sha256(payload)
+            phrase = f"APPROVE_R3_{project.upper()}_{issue_number}_{binding[:16].upper()}"
+            bound_candidate = session.scalar(
+                select(ActionCandidate).where(
+                    ActionCandidate.action == "r3_issue_approval",
+                    ActionCandidate.binding_hash == binding,
+                )
+            )
+            if bound_candidate is None:
+                bound_candidate = ActionCandidate(
+                    action="r3_issue_approval",
+                    project=project,
+                    target_type="github_issue",
+                    target_id=target_id,
+                    payload_json=payload,
+                    capability_status="AVAILABLE",
+                    blockers_json=[],
+                    binding_hash=binding,
+                    confirmation_phrase=phrase,
+                    session_binding_hash=canonical_sha256({"r3": "cross-channel"}),
+                    created_at=now,
+                    expires_at=expires_at,
+                    used_at=None,
+                )
+                session.add(bound_candidate)
+                session.flush()
+            return {
+                "status": (
+                    "AWAITING_R3_APPROVAL" if bound_candidate.used_at is None else "R3_APPROVED"
+                ),
+                "candidate_id": str(bound_candidate.id),
+                "binding": binding,
+                "confirmation_phrase": phrase,
+                "candidate": payload,
+                "telegram_command": (
+                    f"/loop approve-r3 {project} {surface} {issue_number} {binding} {phrase}"
+                ),
+            }
+
+    async def approve_r3_issue(
+        self,
+        project: str,
+        surface: str,
+        issue_number: int,
+        binding: str,
+        phrase: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._approve_r3_issue,
+            project,
+            surface,
+            issue_number,
+            binding,
+            phrase,
+            actor,
+        )
+
+    def _approve_r3_issue(
+        self,
+        project: str,
+        surface: str,
+        issue_number: int,
+        binding: str,
+        phrase: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        if not (
+            actor.startswith("telegram:")
+            or actor == "engineering-ctl"
+            or actor == "dashboard:reauthenticated"
+        ):
+            raise ValueError("R3 approval requires an allowlisted operator channel")
+        candidate = self._r3_issue_candidate(project, surface, issue_number)
+        if candidate["binding"] != binding or candidate["confirmation_phrase"] != phrase:
+            raise ValueError("R3 approval binding or phrase changed")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            row = session.get(
+                ActionCandidate,
+                UUID(str(candidate["candidate_id"])),
+                with_for_update=True,
+            )
+            if row is None or _utc(row.expires_at) <= now:
+                raise ValueError("R3 approval candidate expired")
+            row.used_at = row.used_at or now
+        return {
+            "status": "R3_APPROVED",
+            "binding": binding,
+            "target": f"{candidate['candidate']['repository']}#{issue_number}",
+            "production": False,
+        }
 
     def _candidate(self, command: Command, session_binding_hash: str) -> CandidateView:
         if len(session_binding_hash) != 64:
@@ -190,6 +389,9 @@ class OperationsRepository:
         if isinstance(command, SolveBacklogCommand):
             project_name = command.project
             mode = command.delivery_mode
+        elif isinstance(command, AutonomousBacklogCommand):
+            project_name = "platform"
+            mode = "global-staging-r2"
         elif isinstance(
             command,
             (SolveIssueCommand, AuditPlanCommand, AuditStartCommand, AdvancedAuditCommand),
@@ -207,7 +409,36 @@ class OperationsRepository:
         elif isinstance(command, LLMWikiBootstrapPlanCommand):
             project_name = command.project
 
-        if isinstance(command, SolveIssueCommand):
+        if isinstance(command, AutonomousBacklogCommand):
+            binding = {
+                "campaign_id": str(command.campaign_id),
+                "backlog_campaign_ids": {
+                    key: str(value) for key, value in command.backlog_campaign_ids.items()
+                },
+                "policy_campaign_id": str(command.policy_campaign_id),
+                "environment": "staging",
+                "maximum_risk": "R2",
+                "global_active_issues": 1,
+                "global_deployments": 1,
+                "production": False,
+            }
+            for project, campaign_id in command.backlog_campaign_ids.items():
+                campaign = session.get(GitHubBacklogCampaign, campaign_id)
+                if campaign is None or campaign.project != project:
+                    blockers.append(f"{project.upper()}_BACKLOG_INVENTORY_INVALID")
+            policy = session.get(GitHubBacklogCampaign, command.policy_campaign_id)
+            if policy is None or policy.status not in {"APPROVED", "RUNNING"}:
+                blockers.append("GITHUB_WRITE_POLICY_NOT_ACTIVE")
+            active = session.scalar(
+                select(Run).where(
+                    Run.run_type == "autonomous-global-backlog",
+                    Run.status.in_(tuple(_ACTIVE_OPERATION_STATES | {"PAUSED", "BLOCKED"})),
+                )
+            )
+            if active is not None:
+                blockers.append("BACKLOG_CAMPAIGN_ALREADY_ACTIVE")
+                binding["existing_workflow_id"] = active.workflow_id
+        elif isinstance(command, SolveIssueCommand):
             if command.maximum_risk.value == "R3":
                 blockers.append("R3_OPERATOR_ACTION_REQUIRED")
             if command.delivery_mode == "full-delivery":
@@ -243,18 +474,18 @@ class OperationsRepository:
                 risk = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
                 if risk.get(issue.calculated_risk, 99) > risk[command.maximum_risk.value]:
                     blockers.append("ISSUE_RISK_EXCEEDS_BOUND")
-                active = self._active_operation(
+                issue_operation = self._active_operation(
                     session,
                     "solve_issue",
                     f"{command.repository}#{command.issue_number}",
                     exclude_operation_id=exclude_operation_id,
                 )
-                if active is not None:
+                if issue_operation is not None:
                     blockers.append("ISSUE_WORKFLOW_ALREADY_ACTIVE")
                     binding.update(
                         {
-                            "existing_operation_id": str(active.id),
-                            "existing_workflow_id": active.workflow_id,
+                            "existing_operation_id": str(issue_operation.id),
+                            "existing_workflow_id": issue_operation.workflow_id,
                         }
                     )
             required_credentials.extend(["github-broker", "native-codex", "native-claude"])
@@ -284,18 +515,18 @@ class OperationsRepository:
                     and campaign.import_filter != command.issue_filter
                 ):
                     blockers.append("BACKLOG_QUERY_BINDING_CHANGED")
-                active = self._active_operation(
+                backlog_operation = self._active_operation(
                     session,
                     "solve_backlog",
                     str(campaign.id),
                     exclude_operation_id=exclude_operation_id,
                 )
-                if active is not None:
+                if backlog_operation is not None:
                     blockers.append("BACKLOG_CAMPAIGN_ALREADY_ACTIVE")
                     binding.update(
                         {
-                            "existing_operation_id": str(active.id),
-                            "existing_workflow_id": active.workflow_id,
+                            "existing_operation_id": str(backlog_operation.id),
+                            "existing_workflow_id": backlog_operation.workflow_id,
                         }
                     )
             required_credentials.extend(["github-broker", "native-codex", "native-claude"])
@@ -960,6 +1191,146 @@ class OperationsRepository:
     async def connections(self) -> list[ConnectionView]:
         return await asyncio.to_thread(self._connections)
 
+    async def operator_snapshot(self, surface: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._operator_snapshot, surface)
+
+    def _operator_snapshot(self, surface: str) -> dict[str, Any]:
+        if surface not in {"readiness", "workers", "providers", "channel", "temporal"}:
+            raise ValueError("operator snapshot surface is not allowlisted")
+        now = datetime.now(UTC)
+        with self.sessions() as session:
+            connections = session.scalars(
+                select(ConnectionSnapshot).order_by(ConnectionSnapshot.component)
+            ).all()
+            heartbeats = session.scalars(
+                select(WorkerHeartbeat).order_by(WorkerHeartbeat.worker_kind)
+            ).all()
+            events = session.scalars(
+                select(DashboardEvent)
+                .where(DashboardEvent.source == "hermes")
+                .order_by(desc(DashboardEvent.occurred_at))
+                .limit(500)
+            ).all()
+            quotas = {
+                provider: session.scalar(
+                    select(QuotaSnapshot)
+                    .where(QuotaSnapshot.provider == provider)
+                    .order_by(desc(QuotaSnapshot.captured_at))
+                    .limit(1)
+                )
+                for provider in ("codex", "claude")
+            }
+            runs = session.scalars(select(Run).order_by(desc(Run.updated_at)).limit(1000)).all()
+        if surface == "workers":
+            return {
+                "status": "READY"
+                if heartbeats
+                and all((now - _utc(row.observed_at)).total_seconds() <= 180 for row in heartbeats)
+                else "DEGRADED",
+                "workers": [
+                    {
+                        "identity": row.identity,
+                        "hostname": row.hostname,
+                        "worker_kind": row.worker_kind,
+                        "observed_at": row.observed_at.isoformat(),
+                        "freshness_seconds": max(
+                            0, int((now - _utc(row.observed_at)).total_seconds())
+                        ),
+                    }
+                    for row in heartbeats
+                ],
+            }
+        if surface == "providers":
+            return {
+                "status": "READY"
+                if all(
+                    value is not None
+                    and value.authenticated is True
+                    and value.cli_present is True
+                    and not value.rate_limited
+                    for value in quotas.values()
+                )
+                else "DEGRADED",
+                "providers": {
+                    provider: (
+                        {
+                            "provider_id": f"{provider}_cli",
+                            "authenticated": row.authenticated,
+                            "cli_present": row.cli_present,
+                            "rate_limited": row.rate_limited,
+                            "running_jobs": row.running_jobs,
+                            "status": row.status,
+                            "captured_at": row.captured_at.isoformat(),
+                            "source": row.source,
+                        }
+                        if row is not None
+                        else {"provider_id": f"{provider}_cli", "status": "NOT_REPORTED"}
+                    )
+                    for provider, row in quotas.items()
+                },
+                "permitted_provider_ids": ["codex_cli", "claude_cli"],
+            }
+        if surface == "channel":
+            latest: dict[str, DashboardEvent] = {}
+            for row in events:
+                latest.setdefault(row.event_type, row)
+
+            def event_time(name: str) -> str | None:
+                row = latest.get(name)
+                return row.occurred_at.isoformat() if row is not None else None
+
+            outbound = latest.get("telegram.response_delivered")
+            inbound = latest.get("telegram.command_received")
+            latency_ms = None
+            if (
+                outbound is not None
+                and inbound is not None
+                and outbound.occurred_at >= inbound.occurred_at
+            ):
+                latency_ms = int(
+                    (_utc(outbound.occurred_at) - _utc(inbound.occurred_at)).total_seconds() * 1000
+                )
+            last_error = latest.get("telegram.response_delivery_failed")
+            return {
+                "status": "CONNECTED" if outbound is not None else "STALE",
+                "gateway_state": "RUNNING" if events else "NOT_REPORTED",
+                "transport_mode": "telegram",
+                "last_inbound_update": event_time("telegram.command_received"),
+                "last_recognized_command": event_time("telegram.command_recognized"),
+                "last_api_request": event_time("engineering.api_request_started"),
+                "last_outbound_reply": event_time("telegram.response_delivered"),
+                "latency_ms": latency_ms,
+                "hook_profile": "engineering-control-fixed-commands",
+                "last_safe_error": last_error.message if last_error is not None else None,
+            }
+        if surface == "temporal":
+            temporal = next(
+                (row for row in connections if row.component.lower() == "temporal"), None
+            )
+            active = [
+                row
+                for row in runs
+                if row.status not in {"COMPLETE", "COMPLETED", "SUCCESS", "FAILED", "CANCELLED"}
+            ]
+            return {
+                "status": temporal.status if temporal is not None else "NOT_REPORTED",
+                "target": temporal.logical_target if temporal is not None else None,
+                "checked_at": temporal.checked_at.isoformat() if temporal is not None else None,
+                "active_workflow_projections": len(active),
+                "recent_workflow_projections": len(runs),
+                "worker_heartbeat_count": len(heartbeats),
+            }
+        statuses = [row.status for row in connections]
+        return {
+            "status": "READY"
+            if statuses and all(value == "CONNECTED" for value in statuses)
+            else "DEGRADED",
+            "connection_count": len(connections),
+            "connected_count": sum(value == "CONNECTED" for value in statuses),
+            "worker_count": len(heartbeats),
+            "checked_at": now.isoformat(),
+        }
+
     def _connections(self) -> list[ConnectionView]:
         now = datetime.now(UTC)
         with self.sessions() as session:
@@ -1030,3 +1401,133 @@ class OperationsRepository:
                 "quotas": quotas,
                 "projects": projects,
             }
+
+    async def campaign_reconciliation_candidates(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._campaign_reconciliation_candidates)
+
+    def _campaign_reconciliation_candidates(self) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            campaigns = session.scalars(
+                select(Campaign).order_by(desc(Campaign.updated_at)).limit(1000)
+            ).all()
+            values: list[dict[str, Any]] = []
+            now = datetime.now(UTC)
+            for campaign in campaigns:
+                metadata = (
+                    campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
+                )
+                run = session.scalar(
+                    select(Run)
+                    .where(Run.campaign_id == campaign.id)
+                    .order_by(desc(Run.updated_at))
+                    .limit(1)
+                )
+                workflow_id = metadata.get("workflow_id")
+                if not isinstance(workflow_id, str) or not workflow_id:
+                    workflow_id = run.workflow_id if run is not None else None
+                values.append(
+                    {
+                        "campaign_id": str(campaign.id),
+                        "project": campaign.project,
+                        "name": campaign.name,
+                        "status": campaign.status,
+                        "workflow_id": workflow_id,
+                        "run_type": run.run_type if run is not None else None,
+                        "run_status": run.status if run is not None else None,
+                        "blocker": metadata.get("blocker"),
+                        "age_seconds": max(
+                            0,
+                            int((now - _utc(campaign.updated_at)).total_seconds()),
+                        ),
+                        "updated_at": campaign.updated_at.isoformat(),
+                    }
+                )
+            return values
+
+    async def campaign_detail(self, campaign_id: UUID) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._campaign_detail, campaign_id)
+
+    def _campaign_detail(self, campaign_id: UUID) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                return None
+            metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
+            return {
+                "campaign_id": str(campaign.id),
+                "project": campaign.project,
+                "name": campaign.name,
+                "status": campaign.status,
+                "workflow_id": metadata.get("workflow_id"),
+                "run_id": metadata.get("temporal_run_id"),
+                "plan_hash": metadata.get("plan_hash"),
+                "current_issue": metadata.get("current_issue"),
+                "completed_count": len(metadata.get("completed_issues", [])),
+                "blocked_count": len(metadata.get("blocked_issues", [])),
+                "skipped_count": len(metadata.get("skipped_issues", [])),
+                "updated_at": campaign.updated_at.isoformat(),
+            }
+
+    async def workflow_tail(self, workflow_id: str, limit: int) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._workflow_tail, workflow_id, limit)
+
+    def _workflow_tail(self, workflow_id: str, limit: int) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 100:
+            raise ValueError("workflow tail limit is invalid")
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(DashboardEvent)
+                .where(DashboardEvent.workflow_id == workflow_id)
+                .order_by(desc(DashboardEvent.occurred_at), desc(DashboardEvent.id))
+                .limit(limit)
+            ).all()
+            return [
+                {
+                    "occurred_at": row.occurred_at.isoformat(),
+                    "level": row.level,
+                    "event_type": row.event_type,
+                    "phase": row.current_phase,
+                    "message": row.message,
+                }
+                for row in reversed(rows)
+            ]
+
+    async def reconcile_terminal_campaign(
+        self, campaign_id: UUID, workflow_id: str, temporal_status: str
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._reconcile_terminal_campaign, campaign_id, workflow_id, temporal_status
+        )
+
+    def _reconcile_terminal_campaign(
+        self, campaign_id: UUID, workflow_id: str, temporal_status: str
+    ) -> bool:
+        terminal = {
+            "COMPLETED": "COMPLETE",
+            "FAILED": "FAILED",
+            "CANCELED": "CANCELLED",
+            "TERMINATED": "FAILED",
+            "TIMED_OUT": "FAILED",
+        }.get(temporal_status)
+        if terminal is None:
+            return False
+        with self.sessions.begin() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                return False
+            metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
+            run = session.scalar(
+                select(Run)
+                .where(Run.campaign_id == campaign_id, Run.workflow_id == workflow_id)
+                .limit(1)
+            )
+            bound_workflow = metadata.get("workflow_id") or (run.workflow_id if run else None)
+            if bound_workflow != workflow_id:
+                raise ValueError("campaign workflow binding changed during reconciliation")
+            changed = campaign.status != terminal
+            campaign.status = terminal
+            if run is not None:
+                changed = changed or run.status != terminal
+                run.status = terminal
+                run.finished_at = run.finished_at or datetime.now(UTC)
+            return changed

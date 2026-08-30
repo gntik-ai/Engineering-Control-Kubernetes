@@ -371,6 +371,90 @@ async def test_native_canary_registers_queue_and_prepares_read_only_independent_
 
 
 @pytest.mark.asyncio
+async def test_reverse_native_canary_uses_claude_maker_and_codex_checker(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'reverse-canary.db'}",
+        worktree_root=tmp_path / "worktrees",
+    )
+    settings.worktree_root.mkdir()
+    metadata = MetadataActivityHandler(settings)
+    Base.metadata.create_all(metadata.engine)
+    scan = ScanActivityHandler(settings)
+    workspace_id = uuid4()
+    payload: dict[str, Any] = {
+        "workspace_id": str(workspace_id),
+        "provider_direction": "claude-to-codex",
+        "orchestration": {
+            "workflow_id": f"reverse-observability-acceptance-{workspace_id}",
+            "workflow_run_id": "reverse-temporal-run",
+            "activity_id": "reverse-activity",
+            "attempt": 1,
+            "task_queue": "engineering-control",
+        },
+    }
+    registered = await metadata.handle("observability.register", payload)
+    prepared = await scan.handle("observability.prepare_workspace", registered)
+    claude = await metadata.handle("observability.prepare_claude_maker", prepared)
+    claude_request = AgentRequest.model_validate(claude["maker_request"])
+    assert claude_request.provider is Provider.CLAUDE
+    assert claude_request.role == "implementer"
+    assert claude_request.writable is False
+
+    now = datetime.now(UTC)
+    claude_result = AgentResult(
+        run_id=claude_request.run_id,
+        provider=Provider.CLAUDE,
+        role=claude_request.role,
+        status=RunStatus.SUCCESS,
+        summary="bounded maker result",
+        structured_result={
+            "decision": "PASS",
+            "provider": "claude",
+            "summary": "bounded maker result",
+        },
+        started_at=now,
+        finished_at=now,
+        exit_code=0,
+    )
+    codex = await metadata.handle(
+        "observability.prepare_codex_checker",
+        {**claude, "agent_result": claude_result.model_dump(mode="json")},
+    )
+    codex_request = AgentRequest.model_validate(codex["checker_request"])
+    assert codex_request.provider is Provider.CODEX
+    assert codex_request.role == "code-reviewer"
+    assert codex_request.run_id != claude_request.run_id
+
+    codex_result = AgentResult(
+        run_id=codex_request.run_id,
+        provider=Provider.CODEX,
+        role=codex_request.role,
+        status=RunStatus.SUCCESS,
+        summary="bounded checker result",
+        structured_result={
+            "decision": "PASS",
+            "provider": "codex",
+            "summary": "bounded checker result",
+        },
+        started_at=now,
+        finished_at=now,
+        exit_code=0,
+    )
+    finalized = await metadata.handle(
+        "observability.finalize",
+        {
+            **codex,
+            "agent_result": codex_result.model_dump(mode="json"),
+            "terminal_status": "COMPLETED",
+        },
+    )
+    assert finalized["status"] == "COMPLETED"
+    await scan.handle("observability.cleanup_workspace", finalized)
+
+
+@pytest.mark.asyncio
 async def test_gateway_event_persists_only_safe_bounded_arguments(tmp_path: Path) -> None:
     repository, _, _ = _repositories(tmp_path)
     await repository.gateway_event(

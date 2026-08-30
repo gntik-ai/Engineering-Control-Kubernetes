@@ -5,11 +5,13 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from temporalio.client import Client
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
     ApprovalRecord,
     AuditPlanRequest,
+    AutonomousBacklogStart,
     BacklogImportAccepted,
     CampaignStart,
     DeliveryReconcile,
@@ -33,6 +35,7 @@ from engineering_control.policy.approvals import ApprovalService
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
+    AutonomousBacklogCampaignInput,
     DeliveryReconciliationInput,
     EnhancementDiscoveryInput,
     EnhancementSolutionLoopInput,
@@ -71,12 +74,18 @@ class ControlService(Protocol):
     async def start_observability_acceptance(
         self, request: ObservabilityAcceptanceStart
     ) -> OperationAccepted: ...
+    async def start_reverse_observability_acceptance(
+        self, request: ObservabilityAcceptanceStart
+    ) -> OperationAccepted: ...
     async def start_issue_loop(self, request: IssueLoopStart) -> OperationAccepted: ...
     async def import_github_backlog(
         self, request: GitHubBacklogImportRequest
     ) -> BacklogImportAccepted: ...
     async def start_existing_backlog_loop(
         self, request: ExistingBacklogLoopStart
+    ) -> OperationAccepted: ...
+    async def start_autonomous_backlog(
+        self, request: AutonomousBacklogStart
     ) -> OperationAccepted: ...
     async def start_enhancement_discovery(
         self, request: EnhancementDiscover
@@ -331,6 +340,23 @@ class TemporalControlService:
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
+    async def start_reverse_observability_acceptance(
+        self, request: ObservabilityAcceptanceStart
+    ) -> OperationAccepted:
+        if request.confirm_read_only is not True:
+            raise ValueError("observability acceptance requires the read-only contract")
+        workspace_id = uuid4()
+        workflow_id = f"reverse-observability-acceptance-{workspace_id}"
+        handle = await self.client.start_workflow(
+            WorkflowName.REVERSE_OBSERVABILITY_ACCEPTANCE.value,
+            ObservabilityAcceptanceInput(workspace_id=str(workspace_id)),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
     async def start_issue_loop(self, request: IssueLoopStart) -> OperationAccepted:
         workflow_id = f"loop-{request.project.value}-{request.campaign_id}-{uuid4()}"
         handle = await self.client.start_workflow(
@@ -387,6 +413,37 @@ class TemporalControlService:
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
+
+    async def start_autonomous_backlog(self, request: AutonomousBacklogStart) -> OperationAccepted:
+        for project, campaign_id in request.backlog_campaign_ids.items():
+            campaign = await self.repository.get_backlog_campaign(campaign_id)
+            if campaign is None or campaign.get("project") != project:
+                raise ValueError("global backlog inventory binding is invalid")
+        policy = await self.repository.get_backlog_campaign(request.policy_campaign_id)
+        if policy is None or policy.get("status") not in {"APPROVED", "RUNNING"}:
+            raise ValueError("global backlog GitHub write policy is not active")
+        workflow_id = "autonomous-backlog-staging"
+        workflow_input = AutonomousBacklogCampaignInput(
+            campaign_id=str(request.campaign_id),
+            backlog_campaign_ids={
+                project: str(campaign_id)
+                for project, campaign_id in request.backlog_campaign_ids.items()
+            },
+            policy_campaign_id=str(request.policy_campaign_id),
+        )
+        try:
+            handle = await self.client.start_workflow(
+                WorkflowName.AUTONOMOUS_BACKLOG_CAMPAIGN.value,
+                workflow_input,
+                id=workflow_id,
+                task_queue=self.task_queue,
+            )
+            run_id = handle.first_execution_run_id or ""
+        except WorkflowAlreadyStartedError:
+            existing = self.client.get_workflow_handle(workflow_id)
+            description = await existing.describe()
+            run_id = description.run_id
+        return OperationAccepted(workflow_id=workflow_id, run_id=run_id)
 
     async def start_enhancement_discovery(self, request: EnhancementDiscover) -> OperationAccepted:
         workflow_id = f"enhance-discover-{request.project.value}-{request.campaign_id}-{uuid4()}"

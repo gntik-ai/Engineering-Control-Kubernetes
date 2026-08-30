@@ -6,6 +6,7 @@ from uuid import UUID
 
 from engineering_control.api.schemas import (
     AuditPlanRequest,
+    AutonomousBacklogStart,
     BacklogApprovalCandidateRequest,
     CampaignStart,
     EnhancementDiscover,
@@ -20,6 +21,7 @@ from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditPlanCommand,
     AuditStartCommand,
+    AutonomousBacklogCommand,
     Command,
     EnhancementDiscoverCommand,
     FindingVerifyCommand,
@@ -133,11 +135,15 @@ class TypedCommandBus:
                 )
 
     async def _execute(self, command: Command, *, operator_class: str) -> OperationAccepted | None:
+        if isinstance(command, AutonomousBacklogCommand):
+            return await self.control.start_autonomous_backlog(
+                AutonomousBacklogStart.model_validate(command.model_dump(mode="json"))
+            )
         if isinstance(command, SolveIssueCommand):
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
                 BacklogApprovalCandidateRequest(
-                    project=command.project.value,  # type: ignore[arg-type]
+                    project=command.project.value,
                     delivery_mode=command.delivery_mode,
                     maximum_risk=command.maximum_risk,
                     maximum_items=1,
@@ -151,7 +157,7 @@ class TypedCommandBus:
             )
             return await self.control.start_existing_backlog_loop(
                 ExistingBacklogLoopStart(
-                    project=command.project.value,  # type: ignore[arg-type]
+                    project=command.project.value,
                     backlog_campaign_id=command.backlog_campaign_id,
                     maximum_risk=command.maximum_risk,
                     delivery_mode=command.delivery_mode,

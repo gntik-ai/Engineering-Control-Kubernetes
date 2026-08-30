@@ -126,6 +126,22 @@ def test_observability_canary_routes_each_step_to_one_bounded_worker() -> None:
         assert owners == {owner}
 
 
+def test_reverse_observability_canary_routes_opposite_native_providers() -> None:
+    expected = {
+        "observability.prepare_claude_maker": "controller",
+        "observability.invoke_claude_maker": "claude",
+        "observability.prepare_codex_checker": "controller",
+        "observability.invoke_codex_checker": "codex",
+    }
+    for step, owner in expected.items():
+        owners = {
+            kind
+            for kind in ("controller", "codex", "claude", "browser", "scan", "delivery")
+            if step in ControlActivities.steps_for_worker(kind)
+        }
+        assert owners == {owner}
+
+
 def test_observability_canary_workspace_parent_is_owned_by_scan_runner() -> None:
     worker = (ROOT / "scripts/bootstrap-worker.sh").read_text(encoding="utf-8")
     assert "install -d -o scan-runner -g scan-runner -m 0755" in worker

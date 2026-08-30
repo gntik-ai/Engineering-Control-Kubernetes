@@ -4,12 +4,12 @@ import hashlib
 import json
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.config import Settings
 from engineering_control.db import models as db
@@ -35,6 +35,10 @@ from engineering_control.identity.attestation import (
 )
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 class EngineeringActivityHandler:
@@ -67,6 +71,10 @@ class EngineeringActivityHandler:
             "backlog.revalidate_gate",
             "backlog.record_loop_state",
             "backlog.register_child_run",
+            "global_backlog.register",
+            "global_backlog.select_next",
+            "global_backlog.record_result",
+            "global_backlog.finalize",
             "enhancement.load_evidence",
             "enhancement.prepare_discovery",
             "enhancement.validate_evidence",
@@ -199,6 +207,14 @@ class EngineeringActivityHandler:
             return self._record_backlog_loop_state(payload)
         if step == "backlog.register_child_run":
             return self._register_backlog_child_run(payload)
+        if step == "global_backlog.register":
+            return self._register_global_backlog(payload)
+        if step == "global_backlog.select_next":
+            return self._select_global_backlog_issue(payload)
+        if step == "global_backlog.record_result":
+            return self._record_global_backlog_result(payload)
+        if step == "global_backlog.finalize":
+            return self._finalize_global_backlog(payload)
         if step == "enhancement.load_evidence":
             return self._load_enhancement_evidence(payload)
         if step == "enhancement.dedupe":
@@ -502,6 +518,7 @@ class EngineeringActivityHandler:
             ]
         )
         repositories = snapshot.repositories
+        deployment_snapshot = repositories[1] if len(repositories) == 2 else repositories[0]
         pair = BACKLOG_PROJECT_PAIRS[snapshot.project]
         orchestration = payload.get("orchestration")
         workflow_id = str(
@@ -543,9 +560,16 @@ class EngineeringActivityHandler:
                     existing.project != snapshot.project
                     or existing.plan_hash != plan_hash
                     or existing.source_head_at_import != repositories[0].head_sha
-                    or existing.deployment_head_at_import != repositories[1].head_sha
+                    or existing.deployment_head_at_import != deployment_snapshot.head_sha
                 ):
                     raise ValueError("backlog import idempotency binding changed")
+                self._ensure_backlog_run_projection(
+                    session,
+                    workflow_id=workflow_id,
+                    project=snapshot.project,
+                    campaign_id=campaign_id,
+                    orchestration=orchestration,
+                )
                 return self._backlog_campaign_envelope(existing, "IMPORTED")
             campaign = db.GitHubBacklogCampaign(
                 id=campaign_id,
@@ -555,10 +579,10 @@ class EngineeringActivityHandler:
                 imported_at=snapshot.imported_at,
                 issue_query="state:open is:issue paired-repositories",
                 import_filter=import_filter,
-                source_default_branch="main",
-                deployment_default_branch="main",
+                source_default_branch=repositories[0].default_branch,
+                deployment_default_branch=deployment_snapshot.default_branch,
                 source_head_at_import=repositories[0].head_sha,
-                deployment_head_at_import=repositories[1].head_sha,
+                deployment_head_at_import=deployment_snapshot.head_sha,
                 dependency_graph_hash=graph_hash,
                 plan_hash=plan_hash,
                 approval_binding=None,
@@ -577,6 +601,13 @@ class EngineeringActivityHandler:
             # relationship.  Flush the parent explicitly so PostgreSQL never
             # schedules child inserts ahead of the campaign row.
             session.flush([campaign])
+            self._ensure_backlog_run_projection(
+                session,
+                workflow_id=workflow_id,
+                project=snapshot.project,
+                campaign_id=campaign_id,
+                orchestration=orchestration,
+            )
             for record in planned:
                 session.add(
                     db.BacklogIssueRecord(
@@ -655,6 +686,13 @@ class EngineeringActivityHandler:
                 )
             ).all()
             campaign.status = "PLANNED"
+            run = session.scalar(
+                select(db.Run).where(db.Run.workflow_id == campaign.workflow_id).limit(1)
+            )
+            if run is not None:
+                run.status = "COMPLETED"
+                run.finished_at = datetime.now(UTC)
+                run.summary = "GitHub backlog import and dependency plan completed"
             summary = self._serialize_backlog_campaign(campaign)
         return self._envelope(
             "backlog.plan",
@@ -665,6 +703,65 @@ class EngineeringActivityHandler:
             },
             "PLANNED",
         )
+
+    @staticmethod
+    def _ensure_backlog_run_projection(
+        session: Session,
+        *,
+        workflow_id: str,
+        project: str,
+        campaign_id: UUID,
+        orchestration: Any,
+    ) -> None:
+        """Project imports into the same workflow-detail model used by every channel."""
+        now = datetime.now(UTC)
+        run = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id).limit(1))
+        if run is None:
+            run = db.Run(
+                id=uuid5(NAMESPACE_URL, f"backlog-import-run:{workflow_id}"),
+                workflow_id=workflow_id,
+                run_type="github-backlog-import",
+                status="RUNNING",
+                project=project,
+                worker="controller",
+                started_at=now,
+                summary="GitHub backlog import is running",
+            )
+            session.add(run)
+        elif run.run_type != "github-backlog-import" or run.project != project:
+            raise ValueError("backlog import workflow conflicts with an existing run projection")
+        temporal_run_id = (
+            str(orchestration.get("workflow_run_id") or "")
+            if isinstance(orchestration, dict)
+            else ""
+        )
+        event_id = session.scalar(
+            select(db.DashboardEvent.id)
+            .where(
+                db.DashboardEvent.workflow_id == workflow_id,
+                db.DashboardEvent.event_type == "workflow.started",
+            )
+            .limit(1)
+        )
+        if event_id is None:
+            session.add(
+                db.DashboardEvent(
+                    occurred_at=now,
+                    level="INFO",
+                    event_type="workflow.started",
+                    source="controller",
+                    worker_kind="controller",
+                    project=project,
+                    workflow_id=workflow_id,
+                    temporal_run_id=temporal_run_id or None,
+                    campaign_id=str(campaign_id),
+                    entity_type="github_backlog_campaign",
+                    entity_id=str(campaign_id),
+                    current_phase="backlog.persist_import",
+                    message="GitHub backlog import started",
+                    metadata_json={"status": "RUNNING"},
+                )
+            )
 
     def _backlog_approval_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
@@ -788,12 +885,31 @@ class EngineeringActivityHandler:
             raise ValueError("backlog execution maximum risk is invalid")
         with self.sessions.begin() as session:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
+            global_campaign = None
+            raw_global_id = payload.get("global_campaign_id")
+            if raw_global_id is not None:
+                global_campaign = session.get(db.Campaign, UUID(str(raw_global_id)))
+            globally_authorized = self._global_campaign_authorizes(
+                session,
+                global_campaign,
+                campaign_id,
+                maximum_risk,
+                str(payload.get("delivery_mode")),
+                str(payload.get("target_repository") or ""),
+                int(payload.get("target_issue_number") or 0),
+                str(payload.get("r3_approval_binding") or ""),
+            )
             if (
                 campaign is None
                 or campaign.project != payload.get("project")
-                or campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING"}
-                or campaign.delivery_mode != payload.get("delivery_mode")
-                or campaign.maximum_risk != maximum_risk
+                or (
+                    not globally_authorized
+                    and (
+                        campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING"}
+                        or campaign.delivery_mode != payload.get("delivery_mode")
+                        or campaign.maximum_risk != maximum_risk
+                    )
+                )
             ):
                 return {
                     **payload,
@@ -831,6 +947,14 @@ class EngineeringActivityHandler:
                 self._serialize_backlog_issue(row)
                 for row in rows
                 if risk_rank.get(row.calculated_risk, 99) <= maximum
+                and (
+                    row.calculated_risk != "R3"
+                    or self._valid_r3_candidate(
+                        session,
+                        row,
+                        str(payload.get("r3_approval_binding") or ""),
+                    )
+                )
             ][: int(payload.get("maximum_items", 1))]
             if target_repository is not None and not selected:
                 return {
@@ -838,12 +962,464 @@ class EngineeringActivityHandler:
                     "status": "BLOCKED",
                     "blocker": "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE",
                 }
-            campaign.status = "RUNNING"
+            if campaign.status in {"APPROVED_POLICY_PENDING", "APPROVED"}:
+                campaign.status = "RUNNING"
         return self._envelope(
             "backlog.load_execution",
             {**payload, "items": selected},
             "SELECTED",
         )
+
+    @staticmethod
+    def _global_campaign_authorizes(
+        session: Any,
+        campaign: db.Campaign | None,
+        backlog_campaign_id: UUID,
+        maximum_risk: str,
+        delivery_mode: str,
+        target_repository: str,
+        target_issue_number: int,
+        r3_approval_binding: str,
+    ) -> bool:
+        if (
+            campaign is None
+            or campaign.project != "platform"
+            or campaign.status
+            not in {
+                "RUNNING",
+                "PAUSED",
+            }
+        ):
+            return False
+        metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
+        ids = metadata.get("backlog_campaign_ids")
+        return (
+            metadata.get("kind") == "autonomous-global-backlog"
+            and metadata.get("environment") == "staging"
+            and metadata.get("maximum_risk") == "R2"
+            and maximum_risk in {"R2", "R3"}
+            and metadata.get("delivery_mode") == delivery_mode == "full-delivery"
+            and metadata.get("production") is False
+            and isinstance(ids, dict)
+            and str(backlog_campaign_id) in {str(value) for value in ids.values()}
+            and (
+                maximum_risk == "R2"
+                or (
+                    bool(target_repository)
+                    and target_issue_number > 0
+                    and bool(r3_approval_binding)
+                    and session.scalar(
+                        select(db.ActionCandidate.id)
+                        .where(
+                            db.ActionCandidate.action == "r3_issue_approval",
+                            db.ActionCandidate.target_id
+                            == f"{target_repository}#{target_issue_number}",
+                            db.ActionCandidate.binding_hash == r3_approval_binding,
+                            db.ActionCandidate.used_at.is_not(None),
+                            db.ActionCandidate.expires_at > datetime.now(UTC),
+                        )
+                        .limit(1)
+                    )
+                    is not None
+                )
+            )
+        )
+
+    @staticmethod
+    def _valid_r3_candidate(
+        session: Session,
+        issue: db.BacklogIssueRecord,
+        binding: str | None = None,
+    ) -> db.ActionCandidate | None:
+        query = select(db.ActionCandidate).where(
+            db.ActionCandidate.action == "r3_issue_approval",
+            db.ActionCandidate.target_id == f"{issue.repository}#{issue.issue_number}",
+            db.ActionCandidate.used_at.is_not(None),
+            db.ActionCandidate.expires_at > datetime.now(UTC),
+        )
+        if binding:
+            query = query.where(db.ActionCandidate.binding_hash == binding)
+        candidates = session.scalars(
+            query.order_by(db.ActionCandidate.created_at.desc()).limit(10)
+        ).all()
+        for candidate in candidates:
+            payload = candidate.payload_json
+            if (
+                payload.get("issue_body_sha256") == issue.body_sha256
+                and payload.get("issue_updated_at") == issue.github_updated_at.isoformat()
+                and payload.get("production") is False
+            ):
+                return candidate
+        return None
+
+    def _register_global_backlog(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["campaign_id"]))
+        raw_ids = payload.get("backlog_campaign_ids")
+        if not isinstance(raw_ids, dict) or set(raw_ids) != {"falcone", "musematic", "llmwiki"}:
+            raise ValueError("global backlog requires one inventory for every project")
+        campaign_ids = {project: UUID(str(value)) for project, value in raw_ids.items()}
+        policy_campaign_id = UUID(str(payload["policy_campaign_id"]))
+        workflow_id = str(
+            (payload.get("orchestration") or {}).get(
+                "workflow_id", f"autonomous-backlog-staging-{campaign_id}"
+            )
+        )
+        temporal_run_id = str((payload.get("orchestration") or {}).get("workflow_run_id") or "")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            backlogs = {
+                project: session.get(db.GitHubBacklogCampaign, value)
+                for project, value in campaign_ids.items()
+            }
+            if any(
+                campaign is None or campaign.project != project
+                for project, campaign in backlogs.items()
+            ):
+                raise ValueError("global backlog inventory binding is invalid")
+            policy_campaign = session.get(db.GitHubBacklogCampaign, policy_campaign_id)
+            if (
+                policy_campaign is None
+                or policy_campaign_id not in campaign_ids.values()
+                or policy_campaign.status not in {"APPROVED", "RUNNING"}
+            ):
+                raise ValueError("global backlog requires one active exact GitHub write policy")
+            inventory: list[dict[str, Any]] = []
+            plan_hashes: dict[str, str] = {}
+            for project, backlog in backlogs.items():
+                assert backlog is not None
+                plan_hashes[project] = backlog.plan_hash
+                rows = session.scalars(
+                    select(db.BacklogIssueRecord)
+                    .where(db.BacklogIssueRecord.backlog_campaign_id == backlog.id)
+                    .order_by(db.BacklogIssueRecord.planned_order)
+                ).all()
+                inventory.extend(
+                    {
+                        "project": project,
+                        "backlog_campaign_id": str(backlog.id),
+                        "repository": row.repository,
+                        "issue_number": row.issue_number,
+                        "body_sha256": row.body_sha256,
+                        "updated_at": row.github_updated_at.isoformat(),
+                        "risk": row.calculated_risk,
+                        "wave": row.planned_wave,
+                        "order": row.planned_order,
+                    }
+                    for row in rows
+                )
+            plan_hash = canonical_sha256(
+                {"campaigns": raw_ids, "plan_hashes": plan_hashes, "inventory": inventory}
+            )
+            existing = session.get(db.Campaign, campaign_id)
+            if existing is None:
+                existing = db.Campaign(
+                    id=campaign_id,
+                    project="platform",
+                    name="autonomous-all-project-staging-backlog",
+                    status="RUNNING",
+                    required_cells=len(inventory),
+                    metadata_json={
+                        "kind": "autonomous-global-backlog",
+                        "workflow_id": workflow_id,
+                        "temporal_run_id": temporal_run_id,
+                        "backlog_campaign_ids": {
+                            key: str(value) for key, value in campaign_ids.items()
+                        },
+                        "policy_campaign_id": str(policy_campaign_id),
+                        "environment": "staging",
+                        "maximum_risk": "R2",
+                        "delivery_mode": "full-delivery",
+                        "production": False,
+                        "global_active_issues": 1,
+                        "global_deployments": 1,
+                        "plan_hash": plan_hash,
+                        "inventory": inventory,
+                        "current_issue": None,
+                        "completed_issues": [],
+                        "blocked_issues": [],
+                        "skipped_issues": [],
+                        "external_effect_ledger": [],
+                        "notification_watermark": None,
+                    },
+                )
+                session.add(existing)
+                session.flush([existing])
+            else:
+                metadata = existing.metadata_json
+                if (
+                    existing.project != "platform"
+                    or not isinstance(metadata, dict)
+                    or metadata.get("kind") != "autonomous-global-backlog"
+                    or metadata.get("plan_hash") != plan_hash
+                    or metadata.get("workflow_id") != workflow_id
+                ):
+                    raise ValueError("global backlog idempotency binding changed")
+                existing.status = "RUNNING"
+            run = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id).limit(1))
+            if run is None:
+                session.add(
+                    db.Run(
+                        id=uuid5(NAMESPACE_URL, f"global-backlog-run:{workflow_id}"),
+                        campaign_id=campaign_id,
+                        workflow_id=workflow_id,
+                        run_type="autonomous-global-backlog",
+                        status="RUNNING",
+                        project="platform",
+                        worker="controller",
+                        started_at=now,
+                        summary="Global staging backlog campaign is selecting one issue at a time",
+                    )
+                )
+            event = session.scalar(
+                select(db.DashboardEvent.id)
+                .where(
+                    db.DashboardEvent.workflow_id == workflow_id,
+                    db.DashboardEvent.event_type == "campaign.started",
+                )
+                .limit(1)
+            )
+            if event is None:
+                session.add(
+                    db.DashboardEvent(
+                        occurred_at=now,
+                        level="INFO",
+                        event_type="campaign.started",
+                        source="controller",
+                        worker_kind="controller",
+                        project="platform",
+                        workflow_id=workflow_id,
+                        temporal_run_id=temporal_run_id or None,
+                        campaign_id=str(campaign_id),
+                        entity_type="autonomous_global_backlog",
+                        entity_id=str(campaign_id),
+                        current_phase="GLOBAL_ISSUE_SELECTION",
+                        message="Autonomous global staging backlog campaign started",
+                        metadata_json={"status": "RUNNING", "plan_hash": plan_hash},
+                    )
+                )
+        return {**payload, "status": "RUNNING", "plan_hash": plan_hash}
+
+    def _select_global_backlog_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["campaign_id"]))
+        risk_rank = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+        wave_rank = {"W0": 0, "W1": 1, "W2": 2, "W3": 3, "W4": 4, "W5": 5}
+        severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unspecified": 4}
+        with self.sessions.begin() as session:
+            campaign = session.get(db.Campaign, campaign_id)
+            if campaign is None or campaign.status not in {"RUNNING", "PAUSED"}:
+                raise ValueError("global backlog campaign is not active")
+            metadata = dict(campaign.metadata_json)
+            processed = {
+                str(item.get("reference"))
+                for key in ("completed_issues", "skipped_issues")
+                for item in metadata.get(key, [])
+                if isinstance(item, dict)
+            }
+            now = datetime.now(UTC)
+            blocked_until = {
+                str(item.get("reference")): _as_utc(
+                    datetime.fromisoformat(str(item["retry_after"]))
+                )
+                for item in metadata.get("blocked_issues", [])
+                if isinstance(item, dict) and item.get("reference") and item.get("retry_after")
+            }
+            ids = metadata.get("backlog_campaign_ids")
+            if not isinstance(ids, dict):
+                raise ValueError("global backlog inventory binding is missing")
+            candidates: list[tuple[str, db.BacklogIssueRecord]] = []
+            awaiting_r3_approval = False
+            for project, raw_id in ids.items():
+                rows = session.scalars(
+                    select(db.BacklogIssueRecord).where(
+                        db.BacklogIssueRecord.backlog_campaign_id == UUID(str(raw_id)),
+                        db.BacklogIssueRecord.eligibility_status.in_(
+                            {
+                                "ELIGIBLE_FOR_REVALIDATION",
+                                "ELIGIBLE_FOR_RUNTIME_REVALIDATION",
+                                "READY",
+                            }
+                        ),
+                    )
+                ).all()
+                for row in rows:
+                    reference = f"{row.repository}#{row.issue_number}"
+                    r3_candidate = (
+                        self._valid_r3_candidate(session, row)
+                        if row.calculated_risk == "R3"
+                        else None
+                    )
+                    if row.calculated_risk == "R3" and r3_candidate is None:
+                        awaiting_r3_approval = True
+                    if (
+                        reference not in processed
+                        and blocked_until.get(reference, now) <= now
+                        and (
+                            risk_rank.get(row.calculated_risk, 99) <= 2 or r3_candidate is not None
+                        )
+                        and row.issue_type != BacklogIssueType.ENHANCEMENT.value
+                    ):
+                        candidates.append((project, row))
+            if not candidates:
+                metadata["current_issue"] = None
+                campaign.metadata_json = metadata
+                pending_retries = [value for value in blocked_until.values() if value > now]
+                if pending_retries or awaiting_r3_approval:
+                    retry_seconds = max(
+                        30,
+                        int((min(pending_retries) - now).total_seconds())
+                        if pending_retries
+                        else 900,
+                    )
+                    return {
+                        **payload,
+                        "status": "WAITING",
+                        "item": None,
+                        "retry_after_seconds": min(retry_seconds, 900),
+                        "blocker": (
+                            "AWAITING_R3_APPROVAL"
+                            if awaiting_r3_approval and not pending_retries
+                            else "BLOCKED_ISSUE_RETRY_DELAY"
+                        ),
+                    }
+                return {**payload, "status": "EMPTY", "item": None}
+            project, row = min(
+                candidates,
+                key=lambda value: (
+                    wave_rank.get(value[1].planned_wave, 99),
+                    severity_rank.get(value[1].severity, 99),
+                    -len(value[1].issues_blocked_json or []),
+                    risk_rank.get(value[1].calculated_risk, 99),
+                    value[1].repository,
+                    value[1].issue_number,
+                ),
+            )
+            item = {
+                "project": project,
+                "backlog_campaign_id": str(row.backlog_campaign_id),
+                "repository": row.repository,
+                "issue_number": row.issue_number,
+                "reference": f"{row.repository}#{row.issue_number}",
+                "risk": row.calculated_risk,
+                "wave": row.planned_wave,
+            }
+            if row.calculated_risk == "R3":
+                r3_candidate = self._valid_r3_candidate(session, row)
+                if r3_candidate is None:
+                    raise ValueError("approved R3 candidate disappeared during selection")
+                item["execution_maximum_risk"] = "R3"
+                item["r3_approval_binding"] = r3_candidate.binding_hash
+            metadata["current_issue"] = item
+            metadata["notification_watermark"] = datetime.now(UTC).isoformat()
+            campaign.metadata_json = metadata
+            run = session.scalar(select(db.Run).where(db.Run.campaign_id == campaign_id).limit(1))
+            if run is not None:
+                run.status = "RUNNING"
+                run.summary = f"Current issue: {item['reference']}"
+            session.add(
+                db.DashboardEvent(
+                    occurred_at=datetime.now(UTC),
+                    level="INFO",
+                    event_type="campaign.issue_selected",
+                    source="controller",
+                    worker_kind="controller",
+                    project=project,
+                    workflow_id=str(metadata["workflow_id"]),
+                    temporal_run_id=str(metadata.get("temporal_run_id") or "") or None,
+                    issue_number=row.issue_number,
+                    campaign_id=str(campaign_id),
+                    entity_type="github_issue",
+                    entity_id=item["reference"],
+                    current_phase="CURRENT_STATE_REVALIDATION",
+                    message="Global backlog selected one eligible issue",
+                    metadata_json={"status": "RUNNING", "risk": row.calculated_risk},
+                )
+            )
+        return {**payload, "status": "SELECTED", "item": item}
+
+    def _record_global_backlog_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["campaign_id"]))
+        item = payload.get("item")
+        result = payload.get("result")
+        if not isinstance(item, dict) or not isinstance(result, dict):
+            raise ValueError("global backlog result binding is invalid")
+        status = str(result.get("status") or "FAILED")
+        terminal_bucket = (
+            "completed_issues"
+            if status in {"COMPLETE", "COMPLETED", "SUCCESS", "FIXED"}
+            else "skipped_issues"
+            if status == "SKIPPED"
+            else "blocked_issues"
+        )
+        record = {
+            "reference": str(item["reference"]),
+            "status": status,
+            "blocker": str(result.get("blocker") or "")[:120] or None,
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "retry_after": (
+                (datetime.now(UTC) + timedelta(minutes=15)).isoformat()
+                if terminal_bucket == "blocked_issues"
+                else None
+            ),
+        }
+        with self.sessions.begin() as session:
+            campaign = session.get(db.Campaign, campaign_id)
+            if campaign is None:
+                raise ValueError("global backlog campaign disappeared")
+            metadata = dict(campaign.metadata_json)
+            for other_bucket in (
+                "completed_issues",
+                "blocked_issues",
+                "skipped_issues",
+            ):
+                if other_bucket != terminal_bucket:
+                    metadata[other_bucket] = [
+                        existing
+                        for existing in metadata.get(other_bucket, [])
+                        if not (
+                            isinstance(existing, dict)
+                            and existing.get("reference") == record["reference"]
+                        )
+                    ]
+            bucket = list(metadata.get(terminal_bucket, []))
+            bucket = [
+                existing
+                for existing in bucket
+                if not (
+                    isinstance(existing, dict) and existing.get("reference") == record["reference"]
+                )
+            ]
+            bucket.append(record)
+            metadata[terminal_bucket] = bucket
+            metadata["current_issue"] = None
+            metadata["notification_watermark"] = record["recorded_at"]
+            campaign.metadata_json = metadata
+            run = session.scalar(select(db.Run).where(db.Run.campaign_id == campaign_id).limit(1))
+            if run is not None:
+                run.status = "RUNNING"
+                run.summary = f"Last issue result: {record['reference']} {status}"
+        return {**payload, "status": "RUNNING", "last_result": record}
+
+    def _finalize_global_backlog(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["campaign_id"]))
+        terminal = str(payload.get("terminal_status", "COMPLETE"))
+        if terminal not in {"COMPLETE", "STOPPED", "CANCELLED"}:
+            raise ValueError("global backlog terminal state is invalid")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            campaign = session.get(db.Campaign, campaign_id)
+            if campaign is None:
+                raise ValueError("global backlog campaign disappeared")
+            campaign.status = terminal
+            metadata = dict(campaign.metadata_json)
+            metadata["current_issue"] = None
+            metadata["terminal_at"] = now.isoformat()
+            campaign.metadata_json = metadata
+            run = session.scalar(select(db.Run).where(db.Run.campaign_id == campaign_id).limit(1))
+            if run is not None:
+                run.status = terminal
+                run.finished_at = now
+                run.summary = f"Global backlog campaign reached {terminal}"
+        return {**payload, "status": terminal}
 
     def _backlog_revalidate_gate(self, payload: dict[str, Any]) -> dict[str, Any]:
         item = payload.get("item")

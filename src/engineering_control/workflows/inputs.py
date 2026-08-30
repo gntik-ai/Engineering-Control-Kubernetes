@@ -131,6 +131,22 @@ class ExistingGitHubBacklogLoopInput:
     target_issue_number: int | None = None
     continue_after_blocked_issue: bool = True
     correction_limit: int = 2
+    global_campaign_id: str | None = None
+    r3_approval_binding: str | None = None
+
+
+@dataclass
+class AutonomousBacklogCampaignInput:
+    campaign_id: str
+    backlog_campaign_ids: dict[str, str]
+    policy_campaign_id: str
+    environment: str = "staging"
+    maximum_risk: str = "R2"
+    global_active_issues: int = 1
+    global_deployments: int = 1
+    implementation_correction_limit: int = 5
+    deployment_correction_limit: int = 3
+    production: bool = False
 
 
 @dataclass

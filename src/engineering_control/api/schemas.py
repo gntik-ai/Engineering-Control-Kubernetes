@@ -127,27 +127,27 @@ class IssueLoopStart(APIModel):
 
 
 class GitHubBacklogImportRequest(APIModel):
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     source: Literal["github-open"] = "github-open"
     import_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"]
     maximum_items: int = Field(default=500, ge=1, le=500)
 
 
 class BacklogApprovalCandidateRequest(APIModel):
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     delivery_mode: Literal["source-pr", "full-delivery"]
     maximum_risk: RiskClass
     maximum_items: int = Field(default=1, ge=1, le=50)
 
 
 class BacklogApprovalRequest(APIModel):
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
     typed_confirmation: Literal["APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"]
 
 
 class ExistingBacklogLoopStart(APIModel):
-    project: Literal["falcone", "musematic"]
+    project: Literal["falcone", "musematic", "llmwiki"]
     backlog_campaign_id: UUID
     maximum_risk: RiskClass
     delivery_mode: Literal["source-pr", "full-delivery"]
@@ -158,12 +158,15 @@ class ExistingBacklogLoopStart(APIModel):
             "gntik-ai/falcone-charts",
             "gntik-ai/musematic",
             "gntik-ai/musematic-deploy",
+            "gntik-ai/llmwiki",
         ]
         | None
     ) = None
     target_issue_number: int | None = Field(default=None, ge=1)
     continue_after_blocked_issue: bool = True
     correction_limit: int = Field(default=2, ge=0, le=5)
+    global_campaign_id: UUID | None = None
+    r3_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def exact_issue_binding(self) -> ExistingBacklogLoopStart:
@@ -172,6 +175,36 @@ class ExistingBacklogLoopStart(APIModel):
         if self.target_repository is not None and self.maximum_items != 1:
             raise ValueError("a direct issue operation must remain bound to one item")
         return self
+
+
+class AutonomousBacklogStart(APIModel):
+    campaign_id: UUID
+    backlog_campaign_ids: dict[str, UUID]
+    policy_campaign_id: UUID
+    environment: Literal["staging"] = "staging"
+    maximum_risk: Literal[RiskClass.R2] = RiskClass.R2
+    global_active_issues: Literal[1] = 1
+    global_deployments: Literal[1] = 1
+    implementation_correction_limit: Literal[5] = 5
+    deployment_correction_limit: Literal[3] = 3
+    production: Literal[False] = False
+    typed_confirmation: Literal["START_GLOBAL_STAGING_R2_BACKLOG"]
+
+    @model_validator(mode="after")
+    def exact_project_set(self) -> AutonomousBacklogStart:
+        if set(self.backlog_campaign_ids) != {"falcone", "musematic", "llmwiki"}:
+            raise ValueError("global backlog requires exactly Falcone, Musematic, and LLMWiki")
+        if self.policy_campaign_id not in set(self.backlog_campaign_ids.values()):
+            raise ValueError("policy campaign must be one of the exact imported inventories")
+        return self
+
+
+class R3IssueApprovalRequest(APIModel):
+    project: Literal["musematic"]
+    surface: Literal["source"]
+    issue_number: Literal[1119]
+    binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    confirmation_phrase: str = Field(pattern=r"^APPROVE_R3_MUSEMATIC_1119_[A-F0-9]{16}$")
 
 
 class LoopPlanDispatch(APIModel):

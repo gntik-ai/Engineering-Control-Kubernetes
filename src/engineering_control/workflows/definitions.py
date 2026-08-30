@@ -11,6 +11,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
+    AutonomousBacklogCampaignInput,
     CleanupInput,
     DeliveryReconciliationInput,
     EnhancementDeliveryInput,
@@ -1225,6 +1226,37 @@ class ObservabilityAcceptanceWorkflow(ControlledWorkflow):
             await self._step("observability.cleanup_workspace", context)
 
 
+@workflow.defn(name="ReverseObservabilityAcceptanceWorkflow")
+class ReverseObservabilityAcceptanceWorkflow(ControlledWorkflow):
+    """Read-only native Claude maker then Codex checker canary."""
+
+    @workflow.run
+    async def run(self, request: ObservabilityAcceptanceInput) -> dict[str, Any]:
+        context: dict[str, Any] = {**asdict(request), "provider_direction": "claude-to-codex"}
+        context = await self._step("observability.register", context)
+        context = await self._step("observability.prepare_workspace", context)
+        try:
+            context = await self._step("observability.prepare_claude_maker", context)
+            context = await self._agent_step(
+                "observability.invoke_claude_maker", context, timeout_minutes=10
+            )
+            if context.get("status") != "SUCCESS":
+                return await self._step(
+                    "observability.finalize",
+                    {**context, "terminal_status": "FAILED", "blocker": context.get("blocker")},
+                )
+            context = await self._step("observability.prepare_codex_checker", context)
+            context = await self._agent_step(
+                "observability.invoke_codex_checker", context, timeout_minutes=10
+            )
+            terminal = "COMPLETED" if context.get("status") == "SUCCESS" else "FAILED"
+            return await self._step(
+                "observability.finalize", {**context, "terminal_status": terminal}
+            )
+        finally:
+            await self._step("observability.cleanup_workspace", context)
+
+
 @workflow.defn(name="IssueSolutionLoopWorkflow")
 class IssueSolutionLoopWorkflow(ControlledWorkflow):
     """Durable one-issue-at-a-time solution loop; production mode is intentionally absent."""
@@ -1356,9 +1388,9 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: GitHubBacklogImportInput) -> dict[str, Any]:
-        if request.project not in {"falcone", "musematic"}:
+        if request.project not in {"falcone", "musematic", "llmwiki"}:
             raise ApplicationError(
-                "existing GitHub backlog supports only Falcone and Musematic",
+                "existing GitHub backlog project is not allowlisted",
                 type="PolicyViolation",
                 non_retryable=True,
             )
@@ -1392,7 +1424,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
-        if request.project not in {"falcone", "musematic"}:
+        if request.project not in {"falcone", "musematic", "llmwiki"}:
             raise ApplicationError(
                 "existing backlog loop project is not allowlisted",
                 type="PolicyViolation",
@@ -1668,15 +1700,185 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         return boundary
                     continue
                 return {"status": "AWAITING_STAGING_DELIVERY", "results": results}
-            return {
-                "status": "BLOCKED_BY_DELIVERY",
-                "blocker": "FULL_DELIVERY_REQUIRES_PROJECT_BUILD_AND_STAGING_GATES",
-                "results": results,
-            }
+            if not workflow.patched("existing-backlog-full-delivery-orchestration-v1"):
+                return {
+                    "status": "BLOCKED_BY_DELIVERY",
+                    "blocker": "FULL_DELIVERY_REQUIRES_PROJECT_BUILD_AND_STAGING_GATES",
+                    "results": results,
+                }
+            full_delivery = await self._execute_full_delivery(
+                request=request,
+                finding_id=str(gate["finding_id"]),
+                ordinal=ordinal,
+                delivery=delivery,
+                results=results,
+                register_child_runs=register_child_runs,
+            )
+            if full_delivery["status"] != "RUNTIME_VERIFIED":
+                await self._step(
+                    "backlog.record_loop_state",
+                    {
+                        **asdict(request),
+                        "loop_status": "PAUSED",
+                        "blocker": full_delivery["blocker"],
+                    },
+                )
+                return {
+                    "status": "BLOCKED",
+                    "blocker": full_delivery["blocker"],
+                    "results": results,
+                }
+            # Candidate-revision staging verification is deliberately not treated as
+            # final closure.  A protected merge can change both repository SHAs and
+            # therefore requires a final exact-merge build, deploy, and verification
+            # service before the issue may be commented on or closed.
+            blocker = "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
+            await self._step(
+                "backlog.record_loop_state",
+                {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+            )
+            return {"status": "BLOCKED", "blocker": blocker, "results": results}
         await self._step(
             "backlog.record_loop_state", {**asdict(request), "loop_status": "COMPLETE"}
         )
         return {"status": "COMPLETE", "results": results}
+
+    async def _execute_full_delivery(
+        self,
+        *,
+        request: ExistingGitHubBacklogLoopInput,
+        finding_id: str,
+        ordinal: int,
+        delivery: dict[str, Any],
+        results: list[dict[str, Any]],
+        register_child_runs: bool,
+    ) -> dict[str, str]:
+        """Drive the existing immutable candidate through staging verification.
+
+        This method owns only the already-reviewed candidate pipeline.  It never
+        merges a PR or closes an issue, and returns a precise blocker whenever a
+        project build, approval, release identity, observer, or verification gate
+        is unavailable.
+        """
+        delivery_context = delivery.get("context")
+        change_set_id = (
+            str(delivery_context.get("change_set_id", ""))
+            if isinstance(delivery_context, dict)
+            else ""
+        )
+        if not change_set_id:
+            return {"status": "BLOCKED", "blocker": "CHANGE_SET_BINDING_MISSING"}
+
+        workflow_root = workflow.info().workflow_id
+        task_queue = workflow.info().task_queue
+        stages: tuple[tuple[str, str, Any], ...] = (
+            (
+                "delivery-reconciliation",
+                "DeliveryReconciliationWorkflow",
+                DeliveryReconciliationInput(change_set_id=change_set_id, dry_run=False),
+            ),
+        )
+        current: dict[str, Any] = delivery
+        for child_kind, workflow_type, child_input in stages:
+            child_id = f"{workflow_root}-issue-{ordinal}-{child_kind}"
+            if register_child_runs:
+                await self._step(
+                    "backlog.register_child_run",
+                    {
+                        **asdict(request),
+                        "child_kind": child_kind,
+                        "child_workflow_id": child_id,
+                        "finding_id": finding_id,
+                        "change_set_id": change_set_id,
+                    },
+                )
+            current = await workflow.execute_child_workflow(
+                workflow_type,
+                child_input,
+                id=child_id,
+                task_queue=task_queue,
+                execution_timeout=timedelta(hours=12),
+            )
+            results.append({**current, "stage": child_kind})
+            if current.get("status") != "DEPLOY_PR":
+                return {
+                    "status": "BLOCKED",
+                    "blocker": str(
+                        current.get("blocker")
+                        or current.get("status")
+                        or "DELIVERY_RECONCILIATION_FAILED"
+                    ),
+                }
+
+        staging_id = f"{workflow_root}-issue-{ordinal}-staging-deployment"
+        if register_child_runs:
+            await self._step(
+                "backlog.register_child_run",
+                {
+                    **asdict(request),
+                    "child_kind": "staging-deployment",
+                    "child_workflow_id": staging_id,
+                    "finding_id": finding_id,
+                    "change_set_id": change_set_id,
+                },
+            )
+        staging = await workflow.execute_child_workflow(
+            "StagingDeploymentWorkflow",
+            StagingDeploymentInput(
+                change_set_id=change_set_id, environment="staging", dry_run=False
+            ),
+            id=staging_id,
+            task_queue=task_queue,
+            execution_timeout=timedelta(hours=12),
+        )
+        results.append({**staging, "stage": "staging-deployment"})
+        if staging.get("status") != "STAGING_DEPLOYED":
+            return {
+                "status": "BLOCKED",
+                "blocker": str(
+                    staging.get("blocker") or staging.get("status") or "STAGING_DEPLOYMENT_FAILED"
+                ),
+            }
+        staging_context = staging.get("context")
+        deployment_id = (
+            str(staging_context.get("deployment_id", ""))
+            if isinstance(staging_context, dict)
+            else ""
+        )
+        if not deployment_id:
+            return {"status": "BLOCKED", "blocker": "DEPLOYMENT_BINDING_MISSING"}
+
+        verification_id = f"{workflow_root}-issue-{ordinal}-runtime-verification"
+        if register_child_runs:
+            await self._step(
+                "backlog.register_child_run",
+                {
+                    **asdict(request),
+                    "child_kind": "runtime-verification",
+                    "child_workflow_id": verification_id,
+                    "finding_id": finding_id,
+                    "change_set_id": change_set_id,
+                    "deployment_id": deployment_id,
+                },
+            )
+        verified = await workflow.execute_child_workflow(
+            "RuntimeVerificationWorkflow",
+            RuntimeVerificationInput(deployment_id=deployment_id, project=request.project),
+            id=verification_id,
+            task_queue=task_queue,
+            execution_timeout=timedelta(hours=12),
+        )
+        results.append({**verified, "stage": "runtime-verification"})
+        if verified.get("status") != "RUNTIME_VERIFIED":
+            return {
+                "status": "BLOCKED",
+                "blocker": str(
+                    verified.get("blocker")
+                    or verified.get("status")
+                    or "RUNTIME_VERIFICATION_FAILED"
+                ),
+            }
+        return {"status": "RUNTIME_VERIFIED", "blocker": ""}
 
     async def _after_issue_boundary(
         self,
@@ -1740,6 +1942,100 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 "REVISION_DRIFT",
                 "APPROVAL",
             )
+        )
+
+
+@workflow.defn(name="AutonomousBacklogCampaignWorkflow")
+class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
+    """One global durable selector; at most one child issue workflow is active."""
+
+    @workflow.run
+    async def run(self, request: AutonomousBacklogCampaignInput) -> dict[str, Any]:
+        if (
+            set(request.backlog_campaign_ids) != {"falcone", "musematic", "llmwiki"}
+            or request.environment != "staging"
+            or request.maximum_risk != "R2"
+            or request.global_active_issues != 1
+            or request.global_deployments != 1
+            or request.production
+            or request.implementation_correction_limit != 5
+            or request.deployment_correction_limit != 3
+        ):
+            raise ApplicationError(
+                "global backlog policy is outside the staging R2 mission boundary",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        context = await self._step("global_backlog.register", asdict(request))
+        processed_this_run = 0
+        while not self._cancelled:
+            if not await self._checkpoint("GLOBAL_ISSUE_SELECTION"):
+                break
+            selection = await self._step("global_backlog.select_next", context)
+            item = selection.get("item")
+            if selection.get("status") == "WAITING":
+                wait_seconds = max(
+                    30,
+                    min(int(selection.get("retry_after_seconds", 900)), 900),
+                )
+                self._phase = "WAITING_FOR_BLOCKED_ISSUE_RETRY"
+                await workflow.sleep(timedelta(seconds=wait_seconds))
+                continue
+            if item is None:
+                return await self._step(
+                    "global_backlog.finalize", {**context, "terminal_status": "COMPLETE"}
+                )
+            if not isinstance(item, dict):
+                raise TypeError("global backlog selection must be an object")
+            self._phase = (
+                f"ISSUE:{item['repository']}#{item['issue_number']}:CURRENT_STATE_REVALIDATION"
+            )
+            project = str(item["project"])
+            child_id = (
+                f"{workflow.info().workflow_id}-{project}-"
+                f"{str(item['repository']).removeprefix('gntik-ai/').replace('-', '_')}-"
+                f"{item['issue_number']}"
+            )
+            result = await workflow.execute_child_workflow(
+                "ExistingGitHubBacklogLoopWorkflow",
+                ExistingGitHubBacklogLoopInput(
+                    project=project,
+                    backlog_campaign_id=str(item["backlog_campaign_id"]),
+                    maximum_risk=str(item.get("execution_maximum_risk", "R2")),
+                    delivery_mode="full-delivery",
+                    maximum_items=1,
+                    target_repository=str(item["repository"]),
+                    target_issue_number=int(item["issue_number"]),
+                    continue_after_blocked_issue=False,
+                    correction_limit=5,
+                    global_campaign_id=request.campaign_id,
+                    r3_approval_binding=(
+                        str(item["r3_approval_binding"])
+                        if item.get("r3_approval_binding")
+                        else None
+                    ),
+                ),
+                id=child_id,
+                task_queue=workflow.info().task_queue,
+                execution_timeout=timedelta(days=7),
+            )
+            context = await self._step(
+                "global_backlog.record_result", {**context, "item": item, "result": result}
+            )
+            processed_this_run += 1
+            if self._pause_after_current:
+                self._pause_after_current = False
+                self._paused = True
+            if self._stop_after_current:
+                return await self._step(
+                    "global_backlog.finalize", {**context, "terminal_status": "STOPPED"}
+                )
+            if self._paused:
+                await workflow.wait_condition(lambda: not self._paused or self._cancelled)
+            if processed_this_run >= 25:
+                workflow.continue_as_new(request)
+        return await self._step(
+            "global_backlog.finalize", {**context, "terminal_status": "CANCELLED"}
         )
 
 
@@ -1874,9 +2170,11 @@ ALL_WORKFLOWS = [
     CleanupWorkflow,
     AcceptanceLifecycleWorkflow,
     ObservabilityAcceptanceWorkflow,
+    ReverseObservabilityAcceptanceWorkflow,
     IssueSolutionLoopWorkflow,
     GitHubBacklogImportWorkflow,
     ExistingGitHubBacklogLoopWorkflow,
+    AutonomousBacklogCampaignWorkflow,
     EnhancementDiscoveryWorkflow,
     EnhancementDeliveryWorkflow,
     EnhancementSolutionLoopWorkflow,
