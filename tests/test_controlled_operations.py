@@ -1400,6 +1400,61 @@ async def test_global_child_returns_blocker_without_waiting_or_completing_issue(
 
 
 @pytest.mark.asyncio
+async def test_global_child_persists_correction_exhaustion_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = ExistingGitHubBacklogLoopWorkflow()
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    state_calls: list[dict[str, object]] = []
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if name == "backlog.load_execution":
+            return {
+                "status": "READY",
+                "items": [{"repository": "gntik-ai/falcone", "issue_number": 957}],
+            }
+        if name == "backlog.revalidate_gate":
+            return {
+                "status": "READY",
+                "finding_id": "00000000-0000-4000-8000-000000000957",
+                "risk_class": "R2",
+            }
+        if name == "backlog.record_loop_state":
+            state_calls.append(payload)
+        return {"status": "REGISTERED"}
+
+    async def child(_name: str, _input: object, **_kwargs: object) -> dict[str, object]:
+        return {"status": "REQUEST_CHANGES"}
+
+    instance._step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="synthetic-global-child", task_queue="engineering"),
+    )
+    monkeypatch.setattr(workflow_definitions.workflow, "execute_child_workflow", child)
+
+    result = await instance.run(
+        ExistingGitHubBacklogLoopInput(
+            project="falcone",
+            backlog_campaign_id=str(CAMPAIGN_ID),
+            maximum_risk="R2",
+            delivery_mode="full-delivery",
+            maximum_items=1,
+            continue_after_blocked_issue=False,
+            correction_limit=0,
+            global_campaign_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "CORRECTION_LIMIT_EXHAUSTED"
+    assert state_calls[-1]["loop_status"] == "PAUSED"
+    assert state_calls[-1]["blocker"] == "CORRECTION_LIMIT_EXHAUSTED"
+
+
+@pytest.mark.asyncio
 async def test_full_delivery_owns_candidate_pipeline_and_preserves_final_merge_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

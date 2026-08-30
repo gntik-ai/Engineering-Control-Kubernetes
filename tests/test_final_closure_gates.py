@@ -28,6 +28,7 @@ from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     DocumentationImpact,
     approval_binding,
+    canonical_sha256,
 )
 from engineering_control.models.enums import ChangeSetState
 from engineering_control.models.final_closure import (
@@ -329,25 +330,95 @@ def test_prepare_final_closure_rechecks_current_exact_r3_approval(tmp_path: Path
 
 
 def test_prepare_final_closure_accepts_current_exact_r3_approval(tmp_path: Path) -> None:
-    handler, payload, _campaign_row = _seed_prepare(tmp_path, risk="R3")
+    handler, payload, campaign = _seed_prepare(tmp_path, risk="R3")
     now = datetime.now(UTC)
+    expires_at = now + timedelta(hours=1)
     with handler.sessions.begin() as session:
         issue = session.scalar(
             select(BacklogIssueRecord).where(BacklogIssueRecord.issue_number == 42)
         )
         assert issue is not None
         candidate_payload = {
+            "project": campaign.project,
+            "repository": issue.repository,
+            "issue_number": issue.issue_number,
             "issue_body_sha256": issue.body_sha256,
             "issue_updated_at": issue.github_updated_at.isoformat(),
+            "source_repository": campaign.source_repository,
+            "deployment_repository": campaign.deployment_repository,
+            "source_branch": campaign.source_default_branch,
+            "deployment_branch": campaign.deployment_default_branch,
+            "source_head": campaign.source_head_at_import,
+            "deployment_head": campaign.deployment_head_at_import,
+            "environment": "staging",
             "production": False,
+            "delivery_adapter": "synthetic:test",
+            "expires_at": expires_at.isoformat(),
         }
+        candidate_binding = canonical_sha256(candidate_payload)
         session.add(
             ActionCandidate(
                 action="r3_issue_approval",
                 project="falcone",
                 target_type="github_issue",
                 target_id=f"{issue.repository}#{issue.issue_number}",
-                payload_json=candidate_payload,
+                payload_json={
+                    **candidate_payload,
+                    "approved_by": "telegram:42",
+                    "approved_at": now.isoformat(),
+                },
+                capability_status="AVAILABLE",
+                blockers_json=[],
+                binding_hash=candidate_binding,
+                confirmation_phrase=f"APPROVE_R3_FALCONE_42_{candidate_binding[:16].upper()}",
+                session_binding_hash="6" * 64,
+                created_at=now,
+                expires_at=expires_at,
+                used_at=now,
+            )
+        )
+    payload["r3_approval_binding"] = candidate_binding
+    assert handler._prepare_final_closure(payload)["status"] == "FINAL_CLOSURE_READY"
+    with handler.sessions.begin() as session:
+        candidate = session.scalar(
+            select(ActionCandidate).where(ActionCandidate.binding_hash == candidate_binding)
+        )
+        assert candidate is not None
+        candidate.payload_json = {**candidate.payload_json, "delivery_adapter": "tampered"}
+    with pytest.raises(ValueError, match="current exact R3 issue approval"):
+        handler._prepare_final_closure(payload)
+
+
+def test_prepare_final_closure_rejects_a_different_current_r3_binding(tmp_path: Path) -> None:
+    handler, payload, campaign = _seed_prepare(tmp_path, risk="R3")
+    now = datetime.now(UTC)
+    with handler.sessions.begin() as session:
+        issue = session.scalar(
+            select(BacklogIssueRecord).where(BacklogIssueRecord.issue_number == 42)
+        )
+        assert issue is not None
+        session.add(
+            ActionCandidate(
+                action="r3_issue_approval",
+                project="falcone",
+                target_type="github_issue",
+                target_id=f"{issue.repository}#{issue.issue_number}",
+                payload_json={
+                    "project": campaign.project,
+                    "repository": issue.repository,
+                    "issue_number": issue.issue_number,
+                    "issue_body_sha256": issue.body_sha256,
+                    "issue_updated_at": issue.github_updated_at.isoformat(),
+                    "source_repository": campaign.source_repository,
+                    "deployment_repository": campaign.deployment_repository,
+                    "source_branch": campaign.source_default_branch,
+                    "deployment_branch": campaign.deployment_default_branch,
+                    "source_head": campaign.source_head_at_import,
+                    "deployment_head": campaign.deployment_head_at_import,
+                    "environment": "staging",
+                    "production": False,
+                    "approved_by": "telegram:42",
+                },
                 capability_status="AVAILABLE",
                 blockers_json=[],
                 binding_hash="5" * 64,
@@ -358,7 +429,49 @@ def test_prepare_final_closure_accepts_current_exact_r3_approval(tmp_path: Path)
                 used_at=now,
             )
         )
-    assert handler._prepare_final_closure(payload)["status"] == "FINAL_CLOSURE_READY"
+    payload["r3_approval_binding"] = "7" * 64
+    with pytest.raises(ValueError, match="current exact R3 issue approval"):
+        handler._prepare_final_closure(payload)
+
+
+def test_deployment_merge_authorization_reloads_the_exact_persisted_plan(
+    tmp_path: Path,
+) -> None:
+    handler, payload, _campaign = _seed_prepare(tmp_path)
+    prepared = handler._prepare_final_closure(payload)
+    plan = FinalClosurePlan.model_validate(prepared["final_closure_plan"])
+    deployment_plan = FinalDeploymentMergePlan(
+        closure=plan,
+        deployment=plan.deployment,
+        independent_review_sha256="5" * 64,
+    )
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, plan.change_set_id)
+        assert change_set is not None
+        recovery = dict(change_set.recovery_json)
+        closure = dict(recovery["final_closure"])
+        closure["final_deployment_merge_plan"] = deployment_plan.model_dump(mode="json")
+        recovery["final_closure"] = closure
+        change_set.recovery_json = recovery
+        change_set.state = ChangeSetState.DEPLOY_PR.value
+    authorized = handler._authorize_final_deployment_merge(
+        {
+            **prepared,
+            "status": "DEPLOY_PR",
+            "final_deployment_merge_plan": deployment_plan.model_dump(mode="json"),
+        }
+    )
+    assert authorized["status"] == "FINAL_DEPLOYMENT_MERGE_AUTHORIZED"
+    assert len(authorized["deployment_merge_authorization_sha256"]) == 64
+    changed = deployment_plan.model_copy(update={"independent_review_sha256": "6" * 64})
+    with pytest.raises(ValueError, match="persisted final deployment merge authorization changed"):
+        handler._authorize_final_deployment_merge(
+            {
+                **prepared,
+                "status": "DEPLOY_PR",
+                "final_deployment_merge_plan": changed.model_dump(mode="json"),
+            }
+        )
 
 
 @pytest.mark.parametrize("variant", ["missing-runtime", "wrong-revision", "active-agent"])
@@ -634,6 +747,38 @@ class _NoCloseBroker:
     def close_issue(self, **_kwargs: Any) -> dict[str, Any]:
         self.calls += 1
         return {}
+
+    def merge_pull_request(self, **_kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        return {}
+
+
+def test_deployment_merge_rejects_missing_metadata_authorization_without_broker_call(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    deployment_plan = FinalDeploymentMergePlan(
+        closure=plan,
+        deployment=plan.deployment,
+        independent_review_sha256="5" * 64,
+    )
+    broker = _NoCloseBroker()
+    handler = DeliveryActivityHandler(
+        _settings(tmp_path),
+        runner=_DirtyRunner(),  # type: ignore[arg-type]
+        broker=broker,  # type: ignore[arg-type]
+    )
+    result = handler._merge_bound_pull_request(
+        {
+            "status": "DEPLOY_PR",
+            "final_closure_plan": plan.model_dump(mode="json"),
+            "final_deployment_merge_plan": deployment_plan.model_dump(mode="json"),
+        },
+        source=False,
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "PROTECTED_DEPLOYMENT_MERGE_FAILED"
+    assert broker.calls == 0
 
 
 def test_final_worktree_sync_rejects_dirty_worktree(tmp_path: Path) -> None:

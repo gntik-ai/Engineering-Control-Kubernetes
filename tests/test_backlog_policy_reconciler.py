@@ -123,7 +123,7 @@ def test_root_reconciler_accepts_exact_stopped_owner_and_rejects_malformed_neste
         validate(session, request)
 
 
-def test_expiry_disables_for_expired_owner_even_when_inventory_is_current(
+def test_expiry_disables_and_expires_inventory_when_owner_is_expired(
     tmp_path: Path,
 ) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'expiry.sqlite'}")
@@ -155,7 +155,7 @@ def test_expiry_disables_for_expired_owner_even_when_inventory_is_current(
         assert expire(session, now) is True
     with Session(engine) as session:
         assert session.get(GitHubBacklogCampaign, owner_id).status == "EXPIRED"
-        assert session.get(GitHubBacklogCampaign, inventory_id).status == "APPROVED_INVENTORY"
+        assert session.get(GitHubBacklogCampaign, inventory_id).status == "EXPIRED"
 
 
 def test_expiry_keeps_policy_for_current_owner_and_expires_inventory(
@@ -238,3 +238,35 @@ def test_disable_accepts_expired_terminal_owner_for_fail_safe_policy_removal(
         session.add(owner)
     with Session(engine) as session:
         assert VALIDATE_CAMPAIGN(session, request).id == campaign_id
+
+
+def test_owner_expiry_also_expires_orphaned_inventory_approvals(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'orphaned-inventory.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    owner_id = UUID("11111111-1111-4111-8111-111111111111")
+    inventory_id = UUID("22222222-2222-4222-8222-222222222222")
+    with Session(engine) as session, session.begin():
+        session.add(
+            campaign(
+                owner_id,
+                project="falcone",
+                status="APPROVED",
+                role="owner",
+                now=now - timedelta(days=2),
+            )
+        )
+        session.add(
+            campaign(
+                inventory_id,
+                project="musematic",
+                status="APPROVED_INVENTORY",
+                role="inventory",
+                now=now,
+            )
+        )
+    with Session(engine) as session, session.begin():
+        assert EXPIRE_CAMPAIGNS(session, now) is True
+    with Session(engine) as session:
+        assert session.get(GitHubBacklogCampaign, owner_id).status == "EXPIRED"
+        assert session.get(GitHubBacklogCampaign, inventory_id).status == "EXPIRED"

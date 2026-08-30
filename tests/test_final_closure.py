@@ -672,8 +672,9 @@ async def test_final_closure_resumes_only_bounded_issue_comment_and_close(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hardened_recovery", [False, True])
 async def test_final_closure_orders_verification_before_comment_and_close(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, hardened_recovery: bool
 ) -> None:
     instance = FinalClosureWorkflow()
     instance._checkpoint = lambda _phase: _true()  # type: ignore[method-assign]
@@ -693,6 +694,7 @@ async def test_final_closure_orders_verification_before_comment_and_close(
             "reconcile.prepare_release_review": "RELEASE_REVIEW_READY",
             "reconcile.invoke_release_reviewer": "RELEASE_REVIEWED",
             "reconcile.persist_release_review": "DEPLOY_PR",
+            "final.authorize_deployment_merge": "FINAL_DEPLOYMENT_MERGE_AUTHORIZED",
             "final.merge_deployment": "DEPLOYMENT_MERGED",
             "final.persist_deployment_merge": "FINAL_DEPLOYMENT_MERGE_PERSISTED",
             "final.sync_worktrees": "FINAL_WORKTREES_SYNCHRONIZED",
@@ -721,7 +723,7 @@ async def test_final_closure_orders_verification_before_comment_and_close(
     instance._step = step  # type: ignore[method-assign]
     instance._github_write_step = step  # type: ignore[method-assign]
     instance._agent_step = step  # type: ignore[method-assign]
-    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: hardened_recovery)
     monkeypatch.setattr(
         workflow_definitions.workflow,
         "info",
@@ -743,6 +745,7 @@ async def test_final_closure_orders_verification_before_comment_and_close(
     assert result["status"] == "FIXED"
     assert steps.index("RuntimeVerificationWorkflow") < steps.index("final.comment_issue")
     assert steps.index("final.persist_comment") < steps.index("final.close_issue")
+    assert ("final.authorize_deployment_merge" in steps) is hardened_recovery
 
 
 @pytest.mark.asyncio

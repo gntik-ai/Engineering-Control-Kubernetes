@@ -656,25 +656,61 @@ class SQLMetadataRepository:
                 or campaign.status not in {"AWAITING_APPROVAL", "APPROVED_POLICY_PENDING"}
             ):
                 raise ValueError("existing-backlog approval binding is not current")
+            now = datetime.now(UTC)
             pending_owner = session.scalar(
-                select(GitHubBacklogCampaign.id).where(
+                select(GitHubBacklogCampaign).where(
                     GitHubBacklogCampaign.id != campaign.id,
                     GitHubBacklogCampaign.status == "APPROVED_POLICY_PENDING",
                 )
             )
             if pending_owner is not None:
-                raise ValueError("another backlog campaign policy activation is pending")
+                pending_binding = pending_owner.approval_json.get("binding")
+                pending_expiry = (
+                    datetime.fromisoformat(str(pending_binding.get("expires_at")))
+                    if isinstance(pending_binding, dict)
+                    else now
+                )
+                if pending_expiry.tzinfo is None:
+                    pending_expiry = pending_expiry.replace(tzinfo=UTC)
+                if pending_expiry > now:
+                    raise ValueError("another backlog campaign policy activation is pending")
+                pending_owner.status = "EXPIRED"
             active_campaigns = session.scalars(
                 select(GitHubBacklogCampaign).where(
                     GitHubBacklogCampaign.id != campaign.id,
-                    GitHubBacklogCampaign.status.in_({"APPROVED", "RUNNING", "PAUSED"}),
+                    GitHubBacklogCampaign.status.in_(
+                        {"APPROVED_INVENTORY", "APPROVED", "RUNNING", "PAUSED"}
+                    ),
                 )
             ).all()
-            active_owners = [
-                candidate.id
-                for candidate in active_campaigns
-                if candidate.approval_json.get("policy_role") in {None, "owner"}
-            ]
+            active_owners: list[UUID] = []
+            expired_owner = False
+            for candidate in active_campaigns:
+                if candidate.approval_json.get("policy_role") not in {None, "owner"}:
+                    continue
+                candidate_binding = candidate.approval_json.get("binding")
+                candidate_binding = (
+                    candidate_binding
+                    if isinstance(candidate_binding, dict)
+                    else candidate.approval_json
+                )
+                try:
+                    candidate_expiry = datetime.fromisoformat(
+                        str(candidate_binding.get("expires_at"))
+                    )
+                    if candidate_expiry.tzinfo is None:
+                        candidate_expiry = candidate_expiry.replace(tzinfo=UTC)
+                except (TypeError, ValueError):
+                    candidate_expiry = now
+                if candidate_expiry <= now:
+                    candidate.status = "EXPIRED"
+                    expired_owner = True
+                    continue
+                active_owners.append(candidate.id)
+            if expired_owner or not active_owners:
+                for candidate in active_campaigns:
+                    if candidate.approval_json.get("policy_role") == "inventory":
+                        candidate.status = "EXPIRED"
             if len(active_owners) > 1:
                 raise ValueError("multiple backlog campaigns claim GitHub write policy ownership")
             active_owner = active_owners[0] if active_owners else None
@@ -682,7 +718,7 @@ class SQLMetadataRepository:
             if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
                 raise ValueError("existing-backlog approval candidate changed")
             expires_at = datetime.fromisoformat(str(raw_binding["expires_at"]))
-            if expires_at <= datetime.now(UTC):
+            if expires_at <= now:
                 raise ValueError("existing-backlog approval candidate expired")
             campaign.status = (
                 "APPROVED_INVENTORY" if active_owner is not None else "APPROVED_POLICY_PENDING"

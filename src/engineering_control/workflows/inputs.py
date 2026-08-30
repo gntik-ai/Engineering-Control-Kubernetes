@@ -65,6 +65,7 @@ class FinalClosureInput:
     project: str
     issue_repository: str
     issue_number: int
+    r3_approval_binding: str | None = None
 
 
 @dataclass

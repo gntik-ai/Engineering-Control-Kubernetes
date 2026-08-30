@@ -16,16 +16,19 @@ issue.
 - `final.prepare` revalidates the current unexpired full-delivery campaign approval, repository pair,
   protected-merge and issue-close permissions, provider separation, documentation result, open issue,
   resumable ChangeSet state, and the exact current R3 approval when the issue is R3.
-- An R3 approval must still be current at every closure re-entry. Expiry during a long delivery stops
-  further mutation and requires a newly generated approval bound to the unchanged issue body and
-  update timestamp; completed protected merges are preserved while the issue remains open.
+- An R3 approval must still be current at every closure re-entry and immediately before the
+  deployment merge. Its exact binding is persisted in the closure plan and covers the issue body and
+  update timestamp, repository pair, imported branch heads, staging adapter, correction limits, and
+  `production=false`. Expiry during a long delivery stops further mutation; completed protected
+  merges are preserved while the issue remains open.
 - The exact source PR head is protected-merged first. The merge SHA and tree are persisted before any
   subsequent action.
 - The workflow waits at most 120 one-minute attempts for a signed candidate manifest produced from
   that exact source merge SHA. Exhaustion returns `FINAL_BUILD_WAIT_EXHAUSTED` and performs no
   deployment merge or issue close.
-- Immutable promotion and opposite-provider release review bind the deployment PR head. Only that
-  reviewed head may be protected-merged.
+- Immutable promotion and opposite-provider release review bind the deployment PR head. A metadata
+  activity reloads that exact persisted plan and the current campaign/R3 approval immediately before
+  issuing a bounded authorization digest; the delivery broker rejects deployment merge without it.
 - Both local worktrees must be regular in-root directories, clean before synchronization, and clean
   at the exact merge SHAs and trees afterward.
 - A staging deployment and post-staging runtime verification must persist for the exact final
@@ -56,8 +59,10 @@ issue.
 ## Upgrade and rollback
 
 The change is additive and uses existing JSON/state columns; no database downgrade is required.
-Upgrade registers `FinalClosureWorkflow` and the final activity steps before any parent release can
-start the child. Existing workflows continue on their recorded Temporal patch branch.
+The installed base already registers `FinalClosureWorkflow`; the upgrade retains that registration
+and adds the final activity steps before any parent release can start the child. The pre-install
+visibility check must identify in-flight histories before the implementation changes. Existing
+histories continue on their recorded Temporal patch branch.
 
 Rollback must first stop creation of new final-closure children and wait for or explicitly cancel
 every in-flight final-closure workflow. Do not unregister the workflow while an execution can still

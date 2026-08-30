@@ -202,6 +202,10 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
             "PAUSED",
         } and campaign.approval_json.get("policy_role") in {None, "owner"}:
             unexpired_owner = True
+    if not unexpired_owner:
+        for campaign in active:
+            if campaign.status == "APPROVED_INVENTORY":
+                campaign.status = "EXPIRED"
     return not unexpired_owner
 
 

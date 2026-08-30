@@ -259,6 +259,40 @@ async def test_signed_candidate_persists_digests_and_dry_run_stops_before_git_mu
 
 
 @pytest.mark.asyncio
+async def test_promotion_reentry_rejects_legacy_unbound_promotion_evidence(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'unbound-promotion.sqlite'}",
+            project_config_root=ROOT / "config" / "projects",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id, _run_id, workflow_id = seed_reconciliation(handler, recovery=review_recovery())
+    prepared = await handler.handle(
+        "reconcile.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "candidate_build_run_id": None,
+            "dry_run": False,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        change_set.state = "CANDIDATE_BUILT"
+        change_set.image_digests = {"api": "sha256:" + "9" * 64}
+        recovery = dict(change_set.recovery_json)
+        recovery["promotion"] = {"promoted_head_sha": change_set.deployment_head_sha}
+        change_set.recovery_json = recovery
+
+    with pytest.raises(ValueError, match="promotion binding is incomplete"):
+        handler._prepare_promotion({**prepared, "dry_run": False})
+
+
+@pytest.mark.asyncio
 async def test_promotion_metadata_binds_commit_pr_and_releases_component_lease(
     tmp_path: Path,
 ) -> None:

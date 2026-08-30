@@ -57,6 +57,7 @@ from engineering_control.engineering.backlog import (
     BacklogApprovalBinding,
     BacklogFinalClosureEvidence,
     DocumentationImpact,
+    canonical_sha256,
     evaluate_final_closure,
 )
 from engineering_control.engineering.github import FindingPublication
@@ -362,6 +363,7 @@ class MetadataActivityHandler:
             "final.prepare",
             "final.persist_source_merge",
             "final.persist_artifact",
+            "final.authorize_deployment_merge",
             "final.persist_deployment_merge",
             "final.prepare_issue_close",
             "final.persist_comment",
@@ -506,6 +508,8 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._persist_final_source_merge, payload)
             if step == "final.persist_artifact":
                 return await asyncio.to_thread(self._persist_final_artifact, payload)
+            if step == "final.authorize_deployment_merge":
+                return await asyncio.to_thread(self._authorize_final_deployment_merge, payload)
             if step == "final.persist_deployment_merge":
                 return await asyncio.to_thread(self._persist_final_deployment_merge, payload)
             if step == "final.prepare_issue_close":
@@ -3160,26 +3164,17 @@ class MetadataActivityHandler:
                 == DocumentationImpact.BLOCKED_BY_UNRESOLVED_DOCUMENTATION_IMPACT.value
             ):
                 raise ValueError("issue is not eligible for final closure")
+            requested_r3_binding = payload.get("r3_approval_binding")
             if issue.calculated_risk == RiskClass.R3.value:
-                r3_candidates = session.scalars(
-                    select(ActionCandidate)
-                    .where(
-                        ActionCandidate.action == "r3_issue_approval",
-                        ActionCandidate.target_id == f"{issue.repository}#{issue.issue_number}",
-                        ActionCandidate.used_at.is_not(None),
-                        ActionCandidate.expires_at > now,
-                    )
-                    .order_by(ActionCandidate.created_at.desc())
-                    .limit(10)
-                ).all()
-                if not any(
-                    candidate.payload_json.get("issue_body_sha256") == issue.body_sha256
-                    and candidate.payload_json.get("issue_updated_at")
-                    == issue.github_updated_at.isoformat()
-                    and candidate.payload_json.get("production") is False
-                    for candidate in r3_candidates
-                ):
-                    raise ValueError("final closure requires a current exact R3 issue approval")
+                self._require_current_final_r3_approval(
+                    session,
+                    campaign=campaign,
+                    issue=issue,
+                    binding=str(requested_r3_binding or ""),
+                    now=now,
+                )
+            elif requested_r3_binding is not None:
+                raise ValueError("non-R3 final closure supplied an R3 approval binding")
             recovery = dict(change_set.recovery_json)
             existing_closure_value = recovery.get("final_closure")
             existing_closure = (
@@ -3236,6 +3231,7 @@ class MetadataActivityHandler:
                     or plan.project != project
                     or plan.issue_repository != issue.repository
                     or plan.issue_number != issue.issue_number
+                    or plan.r3_approval_binding_sha256 != requested_r3_binding
                     or plan.maker_provider != maker
                     or plan.checker_provider != checker
                     or plan.documentation_impact.value != issue.documentation_impact
@@ -3268,6 +3264,9 @@ class MetadataActivityHandler:
                     project=project,
                     issue_repository=issue.repository,
                     issue_number=issue.issue_number,
+                    r3_approval_binding_sha256=(
+                        str(requested_r3_binding) if requested_r3_binding is not None else None
+                    ),
                     source=source,
                     deployment=deployment,
                     maker_provider=cast(Literal["codex", "claude"], maker),
@@ -3305,6 +3304,57 @@ class MetadataActivityHandler:
             "final_closure_plan": plan.model_dump(mode="json"),
             "independent_review_sha256": independent,
         }
+
+    @staticmethod
+    def _require_current_final_r3_approval(
+        session: Session,
+        *,
+        campaign: GitHubBacklogCampaign,
+        issue: BacklogIssueRecord,
+        binding: str,
+        now: datetime,
+    ) -> ActionCandidate:
+        if not re.fullmatch(r"[a-f0-9]{64}", binding):
+            raise ValueError("final closure requires a current exact R3 issue approval")
+        candidate = session.scalar(
+            select(ActionCandidate).where(
+                ActionCandidate.action == "r3_issue_approval",
+                ActionCandidate.project == campaign.project,
+                ActionCandidate.target_id == f"{issue.repository}#{issue.issue_number}",
+                ActionCandidate.binding_hash == binding,
+                ActionCandidate.used_at.is_not(None),
+                ActionCandidate.expires_at > now,
+            )
+        )
+        expected = {
+            "project": campaign.project,
+            "repository": issue.repository,
+            "issue_number": issue.issue_number,
+            "issue_updated_at": issue.github_updated_at.isoformat(),
+            "issue_body_sha256": issue.body_sha256,
+            "source_repository": campaign.source_repository,
+            "deployment_repository": campaign.deployment_repository,
+            "source_branch": campaign.source_default_branch,
+            "deployment_branch": campaign.deployment_default_branch,
+            "source_head": campaign.source_head_at_import,
+            "deployment_head": campaign.deployment_head_at_import,
+            "environment": "staging",
+            "production": False,
+        }
+        if candidate is None or any(
+            candidate.payload_json.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError("final closure requires a current exact R3 issue approval")
+        immutable_payload = {
+            key: value
+            for key, value in candidate.payload_json.items()
+            if key not in {"approved_by", "approved_at"}
+        }
+        if canonical_sha256(immutable_payload) != binding:
+            raise ValueError("final closure requires a current exact R3 issue approval")
+        if not isinstance(candidate.payload_json.get("approved_by"), str):
+            raise ValueError("final closure requires a current exact R3 issue approval")
+        return candidate
 
     def _persist_final_source_merge(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
@@ -3453,6 +3503,75 @@ class MetadataActivityHandler:
             **payload,
             "status": "FINAL_ARTIFACT_BUILT",
             "reconciliation_plan": reconciliation.model_dump(mode="json"),
+        }
+
+    def _authorize_final_deployment_merge(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+        deployment_plan = FinalDeploymentMergePlan.model_validate(
+            payload.get("final_deployment_merge_plan")
+        )
+        if payload.get("status") != "DEPLOY_PR" or deployment_plan.closure != plan:
+            raise ValueError("final deployment merge authorization payload changed")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            campaign = session.get(GitHubBacklogCampaign, plan.backlog_campaign_id)
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == plan.backlog_campaign_id,
+                    BacklogIssueRecord.repository == plan.issue_repository,
+                    BacklogIssueRecord.issue_number == plan.issue_number,
+                )
+            )
+            if (
+                run is None
+                or change_set is None
+                or campaign is None
+                or issue is None
+                or run.change_set_id != change_set.id
+                or run.workflow_id != plan.workflow_id
+                or change_set.state != ChangeSetState.DEPLOY_PR.value
+                or change_set.deployment_head_sha != deployment_plan.deployment.head_sha
+                or campaign.approval_binding != plan.approval_binding_sha256
+            ):
+                raise ValueError("final deployment merge authorization binding is missing")
+            raw_binding = campaign.approval_json.get("binding")
+            approval_value = (
+                raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
+            )
+            approval = BacklogApprovalBinding.model_validate(
+                {field: approval_value.get(field) for field in BacklogApprovalBinding.model_fields}
+            )
+            if (
+                approval.sha256() != plan.approval_binding_sha256
+                or _as_utc(approval.expires_at) <= now
+            ):
+                raise ValueError("final deployment merge approval expired or changed")
+            recovery = dict(change_set.recovery_json)
+            closure = self._object(recovery.get("final_closure"), "final closure")
+            persisted_plan = FinalClosurePlan.model_validate(closure.get("plan"))
+            persisted_deployment = FinalDeploymentMergePlan.model_validate(
+                closure.get("final_deployment_merge_plan")
+            )
+            if persisted_plan != plan or persisted_deployment != deployment_plan:
+                raise ValueError("persisted final deployment merge authorization changed")
+            if issue.calculated_risk == RiskClass.R3.value:
+                self._require_current_final_r3_approval(
+                    session,
+                    campaign=campaign,
+                    issue=issue,
+                    binding=str(plan.r3_approval_binding_sha256 or ""),
+                    now=now,
+                )
+            elif plan.r3_approval_binding_sha256 is not None:
+                raise ValueError("non-R3 deployment merge supplied an R3 approval binding")
+        return {
+            **payload,
+            "status": "FINAL_DEPLOYMENT_MERGE_AUTHORIZED",
+            "deployment_merge_authorization_sha256": canonical_sha256(
+                deployment_plan.model_dump(mode="json")
+            ),
         }
 
     def _persist_final_deployment_merge(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4132,17 +4251,12 @@ class MetadataActivityHandler:
                 and existing_promotion.get("source_sha") == change_set.source_head_sha
                 and existing_promotion.get("image_digests") == change_set.image_digests
             )
-            legacy_candidate_promotion = (
-                isinstance(existing_promotion, dict)
-                and run.run_type == "delivery-reconciliation"
-                and change_set.state == ChangeSetState.CANDIDATE_BUILT.value
-                and "source_sha" not in existing_promotion
-                and "image_digests" not in existing_promotion
-            )
+            if isinstance(existing_promotion, dict) and not exact_promotion:
+                raise ValueError("persisted promotion binding is incomplete or changed")
             if (
                 isinstance(existing_promotion, dict)
                 and existing_promotion.get("promoted_head_sha") == expected_promoted_head
-                and (exact_promotion or legacy_candidate_promotion)
+                and exact_promotion
                 and re.fullmatch(
                     r"[a-f0-9]{40}", str(existing_promotion.get("promoted_head_sha", ""))
                 )

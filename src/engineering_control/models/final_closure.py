@@ -48,6 +48,7 @@ class FinalClosurePlan(FinalClosureModel):
     project: Project
     issue_repository: str = Field(pattern=r"^gntik-ai/(falcone|musematic|llmwiki)$")
     issue_number: int = Field(ge=1)
+    r3_approval_binding_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     source: ProtectedPullRequestBinding
     deployment: ProtectedPullRequestBinding
     maker_provider: Literal["codex", "claude"]

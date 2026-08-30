@@ -107,6 +107,7 @@ class ControlActivities:
         "final.persist_source_merge",
         "final.inspect_artifact",
         "final.persist_artifact",
+        "final.authorize_deployment_merge",
         "final.merge_deployment",
         "final.persist_deployment_merge",
         "final.sync_worktrees",

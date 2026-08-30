@@ -16,6 +16,8 @@ global selector from continuing with an independent issue.
   operator evidence, and never enqueue a second privileged policy mutation.
 - A pending owner activation blocks additional inventory approval until the root reconciler has
   committed the policy and advanced the owner to `APPROVED`.
+- Owner expiry invalidates every dependent inventory approval before the shared policy is disabled;
+  a replacement owner and each inventory must receive new exact approvals.
 - Global registration requires current, unexpired approvals for all three inventories and requires
   the selected policy campaign to be the active owner.
 - A global child issue reports a blocker to the parent without changing the inventory campaign state
@@ -37,8 +39,8 @@ global selector from continuing with an independent issue.
 ## Upgrade and rollback
 
 This change is schema-neutral: `policy_role` is stored inside the existing bounded approval JSON.
-Pre-upgrade approvals without that key are interpreted as the sole owner only while no explicit
-owner exists. An already active multi-inventory campaign must be reconciled and re-approved before
+Pre-upgrade approvals without that key are treated as owner claims. More than one legacy/explicit
+owner fails closed and requires the operator to reconcile and re-approve the inventory before global
 registration so that exactly one row is the owner and every additional row is an inventory.
 
 Rollback is allowed only after the root reconciler has disabled the shared GitHub write policy and

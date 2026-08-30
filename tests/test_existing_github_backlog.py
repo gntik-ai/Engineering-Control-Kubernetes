@@ -28,6 +28,7 @@ from engineering_control.engineering.backlog import (
     GitHubRepositoryBacklogSnapshot,
     ReproductionMode,
     approval_binding,
+    canonical_sha256,
     classify_issue,
     evaluate_final_closure,
     plan_records,
@@ -546,6 +547,44 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
     with repository.sessions() as session:
         assert session.get(GitHubBacklogCampaign, falcone_id).status == "APPROVED"
         assert session.get(GitHubBacklogCampaign, musematic_id).status == "APPROVED_INVENTORY"
+
+    llmwiki_id = UUID("33333333-3333-4333-8333-333333333333")
+    with repository.sessions.begin() as session:
+        owner = session.get(GitHubBacklogCampaign, falcone_id)
+        assert owner is not None
+        owner_binding = dict(owner.approval_json["binding"])
+        owner_binding["expires_at"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        owner.approval_binding = canonical_sha256(owner_binding)
+        owner.approval_json = {**owner.approval_json, "binding": owner_binding}
+        session.add(
+            campaign(
+                llmwiki_id,
+                "llmwiki",
+                "gntik-ai/llmwiki",
+                "gntik-ai/llmwiki",
+                "7" * 40,
+                "7" * 40,
+            )
+        )
+    llmwiki_candidate = await repository.prepare_backlog_approval(
+        llmwiki_id,
+        BacklogApprovalCandidateRequest(
+            project="llmwiki",
+            delivery_mode="source-pr",
+            maximum_risk="R2",
+            maximum_items=1,
+        ),
+    )
+    replacement = await repository.approve_backlog_campaign(
+        llmwiki_id,
+        "llmwiki",
+        llmwiki_candidate["approval_binding"],
+        "cli:engineering-ctl",
+    )
+    assert replacement["status"] == "APPROVED_POLICY_PENDING"
+    with repository.sessions() as session:
+        assert session.get(GitHubBacklogCampaign, falcone_id).status == "EXPIRED"
+        assert session.get(GitHubBacklogCampaign, musematic_id).status == "EXPIRED"
     handler = EngineeringActivityHandler(
         Settings(
             database_url=f"sqlite:///{tmp_path / 'metadata.sqlite'}",

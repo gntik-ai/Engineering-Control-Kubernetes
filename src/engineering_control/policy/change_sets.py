@@ -20,7 +20,6 @@ class TransitionEvidence:
     deployment_pr_protected: bool = False
     approval_current: bool = False
     runtime_verified: bool = False
-    final_merged_revision_verified: bool = False
     issue_closed: bool = False
     recovery_evidence_present: bool = False
 
@@ -159,11 +158,7 @@ class ChangeSetPolicy:
             ChangeSetState.AWAITING_STAGING_APPROVAL: ("deployment_pr_protected",),
             ChangeSetState.STAGING_APPROVED: ("approval_current",),
             ChangeSetState.RUNTIME_VERIFIED: ("runtime_verified",),
-            ChangeSetState.ISSUE_CLOSED: (
-                "issue_closed",
-                "runtime_verified",
-                "final_merged_revision_verified",
-            ),
+            ChangeSetState.ISSUE_CLOSED: ("issue_closed", "runtime_verified"),
             ChangeSetState.ROLLED_BACK: ("recovery_evidence_present",),
         }.get(target, ())
         missing = [name for name in required if not getattr(evidence, name)]

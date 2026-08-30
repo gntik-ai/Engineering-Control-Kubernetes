@@ -16,6 +16,7 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker, GhCliPolicyError
 from engineering_control.config import Settings
+from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.models.enums import RedactionStatus
 from engineering_control.models.final_closure import (
@@ -534,6 +535,10 @@ class DeliveryActivityHandler:
                 )
                 if deployment_plan.closure != plan:
                     raise ValueError("final deployment merge closure binding changed")
+                if payload.get("status") != "FINAL_DEPLOYMENT_MERGE_AUTHORIZED" or payload.get(
+                    "deployment_merge_authorization_sha256"
+                ) != canonical_sha256(deployment_plan.model_dump(mode="json")):
+                    raise ValueError("final deployment merge lacks current persisted authorization")
                 binding = deployment_plan.deployment
             expected_head = binding.head_sha
             result = self.broker.merge_pull_request(

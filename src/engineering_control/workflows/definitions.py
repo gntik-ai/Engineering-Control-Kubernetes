@@ -1066,11 +1066,15 @@ class FinalClosureWorkflow(ControlledWorkflow):
             if context.get("agent_invocation_status") != "SUCCESS":
                 return {"status": context.get("status", "BLOCKED"), "context": context}
             context = await self._step("reconcile.persist_release_review", context)
-        if context.get("status") != "DEPLOY_PR":
-            return {"status": context.get("status", "BLOCKED"), "context": context}
+            if context.get("status") != "DEPLOY_PR":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
 
         if hardened_recovery and not await self._checkpoint("FINAL_MERGE_DEPLOYMENT"):
             return {"status": "CANCELLED", "context": context}
+        if hardened_recovery:
+            context = await self._step("final.authorize_deployment_merge", context)
+            if context.get("status") != "FINAL_DEPLOYMENT_MERGE_AUTHORIZED":
+                return {"status": context.get("status", "BLOCKED"), "context": context}
         context = await self._github_write_step(
             "final.merge_deployment", context, timeout_minutes=30
         )
@@ -2069,6 +2073,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 return {"status": "PAUSED", "results": results}
             if sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
                 if global_child_blocker_return and request.global_campaign_id is not None:
+                    await self._step(
+                        "backlog.record_loop_state",
+                        {
+                            **asdict(request),
+                            "loop_status": "PAUSED",
+                            "blocker": "CORRECTION_LIMIT_EXHAUSTED",
+                        },
+                    )
                     return {
                         "status": "BLOCKED",
                         "blocker": "CORRECTION_LIMIT_EXHAUSTED",
@@ -2146,6 +2158,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     project=request.project,
                     issue_repository=str(item["repository"]),
                     issue_number=int(item["issue_number"]),
+                    r3_approval_binding=request.r3_approval_binding,
                 ),
                 id=closure_id,
                 task_queue=workflow.info().task_queue,
