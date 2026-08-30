@@ -110,7 +110,7 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
     expected_statuses = (
         {"APPROVED_POLICY_PENDING"}
         if request["action"] == "enable-existing-backlog"
-        else {"CANCELLED", "COMPLETE"}
+        else {"CANCELLED", "COMPLETE", "STOPPED"}
     )
     if campaign.status not in expected_statuses:
         raise ValueError("GitHub policy request campaign state is invalid")
@@ -125,7 +125,11 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
             raise ValueError("another backlog campaign already owns GitHub write policy")
     binding = campaign.approval_json.get("binding")
     approval = campaign.approval_json.get("approval")
-    if not isinstance(binding, dict) or not isinstance(approval, dict):
+    if (
+        not isinstance(binding, dict)
+        or not isinstance(approval, dict)
+        or campaign.approval_json.get("policy_role") != "owner"
+    ):
         raise ValueError("GitHub campaign approval evidence is incomplete")
     if canonical_sha256(binding) != request["approval_binding"]:
         raise ValueError("GitHub campaign approval binding changed")

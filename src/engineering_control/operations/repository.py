@@ -99,7 +99,8 @@ def _global_inventory_approval_current(
     delivery_mode = "source-pr" if project == "llmwiki" else "full-delivery"
     if (
         campaign.project != project
-        or campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING"}
+        or campaign.status
+        not in {"APPROVED_POLICY_PENDING", "APPROVED_INVENTORY", "APPROVED", "RUNNING"}
         or campaign.delivery_mode != delivery_mode
         or campaign.maximum_risk != "R2"
         or not campaign.approval_binding
@@ -107,15 +108,19 @@ def _global_inventory_approval_current(
     ):
         return False
     approval = campaign.approval_json
+    raw_binding = approval.get("binding")
+    binding_value = raw_binding if isinstance(raw_binding, dict) else approval
+    raw_approval = approval.get("approval")
+    approval_record = raw_approval if isinstance(raw_approval, dict) else approval
     if (
-        approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
-        or not isinstance(approval.get("approved_by"), str)
-        or not approval.get("approved_at")
+        approval_record.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
+        or not isinstance(approval_record.get("approved_by"), str)
+        or not approval_record.get("approved_at")
     ):
         return False
     try:
         binding = BacklogApprovalBinding.model_validate(
-            {field: approval.get(field) for field in BacklogApprovalBinding.model_fields}
+            {field: binding_value.get(field) for field in BacklogApprovalBinding.model_fields}
         )
     except ValueError:
         return False
@@ -127,6 +132,7 @@ def _global_inventory_approval_current(
     return (
         binding.sha256() == campaign.approval_binding
         and binding.backlog_campaign_id == str(campaign.id)
+        and binding.project == project
         and binding.source_head == campaign.source_head_at_import
         and binding.deployment_head == campaign.deployment_head_at_import
         and binding.dependency_plan_hash == campaign.plan_hash
@@ -613,7 +619,11 @@ class OperationsRepository:
                         campaign.approval_binding
                     )
             policy = session.get(GitHubBacklogCampaign, command.policy_campaign_id)
-            if policy is None or policy.status not in {"APPROVED", "RUNNING"}:
+            if (
+                policy is None
+                or policy.status not in {"APPROVED", "RUNNING"}
+                or policy.approval_json.get("policy_role") != "owner"
+            ):
                 blockers.append("GITHUB_WRITE_POLICY_NOT_ACTIVE")
             active = session.scalar(
                 select(Run).where(

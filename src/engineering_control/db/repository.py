@@ -644,7 +644,7 @@ class SQLMetadataRepository:
         ):
             raise ValueError("existing-backlog approval requires a reauthenticated operator")
         result: dict[str, Any]
-        request: dict[str, Any]
+        request: dict[str, Any] | None = None
         with self.sessions.begin() as session:
             campaign = session.get(GitHubBacklogCampaign, campaign_id)
             if (
@@ -654,53 +654,74 @@ class SQLMetadataRepository:
                 or campaign.status not in {"AWAITING_APPROVAL", "APPROVED_POLICY_PENDING"}
             ):
                 raise ValueError("existing-backlog approval binding is not current")
-            other = session.scalar(
+            pending_owner = session.scalar(
                 select(GitHubBacklogCampaign.id).where(
                     GitHubBacklogCampaign.id != campaign.id,
-                    GitHubBacklogCampaign.status.in_(
-                        {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING", "PAUSED"}
-                    ),
+                    GitHubBacklogCampaign.status == "APPROVED_POLICY_PENDING",
                 )
             )
-            if other is not None:
-                raise ValueError("another backlog campaign already owns GitHub write policy")
+            if pending_owner is not None:
+                raise ValueError("another backlog campaign policy activation is pending")
+            active_campaigns = session.scalars(
+                select(GitHubBacklogCampaign).where(
+                    GitHubBacklogCampaign.id != campaign.id,
+                    GitHubBacklogCampaign.status.in_({"APPROVED", "RUNNING", "PAUSED"}),
+                )
+            ).all()
+            active_owner = next(
+                (
+                    candidate.id
+                    for candidate in active_campaigns
+                    if candidate.approval_json.get("policy_role") == "owner"
+                ),
+                None,
+            )
             raw_binding = campaign.approval_json.get("binding")
             if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
                 raise ValueError("existing-backlog approval candidate changed")
             expires_at = datetime.fromisoformat(str(raw_binding["expires_at"]))
             if expires_at <= datetime.now(UTC):
                 raise ValueError("existing-backlog approval candidate expired")
-            campaign.status = "APPROVED_POLICY_PENDING"
+            campaign.status = (
+                "APPROVED_INVENTORY" if active_owner is not None else "APPROVED_POLICY_PENDING"
+            )
             campaign.approval_json = {
                 "binding": raw_binding,
+                "policy_role": "inventory" if active_owner is not None else "owner",
                 "approval": {
                     "approved_by": actor,
                     "approved_at": datetime.now(UTC).isoformat(),
                     "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
                 },
             }
-            request = {
-                "action": "enable-existing-backlog",
-                "backlog_campaign_id": str(campaign.id),
-                "project": project,
-                "approval_binding": binding,
-                "safe_repositories": [
-                    "gntik-ai/falcone",
-                    "gntik-ai/falcone-charts",
-                    "gntik-ai/musematic",
-                    "gntik-ai/musematic-deploy",
-                    "gntik-ai/llmwiki",
-                ],
-                "requested_by": actor,
-                "requested_at": datetime.now(UTC).isoformat(),
-            }
+            if active_owner is None:
+                request = {
+                    "action": "enable-existing-backlog",
+                    "backlog_campaign_id": str(campaign.id),
+                    "project": project,
+                    "approval_binding": binding,
+                    "safe_repositories": [
+                        "gntik-ai/falcone",
+                        "gntik-ai/falcone-charts",
+                        "gntik-ai/musematic",
+                        "gntik-ai/musematic-deploy",
+                        "gntik-ai/llmwiki",
+                    ],
+                    "requested_by": actor,
+                    "requested_at": datetime.now(UTC).isoformat(),
+                }
             result = {
-                "status": "APPROVED_POLICY_PENDING",
+                "status": campaign.status,
                 "backlog_campaign_id": str(campaign.id),
                 "approval_binding": binding,
-                "policy_activation": "QUEUED_ROOT_RECONCILER",
+                "policy_activation": (
+                    "EXISTING_ACTIVE_POLICY"
+                    if active_owner is not None
+                    else "QUEUED_ROOT_RECONCILER"
+                ),
             }
-        self._write_github_policy_request(request)
+        if request is not None:
+            self._write_github_policy_request(request)
         return result
 
     def _write_github_policy_request(self, request: dict[str, Any]) -> None:

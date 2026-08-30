@@ -418,6 +418,126 @@ async def test_telegram_approval_queues_only_one_typed_root_policy_request(tmp_p
     assert "token" not in request and "command" not in request
 
 
+@pytest.mark.asyncio
+async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_path) -> None:
+    request_root = tmp_path / "policy-requests"
+    request_root.mkdir(mode=0o700)
+    repository = SQLMetadataRepository(
+        f"sqlite:///{tmp_path / 'metadata.sqlite'}",
+        github_policy_request_root=request_root,
+    )
+    Base.metadata.create_all(repository.engine)
+    falcone_id = UUID("11111111-1111-4111-8111-111111111111")
+    musematic_id = UUID("22222222-2222-4222-8222-222222222222")
+
+    def campaign(
+        campaign_id: UUID,
+        project: str,
+        source: str,
+        deployment: str,
+        source_head: str,
+        deployment_head: str,
+    ) -> GitHubBacklogCampaign:
+        return GitHubBacklogCampaign(
+            id=campaign_id,
+            project=project,
+            source_repository=source,
+            deployment_repository=deployment,
+            imported_at=NOW,
+            issue_query="state:open",
+            import_filter="all",
+            source_default_branch="main",
+            deployment_default_branch="main",
+            source_head_at_import=source_head,
+            deployment_head_at_import=deployment_head,
+            issue_count=1,
+            eligible_count=1,
+            deferred_count=0,
+            duplicate_count=0,
+            stale_count=0,
+            already_fixed_count=0,
+            existing_pr_count=0,
+            blocked_count=0,
+            dependency_graph_hash="c" * 64,
+            plan_hash=("d" if project == "falcone" else "e") * 64,
+            approval_binding=None,
+            approval_json={},
+            maximum_risk=None,
+            maximum_items=1,
+            maximum_concurrency=1,
+            delivery_mode=None,
+            include_enhancements=False,
+            status="PLANNED",
+            workflow_id=f"backlog-import-{project}",
+        )
+
+    with repository.sessions.begin() as session:
+        session.add_all(
+            [
+                campaign(
+                    falcone_id,
+                    "falcone",
+                    "gntik-ai/falcone",
+                    "gntik-ai/falcone-charts",
+                    "a" * 40,
+                    "b" * 40,
+                ),
+                campaign(
+                    musematic_id,
+                    "musematic",
+                    "gntik-ai/musematic",
+                    "gntik-ai/musematic-deploy",
+                    "f" * 40,
+                    "9" * 40,
+                ),
+            ]
+        )
+    falcone_candidate = await repository.prepare_backlog_approval(
+        falcone_id,
+        BacklogApprovalCandidateRequest(
+            project="falcone",
+            delivery_mode="full-delivery",
+            maximum_risk="R2",
+            maximum_items=1,
+        ),
+    )
+    await repository.approve_backlog_campaign(
+        falcone_id,
+        "falcone",
+        falcone_candidate["approval_binding"],
+        "cli:engineering-ctl",
+    )
+    request_path = request_root / "activate.json"
+    request_path.unlink()
+    with repository.sessions.begin() as session:
+        owner = session.get(GitHubBacklogCampaign, falcone_id)
+        assert owner is not None
+        owner.status = "APPROVED"
+
+    musematic_candidate = await repository.prepare_backlog_approval(
+        musematic_id,
+        BacklogApprovalCandidateRequest(
+            project="musematic",
+            delivery_mode="full-delivery",
+            maximum_risk="R2",
+            maximum_items=1,
+        ),
+    )
+    approved = await repository.approve_backlog_campaign(
+        musematic_id,
+        "musematic",
+        musematic_candidate["approval_binding"],
+        "cli:engineering-ctl",
+    )
+
+    assert approved["status"] == "APPROVED_INVENTORY"
+    assert approved["policy_activation"] == "EXISTING_ACTIVE_POLICY"
+    assert not request_path.exists()
+    with repository.sessions() as session:
+        assert session.get(GitHubBacklogCampaign, falcone_id).status == "APPROVED"
+        assert session.get(GitHubBacklogCampaign, musematic_id).status == "APPROVED_INVENTORY"
+
+
 def test_backlog_stop_after_current_persists_terminal_state_and_policy_deactivation(
     tmp_path: Path,
 ) -> None:

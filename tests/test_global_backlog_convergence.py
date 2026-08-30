@@ -16,8 +16,15 @@ from engineering_control.db.models import (
     DashboardEvent,
     GitHubBacklogCampaign,
 )
-from engineering_control.engineering.backlog import BACKLOG_APPROVAL_PHRASE, approval_binding
-from engineering_control.operations.repository import OperationsRepository
+from engineering_control.engineering.backlog import (
+    BACKLOG_APPROVAL_PHRASE,
+    BacklogApprovalBinding,
+    approval_binding,
+)
+from engineering_control.operations.repository import (
+    OperationsRepository,
+    _global_inventory_approval_current,
+)
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 GLOBAL_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -80,6 +87,7 @@ def _campaign(campaign_id: UUID, project: str, *, status: str) -> GitHubBacklogC
         approval_json=(
             {
                 **binding.model_dump(mode="json"),
+                "policy_role": "owner",
                 "approved_by": "telegram:42",
                 "approved_at": datetime.now(UTC).isoformat(),
                 "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
@@ -149,6 +157,27 @@ def _issue(
     )
 
 
+def test_nested_inventory_approval_is_current_without_owning_shared_policy() -> None:
+    campaign = _campaign(FALCONE_ID, "falcone", status="APPROVED")
+    flat = dict(campaign.approval_json)
+    campaign.approval_json = {
+        "binding": {key: flat[key] for key in BacklogApprovalBinding.model_fields},
+        "policy_role": "inventory",
+        "approval": {
+            "approved_by": flat["approved_by"],
+            "approved_at": flat["approved_at"],
+            "typed_confirmation": flat["typed_confirmation"],
+        },
+    }
+    campaign.status = "APPROVED_INVENTORY"
+
+    assert _global_inventory_approval_current(
+        campaign,
+        project="falcone",
+        now=datetime.now(UTC),
+    )
+
+
 @pytest.mark.asyncio
 async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3(
     tmp_path: Path,
@@ -209,7 +238,9 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
     replaced = await operations.r3_issue_candidate("musematic", "source", 1119)
     assert replaced["binding"] != candidate["binding"]
 
-    handler = EngineeringActivityHandler(Settings(database_url=database_url))
+    state_root = tmp_path / "state"
+    (state_root / "github-policy-requests").mkdir(parents=True, mode=0o700)
+    handler = EngineeringActivityHandler(Settings(database_url=database_url, state_root=state_root))
     context = handler._register_global_backlog(
         {
             "campaign_id": str(GLOBAL_ID),
@@ -232,6 +263,20 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
             },
         }
     )
+
+    preserved = handler._record_backlog_loop_state(
+        {
+            "backlog_campaign_id": str(FALCONE_ID),
+            "global_campaign_id": str(GLOBAL_ID),
+            "loop_status": "PAUSED",
+            "blocker": "SYNTHETIC_CHILD_BLOCKER",
+        }
+    )
+    assert preserved["status"] == "PAUSED"
+    assert preserved["inventory_status_preserved"] == "APPROVED"
+    with operations.sessions() as session:
+        assert session.get(GitHubBacklogCampaign, FALCONE_ID).status == "APPROVED"
+    assert not (state_root / "github-policy-requests" / "activate.json").exists()
 
     first = handler._select_global_backlog_issue(context)
     assert first["item"]["issue_number"] == 953
@@ -318,6 +363,12 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
     assert exhausted["retryable"] is False
     assert exhausted["retry_exhausted"] is True
     assert handler._select_global_backlog_issue(context)["status"] == "EMPTY"
+
+    finalized = handler._finalize_global_backlog({**context, "terminal_status": "STOPPED"})
+    assert finalized["status"] == "STOPPED"
+    deactivation = (state_root / "github-policy-requests" / "activate.json").read_text()
+    assert '"action":"disable-existing-backlog"' in deactivation
+    assert '"safe_repositories":[]' in deactivation
 
 
 def test_global_campaign_requires_every_current_inventory_approval(tmp_path: Path) -> None:

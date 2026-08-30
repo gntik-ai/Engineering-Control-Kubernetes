@@ -63,7 +63,8 @@ def _current_backlog_approval(
 ) -> BacklogApprovalBinding | None:
     if (
         campaign is None
-        or campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING"}
+        or campaign.status
+        not in {"APPROVED_POLICY_PENDING", "APPROVED_INVENTORY", "APPROVED", "RUNNING"}
         or campaign.delivery_mode != delivery_mode
         or campaign.maximum_risk != maximum_risk
         or not campaign.approval_binding
@@ -1188,6 +1189,7 @@ class EngineeringActivityHandler:
                 policy_campaign is None
                 or policy_campaign_id not in campaign_ids.values()
                 or policy_campaign.status not in {"APPROVED", "RUNNING"}
+                or policy_campaign.approval_json.get("policy_role") != "owner"
             ):
                 raise ValueError("global backlog requires one active exact GitHub write policy")
             inventory: list[dict[str, Any]] = []
@@ -1563,6 +1565,7 @@ class EngineeringActivityHandler:
         if terminal not in {"COMPLETE", "STOPPED", "CANCELLED"}:
             raise ValueError("global backlog terminal state is invalid")
         now = datetime.now(UTC)
+        deactivation: dict[str, Any] | None = None
         with self.sessions.begin() as session:
             campaign = session.get(db.Campaign, campaign_id)
             if campaign is None:
@@ -1572,11 +1575,49 @@ class EngineeringActivityHandler:
             metadata["current_issue"] = None
             metadata["terminal_at"] = now.isoformat()
             campaign.metadata_json = metadata
+            raw_policy_id = metadata.get("policy_campaign_id")
+            raw_inventory_ids = metadata.get("backlog_campaign_ids")
+            if raw_policy_id is None or not isinstance(raw_inventory_ids, dict):
+                raise ValueError("global backlog policy binding is missing")
+            policy_campaign = session.get(db.GitHubBacklogCampaign, UUID(str(raw_policy_id)))
+            if (
+                policy_campaign is None
+                or str(policy_campaign.id)
+                not in {str(value) for value in raw_inventory_ids.values()}
+                or policy_campaign.approval_json.get("policy_role") != "owner"
+            ):
+                raise ValueError("global backlog policy campaign is invalid")
+            raw_approval = policy_campaign.approval_json.get("approval")
+            approval = (
+                raw_approval if isinstance(raw_approval, dict) else policy_campaign.approval_json
+            )
+            actor = approval.get("approved_by") if isinstance(approval, dict) else None
+            if not isinstance(actor, str) or not (
+                actor.startswith("telegram:")
+                or actor == "dashboard:reauthenticated"
+                or actor == "cli:engineering-ctl"
+            ):
+                raise ValueError("global backlog policy approval evidence is missing")
+            for raw_inventory_id in raw_inventory_ids.values():
+                inventory = session.get(db.GitHubBacklogCampaign, UUID(str(raw_inventory_id)))
+                if inventory is not None:
+                    inventory.status = terminal
+            deactivation = {
+                "action": "disable-existing-backlog",
+                "backlog_campaign_id": str(policy_campaign.id),
+                "project": policy_campaign.project,
+                "approval_binding": policy_campaign.approval_binding,
+                "safe_repositories": [],
+                "requested_by": actor,
+                "requested_at": now.isoformat(),
+            }
             run = session.scalar(select(db.Run).where(db.Run.campaign_id == campaign_id).limit(1))
             if run is not None:
                 run.status = terminal
                 run.finished_at = now
                 run.summary = f"Global backlog campaign reached {terminal}"
+        if deactivation is not None:
+            self._write_policy_request(deactivation)
         return {**payload, "status": terminal}
 
     def _backlog_revalidate_gate(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1846,6 +1887,27 @@ class EngineeringActivityHandler:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
+            raw_global_id = payload.get("global_campaign_id")
+            if raw_global_id is not None:
+                global_campaign = session.get(db.Campaign, UUID(str(raw_global_id)))
+                metadata = global_campaign.metadata_json if global_campaign is not None else None
+                inventory_ids = (
+                    metadata.get("backlog_campaign_ids") if isinstance(metadata, dict) else None
+                )
+                if (
+                    global_campaign is None
+                    or global_campaign.project != "platform"
+                    or not isinstance(metadata, dict)
+                    or metadata.get("kind") != "autonomous-global-backlog"
+                    or not isinstance(inventory_ids, dict)
+                    or str(campaign_id) not in {str(value) for value in inventory_ids.values()}
+                ):
+                    raise ValueError("global child backlog binding is invalid")
+                return self._envelope(
+                    "backlog.record_loop_state",
+                    {**payload, "inventory_status_preserved": campaign.status},
+                    status,
+                )
             campaign.status = status
             if status in {"CANCELLED", "COMPLETE", "STOPPED"}:
                 approval = campaign.approval_json.get("approval")

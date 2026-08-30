@@ -1816,6 +1816,20 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         continue
                     blocker = f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
                 issue_ref = f"{item['repository']}#{item['issue_number']}"
+                if request.global_campaign_id is not None:
+                    results.append(
+                        {
+                            "status": "BLOCKED",
+                            "blocker": blocker,
+                            "repository": item["repository"],
+                            "issue_number": item["issue_number"],
+                        }
+                    )
+                    await self._step(
+                        "backlog.record_loop_state",
+                        {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    )
+                    return {"status": "BLOCKED", "blocker": blocker, "results": results}
                 if (
                     sequential_source_pr
                     and request.continue_after_blocked_issue
@@ -1953,6 +1967,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 results.append(delivery)
             if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
                 blocker = str(delivery.get("blocker") or delivery.get("status"))
+                if request.global_campaign_id is not None:
+                    await self._step(
+                        "backlog.record_loop_state",
+                        {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    )
+                    return {"status": "BLOCKED", "blocker": blocker, "results": results}
                 if (
                     sequential_source_pr
                     and request.continue_after_blocked_issue
@@ -1973,6 +1993,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 return {"status": "PAUSED", "results": results}
             if sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
+                if request.global_campaign_id is not None:
+                    return {
+                        "status": "BLOCKED",
+                        "blocker": "CORRECTION_LIMIT_EXHAUSTED",
+                        "results": results,
+                    }
                 await self._step(
                     "backlog.record_loop_state",
                     {

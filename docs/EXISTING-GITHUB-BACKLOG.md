@@ -48,7 +48,7 @@ An approval candidate binds the repository pair, immutable imported heads, depen
 risk/item/concurrency limits, delivery mode, production prohibition, correction limits, staging
 targets, and expiry. Exact Telegram approval places a non-secret request in the protected policy
 request directory. A root-only path unit verifies the database approval and atomically enables
-only the four paired repositories. The GitHub worker always evaluates that strict policy before
+only the five allowlisted repositories. The GitHub worker always evaluates that strict policy before
 constructing a mutating command. A timer disables expired bindings; completed and cancelled
 campaigns request immediate disablement.
 
@@ -71,6 +71,12 @@ selects one child issue workflow at a time, durably records completed, blocked a
 retries only classified temporary blockers with bounded exponential backoff, stops retrying after
 five attempts, and never bypasses a project build, promotion, staging, or verification blocker. It
 continues with independent work and continues as new after 25 issue or wait boundaries.
+
+The shared five-repository policy has exactly one owner inventory. Each other project inventory
+retains its own immutable, operator-approved binding with an inventory-only role and cannot activate
+or disable the policy. A global child reports a blocked issue to the selector without changing its
+inventory approval or deactivating shared policy. Only global completion, stop, or cancellation
+queues the single policy-deactivation request.
 
 Full delivery composes immutable candidate reconciliation, staging deployment, runtime verification,
 and the exact-merge `FinalClosureWorkflow`. It remains fail-closed when candidate or final build,

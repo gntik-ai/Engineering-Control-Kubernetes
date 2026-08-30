@@ -1359,6 +1359,47 @@ async def test_source_pr_backlog_is_sequential_and_continues_after_independent_b
 
 
 @pytest.mark.asyncio
+async def test_global_child_returns_blocker_without_waiting_or_completing_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = ExistingGitHubBacklogLoopWorkflow()
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    state_calls: list[dict[str, object]] = []
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if name == "backlog.load_execution":
+            return {
+                "status": "READY",
+                "items": [{"repository": "gntik-ai/falcone", "issue_number": 957}],
+            }
+        if name == "backlog.revalidate_gate":
+            return {"status": "BLOCKED", "blocker": "STAGING_OBSERVER_NOT_READY"}
+        if name == "backlog.record_loop_state":
+            state_calls.append(payload)
+        return {"status": "REGISTERED"}
+
+    instance._step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+
+    result = await instance.run(
+        ExistingGitHubBacklogLoopInput(
+            project="falcone",
+            backlog_campaign_id=str(CAMPAIGN_ID),
+            maximum_risk="R2",
+            delivery_mode="full-delivery",
+            maximum_items=1,
+            continue_after_blocked_issue=False,
+            correction_limit=5,
+            global_campaign_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "STAGING_OBSERVER_NOT_READY"
+    assert state_calls[-1]["loop_status"] == "PAUSED"
+
+
+@pytest.mark.asyncio
 async def test_full_delivery_owns_candidate_pipeline_and_preserves_final_merge_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
