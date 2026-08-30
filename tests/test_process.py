@@ -127,3 +127,22 @@ async def test_jsonl_process_preserves_numeric_usage_counters_during_redaction()
     assert usage.input_tokens == 123
     assert usage.output_tokens == 17
     assert usage.cached_input_tokens == 9
+
+
+@pytest.mark.asyncio
+async def test_jsonl_process_accepts_bounded_result_larger_than_asyncio_default_line_limit() -> (
+    None
+):
+    value = "x" * (128 * 1024)
+    script = "import json; value='x'*(128*1024); print(json.dumps({'type':'result','value':value}))"
+
+    result = await run_jsonl_process(
+        [sys.executable, "-c", script],
+        prompt="bounded",
+        cwd=os.getcwd(),
+        timeout_seconds=30,
+        provider="claude",
+    )
+
+    assert result.exit_code == 0
+    assert result.events == ({"type": "result", "value": value},)

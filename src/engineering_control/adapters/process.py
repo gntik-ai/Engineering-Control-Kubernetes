@@ -10,6 +10,7 @@ from typing import Any
 from engineering_control.security.redaction import SecretRedactor
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+_PROVIDER_STREAM_LIMIT_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ async def run_jsonl_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=_PROVIDER_STREAM_LIMIT_BYTES,
     )
     assert process.stdin is not None
     assert process.stdout is not None
@@ -116,7 +118,15 @@ async def run_jsonl_process(
     stderr_size = 0
 
     async def consume_stdout() -> None:
-        while line := await stdout.readline():
+        while True:
+            try:
+                line = await stdout.readline()
+            except ValueError as error:
+                raise RuntimeError(
+                    "provider JSONL event exceeds the bounded stream limit"
+                ) from error
+            if not line:
+                break
             report = redactor.redact_json_line(line.decode("utf-8", errors="replace"))
             try:
                 import json
