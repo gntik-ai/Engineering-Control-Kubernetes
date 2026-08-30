@@ -5,10 +5,13 @@ import hashlib
 import hmac
 import json
 import secrets
+import stat
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
+import yaml
 from sqlalchemy import create_engine, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -40,6 +43,8 @@ from engineering_control.engineering.backlog import (
     BacklogApprovalBinding,
     canonical_sha256,
 )
+from engineering_control.engineering.models import ProjectManifest
+from engineering_control.models.reconciliation import DeliveryControlPolicy
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditAllProjectsCommand,
@@ -191,6 +196,7 @@ class OperationsRepository:
         *,
         export_retention_days: int = 7,
         export_max_bytes: int = 1024 * 1024,
+        project_config_root: Path | None = None,
     ) -> None:
         if not 1 <= export_retention_days <= 30:
             raise ValueError("operation export retention is outside its safety bound")
@@ -208,6 +214,9 @@ class OperationsRepository:
         self.observability = DashboardObservabilityProjection(self.sessions, self.redactor)
         self.export_retention_days = export_retention_days
         self.export_max_bytes = export_max_bytes
+        self.project_config_root = (
+            project_config_root.absolute() if project_config_root is not None else None
+        )
 
     async def candidate(self, command: Command, session_binding_hash: str) -> CandidateView:
         return await asyncio.to_thread(self._candidate, command, session_binding_hash)
@@ -619,7 +628,7 @@ class OperationsRepository:
             if command.maximum_risk.value == "R3":
                 blockers.append("R3_OPERATOR_ACTION_REQUIRED")
             if command.delivery_mode == "full-delivery":
-                blockers.append("FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED")
+                blockers.extend(self._full_delivery_blockers(command.project.value))
             issue = session.scalar(
                 select(BacklogIssueRecord).where(
                     BacklogIssueRecord.backlog_campaign_id == command.backlog_campaign_id,
@@ -671,7 +680,7 @@ class OperationsRepository:
             if command.maximum_risk.value == "R3":
                 blockers.append("R3_OPERATOR_ACTION_REQUIRED")
             if command.delivery_mode == "full-delivery":
-                blockers.append("FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED")
+                blockers.extend(self._full_delivery_blockers(command.project))
             campaign = session.get(GitHubBacklogCampaign, command.backlog_campaign_id)
             if campaign is None or campaign.project != command.project:
                 blockers.append("BACKLOG_CAMPAIGN_NOT_FOUND")
@@ -976,6 +985,46 @@ class OperationsRepository:
             ),
             binding,
         )
+
+    def _full_delivery_blockers(self, project: str) -> list[str]:
+        blockers = ["FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED"]
+        root = self.project_config_root
+        if root is None:
+            return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED"]
+
+        path = root / f"{project}.yaml"
+        try:
+            if root.is_symlink() or path.is_symlink():
+                raise ValueError("project contract cannot be a symlink")
+            resolved_root = root.resolve(strict=True)
+            resolved_path = path.resolve(strict=True)
+            metadata = resolved_path.stat()
+            if (
+                resolved_path.parent != resolved_root
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_mode & 0o022
+                or metadata.st_size > 512 * 1024
+            ):
+                raise ValueError("project contract metadata is unsafe")
+            raw = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
+            manifest = ProjectManifest.model_validate(raw)
+            if manifest.project != project:
+                raise ValueError("project contract identity mismatch")
+            policy = DeliveryControlPolicy.model_validate(manifest.delivery_control)
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+            return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_INVALID"]
+
+        if not policy.candidate_build.enabled:
+            blockers.append(
+                policy.candidate_build.blocker or "FULL_DELIVERY_CANDIDATE_BUILD_DISABLED"
+            )
+        if not policy.immutable_promotion.enabled:
+            blockers.append(
+                policy.immutable_promotion.blocker or "FULL_DELIVERY_IMMUTABLE_PROMOTION_DISABLED"
+            )
+        if not manifest.deployment.staging_policy.enabled:
+            blockers.append(manifest.deployment.staging_policy.blocker)
+        return list(dict.fromkeys(blockers))
 
     def _provider_blockers(self, session: Session) -> list[str]:
         blockers: list[str] = []

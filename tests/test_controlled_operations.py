@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,10 +67,20 @@ AUDIT_CAMPAIGN_ID = UUID("22222222-2222-4222-8222-222222222222")
 SESSION_A = "a" * 64
 SESSION_B = "b" * 64
 PASSWORD = "bounded dashboard fixture password"  # noqa: S105
+PROJECT_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config" / "projects"
 
 
 def _repository(tmp_path: Path) -> OperationsRepository:
-    repository = OperationsRepository(f"sqlite+pysqlite:///{tmp_path / 'operations.db'}")
+    config_root = tmp_path / "projects.d"
+    config_root.mkdir()
+    for source in PROJECT_CONFIG_ROOT.glob("*.yaml"):
+        destination = config_root / source.name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o640)
+    repository = OperationsRepository(
+        f"sqlite+pysqlite:///{tmp_path / 'operations.db'}",
+        project_config_root=config_root,
+    )
     Base.metadata.create_all(repository.engine)
     return repository
 
@@ -474,6 +485,37 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
     assert (
         "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED" in full_delivery.capability.blockers
     )
+    assert "FALCONE_CANDIDATE_BUILD_CONTRACT_MISSING" in full_delivery.capability.blockers
+    assert (
+        "FALCONE_SCOPED_STAGING_RELEASER_AND_REPOSITORY_VALUES_MISSING"
+        in full_delivery.capability.blockers
+    )
+
+
+def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    assert set(repository._full_delivery_blockers("musematic")) == {
+        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
+        "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
+        "MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED",
+        "MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC",
+    }
+    assert set(repository._full_delivery_blockers("llmwiki")) == {
+        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
+        "LLMWIKI_CANDIDATE_BUILD_DISABLED",
+        "LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED",
+        "LLMWIKI_FIRST_STAGE_BOOTSTRAP_NOT_APPROVED",
+    }
+
+    unconfigured = OperationsRepository(
+        f"sqlite+pysqlite:///{tmp_path / 'unconfigured-operations.db'}"
+    )
+    assert unconfigured._full_delivery_blockers("falcone") == [
+        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
+        "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED",
+    ]
 
 
 def test_audit_publication_is_opt_in_and_full_audit_requires_phrase() -> None:

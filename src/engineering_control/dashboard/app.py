@@ -90,6 +90,7 @@ def create_app(
             resolved.database_url.get_secret_value(),
             export_retention_days=resolved.dashboard_operation_export_retention_days,
             export_max_bytes=resolved.dashboard_operation_export_max_bytes,
+            project_config_root=resolved.project_config_root,
         )
         app.state.operations_repository = resolved_operations
         yield
