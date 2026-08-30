@@ -179,6 +179,16 @@ def test_nested_inventory_approval_is_current_without_owning_shared_policy() -> 
         project="falcone",
         now=datetime.now(UTC),
     )
+    drifted = dict(campaign.approval_json)
+    drifted_binding = dict(drifted["binding"])
+    drifted_binding["source_head"] = "f" * 40
+    drifted["binding"] = drifted_binding
+    campaign.approval_json = drifted
+    assert not _global_inventory_approval_current(
+        campaign,
+        project="falcone",
+        now=datetime.now(UTC),
+    )
 
 
 @pytest.mark.asyncio

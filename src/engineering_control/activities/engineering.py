@@ -46,6 +46,7 @@ _GLOBAL_BACKLOG_RETRY_LIMIT = 5
 _GLOBAL_BACKLOG_RETRY_BASE_MINUTES = 15
 _TERMINAL_GLOBAL_BLOCKERS = frozenset(
     {
+        "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED",
         "LLMWIKI_FULL_DELIVERY_INPUTS_UNRESOLVED",
         "BLOCKED_AUTONOMOUS_REPAIR_EXHAUSTED",
         "CORRECTION_LIMIT_EXHAUSTED",
@@ -1559,7 +1560,10 @@ class EngineeringActivityHandler:
                     db.BacklogIssueRecord.issue_number == int(item["issue_number"]),
                 )
             )
-            if issue is not None and retryable:
+            if issue is not None and blocker == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED":
+                issue.delivery_status = "CANDIDATE_VERIFIED_FINAL_SERVICE_BLOCKED"
+                issue.final_closure_status = "BLOCKED_FINAL_SERVICE"
+            elif issue is not None and retryable:
                 issue.delivery_status = "RETRY_PENDING"
             run = session.scalar(select(db.Run).where(db.Run.campaign_id == campaign_id).limit(1))
             if run is not None:

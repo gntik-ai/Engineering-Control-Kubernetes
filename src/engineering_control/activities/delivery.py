@@ -470,6 +470,9 @@ class DeliveryActivityHandler:
                 }
             selected = max(successful, key=lambda item: int(item.get("databaseId", 0)))
             run_id = int(selected["databaseId"])
+            independent_review_sha256 = str(payload.get("independent_review_sha256") or "")
+            if not re.fullmatch(r"[a-f0-9]{64}", independent_review_sha256):
+                raise ValueError("final artifact independent review binding is missing")
             reconciliation = CIReconciliationPlan(
                 change_set_id=plan.closure.change_set_id,
                 run_id=plan.closure.run_id,
@@ -483,7 +486,7 @@ class DeliveryActivityHandler:
                 source_base_branch=plan.closure.source.base_branch,
                 candidate_build_run_id=run_id,
                 policy=plan.policy,
-                independent_review_sha256=str(payload["independent_review_sha256"]),
+                independent_review_sha256=independent_review_sha256,
                 independent_review_provider=plan.closure.checker_provider,
                 maker_provider=plan.closure.maker_provider,
             )

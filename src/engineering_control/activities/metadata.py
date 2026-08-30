@@ -25,6 +25,7 @@ from engineering_control.activities.retention import (
 )
 from engineering_control.config import Settings
 from engineering_control.db.models import (
+    ActionCandidate,
     AgentExecution,
     AgentInvocation,
     AgentLogChunk,
@@ -3159,6 +3160,26 @@ class MetadataActivityHandler:
                 == DocumentationImpact.BLOCKED_BY_UNRESOLVED_DOCUMENTATION_IMPACT.value
             ):
                 raise ValueError("issue is not eligible for final closure")
+            if issue.calculated_risk == RiskClass.R3.value:
+                r3_candidates = session.scalars(
+                    select(ActionCandidate)
+                    .where(
+                        ActionCandidate.action == "r3_issue_approval",
+                        ActionCandidate.target_id == f"{issue.repository}#{issue.issue_number}",
+                        ActionCandidate.used_at.is_not(None),
+                        ActionCandidate.expires_at > now,
+                    )
+                    .order_by(ActionCandidate.created_at.desc())
+                    .limit(10)
+                ).all()
+                if not any(
+                    candidate.payload_json.get("issue_body_sha256") == issue.body_sha256
+                    and candidate.payload_json.get("issue_updated_at")
+                    == issue.github_updated_at.isoformat()
+                    and candidate.payload_json.get("production") is False
+                    for candidate in r3_candidates
+                ):
+                    raise ValueError("final closure requires a current exact R3 issue approval")
             recovery = dict(change_set.recovery_json)
             existing_closure_value = recovery.get("final_closure")
             existing_closure = (
@@ -3374,7 +3395,7 @@ class MetadataActivityHandler:
             ):
                 raise ValueError("final artifact persistence binding is missing")
             recovery = dict(change_set.recovery_json)
-            closure = self._object(recovery.get("final_closure"), "final closure")
+            closure = dict(self._object(recovery.get("final_closure"), "final closure"))
             final_artifact = {
                 "workflow_run_id": manifest.workflow_run_id,
                 "source_sha": manifest.source_sha,
@@ -3452,10 +3473,18 @@ class MetadataActivityHandler:
                 run is None
                 or change_set is None
                 or change_set.deployment_head_sha not in {merge.head_sha, merge.merge_sha}
+                or change_set.state
+                not in {
+                    ChangeSetState.DEPLOY_PR.value,
+                    ChangeSetState.AWAITING_STAGING_APPROVAL.value,
+                    ChangeSetState.STAGING_APPROVED.value,
+                    ChangeSetState.STAGING_DEPLOYED.value,
+                    ChangeSetState.RUNTIME_VERIFIED.value,
+                }
             ):
                 raise ValueError("final deployment merge persistence binding is missing")
             recovery = dict(change_set.recovery_json)
-            closure = self._object(recovery.get("final_closure"), "final closure")
+            closure = dict(self._object(recovery.get("final_closure"), "final closure"))
             value = merge.model_dump(mode="json")
             prior = closure.get("deployment_merge")
             if prior is not None and prior != value:
@@ -3572,7 +3601,7 @@ class MetadataActivityHandler:
             for lease in worktree_leases:
                 lease.released_at = lease.released_at or now
             recovery = dict(change_set.recovery_json)
-            closure = self._object(recovery.get("final_closure"), "final closure")
+            closure = dict(self._object(recovery.get("final_closure"), "final closure"))
             artifact = self._object(closure.get("final_artifact"), "final artifact")
             evidence = BacklogFinalClosureEvidence(
                 final_source_commit=source.merge_sha,
@@ -3664,7 +3693,20 @@ class MetadataActivityHandler:
             if change_set is None or issue is None:
                 raise ValueError("final comment persistence binding is missing")
             recovery = dict(change_set.recovery_json)
-            closure = self._object(recovery.get("final_closure"), "final closure")
+            closure = dict(self._object(recovery.get("final_closure"), "final closure"))
+            if closure.get("final_issue_plan") is None:
+                raise ValueError("final issue closure requires persisted comment evidence")
+            persisted_plan = FinalIssueMutationPlan.model_validate(closure.get("final_issue_plan"))
+            if (
+                persisted_plan != plan
+                or change_set.state != ChangeSetState.RUNTIME_VERIFIED.value
+                or issue.final_closure_status
+                not in {"FINAL_EVIDENCE_READY", "FINAL_EVIDENCE_PERSISTED"}
+            ):
+                raise ValueError("final comment state changed after runtime verification")
+            prior = closure.get("comment")
+            if prior is not None and prior != result:
+                raise ValueError("final comment evidence changed")
             closure["comment"] = result
             recovery["final_closure"] = closure
             change_set.recovery_json = recovery
@@ -3708,7 +3750,27 @@ class MetadataActivityHandler:
                     "change_set_id": str(plan.closure.change_set_id),
                 }
             recovery = dict(change_set.recovery_json)
-            closure = self._object(recovery.get("final_closure"), "final closure")
+            closure = dict(self._object(recovery.get("final_closure"), "final closure"))
+            if closure.get("final_issue_plan") is None:
+                raise ValueError("final issue closure requires persisted comment evidence")
+            persisted_plan = FinalIssueMutationPlan.model_validate(closure.get("final_issue_plan"))
+            if persisted_plan != plan:
+                raise ValueError("final issue plan changed after runtime verification")
+            persisted_comment = closure.get("comment")
+            if (
+                issue.final_closure_status != "FINAL_EVIDENCE_PERSISTED"
+                or not isinstance(persisted_comment, dict)
+                or persisted_comment.get("status") not in {"COMMENTED", "COMMENT_PRESENT"}
+            ):
+                raise ValueError("final issue closure requires persisted comment evidence")
+            comment = self._object(closure.get("comment"), "final comment evidence")
+            if (
+                change_set.state != ChangeSetState.RUNTIME_VERIFIED.value
+                or issue.state != "OPEN"
+                or issue.final_closure_status != "FINAL_EVIDENCE_PERSISTED"
+                or comment.get("status") not in {"COMMENTED", "COMMENT_PRESENT"}
+            ):
+                raise ValueError("final issue state changed before closure persistence")
             closure["issue_close"] = result
             closure["completed_at"] = now.isoformat()
             recovery["final_closure"] = closure

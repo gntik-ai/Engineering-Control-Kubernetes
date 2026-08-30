@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import runpy
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from engineering_control.db.base import Base
+from engineering_control.db.models import GitHubBacklogCampaign
+from engineering_control.engineering.backlog import BACKLOG_APPROVAL_PHRASE, approval_binding
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = runpy.run_path(str(ROOT / "scripts/reconcile-backlog-github-policy.py"))
+VALIDATE_CAMPAIGN = SCRIPT["validate_campaign"]
+EXPIRE_CAMPAIGNS = SCRIPT["expire_campaign_approvals"]
+
+
+def campaign(
+    campaign_id: UUID,
+    *,
+    project: str,
+    status: str,
+    role: str,
+    now: datetime,
+) -> GitHubBacklogCampaign:
+    pairs = {
+        "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
+        "musematic": ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
+        "llmwiki": ("gntik-ai/llmwiki", "gntik-ai/llmwiki"),
+    }
+    source, deployment = pairs[project]
+    delivery_mode = "source-pr" if project == "llmwiki" else "full-delivery"
+    binding = approval_binding(
+        campaign_id=str(campaign_id),
+        project=project,  # type: ignore[arg-type]
+        import_filter="all",
+        source_head="a" * 40,
+        deployment_head="b" * 40,
+        dependency_plan_hash="c" * 64,
+        maximum_risk="R2",
+        maximum_items=1,
+        delivery_mode=delivery_mode,  # type: ignore[arg-type]
+        include_enhancements=False,
+        now=now,
+    )
+    return GitHubBacklogCampaign(
+        id=campaign_id,
+        project=project,
+        source_repository=source,
+        deployment_repository=deployment,
+        imported_at=now,
+        issue_query="is:issue is:open",
+        import_filter="all",
+        source_default_branch="master" if project == "llmwiki" else "main",
+        deployment_default_branch="master" if project == "llmwiki" else "main",
+        source_head_at_import="a" * 40,
+        deployment_head_at_import="b" * 40,
+        issue_count=1,
+        eligible_count=1,
+        deferred_count=0,
+        duplicate_count=0,
+        stale_count=0,
+        already_fixed_count=0,
+        existing_pr_count=0,
+        blocked_count=0,
+        dependency_graph_hash="c" * 64,
+        plan_hash="c" * 64,
+        approval_binding=binding.sha256(),
+        approval_json={
+            "binding": binding.model_dump(mode="json"),
+            "policy_role": role,
+            "approval": {
+                "approved_by": "telegram:42",
+                "approved_at": now.isoformat(),
+                "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+            },
+        },
+        maximum_risk="R2",
+        maximum_items=1,
+        maximum_concurrency=1,
+        delivery_mode=delivery_mode,
+        include_enhancements=False,
+        status=status,
+        workflow_id=f"backlog-import-{campaign_id}",
+    )
+
+
+def test_root_reconciler_accepts_exact_stopped_owner_and_rejects_malformed_nested(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'reconciler.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    campaign_id = UUID("11111111-1111-4111-8111-111111111111")
+    owner = campaign(
+        campaign_id,
+        project="falcone",
+        status="STOPPED",
+        role="owner",
+        now=now,
+    )
+    request = {
+        "action": "disable-existing-backlog",
+        "backlog_campaign_id": str(campaign_id),
+        "project": "falcone",
+        "approval_binding": owner.approval_binding,
+        "requested_by": "telegram:42",
+    }
+    validate = VALIDATE_CAMPAIGN
+    with Session(engine) as session, session.begin():
+        session.add(owner)
+    with Session(engine) as session:
+        assert validate(session, request).id == campaign_id
+    with Session(engine) as session, session.begin():
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        stored.approval_json = {"binding": stored.approval_json["binding"]}
+    with Session(engine) as session, pytest.raises(ValueError, match="nested approval"):
+        validate(session, request)
+
+
+def test_expiry_disables_for_expired_owner_even_when_inventory_is_current(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'expiry.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    owner_id = UUID("11111111-1111-4111-8111-111111111111")
+    inventory_id = UUID("22222222-2222-4222-8222-222222222222")
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                campaign(
+                    owner_id,
+                    project="falcone",
+                    status="APPROVED",
+                    role="owner",
+                    now=now - timedelta(days=2),
+                ),
+                campaign(
+                    inventory_id,
+                    project="musematic",
+                    status="APPROVED_INVENTORY",
+                    role="inventory",
+                    now=now,
+                ),
+            ]
+        )
+    expire = EXPIRE_CAMPAIGNS
+    with Session(engine) as session, session.begin():
+        assert expire(session, now) is True
+    with Session(engine) as session:
+        assert session.get(GitHubBacklogCampaign, owner_id).status == "EXPIRED"
+        assert session.get(GitHubBacklogCampaign, inventory_id).status == "APPROVED_INVENTORY"
+
+
+def test_expiry_keeps_policy_for_current_owner_and_expires_inventory(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'expiry-owner.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    owner_id = UUID("11111111-1111-4111-8111-111111111111")
+    inventory_id = UUID("22222222-2222-4222-8222-222222222222")
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                campaign(
+                    owner_id,
+                    project="falcone",
+                    status="APPROVED",
+                    role="owner",
+                    now=now,
+                ),
+                campaign(
+                    inventory_id,
+                    project="musematic",
+                    status="APPROVED_INVENTORY",
+                    role="inventory",
+                    now=now - timedelta(days=2),
+                ),
+            ]
+        )
+    expire = EXPIRE_CAMPAIGNS
+    with Session(engine) as session, session.begin():
+        assert expire(session, now) is False
+    with Session(engine) as session:
+        assert session.get(GitHubBacklogCampaign, owner_id).status == "APPROVED"
+        assert session.get(GitHubBacklogCampaign, inventory_id).status == "EXPIRED"

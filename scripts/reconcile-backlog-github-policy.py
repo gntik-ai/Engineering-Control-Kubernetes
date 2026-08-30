@@ -21,7 +21,11 @@ from sqlalchemy.orm import Session
 
 from engineering_control.config import Settings
 from engineering_control.db.models import GitHubBacklogCampaign
-from engineering_control.engineering.backlog import canonical_sha256
+from engineering_control.engineering.backlog import (
+    BACKLOG_APPROVAL_PHRASE,
+    BacklogApprovalBinding,
+    canonical_sha256,
+)
 from engineering_control.policy.github_write import GitHubWritePolicyDocument
 
 SAFE_REPOSITORIES = (
@@ -123,17 +127,32 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
         )
         if other is not None:
             raise ValueError("another backlog campaign already owns GitHub write policy")
+    nested = "binding" in campaign.approval_json or "approval" in campaign.approval_json
     raw_binding = campaign.approval_json.get("binding")
-    binding = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
     raw_approval = campaign.approval_json.get("approval")
-    approval = raw_approval if isinstance(raw_approval, dict) else campaign.approval_json
+    if nested and (not isinstance(raw_binding, dict) or not isinstance(raw_approval, dict)):
+        raise ValueError("GitHub campaign nested approval evidence is malformed")
+    binding = raw_binding if nested else campaign.approval_json
+    approval = raw_approval if nested else campaign.approval_json
     if campaign.approval_json.get("policy_role") not in {None, "owner"}:
         raise ValueError("GitHub campaign approval evidence is incomplete")
-    if canonical_sha256(binding) != request["approval_binding"]:
+    try:
+        exact_binding = BacklogApprovalBinding.model_validate(
+            {field: binding.get(field) for field in BacklogApprovalBinding.model_fields}
+        )
+    except ValueError as error:
+        raise ValueError("GitHub campaign approval evidence is incomplete") from error
+    if canonical_sha256(exact_binding.model_dump(mode="json")) != request["approval_binding"]:
         raise ValueError("GitHub campaign approval binding changed")
-    if approval.get("approved_by") != request["requested_by"]:
+    if (
+        approval.get("approved_by") != request["requested_by"]
+        or approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
+        or not approval.get("approved_at")
+    ):
         raise ValueError("GitHub policy request actor changed")
-    expires_at = datetime.fromisoformat(str(binding["expires_at"]))
+    expires_at = exact_binding.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
     if expires_at <= datetime.now(UTC):
         raise ValueError("GitHub campaign approval expired")
     expected_pair = {
@@ -146,6 +165,35 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
     if binding.get("production") is not False:
         raise ValueError("GitHub campaign unexpectedly permits production")
     return campaign
+
+
+def expire_campaign_approvals(session: Session, now: datetime) -> bool:
+    """Expire all approval rows and report whether shared policy must be disabled."""
+    active = session.scalars(
+        select(GitHubBacklogCampaign).where(
+            GitHubBacklogCampaign.status.in_(
+                {"APPROVED_INVENTORY", "APPROVED", "RUNNING", "PAUSED"}
+            )
+        )
+    ).all()
+    unexpired_owner = False
+    for campaign in active:
+        raw_binding = campaign.approval_json.get("binding")
+        binding = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
+        try:
+            expires_at = datetime.fromisoformat(str(binding.get("expires_at")))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+        except (TypeError, ValueError):
+            expires_at = None
+        if expires_at is None or expires_at <= now:
+            campaign.status = "EXPIRED"
+            continue
+        if campaign.status in {"APPROVED", "RUNNING", "PAUSED"} and campaign.approval_json.get(
+            "policy_role"
+        ) in {None, "owner"}:
+            unexpired_owner = True
+    return not unexpired_owner
 
 
 def validate_current_policy(path: Path, group_id: int) -> None:
@@ -221,27 +269,7 @@ def main() -> int:
     engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
     if args.expire_only:
         with Session(engine) as session, session.begin():
-            active = session.scalars(
-                select(GitHubBacklogCampaign).where(
-                    GitHubBacklogCampaign.status.in_({"APPROVED", "RUNNING", "PAUSED"})
-                )
-            ).all()
-            unexpired = []
-            for campaign in active:
-                binding = campaign.approval_json.get("binding")
-                try:
-                    expires_at = (
-                        datetime.fromisoformat(str(binding.get("expires_at")))
-                        if isinstance(binding, dict)
-                        else None
-                    )
-                except (TypeError, ValueError):
-                    expires_at = None
-                if expires_at is not None and expires_at > datetime.now(UTC):
-                    unexpired.append(campaign)
-                else:
-                    campaign.status = "EXPIRED"
-            if not unexpired:
+            if expire_campaign_approvals(session, datetime.now(UTC)):
                 policy = GitHubWritePolicyDocument.model_validate(
                     yaml.safe_load(args.policy.read_text(encoding="utf-8"))
                 )

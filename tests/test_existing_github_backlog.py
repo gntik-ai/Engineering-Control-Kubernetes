@@ -507,6 +507,22 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
         falcone_candidate["approval_binding"],
         "cli:engineering-ctl",
     )
+    musematic_candidate = await repository.prepare_backlog_approval(
+        musematic_id,
+        BacklogApprovalCandidateRequest(
+            project="musematic",
+            delivery_mode="full-delivery",
+            maximum_risk="R2",
+            maximum_items=1,
+        ),
+    )
+    with pytest.raises(ValueError, match="activation is pending"):
+        await repository.approve_backlog_campaign(
+            musematic_id,
+            "musematic",
+            musematic_candidate["approval_binding"],
+            "cli:engineering-ctl",
+        )
     request_path = request_root / "activate.json"
     request_path.unlink()
     with repository.sessions.begin() as session:
@@ -517,15 +533,6 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
             key: value for key, value in owner.approval_json.items() if key != "policy_role"
         }
 
-    musematic_candidate = await repository.prepare_backlog_approval(
-        musematic_id,
-        BacklogApprovalCandidateRequest(
-            project="musematic",
-            delivery_mode="full-delivery",
-            maximum_risk="R2",
-            maximum_items=1,
-        ),
-    )
     approved = await repository.approve_backlog_campaign(
         musematic_id,
         "musematic",
