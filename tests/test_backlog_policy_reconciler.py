@@ -123,7 +123,7 @@ def test_root_reconciler_accepts_exact_stopped_owner_and_rejects_malformed_neste
         validate(session, request)
 
 
-def test_expiry_disables_and_expires_inventory_when_owner_is_expired(
+def test_expiry_disables_and_expires_running_inventory_when_owner_is_expired(
     tmp_path: Path,
 ) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'expiry.sqlite'}")
@@ -144,7 +144,7 @@ def test_expiry_disables_and_expires_inventory_when_owner_is_expired(
                 campaign(
                     inventory_id,
                     project="musematic",
-                    status="APPROVED_INVENTORY",
+                    status="RUNNING",
                     role="inventory",
                     now=now,
                 ),

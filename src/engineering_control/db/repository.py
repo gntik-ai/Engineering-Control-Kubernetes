@@ -670,11 +670,12 @@ class SQLMetadataRepository:
                     if isinstance(nested_pending_binding, dict)
                     else pending_owner.approval_json
                 )
-                pending_expiry = (
-                    datetime.fromisoformat(str(pending_binding.get("expires_at")))
-                    if pending_binding
-                    else now
-                )
+                try:
+                    pending_expiry = datetime.fromisoformat(str(pending_binding.get("expires_at")))
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "pending backlog campaign policy activation evidence is malformed"
+                    ) from error
                 if pending_expiry.tzinfo is None:
                     pending_expiry = pending_expiry.replace(tzinfo=UTC)
                 if pending_expiry > now:

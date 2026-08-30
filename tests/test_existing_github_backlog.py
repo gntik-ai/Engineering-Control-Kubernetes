@@ -528,8 +528,26 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
     with repository.sessions.begin() as session:
         pending_owner = session.get(GitHubBacklogCampaign, falcone_id)
         assert pending_owner is not None
+        pending_binding = dict(pending_owner.approval_json["binding"])
+        pending_binding["expires_at"] = "not-a-timestamp"
         pending_owner.approval_json = {
-            **pending_owner.approval_json["binding"],
+            **pending_owner.approval_json,
+            "binding": pending_binding,
+        }
+    with pytest.raises(ValueError, match="activation evidence is malformed"):
+        await repository.approve_backlog_campaign(
+            musematic_id,
+            "musematic",
+            musematic_candidate["approval_binding"],
+            "cli:engineering-ctl",
+        )
+    with repository.sessions.begin() as session:
+        pending_owner = session.get(GitHubBacklogCampaign, falcone_id)
+        assert pending_owner is not None
+        pending_binding = dict(pending_owner.approval_json["binding"])
+        pending_binding["expires_at"] = falcone_candidate["approval_candidate"]["expires_at"]
+        pending_owner.approval_json = {
+            **pending_binding,
             **pending_owner.approval_json["approval"],
         }
     with pytest.raises(ValueError, match="activation is pending"):

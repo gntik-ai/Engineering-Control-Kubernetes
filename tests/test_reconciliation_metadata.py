@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import yaml
+from sqlalchemy import select
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
@@ -259,7 +260,7 @@ async def test_signed_candidate_persists_digests_and_dry_run_stops_before_git_mu
 
 
 @pytest.mark.asyncio
-async def test_promotion_reentry_rejects_legacy_unbound_promotion_evidence(
+async def test_promotion_reentry_accepts_installed_legacy_candidate_promotion_evidence(
     tmp_path: Path,
 ) -> None:
     handler = MetadataActivityHandler(
@@ -288,6 +289,16 @@ async def test_promotion_reentry_rejects_legacy_unbound_promotion_evidence(
         recovery["promotion"] = {"promoted_head_sha": change_set.deployment_head_sha}
         change_set.recovery_json = recovery
 
+    resumed = handler._prepare_promotion({**prepared, "dry_run": False})
+    assert resumed["status"] == "PROMOTION_PUBLICATION_READY"
+    assert resumed["promotion_publication"]["repository"] == "gntik-ai/falcone-charts"
+
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+        assert change_set is not None and run is not None
+        change_set.state = "FINAL_ARTIFACT_BUILT"
+        run.run_type = "final-closure"
     with pytest.raises(ValueError, match="promotion binding is incomplete"):
         handler._prepare_promotion({**prepared, "dry_run": False})
 

@@ -989,6 +989,12 @@ class FinalClosureWorkflow(ControlledWorkflow):
             return await self._resume_final_issue_close(
                 context, hardened_recovery=hardened_recovery
             )
+        if context.get("status") == "FINAL_DEPLOYMENT_MERGE_PERSISTED":
+            return await self._resume_after_final_deployment_merge(
+                request,
+                context,
+                hardened_recovery=hardened_recovery,
+            )
         if context.get("status") != "FINAL_CLOSURE_READY":
             return {"status": context.get("status", "BLOCKED"), "context": context}
 
@@ -1071,10 +1077,9 @@ class FinalClosureWorkflow(ControlledWorkflow):
 
         if hardened_recovery and not await self._checkpoint("FINAL_MERGE_DEPLOYMENT"):
             return {"status": "CANCELLED", "context": context}
-        if hardened_recovery:
-            context = await self._step("final.authorize_deployment_merge", context)
-            if context.get("status") != "FINAL_DEPLOYMENT_MERGE_AUTHORIZED":
-                return {"status": context.get("status", "BLOCKED"), "context": context}
+        context = await self._step("final.authorize_deployment_merge", context)
+        if context.get("status") != "FINAL_DEPLOYMENT_MERGE_AUTHORIZED":
+            return {"status": context.get("status", "BLOCKED"), "context": context}
         context = await self._github_write_step(
             "final.merge_deployment", context, timeout_minutes=30
         )
@@ -2158,7 +2163,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     project=request.project,
                     issue_repository=str(item["repository"]),
                     issue_number=int(item["issue_number"]),
-                    r3_approval_binding=request.r3_approval_binding,
+                    r3_approval_binding=(
+                        request.r3_approval_binding if str(gate["risk_class"]) == "R3" else None
+                    ),
                 ),
                 id=closure_id,
                 task_queue=workflow.info().task_queue,

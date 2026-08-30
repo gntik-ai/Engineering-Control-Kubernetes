@@ -3297,6 +3297,43 @@ class MetadataActivityHandler:
                     "final_issue_plan": issue_plan.model_dump(mode="json"),
                     "independent_review_sha256": independent,
                 }
+            stored_deployment_merge = existing_closure.get("deployment_merge")
+            if stored_deployment_merge is not None:
+                source_merge = ProtectedMergeResult.model_validate(
+                    existing_closure.get("source_merge")
+                )
+                deployment_merge = ProtectedMergeResult.model_validate(stored_deployment_merge)
+                deployment_plan = FinalDeploymentMergePlan.model_validate(
+                    existing_closure.get("final_deployment_merge_plan")
+                )
+                if (
+                    deployment_plan.closure != plan
+                    or source_merge.repository != plan.source.repository
+                    or source_merge.pull_request_number != plan.source.number
+                    or deployment_merge.repository != deployment_plan.deployment.repository
+                    or deployment_merge.pull_request_number != deployment_plan.deployment.number
+                    or change_set.source_head_sha != source_merge.merge_sha
+                    or change_set.deployment_head_sha != deployment_merge.merge_sha
+                    or change_set.state
+                    not in {
+                        ChangeSetState.DEPLOY_PR.value,
+                        ChangeSetState.AWAITING_STAGING_APPROVAL.value,
+                        ChangeSetState.STAGING_APPROVED.value,
+                        ChangeSetState.STAGING_DEPLOYED.value,
+                        ChangeSetState.RUNTIME_VERIFIED.value,
+                    }
+                ):
+                    raise ValueError("persisted final deployment merge resume binding changed")
+                issue.final_closure_status = "FINAL_CLOSURE_RUNNING"
+                return {
+                    **payload,
+                    "status": "FINAL_DEPLOYMENT_MERGE_PERSISTED",
+                    "final_closure_plan": plan.model_dump(mode="json"),
+                    "final_deployment_merge_plan": deployment_plan.model_dump(mode="json"),
+                    "source_merge": source_merge.model_dump(mode="json"),
+                    "deployment_merge": deployment_merge.model_dump(mode="json"),
+                    "independent_review_sha256": independent,
+                }
             issue.final_closure_status = "FINAL_CLOSURE_RUNNING"
         return {
             **payload,
@@ -3730,17 +3767,42 @@ class MetadataActivityHandler:
             recovery = dict(change_set.recovery_json)
             closure = dict(self._object(recovery.get("final_closure"), "final closure"))
             artifact = self._object(closure.get("final_artifact"), "final artifact")
+            runtime_evidence = self._object(
+                verification.evidence_json, "final runtime verification evidence"
+            )
+            observation = self._object(
+                runtime_evidence.get("observation"), "final runtime observation"
+            )
+            browser = self._object(runtime_evidence.get("browser"), "final browser evidence")
+            reviews = runtime_evidence.get("reviews")
+            reviews_passed = (
+                isinstance(reviews, list)
+                and bool(reviews)
+                and all(
+                    isinstance(review, dict)
+                    and review.get("decision") == "RUNTIME_VERIFIED"
+                    and isinstance(review.get("checks"), list)
+                    and bool(review["checks"])
+                    and all(
+                        isinstance(check, dict) and check.get("status") == "PASS"
+                        for check in review["checks"]
+                    )
+                    for review in reviews
+                )
+            )
             evidence = BacklogFinalClosureEvidence(
                 final_source_commit=source.merge_sha,
                 final_deployment_commit=deployment_merge.merge_sha,
                 immutable_artifact_digests=tuple(sorted(change_set.image_digests.values())),
                 staging_revision_verified=True,
-                issue_acceptance_passed=True,
-                regression_suite_passed=True,
+                issue_acceptance_passed=(browser.get("status") == "PASS" and reviews_passed),
+                regression_suite_passed=(
+                    observation.get("status") == "RUNTIME_OBSERVATION_PASS" and reviews_passed
+                ),
                 maker_provider=plan.maker_provider,
                 checker_provider=plan.checker_provider,
                 documentation_impact=plan.documentation_impact,
-                cleanup_passed=True,
+                cleanup_passed=all(lease.released_at is not None for lease in worktree_leases),
                 safe_evidence_comment_ready=True,
                 deployed_change=True,
             )
@@ -4202,10 +4264,7 @@ class MetadataActivityHandler:
                     ChangeSetState.DEPLOY_PR.value,
                 }
                 if run.run_type == "final-closure"
-                else {
-                    ChangeSetState.CANDIDATE_BUILT.value,
-                    ChangeSetState.FINAL_ARTIFACT_BUILT.value,
-                }
+                else {ChangeSetState.CANDIDATE_BUILT.value}
             )
             if change_set.state not in allowed_states:
                 raise ValueError("immutable promotion requires a verified candidate build")
@@ -4251,12 +4310,23 @@ class MetadataActivityHandler:
                 and existing_promotion.get("source_sha") == change_set.source_head_sha
                 and existing_promotion.get("image_digests") == change_set.image_digests
             )
-            if isinstance(existing_promotion, dict) and not exact_promotion:
+            legacy_candidate_promotion = (
+                isinstance(existing_promotion, dict)
+                and run.run_type == "delivery-reconciliation"
+                and change_set.state == ChangeSetState.CANDIDATE_BUILT.value
+                and "source_sha" not in existing_promotion
+                and "image_digests" not in existing_promotion
+            )
+            if (
+                isinstance(existing_promotion, dict)
+                and not exact_promotion
+                and not legacy_candidate_promotion
+            ):
                 raise ValueError("persisted promotion binding is incomplete or changed")
             if (
                 isinstance(existing_promotion, dict)
                 and existing_promotion.get("promoted_head_sha") == expected_promoted_head
-                and exact_promotion
+                and (exact_promotion or legacy_candidate_promotion)
                 and re.fullmatch(
                     r"[a-f0-9]{40}", str(existing_promotion.get("promoted_head_sha", ""))
                 )

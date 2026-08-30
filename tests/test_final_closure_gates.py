@@ -41,6 +41,19 @@ from engineering_control.models.final_closure import (
 from engineering_control.models.reconciliation import CandidateArtifactManifest
 
 
+def _runtime_evidence() -> dict[str, Any]:
+    return {
+        "observation": {"status": "RUNTIME_OBSERVATION_PASS"},
+        "browser": {"status": "PASS"},
+        "reviews": [
+            {
+                "decision": "RUNTIME_VERIFIED",
+                "checks": [{"name": "issue-acceptance-and-regression", "status": "PASS"}],
+            }
+        ],
+    }
+
+
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         database_url=f"sqlite+pysqlite:///{tmp_path / 'final-closure.sqlite'}",
@@ -474,9 +487,54 @@ def test_deployment_merge_authorization_reloads_the_exact_persisted_plan(
         )
 
 
-@pytest.mark.parametrize("variant", ["missing-runtime", "wrong-revision", "active-agent"])
+def test_prepare_final_closure_resumes_after_persisted_deployment_merge(
+    tmp_path: Path,
+) -> None:
+    handler, payload, _campaign = _seed_prepare(tmp_path)
+    prepared = handler._prepare_final_closure(payload)
+    plan = FinalClosurePlan.model_validate(prepared["final_closure_plan"])
+    source_merge = _merge(plan, source=True)
+    deployment_merge = _merge(plan, source=False)
+    deployment_plan = FinalDeploymentMergePlan(
+        closure=plan,
+        deployment=plan.deployment,
+        independent_review_sha256="5" * 64,
+    )
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, plan.change_set_id)
+        assert change_set is not None
+        recovery = dict(change_set.recovery_json)
+        closure = dict(recovery["final_closure"])
+        closure.update(
+            {
+                "source_merge": source_merge.model_dump(mode="json"),
+                "final_deployment_merge_plan": deployment_plan.model_dump(mode="json"),
+                "deployment_merge": deployment_merge.model_dump(mode="json"),
+            }
+        )
+        recovery["final_closure"] = closure
+        change_set.recovery_json = recovery
+        change_set.source_head_sha = source_merge.merge_sha
+        change_set.deployment_head_sha = deployment_merge.merge_sha
+        change_set.state = ChangeSetState.DEPLOY_PR.value
+
+    resumed = handler._prepare_final_closure(payload)
+    assert resumed["status"] == "FINAL_DEPLOYMENT_MERGE_PERSISTED"
+    assert resumed["source_merge"]["merge_sha"] == source_merge.merge_sha
+    assert resumed["deployment_merge"]["merge_sha"] == deployment_merge.merge_sha
+
+
+@pytest.mark.parametrize(
+    ("variant", "error"),
+    [
+        ("missing-runtime", "runtime, cleanup, or immutable revision"),
+        ("wrong-revision", "runtime, cleanup, or immutable revision"),
+        ("active-agent", "runtime, cleanup, or immutable revision"),
+        ("failed-evidence", "final closure evidence gate"),
+    ],
+)
 def test_prepare_final_issue_close_rejects_missing_or_active_evidence(
-    tmp_path: Path, variant: str
+    tmp_path: Path, variant: str, error: str
 ) -> None:
     handler = MetadataActivityHandler(_settings(tmp_path))
     Base.metadata.create_all(handler.engine)
@@ -527,6 +585,9 @@ def test_prepare_final_issue_close_rejects_missing_or_active_evidence(
             )
         )
         if variant != "missing-runtime":
+            evidence = _runtime_evidence()
+            if variant == "failed-evidence":
+                evidence["browser"] = {"status": "FAIL"}
             session.add(
                 VerificationResult(
                     change_set_id=plan.change_set_id,
@@ -535,7 +596,7 @@ def test_prepare_final_issue_close_rejects_missing_or_active_evidence(
                     verification_type="post-staging-runtime",
                     verifier_provider="claude",
                     status="RUNTIME_VERIFIED",
-                    evidence_json={},
+                    evidence_json=evidence,
                 )
             )
         for repository in ("falcone", "falcone-charts"):
@@ -608,7 +669,7 @@ def test_prepare_final_issue_close_rejects_missing_or_active_evidence(
             },
         ],
     }
-    with pytest.raises(ValueError, match="runtime, cleanup, or immutable revision"):
+    with pytest.raises(ValueError, match=error):
         handler._prepare_final_issue_close(payload)
 
 

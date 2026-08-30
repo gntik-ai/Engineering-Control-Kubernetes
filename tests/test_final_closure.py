@@ -34,6 +34,19 @@ from engineering_control.workflows.definitions import FinalClosureWorkflow
 from engineering_control.workflows.inputs import FinalClosureInput
 
 
+def runtime_evidence() -> dict[str, Any]:
+    return {
+        "observation": {"status": "RUNTIME_OBSERVATION_PASS"},
+        "browser": {"status": "PASS"},
+        "reviews": [
+            {
+                "decision": "RUNTIME_VERIFIED",
+                "checks": [{"name": "issue-acceptance-and-regression", "status": "PASS"}],
+            }
+        ],
+    }
+
+
 def closure_plan() -> dict[str, Any]:
     change_set_id = uuid4()
     branch = f"agent/falcone/issue/{change_set_id}"
@@ -524,7 +537,7 @@ def test_final_closure_database_gates_require_runtime_and_persisted_comment(
                 verification_type="post-staging-runtime",
                 verifier_provider="claude",
                 status="RUNTIME_VERIFIED",
-                evidence_json={"bounded": True},
+                evidence_json=runtime_evidence(),
             )
         )
     ready = handler._prepare_final_issue_close(close_input)
@@ -672,6 +685,105 @@ async def test_final_closure_resumes_only_bounded_issue_comment_and_close(
 
 
 @pytest.mark.asyncio
+async def test_final_closure_resumes_after_persisted_deployment_merge_without_remerging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = FinalClosureWorkflow()
+    instance._checkpoint = lambda _phase: _true()  # type: ignore[method-assign]
+    steps: list[str] = []
+
+    async def step(name: str, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        statuses = {
+            "final.prepare": "FINAL_DEPLOYMENT_MERGE_PERSISTED",
+            "final.sync_worktrees": "FINAL_WORKTREES_SYNCHRONIZED",
+            "backlog.register_child_run": "REGISTERED",
+            "final.prepare_issue_close": "FINAL_ISSUE_CLOSE_READY",
+            "final.comment_issue": "FINAL_EVIDENCE_COMMENTED",
+            "final.persist_comment": "FINAL_EVIDENCE_PERSISTED",
+            "final.close_issue": "ISSUE_CLOSED",
+            "final.persist_issue_close": "FIXED",
+        }
+        return {**payload, "status": statuses[name]}
+
+    async def child(name: str, _input: object, **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        if name == "StagingDeploymentWorkflow":
+            return {
+                "status": "STAGING_DEPLOYED",
+                "context": {"deployment_id": str(uuid4())},
+            }
+        assert name == "RuntimeVerificationWorkflow"
+        return {"status": "RUNTIME_VERIFIED", "context": {}}
+
+    instance._step = step  # type: ignore[method-assign]
+    instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="resume-final", task_queue="engineering"),
+    )
+    monkeypatch.setattr(workflow_definitions.workflow, "execute_child_workflow", child)
+
+    result = await instance.run(
+        FinalClosureInput(
+            backlog_campaign_id=str(uuid4()),
+            change_set_id=str(uuid4()),
+            finding_id=str(uuid4()),
+            project="falcone",
+            issue_repository="gntik-ai/falcone",
+            issue_number=42,
+        )
+    )
+
+    assert result["status"] == "FIXED"
+    assert "final.merge_source" not in steps
+    assert "final.authorize_deployment_merge" not in steps
+    assert "final.merge_deployment" not in steps
+    assert "StagingDeploymentWorkflow" in steps
+    assert "RuntimeVerificationWorkflow" in steps
+
+
+@pytest.mark.asyncio
+async def test_final_closure_honors_cancellation_before_the_first_irreversible_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = FinalClosureWorkflow()
+    checkpoints: list[str] = []
+    steps: list[str] = []
+
+    async def checkpoint(phase: str) -> bool:
+        checkpoints.append(phase)
+        return phase != "FINAL_MERGE_SOURCE"
+
+    async def step(name: str, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        steps.append(name)
+        assert name == "final.prepare"
+        return {**payload, "status": "FINAL_CLOSURE_READY"}
+
+    instance._checkpoint = checkpoint  # type: ignore[method-assign]
+    instance._step = step  # type: ignore[method-assign]
+    instance._github_write_step = step  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+
+    result = await instance.run(
+        FinalClosureInput(
+            backlog_campaign_id=str(uuid4()),
+            change_set_id=str(uuid4()),
+            finding_id=str(uuid4()),
+            project="falcone",
+            issue_repository="gntik-ai/falcone",
+            issue_number=42,
+        )
+    )
+
+    assert result["status"] == "CANCELLED"
+    assert steps == ["final.prepare"]
+    assert checkpoints == ["FINAL_PREPARE", "FINAL_MERGE_SOURCE"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("hardened_recovery", [False, True])
 async def test_final_closure_orders_verification_before_comment_and_close(
     monkeypatch: pytest.MonkeyPatch, hardened_recovery: bool
@@ -745,7 +857,7 @@ async def test_final_closure_orders_verification_before_comment_and_close(
     assert result["status"] == "FIXED"
     assert steps.index("RuntimeVerificationWorkflow") < steps.index("final.comment_issue")
     assert steps.index("final.persist_comment") < steps.index("final.close_issue")
-    assert ("final.authorize_deployment_merge" in steps) is hardened_recovery
+    assert "final.authorize_deployment_merge" in steps
 
 
 @pytest.mark.asyncio
