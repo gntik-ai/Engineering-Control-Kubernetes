@@ -674,18 +674,18 @@ class OperationsRepository:
                     risk_rank = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
                     if risk_rank.get(enhancement.risk_class, 99) > risk_rank[command.risk.value]:
                         blockers.append("ENHANCEMENT_RISK_EXCEEDS_BOUND")
-                    active = self._active_operation(
+                    active_operation = self._active_operation(
                         session,
                         command.action,
                         command.enhancement_id,
                         exclude_operation_id=exclude_operation_id,
                     )
-                    if active is not None:
+                    if active_operation is not None:
                         blockers.append("ENHANCEMENT_WORKFLOW_ALREADY_ACTIVE")
                         binding.update(
                             {
-                                "existing_operation_id": str(active.id),
-                                "existing_workflow_id": active.workflow_id,
+                                "existing_operation_id": str(active_operation.id),
+                                "existing_workflow_id": active_operation.workflow_id,
                             }
                         )
                     if command.execution_mode != "plan-only":
