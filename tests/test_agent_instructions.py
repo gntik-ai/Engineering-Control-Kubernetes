@@ -132,3 +132,12 @@ def test_instruction_pack_allows_explicitly_narrowed_read_only_maker(tmp_path: P
     assert enriched.writable is False
     assert enriched.allowed_tools == ("Read", "Glob", "Grep")
     assert bundle.allowed_tools == ("Read", "Glob", "Grep")
+
+
+def test_reverse_canary_steps_have_canonical_instruction_skills() -> None:
+    assert AgentInstructionPack._step_skills["observability.invoke_claude_maker"] == (
+        "implement-issue"
+    )
+    assert AgentInstructionPack._step_skills["observability.invoke_codex_checker"] == (
+        "review-change"
+    )

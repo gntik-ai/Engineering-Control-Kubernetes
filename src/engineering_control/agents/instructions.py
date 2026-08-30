@@ -40,6 +40,8 @@ class AgentInstructionPack:
         "enhancement.product_review": "review-enhancement",
         "observability.invoke_codex": "implement-issue",
         "observability.invoke_claude": "review-change",
+        "observability.invoke_claude_maker": "implement-issue",
+        "observability.invoke_codex_checker": "review-change",
     }
 
     def __init__(self, root: Path) -> None:
