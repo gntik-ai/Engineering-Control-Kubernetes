@@ -178,6 +178,7 @@ class Settings(BaseSettings):
             "scan-runner",
             "delivery-runner",
             "release-runner",
+            "github-runner",
         )
         return {
             identity: self._read_service_token(
