@@ -16,6 +16,7 @@ import yaml
 ENGINEERING_COMMANDS = frozenset(
     {
         "audit",
+        "audit-all",
         "audit-plan",
         "bootstrap-plan",
         "bootstrap",

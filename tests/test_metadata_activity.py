@@ -22,6 +22,7 @@ from engineering_control.db.models import (
     ChangeSet,
     ComponentLease,
     CoverageCell,
+    DashboardEvent,
     Deployment,
     Finding,
     FindingVerification,
@@ -95,6 +96,68 @@ def audit_cell() -> dict[str, str]:
         "lens": "correctness",
         "environment": "snapshot",
     }
+
+
+@pytest.mark.asyncio
+async def test_multi_project_audit_status_is_bounded_idempotent_and_observable(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'multi-project.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    workflow_id = "audit-all-11111111-1111-4111-8111-111111111111"
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                workflow_id=workflow_id,
+                run_type="multi-project-audit",
+                status="QUEUED",
+                project="platform",
+                worker="controller",
+            )
+        )
+    running = {
+        "workflow_id": workflow_id,
+        "orchestration": {
+            "workflow_id": workflow_id,
+            "workflow_run_id": "synthetic-run",
+            "activity_run_id": "synthetic-activity-run",
+            "activity_id": "synthetic-activity",
+            "attempt": 1,
+            "task_queue": "engineering-control",
+        },
+        "status": "RUNNING",
+        "preset": "snapshot",
+        "environment": "staging",
+        "current_project": "falcone",
+        "project_results": {
+            "falcone": {
+                "status": "COMPLETE",
+                "campaign_id": "11111111-1111-4111-8111-111111111111",
+                "workflow_id": f"{workflow_id}-falcone",
+                "blocker": None,
+            }
+        },
+    }
+    await handler.handle("campaign.group_status", running)
+    await handler.handle("campaign.group_status", running)
+    terminal = await handler.handle(
+        "campaign.group_status",
+        {**running, "status": "BLOCKED"},
+    )
+
+    with handler.sessions() as session:
+        run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+        events = session.scalars(
+            select(DashboardEvent).where(DashboardEvent.workflow_id == workflow_id)
+        ).all()
+    assert terminal["status"] == "BLOCKED"
+    assert run is not None and run.status == "BLOCKED"
+    assert run.started_at is not None and run.finished_at is not None
+    assert run.error_code == "BLOCKED"
+    assert len(events) == 2
+    assert {event.event_type for event in events} == {"workflow.progress", "workflow.failed"}
 
 
 @pytest.mark.asyncio

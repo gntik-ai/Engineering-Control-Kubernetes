@@ -8,6 +8,7 @@ from __future__ import annotations
 
 COMMANDS = {
     "audit-plan": "Show a validated paired-repository campaign plan.",
+    "audit-all": "Plan or start fixed sequential staging audits for all projects.",
     "audit": "Start a bounded read-only audit campaign.",
     "bootstrap-plan": "Plan the first deterministic LLMWiki staging bootstrap.",
     "bootstrap": "Execute an approval-bound LLMWiki staging bootstrap.",

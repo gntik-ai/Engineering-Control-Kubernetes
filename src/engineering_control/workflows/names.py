@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class WorkflowName(StrEnum):
     AUDIT_CAMPAIGN = "AuditCampaignWorkflow"
+    MULTI_PROJECT_AUDIT = "MultiProjectAuditWorkflow"
     FINDING_VERIFICATION = "FindingVerificationWorkflow"
     ISSUE_DELIVERY = "IssueDeliveryWorkflow"
     DELIVERY_RECONCILIATION = "DeliveryReconciliationWorkflow"

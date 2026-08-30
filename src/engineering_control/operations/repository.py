@@ -38,6 +38,7 @@ from engineering_control.db.models import (
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
+    AuditAllProjectsCommand,
     AuditPlanCommand,
     AuditStartCommand,
     CandidateView,
@@ -94,6 +95,12 @@ def command_target(command: Command) -> tuple[str, str, str | None]:
             "audit",
             f"{command.project.value}:{command.preset}:{command.environment}",
             command.project.value,
+        )
+    if isinstance(command, AuditAllProjectsCommand):
+        return (
+            "audit_group",
+            f"all:{command.preset}:{command.environment}:{command.mode}",
+            "all",
         )
     if isinstance(command, WorkflowControlCommand):
         return "workflow", command.workflow_id, None
@@ -245,6 +252,9 @@ class OperationsRepository:
                 if isinstance(command, AdvancedAuditCommand)
                 else command.preset
             )
+        elif isinstance(command, AuditAllProjectsCommand):
+            project_name = "all"
+            mode = f"{command.mode}:{command.preset}"
         elif isinstance(command, EnhancementDiscoverCommand):
             project_name = command.project.value
         elif isinstance(
@@ -394,6 +404,47 @@ class OperationsRepository:
                         blockers.append("AUDIT_PLAN_REQUIRED")
                     required_credentials.extend(["native-codex", "native-claude"])
                     blockers.extend(self._provider_blockers(session))
+        elif isinstance(command, AuditAllProjectsCommand):
+            binding = {
+                "projects": ["falcone", "musematic", "llmwiki"],
+                "project_count": 3,
+                "execution": "sequential",
+                "preset": command.preset,
+                "effective_preset": (
+                    "static-full" if command.preset == "documentation" else command.preset
+                ),
+                "environment": command.environment,
+                "mode": command.mode,
+                "publish_findings": command.publish_findings,
+            }
+            if command.mode == "start":
+                recent_plan = session.scalar(
+                    select(OperationRequest.id).where(
+                        OperationRequest.action == "audit_all_projects",
+                        OperationRequest.target_id
+                        == f"all:{command.preset}:{command.environment}:plan",
+                        OperationRequest.status == "COMPLETED",
+                        OperationRequest.completed_at > now - timedelta(hours=1),
+                    )
+                )
+                if recent_plan is None:
+                    blockers.append("ALL_PROJECT_AUDIT_PLAN_REQUIRED")
+                active = self._active_operation(
+                    session,
+                    "audit_all_projects",
+                    f"all:{command.preset}:{command.environment}:start",
+                    exclude_operation_id=exclude_operation_id,
+                )
+                if active is not None:
+                    blockers.append("ALL_PROJECT_AUDIT_ALREADY_ACTIVE")
+                    binding.update(
+                        {
+                            "existing_operation_id": str(active.id),
+                            "existing_workflow_id": active.workflow_id,
+                        }
+                    )
+                required_credentials.extend(["native-codex", "native-claude"])
+                blockers.extend(self._provider_blockers(session))
         elif isinstance(command, WorkflowControlCommand):
             state = self._workflow_state(session, command.workflow_id)
             binding = {"workflow_id": command.workflow_id, "observed_status": state}
@@ -625,6 +676,8 @@ class OperationsRepository:
             "security",
         }:
             return f"START AUDIT {binding_hash[:8].upper()}"
+        if isinstance(command, AuditAllProjectsCommand) and command.mode == "start":
+            return f"START ALL AUDITS {binding_hash[:8].upper()}"
         if isinstance(command, EnhancementApproveCommand):
             return f"APPROVE ENHANCEMENT {binding_hash[:8].upper()}"
         if isinstance(command, EnhancementRejectCommand):

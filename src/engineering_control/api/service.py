@@ -22,6 +22,7 @@ from engineering_control.api.schemas import (
     IssueLoopStart,
     LLMWikiBootstrapExecuteRequest,
     LLMWikiBootstrapPlanRequest,
+    MultiProjectAuditStart,
     ObservabilityAcceptanceStart,
     OperationAccepted,
     RollbackRequest,
@@ -29,6 +30,7 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.models import CampaignPlan
+from engineering_control.models.enums import Project
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
@@ -42,6 +44,7 @@ from engineering_control.workflows.inputs import (
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
+    MultiProjectAuditInput,
     ObservabilityAcceptanceInput,
     PreviewDeploymentInput,
     RecoveryInput,
@@ -54,6 +57,9 @@ from engineering_control.workflows.names import WorkflowName
 class ControlService(Protocol):
     async def plan_campaign(self, request: AuditPlanRequest) -> dict[str, Any]: ...
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted: ...
+    async def start_all_project_audits(
+        self, request: MultiProjectAuditStart
+    ) -> OperationAccepted: ...
     async def start_delivery(self, request: DeliveryStart) -> OperationAccepted: ...
     async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted: ...
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
@@ -137,6 +143,34 @@ class TemporalControlService:
         handle = await self.client.start_workflow(
             WorkflowName.AUDIT_CAMPAIGN.value,
             AuditCampaignInput(**value, campaign_id=str(campaign_id)),
+            id=workflow_id,
+            task_queue=self.task_queue,
+        )
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def start_all_project_audits(self, request: MultiProjectAuditStart) -> OperationAccepted:
+        group_id = uuid4()
+        workflow_id = f"audit-all-{group_id}"
+        projects = (Project.FALCONE, Project.MUSEMATIC, Project.LLMWIKI)
+        campaigns = {
+            project: (
+                uuid4(),
+                f"{workflow_id}-{project.value}",
+            )
+            for project in projects
+        }
+        await self.repository.create_multi_project_audit(workflow_id, campaigns, request)
+        handle = await self.client.start_workflow(
+            WorkflowName.MULTI_PROJECT_AUDIT.value,
+            MultiProjectAuditInput(
+                preset=request.preset,
+                environment=request.environment,
+                publish_findings=request.publish_findings,
+                campaign_ids={project.value: str(campaigns[project][0]) for project in projects},
+                child_workflow_ids={project.value: campaigns[project][1] for project in projects},
+            ),
             id=workflow_id,
             task_queue=self.task_queue,
         )

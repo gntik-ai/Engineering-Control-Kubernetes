@@ -40,6 +40,7 @@ class ControlActivities:
         "audit.agent_cell",
         "campaign.persist_cell_result",
         "campaign.finalize",
+        "campaign.group_status",
         "deployment.render",
         "deployment.compare_live",
         "audit.static_source",

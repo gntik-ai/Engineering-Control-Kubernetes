@@ -4,7 +4,11 @@ from typing import Any
 
 import pytest
 
-from engineering_control.api.schemas import AcceptanceLifecycleStart, ObservabilityAcceptanceStart
+from engineering_control.api.schemas import (
+    AcceptanceLifecycleStart,
+    MultiProjectAuditStart,
+    ObservabilityAcceptanceStart,
+)
 from engineering_control.api.service import TemporalControlService
 from engineering_control.db.repository import EmptyMetadataRepository
 
@@ -54,14 +58,35 @@ class _StartedHandle:
 class _StartClient:
     def __init__(self) -> None:
         self.workflow_input: Any = None
+        self.workflow_type = ""
+        self.workflow_id = ""
         self.task_queue = ""
 
     async def start_workflow(
-        self, _workflow_type: str, workflow_input: Any, *, task_queue: str, **_kwargs: Any
+        self, workflow_type: str, workflow_input: Any, *, task_queue: str, **kwargs: Any
     ) -> _StartedHandle:
+        self.workflow_type = workflow_type
         self.workflow_input = workflow_input
+        self.workflow_id = str(kwargs.get("id", ""))
         self.task_queue = task_queue
         return _StartedHandle()
+
+
+class _MultiProjectRepository(EmptyMetadataRepository):
+    def __init__(self) -> None:
+        self.parent_workflow_id = ""
+        self.campaigns: dict[Any, tuple[Any, str]] = {}
+        self.request: MultiProjectAuditStart | None = None
+
+    async def create_multi_project_audit(
+        self,
+        workflow_id: str,
+        campaigns: dict[Any, tuple[Any, str]],
+        request: MultiProjectAuditStart,
+    ) -> None:
+        self.parent_workflow_id = workflow_id
+        self.campaigns = campaigns
+        self.request = request
 
 
 @pytest.mark.asyncio
@@ -147,3 +172,29 @@ async def test_observability_acceptance_rejects_non_read_only_contract() -> None
         await service.start_observability_acceptance(
             ObservabilityAcceptanceStart.model_construct(confirm_read_only=False)  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_multi_project_audit_service_creates_one_parent_and_three_bound_children() -> None:
+    client = _StartClient()
+    repository = _MultiProjectRepository()
+    service = TemporalControlService(client, "engineering-control", repository)
+
+    accepted = await service.start_all_project_audits(MultiProjectAuditStart(preset="snapshot"))
+
+    assert accepted.workflow_id == repository.parent_workflow_id == client.workflow_id
+    assert accepted.workflow_id.startswith("audit-all-")
+    assert accepted.run_id == "started-run-id"
+    assert client.workflow_type == "MultiProjectAuditWorkflow"
+    assert client.task_queue == "engineering-control"
+    assert {project.value for project in repository.campaigns} == {
+        "falcone",
+        "musematic",
+        "llmwiki",
+    }
+    assert set(client.workflow_input.campaign_ids) == {"falcone", "musematic", "llmwiki"}
+    assert all(
+        child.startswith(f"{accepted.workflow_id}-")
+        for child in client.workflow_input.child_workflow_ids.values()
+    )
+    assert repository.request is not None and repository.request.production is False

@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 COMMANDS = {
     "audit",
+    "audit-all",
     "audit-plan",
     "bootstrap-plan",
     "bootstrap",
@@ -65,6 +66,7 @@ _PRESETS = {
     "security",
     "ux",
     "deployment",
+    "documentation",
     "falcone-intensive",
 }
 _LOOP_MODES = {"plan-only", "source-pr", "preview", "staging"}
@@ -429,6 +431,29 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 "project": args[0],
                 "preset": args[1],
                 "environment": args[2],
+            },
+        )
+    if command == "audit-all":
+        if (
+            len(args) not in {3, 4}
+            or args[0] not in {"plan", "start"}
+            or args[1] not in _PRESETS - {"falcone-intensive"}
+            or args[2] != "staging"
+            or (len(args) == 4 and args[3] != "--publish-findings")
+            or (args[0] == "plan" and len(args) == 4)
+        ):
+            raise ValueError("usage: /audit-all <plan|start> <preset> staging [--publish-findings]")
+        return _request(
+            "POST",
+            "/v1/commands",
+            actor,
+            {
+                "action": "audit_all_projects",
+                "mode": args[0],
+                "preset": args[1],
+                "environment": "staging",
+                "publish_findings": len(args) == 4,
+                "production": False,
             },
         )
     if command == "audit":

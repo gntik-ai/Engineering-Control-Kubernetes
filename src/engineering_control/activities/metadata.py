@@ -305,6 +305,7 @@ class MetadataActivityHandler:
             "campaign.persist_cell_blocker",
             "campaign.persist_cell_result",
             "campaign.finalize",
+            "campaign.group_status",
             "finding.load_candidate",
             "finding.prepare_verifier",
             "finding.controls",
@@ -392,6 +393,8 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._persist_cell_result, payload)
             if step == "campaign.finalize":
                 return await asyncio.to_thread(self._finalize_campaign, payload)
+            if step == "campaign.group_status":
+                return await asyncio.to_thread(self._record_campaign_group_status, payload)
             if step == "finding.load_candidate":
                 return await asyncio.to_thread(self._load_candidate, payload)
             if step == "finding.prepare_verifier":
@@ -1620,6 +1623,134 @@ class MetadataActivityHandler:
                 )
                 run.summary = f"campaign={campaign_id};status={status};cells={len(cells)}"
         return {**payload, "status": status, "completed_cells": len(cells)}
+
+    def _record_campaign_group_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = self._workflow_id(payload)
+        if payload.get("workflow_id") != workflow_id:
+            raise ValueError("multi-project audit workflow identity changed")
+        status = str(payload.get("status", ""))
+        allowed_statuses = {"RUNNING", "SUCCESS", "BLOCKED", "FAILED", "CANCELLED"}
+        if status not in allowed_statuses:
+            raise ValueError("multi-project audit status is invalid")
+        preset = str(payload.get("preset", ""))
+        if preset not in {
+            "snapshot",
+            "static-full",
+            "e2e-smoke",
+            "full-e2e",
+            "security",
+            "ux",
+            "deployment",
+        }:
+            raise ValueError("multi-project audit preset is invalid")
+        if payload.get("environment") != "staging":
+            raise ValueError("multi-project audit environment is invalid")
+        current_project = payload.get("current_project")
+        if current_project is not None and current_project not in {
+            "falcone",
+            "musematic",
+            "llmwiki",
+        }:
+            raise ValueError("multi-project audit current project is invalid")
+        raw_results = payload.get("project_results", {})
+        if not isinstance(raw_results, dict) or not set(raw_results).issubset(
+            {"falcone", "musematic", "llmwiki"}
+        ):
+            raise ValueError("multi-project audit results are invalid")
+        results: dict[str, dict[str, str | None]] = {}
+        for project, raw_result in raw_results.items():
+            if not isinstance(raw_result, dict):
+                raise ValueError("multi-project audit project result is invalid")
+            child_status = str(raw_result.get("status", ""))
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", child_status):
+                raise ValueError("multi-project audit child status is invalid")
+            campaign_id = str(UUID(str(raw_result.get("campaign_id", ""))))
+            child_workflow_id = str(raw_result.get("workflow_id", ""))
+            if not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", child_workflow_id):
+                raise ValueError("multi-project audit child workflow ID is invalid")
+            blocker_value = raw_result.get("blocker")
+            blocker = str(blocker_value) if blocker_value is not None else None
+            if blocker is not None and not re.fullmatch(r"[A-Z][A-Z0-9_]{0,119}", blocker):
+                raise ValueError("multi-project audit blocker is invalid")
+            results[str(project)] = {
+                "status": child_status,
+                "campaign_id": campaign_id,
+                "workflow_id": child_workflow_id,
+                "blocker": blocker,
+            }
+        now = datetime.now(UTC)
+        summary = json.dumps(
+            {
+                "preset": preset,
+                "environment": "staging",
+                "current_project": current_project,
+                "project_results": results,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(Run)
+                .where(
+                    Run.workflow_id == workflow_id,
+                    Run.run_type == "multi-project-audit",
+                )
+                .order_by(Run.created_at.desc())
+                .limit(1)
+            )
+            if run is None:
+                raise ValueError("multi-project audit run does not exist")
+            run.status = status
+            run.started_at = run.started_at or now
+            run.finished_at = now if status != "RUNNING" else None
+            run.error_code = status if status in {"BLOCKED", "FAILED", "CANCELLED"} else None
+            run.summary = summary[:4000]
+            event_type = (
+                "workflow.started"
+                if status == "RUNNING" and not results
+                else "workflow.progress"
+                if status == "RUNNING"
+                else "workflow.completed"
+                if status == "SUCCESS"
+                else "workflow.failed"
+            )
+            phase = f"audit_{current_project}" if current_project is not None else status.lower()
+            existing_event = session.scalar(
+                select(DashboardEvent.id)
+                .where(
+                    DashboardEvent.workflow_id == workflow_id,
+                    DashboardEvent.event_type == event_type,
+                    DashboardEvent.current_phase == phase,
+                )
+                .limit(1)
+            )
+            if existing_event is None:
+                session.add(
+                    DashboardEvent(
+                        occurred_at=now,
+                        level="INFO" if status in {"RUNNING", "SUCCESS"} else "WARNING",
+                        event_type=event_type,
+                        source="controller",
+                        worker_kind="controller",
+                        project="platform",
+                        workflow_id=workflow_id,
+                        entity_type="multi_project_audit",
+                        entity_id=workflow_id,
+                        current_phase=phase,
+                        message=(
+                            "All-project audit advanced"
+                            if status == "RUNNING"
+                            else f"All-project audit reached {status.lower()}"
+                        ),
+                        metadata_json={
+                            "status": status,
+                            "current_project": current_project,
+                            "completed_projects": sorted(results),
+                        },
+                    )
+                )
+        return {**payload, "project_results": results}
 
     def _load_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
         finding_id = UUID(str(payload["finding_id"]))

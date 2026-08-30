@@ -93,6 +93,21 @@ class AuditPlanRequest(APIModel):
         return self
 
 
+class MultiProjectAuditStart(APIModel):
+    preset: Literal[
+        "snapshot",
+        "static-full",
+        "e2e-smoke",
+        "full-e2e",
+        "security",
+        "ux",
+        "deployment",
+    ]
+    environment: Literal["staging"] = "staging"
+    publish_findings: bool = False
+    production: Literal[False] = False
+
+
 class LLMWikiBootstrapPlanRequest(APIModel):
     project: Literal["llmwiki"] = "llmwiki"
     environment: Literal["staging"] = "staging"
