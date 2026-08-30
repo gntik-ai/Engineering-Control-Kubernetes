@@ -31,7 +31,7 @@ def subscription_only_environment(
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
-        "".join(("OPEN", "ROUTER_API_KEY")),
+        "OPENROUTER_API_KEY",
         "DEEPSEEK_API_KEY",
         "OMNIROUTE_URL",
         "OMNIROUTE_BASE_URL",

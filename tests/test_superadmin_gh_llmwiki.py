@@ -915,12 +915,13 @@ def test_persona_factory_has_no_built_in_role_or_human_user_mutation_surface() -
 
 def test_no_active_github_token_contract_or_forbidden_fallback() -> None:
     active_paths = [ROOT / "src", ROOT / "config", ROOT / "scripts", ROOT / "systemd"]
-    text = "\n".join(
-        path.read_text(encoding="utf-8", errors="replace")
+    active_text = {
+        path: path.read_text(encoding="utf-8", errors="replace")
         for root in active_paths
         for path in root.rglob("*")
-        if path.is_file()
-    ).lower()
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    text = "\n".join(active_text.values()).lower()
     for name in (
         "controller-read.token",
         "github-read.token",
@@ -929,10 +930,15 @@ def test_no_active_github_token_contract_or_forbidden_fallback() -> None:
         "github-pr-write.token",
     ):
         assert name not in text
-    assert "openrouter" not in text
+    assert {
+        path.relative_to(ROOT)
+        for path, value in active_text.items()
+        if "openrouter" in value.lower()
+    } == {Path("src/engineering_control/adapters/process.py")}
     control = yaml.safe_load((ROOT / "config/control.yaml").read_text())
     assert control["paid_api_fallback"] == {"enabled": False}
     process_adapter = (ROOT / "src/engineering_control/adapters/process.py").read_text()
     assert "OPENAI_API_KEY" in process_adapter
     assert "ANTHROPIC_API_KEY" in process_adapter
+    assert '"OPENROUTER_API_KEY"' in process_adapter
     assert "env.pop(key, None)" in process_adapter
