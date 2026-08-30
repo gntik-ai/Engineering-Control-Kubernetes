@@ -243,6 +243,19 @@ async def test_signed_candidate_persists_digests_and_dry_run_stops_before_git_mu
         assert len(change_set.image_digests) == len(images)
         assert run is not None and run.status == "SUCCESS"
         assert run.finished_at is not None
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        change_set.state = "DEPLOY_PR"
+        recovery = dict(change_set.recovery_json)
+        recovery["promotion"] = {
+            "source_sha": change_set.source_head_sha,
+            "image_digests": change_set.image_digests,
+            "promoted_head_sha": change_set.deployment_head_sha,
+        }
+        change_set.recovery_json = recovery
+    with pytest.raises(ValueError, match="verified candidate build"):
+        handler._prepare_promotion({**persisted, "dry_run": False})
 
 
 @pytest.mark.asyncio

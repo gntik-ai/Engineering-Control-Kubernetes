@@ -7,12 +7,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
 
 from engineering_control.activities.delivery import DeliveryActivityHandler
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
+    ActionCandidate,
     AgentExecution,
     BacklogIssueRecord,
     ChangeSet,
@@ -324,6 +326,39 @@ def test_prepare_final_closure_rechecks_current_exact_r3_approval(tmp_path: Path
     handler, payload, _campaign_row = _seed_prepare(tmp_path, risk="R3")
     with pytest.raises(ValueError, match="current exact R3 issue approval"):
         handler._prepare_final_closure(payload)
+
+
+def test_prepare_final_closure_accepts_current_exact_r3_approval(tmp_path: Path) -> None:
+    handler, payload, _campaign_row = _seed_prepare(tmp_path, risk="R3")
+    now = datetime.now(UTC)
+    with handler.sessions.begin() as session:
+        issue = session.scalar(
+            select(BacklogIssueRecord).where(BacklogIssueRecord.issue_number == 42)
+        )
+        assert issue is not None
+        candidate_payload = {
+            "issue_body_sha256": issue.body_sha256,
+            "issue_updated_at": issue.github_updated_at.isoformat(),
+            "production": False,
+        }
+        session.add(
+            ActionCandidate(
+                action="r3_issue_approval",
+                project="falcone",
+                target_type="github_issue",
+                target_id=f"{issue.repository}#{issue.issue_number}",
+                payload_json=candidate_payload,
+                capability_status="AVAILABLE",
+                blockers_json=[],
+                binding_hash="5" * 64,
+                confirmation_phrase="APPROVE_R3_FALCONE_42_5555555555555555",
+                session_binding_hash="6" * 64,
+                created_at=now,
+                expires_at=now + timedelta(hours=1),
+                used_at=now,
+            )
+        )
+    assert handler._prepare_final_closure(payload)["status"] == "FINAL_CLOSURE_READY"
 
 
 @pytest.mark.parametrize("variant", ["missing-runtime", "wrong-revision", "active-agent"])

@@ -104,3 +104,44 @@ def test_r3_rejects_unbound_typed_confirmation() -> None:
             typed_confirmation="APPROVE R3 wrong wrong",
             **approval_values(),
         )
+
+
+def test_change_set_policy_declares_the_complete_final_closure_path() -> None:
+    item = change_set().model_copy(update={"state": ChangeSetState.RUNTIME_VERIFIED})
+    item = ChangeSetPolicy.transition(
+        item,
+        ChangeSetState.SOURCE_MERGED,
+        TransitionEvidence(source_merged=True, independent_review_passed=True),
+    )
+    item = ChangeSetPolicy.transition(
+        item,
+        ChangeSetState.FINAL_ARTIFACT_BUILT,
+        TransitionEvidence(candidate_digest_present=True),
+    )
+    item = ChangeSetPolicy.transition(item, ChangeSetState.DEPLOY_PR, TransitionEvidence())
+    item = ChangeSetPolicy.transition(
+        item,
+        ChangeSetState.AWAITING_STAGING_APPROVAL,
+        TransitionEvidence(deployment_pr_protected=True),
+    )
+    item = ChangeSetPolicy.transition(
+        item,
+        ChangeSetState.STAGING_APPROVED,
+        TransitionEvidence(approval_current=True),
+    )
+    item = ChangeSetPolicy.transition(
+        item,
+        ChangeSetState.STAGING_DEPLOYED,
+        TransitionEvidence(),
+    )
+    item = ChangeSetPolicy.transition(
+        item,
+        ChangeSetState.RUNTIME_VERIFIED,
+        TransitionEvidence(runtime_verified=True),
+    )
+    item = ChangeSetPolicy.transition(
+        item,
+        ChangeSetState.ISSUE_CLOSED,
+        TransitionEvidence(issue_closed=True, runtime_verified=True),
+    )
+    assert item.state is ChangeSetState.ISSUE_CLOSED

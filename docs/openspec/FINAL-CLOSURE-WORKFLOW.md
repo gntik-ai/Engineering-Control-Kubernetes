@@ -16,6 +16,9 @@ issue.
 - `final.prepare` revalidates the current unexpired full-delivery campaign approval, repository pair,
   protected-merge and issue-close permissions, provider separation, documentation result, open issue,
   resumable ChangeSet state, and the exact current R3 approval when the issue is R3.
+- An R3 approval must still be current at every closure re-entry. Expiry during a long delivery stops
+  further mutation and requires a newly generated approval bound to the unchanged issue body and
+  update timestamp; completed protected merges are preserved while the issue remains open.
 - The exact source PR head is protected-merged first. The merge SHA and tree are persisted before any
   subsequent action.
 - The workflow waits at most 120 one-minute attempts for a signed candidate manifest produced from

@@ -550,8 +550,35 @@ def test_final_closure_database_gates_require_runtime_and_persisted_comment(
             },
         }
     )
+    assert commented["status"] == "FINAL_EVIDENCE_PERSISTED"
+    adopted = handler._persist_final_comment(
+        {
+            **ready,
+            "status": "FINAL_EVIDENCE_COMMENTED",
+            "comment_result": {
+                "status": "COMMENT_PRESENT",
+                "comment_url": "https://github.com/gntik-ai/falcone/issues/42#issuecomment-1",
+            },
+        }
+    )
+    assert adopted["status"] == "FINAL_EVIDENCE_PERSISTED"
+    resumed = handler._prepare_final_closure(
+        {
+            "backlog_campaign_id": str(campaign_id),
+            "change_set_id": str(change_set_id),
+            "project": "falcone",
+            "issue_repository": "gntik-ai/falcone",
+            "issue_number": 42,
+            "orchestration": {"workflow_id": workflow_id},
+        }
+    )
+    assert resumed["status"] == "FINAL_ISSUE_CLOSE_READY"
+    with handler.sessions() as session:
+        issue = session.get(BacklogIssueRecord, issue_record_id)
+        assert issue is not None
+        assert issue.final_closure_status == "FINAL_EVIDENCE_PERSISTED"
     fixed = handler._persist_final_issue_close(
-        {**fake_close, "final_issue_plan": commented["final_issue_plan"]}
+        {**fake_close, "final_issue_plan": resumed["final_issue_plan"]}
     )
     assert fixed["status"] == "FIXED"
 
