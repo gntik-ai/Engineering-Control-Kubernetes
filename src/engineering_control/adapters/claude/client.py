@@ -57,6 +57,15 @@ class ClaudeCLIAdapter:
         ):
             raise ValueError("read-only Claude requests cannot enable write tools")
 
+        cli_schema = dict(request.output_schema)
+        if cli_schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema":
+            # Claude Code validates the structural schema but rejects the otherwise
+            # valid Draft 2020-12 declaration as an unknown meta-schema. Engineering
+            # Control still validates the original schema and the returned object
+            # with Draft202012Validator at the provider boundary; removing this one
+            # annotation from the CLI copy does not remove an output constraint.
+            cli_schema.pop("$schema")
+
         command = [
             self.executable,
             "--print",
@@ -64,7 +73,7 @@ class ClaudeCLIAdapter:
             "stream-json",
             "--verbose",
             "--json-schema",
-            json.dumps(request.output_schema, separators=(",", ":"), sort_keys=True),
+            json.dumps(cli_schema, separators=(",", ":"), sort_keys=True),
             "--no-session-persistence",
             "--safe-mode",
             "--strict-mcp-config",

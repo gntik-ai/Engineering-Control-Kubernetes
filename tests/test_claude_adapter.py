@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +46,10 @@ async def test_claude_stream_json_invocation_enables_verbose(
         model_class=ModelClass.WORKER,
         prompt="perform a bounded synthetic task",
         working_directory=str(tmp_path),
-        output_schema={"type": "object"},
+        output_schema={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+        },
         writable=True,
         allowed_tools=("Read", "Edit", "Write"),
     )
@@ -58,6 +62,9 @@ async def test_claude_stream_json_invocation_enables_verbose(
     assert command[command.index("--permission-mode") + 1] == "dontAsk"
     assert command[command.index("--tools") + 1] == "Read,Edit,Write"
     assert command[command.index("--allowed-tools") + 1] == "Read,Edit,Write"
+    cli_schema = json.loads(command[command.index("--json-schema") + 1])
+    assert cli_schema == {"type": "object"}
+    assert request.output_schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
     assert "--dangerously-skip-permissions" not in command
     assert result.status is RunStatus.SUCCESS
     assert result.structured_result == {"status": "PASS"}
