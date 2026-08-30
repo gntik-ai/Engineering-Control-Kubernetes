@@ -184,6 +184,7 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
     ("command", "raw_args", "method", "path"),
     [
         ("audit-plan", "falcone e2e-smoke staging", "POST", "/v1/commands"),
+        ("audit-all", "plan snapshot staging", "POST", "/v1/commands"),
         ("audit", "falcone e2e-smoke staging --execute", "POST", "/v1/commands"),
         ("campaigns", "", "GET", "/v1/campaigns?limit=20"),
         (
@@ -328,6 +329,37 @@ def test_telegram_export_commands_reject_untyped_targets(
     monkeypatch.setattr(handler, "_request", request)
     result = handler.handle(
         f"command:{command}",
+        {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
+    )
+    assert result is not None and result["decision"] == "handled"
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    "raw_args",
+    [
+        "start snapshot production",
+        "plan snapshot staging --publish-findings",
+        "start falcone-intensive staging",
+        "start snapshot staging --execute",
+        "start snapshot staging;gh",
+    ],
+)
+def test_telegram_all_project_audit_rejects_untyped_targets(
+    monkeypatch: pytest.MonkeyPatch, raw_args: str
+) -> None:
+    handler = load_handler()
+    called = False
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+
+    def request(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        nonlocal called
+        called = True
+        return {"status": "UNEXPECTED"}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        "command:audit-all",
         {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
     )
     assert result is not None and result["decision"] == "handled"

@@ -19,6 +19,7 @@ from engineering_control.api.schemas import (
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
+    MultiProjectAuditStart,
     RollbackRequest,
     RuntimeVerificationStart,
 )
@@ -65,6 +66,13 @@ def serialize_row(row: Any) -> dict[str, Any]:
 class MetadataRepository(Protocol):
     async def create_campaign(
         self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+    ) -> None: ...
+
+    async def create_multi_project_audit(
+        self,
+        workflow_id: str,
+        campaigns: dict[Project, tuple[UUID, str]],
+        request: MultiProjectAuditStart,
     ) -> None: ...
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
@@ -160,6 +168,72 @@ class SQLMetadataRepository:
         self, campaign_id: UUID, workflow_id: str, request: CampaignStart
     ) -> None:
         await asyncio.to_thread(self._create_campaign, campaign_id, workflow_id, request)
+
+    async def create_multi_project_audit(
+        self,
+        workflow_id: str,
+        campaigns: dict[Project, tuple[UUID, str]],
+        request: MultiProjectAuditStart,
+    ) -> None:
+        await asyncio.to_thread(
+            self._create_multi_project_audit,
+            workflow_id,
+            campaigns,
+            request,
+        )
+
+    def _create_multi_project_audit(
+        self,
+        workflow_id: str,
+        campaigns: dict[Project, tuple[UUID, str]],
+        request: MultiProjectAuditStart,
+    ) -> None:
+        expected = {Project.FALCONE, Project.MUSEMATIC, Project.LLMWIKI}
+        if set(campaigns) != expected:
+            raise ValueError("all-project audit requires the exact project catalog")
+        with self.sessions.begin() as session:
+            session.add(
+                Run(
+                    workflow_id=workflow_id,
+                    run_type="multi-project-audit",
+                    status="QUEUED",
+                    project="platform",
+                    worker="controller",
+                    summary=(
+                        f"preset={request.preset};environment={request.environment};projects=3"
+                    ),
+                )
+            )
+            for project in sorted(expected, key=lambda item: item.value):
+                campaign_id, child_workflow_id = campaigns[project]
+                session.add(
+                    Campaign(
+                        id=campaign_id,
+                        project=project.value,
+                        name=f"{request.preset}-{request.environment}-all-projects",
+                        status="QUEUED",
+                        source_sha=None,
+                        deployment_sha=None,
+                        required_cells=0,
+                        metadata_json={
+                            "dry_run": False,
+                            "preset": request.preset,
+                            "environment": request.environment,
+                            "publish_findings": request.publish_findings,
+                            "snapshot_resolution": "automatic",
+                            "parent_workflow_id": workflow_id,
+                        },
+                    )
+                )
+                session.add(
+                    Run(
+                        campaign_id=campaign_id,
+                        workflow_id=child_workflow_id,
+                        run_type="audit-campaign",
+                        status="QUEUED",
+                        project=project.value,
+                    )
+                )
 
     def _create_campaign(self, campaign_id: UUID, workflow_id: str, request: CampaignStart) -> None:
         with self.sessions.begin() as session:
@@ -1218,6 +1292,14 @@ class SQLMetadataRepository:
 class EmptyMetadataRepository:
     async def create_campaign(
         self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+    ) -> None:
+        return None
+
+    async def create_multi_project_audit(
+        self,
+        workflow_id: str,
+        campaigns: dict[Project, tuple[UUID, str]],
+        request: MultiProjectAuditStart,
     ) -> None:
         return None
 

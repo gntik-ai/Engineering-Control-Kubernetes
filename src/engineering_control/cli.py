@@ -84,6 +84,24 @@ def parser() -> argparse.ArgumentParser:
         if action == "start":
             bounded_audit.add_argument("--publish-findings", action="store_true")
 
+    audit_all = commands.add_parser("audit-all")
+    audit_all.add_argument("mode", choices=("plan", "start"))
+    audit_all.add_argument(
+        "preset",
+        choices=(
+            "snapshot",
+            "static-full",
+            "e2e-smoke",
+            "full-e2e",
+            "security",
+            "ux",
+            "deployment",
+            "documentation",
+        ),
+    )
+    audit_all.add_argument("environment", choices=("staging",))
+    audit_all.add_argument("--publish-findings", action="store_true")
+
     commands.add_parser("campaigns").add_argument("--limit", type=int, default=50)
     campaign = commands.add_parser("campaign")
     campaign.add_argument("campaign_id")
@@ -280,6 +298,21 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                     arguments.publish_findings if command == "audit-start" else False
                 ),
                 **({"production": False} if command == "audit-start" else {}),
+            },
+        )
+    if command == "audit-all":
+        if arguments.mode == "plan" and arguments.publish_findings:
+            raise ValueError("audit-all planning cannot publish findings")
+        return client.request(
+            "POST",
+            "/v1/commands",
+            {
+                "action": "audit_all_projects",
+                "mode": arguments.mode,
+                "preset": arguments.preset,
+                "environment": arguments.environment,
+                "publish_findings": arguments.publish_findings,
+                "production": False,
             },
         )
     if command in {"campaigns", "findings"}:

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
-from engineering_control.api.schemas import OperationAccepted
+from engineering_control.api.schemas import MultiProjectAuditStart, OperationAccepted
 from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
 from engineering_control.dashboard.repository import DashboardRepository
@@ -32,8 +32,10 @@ from engineering_control.db.models import (
     WorkerHeartbeat,
 )
 from engineering_control.db.repository import SQLMetadataRepository
+from engineering_control.models.enums import Project
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.models import (
+    AuditAllProjectsCommand,
     AuditStartCommand,
     EnhancementApproveCommand,
     EnhancementRejectCommand,
@@ -50,8 +52,14 @@ from engineering_control.operations.registry import COMMAND_REGISTRY
 from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.service import TypedCommandBus
 from engineering_control.workflows import definitions as workflow_definitions
-from engineering_control.workflows.definitions import ExistingGitHubBacklogLoopWorkflow
-from engineering_control.workflows.inputs import ExistingGitHubBacklogLoopInput
+from engineering_control.workflows.definitions import (
+    ExistingGitHubBacklogLoopWorkflow,
+    MultiProjectAuditWorkflow,
+)
+from engineering_control.workflows.inputs import (
+    ExistingGitHubBacklogLoopInput,
+    MultiProjectAuditInput,
+)
 
 CAMPAIGN_ID = UUID("11111111-1111-4111-8111-111111111111")
 AUDIT_CAMPAIGN_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -975,6 +983,201 @@ async def test_audit_start_requires_recent_matching_plan_and_defaults_to_no_publ
     assert accepted.workflow_id == "audit-synthetic"
     sent = control.start_campaign.await_args.args[0]
     assert sent.publish_findings is False
+
+
+@pytest.mark.asyncio
+async def test_all_project_audit_requires_plan_then_starts_exactly_one_parent(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    control = Mock()
+    control.plan_campaign = AsyncMock(return_value={"status": "PLANNED", "blockers": []})
+    control.start_all_project_audits = AsyncMock(
+        return_value=OperationAccepted(workflow_id="audit-all-synthetic", run_id="audit-all-run")
+    )
+    bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
+    start = AuditAllProjectsCommand(mode="start", preset="snapshot")
+
+    before_plan = await repository.capability(start)
+    assert before_plan.status == "BLOCKED"
+    assert "ALL_PROJECT_AUDIT_PLAN_REQUIRED" in before_plan.blockers
+
+    planned = await bus.submit(
+        AuditAllProjectsCommand(mode="plan", preset="snapshot"),
+        source_channel="cli",
+        operator_class="engineering-ctl",
+        idempotency_key=_idempotency_fixture("audit-all-plan", 1),
+    )
+    assert planned.status == "COMPLETED"
+    assert [call.args[0].project.value for call in control.plan_campaign.await_args_list] == [
+        "falcone",
+        "musematic",
+        "llmwiki",
+    ]
+
+    candidate = await repository.candidate(start, SESSION_A)
+    assert candidate.capability.status == "AVAILABLE"
+    assert candidate.confirmation_phrase == f"START ALL AUDITS {candidate.binding_hash[:8].upper()}"
+    assert candidate.operation_binding["resolved"]["execution"] == "sequential"
+    registry = {item["action"]: item for item in COMMAND_REGISTRY}
+    assert registry["audit_all_projects"]["status"] == "AVAILABLE"
+    assert not any(
+        field["name"] in {"command", "args", "argv", "shell", "endpoint"}
+        for field in registry["audit_all_projects"]["fields"]
+    )
+
+    accepted = await bus.submit(
+        start,
+        source_channel="cli",
+        operator_class="engineering-ctl",
+        idempotency_key=_idempotency_fixture("audit-all-start", 1),
+    )
+    assert accepted.workflow_id == "audit-all-synthetic"
+    assert control.start_all_project_audits.await_count == 1
+
+    duplicate = await repository.capability(start)
+    assert duplicate.status == "BLOCKED"
+    assert "ALL_PROJECT_AUDIT_ALREADY_ACTIVE" in duplicate.blockers
+
+
+@pytest.mark.asyncio
+async def test_all_project_audit_plan_stops_before_start_when_one_project_is_blocked(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    control = Mock()
+    control.plan_campaign = AsyncMock(
+        side_effect=[
+            {"status": "PLANNED", "blockers": []},
+            {"status": "BLOCKED", "blockers": ["SYNTHETIC_OBSERVER_UNAVAILABLE"]},
+        ]
+    )
+    bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
+
+    result = await bus.submit(
+        AuditAllProjectsCommand(mode="plan", preset="snapshot"),
+        source_channel="cli",
+        operator_class="engineering-ctl",
+        idempotency_key=_idempotency_fixture("audit-all-blocked", 1),
+    )
+
+    assert result.status == "BLOCKED"
+    assert result.safe_error == "ALL_PROJECT_AUDIT_PLAN_BLOCKED_MUSEMATIC"
+    assert control.plan_campaign.await_count == 2
+
+
+def test_all_project_audit_command_fails_closed_outside_staging() -> None:
+    with pytest.raises(ValidationError):
+        parse_command(
+            {
+                "action": "audit_all_projects",
+                "mode": "start",
+                "preset": "snapshot",
+                "environment": "production",
+                "production": False,
+            }
+        )
+    with pytest.raises(ValidationError):
+        AuditAllProjectsCommand(mode="plan", preset="security", publish_findings=True)
+
+
+@pytest.mark.asyncio
+async def test_multi_project_audit_metadata_is_created_atomically(tmp_path: Path) -> None:
+    metadata = SQLMetadataRepository(f"sqlite+pysqlite:///{tmp_path / 'audit-all.db'}")
+    Base.metadata.create_all(metadata.engine)
+    parent = "audit-all-11111111-1111-4111-8111-111111111111"
+    campaigns = {
+        Project.FALCONE: (
+            UUID("11111111-1111-4111-8111-111111111111"),
+            f"{parent}-falcone",
+        ),
+        Project.MUSEMATIC: (
+            UUID("22222222-2222-4222-8222-222222222222"),
+            f"{parent}-musematic",
+        ),
+        Project.LLMWIKI: (
+            UUID("33333333-3333-4333-8333-333333333333"),
+            f"{parent}-llmwiki",
+        ),
+    }
+
+    await metadata.create_multi_project_audit(
+        parent,
+        campaigns,
+        MultiProjectAuditStart(preset="snapshot"),
+    )
+
+    with metadata.sessions() as session:
+        parent_run = session.scalar(select(Run).where(Run.workflow_id == parent))
+        children = session.scalars(
+            select(Run).where(Run.run_type == "audit-campaign").order_by(Run.project)
+        ).all()
+        stored_campaigns = session.scalars(select(Campaign).order_by(Campaign.project)).all()
+    assert parent_run is not None and parent_run.status == "QUEUED"
+    assert [child.project for child in children] == ["falcone", "llmwiki", "musematic"]
+    assert [campaign.project for campaign in stored_campaigns] == [
+        "falcone",
+        "llmwiki",
+        "musematic",
+    ]
+    assert all(
+        campaign.metadata_json["parent_workflow_id"] == parent for campaign in stored_campaigns
+    )
+
+
+@pytest.mark.asyncio
+async def test_all_project_audit_workflow_is_sequential_and_continues_after_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = MultiProjectAuditWorkflow()
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    state_calls: list[dict[str, object]] = []
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        assert name == "campaign.group_status"
+        state_calls.append(payload)
+        return payload
+
+    instance._step = step  # type: ignore[method-assign]
+    children: list[str] = []
+
+    async def child(_name: str, _input: object, *, id: str, **_kwargs: object) -> dict[str, object]:
+        children.append(id)
+        if id.endswith("-musematic"):
+            return {"status": "BLOCKED", "blocker": "SYNTHETIC_DEPENDENCY_BLOCKED"}
+        return {"status": "COMPLETE"}
+
+    monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="audit-all-synthetic", task_queue="engineering"),
+    )
+    monkeypatch.setattr(workflow_definitions.workflow, "execute_child_workflow", child)
+    request = MultiProjectAuditInput(
+        preset="snapshot",
+        campaign_ids={
+            "falcone": "11111111-1111-4111-8111-111111111111",
+            "musematic": "22222222-2222-4222-8222-222222222222",
+            "llmwiki": "33333333-3333-4333-8333-333333333333",
+        },
+        child_workflow_ids={
+            project: f"audit-all-synthetic-{project}"
+            for project in ("falcone", "musematic", "llmwiki")
+        },
+    )
+
+    result = await instance.run(request)
+
+    assert children == [
+        "audit-all-synthetic-falcone",
+        "audit-all-synthetic-musematic",
+        "audit-all-synthetic-llmwiki",
+    ]
+    assert result["status"] == "BLOCKED"
+    assert state_calls[-1]["status"] == "BLOCKED"
+    assert set(result["project_results"]) == {"falcone", "musematic", "llmwiki"}
 
 
 @pytest.mark.asyncio

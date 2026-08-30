@@ -79,6 +79,10 @@ def test_protected_pages_local_assets_and_observational_controls(tmp_path: Path)
             assert "start workflow" not in response.text.lower()
             assert "cancel workflow" not in response.text.lower()
             assert "approve deployment" not in response.text.lower()
+        audit_page = client.get("/audits")
+        assert 'id="plan-all-audits"' in audit_page.text
+        assert 'id="start-all-audits"' in audit_page.text
+        assert "Audit all projects unavailable" not in audit_page.text
         assert client.get("/static/dashboard.css").status_code == 200
         assert client.get("/static/dashboard.js").status_code == 200
         assert client.get("/robots.txt").text == "User-agent: *\nDisallow: /\n"

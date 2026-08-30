@@ -14,6 +14,7 @@ from engineering_control.api.schemas import (
     EnhancementRun,
     ExistingBacklogLoopStart,
     LLMWikiBootstrapPlanRequest,
+    MultiProjectAuditStart,
     OperationAccepted,
 )
 from engineering_control.api.service import ControlService
@@ -21,6 +22,7 @@ from engineering_control.db.repository import MetadataRepository
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
+    AuditAllProjectsCommand,
     AuditPlanCommand,
     AuditStartCommand,
     AutonomousBacklogCommand,
@@ -230,6 +232,27 @@ class TypedCommandBus:
                     environment=command.environment,
                     dry_run=False,
                     publish_findings=command.publish_findings,
+                )
+            )
+        if isinstance(command, AuditAllProjectsCommand):
+            if command.mode == "plan":
+                for project in ("falcone", "musematic", "llmwiki"):
+                    result = await self.control.plan_campaign(
+                        AuditPlanRequest(
+                            project=project,  # type: ignore[arg-type]
+                            preset=self._audit_preset(command.preset),
+                            environment=command.environment,
+                        )
+                    )
+                    if result.get("blockers"):
+                        raise ValueError(f"ALL_PROJECT_AUDIT_PLAN_BLOCKED_{project.upper()}")
+                return None
+            return await self.control.start_all_project_audits(
+                MultiProjectAuditStart(
+                    preset=self._audit_preset(command.preset),
+                    environment=command.environment,
+                    publish_findings=command.publish_findings,
+                    production=False,
                 )
             )
         if isinstance(command, AdvancedAuditCommand):

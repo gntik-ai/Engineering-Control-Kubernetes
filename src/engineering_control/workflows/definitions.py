@@ -6,7 +6,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, ChildWorkflowError
 
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
@@ -23,6 +23,7 @@ from engineering_control.workflows.inputs import (
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
+    MultiProjectAuditInput,
     ObservabilityAcceptanceInput,
     PreviewDeploymentInput,
     QuotaRefreshInput,
@@ -662,6 +663,147 @@ class AuditCampaignWorkflow(ControlledWorkflow):
             ]
         )
         return stages
+
+
+@workflow.defn(name="MultiProjectAuditWorkflow")
+class MultiProjectAuditWorkflow(ControlledWorkflow):
+    """Execute the fixed project catalog sequentially under one durable parent."""
+
+    _projects = ("falcone", "musematic", "llmwiki")
+    _presets = frozenset(
+        {
+            "snapshot",
+            "static-full",
+            "e2e-smoke",
+            "full-e2e",
+            "security",
+            "ux",
+            "deployment",
+        }
+    )
+    _child_statuses = frozenset(
+        {
+            "BLOCKED",
+            "BLOCKED_BY_CREDENTIAL",
+            "CANCELLED",
+            "COMPLETE",
+            "FAILED",
+            "INCOMPLETE",
+            "SUCCESS",
+            "TIMED_OUT",
+            "VERIFICATION_REQUIRED",
+        }
+    )
+
+    @workflow.run
+    async def run(self, request: MultiProjectAuditInput) -> dict[str, Any]:
+        if (
+            request.environment != "staging"
+            or request.preset not in self._presets
+            or set(request.campaign_ids) != set(self._projects)
+            or set(request.child_workflow_ids) != set(self._projects)
+        ):
+            raise ApplicationError(
+                "all-project audit binding is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        parent_workflow_id = workflow.info().workflow_id
+        await self._step(
+            "campaign.group_status",
+            {
+                "workflow_id": parent_workflow_id,
+                "status": "RUNNING",
+                "preset": request.preset,
+                "environment": request.environment,
+                "project_results": {},
+            },
+        )
+        results: dict[str, dict[str, str | None]] = {}
+        for project in self._projects:
+            if not await self._checkpoint(f"AUDIT_{project.upper()}"):
+                await self._step(
+                    "campaign.group_status",
+                    {
+                        "workflow_id": parent_workflow_id,
+                        "status": "CANCELLED",
+                        "preset": request.preset,
+                        "environment": request.environment,
+                        "project_results": results,
+                    },
+                )
+                return {"status": "CANCELLED", "project_results": results}
+            try:
+                child = await workflow.execute_child_workflow(
+                    "AuditCampaignWorkflow",
+                    AuditCampaignInput(
+                        project=project,
+                        name=f"{request.preset}-staging-all-projects",
+                        preset=request.preset,
+                        environment="staging",
+                        dry_run=False,
+                        publish_findings=request.publish_findings,
+                        campaign_id=request.campaign_ids[project],
+                    ),
+                    id=request.child_workflow_ids[project],
+                    task_queue=workflow.info().task_queue,
+                    execution_timeout=timedelta(days=7),
+                )
+            except ChildWorkflowError:
+                child = {"status": "FAILED", "blocker": "AUDIT_CHILD_WORKFLOW_FAILED"}
+            if not isinstance(child, dict):
+                child = {"status": "FAILED", "blocker": "AUDIT_CHILD_RESULT_INVALID"}
+            child_status = str(child.get("status", "FAILED")).upper()
+            raw_blocker = child.get("blocker")
+            blocker = str(raw_blocker).upper() if raw_blocker is not None else None
+            if child_status not in self._child_statuses:
+                child_status = "FAILED"
+                blocker = "UNKNOWN_AUDIT_CHILD_STATUS"
+            if blocker is not None and (
+                not 1 <= len(blocker) <= 120
+                or blocker[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                or any(
+                    character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+                    for character in blocker
+                )
+            ):
+                blocker = "AUDIT_CHILD_BLOCKED"
+            result = {
+                "status": child_status,
+                "campaign_id": request.campaign_ids[project],
+                "workflow_id": request.child_workflow_ids[project],
+                "blocker": blocker,
+            }
+            results[project] = result
+            await self._step(
+                "campaign.group_status",
+                {
+                    "workflow_id": parent_workflow_id,
+                    "status": "RUNNING",
+                    "preset": request.preset,
+                    "environment": request.environment,
+                    "current_project": project,
+                    "project_results": results,
+                },
+            )
+        child_statuses = {str(result["status"]).upper() for result in results.values()}
+        if child_statuses & {"FAILED", "TIMED_OUT"}:
+            terminal = "FAILED"
+        elif child_statuses - {"COMPLETE", "VERIFICATION_REQUIRED", "SUCCESS"}:
+            terminal = "BLOCKED"
+        else:
+            terminal = "SUCCESS"
+        await self._step(
+            "campaign.group_status",
+            {
+                "workflow_id": parent_workflow_id,
+                "status": terminal,
+                "preset": request.preset,
+                "environment": request.environment,
+                "project_results": results,
+            },
+        )
+        return {"status": terminal, "project_results": results}
 
 
 @workflow.defn(name="FindingVerificationWorkflow")
@@ -2162,6 +2304,7 @@ class LLMWikiStagingBootstrapWorkflow(ControlledWorkflow):
 
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
+    MultiProjectAuditWorkflow,
     FindingVerificationWorkflow,
     IssueDeliveryWorkflow,
     DeliveryReconciliationWorkflow,

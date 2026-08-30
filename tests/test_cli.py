@@ -205,6 +205,34 @@ def test_cli_advanced_audit_uses_the_shared_typed_command_bus() -> None:
     assert result["payload"]["production"] is False
 
 
+def test_cli_all_project_audit_uses_one_fixed_typed_command() -> None:
+    class FakeClient:
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            return {"method": method, "path": path, "payload": payload or {}}
+
+    result = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args(["audit-all", "start", "snapshot", "staging"]),
+    )
+
+    assert result == {
+        "method": "POST",
+        "path": "/v1/commands",
+        "payload": {
+            "action": "audit_all_projects",
+            "mode": "start",
+            "preset": "snapshot",
+            "environment": "staging",
+            "publish_findings": False,
+            "production": False,
+        },
+    }
+    with pytest.raises(SystemExit):
+        parser().parse_args(["audit-all", "start", "snapshot", "production"])
+
+
 def test_cli_evidence_exports_use_typed_commands_and_fixed_retrieval_route() -> None:
     class FakeClient:
         def request(

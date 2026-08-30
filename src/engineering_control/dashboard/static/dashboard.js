@@ -278,9 +278,12 @@ function setupAudits() {
   form.addEventListener("submit", (event) => { event.preventDefault(); persistForm(form); load(); }); load(); window.setInterval(load, 5000);
   const actionForm = byId("audit-action-form");
   const auditCommand = (action, presetOverride = null) => ({action, project: actionForm.elements.action_project.value, preset: presetOverride || actionForm.elements.preset.value, environment: actionForm.elements.environment.value, personas: [], lenses: [], documentation_level: "all", publish_findings: action === "audit_start" ? actionForm.elements.publish_findings.checked : false, ...(action === "audit_start" ? {production: false} : {})});
+  const allAuditCommand = (mode) => ({action: "audit_all_projects", mode, preset: actionForm.elements.preset.value, environment: actionForm.elements.environment.value, publish_findings: mode === "start" ? actionForm.elements.publish_findings.checked : false, production: false});
   byId("plan-audit").addEventListener("click", () => prepareAction(auditCommand("audit_plan"), "audit-error"));
   byId("start-audit").addEventListener("click", () => prepareAction(auditCommand("audit_start"), "audit-error"));
   byId("documentation-audit").addEventListener("click", () => prepareAction(auditCommand("audit_plan", "documentation"), "audit-error"));
+  byId("plan-all-audits").addEventListener("click", () => prepareAction(allAuditCommand("plan"), "audit-error"));
+  byId("start-all-audits").addEventListener("click", () => prepareAction(allAuditCommand("start"), "audit-error"));
 }
 
 function setupCommands() {

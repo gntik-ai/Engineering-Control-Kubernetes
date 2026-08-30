@@ -28,6 +28,15 @@ class AuditCampaignInput:
 
 
 @dataclass
+class MultiProjectAuditInput:
+    preset: str
+    environment: str = "staging"
+    publish_findings: bool = False
+    campaign_ids: dict[str, str] = field(default_factory=dict)
+    child_workflow_ids: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class FindingVerificationInput:
     finding_id: str
     project: str

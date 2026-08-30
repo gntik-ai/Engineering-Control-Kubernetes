@@ -122,6 +122,30 @@ class AuditStartCommand(OperationModel):
     production: Literal[False] = False
 
 
+class AuditAllProjectsCommand(OperationModel):
+    action: Literal["audit_all_projects"] = "audit_all_projects"
+    mode: Literal["plan", "start"] = "plan"
+    preset: Literal[
+        "snapshot",
+        "static-full",
+        "e2e-smoke",
+        "full-e2e",
+        "security",
+        "ux",
+        "deployment",
+        "documentation",
+    ]
+    environment: Literal["staging"] = "staging"
+    publish_findings: bool = False
+    production: Literal[False] = False
+
+    @model_validator(mode="after")
+    def planning_never_publishes(self) -> AuditAllProjectsCommand:
+        if self.mode == "plan" and self.publish_findings:
+            raise ValueError("all-project audit planning cannot publish findings")
+        return self
+
+
 class AdvancedAuditCommand(OperationModel):
     """Compatibility command for the existing immutable CLI coverage matrix."""
 
@@ -252,6 +276,7 @@ type Command = Annotated[
     | AutonomousBacklogCommand
     | AuditPlanCommand
     | AuditStartCommand
+    | AuditAllProjectsCommand
     | AdvancedAuditCommand
     | WorkflowControlCommand
     | RefreshConnectionsCommand
