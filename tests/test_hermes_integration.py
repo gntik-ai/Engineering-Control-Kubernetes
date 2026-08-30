@@ -373,6 +373,37 @@ def test_telegram_issue_start_uses_explicit_typed_delivery_mode(
 @pytest.mark.parametrize(
     "raw_args",
     [
+        "issue-start falcone source 953",
+        "retry-issue workflow-safe-id falcone source 953",
+    ],
+)
+def test_telegram_issue_actions_fail_bounded_on_malformed_locate_projection(
+    monkeypatch: pytest.MonkeyPatch, raw_args: str
+) -> None:
+    handler = load_handler()
+    calls = 0
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+    monkeypatch.setattr(handler, "_record_acceptance", lambda *_args: None)
+
+    def request(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"issue": {}}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        "command:loop",
+        {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
+    )
+
+    assert result is not None and result["decision"] == "handled"
+    assert "located issue projection is invalid" in result["message"]
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "raw_args",
+    [
         "start snapshot production",
         "plan snapshot staging --publish-findings",
         "start falcone-intensive staging",

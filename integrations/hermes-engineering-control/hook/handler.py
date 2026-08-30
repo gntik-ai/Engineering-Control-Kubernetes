@@ -255,6 +255,22 @@ def _uuid(value: str, label: str) -> str:
         raise ValueError(f"{label} must be a UUID") from error
 
 
+def _located_issue(value: Any) -> tuple[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("located issue projection is invalid")
+    campaign_id = value.get("backlog_campaign_id")
+    issue = value.get("issue")
+    repository = issue.get("repository") if isinstance(issue, dict) else None
+    if (
+        not isinstance(campaign_id, str)
+        or not isinstance(repository, str)
+        or not repository.startswith("gntik-ai/")
+        or repository.removeprefix("gntik-ai/") not in _BACKLOG_REPOSITORIES
+    ):
+        raise ValueError("located issue projection is invalid")
+    return _uuid(campaign_id, "backlog campaign ID"), repository
+
+
 def _page_token() -> str:
     return hashlib.sha256(os.urandom(32)).hexdigest()[:32]
 
@@ -792,9 +808,7 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
             located = _request("GET", f"/v1/backlogs/locate?{query}", actor)
             if action == "issue-locate":
                 return located
-            issue = located.get("issue") if isinstance(located, dict) else None
-            if not isinstance(issue, dict):
-                raise ValueError("located issue projection is invalid")
+            campaign_id, repository = _located_issue(located)
             return _request(
                 "POST",
                 "/v1/commands",
@@ -802,8 +816,8 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 {
                     "action": "solve_issue",
                     "project": args[1],
-                    "backlog_campaign_id": located["backlog_campaign_id"],
-                    "repository": issue["repository"],
+                    "backlog_campaign_id": campaign_id,
+                    "repository": repository,
                     "issue_number": int(args[3]),
                     "maximum_risk": "R2",
                     "delivery_mode": args[4] if len(args) == 5 else "source-pr",
@@ -843,7 +857,8 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                 {"project": args[2], "surface": args[3], "issue_number": int(args[4])}
             )
             located = _request("GET", f"/v1/backlogs/locate?{query}", actor)
-            repository = str(located["issue"]["repository"]).removeprefix("gntik-ai/")
+            _campaign_id, full_repository = _located_issue(located)
+            repository = full_repository.removeprefix("gntik-ai/")
             return _request(
                 "POST",
                 "/v1/commands",
