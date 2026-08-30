@@ -208,6 +208,18 @@ class LLMWikiBootstrapPlanCommand(OperationModel):
     environment: Literal["staging"] = "staging"
 
 
+class EvidenceExportCampaignCommand(OperationModel):
+    action: Literal["evidence_export_campaign"] = "evidence_export_campaign"
+    campaign_id: UUID
+    format: Literal["json"] = "json"
+
+
+class EvidenceExportWorkflowCommand(OperationModel):
+    action: Literal["evidence_export_workflow"] = "evidence_export_workflow"
+    workflow_id: str = Field(min_length=1, max_length=240, pattern=r"^[A-Za-z0-9._:-]+$")
+    format: Literal["json"] = "json"
+
+
 type Command = Annotated[
     SolveIssueCommand
     | SolveBacklogCommand
@@ -221,7 +233,9 @@ type Command = Annotated[
     | EnhancementRejectCommand
     | EnhancementRunCommand
     | FindingVerifyCommand
-    | LLMWikiBootstrapPlanCommand,
+    | LLMWikiBootstrapPlanCommand
+    | EvidenceExportCampaignCommand
+    | EvidenceExportWorkflowCommand,
     Field(discriminator="action"),
 ]
 
@@ -269,6 +283,7 @@ class OperationView(OperationModel):
     binding_hash: str
     safe_error: str | None
     created_at: datetime
+    result_available: bool = False
 
 
 class ConnectionView(OperationModel):

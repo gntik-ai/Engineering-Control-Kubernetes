@@ -320,16 +320,22 @@ COMMAND_REGISTRY: list[dict[str, Any]] = [
         "Evidence",
         "evidence_export_campaign",
         "Export campaign",
-        available=False,
+        available=True,
         effect="metadata-mutation",
-        blocker="BOUNDED_EXPORT_SERVICE_NOT_IMPLEMENTED",
+        fields=[
+            {"name": "campaign_id", "type": "uuid"},
+            {"name": "format", "type": "select", "values": ["json"]},
+        ],
     ),
     _entry(
         "Evidence",
         "evidence_export_workflow",
         "Export workflow summary",
-        available=False,
+        available=True,
         effect="metadata-mutation",
-        blocker="BOUNDED_EXPORT_SERVICE_NOT_IMPLEMENTED",
+        fields=[
+            _WORKFLOW,
+            {"name": "format", "type": "select", "values": ["json"]},
+        ],
     ),
 ]

@@ -156,6 +156,50 @@ def test_cli_advanced_audit_uses_the_shared_typed_command_bus() -> None:
     assert result["payload"]["production"] is False
 
 
+def test_cli_evidence_exports_use_typed_commands_and_fixed_retrieval_route() -> None:
+    class FakeClient:
+        def request(
+            self, method: str, path: str, payload: dict[str, object] | None = None
+        ) -> dict[str, object]:
+            return {"method": method, "path": path, "payload": payload or {}}
+
+    campaign_id = "11111111-1111-4111-8111-111111111111"
+    operation_id = "22222222-2222-4222-8222-222222222222"
+    campaign = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args(["export-campaign", campaign_id]),
+    )
+    workflow = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args(["export-workflow", "workflow-safe-id"]),
+    )
+    download = dispatch(
+        FakeClient(),  # type: ignore[arg-type]
+        parser().parse_args(["operation-export", operation_id]),
+    )
+
+    assert campaign == {
+        "method": "POST",
+        "path": "/v1/commands",
+        "payload": {
+            "action": "evidence_export_campaign",
+            "campaign_id": campaign_id,
+            "format": "json",
+        },
+    }
+    assert workflow["path"] == "/v1/commands"
+    assert workflow["payload"] == {
+        "action": "evidence_export_workflow",
+        "workflow_id": "workflow-safe-id",
+        "format": "json",
+    }
+    assert download == {
+        "method": "GET",
+        "path": f"/v1/operations/{operation_id}/export",
+        "payload": {},
+    }
+
+
 def test_cli_backlog_parser_rejects_arbitrary_filters_repositories_and_modes() -> None:
     with pytest.raises(SystemExit):
         parser().parse_args(["backlog-import", "falcone", "arbitrary"])

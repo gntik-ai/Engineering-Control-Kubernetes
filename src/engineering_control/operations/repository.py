@@ -3,23 +3,30 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import create_engine, desc, select
+from sqlalchemy import create_engine, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.db.models import (
     ActionCandidate,
+    Artifact,
     BacklogIssueRecord,
+    Campaign,
     ConnectionSnapshot,
+    CoverageCell,
     DashboardEvent,
     Enhancement,
+    Finding,
     GitHubBacklogCampaign,
     NotificationOutbox,
+    OperationExport,
     OperationRequest,
     ProjectSnapshot,
     QuotaSnapshot,
@@ -41,6 +48,8 @@ from engineering_control.operations.models import (
     EnhancementDiscoverCommand,
     EnhancementRejectCommand,
     EnhancementRunCommand,
+    EvidenceExportCampaignCommand,
+    EvidenceExportWorkflowCommand,
     FindingVerifyCommand,
     LLMWikiBootstrapPlanCommand,
     OperationView,
@@ -101,6 +110,10 @@ def command_target(command: Command) -> tuple[str, str, str | None]:
         return "finding", str(command.finding_id), None
     if isinstance(command, LLMWikiBootstrapPlanCommand):
         return "llmwiki", "staging-bootstrap-plan", "llmwiki"
+    if isinstance(command, EvidenceExportCampaignCommand):
+        return "audit_campaign", str(command.campaign_id), None
+    if isinstance(command, EvidenceExportWorkflowCommand):
+        return "workflow", command.workflow_id, None
     raise ValueError("command target is not registered")
 
 
@@ -111,7 +124,17 @@ def _utc(value: datetime) -> datetime:
 class OperationsRepository:
     """Durable operation store. It never reads service or provider credentials."""
 
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        export_retention_days: int = 7,
+        export_max_bytes: int = 1024 * 1024,
+    ) -> None:
+        if not 1 <= export_retention_days <= 30:
+            raise ValueError("operation export retention is outside its safety bound")
+        if not 65_536 <= export_max_bytes <= 5 * 1024 * 1024:
+            raise ValueError("operation export size is outside its safety bound")
         self.engine = create_engine(
             database_url,
             pool_pre_ping=True,
@@ -121,6 +144,9 @@ class OperationsRepository:
         )
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         self.redactor = SecretRedactor()
+        self.observability = DashboardObservabilityProjection(self.sessions, self.redactor)
+        self.export_retention_days = export_retention_days
+        self.export_max_bytes = export_max_bytes
 
     async def candidate(self, command: Command, session_binding_hash: str) -> CandidateView:
         return await asyncio.to_thread(self._candidate, command, session_binding_hash)
@@ -133,6 +159,7 @@ class OperationsRepository:
         payload = command.model_dump(mode="json")
         with self.sessions.begin() as session:
             capability, binding = self._capability(session, command, now)
+            project = project or capability.project
             if isinstance(
                 command,
                 (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
@@ -228,6 +255,10 @@ class OperationsRepository:
             mode = command.execution_mode if isinstance(command, EnhancementRunCommand) else None
         elif isinstance(command, LLMWikiBootstrapPlanCommand):
             project_name = command.project
+        elif isinstance(command, EvidenceExportCampaignCommand):
+            mode = command.format
+        elif isinstance(command, EvidenceExportWorkflowCommand):
+            mode = command.format
 
         if isinstance(command, SolveIssueCommand):
             if command.maximum_risk.value == "R3":
@@ -466,6 +497,54 @@ class OperationsRepository:
         ):
             binding = {"typed_application_service": True}
             blockers.extend(self._provider_blockers(session))
+        elif isinstance(command, EvidenceExportCampaignCommand):
+            audit_campaign = session.get(Campaign, command.campaign_id)
+            if audit_campaign is None:
+                blockers.append("CAMPAIGN_NOT_FOUND")
+            else:
+                project_name = audit_campaign.project
+                binding = {
+                    "campaign_id": str(audit_campaign.id),
+                    "project": audit_campaign.project,
+                    "name": audit_campaign.name,
+                    "status": audit_campaign.status,
+                    "updated_at": _utc(audit_campaign.updated_at).isoformat(),
+                    "coverage_cells": int(
+                        session.scalar(
+                            select(func.count(CoverageCell.id)).where(
+                                CoverageCell.campaign_id == audit_campaign.id
+                            )
+                        )
+                        or 0
+                    ),
+                    "findings": int(
+                        session.scalar(
+                            select(func.count(Finding.id)).where(
+                                Finding.campaign_id == audit_campaign.id
+                            )
+                        )
+                        or 0
+                    ),
+                }
+        elif isinstance(command, EvidenceExportWorkflowCommand):
+            run = session.scalar(
+                select(Run)
+                .where(Run.workflow_id == command.workflow_id)
+                .order_by(desc(Run.updated_at))
+                .limit(1)
+            )
+            if run is None:
+                blockers.append("WORKFLOW_NOT_FOUND")
+            else:
+                project_name = run.project
+                binding = {
+                    "workflow_id": run.workflow_id,
+                    "run_id": str(run.id),
+                    "project": run.project,
+                    "run_type": run.run_type,
+                    "status": run.status,
+                    "updated_at": _utc(run.updated_at).isoformat(),
+                }
 
         status = (
             "AVAILABLE"
@@ -776,7 +855,18 @@ class OperationsRepository:
     def _operation(self, operation_id: UUID) -> OperationView | None:
         with self.sessions() as session:
             row = session.get(OperationRequest, operation_id)
-            return self._operation_view(row) if row else None
+            if row is None:
+                return None
+            result_available = False
+            if row.status == "COMPLETED" and row.action in {
+                "evidence_export_campaign",
+                "evidence_export_workflow",
+            }:
+                operation_export = session.scalar(
+                    select(OperationExport).where(OperationExport.operation_id == row.id)
+                )
+                result_available = self._valid_export(operation_export, datetime.now(UTC))
+            return self._operation_view(row, result_available=result_available)
 
     async def claim_pending(self) -> tuple[UUID, Command, SourceChannel, str] | None:
         return await asyncio.to_thread(self._claim_pending)
@@ -901,7 +991,10 @@ class OperationsRepository:
                     host=None,
                     worker_kind="controller",
                     project=operation.project,
-                    workflow_id=workflow_id,
+                    workflow_id=(
+                        workflow_id
+                        or (operation.target_id if operation.target_type == "workflow" else None)
+                    ),
                     temporal_run_id=operation.temporal_run_id,
                     issue_number=(
                         int(operation.target_id.rsplit("#", 1)[1])
@@ -911,7 +1004,7 @@ class OperationsRepository:
                     ),
                     campaign_id=(
                         operation.target_id
-                        if operation.target_type in {"backlog_campaign", "audit"}
+                        if operation.target_type in {"backlog_campaign", "audit", "audit_campaign"}
                         else None
                     ),
                     entity_type="operation",
@@ -973,6 +1066,10 @@ class OperationsRepository:
         payload = command.model_dump(mode="json")
         digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
         with self.sessions.begin() as session:
+            resolved_binding: dict[str, Any] = {}
+            if isinstance(command, (EvidenceExportCampaignCommand, EvidenceExportWorkflowCommand)):
+                capability, resolved_binding = self._capability(session, command, datetime.now(UTC))
+                project = project or capability.project
             if (
                 isinstance(
                     command,
@@ -985,7 +1082,18 @@ class OperationsRepository:
                 )
                 if enhancement is not None and isinstance(enhancement.approval_binding_sha256, str):
                     payload["approval_binding"] = enhancement.approval_binding_sha256
-            binding_hash = canonical_sha256(payload)
+            binding_hash = canonical_sha256(
+                {
+                    "payload": payload,
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "project": project,
+                    "resolved": resolved_binding,
+                    "production": False,
+                }
+                if resolved_binding
+                else payload
+            )
             existing = session.scalar(
                 select(OperationRequest).where(OperationRequest.idempotency_key == digest)
             )
@@ -1067,6 +1175,291 @@ class OperationsRepository:
     async def connections(self) -> list[ConnectionView]:
         return await asyncio.to_thread(self._connections)
 
+    async def create_export(
+        self,
+        operation_id: UUID,
+        command: EvidenceExportCampaignCommand | EvidenceExportWorkflowCommand,
+    ) -> None:
+        await asyncio.to_thread(self._create_export, operation_id, command)
+
+    def _create_export(
+        self,
+        operation_id: UUID,
+        command: EvidenceExportCampaignCommand | EvidenceExportWorkflowCommand,
+    ) -> None:
+        now = datetime.now(UTC)
+        content = (
+            self._campaign_export(command.campaign_id, now)
+            if isinstance(command, EvidenceExportCampaignCommand)
+            else self._workflow_export(command.workflow_id, now)
+        )
+        report = self.redactor.redact(content)
+        if not isinstance(report.value, dict):
+            raise ValueError("operation export did not produce an object")
+        encoded = self._encode_export(report.value)
+        if not encoded or len(encoded) > self.export_max_bytes:
+            raise ValueError("operation export exceeds the configured size bound")
+        digest = hashlib.sha256(encoded).hexdigest()
+        export_kind = (
+            "campaign" if isinstance(command, EvidenceExportCampaignCommand) else "workflow"
+        )
+        target_id = (
+            str(command.campaign_id)
+            if isinstance(command, EvidenceExportCampaignCommand)
+            else command.workflow_id
+        )
+        with self.sessions.begin() as session:
+            operation = session.get(OperationRequest, operation_id, with_for_update=True)
+            if (
+                operation is None
+                or operation.status != "DISPATCHING"
+                or operation.action != command.action
+                or operation.target_id != target_id
+            ):
+                raise ValueError("operation export binding changed before persistence")
+            existing = session.scalar(
+                select(OperationExport).where(OperationExport.operation_id == operation_id)
+            )
+            if existing is not None:
+                if existing.content_sha256 != digest:
+                    raise ValueError("operation export idempotency conflict")
+                return
+            session.add(
+                OperationExport(
+                    operation_id=operation_id,
+                    export_kind=export_kind,
+                    target_id=target_id,
+                    content_json=report.value,
+                    content_sha256=digest,
+                    size_bytes=len(encoded),
+                    created_at=now,
+                    expires_at=now + timedelta(days=self.export_retention_days),
+                )
+            )
+
+    def _workflow_export(self, workflow_id: str, now: datetime) -> dict[str, Any]:
+        workflow = self.observability.workflow(workflow_id)
+        if workflow is None:
+            raise ValueError("workflow not found")
+        return {
+            "schema_version": 1,
+            "export_kind": "workflow-summary",
+            "generated_at": now.isoformat(),
+            "retention_days": self.export_retention_days,
+            "source": "redacted-dashboard-workflow-projection",
+            "workflow": workflow,
+            "exclusions": [
+                "raw prompts",
+                "raw model responses",
+                "agent transcript content",
+                "journal content",
+                "credential material",
+                "raw artifact content",
+            ],
+        }
+
+    def _campaign_export(self, campaign_id: UUID, now: datetime) -> dict[str, Any]:
+        with self.sessions() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                raise ValueError("campaign not found")
+            status_counts = {
+                str(status): int(count)
+                for status, count in session.execute(
+                    select(CoverageCell.status, func.count(CoverageCell.id))
+                    .where(CoverageCell.campaign_id == campaign_id)
+                    .group_by(CoverageCell.status)
+                ).all()
+            }
+            finding_rows = list(
+                session.scalars(
+                    select(Finding)
+                    .where(Finding.campaign_id == campaign_id)
+                    .order_by(desc(Finding.updated_at))
+                    .limit(501)
+                ).all()
+            )
+            run_rows = list(
+                session.scalars(
+                    select(Run)
+                    .where(Run.campaign_id == campaign_id)
+                    .order_by(desc(Run.updated_at))
+                    .limit(501)
+                ).all()
+            )
+            artifact_rows = list(
+                session.scalars(
+                    select(Artifact)
+                    .where(Artifact.campaign_id == campaign_id)
+                    .order_by(desc(Artifact.created_at))
+                    .limit(501)
+                ).all()
+            )
+            metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
+            raw_blockers = metadata.get("root_blockers")
+            blockers = raw_blockers if isinstance(raw_blockers, dict) else {}
+            return {
+                "schema_version": 1,
+                "export_kind": "campaign-summary",
+                "generated_at": now.isoformat(),
+                "retention_days": self.export_retention_days,
+                "source": "bounded-campaign-metadata-projection",
+                "campaign": {
+                    "campaign_id": str(campaign.id),
+                    "project": campaign.project,
+                    "name": campaign.name,
+                    "status": campaign.status,
+                    "source_sha": campaign.source_sha,
+                    "deployment_sha": campaign.deployment_sha,
+                    "required_cells": campaign.required_cells,
+                    "created_at": _utc(campaign.created_at).isoformat(),
+                    "updated_at": _utc(campaign.updated_at).isoformat(),
+                },
+                "coverage": {
+                    "total": sum(status_counts.values()),
+                    "status_counts": status_counts,
+                    "repository_surfaces": int(
+                        session.scalar(
+                            select(
+                                func.count(func.distinct(CoverageCell.repository_surface))
+                            ).where(CoverageCell.campaign_id == campaign_id)
+                        )
+                        or 0
+                    ),
+                    "domains": int(
+                        session.scalar(
+                            select(func.count(func.distinct(CoverageCell.domain))).where(
+                                CoverageCell.campaign_id == campaign_id
+                            )
+                        )
+                        or 0
+                    ),
+                    "personas": int(
+                        session.scalar(
+                            select(func.count(func.distinct(CoverageCell.persona))).where(
+                                CoverageCell.campaign_id == campaign_id
+                            )
+                        )
+                        or 0
+                    ),
+                },
+                "root_blockers": [
+                    {
+                        "blocker_id": str(identity)[:120],
+                        "code": str(value.get("code") or identity)[:120],
+                        "classification": str(value.get("classification") or "")[:80],
+                        "summary": str(value.get("summary") or "")[:500],
+                        "resolution_state": str(value.get("resolution_state") or "open")[:80],
+                    }
+                    for identity, raw in sorted(blockers.items(), key=lambda item: str(item[0]))[
+                        :200
+                    ]
+                    for value in [raw if isinstance(raw, dict) else {}]
+                ],
+                "findings": [
+                    {
+                        "finding_id": str(row.id),
+                        "fingerprint": row.fingerprint,
+                        "domain": row.domain,
+                        "persona": row.persona,
+                        "severity": row.severity,
+                        "risk_class": row.risk_class,
+                        "disposition": row.disposition,
+                        "affected_component": row.affected_component,
+                        "recommended_action": row.recommended_action[:1000],
+                        "updated_at": _utc(row.updated_at).isoformat(),
+                    }
+                    for row in finding_rows[:500]
+                ],
+                "runs": [
+                    {
+                        "run_id": str(row.id),
+                        "workflow_id": row.workflow_id,
+                        "run_type": row.run_type,
+                        "status": row.status,
+                        "worker": row.worker,
+                        "error_code": row.error_code,
+                        "summary": row.summary[:1000] if row.summary else None,
+                        "started_at": _utc(row.started_at).isoformat() if row.started_at else None,
+                        "finished_at": _utc(row.finished_at).isoformat()
+                        if row.finished_at
+                        else None,
+                        "updated_at": _utc(row.updated_at).isoformat(),
+                    }
+                    for row in run_rows[:500]
+                ],
+                "artifacts": [
+                    {
+                        "artifact_id": str(row.id),
+                        "sha256": row.sha256,
+                        "content_type": row.content_type,
+                        "producer": row.producer,
+                        "redaction_status": row.redaction_status,
+                        "size_bytes": row.size_bytes,
+                        "retention_class": row.retention_class,
+                        "purged": row.purged_at is not None,
+                    }
+                    for row in artifact_rows[:500]
+                ],
+                "truncated": {
+                    "root_blockers": len(blockers) > 200,
+                    "findings": len(finding_rows) > 500,
+                    "runs": len(run_rows) > 500,
+                    "artifacts": len(artifact_rows) > 500,
+                },
+                "exclusions": [
+                    "raw evidence content",
+                    "raw coverage results",
+                    "raw prompts and model responses",
+                    "agent transcript content",
+                    "journal content",
+                    "credential material",
+                    "internal filesystem paths",
+                ],
+            }
+
+    async def export_content(self, operation_id: UUID) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._export_content, operation_id)
+
+    def _export_content(self, operation_id: UUID) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            operation = session.get(OperationRequest, operation_id)
+            if (
+                operation is None
+                or operation.status != "COMPLETED"
+                or operation.action not in {"evidence_export_campaign", "evidence_export_workflow"}
+            ):
+                return None
+            export = session.scalar(
+                select(OperationExport).where(OperationExport.operation_id == operation_id)
+            )
+            if not self._valid_export(export, datetime.now(UTC)):
+                return None
+            assert export is not None
+            return export.content_json
+
+    @staticmethod
+    def _encode_export(value: dict[str, Any]) -> bytes:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @classmethod
+    def _valid_export(cls, export: OperationExport | None, now: datetime) -> bool:
+        if export is None or _utc(export.expires_at) <= now:
+            return False
+        try:
+            encoded = cls._encode_export(export.content_json)
+        except (TypeError, ValueError):
+            return False
+        return export.size_bytes == len(encoded) and hmac.compare_digest(
+            export.content_sha256,
+            hashlib.sha256(encoded).hexdigest(),
+        )
+
     def _connections(self) -> list[ConnectionView]:
         now = datetime.now(UTC)
         with self.sessions() as session:
@@ -1092,7 +1485,11 @@ class OperationsRepository:
             ]
 
     @staticmethod
-    def _operation_view(row: OperationRequest) -> OperationView:
+    def _operation_view(
+        row: OperationRequest,
+        *,
+        result_available: bool = False,
+    ) -> OperationView:
         return OperationView(
             operation_id=row.id,
             action=row.action,
@@ -1105,6 +1502,7 @@ class OperationsRepository:
             binding_hash=row.binding_hash,
             safe_error=row.safe_error,
             created_at=row.created_at,
+            result_available=result_available,
         )
 
     def health_sources(self) -> dict[str, Any]:

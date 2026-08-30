@@ -27,6 +27,8 @@ from engineering_control.operations.models import (
     EnhancementDiscoverCommand,
     EnhancementRejectCommand,
     EnhancementRunCommand,
+    EvidenceExportCampaignCommand,
+    EvidenceExportWorkflowCommand,
     FindingVerifyCommand,
     LLMWikiBootstrapPlanCommand,
     OperationView,
@@ -92,7 +94,11 @@ class TypedCommandBus:
             if capability.status != "AVAILABLE":
                 blocker = capability.blockers[0] if capability.blockers else capability.status
                 raise ValueError(f"operation preflight changed: {blocker}")
-            accepted = await self._execute(command, operator_class=operator_class)
+            accepted = await self._execute(
+                command,
+                operator_class=operator_class,
+                operation_id=operation_id,
+            )
         except ValueError as error:
             await self.operations.finish(operation_id, status="BLOCKED", safe_error=str(error))
             await self.operations.record_dispatch_event(
@@ -137,7 +143,13 @@ class TypedCommandBus:
                     workflow_id=accepted.workflow_id,
                 )
 
-    async def _execute(self, command: Command, *, operator_class: str) -> OperationAccepted | None:
+    async def _execute(
+        self,
+        command: Command,
+        *,
+        operator_class: str,
+        operation_id: UUID,
+    ) -> OperationAccepted | None:
         if isinstance(command, SolveIssueCommand):
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
@@ -304,6 +316,9 @@ class TypedCommandBus:
             return await self.control.start_finding_verification(command.finding_id)
         if isinstance(command, LLMWikiBootstrapPlanCommand):
             return await self.control.start_llmwiki_bootstrap_plan(LLMWikiBootstrapPlanRequest())
+        if isinstance(command, (EvidenceExportCampaignCommand, EvidenceExportWorkflowCommand)):
+            await self.operations.create_export(operation_id, command)
+            return None
         raise ValueError("typed command is not registered")
 
     @staticmethod

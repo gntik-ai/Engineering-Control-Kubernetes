@@ -232,6 +232,13 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
         ("enhancements", "list musematic", "GET", "/v1/enhancements?project=musematic"),
         ("status", "workflow-safe-id", "GET", "/v1/runs/workflow-safe-id"),
         ("evidence", "artifact-safe-id", "GET", "/v1/evidence/artifact-safe-id"),
+        (
+            "export-campaign",
+            "11111111-1111-4111-8111-111111111111",
+            "POST",
+            "/v1/commands",
+        ),
+        ("export-workflow", "workflow-safe-id", "POST", "/v1/commands"),
         ("usage", "", "GET", "/v1/usage"),
         ("pause", "workflow-safe-id", "POST", "/v1/commands"),
         ("resume", "workflow-safe-id", "POST", "/v1/commands"),
@@ -267,6 +274,36 @@ def test_required_telegram_commands_are_fixed_and_bounded(
 
     assert result is not None and result["decision"] == "handled"
     assert observed == [(method, path)]
+
+
+@pytest.mark.parametrize(
+    ("command", "raw_args"),
+    [
+        ("export-campaign", "not-a-uuid"),
+        ("export-campaign", "11111111-1111-4111-8111-111111111111 extra"),
+        ("export-workflow", "workflow/shell"),
+        ("export-workflow", "workflow-safe-id extra"),
+    ],
+)
+def test_telegram_export_commands_reject_untyped_targets(
+    monkeypatch: pytest.MonkeyPatch, command: str, raw_args: str
+) -> None:
+    handler = load_handler()
+    called = False
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+
+    def request(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        nonlocal called
+        called = True
+        return {"status": "UNEXPECTED"}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        f"command:{command}",
+        {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
+    )
+    assert result is not None and result["decision"] == "handled"
+    assert called is False
 
 
 @pytest.mark.parametrize(

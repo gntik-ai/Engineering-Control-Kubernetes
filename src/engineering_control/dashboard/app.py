@@ -86,7 +86,9 @@ def create_app(
         app.state.dashboard_repository = resolved_repository
         app.state.dashboard_service = DashboardService(resolved_repository)
         resolved_operations = operations_repository or OperationsRepository(
-            resolved.database_url.get_secret_value()
+            resolved.database_url.get_secret_value(),
+            export_retention_days=resolved.dashboard_operation_export_retention_days,
+            export_max_bytes=resolved.dashboard_operation_export_max_bytes,
         )
         app.state.operations_repository = resolved_operations
         yield
@@ -835,6 +837,33 @@ def create_app(
         if value is None:
             raise HTTPException(status_code=404, detail="operation not found")
         return JSONResponse(value.model_dump(mode="json"))
+
+    @app.get("/api/dashboard/operations/{operation_id}/export")
+    async def dashboard_operation_export_api(operation_id: UUID, request: Request) -> Response:
+        authenticated = await require_session(request, api=True)
+        if isinstance(authenticated, Response):
+            return authenticated
+        value = await operations(request).export_content(operation_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="operation export not found")
+        payload = (
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        return Response(
+            payload,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="engineering-control-export-{operation_id}.json"'
+                )
+            },
+        )
 
     @app.get("/api/dashboard/connections")
     async def connections_api(request: Request) -> Response:

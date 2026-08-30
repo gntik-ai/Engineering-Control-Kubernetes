@@ -125,7 +125,9 @@ async function confirmAction(event) {
     }
     if (["FAILED", "BLOCKED"].includes(operation.status)) throw new Error(operation.safe_error || `Operation ${operation.status.toLowerCase()}.`);
     byId("action-dialog").close(); pendingCandidate = null;
-    if (operation.workflow_id) location.assign(`/workflows/${encodeURIComponent(operation.workflow_id)}`); else location.reload();
+    if (operation.workflow_id) location.assign(`/workflows/${encodeURIComponent(operation.workflow_id)}`);
+    else if (operation.result_available) location.assign(`/api/dashboard/operations/${operation.operation_id}/export`);
+    else location.reload();
   } catch (error) { setError("action-blockers", error.message); }
   finally { execute.disabled = false; }
 }

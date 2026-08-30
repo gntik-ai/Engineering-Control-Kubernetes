@@ -27,6 +27,8 @@ COMMANDS = {
     "run",
     "status",
     "evidence",
+    "export-campaign",
+    "export-workflow",
     "approve",
     "reject",
     "pause",
@@ -366,6 +368,32 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if len(args) != 1:
             raise ValueError("usage: /evidence <artifact-id>")
         return _request("GET", f"/v1/evidence/{urllib.parse.quote(args[0], safe='')}", actor)
+    if command == "export-campaign":
+        if len(args) != 1:
+            raise ValueError("usage: /export-campaign <campaign-uuid>")
+        return _request(
+            "POST",
+            "/v1/commands",
+            actor,
+            {
+                "action": "evidence_export_campaign",
+                "campaign_id": _uuid(args[0], "campaign ID"),
+                "format": "json",
+            },
+        )
+    if command == "export-workflow":
+        if len(args) != 1 or not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", args[0]):
+            raise ValueError("usage: /export-workflow <workflow-id>")
+        return _request(
+            "POST",
+            "/v1/commands",
+            actor,
+            {
+                "action": "evidence_export_workflow",
+                "workflow_id": args[0],
+                "format": "json",
+            },
+        )
     if command in {"pause", "resume", "cancel"}:
         if len(args) != 1:
             raise ValueError(f"usage: /{command} <workflow-id>")

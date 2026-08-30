@@ -41,6 +41,7 @@ from engineering_control.db.models import (
     FindingVerification,
     Incident,
     Issue,
+    OperationExport,
     ProjectSnapshot,
     ProviderUsage,
     QuotaSnapshot,
@@ -5224,6 +5225,12 @@ class MetadataActivityHandler:
                 )
                 or 0
             )
+            operation_export_cleanup_count = int(
+                session.scalar(
+                    select(func.count(OperationExport.id)).where(OperationExport.expires_at < now)
+                )
+                or 0
+            )
         return {
             **payload,
             "status": "CLEANUP_CANDIDATES_DISCOVERED",
@@ -5234,6 +5241,7 @@ class MetadataActivityHandler:
             "dashboard_event_cleanup_count": dashboard_event_cleanup_count,
             "agent_log_cleanup_count": agent_log_cleanup_count,
             "agent_execution_cleanup_count": agent_execution_cleanup_count,
+            "operation_export_cleanup_count": operation_export_cleanup_count,
             "protected_count": protected_count,
         }
 
@@ -5493,6 +5501,7 @@ class MetadataActivityHandler:
         deleted_dashboard_events = 0
         deleted_agent_logs = 0
         deleted_agent_executions = 0
+        deleted_operation_exports = 0
         candidate_fields = set(FileCleanupCandidate.model_fields)
         preview_fields = set(PreviewNamespaceCleanupCandidate.model_fields)
         with self.sessions.begin() as session:
@@ -5620,6 +5629,16 @@ class MetadataActivityHandler:
                 session.delete(execution)
             deleted_agent_executions = len(expired_executions)
 
+            expired_exports = session.scalars(
+                select(OperationExport)
+                .where(OperationExport.expires_at < now)
+                .order_by(OperationExport.expires_at)
+                .limit(10_000)
+            ).all()
+            for operation_export in expired_exports:
+                session.delete(operation_export)
+            deleted_operation_exports = len(expired_exports)
+
         return {
             **payload,
             "status": "METADATA_CLEANUP_EXECUTED",
@@ -5629,6 +5648,7 @@ class MetadataActivityHandler:
             "deleted_dashboard_event_count": deleted_dashboard_events,
             "deleted_agent_log_count": deleted_agent_logs,
             "deleted_agent_execution_count": deleted_agent_executions,
+            "deleted_operation_export_count": deleted_operation_exports,
         }
 
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:

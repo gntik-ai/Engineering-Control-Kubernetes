@@ -47,6 +47,14 @@ status names and bounded error summaries published by the component that already
 credential; the dashboard receives no Telegram, GitHub, Codex, Claude, Kubernetes or product
 credential.
 
+Additive migration `0013` adds `operation_exports`. Each row belongs to exactly one completed typed
+operation and contains a canonical JSON projection, its SHA-256 integrity digest, its encoded size,
+and an expiry. It does not copy raw artifact bodies, coverage-cell result/evidence JSON, agent
+transcripts, prompts, model responses, journals, credentials, or internal filesystem paths. The
+canonical redactor runs before the bounded projection is inserted. The default maximum encoded
+export is 1 MiB and the default retention is seven days; both settings are validated within fixed
+safety limits.
+
 Every dashboard mutation requires CSRF plus the current dashboard password. A successful
 reauthentication token is HMAC/session bound, action-candidate bound, expires after five minutes,
 and is consumed exactly once. High-impact backlog and full/security audit candidates require a
@@ -212,6 +220,32 @@ Privileged components publish safe heartbeat/quota/event/project snapshots into 
 missing or old snapshot becomes `NOT_CONFIGURED` or `STALE`; source code presence alone never
 produces `CONNECTED`.
 
+## Bounded evidence exports
+
+Commands provides two typed JSON-only operations: campaign summary export and workflow summary
+export. The forms accept only a campaign UUID or a bounded workflow ID; there is no output path,
+format plugin, command string, query language, or artifact-body selector. Dashboard submissions use
+the normal CSRF, current-password reauthentication, immutable candidate binding, and one-use token
+flow. Telegram and `engineering-ctl` submit the same discriminated command models and create the
+same durable `operation_requests` audit record.
+
+An authenticated dashboard session downloads a completed, unexpired result from the fixed
+`/api/dashboard/operations/{operation_id}/export` route. The private authenticated API uses
+`/v1/operations/{operation_id}/export`. The CLI equivalents are:
+
+```bash
+engineering-ctl export-campaign CAMPAIGN_UUID
+engineering-ctl export-workflow WORKFLOW_ID
+engineering-ctl operation-export OPERATION_UUID
+```
+
+Campaign exports contain campaign identity, aggregate coverage counts, bounded root-blocker
+summaries, finding summaries, workflow-run summaries, artifact metadata, truncation flags, source,
+generation time, and the explicit exclusion list. Workflow exports contain the existing redacted
+dashboard workflow projection plus its exclusion list. Export expiry is enforced on retrieval and
+expired rows are removed by the existing authorized metadata cleanup in batches of at most 10,000.
+The durable operation audit record remains after its downloadable result expires.
+
 ## Read-only observability acceptance
 
 When the existing acceptance feature flag is enabled, the authenticated private API exposes one
@@ -239,10 +273,10 @@ not expose `journalctl` through a web route.
 Before installation, take fresh root-owned runtime, configuration and PostgreSQL backups. Install
 only the exact committed tree using the existing commit-addressed controller bootstrap. Because
 provider adapters and worker instrumentation are part of this release, controller and worker must
-run the exact same committed tree. Apply migrations through `0012` only after the database backup, then
+run the exact same committed tree. Apply migrations through `0013` only after the database backup, then
 restart only the affected controller, provider, scan, evidence-ingest and dashboard services.
 Preserve the current password hash/version, session key, DNS, Caddy and TLS state. Apply migration
-`0012` after `0011`; it is additive and does not alter authentication, workflow, campaign, finding,
+`0013` after `0012`; it is additive and does not alter authentication, workflow, campaign, finding,
 ChangeSet, evidence, transcript or session-key state.
 
 Normal rollback:
@@ -251,11 +285,12 @@ Normal rollback:
 2. Switch controller and worker `/opt/engineering-control/source` links to their recorded previous
    commit-addressed releases.
 3. Restart the previous controller, worker and dashboard services in controlled order.
-4. Leave `agent_executions` and `agent_log_chunks` in place by default; the previous release ignores
-   additive tables.
+4. Leave `agent_executions`, `agent_log_chunks`, and `operation_exports` in place by default; the
+   previous release ignores additive tables.
 5. If a database downgrade is explicitly required, back up PostgreSQL again, stop all writers, and
-   downgrade `0012` to `0011`; this removes only candidates, one-use reauthentication bindings,
-   operation correlation, and connection snapshots. Leave `0011` transcript data in place.
+   downgrade `0013` to `0012`; this removes only bounded downloadable export projections. Do not
+   remove operation audit records. Leave `0012` command candidates, operation correlation,
+   connection snapshots, and `0011` transcript data in place.
 6. Preserve the dashboard password row/version and `/etc/engineering-control/dashboard/session.key`.
 7. Do not change DNS, Caddy or TLS for a normal observability rollback.
 
