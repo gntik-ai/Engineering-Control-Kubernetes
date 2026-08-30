@@ -396,6 +396,65 @@ def test_telegram_pagination_preserves_record_boundaries_and_opaque_cursor() -> 
         handler._cursor_page(cursors[0], command="campaigns", actor=actor)
 
 
+def test_telegram_pagination_measures_rendered_small_records() -> None:
+    handler = load_handler()
+    actor = "telegram:42"
+    records = [
+        {
+            "repository": "gntik-ai/falcone",
+            "issue_number": ordinal,
+            "title": f"Bounded issue {ordinal}",
+            "status": "READY",
+        }
+        for ordinal in range(1, 41)
+    ]
+
+    rendered = handler._format({"items": records}, command="campaigns", actor=actor)
+    observed: list[int] = []
+    while True:
+        assert len(rendered) <= 3500
+        envelope = json.loads(rendered)
+        observed.extend(item["issue_number"] for item in envelope["payload"]["items"])
+        cursor = envelope["next_cursor"]
+        if cursor is None:
+            break
+        rendered = handler._cursor_page(cursor, command="campaigns", actor=actor)
+
+    assert observed == list(range(1, 41))
+
+
+def test_telegram_cursor_cache_is_bounded_and_cursor_survives_render_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = load_handler()
+    handler._PAGE_CACHE.clear()
+    monkeypatch.setattr(handler, "_PAGE_CACHE_MAX_ENTRIES", 3)
+    records = [{"record": ordinal, "value": "x" * 400} for ordinal in range(20)]
+    for actor_index in range(4):
+        rendered = handler._format(
+            {"items": records},
+            command="campaigns",
+            actor=f"telegram:{actor_index}",
+        )
+        assert json.loads(rendered)["next_cursor"] is not None
+    assert len(handler._PAGE_CACHE) == 3
+
+    actor = "telegram:3"
+    cursor = json.loads(rendered)["next_cursor"]
+    original = handler._render_page
+
+    def fail_render(*_args: Any, **_kwargs: Any) -> str:
+        raise ValueError("synthetic render failure")
+
+    monkeypatch.setattr(handler, "_render_page", fail_render)
+    with pytest.raises(ValueError, match="synthetic render failure"):
+        handler._cursor_page(cursor, command="campaigns", actor=actor)
+    assert cursor in handler._PAGE_CACHE
+    monkeypatch.setattr(handler, "_render_page", original)
+    handler._cursor_page(cursor, command="campaigns", actor=actor)
+    assert cursor not in handler._PAGE_CACHE
+
+
 def test_telegram_oversized_error_is_replaced_by_digest_not_truncated() -> None:
     handler = load_handler()
     rendered = handler._safe_error("failure: " + "λ" * 4000)

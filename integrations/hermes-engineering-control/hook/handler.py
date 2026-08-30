@@ -97,7 +97,8 @@ _BACKLOG_SKIP_REASONS = {
     "ENHANCEMENT_DEFERRED",
 }
 _MESSAGE_LIMIT = 3500
-_PAGE_PAYLOAD_LIMIT = 3100
+_PAGE_CACHE_MAX_ENTRIES = 256
+_CURSOR_PLACEHOLDER = "0" * 32
 _PAGE_CACHE: dict[str, tuple[datetime, str, str, list[Any]]] = {}
 
 
@@ -256,9 +257,25 @@ def _page_token() -> str:
     return hashlib.sha256(os.urandom(32)).hexdigest()[:32]
 
 
+def _rendered_page(payload: Any, cursor: str | None) -> str:
+    return _redact(
+        json.dumps(
+            {"payload": payload, "next_cursor": cursor},
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+def _page_fits(payload: Any, *, has_next: bool) -> bool:
+    cursor = _CURSOR_PLACEHOLDER if has_next else None
+    return len(_rendered_page(payload, cursor)) <= _MESSAGE_LIMIT
+
+
 def _bounded_record(value: Any) -> Any:
-    serialized = _redact(json.dumps(value, sort_keys=True, default=str))
-    if len(serialized) <= _PAGE_PAYLOAD_LIMIT:
+    serialized = _redact(json.dumps(value, indent=2, sort_keys=True, default=str))
+    if _page_fits(value, has_next=True):
         return value
     if isinstance(value, dict):
         bounded = {
@@ -273,8 +290,7 @@ def _bounded_record(value: Any) -> Any:
             )
             for key, item in value.items()
         }
-        candidate = _redact(json.dumps(bounded, sort_keys=True, default=str))
-        if len(candidate) <= _PAGE_PAYLOAD_LIMIT:
+        if _page_fits(bounded, has_next=True):
             return bounded
     return {
         "oversized_record": True,
@@ -293,16 +309,19 @@ def _page_payloads(value: Any) -> list[Any]:
                 return [value]
             pages: list[Any] = []
             current: list[Any] = []
-            for record in records:
+            for index, record in enumerate(records):
                 bounded = _bounded_record(record)
                 candidate = {**base, list_key: [*current, bounded]}
-                rendered = _redact(json.dumps(candidate, sort_keys=True, default=str))
-                if current and len(rendered) > _PAGE_PAYLOAD_LIMIT:
+                has_next = index < len(records) - 1
+                if current and not _page_fits(candidate, has_next=has_next):
                     pages.append({**base, list_key: current})
                     current = [bounded]
                 else:
                     current.append(bounded)
             pages.append({**base, list_key: current})
+            for index, page in enumerate(pages):
+                if not _page_fits(page, has_next=index < len(pages) - 1):
+                    raise ValueError("one bounded Telegram record cannot fit in a rendered page")
             return pages
     if isinstance(value, list):
         return _page_payloads({"items": value})
@@ -316,44 +335,48 @@ def _render_page(
     actor: str,
     remaining: list[Any],
 ) -> str:
-    cursor = None
-    if remaining:
-        cursor = _page_token()
+    cursor = _page_token() if remaining else None
+    rendered = _rendered_page(payload, cursor)
+    if len(rendered) > _MESSAGE_LIMIT:
+        raise ValueError("bounded Telegram page unexpectedly exceeds 3500 characters")
+    if cursor is not None:
+        _sweep_page_cache(datetime.now(UTC))
+        while len(_PAGE_CACHE) >= _PAGE_CACHE_MAX_ENTRIES:
+            oldest = min(_PAGE_CACHE, key=lambda key: _PAGE_CACHE[key][0])
+            _PAGE_CACHE.pop(oldest, None)
         _PAGE_CACHE[cursor] = (
             datetime.now(UTC) + timedelta(minutes=10),
             command,
             actor,
             remaining,
         )
-    envelope = {"payload": payload, "next_cursor": cursor}
-    rendered = _redact(json.dumps(envelope, indent=2, sort_keys=True, default=str))
-    if len(rendered) > _MESSAGE_LIMIT:
-        raise ValueError("bounded Telegram page unexpectedly exceeds 3500 characters")
     return rendered
 
 
-def _format(value: Any, *, command: str, actor: str) -> str:
-    now = datetime.now(UTC)
+def _sweep_page_cache(now: datetime) -> None:
     for key, (expires_at, _command, _actor, _pages) in list(_PAGE_CACHE.items()):
         if expires_at <= now:
             _PAGE_CACHE.pop(key, None)
+
+
+def _format(value: Any, *, command: str, actor: str) -> str:
+    _sweep_page_cache(datetime.now(UTC))
     pages = _page_payloads(value)
     return _render_page(pages[0], command=command, actor=actor, remaining=pages[1:])
 
 
 def _cursor_page(token: str, *, command: str, actor: str) -> str:
-    cached = _PAGE_CACHE.pop(token, None)
+    now = datetime.now(UTC)
+    _sweep_page_cache(now)
+    cached = _PAGE_CACHE.get(token)
     if cached is None:
         raise ValueError("pagination cursor is invalid or expired")
     expires_at, expected_command, expected_actor, pages = cached
-    if (
-        expires_at <= datetime.now(UTC)
-        or expected_command != command
-        or expected_actor != actor
-        or not pages
-    ):
+    if expires_at <= now or expected_command != command or expected_actor != actor or not pages:
         raise ValueError("pagination cursor is invalid or expired")
-    return _render_page(pages[0], command=command, actor=actor, remaining=pages[1:])
+    rendered = _render_page(pages[0], command=command, actor=actor, remaining=pages[1:])
+    _PAGE_CACHE.pop(token, None)
+    return rendered
 
 
 def _split_cursor(raw_args: str) -> tuple[str, str | None]:

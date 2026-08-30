@@ -26,7 +26,9 @@ Every response is a valid JSON envelope. Rendered Telegram messages are limited 
 characters and paginated only between complete records. A record too large for one page is
 replaced by a bounded digest record; raw bytes are never split through Unicode, Markdown entities,
 JSON tokens, or code fences. Continuation cursors are opaque, actor/command-bound, expire after ten
-minutes, and are consumed once.
+minutes, are consumed once, and are kept in a bounded process-local cache. A gateway restart or a
+different gateway process invalidates an outstanding cursor; the operator can safely repeat the
+fixed read command to obtain a fresh first page.
 
 Provision the allowlist without sending tokens through Telegram:
 
