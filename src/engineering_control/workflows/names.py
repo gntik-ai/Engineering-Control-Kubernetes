@@ -7,6 +7,7 @@ class WorkflowName(StrEnum):
     FINDING_VERIFICATION = "FindingVerificationWorkflow"
     ISSUE_DELIVERY = "IssueDeliveryWorkflow"
     DELIVERY_RECONCILIATION = "DeliveryReconciliationWorkflow"
+    FINAL_CLOSURE = "FinalClosureWorkflow"
     PREVIEW_DEPLOYMENT = "PreviewDeploymentWorkflow"
     STAGING_DEPLOYMENT = "StagingDeploymentWorkflow"
     RUNTIME_VERIFICATION = "RuntimeVerificationWorkflow"

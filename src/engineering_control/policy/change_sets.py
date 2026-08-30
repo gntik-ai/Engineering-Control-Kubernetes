@@ -108,6 +108,7 @@ class ChangeSetPolicy:
             ChangeSetState.INCIDENT_OPEN,
         },
         ChangeSetState.RUNTIME_VERIFIED: {
+            ChangeSetState.SOURCE_MERGED,
             ChangeSetState.ISSUE_CLOSED,
             ChangeSetState.INCIDENT_OPEN,
         },

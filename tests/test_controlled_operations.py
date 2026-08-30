@@ -482,8 +482,8 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
         "c" * 64,
     )
     assert full_delivery.capability.status == "BLOCKED"
-    assert (
-        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED" in full_delivery.capability.blockers
+    assert "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED" not in (
+        full_delivery.capability.blockers
     )
     assert "FALCONE_CANDIDATE_BUILD_CONTRACT_MISSING" in full_delivery.capability.blockers
     assert (
@@ -497,13 +497,11 @@ def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
 ) -> None:
     repository = _repository(tmp_path)
     assert set(repository._full_delivery_blockers("musematic")) == {
-        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
         "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
         "MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED",
         "MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC",
     }
     assert set(repository._full_delivery_blockers("llmwiki")) == {
-        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
         "LLMWIKI_CANDIDATE_BUILD_DISABLED",
         "LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED",
         "LLMWIKI_FIRST_STAGE_BOOTSTRAP_NOT_APPROVED",
@@ -513,7 +511,6 @@ def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
         f"sqlite+pysqlite:///{tmp_path / 'unconfigured-operations.db'}"
     )
     assert unconfigured._full_delivery_blockers("falcone") == [
-        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
         "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED",
     ]
 
@@ -1402,8 +1399,10 @@ async def test_full_delivery_owns_candidate_pipeline_and_preserves_final_merge_g
                 "status": "STAGING_DEPLOYED",
                 "context": {"deployment_id": "00000000-0000-4000-8000-000000000002"},
             }
-        assert name == "RuntimeVerificationWorkflow"
-        return {"status": "RUNTIME_VERIFIED", "context": {}}
+        if name == "RuntimeVerificationWorkflow":
+            return {"status": "RUNTIME_VERIFIED", "context": {}}
+        assert name == "FinalClosureWorkflow"
+        return {"status": "FIXED", "context": {}}
 
     monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
     monkeypatch.setattr(
@@ -1430,10 +1429,10 @@ async def test_full_delivery_owns_candidate_pipeline_and_preserves_final_merge_g
         "DeliveryReconciliationWorkflow",
         "StagingDeploymentWorkflow",
         "RuntimeVerificationWorkflow",
+        "FinalClosureWorkflow",
     ]
-    assert result["status"] == "BLOCKED"
-    assert result["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
-    assert state_calls[-1]["blocker"] == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
+    assert result["status"] == "COMPLETE"
+    assert state_calls[-1]["loop_status"] == "COMPLETE"
 
 
 @pytest.mark.asyncio

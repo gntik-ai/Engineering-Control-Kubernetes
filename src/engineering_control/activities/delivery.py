@@ -18,6 +18,12 @@ from engineering_control.adapters.github.client import GhCliAuthError, GhCliBrok
 from engineering_control.config import Settings
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.models.enums import RedactionStatus
+from engineering_control.models.final_closure import (
+    FinalArtifactPlan,
+    FinalClosurePlan,
+    FinalIssueMutationPlan,
+    ProtectedMergeResult,
+)
 from engineering_control.models.reconciliation import (
     CandidateArtifactManifest,
     CIReconciliationPlan,
@@ -103,7 +109,7 @@ class PublicationPlan(BaseModel):
 
 
 class DeliveryActivityHandler:
-    """Publish exact validated commits and draft PRs; never merge or rewrite history."""
+    """Perform only typed, policy-bound GitHub delivery operations."""
 
     supported_steps = frozenset(
         {
@@ -114,6 +120,12 @@ class DeliveryActivityHandler:
             "reconcile.inspect_ci",
             "reconcile.publish_promotion",
             "delivery.publish",
+            "final.merge_source",
+            "final.inspect_artifact",
+            "final.merge_deployment",
+            "final.sync_worktrees",
+            "final.comment_issue",
+            "final.close_issue",
         }
     )
     write_capable_steps = WRITE_CAPABLE_GITHUB_STEPS
@@ -161,6 +173,18 @@ class DeliveryActivityHandler:
             return self._inspect_ci(payload)
         if step == "reconcile.publish_promotion":
             return self._publish_promotion(payload)
+        if step == "final.merge_source":
+            return self._merge_bound_pull_request(payload, source=True)
+        if step == "final.inspect_artifact":
+            return self._inspect_final_artifact(payload)
+        if step == "final.merge_deployment":
+            return self._merge_bound_pull_request(payload, source=False)
+        if step == "final.sync_worktrees":
+            return self._sync_final_worktrees(payload)
+        if step == "final.comment_issue":
+            return self._comment_final_evidence(payload)
+        if step == "final.close_issue":
+            return self._close_final_issue(payload)
         if step != "delivery.publish":
             raise ApplicationError("unsupported delivery activity", non_retryable=True)
         try:
@@ -402,6 +426,283 @@ class DeliveryActivityHandler:
             "attestation_sha256": attestation_hashes,
             "image_count": len(manifest.images),
         }
+
+    def _inspect_final_artifact(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            plan = FinalArtifactPlan.model_validate(payload.get("final_artifact_plan"))
+            policy = plan.policy.candidate_build
+            if not policy.enabled:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": policy.blocker or "FINAL_BUILD_NOT_CONFIGURED",
+                }
+            runs = self.broker.list_workflow_runs(
+                plan.closure.source.repository,
+                workflow_name=policy.workflow_name,
+                commit_sha=plan.final_source_sha,
+            )
+            exact = [
+                item
+                for item in runs
+                if item.get("headSha") == plan.final_source_sha
+                and item.get("workflowName") == policy.workflow_name
+            ]
+            successful = [
+                item
+                for item in exact
+                if str(item.get("status", "")).lower() == "completed"
+                and str(item.get("conclusion", "")).lower() == "success"
+            ]
+            if not successful:
+                failed = any(
+                    str(item.get("status", "")).lower() == "completed"
+                    and str(item.get("conclusion", "")).lower() not in {"", "success"}
+                    for item in exact
+                )
+                return {
+                    **payload,
+                    "status": "BLOCKED" if failed else "AWAITING_FINAL_BUILD",
+                    "blocker": (
+                        "FINAL_BUILD_FAILED" if failed else "FINAL_BUILD_NOT_YET_AVAILABLE"
+                    ),
+                }
+            selected = max(successful, key=lambda item: int(item.get("databaseId", 0)))
+            run_id = int(selected["databaseId"])
+            reconciliation = CIReconciliationPlan(
+                change_set_id=plan.closure.change_set_id,
+                run_id=plan.closure.run_id,
+                workflow_id=plan.closure.workflow_id,
+                project=plan.closure.project,
+                repository=plan.closure.source.repository,
+                source_pr_number=plan.closure.source.number,
+                source_pr_url=plan.closure.source.url,
+                source_branch=plan.closure.source.head_branch,
+                source_head_sha=plan.final_source_sha,
+                source_base_branch=plan.closure.source.base_branch,
+                candidate_build_run_id=run_id,
+                policy=plan.policy,
+                independent_review_sha256=str(payload.get("independent_review_sha256") or "0" * 64),
+                independent_review_provider=plan.closure.checker_provider,
+                maker_provider=plan.closure.maker_provider,
+            )
+            registry_auth = self._registry_auth()
+            if registry_auth is None:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "MANUAL_GITHUB_REGISTRY_AUTH_REQUIRED",
+                }
+            root = (self.settings.run_root / "delivery").resolve()
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            manifest, evidence = self._candidate_manifest(reconciliation, root, registry_auth)
+            return {
+                **payload,
+                "status": "FINAL_ARTIFACT_VERIFIED",
+                "final_build_run_id": run_id,
+                "final_artifact_manifest": manifest.model_dump(mode="json"),
+                "final_artifact_evidence": evidence,
+            }
+        except GhCliAuthError:
+            return {**payload, "status": "BLOCKED", "blocker": "BLOCKED_BY_GH_AUTH"}
+        except (
+            CommandFailure,
+            OSError,
+            ValueError,
+            ValidationError,
+            json.JSONDecodeError,
+        ) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "FINAL_ARTIFACT_RECONCILIATION_FAILED",
+                "error_type": type(error).__name__,
+            }
+
+    def _merge_bound_pull_request(self, payload: dict[str, Any], *, source: bool) -> dict[str, Any]:
+        try:
+            plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+            binding = plan.source if source else plan.deployment
+            expected_head = binding.head_sha if source else str(payload.get("deployment_sha") or "")
+            result = self.broker.merge_pull_request(
+                repository=binding.repository,
+                number=binding.number,
+                expected_head_sha=expected_head,
+                expected_base_branch=binding.base_branch,
+                change_binding=f"changeset:{plan.change_set_id}",
+            )
+            ProtectedMergeResult.model_validate(result)
+            return {
+                **payload,
+                "status": "SOURCE_MERGED" if source else "DEPLOYMENT_MERGED",
+                "source_merge" if source else "deployment_merge": result,
+            }
+        except GhCliAuthError:
+            return {**payload, "status": "BLOCKED", "blocker": "BLOCKED_BY_GH_AUTH"}
+        except (CommandFailure, OSError, ValueError, ValidationError, GhCliPolicyError) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": (
+                    "PROTECTED_SOURCE_MERGE_FAILED"
+                    if source
+                    else "PROTECTED_DEPLOYMENT_MERGE_FAILED"
+                ),
+                "error_type": type(error).__name__,
+            }
+
+    def _sync_final_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+            source = ProtectedMergeResult.model_validate(payload.get("source_merge"))
+            deployment = ProtectedMergeResult.model_validate(payload.get("deployment_merge"))
+            synchronized: list[dict[str, str | bool]] = []
+            for binding, result, slug in (
+                (plan.source, source, plan.source.repository.rsplit("/", 1)[-1]),
+                (
+                    plan.deployment,
+                    deployment,
+                    plan.deployment.repository.rsplit("/", 1)[-1],
+                ),
+            ):
+                worktree = (self.settings.worktree_root / slug / str(plan.change_set_id)).resolve()
+                expected = self.settings.worktree_root.resolve() / slug / str(plan.change_set_id)
+                if worktree != expected or not worktree.is_dir() or worktree.is_symlink():
+                    raise ValueError("final synchronization escaped its ChangeSet worktree")
+                status = self.runner.run(
+                    "git",
+                    ["-c", f"safe.directory={worktree}", "status", "--porcelain=v1"],
+                    cwd=worktree,
+                ).stdout
+                if status:
+                    raise ValueError("final synchronization requires a clean worktree")
+                environment = {
+                    "HOME": str(self.broker.authenticated_home),
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "safe.directory",
+                    "GIT_CONFIG_VALUE_0": str(worktree),
+                }
+                self.runner.run(
+                    "git",
+                    [
+                        "-c",
+                        f"safe.directory={worktree}",
+                        "fetch",
+                        "--no-tags",
+                        f"https://github.com/{binding.repository}.git",
+                        result.merge_sha,
+                    ],
+                    cwd=worktree,
+                    timeout_seconds=900,
+                    environment=environment,
+                )
+                fetched = self.runner.run(
+                    "git",
+                    [
+                        "-c",
+                        f"safe.directory={worktree}",
+                        "show",
+                        "-s",
+                        "--format=%T",
+                        result.merge_sha,
+                    ],
+                    cwd=worktree,
+                ).stdout.strip()
+                if fetched != result.merge_tree_sha:
+                    raise ValueError("final merge tree changed during synchronization")
+                self.runner.run(
+                    "git",
+                    ["-c", f"safe.directory={worktree}", "reset", "--hard", result.merge_sha],
+                    cwd=worktree,
+                )
+                final_head = self.runner.run(
+                    "git",
+                    ["-c", f"safe.directory={worktree}", "rev-parse", "HEAD"],
+                    cwd=worktree,
+                ).stdout.strip()
+                final_status = self.runner.run(
+                    "git",
+                    ["-c", f"safe.directory={worktree}", "status", "--porcelain=v1"],
+                    cwd=worktree,
+                ).stdout
+                if final_head != result.merge_sha or final_status:
+                    raise ValueError("final synchronization did not produce a clean exact head")
+                synchronized.append(
+                    {
+                        "repository": binding.repository,
+                        "merge_sha": result.merge_sha,
+                        "merge_tree_sha": result.merge_tree_sha,
+                        "clean": True,
+                    }
+                )
+            return {
+                **payload,
+                "status": "FINAL_WORKTREES_SYNCHRONIZED",
+                "final_worktree_sync": synchronized,
+            }
+        except (CommandFailure, OSError, ValueError, ValidationError) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "FINAL_WORKTREE_SYNCHRONIZATION_FAILED",
+                "error_type": type(error).__name__,
+            }
+
+    def _comment_final_evidence(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            plan = FinalIssueMutationPlan.model_validate(payload.get("final_issue_plan"))
+            marker = f"<!-- engineering-control-final-closure:{plan.closure.change_set_id} -->"
+            root = (self.settings.run_root / "delivery").resolve()
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor, raw = tempfile.mkstemp(prefix="final-closure-", suffix=".md", dir=root)
+            path = Path(raw)
+            os.chmod(path, 0o600)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(str(self.redactor.redact_text(plan.comment_body).value))
+                result = self.broker.comment_issue(
+                    repository=plan.closure.issue_repository,
+                    number=plan.closure.issue_number,
+                    body_file=path,
+                    marker=marker,
+                    change_binding=f"changeset:{plan.closure.change_set_id}",
+                )
+            finally:
+                path.unlink(missing_ok=True)
+            return {**payload, "status": "FINAL_EVIDENCE_COMMENTED", "comment_result": result}
+        except GhCliAuthError:
+            return {**payload, "status": "BLOCKED", "blocker": "BLOCKED_BY_GH_AUTH"}
+        except (CommandFailure, OSError, ValueError, ValidationError, GhCliPolicyError) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "FINAL_EVIDENCE_COMMENT_FAILED",
+                "error_type": type(error).__name__,
+            }
+
+    def _close_final_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            plan = FinalIssueMutationPlan.model_validate(payload.get("final_issue_plan"))
+            if payload.get("status") != "FINAL_EVIDENCE_PERSISTED":
+                raise ValueError("issue closure requires persisted final evidence")
+            marker = f"<!-- engineering-control-final-closure:{plan.closure.change_set_id} -->"
+            result = self.broker.close_issue(
+                repository=plan.closure.issue_repository,
+                number=plan.closure.issue_number,
+                marker=marker,
+                change_binding=f"changeset:{plan.closure.change_set_id}",
+            )
+            return {**payload, "status": "ISSUE_CLOSED", "issue_close_result": result}
+        except GhCliAuthError:
+            return {**payload, "status": "BLOCKED", "blocker": "BLOCKED_BY_GH_AUTH"}
+        except (CommandFailure, OSError, ValueError, ValidationError, GhCliPolicyError) as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "FINAL_ISSUE_CLOSE_FAILED",
+                "error_type": type(error).__name__,
+            }
 
     def _with_ci_evidence(
         self,
@@ -896,6 +1197,19 @@ class DeliveryActivityHandler:
             if not isinstance(promotion, dict):
                 raise ValueError("promotion publication target is missing")
             return (str(promotion.get("repository", "")),)
+        if step in {"final.merge_source", "final.merge_deployment"}:
+            plan = payload.get("final_closure_plan")
+            key = "source" if step == "final.merge_source" else "deployment"
+            binding = plan.get(key) if isinstance(plan, dict) else None
+            if not isinstance(binding, dict):
+                raise ValueError("final merge target is missing")
+            return (str(binding.get("repository", "")),)
+        if step in {"final.comment_issue", "final.close_issue"}:
+            plan = payload.get("final_issue_plan")
+            closure = plan.get("closure") if isinstance(plan, dict) else None
+            if not isinstance(closure, dict):
+                raise ValueError("final issue target is missing")
+            return (str(closure.get("issue_repository", "")),)
         if step == "enhancement.publish":
             enhancement = payload.get("enhancement")
             repository = (

@@ -39,9 +39,9 @@ class NoCommandRunner:
 
 
 def test_github_activity_classification_is_complete_and_disjoint() -> None:
-    assert len(GITHUB_ACTIVITY_STEPS) == 10
-    assert len(READ_ONLY_GITHUB_STEPS) == 6
-    assert len(WRITE_CAPABLE_GITHUB_STEPS) == 4
+    assert len(GITHUB_ACTIVITY_STEPS) == 16
+    assert len(READ_ONLY_GITHUB_STEPS) == 8
+    assert len(WRITE_CAPABLE_GITHUB_STEPS) == 8
     assert READ_ONLY_GITHUB_STEPS.isdisjoint(WRITE_CAPABLE_GITHUB_STEPS)
     assert GITHUB_ACTIVITY_STEPS == ControlActivities.steps_for_worker("github")
 
@@ -66,6 +66,12 @@ def write_payloads(root: Path) -> dict[str, dict[str, Any]]:
         "working_directory": str(root / "falcone-charts" / str(change_set_id)),
         "head_sha": "b" * 40,
     }
+    closure = {
+        "change_set_id": str(change_set_id),
+        "source": {"repository": "gntik-ai/falcone"},
+        "deployment": {"repository": "gntik-ai/falcone-charts"},
+    }
+    issue_plan = {"closure": {**closure, "issue_repository": "gntik-ai/falcone"}}
     return {
         "delivery.publish": {
             "publication_plan": {
@@ -88,6 +94,10 @@ def write_payloads(root: Path) -> dict[str, dict[str, Any]]:
                 "change_set_id": str(change_set_id),
             }
         },
+        "final.merge_source": {"final_closure_plan": closure},
+        "final.merge_deployment": {"final_closure_plan": closure},
+        "final.comment_issue": {"final_issue_plan": issue_plan},
+        "final.close_issue": {"final_issue_plan": issue_plan},
     }
 
 
@@ -127,8 +137,13 @@ def outside_payload(step: str, payload: dict[str, Any]) -> dict[str, Any]:
         value["finding_publication"]["repository"] = "outside/repository"
     elif step == "enhancement.publish":
         value["affected_repository"] = "outside/repository"
-    else:
+    elif step == "reconcile.publish_promotion":
         value["promotion_publication"]["repository"] = "outside/repository"
+    elif step in {"final.merge_source", "final.merge_deployment"}:
+        key = "source" if step == "final.merge_source" else "deployment"
+        value["final_closure_plan"][key]["repository"] = "outside/repository"
+    else:
+        value["final_issue_plan"]["closure"]["issue_repository"] = "outside/repository"
     return value
 
 

@@ -46,8 +46,6 @@ _GLOBAL_BACKLOG_RETRY_LIMIT = 5
 _GLOBAL_BACKLOG_RETRY_BASE_MINUTES = 15
 _TERMINAL_GLOBAL_BLOCKERS = frozenset(
     {
-        "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED",
-        "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED",
         "LLMWIKI_FULL_DELIVERY_INPUTS_UNRESOLVED",
         "BLOCKED_AUTONOMOUS_REPAIR_EXHAUSTED",
         "CORRECTION_LIMIT_EXHAUSTED",
@@ -73,15 +71,19 @@ def _current_backlog_approval(
     ):
         return None
     approval = campaign.approval_json
+    raw_binding = approval.get("binding")
+    binding_value = raw_binding if isinstance(raw_binding, dict) else approval
+    raw_approval = approval.get("approval")
+    approval_record = raw_approval if isinstance(raw_approval, dict) else approval
     if (
-        approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
-        or not isinstance(approval.get("approved_by"), str)
-        or not approval.get("approved_at")
+        approval_record.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
+        or not isinstance(approval_record.get("approved_by"), str)
+        or not approval_record.get("approved_at")
     ):
         return None
     try:
         binding = BacklogApprovalBinding.model_validate(
-            {field: approval.get(field) for field in BacklogApprovalBinding.model_fields}
+            {field: binding_value.get(field) for field in BacklogApprovalBinding.model_fields}
         )
     except ValueError:
         return None
@@ -1547,10 +1549,7 @@ class EngineeringActivityHandler:
                     db.BacklogIssueRecord.issue_number == int(item["issue_number"]),
                 )
             )
-            if issue is not None and blocker == "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED":
-                issue.delivery_status = "CANDIDATE_VERIFIED_FINAL_SERVICE_BLOCKED"
-                issue.final_closure_status = "BLOCKED_FINAL_SERVICE"
-            elif issue is not None and retryable:
+            if issue is not None and retryable:
                 issue.delivery_status = "RETRY_PENDING"
             run = session.scalar(select(db.Run).where(db.Run.campaign_id == campaign_id).limit(1))
             if run is not None:
@@ -1873,22 +1872,42 @@ class EngineeringActivityHandler:
     def _register_backlog_child_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         child_kind = str(payload.get("child_kind", ""))
         child_workflow_id = str(payload.get("child_workflow_id", ""))
-        if child_kind not in {"finding-verification", "issue-delivery"}:
+        allowed = {
+            "finding-verification",
+            "issue-delivery",
+            "delivery-reconciliation",
+            "staging-deployment",
+            "runtime-verification",
+        }
+        if child_kind not in allowed:
             raise ValueError("backlog child run kind is not allowlisted")
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", child_workflow_id):
             raise ValueError("backlog child workflow identity is invalid")
         finding_id = UUID(str(payload.get("finding_id", "")))
+        change_set_id = (
+            UUID(str(payload["change_set_id"]))
+            if child_kind not in {"finding-verification", "issue-delivery"}
+            else None
+        )
         with self.sessions.begin() as session:
             finding = session.get(db.Finding, finding_id)
             if finding is None:
                 raise ValueError("backlog child finding is missing")
             if child_kind == "issue-delivery" and finding.disposition != "CONFIRMED":
                 raise ValueError("backlog delivery child requires a confirmed finding")
+            change_set = session.get(db.ChangeSet, change_set_id) if change_set_id else None
+            if change_set_id is not None and (
+                change_set is None
+                or change_set.finding_id != finding.id
+                or change_set.project != finding.project
+            ):
+                raise ValueError("backlog delivery-stage ChangeSet binding is invalid")
             existing = session.scalar(select(db.Run).where(db.Run.workflow_id == child_workflow_id))
             if existing is not None:
                 if (
                     existing.run_type != child_kind
                     or existing.project != finding.project
+                    or existing.change_set_id != change_set_id
                     or (
                         child_kind == "finding-verification" and existing.summary != str(finding.id)
                     )
@@ -1901,6 +1920,7 @@ class EngineeringActivityHandler:
                 )
             run = db.Run(
                 campaign_id=(finding.campaign_id if child_kind == "finding-verification" else None),
+                change_set_id=change_set_id,
                 workflow_id=child_workflow_id,
                 run_type=child_kind,
                 status="QUEUED",

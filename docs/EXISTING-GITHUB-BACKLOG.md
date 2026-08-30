@@ -69,16 +69,18 @@ are resolved; requesting LLMWiki full delivery fails closed instead of approving
 target. It
 selects one child issue workflow at a time, durably records completed, blocked and skipped issues,
 retries only classified temporary blockers with bounded exponential backoff, stops retrying after
-five attempts, and never re-drives a candidate stopped by the final-merge service boundary. It
+five attempts, and never bypasses a project build, promotion, staging, or verification blocker. It
 continues with independent work and continues as new after 25 issue or wait boundaries.
 
-Full delivery composes the existing immutable CI/artifact reconciliation, staging deployment, and
-runtime verification workflows. It remains fail-closed when candidate build, provenance, staging
-identity, Argo/Helm, observer/browser verification, or approval is unavailable. Candidate-only
-runtime evidence can never close an issue: after candidate verification the workflow reports
-`FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED` until a separately reviewed service can merge,
-build, deploy, and verify the exact final merge revisions. The dashboard's ordinary full-delivery
-actions remain disabled by that same conservative closure boundary.
+Full delivery composes immutable candidate reconciliation, staging deployment, runtime verification,
+and the exact-merge `FinalClosureWorkflow`. It remains fail-closed when candidate or final build,
+provenance, immutable rendering, staging identity, Argo/Helm, observer/browser verification,
+approval, protected merge, or GitHub write policy is unavailable. Candidate-only runtime evidence
+can never close an issue. The final service must verify signed artifacts at the protected source
+merge SHA, independently review and merge the exact deployment head, deploy that merge SHA, repeat
+runtime verification, persist bounded closure evidence, comment, and close in that order. Current
+project-specific capability blockers continue to disable ordinary full-delivery actions until the
+corresponding contracts are configured.
 
 Musematic issue 1119 is never selected under the global R2 bound without its issue-specific R3
 candidate. That immutable candidate binds the GitHub `updated_at`, body digest, both repository

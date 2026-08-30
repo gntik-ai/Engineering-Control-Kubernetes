@@ -31,6 +31,7 @@ from engineering_control.db.models import (
     Approval,
     ApprovalCandidate,
     Artifact,
+    BacklogIssueRecord,
     Campaign,
     ChangeSet,
     ComponentLease,
@@ -39,6 +40,7 @@ from engineering_control.db.models import (
     Deployment,
     Finding,
     FindingVerification,
+    GitHubBacklogCampaign,
     Incident,
     Issue,
     OperationExport,
@@ -48,6 +50,13 @@ from engineering_control.db.models import (
     Run,
     VerificationResult,
     WorktreeLease,
+)
+from engineering_control.engineering.backlog import (
+    BACKLOG_APPROVAL_PHRASE,
+    BacklogApprovalBinding,
+    BacklogFinalClosureEvidence,
+    DocumentationImpact,
+    evaluate_final_closure,
 )
 from engineering_control.engineering.github import FindingPublication
 from engineering_control.engineering.models import ProjectManifest
@@ -63,6 +72,13 @@ from engineering_control.models.enums import (
     RiskClass,
     RootBlockerClassification,
 )
+from engineering_control.models.final_closure import (
+    FinalArtifactPlan,
+    FinalClosurePlan,
+    FinalIssueMutationPlan,
+    ProtectedMergeResult,
+    ProtectedPullRequestBinding,
+)
 from engineering_control.models.reconciliation import (
     CandidateArtifactManifest,
     CIReconciliationPlan,
@@ -75,6 +91,10 @@ from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
 from engineering_control.security.redaction import SecretRedactor
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 class QuotaSnapshotRecord(BaseModel):
@@ -337,6 +357,13 @@ class MetadataActivityHandler:
             "reconcile.persist_promotion_publication",
             "reconcile.prepare_release_review",
             "reconcile.persist_release_review",
+            "final.prepare",
+            "final.persist_source_merge",
+            "final.persist_artifact",
+            "final.persist_deployment_merge",
+            "final.prepare_issue_close",
+            "final.persist_comment",
+            "final.persist_issue_close",
             "preview.prepare",
             "preview.record_candidate",
             "preview.validate_approval",
@@ -471,6 +498,20 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._prepare_release_review, payload)
             if step == "reconcile.persist_release_review":
                 return await asyncio.to_thread(self._persist_release_review, payload)
+            if step == "final.prepare":
+                return await asyncio.to_thread(self._prepare_final_closure, payload)
+            if step == "final.persist_source_merge":
+                return await asyncio.to_thread(self._persist_final_source_merge, payload)
+            if step == "final.persist_artifact":
+                return await asyncio.to_thread(self._persist_final_artifact, payload)
+            if step == "final.persist_deployment_merge":
+                return await asyncio.to_thread(self._persist_final_deployment_merge, payload)
+            if step == "final.prepare_issue_close":
+                return await asyncio.to_thread(self._prepare_final_issue_close, payload)
+            if step == "final.persist_comment":
+                return await asyncio.to_thread(self._persist_final_comment, payload)
+            if step == "final.persist_issue_close":
+                return await asyncio.to_thread(self._persist_final_issue_close, payload)
             if step == "preview.prepare":
                 return await asyncio.to_thread(self._prepare_deployment, payload, "preview")
             if step == "preview.record_candidate":
@@ -3034,6 +3075,602 @@ class MetadataActivityHandler:
             "deployment_deferred": deployment is None,
         }
 
+    def _prepare_final_closure(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        campaign_id = UUID(str(payload["backlog_campaign_id"]))
+        issue_repository = str(payload["issue_repository"])
+        issue_number = int(payload["issue_number"])
+        project = Project(str(payload["project"]))
+        workflow_id = self._workflow_id(payload)
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            campaign = session.get(GitHubBacklogCampaign, campaign_id)
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == campaign_id,
+                    BacklogIssueRecord.repository == issue_repository,
+                    BacklogIssueRecord.issue_number == issue_number,
+                )
+            )
+            change_set = session.get(ChangeSet, change_set_id)
+            if (
+                campaign is None
+                or issue is None
+                or change_set is None
+                or campaign.project != project.value
+                or issue.change_set_id != change_set.id
+                or change_set.project != project.value
+            ):
+                raise ValueError("final closure campaign, issue, or ChangeSet binding is missing")
+            if (
+                campaign.delivery_mode != "full-delivery"
+                or campaign.status not in {"APPROVED", "RUNNING"}
+                or not campaign.approval_binding
+                or not isinstance(campaign.approval_json, dict)
+            ):
+                raise ValueError("final closure requires a current full-delivery approval")
+            approval_value = campaign.approval_json
+            raw_binding = approval_value.get("binding")
+            binding_value = raw_binding if isinstance(raw_binding, dict) else approval_value
+            raw_approval = approval_value.get("approval")
+            approval_record = raw_approval if isinstance(raw_approval, dict) else approval_value
+            approval = BacklogApprovalBinding.model_validate(
+                {field: binding_value.get(field) for field in BacklogApprovalBinding.model_fields}
+            )
+            if (
+                approval.sha256() != campaign.approval_binding
+                or approval.backlog_campaign_id != str(campaign.id)
+                or approval.project != project.value
+                or approval.delivery_mode != "full-delivery"
+                or approval.merge_policy != "protected-explicit"
+                or approval.issue_close_policy != "verified-final-runtime"
+                or "protected-pr-merge" not in approval.allowed_github_operations
+                or "issue-close-after-verification" not in approval.allowed_github_operations
+                or approval_record.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
+                or not approval_record.get("approved_by")
+                or _as_utc(approval.expires_at) <= now
+            ):
+                raise ValueError("final closure approval is absent, expired, or changed")
+            if change_set.state != ChangeSetState.RUNTIME_VERIFIED.value:
+                raise ValueError("final closure requires candidate runtime verification")
+            if (
+                issue.state != "OPEN"
+                or issue.documentation_impact
+                == DocumentationImpact.BLOCKED_BY_UNRESOLVED_DOCUMENTATION_IMPACT.value
+            ):
+                raise ValueError("issue is not eligible for final closure")
+            recovery = dict(change_set.recovery_json)
+            chain = self._object(recovery.get("provider_chain"), "provider chain")
+            release_evidence = self._object(
+                recovery.get("release_evidence", {}), "release evidence"
+            )
+            independent = release_evidence.get("independent_review_sha256")
+            if not self._is_digest(independent):
+                raise ValueError("final closure independent review evidence is missing")
+            maker = str(chain.get("maker", ""))
+            checker = str(chain.get("checker", ""))
+            if maker not in {"codex", "claude"} or checker not in {"codex", "claude"}:
+                raise ValueError("final closure provider chain is incomplete")
+            source = self._final_pr_binding(
+                repository=f"gntik-ai/{change_set.source_repository}",
+                url=change_set.source_pr_url,
+                branch=change_set.source_branch,
+                head_sha=change_set.source_head_sha,
+                base_branch=approval.source_branch,
+            )
+            deployment = self._final_pr_binding(
+                repository=f"gntik-ai/{change_set.deployment_repository}",
+                url=change_set.deployment_pr_url,
+                branch=change_set.deployment_branch,
+                head_sha=change_set.deployment_head_sha,
+                base_branch=approval.deployment_branch,
+            )
+            run_id = uuid5(NAMESPACE_URL, f"final-closure:{workflow_id}:{change_set.id}")
+            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            if run is None:
+                run = Run(
+                    id=run_id,
+                    campaign_id=None,
+                    change_set_id=change_set.id,
+                    workflow_id=workflow_id,
+                    run_type="final-closure",
+                    status="RUNNING",
+                    project=project.value,
+                    worker="controller",
+                    started_at=now,
+                    finished_at=None,
+                    error_code=None,
+                    summary="Exact protected-merge final closure is running",
+                )
+                session.add(run)
+            elif (
+                run.id != run_id
+                or run.run_type != "final-closure"
+                or run.change_set_id != change_set.id
+            ):
+                raise ValueError("final closure workflow idempotency binding changed")
+            policy = self._delivery_control_policy(project)
+            plan = FinalClosurePlan(
+                change_set_id=change_set.id,
+                run_id=run.id,
+                workflow_id=workflow_id,
+                backlog_campaign_id=campaign.id,
+                approval_binding_sha256=campaign.approval_binding,
+                project=project,
+                issue_repository=issue.repository,
+                issue_number=issue.issue_number,
+                source=source,
+                deployment=deployment,
+                maker_provider=cast(Literal["codex", "claude"], maker),
+                checker_provider=cast(Literal["codex", "claude"], checker),
+                documentation_impact=DocumentationImpact(issue.documentation_impact),
+                policy=policy,
+                production=False,
+            )
+            issue.final_closure_status = "FINAL_CLOSURE_RUNNING"
+        return {
+            **payload,
+            "status": "FINAL_CLOSURE_READY",
+            "final_closure_plan": plan.model_dump(mode="json"),
+            "independent_review_sha256": independent,
+        }
+
+    def _persist_final_source_merge(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+        merge = ProtectedMergeResult.model_validate(payload.get("source_merge"))
+        if (
+            payload.get("status") != "SOURCE_MERGED"
+            or merge.repository != plan.source.repository
+            or merge.pull_request_number != plan.source.number
+            or merge.head_sha != plan.source.head_sha
+        ):
+            raise ValueError("final source merge is not bound to its protected PR")
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            if run is None or change_set is None or run.change_set_id != change_set.id:
+                raise ValueError("final source merge persistence binding is missing")
+            recovery = dict(change_set.recovery_json)
+            existing = recovery.get("final_closure")
+            closure = dict(existing) if isinstance(existing, dict) else {}
+            prior = closure.get("source_merge")
+            value = merge.model_dump(mode="json")
+            if prior is not None and prior != value:
+                raise ValueError("final source merge evidence changed")
+            already_persisted = prior == value and change_set.source_head_sha == merge.merge_sha
+            if not already_persisted:
+                if (
+                    change_set.state != ChangeSetState.RUNTIME_VERIFIED.value
+                    or change_set.source_head_sha != plan.source.head_sha
+                ):
+                    raise ValueError("final source merge state changed before persistence")
+                closure["source_merge"] = value
+                recovery["final_closure"] = closure
+                change_set.recovery_json = recovery
+                change_set.source_head_sha = merge.merge_sha
+                change_set.state = ChangeSetState.SOURCE_MERGED.value
+                change_set.version += 1
+                run.status = "RUNNING"
+                run.summary = "Protected source PR merged; exact final build is required"
+            artifact = FinalArtifactPlan(
+                closure=plan,
+                final_source_sha=merge.merge_sha,
+                policy=plan.policy,
+            )
+        return {
+            **payload,
+            "status": "AWAITING_FINAL_BUILD",
+            "final_artifact_plan": artifact.model_dump(mode="json"),
+        }
+
+    def _persist_final_artifact(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = FinalArtifactPlan.model_validate(payload.get("final_artifact_plan"))
+        manifest = CandidateArtifactManifest.model_validate(payload.get("final_artifact_manifest"))
+        evidence = self._object(payload.get("final_artifact_evidence"), "final artifact evidence")
+        if (
+            payload.get("status") != "FINAL_ARTIFACT_VERIFIED"
+            or manifest.source_sha != plan.final_source_sha
+            or manifest.project is not plan.closure.project
+            or manifest.source_repository != plan.closure.source.repository
+            or manifest.workflow_run_id != payload.get("final_build_run_id")
+        ):
+            raise ValueError("final artifact is not bound to the exact source merge")
+        expected_repositories = plan.policy.immutable_promotion.image_repositories
+        repositories = {image.component: image.repository for image in manifest.images}
+        digests = {image.component: image.digest for image in manifest.images}
+        attestations = evidence.get("attestation_sha256")
+        if (
+            repositories != expected_repositories
+            or not self._is_digest(evidence.get("manifest_sha256"))
+            or not isinstance(attestations, dict)
+            or set(attestations) != set(digests)
+            or any(not self._is_digest(value) for value in attestations.values())
+        ):
+            raise ValueError("final artifact provenance evidence is incomplete")
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.closure.run_id)
+            change_set = session.get(ChangeSet, plan.closure.change_set_id)
+            if (
+                run is None
+                or change_set is None
+                or change_set.source_head_sha != plan.final_source_sha
+                or change_set.state
+                not in {
+                    ChangeSetState.SOURCE_MERGED.value,
+                    ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+                    ChangeSetState.DEPLOY_PR.value,
+                }
+            ):
+                raise ValueError("final artifact persistence binding is missing")
+            recovery = dict(change_set.recovery_json)
+            closure = self._object(recovery.get("final_closure"), "final closure")
+            final_artifact = {
+                "workflow_run_id": manifest.workflow_run_id,
+                "source_sha": manifest.source_sha,
+                "manifest_sha256": evidence["manifest_sha256"],
+                "attestation_sha256": attestations,
+                "image_digests": digests,
+            }
+            prior = closure.get("final_artifact")
+            if prior is not None and prior != final_artifact:
+                raise ValueError("final artifact evidence changed")
+            already_persisted = (
+                prior == final_artifact
+                and change_set.image_digests == digests
+                and change_set.state
+                in {
+                    ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+                    ChangeSetState.DEPLOY_PR.value,
+                }
+            )
+            if not already_persisted:
+                if change_set.state != ChangeSetState.SOURCE_MERGED.value:
+                    raise ValueError("final artifact state changed before persistence")
+                closure["final_artifact"] = final_artifact
+                recovery["final_closure"] = closure
+                change_set.recovery_json = recovery
+                change_set.image_digests = digests
+                change_set.state = ChangeSetState.FINAL_ARTIFACT_BUILT.value
+                change_set.version += 1
+                run.summary = "Signed immutable artifacts verified at exact source merge"
+            reconciliation = CIReconciliationPlan(
+                change_set_id=change_set.id,
+                run_id=run.id,
+                workflow_id=plan.closure.workflow_id,
+                project=plan.closure.project,
+                repository=plan.closure.source.repository,
+                source_pr_number=plan.closure.source.number,
+                source_pr_url=plan.closure.source.url,
+                source_branch=plan.closure.source.head_branch,
+                source_head_sha=plan.final_source_sha,
+                source_base_branch=plan.closure.source.base_branch,
+                candidate_build_run_id=manifest.workflow_run_id,
+                policy=plan.policy,
+                independent_review_sha256=str(payload["independent_review_sha256"]),
+                independent_review_provider=plan.closure.checker_provider,
+                maker_provider=plan.closure.maker_provider,
+            )
+        return {
+            **payload,
+            "status": "FINAL_ARTIFACT_BUILT",
+            "reconciliation_plan": reconciliation.model_dump(mode="json"),
+        }
+
+    def _persist_final_deployment_merge(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+        merge = ProtectedMergeResult.model_validate(payload.get("deployment_merge"))
+        if (
+            payload.get("status") != "DEPLOYMENT_MERGED"
+            or merge.repository != plan.deployment.repository
+            or merge.pull_request_number != plan.deployment.number
+            or merge.head_sha != str(payload.get("deployment_sha"))
+        ):
+            raise ValueError("final deployment merge is not bound to its reviewed PR head")
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            if (
+                run is None
+                or change_set is None
+                or change_set.deployment_head_sha not in {merge.head_sha, merge.merge_sha}
+            ):
+                raise ValueError("final deployment merge persistence binding is missing")
+            recovery = dict(change_set.recovery_json)
+            closure = self._object(recovery.get("final_closure"), "final closure")
+            value = merge.model_dump(mode="json")
+            prior = closure.get("deployment_merge")
+            if prior is not None and prior != value:
+                raise ValueError("final deployment merge evidence changed")
+            already_persisted = prior == value and change_set.deployment_head_sha == merge.merge_sha
+            if not already_persisted:
+                if change_set.deployment_head_sha != merge.head_sha:
+                    raise ValueError("deployment PR head changed before merge persistence")
+                closure["deployment_merge"] = value
+                recovery["final_closure"] = closure
+                change_set.recovery_json = recovery
+                change_set.deployment_head_sha = merge.merge_sha
+                change_set.version += 1
+                run.summary = "Protected deployment PR merged; final staging verification required"
+        return {**payload, "status": "FINAL_DEPLOYMENT_MERGE_PERSISTED"}
+
+    def _prepare_final_issue_close(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = FinalClosurePlan.model_validate(payload.get("final_closure_plan"))
+        source = ProtectedMergeResult.model_validate(payload.get("source_merge"))
+        deployment_merge = ProtectedMergeResult.model_validate(payload.get("deployment_merge"))
+        deployment_id = UUID(str(payload["deployment_id"]))
+        raw_synchronization = payload.get("final_worktree_sync")
+        if payload.get("status") != "FINAL_WORKTREES_SYNCHRONIZED" or not isinstance(
+            raw_synchronization, list
+        ):
+            raise ValueError("final clean-worktree evidence is missing")
+        synchronization = {
+            str(item.get("repository")): item
+            for item in raw_synchronization
+            if isinstance(item, dict)
+        }
+        expected_synchronization = {
+            source.repository: (source.merge_sha, source.merge_tree_sha),
+            deployment_merge.repository: (
+                deployment_merge.merge_sha,
+                deployment_merge.merge_tree_sha,
+            ),
+        }
+        if len(synchronization) != len(expected_synchronization) or any(
+            not isinstance(item := synchronization.get(repository), dict)
+            or item.get("merge_sha") != merge_sha
+            or item.get("merge_tree_sha") != tree_sha
+            or item.get("clean") is not True
+            for repository, (merge_sha, tree_sha) in expected_synchronization.items()
+        ):
+            raise ValueError("final clean-worktree evidence changed")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.run_id)
+            change_set = session.get(ChangeSet, plan.change_set_id)
+            deployment = session.get(Deployment, deployment_id)
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == plan.backlog_campaign_id,
+                    BacklogIssueRecord.repository == plan.issue_repository,
+                    BacklogIssueRecord.issue_number == plan.issue_number,
+                )
+            )
+            verification = session.scalar(
+                select(VerificationResult)
+                .where(
+                    VerificationResult.deployment_id == deployment_id,
+                    VerificationResult.verification_type == "post-staging-runtime",
+                    VerificationResult.status == "RUNTIME_VERIFIED",
+                )
+                .order_by(VerificationResult.created_at.desc())
+            )
+            active_agents = (
+                int(
+                    session.scalar(
+                        select(func.count(AgentExecution.id)).where(
+                            AgentExecution.change_set_id == change_set.id,
+                            AgentExecution.ended_at.is_(None),
+                        )
+                    )
+                    or 0
+                )
+                if change_set is not None
+                else 0
+            )
+            worktree_leases = (
+                session.scalars(
+                    select(WorktreeLease).where(
+                        WorktreeLease.change_set_id == change_set.id,
+                        WorktreeLease.released_at.is_(None),
+                    )
+                ).all()
+                if change_set is not None
+                else []
+            )
+            if (
+                run is None
+                or change_set is None
+                or deployment is None
+                or issue is None
+                or verification is None
+                or deployment.change_set_id != change_set.id
+                or deployment.desired_sha != deployment_merge.merge_sha
+                or deployment.status != "RUNTIME_VERIFIED"
+                or change_set.state != ChangeSetState.RUNTIME_VERIFIED.value
+                or change_set.source_head_sha != source.merge_sha
+                or change_set.deployment_head_sha != deployment_merge.merge_sha
+                or active_agents
+            ):
+                raise ValueError(
+                    "final runtime, cleanup, or immutable revision evidence is missing"
+                )
+            lease_repositories = {lease.repository for lease in worktree_leases}
+            expected_lease_repositories = {
+                plan.source.repository.rsplit("/", 1)[-1],
+                plan.deployment.repository.rsplit("/", 1)[-1],
+            }
+            if lease_repositories != expected_lease_repositories:
+                raise ValueError("final worktree cleanup lease binding is incomplete")
+            for lease in worktree_leases:
+                lease.released_at = now
+            recovery = dict(change_set.recovery_json)
+            closure = self._object(recovery.get("final_closure"), "final closure")
+            artifact = self._object(closure.get("final_artifact"), "final artifact")
+            evidence = BacklogFinalClosureEvidence(
+                final_source_commit=source.merge_sha,
+                final_deployment_commit=deployment_merge.merge_sha,
+                immutable_artifact_digests=tuple(sorted(change_set.image_digests.values())),
+                staging_revision_verified=True,
+                issue_acceptance_passed=True,
+                regression_suite_passed=True,
+                maker_provider=plan.maker_provider,
+                checker_provider=plan.checker_provider,
+                documentation_impact=plan.documentation_impact,
+                cleanup_passed=True,
+                safe_evidence_comment_ready=True,
+                deployed_change=True,
+            )
+            if evaluate_final_closure(evidence) != "FIXED_CLOSURE_ELIGIBLE":
+                raise ValueError("final closure evidence gate rejected issue closure")
+            evidence_value = evidence.model_dump(mode="json")
+            evidence_value["final_artifact_manifest_sha256"] = artifact["manifest_sha256"]
+            evidence_value["runtime_verification_id"] = str(verification.id)
+            evidence_sha = hashlib.sha256(
+                json.dumps(evidence_value, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            comment = (
+                f"<!-- engineering-control-final-closure:{change_set.id} -->\n"
+                "## Engineering Control final verification\n\n"
+                f"- ChangeSet: `{change_set.id}`\n"
+                f"- Final source commit: `{source.merge_sha}`\n"
+                f"- Final deployment commit: `{deployment_merge.merge_sha}`\n"
+                f"- Immutable artifact evidence: `{artifact['manifest_sha256']}`\n"
+                f"- Runtime verification: `{verification.id}`\n"
+                f"- Final evidence: `{evidence_sha}`\n"
+                "- Result: final staging and runtime verification passed\n"
+            )
+            issue_plan = FinalIssueMutationPlan(
+                closure=plan,
+                final_source_sha=source.merge_sha,
+                final_deployment_sha=deployment_merge.merge_sha,
+                deployment_id=deployment.id,
+                evidence_sha256=evidence_sha,
+                comment_body=comment,
+            )
+            closure["evidence"] = evidence_value
+            closure["evidence_sha256"] = evidence_sha
+            closure["worktree_cleanup"] = {
+                "released_at": now.isoformat(),
+                "repositories": sorted(lease_repositories),
+                "retention_cleanup_pending": True,
+            }
+            recovery["final_closure"] = closure
+            change_set.recovery_json = recovery
+            issue.final_closure_status = "FINAL_EVIDENCE_READY"
+            run.summary = "Final runtime verified; bounded evidence comment is ready"
+        return {
+            **payload,
+            "status": "FINAL_ISSUE_CLOSE_READY",
+            "final_issue_plan": issue_plan.model_dump(mode="json"),
+        }
+
+    def _persist_final_comment(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = FinalIssueMutationPlan.model_validate(payload.get("final_issue_plan"))
+        result = self._object(payload.get("comment_result"), "comment result")
+        if (
+            payload.get("status") != "FINAL_EVIDENCE_COMMENTED"
+            or result.get("status") not in {"COMMENTED", "COMMENT_PRESENT"}
+            or not re.fullmatch(
+                rf"https://github\.com/{re.escape(plan.closure.issue_repository)}/issues/"
+                rf"{plan.closure.issue_number}#issuecomment-[1-9][0-9]*",
+                str(result.get("comment_url", "")),
+            )
+        ):
+            raise ValueError("final evidence comment result is invalid")
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, plan.closure.change_set_id)
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == plan.closure.backlog_campaign_id,
+                    BacklogIssueRecord.repository == plan.closure.issue_repository,
+                    BacklogIssueRecord.issue_number == plan.closure.issue_number,
+                )
+            )
+            if change_set is None or issue is None:
+                raise ValueError("final comment persistence binding is missing")
+            recovery = dict(change_set.recovery_json)
+            closure = self._object(recovery.get("final_closure"), "final closure")
+            closure["comment"] = result
+            recovery["final_closure"] = closure
+            change_set.recovery_json = recovery
+            issue.final_closure_status = "FINAL_EVIDENCE_PERSISTED"
+        return {**payload, "status": "FINAL_EVIDENCE_PERSISTED"}
+
+    def _persist_final_issue_close(self, payload: dict[str, Any]) -> dict[str, Any]:
+        plan = FinalIssueMutationPlan.model_validate(payload.get("final_issue_plan"))
+        result = self._object(payload.get("issue_close_result"), "issue close result")
+        if (
+            payload.get("status") != "ISSUE_CLOSED"
+            or result.get("status") != "CLOSED"
+            or result.get("issue_url")
+            != (
+                f"https://github.com/{plan.closure.issue_repository}/issues/"
+                f"{plan.closure.issue_number}"
+            )
+        ):
+            raise ValueError("final issue closure was not confirmed")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            run = session.get(Run, plan.closure.run_id)
+            change_set = session.get(ChangeSet, plan.closure.change_set_id)
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == plan.closure.backlog_campaign_id,
+                    BacklogIssueRecord.repository == plan.closure.issue_repository,
+                    BacklogIssueRecord.issue_number == plan.closure.issue_number,
+                )
+            )
+            if run is None or change_set is None or issue is None:
+                raise ValueError("final issue closure persistence binding is missing")
+            if (
+                change_set.state == ChangeSetState.ISSUE_CLOSED.value
+                and issue.state == "CLOSED"
+                and issue.final_closure_status == "FIXED_CLOSURE_COMPLETE"
+            ):
+                return {
+                    **payload,
+                    "status": "FIXED",
+                    "change_set_id": str(plan.closure.change_set_id),
+                }
+            recovery = dict(change_set.recovery_json)
+            closure = self._object(recovery.get("final_closure"), "final closure")
+            closure["issue_close"] = result
+            closure["completed_at"] = now.isoformat()
+            recovery["final_closure"] = closure
+            change_set.recovery_json = recovery
+            change_set.state = ChangeSetState.ISSUE_CLOSED.value
+            change_set.version += 1
+            issue.state = "CLOSED"
+            issue.candidate_status = "FIXED"
+            issue.eligibility_status = "COMPLETE"
+            issue.eligibility_reason = "FINAL_RUNTIME_VERIFIED"
+            issue.delivery_status = "COMPLETE"
+            issue.final_closure_status = "FIXED_CLOSURE_COMPLETE"
+            snapshot = dict(issue.github_snapshot_json)
+            snapshot["state"] = "CLOSED"
+            snapshot["closed_at"] = result.get("closed_at")
+            issue.github_snapshot_json = snapshot
+            run.status = "SUCCESS"
+            run.error_code = None
+            run.summary = "Protected merges, final runtime verification, and issue closure complete"
+            run.finished_at = now
+        return {**payload, "status": "FIXED", "change_set_id": str(plan.closure.change_set_id)}
+
+    @staticmethod
+    def _final_pr_binding(
+        *,
+        repository: str,
+        url: str | None,
+        branch: str | None,
+        head_sha: str | None,
+        base_branch: Literal["main", "master"],
+    ) -> ProtectedPullRequestBinding:
+        if url is None or branch is None or head_sha is None:
+            raise ValueError("final closure PR binding is incomplete")
+        match = re.fullmatch(
+            rf"https://github\.com/{re.escape(repository)}/pull/([1-9][0-9]*)", url
+        )
+        if match is None:
+            raise ValueError("final closure PR URL does not match its repository")
+        return ProtectedPullRequestBinding(
+            repository=repository,
+            number=int(match.group(1)),
+            url=url,
+            head_branch=branch,
+            head_sha=head_sha,
+            base_branch=base_branch,
+        )
+
     def _prepare_reconciliation(self, payload: dict[str, Any]) -> dict[str, Any]:
         change_set_id = UUID(str(payload["change_set_id"]))
         orchestration = self._object(payload.get("orchestration"), "orchestration")
@@ -3279,7 +3916,10 @@ class MetadataActivityHandler:
             change_set = session.get(ChangeSet, plan.change_set_id)
             if run is None or change_set is None or run.change_set_id != change_set.id:
                 raise ValueError("promotion metadata binding is missing")
-            if change_set.state != ChangeSetState.CANDIDATE_BUILT.value:
+            if change_set.state not in {
+                ChangeSetState.CANDIDATE_BUILT.value,
+                ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+            }:
                 raise ValueError("immutable promotion requires a verified candidate build")
             if dry_run:
                 run.status = "SUCCESS"
@@ -3305,6 +3945,8 @@ class MetadataActivityHandler:
             existing_promotion = recovery.get("promotion")
             if isinstance(existing_promotion, dict) and (
                 existing_promotion.get("promoted_head_sha") == change_set.deployment_head_sha
+                and existing_promotion.get("source_sha") == change_set.source_head_sha
+                and existing_promotion.get("image_digests") == change_set.image_digests
                 and re.fullmatch(
                     r"[a-f0-9]{40}", str(existing_promotion.get("promoted_head_sha", ""))
                 )
@@ -3413,6 +4055,8 @@ class MetadataActivityHandler:
             recovery["promotion"] = {
                 "base_sha": plan.expected_head_sha,
                 "promoted_head_sha": promoted_head,
+                "source_sha": change_set.source_head_sha,
+                "image_digests": plan.image_digests,
                 "diff_sha256": evidence.get("diff_sha256"),
                 "rendered_manifest_sha256": evidence.get("rendered_manifest_sha256"),
                 "artifacts": payload.get("promotion_artifacts"),
@@ -3429,10 +4073,12 @@ class MetadataActivityHandler:
     def _persist_promotion_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
         publication = PromotionPublication.model_validate(payload.get("promotion_publication"))
         with self.sessions.begin() as session:
+            workflow_id = self._workflow_id(payload)
             run = session.scalar(
                 select(Run).where(
+                    Run.workflow_id == workflow_id,
                     Run.change_set_id == publication.change_set_id,
-                    Run.run_type == "delivery-reconciliation",
+                    Run.run_type.in_({"delivery-reconciliation", "final-closure"}),
                     Run.status == "RUNNING",
                 )
             )
@@ -3482,7 +4128,7 @@ class MetadataActivityHandler:
                 select(Run).where(
                     Run.workflow_id == workflow_id,
                     Run.change_set_id == change_set_id,
-                    Run.run_type == "delivery-reconciliation",
+                    Run.run_type.in_({"delivery-reconciliation", "final-closure"}),
                 )
             )
             if change_set is None or run is None:
@@ -3557,7 +4203,7 @@ class MetadataActivityHandler:
                 select(Run).where(
                     Run.workflow_id == workflow_id,
                     Run.change_set_id == change_set_id,
-                    Run.run_type == "delivery-reconciliation",
+                    Run.run_type.in_({"delivery-reconciliation", "final-closure"}),
                 )
             )
             if change_set is None or run is None:
@@ -3654,10 +4300,10 @@ class MetadataActivityHandler:
             recovery["rollback_plan"] = rollback_plan
             recovery["release_evidence"] = release_evidence
             change_set.recovery_json = recovery
-            run.status = "SUCCESS"
+            run.status = "RUNNING" if run.run_type == "final-closure" else "SUCCESS"
             run.error_code = None
             run.summary = "immutable release and recovery plan independently reviewed"
-            run.finished_at = datetime.now(UTC)
+            run.finished_at = None if run.run_type == "final-closure" else datetime.now(UTC)
             self._release_reconciliation_component(session, change_set, run)
         return {
             **payload,

@@ -205,7 +205,10 @@ class GhCliBroker:
                     "--repo",
                     repository,
                     "--json",
-                    "number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeStateStatus,reviewDecision,statusCheckRollup",
+                    (
+                        "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
+                        "mergeStateStatus,reviewDecision,statusCheckRollup,mergedAt,mergeCommit"
+                    ),
                 ]
             ).stdout,
             "pull request",
@@ -213,6 +216,64 @@ class GhCliBroker:
         if not isinstance(value, dict):
             raise GhCliPolicyError("pull request response is not an object")
         return value
+
+    def view_issue(self, repository: str, number: int) -> dict[str, Any]:
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("issue number is invalid")
+        value = self._json(
+            self._run(
+                [
+                    "issue",
+                    "view",
+                    str(number),
+                    "--repo",
+                    repository,
+                    "--json",
+                    "number,url,state,title,comments,closedAt",
+                ]
+            ).stdout,
+            "issue",
+        )
+        if not isinstance(value, dict):
+            raise GhCliPolicyError("issue response is not an object")
+        comments = value.get("comments")
+        if not isinstance(comments, list) or len(comments) > 500:
+            raise GhCliPolicyError("issue comments response is unbounded")
+        return value
+
+    def list_workflow_runs(
+        self,
+        repository: str,
+        *,
+        workflow_name: str,
+        commit_sha: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        repository = self._batch(repository)
+        workflow_name = self._value(workflow_name, "workflow name", maximum=160)
+        if not re.fullmatch(r"[a-f0-9]{40}", commit_sha) or not 1 <= limit <= 20:
+            raise GhCliPolicyError("workflow run lookup binding is invalid")
+        value = self._json(
+            self._run(
+                [
+                    "run",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--workflow",
+                    workflow_name,
+                    "--commit",
+                    commit_sha,
+                    "--limit",
+                    str(limit),
+                    "--json",
+                    "databaseId,headSha,conclusion,status,event,workflowName,url,createdAt",
+                ]
+            ).stdout,
+            "workflow runs",
+        )
+        return self._list(value, "workflow runs", maximum=limit)
 
     def list_pull_requests(
         self, repository: str, *, head: str, state: Literal["open", "closed", "merged", "all"]
@@ -386,6 +447,149 @@ class GhCliBroker:
         if draft:
             arguments.append("--draft")
         return self._run(arguments).stdout.strip()
+
+    def merge_pull_request(
+        self,
+        *,
+        repository: str,
+        number: int,
+        expected_head_sha: str,
+        expected_base_branch: str,
+        change_binding: str,
+    ) -> dict[str, Any]:
+        repository = self._write(repository, change_binding)
+        expected_base_branch = self._value(
+            expected_base_branch, "protected merge base branch", maximum=120
+        )
+        if number < 1 or not re.fullmatch(r"[a-f0-9]{40}", expected_head_sha):
+            raise GhCliPolicyError("protected merge binding is invalid")
+        current = self.view_pull_request(repository, number)
+        if (
+            current.get("headRefOid") != expected_head_sha
+            or current.get("baseRefName") != expected_base_branch
+        ):
+            raise GhCliPolicyError("protected merge head or base changed")
+        if current.get("state") != "MERGED":
+            if (
+                current.get("state") != "OPEN"
+                or current.get("isDraft") is not False
+                or current.get("mergeStateStatus") != "CLEAN"
+            ):
+                raise GhCliPolicyError("protected merge preconditions are not satisfied")
+            self._run(
+                [
+                    "pr",
+                    "merge",
+                    str(number),
+                    "--repo",
+                    repository,
+                    "--merge",
+                    "--match-head-commit",
+                    expected_head_sha,
+                ]
+            )
+            current = self.view_pull_request(repository, number)
+        merge_commit = current.get("mergeCommit")
+        merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+        if (
+            current.get("state") != "MERGED"
+            or current.get("headRefOid") != expected_head_sha
+            or current.get("baseRefName") != expected_base_branch
+            or not isinstance(merge_sha, str)
+            or not re.fullmatch(r"[a-f0-9]{40}", merge_sha)
+        ):
+            raise GhCliPolicyError("protected merge result is not immutable")
+        commit = self.branch_commit(repository, merge_sha)
+        return {
+            "repository": repository,
+            "pull_request_number": number,
+            "pull_request_url": current.get("url"),
+            "head_sha": expected_head_sha,
+            "merge_sha": merge_sha,
+            "merge_tree_sha": commit["tree"],
+            "state": "MERGED",
+        }
+
+    def comment_issue(
+        self,
+        *,
+        repository: str,
+        number: int,
+        body_file: Path,
+        marker: str,
+        change_binding: str,
+    ) -> dict[str, Any]:
+        repository = self._write(repository, change_binding)
+        if number < 1 or not re.fullmatch(
+            r"<!-- engineering-control-final-closure:[a-f0-9-]{36} -->", marker
+        ):
+            raise GhCliPolicyError("issue comment binding is invalid")
+        issue = self.view_issue(repository, number)
+        matches = [
+            comment
+            for comment in issue["comments"]
+            if isinstance(comment, dict) and marker in str(comment.get("body") or "")
+        ]
+        if len(matches) > 1:
+            raise GhCliPolicyError("multiple final-closure comments share one binding")
+        if matches:
+            return {"status": "COMMENT_PRESENT", "comment_url": matches[0].get("url")}
+        if issue.get("state") != "OPEN":
+            raise GhCliPolicyError("issue closed before final evidence publication")
+        url = self._run(
+            [
+                "issue",
+                "comment",
+                str(number),
+                "--repo",
+                repository,
+                "--body-file",
+                str(self._bounded_file(body_file)),
+            ]
+        ).stdout.strip()
+        if not re.fullmatch(r"https://github\.com/[^\s]+#issuecomment-[1-9][0-9]*", url):
+            raise GhCliPolicyError("issue comment returned an invalid URL")
+        return {"status": "COMMENTED", "comment_url": url}
+
+    def close_issue(
+        self,
+        *,
+        repository: str,
+        number: int,
+        marker: str,
+        change_binding: str,
+    ) -> dict[str, Any]:
+        repository = self._write(repository, change_binding)
+        if number < 1 or not re.fullmatch(
+            r"<!-- engineering-control-final-closure:[a-f0-9-]{36} -->", marker
+        ):
+            raise GhCliPolicyError("issue closure binding is invalid")
+        issue = self.view_issue(repository, number)
+        if not any(
+            isinstance(comment, dict) and marker in str(comment.get("body") or "")
+            for comment in issue["comments"]
+        ):
+            raise GhCliPolicyError("issue closure requires its persisted evidence comment")
+        if issue.get("state") == "OPEN":
+            self._run(
+                [
+                    "issue",
+                    "close",
+                    str(number),
+                    "--repo",
+                    repository,
+                    "--reason",
+                    "completed",
+                ]
+            )
+            issue = self.view_issue(repository, number)
+        if issue.get("state") != "CLOSED" or not issue.get("closedAt"):
+            raise GhCliPolicyError("issue closure was not confirmed")
+        return {
+            "status": "CLOSED",
+            "issue_url": issue.get("url"),
+            "closed_at": issue.get("closedAt"),
+        }
 
     def search_open_issues(self, repository: str, fingerprint: str) -> list[dict[str, Any]]:
         return self.search_issues(repository, f'"{fingerprint}"')

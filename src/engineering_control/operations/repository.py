@@ -987,7 +987,7 @@ class OperationsRepository:
         )
 
     def _full_delivery_blockers(self, project: str) -> list[str]:
-        blockers = ["FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED"]
+        blockers: list[str] = []
         root = self.project_config_root
         if root is None:
             return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED"]

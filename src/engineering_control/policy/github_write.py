@@ -23,6 +23,8 @@ READ_ONLY_GITHUB_STEPS = frozenset(
         "backlog.github_import",
         "llmwiki.bootstrap.plan",
         "reconcile.inspect_ci",
+        "final.inspect_artifact",
+        "final.sync_worktrees",
     }
 )
 WRITE_CAPABLE_GITHUB_STEPS = frozenset(
@@ -31,6 +33,10 @@ WRITE_CAPABLE_GITHUB_STEPS = frozenset(
         "enhancement.publish",
         "finding.publish",
         "reconcile.publish_promotion",
+        "final.merge_source",
+        "final.merge_deployment",
+        "final.comment_issue",
+        "final.close_issue",
     }
 )
 GITHUB_ACTIVITY_STEPS = READ_ONLY_GITHUB_STEPS | WRITE_CAPABLE_GITHUB_STEPS

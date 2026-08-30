@@ -58,6 +58,16 @@ class DeliveryReconciliationInput:
 
 
 @dataclass
+class FinalClosureInput:
+    backlog_campaign_id: str
+    change_set_id: str
+    finding_id: str
+    project: str
+    issue_repository: str
+    issue_number: int
+
+
+@dataclass
 class PreviewDeploymentInput:
     change_set_id: str
     project: str

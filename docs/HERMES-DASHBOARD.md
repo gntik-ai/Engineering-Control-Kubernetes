@@ -62,15 +62,16 @@ server-generated typed phrase bound to the candidate digest. Capability prefligh
 the API dispatcher immediately before starting or signaling a workflow. Production is a literal
 `false` field in the typed schemas. R3 actions fail closed for operator handling.
 
-The current complete-delivery backend has no reviewed exact-final-merge build/deploy/verify and
-GitHub merge/comment/issue-close application service. Consequently ordinary `full-delivery`
-candidates report `FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED` and remain disabled.
-Source-PR mode uses the existing gated issue-delivery workflow and registers its child
-finding-verification and delivery Runs durably before child start. The global campaign may drive a
-candidate through immutable reconciliation, staging, and runtime verification, but stops at
-`FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED`; it never treats candidate-only evidence as final
-closure. This distinction prevents the console from advertising a complete solve path that the
-current runtime cannot finish.
+Full delivery now includes a separate typed `FinalClosureWorkflow`. Candidate staging evidence is
+still not final evidence: the closure workflow merges only the exact protected source PR head,
+discovers and verifies signed artifacts built at the resulting merge SHA, regenerates immutable
+deployment content, obtains an opposite-provider release review, merges the exact deployment PR
+head, synchronizes the bounded worktrees to both merge commits, and repeats staging and runtime
+verification. Only then may it publish a bounded evidence comment and close the issue. Each GitHub
+mutation passes through the same repository write policy as Telegram and `engineering-ctl`, and
+uses an idempotent ChangeSet binding. Source-PR mode retains the existing gated path. Project build,
+promotion, staging, observer, credential, and production blockers remain authoritative, so the
+presence of the closure service does not make an incompletely configured project actionable.
 
 Enhancement candidates use their existing `approval_binding_sha256` as the authoritative immutable
 binding. Commands exposes typed approve, reject, and run forms: the server resolves and injects the
