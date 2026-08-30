@@ -18,6 +18,7 @@ from engineering_control.db.models import BacklogIssueRecord, GitHubBacklogCampa
 from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.engineering.backlog import (
     BACKLOG_PROJECT_PAIRS,
+    BacklogApprovalBinding,
     BacklogFinalClosureEvidence,
     BacklogIssueType,
     DocumentationImpact,
@@ -524,6 +525,20 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
             musematic_candidate["approval_binding"],
             "cli:engineering-ctl",
         )
+    with repository.sessions.begin() as session:
+        pending_owner = session.get(GitHubBacklogCampaign, falcone_id)
+        assert pending_owner is not None
+        pending_owner.approval_json = {
+            **pending_owner.approval_json["binding"],
+            **pending_owner.approval_json["approval"],
+        }
+    with pytest.raises(ValueError, match="activation is pending"):
+        await repository.approve_backlog_campaign(
+            musematic_id,
+            "musematic",
+            musematic_candidate["approval_binding"],
+            "cli:engineering-ctl",
+        )
     request_path = request_root / "activate.json"
     request_path.unlink()
     with repository.sessions.begin() as session:
@@ -552,10 +567,17 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
     with repository.sessions.begin() as session:
         owner = session.get(GitHubBacklogCampaign, falcone_id)
         assert owner is not None
-        owner_binding = dict(owner.approval_json["binding"])
+        owner_binding = BacklogApprovalBinding.model_validate(
+            {field: owner.approval_json.get(field) for field in BacklogApprovalBinding.model_fields}
+        ).model_dump(mode="json")
         owner_binding["expires_at"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
         owner.approval_binding = canonical_sha256(owner_binding)
-        owner.approval_json = {**owner.approval_json, "binding": owner_binding}
+        owner.approval_json = {
+            **owner_binding,
+            "approved_by": owner.approval_json["approved_by"],
+            "approved_at": owner.approval_json["approved_at"],
+            "typed_confirmation": owner.approval_json["typed_confirmation"],
+        }
         session.add(
             campaign(
                 llmwiki_id,

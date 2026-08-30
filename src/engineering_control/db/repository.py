@@ -664,10 +664,15 @@ class SQLMetadataRepository:
                 )
             )
             if pending_owner is not None:
-                pending_binding = pending_owner.approval_json.get("binding")
+                nested_pending_binding = pending_owner.approval_json.get("binding")
+                pending_binding = (
+                    nested_pending_binding
+                    if isinstance(nested_pending_binding, dict)
+                    else pending_owner.approval_json
+                )
                 pending_expiry = (
                     datetime.fromisoformat(str(pending_binding.get("expires_at")))
-                    if isinstance(pending_binding, dict)
+                    if pending_binding
                     else now
                 )
                 if pending_expiry.tzinfo is None:

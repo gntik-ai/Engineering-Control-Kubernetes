@@ -28,7 +28,11 @@ issue.
   deployment merge or issue close.
 - Immutable promotion and opposite-provider release review bind the deployment PR head. A metadata
   activity reloads that exact persisted plan and the current campaign/R3 approval immediately before
-  issuing a bounded authorization digest; the delivery broker rejects deployment merge without it.
+  issuing a deterministic ordering marker; the delivery broker rejects deployment merge without
+  that marker. The database revalidation, rather than secrecy of the marker, is the authorization
+  boundary.
+- The five currently approved repositories use only `main` or `master` as their bound protected base
+  branch. Any other persisted/default branch fails closed until explicitly supported.
 - Both local worktrees must be regular in-root directories, clean before synchronization, and clean
   at the exact merge SHAs and trees afterward.
 - A staging deployment and post-staging runtime verification must persist for the exact final
