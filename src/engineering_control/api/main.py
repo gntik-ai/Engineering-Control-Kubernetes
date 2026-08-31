@@ -187,6 +187,10 @@ def create_app(
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=16, max_length=128),
         bus: TypedCommandBus = commands_dependency,
     ) -> dict[str, Any]:
+        # This private HTTP ingress is used by the fixed Telegram hook and the
+        # hermes-owned CLI.  The dashboard invokes TypedCommandBus in-process
+        # only after password reauthentication, so it cannot self-assert an
+        # HTTP actor header here.
         durable_actor = approval_actor(subject)
         try:
             command = parse_command(body)

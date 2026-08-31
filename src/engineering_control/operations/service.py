@@ -354,7 +354,7 @@ class TypedCommandBus:
     @staticmethod
     def _approval_actor(operator_class: str) -> str:
         if operator_class == "password-reauthenticated-operator":
-            return "dashboard:reauthenticated:hermes"
+            return "dashboard:reauthenticated"
         try:
             return canonical_operator_approval_actor(operator_class)
         except ValueError as error:

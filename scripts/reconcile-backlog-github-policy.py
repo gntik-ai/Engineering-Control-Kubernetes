@@ -37,6 +37,9 @@ SAFE_REPOSITORIES = (
     "gntik-ai/llmwiki",
 )
 PRE_APPROVAL_STATUSES = frozenset({"IMPORTED", "PLANNED", "AWAITING_APPROVAL"})
+UNAPPROVED_EVIDENCE_STATUSES = PRE_APPROVAL_STATUSES | frozenset(
+    {"EXPIRED", "STOPPED", "CANCELLED", "FAILED"}
+)
 REQUEST_KEYS = frozenset(
     {
         "action",
@@ -266,7 +269,7 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
             field in evidence for field in ("approved_by", "approved_at", "typed_confirmation")
         )
         if not nested and not has_flat_approval:
-            if campaign.status not in PRE_APPROVAL_STATUSES:
+            if campaign.status not in UNAPPROVED_EVIDENCE_STATUSES:
                 raise approval_audit_error(
                     campaign_id=campaign.id,
                     campaign_count=campaign_count,
@@ -278,7 +281,10 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
             continue
         if nested:
             if raw_approval is None and not has_flat_approval:
-                if isinstance(raw_binding, dict) and campaign.status in PRE_APPROVAL_STATUSES:
+                if (
+                    isinstance(raw_binding, dict)
+                    and campaign.status in UNAPPROVED_EVIDENCE_STATUSES
+                ):
                     unapproved += 1
                     continue
                 raise approval_audit_error(

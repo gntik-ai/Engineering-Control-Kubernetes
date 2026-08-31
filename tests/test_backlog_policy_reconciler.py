@@ -102,7 +102,7 @@ def campaign(
 
 @pytest.mark.parametrize(
     "approved_by",
-    ["telegram:42", "dashboard:reauthenticated:hermes", "cli:engineering-ctl:hermes"],
+    ["telegram:42", "dashboard:reauthenticated", "cli:engineering-ctl"],
 )
 def test_root_reconciler_accepts_every_typed_reauthenticated_approval_actor(
     tmp_path: Path,
@@ -135,7 +135,7 @@ def test_root_reconciler_accepts_every_typed_reauthenticated_approval_actor(
 
 @pytest.mark.parametrize(
     "requested_by",
-    ["telegram:42", "dashboard:reauthenticated:hermes", "cli:engineering-ctl:hermes"],
+    ["telegram:42", "dashboard:reauthenticated", "cli:engineering-ctl"],
 )
 def test_policy_request_accepts_every_typed_reauthenticated_operator(
     tmp_path: Path,
@@ -214,7 +214,7 @@ def test_policy_request_rejects_wrong_owner_mode_and_symlink(tmp_path: Path) -> 
 
 @pytest.mark.parametrize(
     "actor",
-    ["telegram:42", "dashboard:reauthenticated:hermes", "cli:engineering-ctl:hermes"],
+    ["telegram:42", "dashboard:reauthenticated", "cli:engineering-ctl"],
 )
 def test_shared_backlog_operator_policy_accepts_exact_identities(actor: str) -> None:
     assert is_reauthenticated_backlog_operator(actor) is True
@@ -223,7 +223,7 @@ def test_shared_backlog_operator_policy_accepts_exact_identities(actor: str) -> 
 def test_shared_backlog_operator_policy_fixed_set_is_fail_closed() -> None:
     assert isinstance(BACKLOG_FIXED_OPERATOR_ACTORS, frozenset)
     assert BACKLOG_FIXED_OPERATOR_ACTORS == frozenset(
-        {"dashboard:reauthenticated:hermes", "cli:engineering-ctl:hermes"}
+        {"dashboard:reauthenticated", "cli:engineering-ctl"}
     )
 
 
@@ -232,15 +232,13 @@ def test_typed_telegram_actor_accepts_any_canonical_id_after_ingress_authenticat
 
 
 def test_authenticated_cli_subject_maps_to_stable_durable_operator() -> None:
-    assert canonical_operator_approval_actor("engineering-ctl:hermes") == (
-        "cli:engineering-ctl:hermes"
-    )
+    assert canonical_operator_approval_actor("engineering-ctl:hermes") == ("cli:engineering-ctl")
     assert canonical_operator_approval_actor("telegram:42") == "telegram:42"
     for invalid in (
         "engineering-ctl",
         "engineering-ctl:root",
-        "cli:engineering-ctl:hermes",
-        "dashboard:reauthenticated:hermes",
+        "cli:engineering-ctl",
+        "dashboard:reauthenticated",
         "telegram:allowlisted",
     ):
         with pytest.raises(ValueError, match="authenticated operator identity"):
@@ -267,12 +265,10 @@ def test_authenticated_cli_subject_maps_to_stable_durable_operator() -> None:
         "telegram:\u0664\u0662",
         "dashboard:",
         "dashboard:session",
-        "dashboard:reauthenticated",
-        "dashboard:reauthenticated:hermes ",
+        "dashboard:reauthenticated ",
         "cli:",
         "cli:other",
-        "cli:engineering-ctl",
-        "cli:engineering-ctl:hermes ",
+        "cli:engineering-ctl ",
     ],
 )
 def test_shared_backlog_operator_policy_rejects_near_matches(actor: str) -> None:
@@ -316,7 +312,7 @@ def test_root_reconciler_accepts_exact_stopped_owner_and_rejects_malformed_neste
 @pytest.mark.parametrize(
     ("requested_by", "approval_binding", "message"),
     [
-        ("cli:engineering-ctl:hermes", None, "actor changed"),
+        ("cli:engineering-ctl", None, "actor changed"),
         ("api:untrusted", None, "typed reauthenticated operator"),
         ("telegram:42", "f" * 64, "no current approved campaign"),
     ],
@@ -379,7 +375,7 @@ def test_durable_actor_audit_accepts_canonical_and_rejects_legacy_shape(tmp_path
         status="APPROVED_POLICY_PENDING",
         role="owner",
         now=now,
-        approved_by="cli:engineering-ctl:hermes",
+        approved_by="cli:engineering-ctl",
     )
     valid_telegram = campaign(
         UUID("33333333-3333-4333-8333-333333333333"),
@@ -462,7 +458,7 @@ def test_durable_actor_audit_counts_unapproved_and_rejects_shape_disagreement(
                 "approved_at": datetime.now(UTC).isoformat(),
                 "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
             },
-            "approved_by": "cli:engineering-ctl:hermes",
+            "approved_by": "cli:engineering-ctl",
         }
     with Session(engine) as session, pytest.raises(ValueError, match="shapes disagree"):
         AUDIT_ACTORS(session)
@@ -575,10 +571,18 @@ def test_durable_actor_audit_accepts_terminal_evidence_and_one_phrase_only(
         role="inventory",
         now=now,
     )
+    stopped_unapproved = campaign(
+        UUID("33333333-3333-4333-8333-333333333333"),
+        project="llmwiki",
+        status="STOPPED",
+        role="inventory",
+        now=now,
+    )
+    stopped_unapproved.approval_json = {"binding": stopped_unapproved.approval_json["binding"]}
     with Session(engine) as session, session.begin():
-        session.add_all([stopped, expired])
+        session.add_all([stopped, expired, stopped_unapproved])
     with Session(engine) as session:
-        assert AUDIT_ACTORS(session) == (2, 2, 0)
+        assert AUDIT_ACTORS(session) == (3, 2, 1)
 
     with Session(engine) as session, session.begin():
         stored = session.get(GitHubBacklogCampaign, stopped_id)
