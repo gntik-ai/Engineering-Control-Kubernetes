@@ -36,6 +36,19 @@ SAFE_REPOSITORIES = (
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
 )
+APPROVAL_REQUIRED_STATUSES = frozenset(
+    {
+        "APPROVED_POLICY_PENDING",
+        "APPROVED_INVENTORY",
+        "APPROVED",
+        "RUNNING",
+        "PAUSED",
+        "COMPLETE",
+        "STOPPED",
+        "CANCELLED",
+        "EXPIRED",
+    }
+)
 REQUEST_KEYS = frozenset(
     {
         "action",
@@ -219,10 +232,11 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     return not unexpired_owner
 
 
-def audit_approval_actors(session: Session) -> tuple[int, int]:
+def audit_approval_actors(session: Session) -> tuple[int, int, int]:
     """Fail closed when durable backlog approvals contain a noncanonical actor."""
     campaign_count = 0
     reviewed = 0
+    unapproved = 0
     campaigns = session.scalars(select(GitHubBacklogCampaign)).yield_per(100)
     for campaign in campaigns:
         campaign_count += 1
@@ -235,15 +249,22 @@ def audit_approval_actors(session: Session) -> tuple[int, int]:
             field in evidence for field in ("approved_by", "approved_at", "typed_confirmation")
         )
         if not nested and not has_flat_approval:
+            if campaign.status in APPROVAL_REQUIRED_STATUSES:
+                raise ValueError("durable backlog campaign lacks canonical approval evidence")
+            unapproved += 1
             continue
         if nested and not isinstance(raw_approval, dict):
             raise ValueError("durable backlog approval evidence is malformed")
         approval = raw_approval if nested else evidence
+        if nested and has_flat_approval:
+            for field in ("approved_by", "approved_at", "typed_confirmation"):
+                if field in evidence and evidence[field] != approval.get(field):
+                    raise ValueError("durable backlog approval shapes disagree")
         actor = approval.get("approved_by")
         reviewed += 1
         if not isinstance(actor, str) or not is_reauthenticated_backlog_operator(actor):
             raise ValueError("durable backlog approval contains a noncanonical operator actor")
-    return campaign_count, reviewed
+    return campaign_count, reviewed, unapproved
 
 
 def validate_current_policy(path: Path, group_id: int) -> None:
@@ -319,10 +340,11 @@ def main() -> int:
     engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
     if args.audit_only:
         with Session(engine) as session:
-            campaigns, reviewed = audit_approval_actors(session)
+            campaigns, reviewed, unapproved = audit_approval_actors(session)
             session.rollback()
         print(
-            f"GITHUB_BACKLOG_APPROVAL_ACTOR_AUDIT_PASS campaigns={campaigns} approvals={reviewed}"
+            "GITHUB_BACKLOG_APPROVAL_ACTOR_AUDIT_PASS "
+            f"campaigns={campaigns} approvals={reviewed} unapproved={unapproved}"
         )
         return 0
     if args.expire_only:

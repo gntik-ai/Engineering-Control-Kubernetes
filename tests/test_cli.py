@@ -13,7 +13,21 @@ def test_cli_accepts_service_group_read_token(tmp_path: Path) -> None:
 
     client = APIClient("http://127.0.0.1:8740", token)
 
+    assert client.client.headers["X-Engineering-Actor"] == "engineering-ctl:hermes"
     client.client.close()
+
+
+def test_cli_refuses_a_non_operator_unix_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = tmp_path / "api.token"
+    token.write_text("x" * 48, encoding="utf-8")
+    os.chmod(token, 0o640)
+    identity = type("Identity", (), {"pw_name": "root"})()
+    monkeypatch.setattr("engineering_control.cli.pwd.getpwuid", lambda _uid: identity)
+
+    with pytest.raises(PermissionError, match="must run as the hermes operator"):
+        APIClient("http://127.0.0.1:8740", token)
 
 
 def test_cli_rejects_group_writable_token(tmp_path: Path) -> None:

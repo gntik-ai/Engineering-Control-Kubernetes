@@ -507,7 +507,7 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
         falcone_id,
         "falcone",
         falcone_candidate["approval_binding"],
-        "cli:engineering-ctl",
+        "cli:engineering-ctl:hermes",
     )
     musematic_candidate = await repository.prepare_backlog_approval(
         musematic_id,
@@ -523,7 +523,7 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
             musematic_id,
             "musematic",
             musematic_candidate["approval_binding"],
-            "cli:engineering-ctl",
+            "cli:engineering-ctl:hermes",
         )
     with repository.sessions.begin() as session:
         pending_owner = session.get(GitHubBacklogCampaign, falcone_id)
@@ -539,7 +539,7 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
             musematic_id,
             "musematic",
             musematic_candidate["approval_binding"],
-            "cli:engineering-ctl",
+            "cli:engineering-ctl:hermes",
         )
     with repository.sessions.begin() as session:
         pending_owner = session.get(GitHubBacklogCampaign, falcone_id)
@@ -555,7 +555,7 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
             musematic_id,
             "musematic",
             musematic_candidate["approval_binding"],
-            "cli:engineering-ctl",
+            "cli:engineering-ctl:hermes",
         )
     request_path = request_root / "activate.json"
     request_path.unlink()
@@ -571,7 +571,7 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
         musematic_id,
         "musematic",
         musematic_candidate["approval_binding"],
-        "cli:engineering-ctl",
+        "cli:engineering-ctl:hermes",
     )
 
     assert approved["status"] == "APPROVED_INVENTORY"
@@ -619,7 +619,7 @@ async def test_global_inventory_approval_reuses_the_active_shared_policy(tmp_pat
         llmwiki_id,
         "llmwiki",
         llmwiki_candidate["approval_binding"],
-        "cli:engineering-ctl",
+        "cli:engineering-ctl:hermes",
     )
     assert replacement["status"] == "APPROVED_POLICY_PENDING"
     with repository.sessions() as session:
@@ -686,7 +686,7 @@ def test_backlog_stop_after_current_persists_terminal_state_and_policy_deactivat
                 dependency_graph_hash="c" * 64,
                 plan_hash="d" * 64,
                 approval_binding="e" * 64,
-                approval_json={"approval": {"approved_by": "dashboard:reauthenticated"}},
+                approval_json={"approval": {"approved_by": "dashboard:reauthenticated:hermes"}},
                 maximum_risk="R2",
                 maximum_items=2,
                 maximum_concurrency=1,
@@ -710,7 +710,7 @@ def test_backlog_stop_after_current_persists_terminal_state_and_policy_deactivat
         assert session.get(GitHubBacklogCampaign, campaign_id).status == "STOPPED"
     policy = json.loads((policy_root / "activate.json").read_text(encoding="utf-8"))
     assert policy["action"] == "disable-existing-backlog"
-    assert policy["requested_by"] == "dashboard:reauthenticated"
+    assert policy["requested_by"] == "dashboard:reauthenticated:hermes"
 
 
 def test_synthetic_existing_backlog_lifecycle_covers_terminal_cases() -> None:

@@ -422,8 +422,8 @@ class OperationsRepository:
     ) -> dict[str, Any]:
         if not (
             actor.startswith("telegram:")
-            or actor == "engineering-ctl"
-            or actor == "dashboard:reauthenticated"
+            or actor == "cli:engineering-ctl:hermes"
+            or actor == "dashboard:reauthenticated:hermes"
         ):
             raise ValueError("R3 approval requires an allowlisted operator channel")
         candidate = self._r3_issue_candidate(project, surface, issue_number, False)

@@ -529,7 +529,7 @@ def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
         )
         cli_actor = client.post(
             "/v1/commands",
-            headers={**base, "X-Engineering-Actor": "engineering-ctl"},
+            headers={**base, "X-Engineering-Actor": "engineering-ctl:hermes"},
             json={"action": "refresh_connections"},
         )
         telegram_actor = client.post(
@@ -539,7 +539,7 @@ def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
         )
         arbitrary = client.post(
             "/v1/commands",
-            headers={**base, "X-Engineering-Actor": "engineering-ctl"},
+            headers={**base, "X-Engineering-Actor": "engineering-ctl:hermes"},
             json={"action": "shell", "command": "id"},
         )
     assert default_actor.status_code == 403

@@ -51,6 +51,7 @@ from engineering_control.db.repository import (
     MetadataRepository,
     SQLMetadataRepository,
 )
+from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project, RiskClass
 from engineering_control.observability.agent import (
@@ -180,7 +181,7 @@ def create_app(
         bus: TypedCommandBus = commands_dependency,
     ) -> dict[str, Any]:
         try:
-            if subject != "engineering-ctl" and not subject.startswith("telegram:"):
+            if subject != "engineering-ctl:hermes" and not subject.startswith("telegram:"):
                 raise HTTPException(status_code=403, detail="typed command channel is not allowed")
             command = parse_command(body)
             source_channel = "telegram" if subject.startswith("telegram:") else "cli"
@@ -530,7 +531,7 @@ def create_app(
                 body.issue_number,
                 body.binding,
                 body.confirmation_phrase,
-                subject,
+                canonical_operator_approval_actor(subject),
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -757,7 +758,10 @@ def create_app(
     ) -> dict[str, Any]:
         try:
             return await repository.approve_backlog_campaign(
-                campaign_id, body.project, body.approval_binding, subject
+                campaign_id,
+                body.project,
+                body.approval_binding,
+                canonical_operator_approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -902,7 +906,9 @@ def create_app(
     ) -> dict[str, Any]:
         try:
             return await repository.approve_enhancement(
-                enhancement_id, body.approval_binding, subject
+                enhancement_id,
+                body.approval_binding,
+                canonical_operator_approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -915,7 +921,11 @@ def create_app(
         repository: MetadataRepository = metadata_dependency,
     ) -> dict[str, Any]:
         try:
-            return await repository.reject_enhancement(enhancement_id, body.reason, subject)
+            return await repository.reject_enhancement(
+                enhancement_id,
+                body.reason,
+                canonical_operator_approval_actor(subject),
+            )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -997,7 +1007,7 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> dict[str, str]:
         try:
-            await service.record_approval(body, subject)
+            await service.record_approval(body, canonical_operator_approval_actor(subject))
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"status": "ACCEPTED"}

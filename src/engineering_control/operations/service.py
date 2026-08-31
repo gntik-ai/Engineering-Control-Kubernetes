@@ -353,11 +353,11 @@ class TypedCommandBus:
     @staticmethod
     def _approval_actor(operator_class: str) -> str:
         if operator_class == "password-reauthenticated-operator":
-            return "dashboard:reauthenticated"
+            return "dashboard:reauthenticated:hermes"
         if operator_class.startswith("telegram:"):
             return operator_class
-        if operator_class == "engineering-ctl":
-            return "cli:engineering-ctl"
+        if operator_class == "engineering-ctl:hermes":
+            return "cli:engineering-ctl:hermes"
         raise ValueError("operation requires an allowlisted operator channel")
 
     @staticmethod

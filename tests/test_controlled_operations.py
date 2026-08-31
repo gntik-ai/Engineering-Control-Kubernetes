@@ -729,7 +729,7 @@ async def test_bounded_evidence_exports_are_typed_redacted_expiring_and_cross_ch
     campaign_operation = await bus.submit(
         campaign_command,
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("campaign-export", 1),
     )
     assert campaign_operation.status == "COMPLETED"
@@ -824,7 +824,7 @@ async def test_evidence_export_truncates_collection_prefixes_to_configured_size(
     operation = await bus.submit(
         EvidenceExportCampaignCommand(campaign_id=AUDIT_CAMPAIGN_ID),
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("oversized-campaign-export", 1),
     )
     assert operation.status == "COMPLETED"
@@ -914,7 +914,7 @@ async def test_enhancement_actions_use_immutable_binding_and_typed_services(
     approved = await bus.submit(
         approve,
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("enhancement-approve", 1),
     )
     assert approved.status == "COMPLETED"
@@ -951,7 +951,7 @@ async def test_enhancement_actions_use_immutable_binding_and_typed_services(
             reason_code="OUT_OF_SCOPE",
         ),
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("enhancement-reject", 1),
     )
     assert rejected.status == "COMPLETED"
@@ -990,7 +990,7 @@ async def test_cli_and_telegram_share_one_command_bus_and_workflow_identity(
     cli = await bus.submit(
         _solve_issue(),
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("cli", 1),
     )
     telegram = await bus.submit(
@@ -1043,7 +1043,7 @@ async def test_state_dependent_workflow_controls_use_only_typed_signals(
         result = await bus.submit(
             WorkflowControlCommand(action=action, workflow_id=workflow_id),  # type: ignore[arg-type]
             source_channel="cli",
-            operator_class="engineering-ctl",
+            operator_class="engineering-ctl:hermes",
             idempotency_key=_idempotency_fixture("control", ordinal),
         )
         assert result.status == "STARTED"
@@ -1081,14 +1081,14 @@ async def test_audit_start_requires_recent_matching_plan_and_defaults_to_no_publ
             }
         ),
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("audit-plan", 1),
     )
     assert planned.status == "COMPLETED"
     accepted = await bus.submit(
         start,
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("audit-start", 1),
     )
     assert accepted.workflow_id == "audit-synthetic"
@@ -1117,7 +1117,7 @@ async def test_all_project_audit_requires_plan_then_starts_exactly_one_parent(
     planned = await bus.submit(
         AuditAllProjectsCommand(mode="plan", preset="snapshot"),
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("audit-all-plan", 1),
     )
     assert planned.status == "COMPLETED"
@@ -1141,7 +1141,7 @@ async def test_all_project_audit_requires_plan_then_starts_exactly_one_parent(
     accepted = await bus.submit(
         start,
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("audit-all-start", 1),
     )
     assert accepted.workflow_id == "audit-all-synthetic"
@@ -1169,7 +1169,7 @@ async def test_all_project_audit_plan_stops_before_start_when_one_project_is_blo
     result = await bus.submit(
         AuditAllProjectsCommand(mode="plan", preset="snapshot"),
         source_channel="cli",
-        operator_class="engineering-ctl",
+        operator_class="engineering-ctl:hermes",
         idempotency_key=_idempotency_fixture("audit-all-blocked", 1),
     )
 

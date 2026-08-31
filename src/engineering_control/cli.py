@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import stat
 import sys
 from collections.abc import Callable
@@ -30,6 +31,9 @@ def _bounded_integer(minimum: int, maximum: int) -> Callable[[str], int]:
 
 class APIClient:
     def __init__(self, base_url: str, token_file: Path) -> None:
+        operator = pwd.getpwuid(os.geteuid()).pw_name
+        if operator != "hermes":
+            raise PermissionError("engineering-ctl must run as the hermes operator")
         metadata = token_file.stat()
         if metadata.st_mode & (stat.S_IWGRP | stat.S_IXGRP | stat.S_IRWXO):
             raise PermissionError("API token file permissions are too broad")
@@ -38,7 +42,7 @@ class APIClient:
             base_url=base_url,
             headers={
                 "Authorization": f"Bearer {token}",
-                "X-Engineering-Actor": "engineering-ctl",
+                "X-Engineering-Actor": f"engineering-ctl:{operator}",
             },
             timeout=30,
         )
