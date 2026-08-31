@@ -151,12 +151,15 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
         raise ValueError("GitHub campaign approval evidence is incomplete") from error
     if canonical_sha256(exact_binding.model_dump(mode="json")) != request["approval_binding"]:
         raise ValueError("GitHub campaign approval binding changed")
-    if (
-        approval.get("approved_by") != request["requested_by"]
-        or approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
-        or not approval.get("approved_at")
-    ):
+    approved_by = approval.get("approved_by")
+    if not isinstance(approved_by, str) or not is_reauthenticated_backlog_operator(approved_by):
+        raise ValueError("GitHub campaign approval actor is noncanonical")
+    if approved_by != request["requested_by"]:
         raise ValueError("GitHub policy request actor changed")
+    if approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE or not approval.get(
+        "approved_at"
+    ):
+        raise ValueError("GitHub campaign approval evidence is incomplete")
     expires_at = exact_binding.expires_at
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
@@ -216,20 +219,31 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     return not unexpired_owner
 
 
-def audit_approval_actors(session: Session) -> int:
+def audit_approval_actors(session: Session) -> tuple[int, int]:
     """Fail closed when durable backlog approvals contain a noncanonical actor."""
+    campaign_count = 0
     reviewed = 0
-    campaigns = session.scalars(select(GitHubBacklogCampaign)).all()
+    campaigns = session.scalars(select(GitHubBacklogCampaign)).yield_per(100)
     for campaign in campaigns:
-        raw_approval = campaign.approval_json.get("approval")
-        approval = raw_approval if isinstance(raw_approval, dict) else campaign.approval_json
-        actor = approval.get("approved_by") if isinstance(approval, dict) else None
-        if actor is None:
+        campaign_count += 1
+        evidence = campaign.approval_json
+        if not isinstance(evidence, dict):
+            raise ValueError("durable backlog approval evidence is malformed")
+        nested = "approval" in evidence
+        raw_approval = evidence.get("approval")
+        has_flat_approval = any(
+            field in evidence for field in ("approved_by", "approved_at", "typed_confirmation")
+        )
+        if not nested and not has_flat_approval:
             continue
+        if nested and not isinstance(raw_approval, dict):
+            raise ValueError("durable backlog approval evidence is malformed")
+        approval = raw_approval if nested else evidence
+        actor = approval.get("approved_by")
         reviewed += 1
         if not isinstance(actor, str) or not is_reauthenticated_backlog_operator(actor):
             raise ValueError("durable backlog approval contains a noncanonical operator actor")
-    return reviewed
+    return campaign_count, reviewed
 
 
 def validate_current_policy(path: Path, group_id: int) -> None:
@@ -305,8 +319,11 @@ def main() -> int:
     engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
     if args.audit_only:
         with Session(engine) as session:
-            reviewed = audit_approval_actors(session)
-        print(f"GITHUB_BACKLOG_APPROVAL_ACTOR_AUDIT_PASS reviewed={reviewed}")
+            campaigns, reviewed = audit_approval_actors(session)
+            session.rollback()
+        print(
+            f"GITHUB_BACKLOG_APPROVAL_ACTOR_AUDIT_PASS campaigns={campaigns} approvals={reviewed}"
+        )
         return 0
     if args.expire_only:
         with Session(engine) as session, session.begin():

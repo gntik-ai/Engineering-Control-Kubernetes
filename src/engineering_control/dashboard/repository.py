@@ -213,31 +213,31 @@ class DashboardRepository:
     ) -> dict[str, Any]:
         records: list[dict[str, Any]] = []
         with self.sessions() as session:
-            ranked_issues = (
-                select(
-                    BacklogIssueRecord.id.label("issue_id"),
-                    func.row_number()
-                    .over(
-                        partition_by=(
-                            GitHubBacklogCampaign.project,
-                            BacklogIssueRecord.repository,
-                            BacklogIssueRecord.issue_number,
-                        ),
-                        order_by=(
-                            GitHubBacklogCampaign.imported_at.desc().nulls_last(),
-                            GitHubBacklogCampaign.created_at.desc(),
-                            BacklogIssueRecord.updated_at.desc(),
-                            BacklogIssueRecord.id.desc(),
-                        ),
-                    )
-                    .label("campaign_rank"),
+            ranked_issue_query = select(
+                BacklogIssueRecord.id.label("issue_id"),
+                func.row_number()
+                .over(
+                    partition_by=(
+                        BacklogIssueRecord.repository,
+                        BacklogIssueRecord.issue_number,
+                    ),
+                    order_by=(
+                        GitHubBacklogCampaign.imported_at.desc().nulls_last(),
+                        GitHubBacklogCampaign.created_at.desc(),
+                        BacklogIssueRecord.updated_at.desc(),
+                        BacklogIssueRecord.id.desc(),
+                    ),
                 )
-                .join(
-                    GitHubBacklogCampaign,
-                    BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
-                )
-                .subquery()
+                .label("campaign_rank"),
+            ).join(
+                GitHubBacklogCampaign,
+                BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
             )
+            if project:
+                ranked_issue_query = ranked_issue_query.where(
+                    GitHubBacklogCampaign.project == project
+                )
+            ranked_issues = ranked_issue_query.subquery()
             query = (
                 select(BacklogIssueRecord, GitHubBacklogCampaign)
                 .join(
