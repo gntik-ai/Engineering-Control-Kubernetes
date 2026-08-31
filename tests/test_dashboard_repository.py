@@ -339,12 +339,23 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
         session.flush()
         older_issue = _issue(older.id, 11, "Older queued API repair", "QUEUED")
         older_issue.updated_at = now + timedelta(minutes=1)
+        current_issue = _issue(newer.id, 11, "Current blocked API repair", "BLOCKED")
+        current_issue.updated_at = now
+        tied_issue = _issue(newer.id, 12, "Current tied API repair", "BLOCKED")
+        tied_issue.updated_at = now
         session.add_all(
             [
                 older_issue,
-                _issue(newer.id, 11, "Current blocked API repair", "BLOCKED"),
+                current_issue,
+                tied_issue,
             ]
         )
+        session.flush()
+        newer_id = newer.id
+        expected_tied_order = [
+            issue.issue_number
+            for issue in sorted((current_issue, tied_issue), key=lambda item: item.id, reverse=True)
+        ]
 
     projected = await repository.list_backlog(
         project="falcone", status=None, search=None, page=1, page_size=10
@@ -352,13 +363,23 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
     old_search = await repository.list_backlog(
         project="falcone", status=None, search="older", page=1, page_size=10
     )
+    stale_status = await repository.list_backlog(
+        project="falcone", status="queued", search=None, page=1, page_size=10
+    )
+    current_status = await repository.list_backlog(
+        project="falcone", status="blocked", search=None, page=1, page_size=10
+    )
 
-    assert projected["total"] == 1
-    assert projected["items"][0]["title"] == "Current blocked API repair"
-    assert projected["items"][0]["backlog_campaign_id"] == str(newer.id)
+    assert projected["total"] == 2
+    assert [item["issue_number"] for item in projected["items"]] == expected_tied_order
+    selected = next(item for item in projected["items"] if item["issue_number"] == 11)
+    assert selected["title"] == "Current blocked API repair"
+    assert selected["backlog_campaign_id"] == str(newer_id)
     assert old_search["total"] == 0
+    assert stale_status["total"] == 0
+    assert current_status["total"] == 2
     with repository.sessions() as session:
-        assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 2
+        assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 3
 
 
 @pytest.mark.asyncio

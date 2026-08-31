@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,7 @@ from engineering_control.db.base import Base
 from engineering_control.db.models import GitHubBacklogCampaign
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
+    BACKLOG_FIXED_OPERATOR_ACTORS,
     approval_binding,
     is_reauthenticated_backlog_operator,
 )
@@ -23,6 +25,7 @@ SCRIPT = runpy.run_path(str(ROOT / "scripts/reconcile-backlog-github-policy.py")
 VALIDATE_CAMPAIGN = SCRIPT["validate_campaign"]
 EXPIRE_CAMPAIGNS = SCRIPT["expire_campaign_approvals"]
 READ_REQUEST = SCRIPT["read_request"]
+AUDIT_ACTORS = SCRIPT["audit_approval_actors"]
 
 
 def campaign(
@@ -160,7 +163,7 @@ def test_policy_request_accepts_every_typed_reauthenticated_operator(
     )
     request_path.chmod(0o600)
 
-    assert READ_REQUEST(request_path, request_path.stat().st_uid)["requested_by"] == requested_by
+    assert READ_REQUEST(request_path, os.getuid())["requested_by"] == requested_by
 
 
 def test_policy_request_rejects_an_untyped_actor(tmp_path: Path) -> None:
@@ -188,7 +191,24 @@ def test_policy_request_rejects_an_untyped_actor(tmp_path: Path) -> None:
     request_path.chmod(0o600)
 
     with pytest.raises(ValueError, match="typed reauthenticated operator"):
-        READ_REQUEST(request_path, request_path.stat().st_uid)
+        READ_REQUEST(request_path, os.getuid())
+
+
+def test_policy_request_rejects_wrong_owner_mode_and_symlink(tmp_path: Path) -> None:
+    request_path = tmp_path / "activate.json"
+    request_path.write_text("{}", encoding="utf-8")
+    request_path.chmod(0o600)
+    with pytest.raises(ValueError, match="ownership or mode"):
+        READ_REQUEST(request_path, os.getuid() + 1)
+    for unsafe_mode in (0o644, 0o660):
+        request_path.chmod(unsafe_mode)
+        with pytest.raises(ValueError, match="ownership or mode"):
+            READ_REQUEST(request_path, os.getuid())
+    request_path.chmod(0o600)
+    symlink_path = tmp_path / "activate-link.json"
+    symlink_path.symlink_to(request_path)
+    with pytest.raises(ValueError, match="regular non-symlink"):
+        READ_REQUEST(symlink_path, os.getuid())
 
 
 @pytest.mark.parametrize(
@@ -199,19 +219,33 @@ def test_shared_backlog_operator_policy_accepts_exact_identities(actor: str) -> 
     assert is_reauthenticated_backlog_operator(actor) is True
 
 
+def test_shared_backlog_operator_policy_fixed_set_is_fail_closed() -> None:
+    assert BACKLOG_FIXED_OPERATOR_ACTORS == frozenset(
+        {"dashboard:reauthenticated", "cli:engineering-ctl"}
+    )
+
+
 @pytest.mark.parametrize(
     "actor",
     [
         "api:untrusted",
         "telegram:",
         "telegram:0",
+        "telegram:042",
         "telegram:abc",
+        "telegram:12345678901234567890",
+        " telegram:42",
         "telegram:42 ",
+        "telegram:42\n",
         "Telegram:42",
+        "TELEGRAM:42",
+        "telegram:\u0664\u0662",
         "dashboard:",
         "dashboard:session",
+        "dashboard:reauthenticated ",
         "cli:",
         "cli:other",
+        "cli:engineering-ctl ",
     ],
 )
 def test_shared_backlog_operator_policy_rejects_near_matches(actor: str) -> None:
@@ -250,6 +284,84 @@ def test_root_reconciler_accepts_exact_stopped_owner_and_rejects_malformed_neste
         stored.approval_json = {"binding": stored.approval_json["binding"]}
     with Session(engine) as session, pytest.raises(ValueError, match="nested approval"):
         validate(session, request)
+
+
+@pytest.mark.parametrize(
+    ("requested_by", "approval_binding", "message"),
+    [
+        ("cli:engineering-ctl", None, "actor changed"),
+        ("api:untrusted", None, "typed reauthenticated operator"),
+        ("telegram:42", "f" * 64, "no current approved campaign"),
+    ],
+)
+def test_root_reconciler_rejects_actor_or_binding_mismatch_without_mutation(
+    tmp_path: Path,
+    requested_by: str,
+    approval_binding: str | None,
+    message: str,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'mismatch.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    campaign_id = UUID("11111111-1111-4111-8111-111111111111")
+    owner = campaign(
+        campaign_id,
+        project="falcone",
+        status="APPROVED_POLICY_PENDING",
+        role="owner",
+        now=now,
+    )
+    original_approval = json.loads(json.dumps(owner.approval_json))
+    request = {
+        "action": "enable-existing-backlog",
+        "backlog_campaign_id": str(campaign_id),
+        "project": "falcone",
+        "approval_binding": approval_binding or owner.approval_binding,
+        "requested_by": requested_by,
+    }
+    with Session(engine) as session, session.begin():
+        session.add(owner)
+    with Session(engine) as session, pytest.raises(ValueError, match=message):
+        VALIDATE_CAMPAIGN(session, request)
+    with Session(engine) as session:
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        assert stored.status == "APPROVED_POLICY_PENDING"
+        assert stored.approval_json == original_approval
+
+
+def test_durable_actor_audit_accepts_canonical_and_rejects_legacy_shape(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'actor-audit.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    valid = campaign(
+        UUID("11111111-1111-4111-8111-111111111111"),
+        project="falcone",
+        status="APPROVED_POLICY_PENDING",
+        role="owner",
+        now=now,
+        approved_by="cli:engineering-ctl",
+    )
+    invalid = campaign(
+        UUID("22222222-2222-4222-8222-222222222222"),
+        project="musematic",
+        status="APPROVED_INVENTORY",
+        role="inventory",
+        now=now,
+        approved_by="telegram:allowlisted",
+    )
+    with Session(engine) as session, session.begin():
+        session.add(valid)
+    with Session(engine) as session:
+        assert AUDIT_ACTORS(session) == 1
+    with Session(engine) as session, session.begin():
+        session.add(invalid)
+    with (
+        Session(engine) as session,
+        pytest.raises(ValueError, match="noncanonical operator actor") as error,
+    ):
+        AUDIT_ACTORS(session)
+    assert str(error.value) == "durable backlog approval contains a noncanonical operator actor"
 
 
 def test_expiry_disables_and_expires_running_inventory_when_owner_is_expired(

@@ -219,11 +219,12 @@ class DashboardRepository:
                     func.row_number()
                     .over(
                         partition_by=(
+                            GitHubBacklogCampaign.project,
                             BacklogIssueRecord.repository,
                             BacklogIssueRecord.issue_number,
                         ),
                         order_by=(
-                            GitHubBacklogCampaign.imported_at.desc(),
+                            GitHubBacklogCampaign.imported_at.desc().nulls_last(),
                             GitHubBacklogCampaign.created_at.desc(),
                             BacklogIssueRecord.updated_at.desc(),
                             BacklogIssueRecord.id.desc(),
@@ -246,8 +247,8 @@ class DashboardRepository:
                 .join(ranked_issues, ranked_issues.c.issue_id == BacklogIssueRecord.id)
                 .where(ranked_issues.c.campaign_rank == 1)
                 .order_by(
-                    GitHubBacklogCampaign.imported_at.desc(),
                     BacklogIssueRecord.updated_at.desc(),
+                    BacklogIssueRecord.id.desc(),
                 )
                 .limit(5000)
             )

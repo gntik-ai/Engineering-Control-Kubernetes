@@ -34,9 +34,10 @@ BACKLOG_SKIP_REASONS = frozenset(
 BACKLOG_DELIVERY_MODES = frozenset({"source-pr", "full-delivery"})
 BACKLOG_APPROVAL_PHRASE = "APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"
 BACKLOG_DELIVERY_APPROVAL_PHRASE = "APPROVE_STAGING_ISSUE_DELIVERY"
+BACKLOG_FIXED_OPERATOR_ACTORS = frozenset({"dashboard:reauthenticated", "cli:engineering-ctl"})
 
 _SHA = re.compile(r"^[a-f0-9]{40}$")
-_TELEGRAM_OPERATOR_ACTOR = re.compile(r"^telegram:[1-9][0-9]{0,19}$")
+_TELEGRAM_OPERATOR_ACTOR = re.compile(r"^telegram:[1-9][0-9]{0,18}$")
 _REPOSITORY = re.compile(r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$")
 _ISSUE_URL = re.compile(
     r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)/issues/[1-9][0-9]*$"
@@ -51,10 +52,8 @@ _DEPENDENCY = re.compile(
 
 def is_reauthenticated_backlog_operator(actor: str) -> bool:
     """Return whether an actor is an exact typed backlog-approval identity."""
-    return bool(
-        _TELEGRAM_OPERATOR_ACTOR.fullmatch(actor)
-        or actor == "dashboard:reauthenticated"
-        or actor == "cli:engineering-ctl"
+    return isinstance(actor, str) and bool(
+        _TELEGRAM_OPERATOR_ACTOR.fullmatch(actor) or actor in BACKLOG_FIXED_OPERATOR_ACTORS
     )
 
 

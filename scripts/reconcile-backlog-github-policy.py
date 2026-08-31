@@ -51,7 +51,9 @@ REQUEST_KEYS = frozenset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--expire-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--expire-only", action="store_true")
+    mode.add_argument("--audit-only", action="store_true")
     parser.add_argument(
         "--request",
         type=Path,
@@ -106,6 +108,9 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
 
 
 def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklogCampaign:
+    requested_by = request.get("requested_by")
+    if not isinstance(requested_by, str) or not is_reauthenticated_backlog_operator(requested_by):
+        raise ValueError("GitHub policy request lacks a typed reauthenticated operator")
     campaign = session.get(GitHubBacklogCampaign, UUID(str(request["backlog_campaign_id"])))
     if (
         campaign is None
@@ -211,6 +216,22 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     return not unexpired_owner
 
 
+def audit_approval_actors(session: Session) -> int:
+    """Fail closed when durable backlog approvals contain a noncanonical actor."""
+    reviewed = 0
+    campaigns = session.scalars(select(GitHubBacklogCampaign)).all()
+    for campaign in campaigns:
+        raw_approval = campaign.approval_json.get("approval")
+        approval = raw_approval if isinstance(raw_approval, dict) else campaign.approval_json
+        actor = approval.get("approved_by") if isinstance(approval, dict) else None
+        if actor is None:
+            continue
+        reviewed += 1
+        if not isinstance(actor, str) or not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("durable backlog approval contains a noncanonical operator actor")
+    return reviewed
+
+
 def validate_current_policy(path: Path, group_id: int) -> None:
     metadata = path.lstat()
     parent = path.parent.lstat()
@@ -245,7 +266,7 @@ def install_policy(path: Path, backup_root: Path, group_id: int, *, enabled: boo
     temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
     content = (
         (
-            "# Enabled by an exact Telegram backlog campaign approval.\n"
+            "# Enabled by an exact typed-operator backlog campaign approval.\n"
             "enabled: true\n"
             "safe_repositories:\n"
             + "".join(f"  - {repository}\n" for repository in SAFE_REPOSITORIES)
@@ -282,6 +303,11 @@ def main() -> int:
     validate_current_policy(args.policy, group_id)
     settings = Settings()
     engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
+    if args.audit_only:
+        with Session(engine) as session:
+            reviewed = audit_approval_actors(session)
+        print(f"GITHUB_BACKLOG_APPROVAL_ACTOR_AUDIT_PASS reviewed={reviewed}")
+        return 0
     if args.expire_only:
         with Session(engine) as session, session.begin():
             if expire_campaign_approvals(session, datetime.now(UTC)):
