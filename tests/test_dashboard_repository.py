@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, select
 
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.status_mapping import (
@@ -321,6 +322,43 @@ async def test_backlog_projects_links_filters_search_pagination_and_ordering(
     )
     assert paged["page"] == 2
     assert paged["pages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    now = datetime.now(UTC)
+    with repository.sessions.begin() as session:
+        older = _backlog_campaign("falcone", "falcone-import-older")
+        older.imported_at = now - timedelta(days=1)
+        newer = _backlog_campaign("falcone", "falcone-import-newer")
+        newer.imported_at = now
+        session.add_all([older, newer])
+        session.flush()
+        older_issue = _issue(older.id, 11, "Older queued API repair", "QUEUED")
+        older_issue.updated_at = now + timedelta(minutes=1)
+        session.add_all(
+            [
+                older_issue,
+                _issue(newer.id, 11, "Current blocked API repair", "BLOCKED"),
+            ]
+        )
+
+    projected = await repository.list_backlog(
+        project="falcone", status=None, search=None, page=1, page_size=10
+    )
+    old_search = await repository.list_backlog(
+        project="falcone", status=None, search="older", page=1, page_size=10
+    )
+
+    assert projected["total"] == 1
+    assert projected["items"][0]["title"] == "Current blocked API repair"
+    assert projected["items"][0]["backlog_campaign_id"] == str(newer.id)
+    assert old_search["total"] == 0
+    with repository.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 2
 
 
 @pytest.mark.asyncio

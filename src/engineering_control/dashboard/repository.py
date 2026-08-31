@@ -213,13 +213,42 @@ class DashboardRepository:
     ) -> dict[str, Any]:
         records: list[dict[str, Any]] = []
         with self.sessions() as session:
+            ranked_issues = (
+                select(
+                    BacklogIssueRecord.id.label("issue_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=(
+                            BacklogIssueRecord.repository,
+                            BacklogIssueRecord.issue_number,
+                        ),
+                        order_by=(
+                            GitHubBacklogCampaign.imported_at.desc(),
+                            GitHubBacklogCampaign.created_at.desc(),
+                            BacklogIssueRecord.updated_at.desc(),
+                            BacklogIssueRecord.id.desc(),
+                        ),
+                    )
+                    .label("campaign_rank"),
+                )
+                .join(
+                    GitHubBacklogCampaign,
+                    BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
+                )
+                .subquery()
+            )
             query = (
                 select(BacklogIssueRecord, GitHubBacklogCampaign)
                 .join(
                     GitHubBacklogCampaign,
                     BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
                 )
-                .order_by(BacklogIssueRecord.updated_at.desc())
+                .join(ranked_issues, ranked_issues.c.issue_id == BacklogIssueRecord.id)
+                .where(ranked_issues.c.campaign_rank == 1)
+                .order_by(
+                    GitHubBacklogCampaign.imported_at.desc(),
+                    BacklogIssueRecord.updated_at.desc(),
+                )
                 .limit(5000)
             )
             if project:
