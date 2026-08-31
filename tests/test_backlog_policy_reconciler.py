@@ -12,7 +12,11 @@ from sqlalchemy.orm import Session
 
 from engineering_control.db.base import Base
 from engineering_control.db.models import GitHubBacklogCampaign
-from engineering_control.engineering.backlog import BACKLOG_APPROVAL_PHRASE, approval_binding
+from engineering_control.engineering.backlog import (
+    BACKLOG_APPROVAL_PHRASE,
+    approval_binding,
+    is_reauthenticated_backlog_operator,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = runpy.run_path(str(ROOT / "scripts/reconcile-backlog-github-policy.py"))
@@ -185,6 +189,33 @@ def test_policy_request_rejects_an_untyped_actor(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="typed reauthenticated operator"):
         READ_REQUEST(request_path, request_path.stat().st_uid)
+
+
+@pytest.mark.parametrize(
+    "actor",
+    ["telegram:42", "dashboard:reauthenticated", "cli:engineering-ctl"],
+)
+def test_shared_backlog_operator_policy_accepts_exact_identities(actor: str) -> None:
+    assert is_reauthenticated_backlog_operator(actor) is True
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        "api:untrusted",
+        "telegram:",
+        "telegram:0",
+        "telegram:abc",
+        "telegram:42 ",
+        "Telegram:42",
+        "dashboard:",
+        "dashboard:session",
+        "cli:",
+        "cli:other",
+    ],
+)
+def test_shared_backlog_operator_policy_rejects_near_matches(actor: str) -> None:
+    assert is_reauthenticated_backlog_operator(actor) is False
 
 
 def test_root_reconciler_accepts_exact_stopped_owner_and_rejects_malformed_nested(

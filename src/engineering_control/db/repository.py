@@ -45,6 +45,7 @@ from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     approval_binding,
     canonical_sha256,
+    is_reauthenticated_backlog_operator,
 )
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
@@ -637,11 +638,7 @@ class SQLMetadataRepository:
     def _approve_backlog_campaign(
         self, campaign_id: UUID, project: str, binding: str, actor: str
     ) -> dict[str, Any]:
-        if not (
-            actor.startswith("telegram:")
-            or actor == "dashboard:reauthenticated"
-            or actor == "cli:engineering-ctl"
-        ):
+        if not is_reauthenticated_backlog_operator(actor):
             raise ValueError("existing-backlog approval requires a reauthenticated operator")
         result: dict[str, Any]
         request: dict[str, Any] | None = None

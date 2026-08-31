@@ -25,6 +25,7 @@ from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BacklogApprovalBinding,
     canonical_sha256,
+    is_reauthenticated_backlog_operator,
 )
 from engineering_control.policy.github_write import GitHubWritePolicyDocument
 
@@ -95,11 +96,7 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
     if tuple(value["safe_repositories"]) != expected_repositories:
         raise ValueError("GitHub policy request repository set changed")
     requested_by = str(value["requested_by"])
-    if not (
-        requested_by.startswith("telegram:")
-        or requested_by == "dashboard:reauthenticated"
-        or requested_by == "cli:engineering-ctl"
-    ):
+    if not is_reauthenticated_backlog_operator(requested_by):
         raise ValueError("GitHub policy request lacks a typed reauthenticated operator")
     UUID(str(value["backlog_campaign_id"]))
     if len(str(value["approval_binding"])) != 64:

@@ -24,6 +24,7 @@ from engineering_control.engineering.backlog import (
     approval_binding,
     canonical_sha256,
     classify_issue,
+    is_reauthenticated_backlog_operator,
     plan_records,
 )
 from engineering_control.engineering.configuration import EngineeringCatalog
@@ -1604,11 +1605,7 @@ class EngineeringActivityHandler:
                 raw_approval if isinstance(raw_approval, dict) else policy_campaign.approval_json
             )
             actor = approval.get("approved_by") if isinstance(approval, dict) else None
-            if not isinstance(actor, str) or not (
-                actor.startswith("telegram:")
-                or actor == "dashboard:reauthenticated"
-                or actor == "cli:engineering-ctl"
-            ):
+            if not isinstance(actor, str) or not is_reauthenticated_backlog_operator(actor):
                 raise ValueError("global backlog policy approval evidence is missing")
             for raw_inventory_id in raw_inventory_ids.values():
                 inventory = session.get(db.GitHubBacklogCampaign, UUID(str(raw_inventory_id)))
@@ -1943,11 +1940,7 @@ class EngineeringActivityHandler:
             if status in {"CANCELLED", "COMPLETE", "STOPPED"}:
                 approval = campaign.approval_json.get("approval")
                 actor = approval.get("approved_by") if isinstance(approval, dict) else None
-                if not isinstance(actor, str) or not (
-                    actor.startswith("telegram:")
-                    or actor == "dashboard:reauthenticated"
-                    or actor == "cli:engineering-ctl"
-                ):
+                if not isinstance(actor, str) or not is_reauthenticated_backlog_operator(actor):
                     raise ValueError("terminal backlog campaign approval evidence is missing")
                 deactivation = {
                     "action": "disable-existing-backlog",
