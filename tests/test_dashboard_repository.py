@@ -372,6 +372,9 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
     all_projects = await repository.list_backlog(
         project=None, status=None, search=None, page=1, page_size=10
     )
+    second_page = await repository.list_backlog(
+        project="falcone", status=None, search=None, page=2, page_size=1
+    )
 
     assert projected["total"] == 2
     assert [item["issue_number"] for item in projected["items"]] == expected_tied_order
@@ -382,6 +385,9 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
     assert stale_status["total"] == 0
     assert current_status["total"] == 2
     assert all_projects["total"] == 2
+    assert second_page["total"] == 2
+    assert second_page["pages"] == 2
+    assert [item["issue_number"] for item in second_page["items"]] == [expected_tied_order[1]]
     with repository.sessions() as session:
         assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 3
 

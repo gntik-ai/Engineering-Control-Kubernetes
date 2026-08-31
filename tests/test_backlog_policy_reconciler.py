@@ -456,6 +456,7 @@ def test_durable_actor_audit_counts_unapproved_and_rejects_shape_disagreement(
         assert stored is not None
         stored.status = "APPROVED_POLICY_PENDING"
         stored.approval_json = {
+            "binding": {},
             "approval": {
                 "approved_by": "telegram:42",
                 "approved_at": datetime.now(UTC).isoformat(),
@@ -491,11 +492,102 @@ def test_durable_actor_audit_rejects_unknown_status_and_incomplete_approval(
         assert stored is not None
         stored.status = "APPROVED_POLICY_PENDING"
         stored.approval_json = {
+            "binding": {},
             "approval": {
                 "approved_by": "telegram:42",
                 "approved_at": datetime.now(UTC).isoformat(),
-            }
+            },
         }
+    with Session(engine) as session, pytest.raises(ValueError, match="incomplete"):
+        AUDIT_ACTORS(session)
+
+
+def test_durable_actor_audit_aligns_nested_shapes_and_redacts_invalid_timestamps(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'nested-audit.sqlite'}")
+    Base.metadata.create_all(engine)
+    campaign_id = UUID("11111111-1111-4111-8111-111111111111")
+    binding_only = campaign(
+        campaign_id,
+        project="falcone",
+        status="AWAITING_APPROVAL",
+        role="owner",
+        now=datetime.now(UTC),
+    )
+    binding_only.approval_json = {"binding": binding_only.approval_json["binding"]}
+    with Session(engine) as session, session.begin():
+        session.add(binding_only)
+    with Session(engine) as session:
+        assert AUDIT_ACTORS(session) == (1, 0, 1)
+
+    with Session(engine) as session, session.begin():
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        stored.status = "APPROVED_POLICY_PENDING"
+        stored.approval_json = {
+            "binding": stored.approval_json["binding"],
+            "approved_by": "telegram:42",
+            "approved_at": datetime.now(UTC).isoformat(),
+            "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+        }
+    with Session(engine) as session, pytest.raises(ValueError, match="malformed"):
+        AUDIT_ACTORS(session)
+
+    with Session(engine) as session, session.begin():
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        stored.approval_json = {
+            "binding": stored.approval_json["binding"],
+            "approval": {
+                "approved_by": "telegram:42",
+                "approved_at": "SENSITIVE_TIMESTAMP_PAYLOAD",
+                "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+            },
+        }
+    with (
+        Session(engine) as session,
+        pytest.raises(ValueError, match="incomplete") as error,
+    ):
+        AUDIT_ACTORS(session)
+    assert "SENSITIVE_TIMESTAMP_PAYLOAD" not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_durable_actor_audit_accepts_terminal_evidence_and_one_phrase_only(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'terminal-audit.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    stopped_id = UUID("11111111-1111-4111-8111-111111111111")
+    stopped = campaign(
+        stopped_id,
+        project="falcone",
+        status="STOPPED",
+        role="owner",
+        now=now,
+    )
+    expired = campaign(
+        UUID("22222222-2222-4222-8222-222222222222"),
+        project="musematic",
+        status="EXPIRED",
+        role="inventory",
+        now=now,
+    )
+    with Session(engine) as session, session.begin():
+        session.add_all([stopped, expired])
+    with Session(engine) as session:
+        assert AUDIT_ACTORS(session) == (2, 2, 0)
+
+    with Session(engine) as session, session.begin():
+        stored = session.get(GitHubBacklogCampaign, stopped_id)
+        assert stored is not None
+        evidence = dict(stored.approval_json)
+        approval = dict(evidence["approval"])
+        approval["typed_confirmation"] = "APPROVE_STAGING_ISSUE_DELIVERY"
+        evidence["approval"] = approval
+        stored.approval_json = evidence
     with Session(engine) as session, pytest.raises(ValueError, match="incomplete"):
         AUDIT_ACTORS(session)
 

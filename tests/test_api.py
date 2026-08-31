@@ -567,6 +567,78 @@ def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
     assert arbitrary.status_code == 409
     assert bus.submit.await_args_list[0].kwargs["source_channel"] == "cli"
     assert bus.submit.await_args_list[1].kwargs["source_channel"] == "telegram"
+    assert bus.submit.await_args_list[0].kwargs["operator_class"] == "engineering-ctl:hermes"
+    assert bus.submit.await_args_list[1].kwargs["operator_class"] == "telegram:42"
+
+
+def test_every_direct_approval_route_returns_403_before_dispatch_for_forged_actors() -> None:
+    metadata = Mock()
+    metadata.approve_backlog_campaign = AsyncMock()
+    metadata.approve_enhancement = AsyncMock()
+    metadata.reject_enhancement = AsyncMock()
+    operations = Mock()
+    operations.approve_r3_issue = AsyncMock()
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    service = FakeService()
+    service.record_approval = AsyncMock()
+    app = create_app(
+        settings=Settings(),
+        service=service,
+        repository=metadata,
+        token="x" * 32,
+        operations_repository=operations,
+        command_bus=bus,
+    )
+    routes = (
+        (
+            "/v1/r3-issues/approve",
+            {
+                "project": "musematic",
+                "surface": "source",
+                "issue_number": 1119,
+                "binding": "a" * 64,
+                "confirmation_phrase": "APPROVE_R3_MUSEMATIC_1119_AAAAAAAAAAAAAAAA",
+            },
+        ),
+        (
+            f"/v1/backlogs/{uuid4()}/approve",
+            {
+                "project": "falcone",
+                "approval_binding": "a" * 64,
+                "typed_confirmation": "APPROVE_EXISTING_GITHUB_BACKLOG_LOOP",
+            },
+        ),
+        (f"/v1/enhancements/{uuid4()}/approve", {"approval_binding": "a" * 64}),
+        (f"/v1/enhancements/{uuid4()}/reject", {"reason": "bounded rejection"}),
+        (
+            "/v1/approvals",
+            {
+                "change_set_id": str(uuid4()),
+                "artifact_binding_sha256": "a" * 64,
+                "decision": "approve",
+            },
+        ),
+    )
+    base = {"Authorization": f"Bearer {'x' * 32}"}
+
+    with TestClient(app) as client:
+        responses = [
+            client.post(
+                path,
+                headers={**base, "X-Engineering-Actor": actor},
+                json=payload,
+            )
+            for actor in ("engineering-ctl", "engineering-ctl:root", "telegram:allowlisted")
+            for path, payload in routes
+        ]
+
+    assert all(response.status_code == 403 for response in responses)
+    operations.approve_r3_issue.assert_not_awaited()
+    metadata.approve_backlog_campaign.assert_not_awaited()
+    metadata.approve_enhancement.assert_not_awaited()
+    metadata.reject_enhancement.assert_not_awaited()
+    service.record_approval.assert_not_awaited()
 
 
 def test_private_operation_export_requires_api_auth_and_returns_only_stored_projection() -> None:

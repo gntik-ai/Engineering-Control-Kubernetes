@@ -259,7 +259,8 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
                 unapproved=unapproved,
                 reason="durable backlog approval evidence is malformed",
             )
-        nested = "approval" in evidence
+        nested = "binding" in evidence or "approval" in evidence
+        raw_binding = evidence.get("binding")
         raw_approval = evidence.get("approval")
         has_flat_approval = any(
             field in evidence for field in ("approved_by", "approved_at", "typed_confirmation")
@@ -276,7 +277,18 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
             unapproved += 1
             continue
         if nested:
-            if not isinstance(raw_approval, dict):
+            if raw_approval is None and not has_flat_approval:
+                if isinstance(raw_binding, dict) and campaign.status in PRE_APPROVAL_STATUSES:
+                    unapproved += 1
+                    continue
+                raise approval_audit_error(
+                    campaign_id=campaign.id,
+                    campaign_count=campaign_count,
+                    reviewed=reviewed,
+                    unapproved=unapproved,
+                    reason="durable backlog campaign lacks canonical approval evidence",
+                )
+            if not isinstance(raw_binding, dict) or not isinstance(raw_approval, dict):
                 raise approval_audit_error(
                     campaign_id=campaign.id,
                     campaign_count=campaign_count,
@@ -308,6 +320,8 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
                 reason="durable backlog approval contains a noncanonical operator actor",
             )
         approved_at = approval.get("approved_at")
+        # GitHubBacklogCampaign stores only the campaign-ownership phrase. Issue delivery
+        # approvals use a different persistence model and are not part of this survey.
         if approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE or not isinstance(
             approved_at, str
         ):
@@ -320,14 +334,14 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
             )
         try:
             approved_time = datetime.fromisoformat(approved_at)
-        except ValueError as error:
+        except ValueError:
             raise approval_audit_error(
                 campaign_id=campaign.id,
                 campaign_count=campaign_count,
                 reviewed=reviewed,
                 unapproved=unapproved,
                 reason="durable backlog approval evidence is incomplete",
-            ) from error
+            ) from None
         if approved_time.tzinfo is None:
             raise approval_audit_error(
                 campaign_id=campaign.id,
@@ -411,7 +425,7 @@ def main() -> int:
     settings = Settings()
     engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
     if args.audit_only:
-        with Session(engine) as session:
+        with Session(engine, autoflush=False) as session:
             campaigns, reviewed, unapproved = audit_approval_actors(session)
             session.rollback()
         print(

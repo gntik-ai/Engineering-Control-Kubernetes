@@ -173,6 +173,13 @@ def create_app(
     commands_dependency = Depends(commands)
     control_metrics = ControlPlaneMetrics()
 
+    def approval_actor(subject: str) -> str:
+        """Authorize a raw API channel subject and return its durable actor."""
+        try:
+            return canonical_operator_approval_actor(subject)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="approval channel is not allowed") from None
+
     @app.post("/v1/commands", status_code=202)
     async def typed_command(
         body: dict[str, Any],
@@ -180,12 +187,7 @@ def create_app(
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=16, max_length=128),
         bus: TypedCommandBus = commands_dependency,
     ) -> dict[str, Any]:
-        try:
-            durable_actor = canonical_operator_approval_actor(subject)
-        except ValueError as error:
-            raise HTTPException(
-                status_code=403, detail="typed command channel is not allowed"
-            ) from error
+        durable_actor = approval_actor(subject)
         try:
             command = parse_command(body)
             source_channel = "telegram" if durable_actor.startswith("telegram:") else "cli"
@@ -535,7 +537,7 @@ def create_app(
                 body.issue_number,
                 body.binding,
                 body.confirmation_phrase,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -765,7 +767,7 @@ def create_app(
                 campaign_id,
                 body.project,
                 body.approval_binding,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -912,7 +914,7 @@ def create_app(
             return await repository.approve_enhancement(
                 enhancement_id,
                 body.approval_binding,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -928,7 +930,7 @@ def create_app(
             return await repository.reject_enhancement(
                 enhancement_id,
                 body.reason,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -1011,7 +1013,7 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> dict[str, str]:
         try:
-            await service.record_approval(body, canonical_operator_approval_actor(subject))
+            await service.record_approval(body, approval_actor(subject))
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"status": "ACCEPTED"}
