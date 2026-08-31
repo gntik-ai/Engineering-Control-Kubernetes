@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch for typed Telegram-approved GitHub backlog policy requests
+Description=Watch for typed operator-approved GitHub backlog policy requests
 
 [Path]
 PathExists=/var/lib/engineering-control/github-policy-requests/activate.json

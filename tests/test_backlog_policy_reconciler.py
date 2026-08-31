@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import runpy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = runpy.run_path(str(ROOT / "scripts/reconcile-backlog-github-policy.py"))
 VALIDATE_CAMPAIGN = SCRIPT["validate_campaign"]
 EXPIRE_CAMPAIGNS = SCRIPT["expire_campaign_approvals"]
+READ_REQUEST = SCRIPT["read_request"]
 
 
 def campaign(
@@ -26,6 +28,7 @@ def campaign(
     status: str,
     role: str,
     now: datetime,
+    approved_by: str = "telegram:42",
 ) -> GitHubBacklogCampaign:
     pairs = {
         "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
@@ -74,7 +77,7 @@ def campaign(
             "binding": binding.model_dump(mode="json"),
             "policy_role": role,
             "approval": {
-                "approved_by": "telegram:42",
+                "approved_by": approved_by,
                 "approved_at": now.isoformat(),
                 "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
             },
@@ -87,6 +90,101 @@ def campaign(
         status=status,
         workflow_id=f"backlog-import-{campaign_id}",
     )
+
+
+@pytest.mark.parametrize(
+    "approved_by",
+    ["telegram:42", "dashboard:reauthenticated", "cli:engineering-ctl"],
+)
+def test_root_reconciler_accepts_every_typed_reauthenticated_approval_actor(
+    tmp_path: Path,
+    approved_by: str,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'approval-actors.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    campaign_id = UUID("11111111-1111-4111-8111-111111111111")
+    owner = campaign(
+        campaign_id,
+        project="falcone",
+        status="APPROVED_POLICY_PENDING",
+        role="owner",
+        now=now,
+        approved_by=approved_by,
+    )
+    request = {
+        "action": "enable-existing-backlog",
+        "backlog_campaign_id": str(campaign_id),
+        "project": "falcone",
+        "approval_binding": owner.approval_binding,
+        "requested_by": approved_by,
+    }
+    with Session(engine) as session, session.begin():
+        session.add(owner)
+    with Session(engine) as session:
+        assert VALIDATE_CAMPAIGN(session, request).id == campaign_id
+
+
+@pytest.mark.parametrize(
+    "requested_by",
+    ["telegram:42", "dashboard:reauthenticated", "cli:engineering-ctl"],
+)
+def test_policy_request_accepts_every_typed_reauthenticated_operator(
+    tmp_path: Path,
+    requested_by: str,
+) -> None:
+    request_path = tmp_path / "activate.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "action": "enable-existing-backlog",
+                "backlog_campaign_id": "11111111-1111-4111-8111-111111111111",
+                "project": "falcone",
+                "approval_binding": "a" * 64,
+                "safe_repositories": [
+                    "gntik-ai/falcone",
+                    "gntik-ai/falcone-charts",
+                    "gntik-ai/musematic",
+                    "gntik-ai/musematic-deploy",
+                    "gntik-ai/llmwiki",
+                ],
+                "requested_by": requested_by,
+                "requested_at": datetime.now(UTC).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_path.chmod(0o600)
+
+    assert READ_REQUEST(request_path, request_path.stat().st_uid)["requested_by"] == requested_by
+
+
+def test_policy_request_rejects_an_untyped_actor(tmp_path: Path) -> None:
+    request_path = tmp_path / "activate.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "action": "enable-existing-backlog",
+                "backlog_campaign_id": "11111111-1111-4111-8111-111111111111",
+                "project": "falcone",
+                "approval_binding": "a" * 64,
+                "safe_repositories": [
+                    "gntik-ai/falcone",
+                    "gntik-ai/falcone-charts",
+                    "gntik-ai/musematic",
+                    "gntik-ai/musematic-deploy",
+                    "gntik-ai/llmwiki",
+                ],
+                "requested_by": "api:untrusted",
+                "requested_at": datetime.now(UTC).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="typed reauthenticated operator"):
+        READ_REQUEST(request_path, request_path.stat().st_uid)
 
 
 def test_root_reconciler_accepts_exact_stopped_owner_and_rejects_malformed_nested(

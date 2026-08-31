@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply one Telegram-approved backlog policy request as a root-only reconciliation."""
+"""Apply one typed operator-approved backlog policy request as root."""
 
 from __future__ import annotations
 
@@ -94,8 +94,13 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
     )
     if tuple(value["safe_repositories"]) != expected_repositories:
         raise ValueError("GitHub policy request repository set changed")
-    if not str(value["requested_by"]).startswith("telegram:"):
-        raise ValueError("GitHub policy request is not Telegram-approved")
+    requested_by = str(value["requested_by"])
+    if not (
+        requested_by.startswith("telegram:")
+        or requested_by == "dashboard:reauthenticated"
+        or requested_by == "cli:engineering-ctl"
+    ):
+        raise ValueError("GitHub policy request lacks a typed reauthenticated operator")
     UUID(str(value["backlog_campaign_id"]))
     if len(str(value["approval_binding"])) != 64:
         raise ValueError("GitHub policy approval binding is invalid")
