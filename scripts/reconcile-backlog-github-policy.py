@@ -150,14 +150,21 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
         )
         if other is not None:
             raise ValueError("another backlog campaign already owns GitHub write policy")
-    nested = "binding" in campaign.approval_json or "approval" in campaign.approval_json
-    raw_binding = campaign.approval_json.get("binding")
-    raw_approval = campaign.approval_json.get("approval")
-    if nested and (not isinstance(raw_binding, dict) or not isinstance(raw_approval, dict)):
-        raise ValueError("GitHub campaign nested approval evidence is malformed")
-    binding = raw_binding if nested else campaign.approval_json
-    approval = raw_approval if nested else campaign.approval_json
-    if campaign.approval_json.get("policy_role") not in {None, "owner"}:
+    evidence = campaign.approval_json
+    if not isinstance(evidence, dict):
+        raise ValueError("GitHub campaign approval evidence is incomplete")
+    nested = "binding" in evidence or "approval" in evidence
+    raw_binding = evidence.get("binding")
+    raw_approval = evidence.get("approval")
+    if nested:
+        if not isinstance(raw_binding, dict) or not isinstance(raw_approval, dict):
+            raise ValueError("GitHub campaign nested approval evidence is malformed")
+        binding = raw_binding
+        approval = raw_approval
+    else:
+        binding = evidence
+        approval = evidence
+    if evidence.get("policy_role") not in {None, "owner"}:
         raise ValueError("GitHub campaign approval evidence is incomplete")
     try:
         exact_binding = BacklogApprovalBinding.model_validate(
@@ -268,15 +275,18 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
                 )
             unapproved += 1
             continue
-        if nested and not isinstance(raw_approval, dict):
-            raise approval_audit_error(
-                campaign_id=campaign.id,
-                campaign_count=campaign_count,
-                reviewed=reviewed,
-                unapproved=unapproved,
-                reason="durable backlog approval evidence is malformed",
-            )
-        approval = raw_approval if nested else evidence
+        if nested:
+            if not isinstance(raw_approval, dict):
+                raise approval_audit_error(
+                    campaign_id=campaign.id,
+                    campaign_count=campaign_count,
+                    reviewed=reviewed,
+                    unapproved=unapproved,
+                    reason="durable backlog approval evidence is malformed",
+                )
+            approval = raw_approval
+        else:
+            approval = evidence
         if nested and has_flat_approval:
             for field in ("approved_by", "approved_at", "typed_confirmation"):
                 if field in evidence and evidence[field] != approval.get(field):
