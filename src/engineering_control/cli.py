@@ -31,7 +31,10 @@ def _bounded_integer(minimum: int, maximum: int) -> Callable[[str], int]:
 
 class APIClient:
     def __init__(self, base_url: str, token_file: Path) -> None:
-        operator = pwd.getpwuid(os.geteuid()).pw_name
+        try:
+            operator = pwd.getpwuid(os.geteuid()).pw_name
+        except KeyError as error:
+            raise PermissionError("engineering-ctl must run as the hermes operator") from error
         if operator != "hermes":
             raise PermissionError("engineering-ctl must run as the hermes operator")
         metadata = token_file.stat()

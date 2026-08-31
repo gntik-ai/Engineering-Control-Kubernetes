@@ -181,10 +181,14 @@ def create_app(
         bus: TypedCommandBus = commands_dependency,
     ) -> dict[str, Any]:
         try:
-            if subject != "engineering-ctl:hermes" and not subject.startswith("telegram:"):
-                raise HTTPException(status_code=403, detail="typed command channel is not allowed")
+            durable_actor = canonical_operator_approval_actor(subject)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=403, detail="typed command channel is not allowed"
+            ) from error
+        try:
             command = parse_command(body)
-            source_channel = "telegram" if subject.startswith("telegram:") else "cli"
+            source_channel = "telegram" if durable_actor.startswith("telegram:") else "cli"
             result = await bus.submit(
                 command,
                 source_channel=source_channel,  # type: ignore[arg-type]

@@ -534,6 +534,21 @@ def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
         )
         telegram_actor = client.post(
             "/v1/commands",
+            headers={**base, "X-Engineering-Actor": "telegram:42"},
+            json={"action": "refresh_connections"},
+        )
+        legacy_cli_actor = client.post(
+            "/v1/commands",
+            headers={**base, "X-Engineering-Actor": "engineering-ctl"},
+            json={"action": "refresh_connections"},
+        )
+        forged_cli_actor = client.post(
+            "/v1/commands",
+            headers={**base, "X-Engineering-Actor": "engineering-ctl:root"},
+            json={"action": "refresh_connections"},
+        )
+        malformed_telegram_actor = client.post(
+            "/v1/commands",
             headers={**base, "X-Engineering-Actor": "telegram:allowlisted"},
             json={"action": "refresh_connections"},
         )
@@ -546,6 +561,9 @@ def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
     assert dashboard_actor.status_code == 403
     assert cli_actor.status_code == 202
     assert telegram_actor.status_code == 202
+    assert legacy_cli_actor.status_code == 403
+    assert forged_cli_actor.status_code == 403
+    assert malformed_telegram_actor.status_code == 403
     assert arbitrary.status_code == 409
     assert bus.submit.await_args_list[0].kwargs["source_channel"] == "cli"
     assert bus.submit.await_args_list[1].kwargs["source_channel"] == "telegram"

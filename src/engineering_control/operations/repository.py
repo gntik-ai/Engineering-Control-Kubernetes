@@ -42,6 +42,7 @@ from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BacklogApprovalBinding,
     canonical_sha256,
+    is_reauthenticated_backlog_operator,
 )
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
@@ -420,11 +421,7 @@ class OperationsRepository:
         phrase: str,
         actor: str,
     ) -> dict[str, Any]:
-        if not (
-            actor.startswith("telegram:")
-            or actor == "cli:engineering-ctl:hermes"
-            or actor == "dashboard:reauthenticated:hermes"
-        ):
+        if not is_reauthenticated_backlog_operator(actor):
             raise ValueError("R3 approval requires an allowlisted operator channel")
         candidate = self._r3_issue_candidate(project, surface, issue_number, False)
         if candidate["binding"] != binding or candidate["confirmation_phrase"] != phrase:

@@ -402,7 +402,7 @@ async def test_backlog_requires_server_phrase_and_prevents_duplicate_active_oper
     second = await repository.create_external(
         command,
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("telegram", 1),
     )
     assert second.operation_id == first.operation_id
@@ -746,7 +746,7 @@ async def test_bounded_evidence_exports_are_typed_redacted_expiring_and_cross_ch
     workflow_operation = await bus.submit(
         EvidenceExportWorkflowCommand(workflow_id=workflow_id),
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("workflow-export", 1),
     )
     assert workflow_operation.status == "COMPLETED"
@@ -935,7 +935,7 @@ async def test_enhancement_actions_use_immutable_binding_and_typed_services(
     started = await bus.submit(
         run,
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("enhancement-run", 1),
     )
     assert started.workflow_id == "enhance-solution-synthetic"
@@ -996,7 +996,7 @@ async def test_cli_and_telegram_share_one_command_bus_and_workflow_identity(
     telegram = await bus.submit(
         _solve_issue(),
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("telegram", 2),
     )
     assert cli.operation_id == telegram.operation_id

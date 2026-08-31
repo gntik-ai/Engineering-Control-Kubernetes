@@ -874,7 +874,11 @@ class EngineeringActivityHandler:
         supplied = str(payload.get("approval_binding", ""))
         confirmation = str(payload.get("typed_confirmation", ""))
         actor = str(payload.get("actor", ""))
-        if confirmation != BACKLOG_APPROVAL_PHRASE or not actor.startswith("telegram:"):
+        if (
+            confirmation != BACKLOG_APPROVAL_PHRASE
+            or not actor.startswith("telegram:")
+            or not is_reauthenticated_backlog_operator(actor)
+        ):
             return {**payload, "status": "BLOCKED", "blocker": "BACKLOG_APPROVAL_INVALID"}
         with self.sessions.begin() as session:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)

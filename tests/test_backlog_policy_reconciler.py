@@ -236,8 +236,15 @@ def test_authenticated_cli_subject_maps_to_stable_durable_operator() -> None:
         "cli:engineering-ctl:hermes"
     )
     assert canonical_operator_approval_actor("telegram:42") == "telegram:42"
-    with pytest.raises(ValueError, match="authenticated operator identity"):
-        canonical_operator_approval_actor("engineering-ctl")
+    for invalid in (
+        "engineering-ctl",
+        "engineering-ctl:root",
+        "cli:engineering-ctl:hermes",
+        "dashboard:reauthenticated:hermes",
+        "telegram:allowlisted",
+    ):
+        with pytest.raises(ValueError, match="authenticated operator identity"):
+            canonical_operator_approval_actor(invalid)
 
 
 @pytest.mark.parametrize(
@@ -351,6 +358,7 @@ def test_root_reconciler_rejects_actor_or_binding_mismatch_without_mutation(
             VALIDATE_CAMPAIGN(session, request)
         assert not session.dirty
         assert not session.new
+        assert not session.deleted
     with Session(engine) as session:
         stored = session.get(GitHubBacklogCampaign, campaign_id)
         assert stored is not None
@@ -381,8 +389,9 @@ def test_durable_actor_audit_accepts_canonical_and_rejects_legacy_shape(tmp_path
         now=now,
         approved_by="telegram:42",
     )
+    invalid_id = UUID("22222222-2222-4222-8222-222222222222")
     invalid = campaign(
-        UUID("22222222-2222-4222-8222-222222222222"),
+        invalid_id,
         project="falcone",
         status="APPROVED_POLICY_PENDING",
         role="owner",
@@ -400,7 +409,11 @@ def test_durable_actor_audit_accepts_canonical_and_rejects_legacy_shape(tmp_path
         pytest.raises(ValueError, match="noncanonical operator actor") as error,
     ):
         AUDIT_ACTORS(session)
-    assert str(error.value) == "durable backlog approval contains a noncanonical operator actor"
+    assert f"campaign={invalid_id}" in str(error.value)
+    assert "campaigns=" in str(error.value)
+    assert "approvals=" in str(error.value)
+    assert "unapproved=" in str(error.value)
+    assert "telegram:allowlisted" not in str(error.value)
 
 
 def test_durable_actor_audit_rejects_present_approval_without_actor(tmp_path: Path) -> None:
@@ -451,6 +464,39 @@ def test_durable_actor_audit_counts_unapproved_and_rejects_shape_disagreement(
             "approved_by": "cli:engineering-ctl:hermes",
         }
     with Session(engine) as session, pytest.raises(ValueError, match="shapes disagree"):
+        AUDIT_ACTORS(session)
+
+
+def test_durable_actor_audit_rejects_unknown_status_and_incomplete_approval(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'fail-closed-audit.sqlite'}")
+    Base.metadata.create_all(engine)
+    campaign_id = UUID("11111111-1111-4111-8111-111111111111")
+    unknown = campaign(
+        campaign_id,
+        project="falcone",
+        status="FUTURE_STATE",
+        role="owner",
+        now=datetime.now(UTC),
+    )
+    unknown.approval_json = {}
+    with Session(engine) as session, session.begin():
+        session.add(unknown)
+    with Session(engine) as session, pytest.raises(ValueError, match="lacks canonical"):
+        AUDIT_ACTORS(session)
+
+    with Session(engine) as session, session.begin():
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        stored.status = "APPROVED_POLICY_PENDING"
+        stored.approval_json = {
+            "approval": {
+                "approved_by": "telegram:42",
+                "approved_at": datetime.now(UTC).isoformat(),
+            }
+        }
+    with Session(engine) as session, pytest.raises(ValueError, match="incomplete"):
         AUDIT_ACTORS(session)
 
 

@@ -37,6 +37,7 @@ BACKLOG_DELIVERY_APPROVAL_PHRASE = "APPROVE_STAGING_ISSUE_DELIVERY"
 BACKLOG_FIXED_OPERATOR_ACTORS = frozenset(
     {"dashboard:reauthenticated:hermes", "cli:engineering-ctl:hermes"}
 )
+ENGINEERING_CTL_OPERATOR_SUBJECT = "engineering-ctl:hermes"
 
 _SHA = re.compile(r"^[a-f0-9]{40}$")
 _TELEGRAM_OPERATOR_ACTOR = re.compile(r"^telegram:[1-9][0-9]{0,18}$")
@@ -61,10 +62,11 @@ def is_reauthenticated_backlog_operator(actor: str) -> bool:
 
 def canonical_operator_approval_actor(subject: str) -> str:
     """Map an authenticated channel subject to its durable operator identity."""
-    actor = "cli:engineering-ctl:hermes" if subject == "engineering-ctl:hermes" else subject
-    if not is_reauthenticated_backlog_operator(actor):
-        raise ValueError("approval requires an authenticated operator identity")
-    return actor
+    if subject == ENGINEERING_CTL_OPERATOR_SUBJECT:
+        return "cli:engineering-ctl:hermes"
+    if isinstance(subject, str) and _TELEGRAM_OPERATOR_ACTOR.fullmatch(subject):
+        return subject
+    raise ValueError("approval requires an authenticated operator identity")
 
 
 class BacklogModel(BaseModel):

@@ -17,6 +17,7 @@ from engineering_control.db.base import Base
 from engineering_control.db.models import BacklogIssueRecord, GitHubBacklogCampaign
 from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.engineering.backlog import (
+    BACKLOG_APPROVAL_PHRASE,
     BACKLOG_PROJECT_PAIRS,
     BacklogApprovalBinding,
     BacklogFinalClosureEvidence,
@@ -711,6 +712,26 @@ def test_backlog_stop_after_current_persists_terminal_state_and_policy_deactivat
     policy = json.loads((policy_root / "activate.json").read_text(encoding="utf-8"))
     assert policy["action"] == "disable-existing-backlog"
     assert policy["requested_by"] == "dashboard:reauthenticated:hermes"
+
+
+def test_legacy_temporal_backlog_approval_rejects_a_malformed_telegram_actor(
+    tmp_path: Path,
+) -> None:
+    handler = EngineeringActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'legacy-approval.sqlite'}")
+    )
+
+    result = handler._record_backlog_approval(
+        {
+            "backlog_campaign_id": "11111111-1111-4111-8111-111111111111",
+            "approval_binding": "a" * 64,
+            "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+            "actor": "telegram:allowlisted",
+        }
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "BACKLOG_APPROVAL_INVALID"
 
 
 def test_synthetic_existing_backlog_lifecycle_covers_terminal_cases() -> None:

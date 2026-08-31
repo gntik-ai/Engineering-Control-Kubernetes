@@ -19,6 +19,7 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
+from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
@@ -354,11 +355,10 @@ class TypedCommandBus:
     def _approval_actor(operator_class: str) -> str:
         if operator_class == "password-reauthenticated-operator":
             return "dashboard:reauthenticated:hermes"
-        if operator_class.startswith("telegram:"):
-            return operator_class
-        if operator_class == "engineering-ctl:hermes":
-            return "cli:engineering-ctl:hermes"
-        raise ValueError("operation requires an allowlisted operator channel")
+        try:
+            return canonical_operator_approval_actor(operator_class)
+        except ValueError as error:
+            raise ValueError("operation requires an allowlisted operator channel") from error
 
     @staticmethod
     def _enhancement_binding(
