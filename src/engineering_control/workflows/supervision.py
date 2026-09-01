@@ -6,7 +6,6 @@ import signal
 from collections.abc import Iterable
 from typing import Protocol
 
-
 LOGGER = logging.getLogger(__name__)
 SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
