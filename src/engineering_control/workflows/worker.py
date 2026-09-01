@@ -9,6 +9,7 @@ from engineering_control.activities.core import ControlActivities
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
 from engineering_control.workflows.definitions import ALL_WORKFLOWS
+from engineering_control.workflows.supervision import run_worker_until_signal
 
 
 async def serve() -> None:
@@ -24,7 +25,7 @@ async def serve() -> None:
         max_concurrent_workflow_tasks=50,
         max_concurrent_activities=8,
     )
-    await worker.run()
+    await run_worker_until_signal(worker)
 
 
 def run() -> None:
