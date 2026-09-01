@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import signal
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Iterable
 from typing import Protocol
+
+
+LOGGER = logging.getLogger(__name__)
+SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 class ShutdownWorker(Protocol):
@@ -16,7 +21,6 @@ async def run_worker_until_signal(
     worker: ShutdownWorker,
     *,
     shutdown_signals: Iterable[signal.Signals] = (signal.SIGTERM, signal.SIGINT),
-    on_shutdown: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Translate service termination into an orderly Temporal worker shutdown.
 
@@ -34,6 +38,8 @@ async def run_worker_until_signal(
         except (NotImplementedError, RuntimeError):
             continue
         installed.append(selected)
+    if not installed:
+        LOGGER.warning("Temporal worker signal supervision is unavailable")
 
     worker_task = asyncio.create_task(worker.run(), name="temporal-worker")
     stop_task = asyncio.create_task(stop.wait(), name="temporal-worker-stop")
@@ -44,12 +50,14 @@ async def run_worker_until_signal(
         if worker_task in done:
             await worker_task
             return
-        if on_shutdown is not None:
-            await on_shutdown()
-        await worker.shutdown()
+        LOGGER.info("Temporal worker shutdown requested")
+        await asyncio.wait_for(worker.shutdown(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
         await worker_task
+        LOGGER.info("Temporal worker drain complete")
     finally:
         stop_task.cancel()
-        await asyncio.gather(stop_task, return_exceptions=True)
+        if not worker_task.done():
+            worker_task.cancel()
+        await asyncio.gather(stop_task, worker_task, return_exceptions=True)
         for selected in installed:
             loop.remove_signal_handler(selected)

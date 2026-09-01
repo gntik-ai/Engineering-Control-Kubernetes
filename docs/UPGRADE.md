@@ -5,12 +5,15 @@
 3. Build/test new `engineering-control` and agent-pack commits without changing active symlinks.
 4. Pull new pinned image digests and CLI/scanner checksums.
 5. Stop schedulers, drain role workers, and let in-flight activities heartbeat or cancel safely.
-   Worker entry points translate systemd's `SIGTERM` into `Worker.shutdown()` before exiting. This
-   cancellation path must finish within each unit's `TimeoutStopSec`; native CLI activities then
-   terminate their owned process group and Temporal retries from the last heartbeat. A worker that
-   exits while an owned child remains alive fails the maintenance gate even if a later retry
-   succeeds. Verify one audit-owned in-flight retry against an idempotent controlled sink before
-   restarting shared workers.
+   Worker entry points translate systemd's `SIGTERM` into a bounded 30-second
+   `Worker.shutdown()` before exiting. The installed worker units allow at least 60 seconds, so
+   native CLI activity cancellation has time to terminate its owned process group before systemd
+   can escalate. Temporal retries the activity on another worker; heartbeat details from the lost
+   attempt are available if the implementation supports resumption. A worker that exits while an
+   owned child remains alive fails the maintenance gate even if a later idempotent retry succeeds.
+   Verify one audit-owned in-flight retry against an idempotent controlled sink before restarting
+   shared workers. Repeated termination signals do not shorten the 30-second application bound;
+   use the unit's normal timeout rather than manually sending `SIGKILL` during a drain.
 6. Run database migrations once; never edit a released migration. Migration `0005` adds nullable
    artifact purge tombstones. Migration `0006` adds nullable native-provider presence,
    authentication, and status fields to quota snapshots. Migration `0007` adds nullable immutable

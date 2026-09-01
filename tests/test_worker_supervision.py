@@ -13,10 +13,15 @@ class _Worker:
         self.running = asyncio.Event()
         self.stopped = asyncio.Event()
         self.shutdown_calls = 0
+        self.run_cancelled = False
 
     async def run(self) -> None:
         self.running.set()
-        await self.stopped.wait()
+        try:
+            await self.stopped.wait()
+        except asyncio.CancelledError:
+            self.run_cancelled = True
+            raise
 
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
@@ -50,6 +55,30 @@ async def test_service_sigterm_requests_orderly_temporal_worker_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_signal_received_during_handler_install_still_drains_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    invoked = False
+
+    def add(selected: signal.Signals, callback: object, *args: object) -> None:
+        nonlocal invoked
+        if selected is signal.SIGTERM and not invoked:
+            invoked = True
+            assert callable(callback)
+            callback()
+
+    monkeypatch.setattr(loop, "add_signal_handler", add)
+    monkeypatch.setattr(loop, "remove_signal_handler", lambda *_args: None)
+    worker = _Worker()
+
+    await asyncio.wait_for(run_worker_until_signal(worker), timeout=1)
+
+    assert worker.shutdown_calls == 1
+    assert worker.run_cancelled is False
+
+
+@pytest.mark.asyncio
 async def test_natural_worker_completion_does_not_request_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -62,3 +91,21 @@ async def test_natural_worker_completion_does_not_request_shutdown(
     await run_worker_until_signal(worker)
 
     assert worker.shutdown_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_outer_cancellation_collects_the_worker_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "add_signal_handler", lambda *_args: None)
+    monkeypatch.setattr(loop, "remove_signal_handler", lambda *_args: None)
+    worker = _Worker()
+    task = asyncio.create_task(run_worker_until_signal(worker))
+    await worker.running.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert worker.run_cancelled is True
