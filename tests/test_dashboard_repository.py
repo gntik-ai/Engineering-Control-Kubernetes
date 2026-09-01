@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.status_mapping import (
     NORMALIZED_STATUSES,
+    expected_next_step,
     map_status,
     normalize_status,
 )
@@ -146,6 +147,7 @@ def test_all_normalized_statuses_are_reachable() -> None:
     assert map_status("UNKNOWN_STATE").blocker_code == "UNKNOWN_STATUS_MAPPING"
     assert normalize_status("PAUSED_AFTER_CURRENT") == "paused"
     assert normalize_status("STOPPED_AFTER_CURRENT") == "cancelled"
+    assert expected_next_step("blocked") == "Resolve blocker and emit the expected retry event"
 
 
 def test_every_persisted_status_enum_has_an_explicit_non_unknown_mapping() -> None:
@@ -489,3 +491,6 @@ async def test_audit_totals_progress_zero_cells_dimensions_findings_and_order(
     assert item["blocker"] == "blocked safely"
     empty_item = next(value for value in audits["items"] if value["campaign_id"] == str(empty.id))
     assert empty_item["completion_percentage"] == 0.0
+    assert empty_item["execution_status"] == "completed"
+    assert empty_item["coverage_outcome"] == "NOT_RUN"
+    assert empty_item["normalized_status"] == "skipped"

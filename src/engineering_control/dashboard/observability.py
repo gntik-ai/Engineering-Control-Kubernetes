@@ -32,6 +32,7 @@ from engineering_control.db.models import (
     VerificationResult,
     WorkerHeartbeat,
 )
+from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -600,6 +601,22 @@ class DashboardObservabilityProjection:
             active_step.updated_at if active_step else None,
             events[0].occurred_at if events else None,
         )
+        projection_state = classify_run_projection(
+            status=run.status,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            updated_at=run.updated_at,
+            now=datetime.now(UTC),
+        )
+        normalized_status = (
+            "blocked" if projection_state == "ORPHANED_START_INTENT" else mapped.normalized
+        )
+        blocker_code = (
+            run.error_code
+            or ("ORPHANED_START_INTENT" if projection_state == "ORPHANED_START_INTENT" else None)
+            or (active_execution.blocker_code if active_execution else None)
+            or mapped.blocker_code
+        )
         start = run.started_at or run.created_at
         end = run.finished_at or datetime.now(UTC)
         item: dict[str, Any] = {
@@ -625,13 +642,10 @@ class DashboardObservabilityProjection:
             "change_set_id": str(run.change_set_id) if run.change_set_id else None,
             "deployment_id": str(deployments[0].id) if deployments else None,
             "workflow_type": run.run_type,
-            "normalized_status": mapped.normalized,
+            "normalized_status": normalized_status,
             "raw_status": run.status,
-            "blocker_code": (
-                run.error_code
-                or (active_execution.blocker_code if active_execution else None)
-                or mapped.blocker_code
-            ),
+            "projection_state": projection_state,
+            "blocker_code": blocker_code,
             "blocker": self._sanitize(
                 run.error_code or (active_execution.error_summary if active_execution else None)
             ),
@@ -659,7 +673,11 @@ class DashboardObservabilityProjection:
                 == "completed"
             ],
             "current_step": active_step.name if active_step else phase,
-            "expected_next_step": expected_next_step(mapped.normalized, mapped.blocker_code),
+            "expected_next_step": (
+                "Reconcile the durable start intent against Temporal before retrying."
+                if projection_state == "ORPHANED_START_INTENT"
+                else expected_next_step(mapped.normalized, blocker_code)
+            ),
             "execution_id": str(active_execution.id) if active_execution else None,
             "source": "runs/steps/agent_executions/dashboard_events",
             **freshness(last_activity, stale_seconds=self.stale_seconds),

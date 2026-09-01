@@ -107,6 +107,17 @@ class Settings(BaseSettings):
     worker_heartbeat_seconds: int = Field(default=30, ge=10, le=300)
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = Field(default=8750, ge=1024, le=65535)
+    dashboard_allowed_hosts: tuple[str, ...] = (
+        "ade.musematic.ai",
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    )
+    dashboard_allowed_origins: tuple[str, ...] = (
+        "https://ade.musematic.ai",
+        "http://127.0.0.1:8750",
+        "http://localhost:8750",
+    )
     dashboard_session_key_file: Path = Path("/etc/engineering-control/dashboard/session.key")
     dashboard_session_hours: int = Field(default=12, ge=1, le=24)
     dashboard_event_retention_days: int = Field(default=30, ge=1, le=365)
@@ -153,6 +164,34 @@ class Settings(BaseSettings):
         if value not in {"127.0.0.1", "::1", "localhost"}:
             raise ValueError("the dashboard must bind only to loopback")
         return value
+
+    @field_validator("dashboard_allowed_hosts")
+    @classmethod
+    def bounded_dashboard_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(dict.fromkeys(item.strip().lower() for item in value if item.strip()))
+        if not normalized or len(normalized) > 16:
+            raise ValueError("dashboard allowed hosts must contain between 1 and 16 entries")
+        if any("/" in item or "@" in item or len(item) > 253 for item in normalized):
+            raise ValueError("dashboard allowed host is invalid")
+        return normalized
+
+    @field_validator("dashboard_allowed_origins")
+    @classmethod
+    def bounded_dashboard_origins(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(
+            dict.fromkeys(item.strip().lower().rstrip("/") for item in value if item.strip())
+        )
+        if not normalized or len(normalized) > 16:
+            raise ValueError("dashboard allowed origins must contain between 1 and 16 entries")
+        if any(
+            not item.startswith(("https://", "http://"))
+            or "/" in item.split("://", 1)[1]
+            or "@" in item
+            or len(item) > 300
+            for item in normalized
+        ):
+            raise ValueError("dashboard allowed origin is invalid")
+        return normalized
 
     @field_validator("evidence_ingest_host")
     @classmethod

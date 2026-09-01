@@ -77,12 +77,16 @@ async def test_sse_resume_heartbeat_disconnect_and_retention(tmp_path: Path) -> 
     async def connected() -> bool:
         return False
 
+    async def authorized() -> bool:
+        return True
+
     chunks = [
         chunk
         async for chunk in sse_events(
             repository,
             after_id=old_id,
             disconnected=connected,
+            authorized=authorized,
             poll_seconds=0,
             heartbeat_seconds=0,
             maximum_iterations=2,
@@ -102,9 +106,66 @@ async def test_sse_resume_heartbeat_disconnect_and_retention(tmp_path: Path) -> 
             repository,
             after_id=0,
             disconnected=disconnected,
+            authorized=authorized,
             maximum_iterations=1,
         )
     ] == []
+
+
+@pytest.mark.asyncio
+async def test_sse_stops_when_session_authorization_is_revoked(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+
+    async def connected() -> bool:
+        return False
+
+    async def revoked() -> bool:
+        return False
+
+    assert [
+        chunk
+        async for chunk in sse_events(
+            repository,
+            after_id=0,
+            disconnected=connected,
+            authorized=revoked,
+            poll_seconds=0,
+            heartbeat_seconds=0,
+            authorization_seconds=0,
+            maximum_iterations=2,
+        )
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_sse_rechecks_authorization_and_stops_within_the_bound(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    authorization_calls = 0
+
+    async def connected() -> bool:
+        return False
+
+    async def authorized_then_revoked() -> bool:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        return authorization_calls == 1
+
+    chunks = [
+        chunk
+        async for chunk in sse_events(
+            repository,
+            after_id=0,
+            disconnected=connected,
+            authorized=authorized_then_revoked,
+            poll_seconds=0.001,
+            heartbeat_seconds=0,
+            authorization_seconds=0.005,
+            maximum_iterations=8,
+        )
+    ]
+    assert authorization_calls == 2
+    assert len(chunks) <= 5
+    assert all("heartbeat" in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio

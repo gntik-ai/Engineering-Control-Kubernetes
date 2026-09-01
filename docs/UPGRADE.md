@@ -9,10 +9,44 @@
    artifact purge tombstones. Migration `0006` adds nullable native-provider presence,
    authentication, and status fields to quota snapshots. Migration `0007` adds nullable immutable
    agent-pack revision, instruction-bundle hash/source, and effective-tool provenance to agent
-   invocations. All are backward-compatible with readers that ignore those columns.
+   invocations. Migration `0014` adds durable dashboard session revocations. All are
+   backward-compatible with readers that ignore those columns, but code that enforces durable
+   logout requires `0014` to be present before its dashboard/API processes start.
 7. Switch `/opt/engineering-control/source`, restart services, and run verification.
 8. Roll back code/image symlinks on failure. Restore PostgreSQL only when a migration is not
    backward-compatible and after stopping all writers.
+
+## Migration 0014 order and rollback
+
+The deployment order is mandatory: take and verify a restorable PostgreSQL backup, drain the
+affected dashboard/API processes, apply migration `0014`, verify the table contract and both
+indexes, then start the candidate processes. Starting candidate code before `0014` fails closed and
+can make every authenticated page and metric probe unavailable; it is not a supported rolling
+compatibility window.
+
+If migration `0014` finds only part of the expected table, it stops with `revision 0014 found a
+partial bootstrap schema`. Keep application processes stopped, retain the backup and schema
+inspection evidence, and obtain an approved database repair or restore plan. Do not drop, rename,
+or recreate the partial table ad hoc, because that can resurrect logged-out sessions or discard
+forensic data.
+
+Code-only rollback to a release that does not consult `dashboard_session_revocations` is unsafe
+while `0014` and its rows remain: previously logged-out cookies could become valid again. Before
+starting old code, either run the reviewed `0014` downgrade (which increments the global
+`password_version` before dropping the table) or rotate/reset the dashboard password to increment
+that version and invalidate every outstanding cookie. Verify old-cookie denial after rollback.
+The supported runtime database is PostgreSQL. SQLite is used only by isolated tests; any other
+dialect is rejected at repository startup rather than silently weakening revocation semantics.
+The versioned `.github/workflows/postgresql-acceptance.yml` job uses a digest-pinned PostgreSQL 17
+service and runs the migration-reader concurrency, rollback-invalidation, and re-upgrade gate on
+pull requests and `main` pushes. The gate asserts the PostgreSQL 17 server version and exercises
+the PostgreSQL conflict-upsert session revocation path, timezone-aware expiry metrics, and
+concurrent idempotent cleanup finalization. Local execution must set
+`ENGINEERING_TEST_POSTGRES_URL` to an audit-owned loopback PostgreSQL database; the test refuses
+non-PostgreSQL URLs. The target must be a new disposable database because the gate deliberately
+seeds fixed singleton and count-bound fixtures; remove the audit-owned database or container after
+each run instead of reusing it. A skipped local test is not equivalent to the required
+real-PostgreSQL acceptance result.
 
 Component guidance:
 

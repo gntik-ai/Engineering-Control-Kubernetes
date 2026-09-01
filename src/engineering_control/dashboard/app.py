@@ -4,12 +4,14 @@ import grp
 import hmac
 import ipaddress
 import json
+import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 import uvicorn
@@ -29,6 +31,7 @@ from starlette.templating import Jinja2Templates
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
+    SESSION_CLOCK_SKEW_SECONDS,
     SESSION_COOKIE,
     LoginFailureLimiter,
     SignedSessionManager,
@@ -56,6 +59,7 @@ PACKAGE_ROOT = Path(__file__).parent
 TEMPLATE_ROOT = PACKAGE_ROOT / "templates"
 STATIC_ROOT = PACKAGE_ROOT / "static"
 PROJECTS = frozenset({"falcone", "musematic", "llmwiki"})
+LOGGER = logging.getLogger(__name__)
 
 
 def create_app(
@@ -75,6 +79,39 @@ def create_app(
         key,
         lifetime_seconds=resolved.dashboard_session_hours * 3600,
     )
+    failure_log_next: dict[str, float] = {}
+    failure_log_suppressed: dict[str, int] = {}
+    active_failures: set[str] = set()
+    failure_totals = {
+        "health-readiness": 0,
+        "logout-revocation": 0,
+        "session-validation": 0,
+    }
+
+    def log_failure(key: str, message: str, error: BaseException) -> None:
+        active_failures.add(key)
+        failure_totals[key] += 1
+        now = time.monotonic()
+        if now < failure_log_next.get(key, 0.0):
+            failure_log_suppressed[key] = failure_log_suppressed.get(key, 0) + 1
+            return
+        suppressed = failure_log_suppressed.pop(key, 0)
+        failure_log_next[key] = now + 60.0
+        LOGGER.error(
+            "%s; error_type=%s; suppressed_since_last=%d",
+            message,
+            type(error).__name__,
+            suppressed,
+        )
+
+    def log_recovery(key: str, message: str) -> None:
+        if key not in active_failures:
+            return
+        active_failures.discard(key)
+        suppressed = failure_log_suppressed.pop(key, 0)
+        failure_log_next.pop(key, None)
+        LOGGER.info("%s; suppressed_failures=%d", message, suppressed)
+
     login_limiter = limiter or LoginFailureLimiter()
     templates = Jinja2Templates(directory=TEMPLATE_ROOT)
     templates.env.undefined = StrictUndefined
@@ -109,7 +146,21 @@ def create_app(
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Response:
-        response = cast(Response, await call_next(request))
+        host = _request_host(request.headers.get("host"))
+        response: Response
+        if host not in resolved.dashboard_allowed_hosts:
+            response = JSONResponse({"detail": "invalid request host"}, status_code=400)
+        elif (
+            request.url.path.startswith("/api/dashboard/")
+            and await current_session(request) is None
+        ):
+            response = JSONResponse({"detail": "authentication required"}, status_code=401)
+        elif request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and not _trusted_origin(
+            request, resolved.dashboard_allowed_origins
+        ):
+            response = JSONResponse({"detail": "invalid request origin"}, status_code=403)
+        else:
+            response = cast(Response, await call_next(request))
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -135,16 +186,42 @@ def create_app(
         return cast(OperationsRepository, request.app.state.operations_repository)
 
     async def current_session(request: Request) -> AuthenticatedSession | None:
+        if getattr(request.state, "dashboard_session_checked", False):
+            return cast(AuthenticatedSession | None, request.state.dashboard_session)
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
+            request.state.dashboard_session_checked = True
+            request.state.dashboard_session = None
             return None
         data = sessions.verify(token)
         if data is None:
+            request.state.dashboard_session_checked = True
+            request.state.dashboard_session = None
             return None
-        version = await repo(request).authentication_version()
-        if version is None or version != data.password_version:
+        try:
+            authorized = await repo(request).session_authorized(
+                sessions.binding_digest(token),
+                password_version=data.password_version,
+            )
+        except Exception as error:  # noqa: BLE001 - authentication must fail closed on DB errors
+            log_failure("session-validation", "dashboard session validation failed", error)
+            request.state.dashboard_session_checked = True
+            request.state.dashboard_session = None
             return None
-        return AuthenticatedSession(token=token, data=data)
+        log_recovery("session-validation", "dashboard session validation recovered")
+        if not authorized:
+            request.state.dashboard_session_checked = True
+            request.state.dashboard_session = None
+            return None
+        authenticated = AuthenticatedSession(token=token, data=data)
+        request.state.dashboard_session_checked = True
+        request.state.dashboard_session = authenticated
+        return authenticated
+
+    async def request_authorized(request: Request) -> bool:
+        request.state.dashboard_session_checked = False
+        request.state.dashboard_session = None
+        return await current_session(request) is not None
 
     async def require_session(
         request: Request, *, api: bool = False
@@ -188,11 +265,51 @@ def create_app(
 
     @app.get("/health/ready")
     async def health_ready(request: Request) -> Response:
-        repository_ready = await repo(request).ping()
-        initialized = await repo(request).authentication_version()
-        if not repository_ready or initialized is None:
+        try:
+            repository_ready = await repo(request).ready()
+        except Exception as error:  # noqa: BLE001 - readiness fails closed without database detail
+            log_failure("health-readiness", "dashboard readiness persistence check failed", error)
+            return JSONResponse({"status": "not-ready"}, status_code=503)
+        log_recovery("health-readiness", "dashboard readiness persistence check recovered")
+        # This query touches the same authentication and revocation relations
+        # as session validation, including after all browser cookies are gone.
+        log_recovery("session-validation", "dashboard session validation recovered")
+        if not repository_ready:
             return JSONResponse({"status": "not-ready"}, status_code=503)
         return JSONResponse({"status": "ready"})
+
+    @app.get("/internal/metrics")
+    async def internal_metrics(request: Request) -> Response:
+        if _request_host(request.headers.get("host")) not in {"127.0.0.1", "localhost", "::1"}:
+            return Response(status_code=404)
+        labels = {
+            "health-readiness": "readiness",
+            "logout-revocation": "logout_revocation",
+            "session-validation": "session_validation",
+        }
+        lines = [
+            "# HELP engineering_dashboard_persistence_failures_total "
+            "Fixed-boundary persistence failures.",
+            "# TYPE engineering_dashboard_persistence_failures_total counter",
+        ]
+        lines.extend(
+            "engineering_dashboard_persistence_failures_total"
+            f'{{operation="{label}"}} {failure_totals[key]}'
+            for key, label in labels.items()
+        )
+        lines.extend(
+            [
+                "# HELP engineering_dashboard_persistence_failure_active "
+                "One while the fixed persistence boundary has not recovered.",
+                "# TYPE engineering_dashboard_persistence_failure_active gauge",
+            ]
+        )
+        lines.extend(
+            "engineering_dashboard_persistence_failure_active"
+            f'{{operation="{label}"}} {int(key in active_failures)}'
+            for key, label in labels.items()
+        )
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     @app.get("/robots.txt")
     async def robots() -> PlainTextResponse:
@@ -284,6 +401,29 @@ def create_app(
         form = await _form(request)
         if not _valid_csrf(authenticated, form.get("csrf_token")):
             return PlainTextResponse("invalid request", status_code=403)
+        now = datetime.now(UTC)
+        grace = timedelta(seconds=SESSION_CLOCK_SKEW_SECONDS)
+        expires_at = min(
+            datetime.fromtimestamp(authenticated.data.expires_at, UTC) + grace,
+            now + timedelta(seconds=sessions.lifetime_seconds) + grace,
+        )
+        try:
+            await repo(request).revoke_session(
+                sessions.binding_digest(authenticated.token),
+                password_version=authenticated.data.password_version,
+                expires_at=expires_at,
+            )
+        except Exception as error:  # noqa: BLE001 - logout must fail closed without database detail
+            log_failure(
+                "logout-revocation",
+                "dashboard logout session revocation failed",
+                error,
+            )
+            return PlainTextResponse(
+                "Logout is temporarily unavailable; this session remains active.",
+                status_code=503,
+            )
+        log_recovery("logout-revocation", "dashboard logout session revocation recovered")
         response = RedirectResponse("/login", status_code=303)
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
@@ -688,6 +828,7 @@ def create_app(
                 execution_id,
                 after_sequence=after_sequence,
                 disconnected=request.is_disconnected,
+                authorized=lambda: request_authorized(request),
             ),
             media_type="text/event-stream",
         )
@@ -743,15 +884,14 @@ def create_app(
         return JSONResponse({"items": COMMAND_REGISTRY})
 
     @app.get("/api/dashboard/r3-issues/candidate")
-    async def dashboard_r3_issue_candidate_api(
-        request: Request,
-        project: str = Query(pattern=r"^musematic$"),
-        surface: str = Query(pattern=r"^source$"),
-        issue_number: int = Query(ge=1119, le=1119),
-    ) -> Response:
+    async def dashboard_r3_issue_candidate_api(request: Request) -> Response:
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
+        try:
+            project, surface, issue_number = _r3_candidate_target(request)
+        except ValueError:
+            return JSONResponse({"detail": "invalid request"}, status_code=422)
         try:
             return JSONResponse(
                 await operations(request).r3_issue_candidate_status(project, surface, issue_number)
@@ -760,19 +900,22 @@ def create_app(
             return JSONResponse({"detail": str(error)}, status_code=404)
 
     @app.post("/api/dashboard/r3-issues/candidate", status_code=201)
-    async def dashboard_r3_issue_candidate_create_api(
-        request: Request,
-        project: str = Query(pattern=r"^musematic$"),
-        surface: str = Query(pattern=r"^source$"),
-        issue_number: int = Query(ge=1119, le=1119),
-    ) -> Response:
+    async def dashboard_r3_issue_candidate_create_api(request: Request) -> Response:
         authenticated = await require_session(request, api=True)
         if isinstance(authenticated, Response):
             return authenticated
         try:
-            body = R3CandidateCreateInput.model_validate(await _json(request))
-            if not _valid_csrf(authenticated, body.csrf_token):
-                return JSONResponse({"detail": "invalid request"}, status_code=403)
+            project, surface, issue_number = _r3_candidate_target(request)
+        except ValueError:
+            return JSONResponse({"detail": "invalid request"}, status_code=422)
+        body = await _json(request)
+        try:
+            candidate = R3CandidateCreateInput.model_validate(body)
+        except ValueError:
+            return JSONResponse({"detail": "invalid request"}, status_code=422)
+        if not _valid_csrf(authenticated, candidate.csrf_token):
+            return JSONResponse({"detail": "invalid request"}, status_code=403)
+        try:
             return JSONResponse(
                 await operations(request).r3_issue_candidate(project, surface, issue_number),
                 status_code=201,
@@ -938,6 +1081,7 @@ def create_app(
                 repo(request),
                 after_id=after_id,
                 disconnected=request.is_disconnected,
+                authorized=lambda: request_authorized(request),
             ),
             media_type="text/event-stream",
         )
@@ -1055,11 +1199,75 @@ def _client_address(request: Request) -> str:
     return direct
 
 
+def _request_host(value: str | None) -> str:
+    if not value:
+        return ""
+    if value != value.strip() or any(character in value for character in "/\\@?#"):
+        return ""
+    try:
+        parsed = urlsplit(f"//{value}")
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        return (parsed.hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _trusted_origin(request: Request, allowed: tuple[str, ...]) -> bool:
+    supplied = request.headers.get("origin")
+    if supplied:
+        return _canonical_origin(supplied, allow_path=False) in allowed
+    referer = request.headers.get("referer")
+    if not referer:
+        return False
+    return _canonical_origin(referer, allow_path=True) in allowed
+
+
+def _canonical_origin(value: str, *, allow_path: bool) -> str:
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or (
+                not allow_path and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment)
+            )
+        ):
+            return ""
+        origin = f"{parsed.scheme.lower()}://{parsed.hostname.lower()}"
+        if parsed.port is not None:
+            origin = f"{origin}:{parsed.port}"
+        return origin
+    except ValueError:
+        return ""
+
+
 def _validate_filters(project: str | None, status: str | None) -> None:
     if project is not None and project not in PROJECTS:
         raise HTTPException(status_code=422, detail="invalid project filter")
     if status is not None and status not in NORMALIZED_STATUSES:
         raise HTTPException(status_code=422, detail="invalid status filter")
+
+
+def _r3_candidate_target(request: Request) -> tuple[str, str, int]:
+    """Validate the fixed R3 lookup only after the caller is authenticated."""
+    if len(request.url.query) > 256:
+        raise ValueError("invalid R3 candidate target")
+    items = list(request.query_params.multi_items())
+    if len(items) != 3 or {key for key, _value in items} != {
+        "project",
+        "surface",
+        "issue_number",
+    }:
+        raise ValueError("invalid R3 candidate target")
+    project = request.query_params.get("project")
+    surface = request.query_params.get("surface")
+    issue_number = request.query_params.get("issue_number")
+    if project != "musematic" or surface != "source" or issue_number != "1119":
+        raise ValueError("invalid R3 candidate target")
+    return project, surface, 1119
 
 
 def _validate_observability_filters(

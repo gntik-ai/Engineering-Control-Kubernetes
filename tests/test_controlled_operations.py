@@ -23,6 +23,7 @@ from engineering_control.db.models import (
     Campaign,
     ConnectionSnapshot,
     CoverageCell,
+    DashboardEvent,
     Enhancement,
     GitHubBacklogCampaign,
     OperationExport,
@@ -457,6 +458,10 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
     stale = await repository.candidate(_solve_issue(), SESSION_A)
     assert stale.capability.status == "BLOCKED"
     assert {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"} <= set(stale.capability.blockers)
+    providers = await repository.operator_snapshot("providers")
+    assert providers["status"] == "DEGRADED"
+    assert {value["status"] for value in providers["providers"].values()} == {"STALE"}
+    assert all(value["freshness_seconds"] >= 599 for value in providers["providers"].values())
 
     r3 = await repository.candidate(
         SolveIssueCommand(
@@ -535,7 +540,11 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
         operations_repository=operations,
         session_key=b"c" * 48,
     )
-    with TestClient(app, base_url="https://testserver") as client:
+    with TestClient(
+        app,
+        base_url="https://ade.musematic.ai",
+        headers={"Origin": "https://ade.musematic.ai"},
+    ) as client:
         endpoint = "/api/dashboard/actions/candidates"
         assert client.post(endpoint, json={}).status_code == 401
         login = client.get("/login")
@@ -643,6 +652,213 @@ async def test_connection_snapshot_reports_freshness_without_sensitive_probe_out
     assert values[0].status == "STALE"
     assert values[0].freshness_seconds >= 599
     assert values[0].details == {"authentication_status": "READY"}
+
+
+@pytest.mark.asyncio
+async def test_terminal_zero_and_blocked_campaigns_have_truthful_coverage_status(
+    tmp_path: Path,
+) -> None:
+    operations = _repository(tmp_path)
+    now = datetime.now(UTC)
+    empty = Campaign(
+        project="falcone",
+        name="empty-terminal",
+        status="COMPLETED",
+        required_cells=0,
+        metadata_json={},
+        source_sha=None,
+        deployment_sha=None,
+        created_at=now,
+        updated_at=now,
+    )
+    blocked = Campaign(
+        project="falcone",
+        name="blocked-terminal",
+        status="COMPLETED",
+        required_cells=1,
+        metadata_json={},
+        source_sha=None,
+        deployment_sha=None,
+        created_at=now - timedelta(seconds=1),
+        updated_at=now,
+    )
+    inconsistent = Campaign(
+        project="llmwiki",
+        name="terminal-with-active-cell",
+        status="COMPLETED",
+        required_cells=1,
+        metadata_json={},
+        source_sha=None,
+        deployment_sha=None,
+        created_at=now - timedelta(seconds=2),
+        updated_at=now,
+    )
+    with operations.sessions.begin() as session:
+        session.add_all([empty, blocked, inconsistent])
+        session.flush()
+        session.add(
+            CoverageCell(
+                campaign_id=blocked.id,
+                repository_surface="source",
+                domain="api",
+                persona="operator",
+                flow="bounded-fixture",
+                lens="functional",
+                environment="staging",
+                status="BLOCKED",
+                blocker="FIXTURE_DEPENDENCY",
+                exclusion_approval_id=None,
+                evidence_json=[],
+                result_json={},
+            )
+        )
+        session.add(
+            CoverageCell(
+                campaign_id=inconsistent.id,
+                repository_surface="docs",
+                domain="publication",
+                persona="operator",
+                flow="bounded-fixture",
+                lens="functional",
+                environment="staging",
+                status="IN_PROGRESS",
+                blocker=None,
+                exclusion_approval_id=None,
+                evidence_json=[],
+                result_json={},
+            )
+        )
+
+    metadata = SQLMetadataRepository(str(operations.engine.url))
+    values = {value["name"]: value for value in await metadata.list_campaigns(10)}
+    assert values["empty-terminal"]["execution_status"] == "COMPLETED"
+    assert values["empty-terminal"]["coverage_outcome"] == "NOT_RUN"
+    assert values["empty-terminal"]["status"] == "NOT_RUN"
+    assert values["blocked-terminal"]["coverage_outcome"] == "BLOCKED"
+    assert values["blocked-terminal"]["status"] == "BLOCKED"
+    assert values["terminal-with-active-cell"]["execution_status"] == "COMPLETED"
+    assert values["terminal-with-active-cell"]["coverage_outcome"] == "IN_PROGRESS"
+    assert values["terminal-with-active-cell"]["status"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_connection_reads_expire_green_snapshots_and_cli_is_not_a_connection(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    old = datetime.now(UTC) - timedelta(minutes=10)
+    for component in ("engineering-api", "temporal"):
+        await repository.upsert_connection(
+            {
+                "component": component,
+                "logical_target": component,
+                "status": "CONNECTED",
+                "checked_at": old,
+                "last_success_at": old,
+                "last_failure_at": None,
+                "latency_ms": 1,
+                "safe_error": None,
+                "source": "stale-green-fixture",
+                "next_action": None,
+                "details": {},
+            }
+        )
+    await repository.upsert_connection(
+        {
+            "component": "engineering-cli",
+            "logical_target": "/opt/engineering-control/venv/bin/engineering-ctl",
+            "status": "PRESENT",
+            "checked_at": old,
+            "last_success_at": None,
+            "last_failure_at": None,
+            "latency_ms": None,
+            "safe_error": None,
+            "source": "fixed-path-metadata",
+            "next_action": None,
+            "details": {"api_compatibility": "v1", "kind": "client"},
+        }
+    )
+
+    values = {value.component: value for value in await repository.connections()}
+    assert values["engineering-api"].status == "STALE"
+    assert values["temporal"].status == "STALE"
+    assert values["engineering-api"].safe_error == (
+        "persisted connection snapshot exceeded its freshness limit"
+    )
+    assert values["engineering-api"].next_action == (
+        "Refresh the owning fixed probe or persisted publisher."
+    )
+    assert values["engineering-cli"].status == "PRESENT"
+    readiness = await repository.operator_snapshot("readiness-all")
+    assert readiness["connection_count"] == 2
+    assert readiness["connected_count"] == 0
+    assert readiness["status"] == "DEGRADED"
+
+
+def test_gateway_delivery_failure_is_never_projected_as_success(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    now = datetime.now(UTC)
+    with repository.sessions.begin() as session:
+        session.add_all(
+            [
+                DashboardEvent(
+                    occurred_at=now - timedelta(seconds=2),
+                    level="INFO",
+                    event_type="telegram.response_delivered",
+                    source="hermes",
+                    host=None,
+                    worker_kind=None,
+                    project=None,
+                    workflow_id=None,
+                    temporal_run_id=None,
+                    issue_number=None,
+                    campaign_id=None,
+                    entity_type=None,
+                    entity_id=None,
+                    current_phase=None,
+                    message="Telegram response delivered",
+                    metadata_json={},
+                ),
+                DashboardEvent(
+                    occurred_at=now - timedelta(seconds=1),
+                    level="ERROR",
+                    event_type="telegram.response_delivery_failed",
+                    source="hermes",
+                    host=None,
+                    worker_kind=None,
+                    project=None,
+                    workflow_id=None,
+                    temporal_run_id=None,
+                    issue_number=None,
+                    campaign_id=None,
+                    entity_type=None,
+                    entity_id=None,
+                    current_phase=None,
+                    message="Telegram response delivery failed",
+                    metadata_json={},
+                ),
+            ]
+        )
+
+    event_types = [event.event_type for event in repository.health_sources()["events"]]
+    assert event_types[:2] == [
+        "telegram.response_delivery_failed",
+        "telegram.response_delivered",
+    ]
+    ConnectionHealthProjector(repository)._persisted(now)
+    values = {value.component: value for value in repository._connections()}
+    for component in ("hermes-gateway", "telegram"):
+        assert values[component].status == "DEGRADED"
+        assert values[component].last_success_at is not None
+        assert values[component].last_failure_at is not None
+        assert values[component].last_success_at.replace(tzinfo=UTC) == now - timedelta(seconds=2)
+        assert values[component].last_failure_at.replace(tzinfo=UTC) == now - timedelta(seconds=1)
+        assert values[component].details["last_event_type"] == ("telegram.response_delivery_failed")
+    assert values["engineering-cli"].status == "PRESENT"
+
+    channel = repository._operator_snapshot("channel")
+    assert channel["status"] == "DEGRADED"
+    assert channel["last_safe_error"] == "Telegram response delivery failed"
 
 
 @pytest.mark.asyncio

@@ -56,6 +56,9 @@ packages = ["src/engineering_control"]
 addopts = "-ra --strict-markers"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+  "postgresql: requires an explicitly supplied disposable PostgreSQL database",
+]
 
 [tool.ruff]
 line-length = 100

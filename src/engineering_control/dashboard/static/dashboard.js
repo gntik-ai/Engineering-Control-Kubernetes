@@ -24,7 +24,10 @@ const elapsed = (seconds) => {
   parts.push([Math.floor(rest / 60), "m"], [Math.floor(rest % 60), "s"]);
   return parts.filter(([amount]) => amount).slice(0, 2).map(([amount, unit]) => `${amount}${unit}`).join(" ") || "0s";
 };
-const status = (value) => node("span", `status status-${value || "unknown"}`, value || "unknown");
+const status = (value) => {
+  const label = value || "unknown";
+  return node("span", `status status-${String(label).toLowerCase()}`, label);
+};
 const badge = (value, kind = "") => node("span", `badge ${kind}`, value);
 const link = (href, label, external = false) => {
   const value = node("a", "", label); value.href = href;

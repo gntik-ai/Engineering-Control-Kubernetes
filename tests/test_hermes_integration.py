@@ -2,14 +2,36 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import urllib.error
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 
-def load_handler() -> ModuleType:
+@pytest.fixture(autouse=True)
+def deny_hermes_hook_network_egress(monkeypatch: pytest.MonkeyPatch) -> Any:
+    attempted: list[str] = []
+
+    def deny_urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        attempted.append("urllib.request.urlopen")
+        raise AssertionError("Hermes integration test attempted network access")
+
+    def deny_socket(*_args: Any, **_kwargs: Any) -> Any:
+        attempted.append("socket connection")
+        raise AssertionError("Hermes integration test attempted socket access")
+
+    monkeypatch.setattr("urllib.request.urlopen", deny_urlopen)
+    monkeypatch.setattr("socket.create_connection", deny_socket)
+    monkeypatch.setattr("socket.socket.connect", deny_socket)
+    yield
+    assert attempted == []
+
+
+def load_handler(*, replace_gateway_event: bool = True) -> ModuleType:
     path = (
         Path(__file__).parents[1]
         / "integrations"
@@ -20,7 +42,51 @@ def load_handler() -> ModuleType:
     spec = importlib.util.spec_from_file_location("engineering_control_hermes_hook", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "ENGINEERING_API_URL": "http://127.0.0.1:9",
+                "ENGINEERING_API_TOKEN_FILE": "/nonexistent/engineering-control-test-token",
+            },
+            clear=True,
+        ),
+        patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("Hermes hook import attempted network access"),
+        ),
+    ):
+        spec.loader.exec_module(module)
+    gateway_events: list[dict[str, Any]] = []
+
+    def record_gateway_event(
+        event_type: str,
+        command: str,
+        *,
+        raw_args: str = "",
+        result: Any = None,
+        outcome: str | None = None,
+    ) -> None:
+        gateway_events.append(
+            {
+                "event_type": event_type,
+                "command": command,
+                "raw_args": raw_args,
+                "result": result,
+                "outcome": outcome,
+            }
+        )
+
+    # The hook's default event sink targets the installed live gateway. Tests load
+    # the hook from source, so they must replace that sink before invoking handle().
+    # Keeping events in memory preserves behavioral assertions without allowing a
+    # unit test to read the installed API token or contact a shared service.
+    if replace_gateway_event:
+        module._gateway_event = record_gateway_event
+    module._test_gateway_events = gateway_events
+    assert module.API_URL == "http://127.0.0.1:9"
+    assert str(module.TOKEN_FILE) == "/nonexistent/engineering-control-test-token"
+    assert not module.TOKEN_FILE.exists()
     return module
 
 
@@ -88,10 +154,137 @@ def test_authorized_command_records_telegram_actor(monkeypatch: pytest.MonkeyPat
 
 
 def test_unknown_command_is_denied() -> None:
-    assert load_handler().handle("command:help", {}) == {
+    handler = load_handler()
+    assert handler.handle("command:help", {}) == {
         "decision": "deny",
         "message": "Unknown engineering command denied.",
     }
+    assert handler._test_gateway_events == [
+        {
+            "event_type": "telegram.command_rejected",
+            "command": "unknown",
+            "raw_args": "",
+            "result": None,
+            "outcome": "UNKNOWN_COMMAND",
+        }
+    ]
+
+
+def test_gateway_event_uses_protected_token_and_bounded_loopback_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = load_handler(replace_gateway_event=False)
+    token_file = tmp_path / "gateway-event.token"
+    token_file.write_text("synthetic-gateway-event-token-1234567890\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    handler.TOKEN_FILE = token_file
+    handler.API_URL = "http://127.0.0.1:8740"
+    captured: dict[str, Any] = {}
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self, limit: int) -> bytes:
+            captured["read_limit"] = limit
+            return b"{}"
+
+    def urlopen(request: Any, *, timeout: int) -> Response:
+        captured.update(
+            url=request.full_url,
+            method=request.method,
+            authorization=request.get_header("Authorization"),
+            actor=request.get_header("X-engineering-actor"),
+            content_type=request.get_header("Content-type"),
+            payload=json.loads(request.data),
+            timeout=timeout,
+        )
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    handler._gateway_event(
+        "telegram.command_completed",
+        "status",
+        raw_args="musematic 1119 staging ignored-extra-data",
+        result={
+            "workflow_id": "synthetic-workflow-123",
+            "secret": "must-not-leave-memory",
+        },
+        outcome="COMPLETED",
+    )
+
+    assert captured == {
+        "url": "http://127.0.0.1:8740/v1/observability/gateway-events",
+        "method": "POST",
+        "authorization": "Bearer synthetic-gateway-event-token-1234567890",
+        "actor": "hermes-gateway",
+        "content_type": "application/json",
+        "payload": {
+            "event_type": "telegram.command_completed",
+            "command": "status",
+            "outcome": "COMPLETED",
+            "project": "musematic",
+            "issue_number": 1119,
+            "mode": "staging",
+            "workflow_id": "synthetic-workflow-123",
+        },
+        "timeout": 2,
+        "read_limit": 4096,
+    }
+
+
+def test_gateway_event_failures_are_best_effort_and_do_not_change_hook_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = load_handler(replace_gateway_event=False)
+    handler.API_URL = "http://127.0.0.1:8740"
+    attempts = 0
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.URLError("synthetic transport unavailable")
+
+    monkeypatch.setattr("urllib.request.urlopen", unavailable)
+    handler.TOKEN_FILE = tmp_path / "missing-gateway-event.token"
+    assert handler.handle("command:help", {}) == {
+        "decision": "deny",
+        "message": "Unknown engineering command denied.",
+    }
+    assert attempts == 0
+
+    token_file = tmp_path / "gateway-event.token"
+    token_file.write_text("synthetic-gateway-event-token-1234567890\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    handler.TOKEN_FILE = token_file
+    assert handler.handle("command:help", {}) == {
+        "decision": "deny",
+        "message": "Unknown engineering command denied.",
+    }
+    assert attempts == 1
+
+    def rejected(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.HTTPError(
+            "http://127.0.0.1:8740/v1/observability/gateway-events",
+            503,
+            "synthetic unavailable",
+            {},
+            None,
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", rejected)
+    assert handler.handle("command:help", {}) == {
+        "decision": "deny",
+        "message": "Unknown engineering command denied.",
+    }
+    assert attempts == 2
 
 
 def test_validate_command_starts_only_bounded_synthetic_lifecycle(

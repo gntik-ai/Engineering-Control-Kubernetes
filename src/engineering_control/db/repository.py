@@ -23,6 +23,7 @@ from engineering_control.api.schemas import (
     RollbackRequest,
     RuntimeVerificationStart,
 )
+from engineering_control.coverage_outcome import coverage_outcome, truthful_campaign_status
 from engineering_control.db.models import (
     AgentInvocation,
     Approval,
@@ -31,10 +32,13 @@ from engineering_control.db.models import (
     BacklogIssueRecord,
     Campaign,
     ChangeSet,
+    CoverageCell,
+    DashboardSessionRevocation,
     Deployment,
     Enhancement,
     Finding,
     GitHubBacklogCampaign,
+    NotificationOutbox,
     ProviderUsage,
     QuotaSnapshot,
     Run,
@@ -49,6 +53,12 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
+from engineering_control.retention_limits import (
+    DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
+    NOTIFICATION_OUTBOX_METRIC_STATUSES,
+    NOTIFICATION_OUTBOX_PENDING_STATUS,
+    NOTIFICATION_OUTBOX_UNKNOWN_STATUS,
+)
 
 
 def serialize_row(row: Any) -> dict[str, Any]:
@@ -492,7 +502,20 @@ class SQLMetadataRepository:
             rows = session.scalars(
                 select(Campaign).order_by(Campaign.created_at.desc()).limit(limit)
             ).all()
-            return [serialize_row(row) for row in rows]
+            values: list[dict[str, Any]] = []
+            for row in rows:
+                statuses = list(
+                    session.scalars(
+                        select(CoverageCell.status).where(CoverageCell.campaign_id == row.id)
+                    ).all()
+                )
+                outcome = coverage_outcome(statuses)
+                value = serialize_row(row)
+                value["execution_status"] = row.status
+                value["coverage_outcome"] = outcome
+                value["status"] = truthful_campaign_status(row.status, outcome)
+                values.append(value)
+            return values
 
     async def list_backlog_campaigns(self, project: str | None, limit: int) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_backlog_campaigns, project, limit)
@@ -1085,6 +1108,7 @@ class SQLMetadataRepository:
             "STAGING_APPROVED",
             "STAGING_DEPLOYED",
         }
+        now = datetime.now(UTC)
         with self.sessions() as session:
             active_campaigns = session.execute(
                 select(Campaign.project, func.count())
@@ -1136,6 +1160,30 @@ class SQLMetadataRepository:
                 .where(Artifact.purged_at.is_(None))
                 .group_by(Artifact.project, Artifact.retention_class)
             ).all()
+            active_dashboard_session_revocations = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at >= now
+                    )
+                )
+                or 0
+            )
+            expired_dashboard_session_revocations = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at < now
+                    )
+                )
+                or 0
+            )
+            notification_outbox = session.execute(
+                select(NotificationOutbox.status, func.count()).group_by(NotificationOutbox.status)
+            ).all()
+            oldest_pending_notification = session.scalar(
+                select(func.min(NotificationOutbox.created_at)).where(
+                    NotificationOutbox.status == NOTIFICATION_OUTBOX_PENDING_STATUS
+                )
+            )
         deployment_durations: dict[tuple[str, str], list[float]] = {}
         deployment_failures: dict[tuple[str, str], int] = {}
         for deployment in deployments:
@@ -1165,7 +1213,50 @@ class SQLMetadataRepository:
             "evidence_storage": [
                 [project, retention, int(size or 0)] for project, retention, size in evidence
             ],
+            "dashboard_session_revocations": [
+                ["active", active_dashboard_session_revocations],
+                ["expired", expired_dashboard_session_revocations],
+            ],
+            "dashboard_session_revocation_cleanup_truncated": [
+                [
+                    1
+                    if expired_dashboard_session_revocations
+                    > DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT
+                    else 0
+                ]
+            ],
+            "notification_outbox": self._notification_status_metrics(notification_outbox),
+            "notification_oldest_pending_age_seconds": [
+                [
+                    max(
+                        0.0,
+                        (
+                            now
+                            - (
+                                oldest_pending_notification
+                                if oldest_pending_notification.tzinfo is not None
+                                else oldest_pending_notification.replace(tzinfo=UTC)
+                            )
+                        ).total_seconds(),
+                    )
+                    if oldest_pending_notification is not None
+                    else 0.0
+                ]
+            ],
         }
+
+    @staticmethod
+    def _notification_status_metrics(rows: Any) -> list[list[str | int]]:
+        counts = {status: 0 for status in NOTIFICATION_OUTBOX_METRIC_STATUSES}
+        for raw_status, raw_count in rows:
+            status = str(raw_status)
+            key = (
+                status
+                if status in counts and status != NOTIFICATION_OUTBOX_UNKNOWN_STATUS
+                else NOTIFICATION_OUTBOX_UNKNOWN_STATUS
+            )
+            counts[key] += int(raw_count)
+        return [[status, counts[status]] for status in NOTIFICATION_OUTBOX_METRIC_STATUSES]
 
     async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._get_deployment, deployment_id)

@@ -526,6 +526,14 @@ class DashboardAuthentication(Base):
     __table_args__ = (CheckConstraint("id = 1", name="singleton"),)
 
 
+class DashboardSessionRevocation(Base):
+    __tablename__ = "dashboard_session_revocations"
+    session_binding_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    password_version: Mapped[int] = mapped_column(Integer)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class DashboardEvent(Base):
     __tablename__ = "dashboard_events"
     id: Mapped[int] = mapped_column(

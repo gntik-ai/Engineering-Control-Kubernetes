@@ -24,7 +24,7 @@ NORMALIZED_STATUSES = (
     "skipped",
 )
 
-TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "skipped"})
+TERMINAL_STATUSES = frozenset({"blocked", "completed", "failed", "cancelled", "skipped"})
 _EXACT: dict[str, str] = {}
 
 
@@ -295,11 +295,15 @@ _NEXT_STEP = {
 
 
 def expected_next_step(normalized_status: str, blocker_code: str | None = None) -> str | None:
+    if normalized_status == "blocked":
+        return (
+            f"Resolve {blocker_code} and emit the expected retry event"
+            if blocker_code
+            else _NEXT_STEP.get("blocked", "Resolve unknown status mapping")
+        )
     if normalized_status in TERMINAL_STATUSES:
         return None
     value = _NEXT_STEP.get(normalized_status, "Resolve unknown status mapping")
-    if normalized_status == "blocked" and blocker_code:
-        return f"Resolve {blocker_code} and emit the expected retry event"
     return value
 
 

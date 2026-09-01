@@ -38,12 +38,14 @@ from engineering_control.db.models import (
     ComponentLease,
     CoverageCell,
     DashboardEvent,
+    DashboardSessionRevocation,
     Deployment,
     Finding,
     FindingVerification,
     GitHubBacklogCampaign,
     Incident,
     Issue,
+    NotificationOutbox,
     OperationExport,
     ProjectSnapshot,
     ProviderUsage,
@@ -93,6 +95,10 @@ from engineering_control.observability.agent import normalize_agent_role
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
+from engineering_control.retention_limits import (
+    DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
+    NOTIFICATION_OUTBOX_PENDING_STATUS,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -6531,6 +6537,14 @@ class MetadataActivityHandler:
                 )
                 or 0
             )
+            dashboard_session_revocation_cleanup_count = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at < now
+                    )
+                )
+                or 0
+            )
             log_cutoff = now - timedelta(days=self.settings.dashboard_agent_log_retention_days)
             execution_cutoff = now - timedelta(
                 days=self.settings.dashboard_agent_execution_retention_days
@@ -6566,6 +6580,13 @@ class MetadataActivityHandler:
             "file_cleanup_candidates": file_candidates,
             "preview_namespace_cleanup_candidates": preview_candidates,
             "dashboard_event_cleanup_count": dashboard_event_cleanup_count,
+            "dashboard_session_revocation_cleanup_count": (
+                dashboard_session_revocation_cleanup_count
+            ),
+            "dashboard_session_revocation_cleanup_truncated": (
+                dashboard_session_revocation_cleanup_count
+                > DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT
+            ),
             "agent_log_cleanup_count": agent_log_cleanup_count,
             "agent_execution_cleanup_count": agent_execution_cleanup_count,
             "operation_export_cleanup_count": operation_export_cleanup_count,
@@ -6769,6 +6790,12 @@ class MetadataActivityHandler:
                 type="SecurityBlocker",
                 non_retryable=True,
             )
+        if payload.get("dry_run") is not False:
+            raise ApplicationError(
+                "metadata cleanup requires explicit dry_run=false",
+                type="SecurityBlocker",
+                non_retryable=True,
+            )
         workflow_id = str(payload["orchestration"]["workflow_id"])
         worktrees = payload.get("authorized_candidates")
         files = payload.get("authorized_file_candidates")
@@ -6826,6 +6853,8 @@ class MetadataActivityHandler:
         purged: list[str] = []
         cleaned_previews: list[str] = []
         deleted_dashboard_events = 0
+        deleted_dashboard_session_revocations = 0
+        remaining_dashboard_session_revocations = 0
         deleted_agent_logs = 0
         deleted_agent_executions = 0
         deleted_operation_exports = 0
@@ -6929,6 +6958,24 @@ class MetadataActivityHandler:
                 session.delete(event)
             deleted_dashboard_events = len(expired_events)
 
+            expired_session_revocations = session.scalars(
+                select(DashboardSessionRevocation)
+                .where(DashboardSessionRevocation.expires_at < now)
+                .order_by(DashboardSessionRevocation.expires_at)
+                .limit(DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT)
+            ).all()
+            for revocation in expired_session_revocations:
+                session.delete(revocation)
+            deleted_dashboard_session_revocations = len(expired_session_revocations)
+            remaining_dashboard_session_revocations = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at < now
+                    )
+                )
+                or 0
+            )
+
             log_cutoff = now - timedelta(days=self.settings.dashboard_agent_log_retention_days)
             expired_logs = session.scalars(
                 select(AgentLogChunk)
@@ -6973,6 +7020,14 @@ class MetadataActivityHandler:
             "purged_artifact_ids": sorted(purged),
             "cleaned_preview_deployment_ids": sorted(cleaned_previews),
             "deleted_dashboard_event_count": deleted_dashboard_events,
+            "deleted_dashboard_session_revocation_count": (deleted_dashboard_session_revocations),
+            "remaining_dashboard_session_revocation_count": (
+                remaining_dashboard_session_revocations
+            ),
+            "dashboard_session_revocation_cleanup_truncated": (
+                deleted_dashboard_session_revocations == DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT
+                and remaining_dashboard_session_revocations > 0
+            ),
             "deleted_agent_log_count": deleted_agent_logs,
             "deleted_agent_execution_count": deleted_agent_executions,
             "deleted_operation_export_count": deleted_operation_exports,
@@ -6985,7 +7040,9 @@ class MetadataActivityHandler:
             raise ValueError("cleanup terminal status is not allowlisted")
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
-            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            run = session.scalar(
+                select(Run).where(Run.workflow_id == workflow_id).with_for_update()
+            )
             if run is None:
                 raise ValueError("cleanup finalization Run is missing")
             if run.finished_at is not None:
@@ -7089,6 +7146,38 @@ class MetadataActivityHandler:
                 run.status = "BLOCKED"
                 run.error_code = str(payload.get("blocker", "CLEANUP_BLOCKED"))
                 run.summary = "cleanup blocked without mutation"
+            if payload.get("dashboard_session_revocation_cleanup_truncated") is True:
+                topic = "alerts.dashboard-session-revocation-cleanup-truncated"
+                alert_id = uuid5(NAMESPACE_URL, f"notification:{topic}:{workflow_id}")
+                observed_count = int(payload.get("dashboard_session_revocation_cleanup_count", 0))
+                deleted_count = int(payload.get("deleted_dashboard_session_revocation_count", 0))
+                remaining_count = int(
+                    payload.get(
+                        "remaining_dashboard_session_revocation_count",
+                        max(0, observed_count - deleted_count),
+                    )
+                )
+                if session.get(NotificationOutbox, alert_id) is None:
+                    session.add(
+                        NotificationOutbox(
+                            id=alert_id,
+                            topic=topic,
+                            status=NOTIFICATION_OUTBOX_PENDING_STATUS,
+                            payload_json={
+                                "workflow_id": workflow_id,
+                                "severity": "warning",
+                                "reason": "SESSION_REVOCATION_CLEANUP_LIMIT_EXCEEDED",
+                                "observed_expired_count": observed_count,
+                                "cleanup_limit": DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
+                                "deleted_count": deleted_count,
+                                "remaining_count": remaining_count,
+                            },
+                            attempts=0,
+                            next_attempt_at=now,
+                            delivered_at=None,
+                            last_error_code=None,
+                        )
+                    )
             run.finished_at = now
         return {**payload, "status": terminal}
 

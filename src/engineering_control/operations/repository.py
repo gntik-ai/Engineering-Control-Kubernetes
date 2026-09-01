@@ -45,6 +45,10 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
+from engineering_control.operations.connection_status import (
+    PROVIDER_FRESHNESS_SECONDS,
+    effective_connection_status,
+)
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditAllProjectsCommand,
@@ -71,6 +75,8 @@ from engineering_control.operations.models import (
     WorkflowControlCommand,
     parse_command,
 )
+from engineering_control.retention_limits import NOTIFICATION_OUTBOX_PENDING_STATUS
+from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
 _ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNNING"})
@@ -1489,7 +1495,7 @@ class OperationsRepository:
                 session.add(
                     NotificationOutbox(
                         topic="telegram.engineering-operation-started",
-                        status="PENDING",
+                        status=NOTIFICATION_OUTBOX_PENDING_STATUS,
                         payload_json={
                             "operation_id": str(operation.id),
                             "project": operation.project,
@@ -1700,46 +1706,83 @@ class OperationsRepository:
                 ],
             }
         if surface == "providers":
+            freshness_seconds: dict[str, int | None] = {}
+            provider_current: dict[str, bool] = {}
+            for provider, quota_row in quotas.items():
+                age = (
+                    max(0, int((now - _utc(quota_row.captured_at)).total_seconds()))
+                    if quota_row is not None
+                    else None
+                )
+                freshness_seconds[provider] = age
+                provider_current[provider] = age is not None and age <= PROVIDER_FRESHNESS_SECONDS
             return {
                 "status": "READY"
                 if all(
                     value is not None
+                    and provider_current[provider]
                     and value.authenticated is True
                     and value.cli_present is True
                     and not value.rate_limited
-                    for value in quotas.values()
+                    for provider, value in quotas.items()
                 )
                 else "DEGRADED",
                 "providers": {
                     provider: (
                         {
                             "provider_id": f"{provider}_cli",
-                            "authenticated": row.authenticated,
-                            "cli_present": row.cli_present,
-                            "rate_limited": row.rate_limited,
-                            "running_jobs": row.running_jobs,
-                            "status": row.status,
-                            "captured_at": row.captured_at.isoformat(),
-                            "source": row.source,
+                            "authenticated": quota_row.authenticated,
+                            "cli_present": quota_row.cli_present,
+                            "rate_limited": quota_row.rate_limited,
+                            "running_jobs": quota_row.running_jobs,
+                            "status": (
+                                "STALE" if not provider_current[provider] else quota_row.status
+                            ),
+                            "captured_at": quota_row.captured_at.isoformat(),
+                            "freshness_seconds": freshness_seconds[provider],
+                            "source": quota_row.source,
                         }
-                        if row is not None
+                        if quota_row is not None
                         else {"provider_id": f"{provider}_cli", "status": "NOT_REPORTED"}
                     )
-                    for provider, row in quotas.items()
+                    for provider, quota_row in quotas.items()
                 },
                 "permitted_provider_ids": ["codex_cli", "claude_cli"],
             }
         if surface == "channel":
             latest: dict[str, DashboardEvent] = {}
-            for row in events:
-                latest.setdefault(row.event_type, row)
+            for event_row in events:
+                latest.setdefault(event_row.event_type, event_row)
 
             def event_time(name: str) -> str | None:
-                row = latest.get(name)
-                return row.occurred_at.isoformat() if row is not None else None
+                event_row = latest.get(name)
+                return event_row.occurred_at.isoformat() if event_row is not None else None
 
             outbound = latest.get("telegram.response_delivered")
             inbound = latest.get("telegram.command_received")
+            failure = latest.get("telegram.response_delivery_failed")
+            observed_rows = [row for row in (outbound, inbound, failure) if row is not None]
+            observed_at = max((_utc(row.occurred_at) for row in observed_rows), default=None)
+            observed_age = (
+                max(0, int((now - observed_at).total_seconds()))
+                if observed_at is not None
+                else None
+            )
+            failure_is_latest = failure is not None and (
+                outbound is None or _utc(failure.occurred_at) >= _utc(outbound.occurred_at)
+            )
+            reply_follows_inbound = outbound is not None and (
+                inbound is None or _utc(outbound.occurred_at) >= _utc(inbound.occurred_at)
+            )
+            channel_status = (
+                "STALE"
+                if observed_age is not None and observed_age > 600
+                else "CONNECTED"
+                if outbound is not None and reply_follows_inbound and not failure_is_latest
+                else "DEGRADED"
+                if observed_rows
+                else "NOT_CONFIGURED"
+            )
             latency_ms = None
             if (
                 outbound is not None
@@ -1749,10 +1792,15 @@ class OperationsRepository:
                 latency_ms = int(
                     (_utc(outbound.occurred_at) - _utc(inbound.occurred_at)).total_seconds() * 1000
                 )
-            last_error = latest.get("telegram.response_delivery_failed")
             return {
-                "status": "CONNECTED" if outbound is not None else "STALE",
-                "gateway_state": "RUNNING" if events else "NOT_REPORTED",
+                "status": channel_status,
+                "gateway_state": (
+                    "RUNNING"
+                    if channel_status in {"CONNECTED", "DEGRADED"}
+                    else "STALE"
+                    if observed_rows
+                    else "NOT_REPORTED"
+                ),
                 "transport_mode": "telegram",
                 "last_inbound_update": event_time("telegram.command_received"),
                 "last_recognized_command": event_time("telegram.command_recognized"),
@@ -1760,22 +1808,40 @@ class OperationsRepository:
                 "last_outbound_reply": event_time("telegram.response_delivered"),
                 "latency_ms": latency_ms,
                 "hook_profile": "engineering-control-fixed-commands",
-                "last_safe_error": last_error.message if last_error is not None else None,
+                "last_safe_error": (
+                    failure.message if failure is not None and failure_is_latest else None
+                ),
             }
         if surface == "temporal":
             temporal = next(
                 (row for row in connections if row.component.lower() == "temporal"), None
             )
-            active = [
-                row
+            projection_states = [
+                classify_run_projection(
+                    status=row.status,
+                    started_at=row.started_at,
+                    finished_at=row.finished_at,
+                    updated_at=row.updated_at,
+                    now=now,
+                )
                 for row in runs
-                if row.status not in {"COMPLETE", "COMPLETED", "SUCCESS", "FAILED", "CANCELLED"}
             ]
             return {
-                "status": temporal.status if temporal is not None else "NOT_REPORTED",
+                "status": (
+                    effective_connection_status(
+                        temporal.component, temporal.status, temporal.checked_at, now
+                    )
+                    if temporal is not None
+                    else "NOT_REPORTED"
+                ),
                 "target": temporal.logical_target if temporal is not None else None,
                 "checked_at": temporal.checked_at.isoformat() if temporal is not None else None,
-                "active_workflow_projections": len(active),
+                "active_workflow_projections": projection_states.count(
+                    "ACTIVE_REQUIRES_TEMPORAL_CORRELATION"
+                ),
+                "durable_wait_projections": projection_states.count("DURABLE_WAIT"),
+                "orphaned_start_intents": projection_states.count("ORPHANED_START_INTENT"),
+                "terminal_workflow_projections": projection_states.count("TERMINAL"),
                 "recent_workflow_projections": len(runs),
                 "worker_heartbeat_count": len(heartbeats),
             }
@@ -1783,9 +1849,13 @@ class OperationsRepository:
             row
             for row in connections
             if row.component != "worker-controller"
+            and row.component != "engineering-cli"
             and (surface != "readiness-core" or not row.component.startswith("project-"))
         ]
-        statuses = [row.status for row in required_connections]
+        statuses = [
+            effective_connection_status(row.component, row.status, row.checked_at, now)
+            for row in required_connections
+        ]
         return {
             "status": "READY"
             if statuses and all(value == "CONNECTED" for value in statuses)
@@ -2168,23 +2238,37 @@ class OperationsRepository:
             rows = session.scalars(
                 select(ConnectionSnapshot).order_by(ConnectionSnapshot.component)
             ).all()
-            return [
-                ConnectionView(
-                    component=row.component,
-                    logical_target=row.logical_target,
-                    status=cast(Any, row.status),
-                    checked_at=row.checked_at,
-                    last_success_at=row.last_success_at,
-                    last_failure_at=row.last_failure_at,
-                    latency_ms=row.latency_ms,
-                    freshness_seconds=max(0, int((now - _utc(row.checked_at)).total_seconds())),
-                    safe_error=row.safe_error,
-                    source=row.source,
-                    next_action=row.next_action,
-                    details=row.detail_json,
+            values: list[ConnectionView] = []
+            for row in rows:
+                effective = effective_connection_status(
+                    row.component, row.status, row.checked_at, now
                 )
-                for row in rows
-            ]
+                became_stale = effective == "STALE" and row.status != "STALE"
+                values.append(
+                    ConnectionView(
+                        component=row.component,
+                        logical_target=row.logical_target,
+                        status=cast(Any, effective),
+                        checked_at=row.checked_at,
+                        last_success_at=row.last_success_at,
+                        last_failure_at=row.last_failure_at,
+                        latency_ms=row.latency_ms,
+                        freshness_seconds=max(0, int((now - _utc(row.checked_at)).total_seconds())),
+                        safe_error=(
+                            "persisted connection snapshot exceeded its freshness limit"
+                            if became_stale
+                            else row.safe_error
+                        ),
+                        source=row.source,
+                        next_action=(
+                            "Refresh the owning fixed probe or persisted publisher."
+                            if became_stale
+                            else row.next_action
+                        ),
+                        details=row.detail_json,
+                    )
+                )
+            return values
 
     @staticmethod
     def _operation_view(

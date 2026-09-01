@@ -82,6 +82,15 @@ Codex/Claude readiness, a bounded risk, and a server-generated confirmation phra
 call the existing enhancement repository and solution workflow; they do not add a GitHub or shell
 bypass.
 
+The application validates the HTTP `Host` before routing. It also requires an allowlisted
+`Origin`, or an allowlisted same-origin `Referer` when `Origin` is absent, for every unsafe method.
+Anonymous `/api/dashboard/*` requests are rejected before request-body or object validation so the
+public boundary does not expose an authenticated route's schema or object-existence differences.
+The bounded settings are `dashboard_allowed_hosts` and `dashboard_allowed_origins`; only the
+installed public name and loopback origins are defaults. A proxy hostname change must update these
+settings through normal release configuration and repeat the Host/Origin regression tests. A
+non-default `dashboard_port` must likewise be reflected in the loopback origin entries.
+
 Raw state remains visible. The canonical normalized states are `backlog`, `eligible`, `queued`,
 `preparing`, `implementing`, `reviewing`, `reworking`, `testing`, `awaiting_ci`,
 `awaiting_approval`, `building`, `deploying`, `verifying`, `blocked`, `paused`, `completed`,
@@ -90,6 +99,21 @@ Raw state remains visible. The canonical normalized states are `backlog`, `eligi
 their raw role remains durable metadata. Audit completion uses terminal coverage cells divided by
 total cells; zero-cell campaigns report zero percent and indeterminate work never receives a false
 percentage.
+
+Workflow projections distinguish terminal rows, durable external/human waits, active rows that
+still require Temporal correlation, and queued/planned start intents older than 15 minutes. The
+last class is shown as `ORPHANED_START_INTENT` with a reconciliation next action; it is never
+reported as active merely because its database row is nonterminal. Campaigns expose both their
+workflow execution status and a derived coverage outcome. A terminal campaign with no executed
+cells is `NOT_RUN`; all-blocked cells are `BLOCKED`; findings and partial blockers remain distinct
+from a clean pass. If the campaign execution is terminal while any coverage cell remains
+nonterminal, its execution and coverage fields remain visible but its derived operator status is
+`BLOCKED` until reconciled.
+
+Status domains are explicit per surface. The private control API's campaign `execution_status`
+preserves the raw uppercase persisted workflow value, while the dashboard audit projection uses a
+lowercase normalized `execution_status` for presentation. Both expose the independently derived
+`coverage_outcome`; consumers must not compare raw and normalized fields without conversion.
 
 Operational-event and transcript streams use authenticated SSE, ordered event IDs,
 `Last-Event-ID`, bounded PostgreSQL reads, approximately 15-second heartbeats and clean disconnect
@@ -124,7 +148,12 @@ Provider roles mean:
 
 There is one password and no username. Sessions are HMAC signed for 12 hours and use Secure,
 HttpOnly, SameSite=Strict cookies. The signed value includes `password_version`; a password change
-or reset invalidates all older sessions. Login failures are limited in memory per public client IP.
+or reset invalidates all older sessions. Successful logout also writes a token-binding digest to
+PostgreSQL, so that exact cookie remains revoked across process restarts while other concurrent
+operator sessions remain valid. Authorization matches the revocation row's binding digest and
+password version and independently requires the current global password version. If PostgreSQL is unavailable,
+session validation fails closed and logout returns 503 without clearing the still-active cookie.
+Login failures are limited in memory per public client IP.
 All state-changing forms use CSRF validation. Controlled operations additionally require the same
 password again; the password value is verified in memory and never enters an operation record,
 event, log, report, or URL.
@@ -182,9 +211,16 @@ restrictive Permissions-Policy and self-only CSP headers. Validate before every 
 systemctl status engineering-dashboard.service
 journalctl -u engineering-dashboard.service
 curl --fail http://127.0.0.1:8750/health/ready
+curl --fail -H 'Host: 127.0.0.1' http://127.0.0.1:8750/internal/metrics
 dig +short ade.musematic.ai A
 curl -I https://ade.musematic.ai/login
 ```
+
+The dashboard metrics endpoint is accepted only with a loopback Host and is not a public Caddy
+surface. It exports fixed-label counters and active-state gauges for readiness, logout-revocation,
+and session-validation persistence failures. A public-host request receives 404. Alert on an
+active gauge of one and close the incident only after it returns to zero following the matching
+recovery event.
 
 The systemd unit runs as `engineering-control:engineering-control`, not `hermes`. It uses a strict
 filesystem sandbox, loopback-only network access and explicit inaccessible operator credential
@@ -219,10 +255,30 @@ durable `operation_requests` queue; the dashboard process never receives the pri
 Temporal client. A started dashboard operation creates a bounded Telegram notification outbox
 record containing only project, target, workflow and phase.
 
+The fixed `/api/dashboard/r3-issues/candidate` GET and POST routes authenticate the dashboard
+session before examining the query or POST body. Their only accepted query contains exactly the
+order-insensitive keys and values `project=musematic`, `surface=source`, and `issue_number=1119`,
+with no duplicate or extra keys. Anonymous
+missing, malformed and oversized inputs receive the generic authentication response. Authenticated
+invalid targets receive the fixed `{"detail":"invalid request"}` 422 response; authenticated valid
+targets retain the typed 404/409 operation outcomes. A valid target with an invalid typed body gets
+the same generic 422, while bounded JSON media-type, size and syntax errors keep their fixed
+415/413/400 responses; an incorrect CSRF token gets the fixed generic 403. The fixed query is validated in application
+code after authentication and is therefore intentionally not inferred from FastAPI query-parameter
+declarations in the generated OpenAPI schema. Requests larger than the proxy or ASGI request-line
+limit can be rejected at that edge before application authentication; the application contract
+applies to requests admitted to the ASGI app with an accepted Host/Origin. Host and unsafe-method
+Origin enforcement intentionally runs before the route-level session check.
+
 Connections refresh executes only fixed loopback/public HTTP, DNS, TLS and Temporal TCP probes.
 Privileged components publish safe heartbeat/quota/event/project snapshots into PostgreSQL. A
 missing or old snapshot becomes `NOT_CONFIGURED` or `STALE`; source code presence alone never
-produces `CONNECTED`.
+produces `CONNECTED`. Status is recomputed at read time: workers expire after 180 seconds,
+providers and ordinary service probes after 300 seconds, Hermes/Telegram after 600 seconds,
+GitHub broker observations after 900 seconds, and project readiness observations after 24 hours.
+The CLI is reported as `PRESENT`, not as a continuously connected service. Telegram requires a
+causally ordered delivered response after the latest inbound command; a later delivery failure is
+`DEGRADED`, and an old exchange is `STALE`.
 
 ## Bounded evidence exports
 

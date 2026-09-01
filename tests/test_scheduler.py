@@ -13,6 +13,9 @@ def test_periodic_cleanup_is_dry_run_unless_execution_is_explicitly_enabled() ->
         "engineering-safe-cleanup"
     ]
 
+    # Temporal Schedule actions expand this template with the scheduled UTC instant.
+    assert default.action.id == "cleanup-scheduled"
+    assert enabled.action.id == "cleanup-scheduled"
     assert default.action.args == [CleanupInput(dry_run=True)]
     assert enabled.action.args == [CleanupInput(dry_run=False)]
 

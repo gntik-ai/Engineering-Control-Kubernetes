@@ -13,6 +13,10 @@ from sqlalchemy.orm import Session
 from engineering_control.config import Settings, get_settings
 from engineering_control.db.models import NotificationOutbox
 from engineering_control.logging import configure_logging
+from engineering_control.retention_limits import (
+    NOTIFICATION_OUTBOX_DELIVERED_STATUS,
+    NOTIFICATION_OUTBOX_PENDING_STATUS,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 logger = structlog.get_logger()
@@ -40,7 +44,7 @@ class NotificationService:
             rows = session.scalars(
                 select(NotificationOutbox)
                 .where(
-                    NotificationOutbox.status == "PENDING",
+                    NotificationOutbox.status == NOTIFICATION_OUTBOX_PENDING_STATUS,
                     NotificationOutbox.next_attempt_at <= datetime.now(UTC),
                 )
                 .order_by(NotificationOutbox.created_at)
@@ -58,14 +62,18 @@ class NotificationService:
                             json={"topic": row.topic, "payload": payload},
                         )
                         response.raise_for_status()
-                    except httpx.HTTPError:
+                    except httpx.HTTPError as error:
                         row.attempts += 1
-                        row.last_error_code = "SINK_HTTP_ERROR"
+                        row.last_error_code = (
+                            "SINK_HTTP_STATUS_ERROR"
+                            if isinstance(error, httpx.HTTPStatusError)
+                            else "SINK_TRANSPORT_ERROR"
+                        )
                         row.next_attempt_at = datetime.now(UTC) + timedelta(
                             seconds=min(3600, 2 ** min(row.attempts, 10))
                         )
                     else:
-                        row.status = "DELIVERED"
+                        row.status = NOTIFICATION_OUTBOX_DELIVERED_STATUS
                         row.delivered_at = datetime.now(UTC)
                         delivered += 1
         return delivered

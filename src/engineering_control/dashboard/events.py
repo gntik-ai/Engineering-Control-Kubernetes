@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import UUID
 
@@ -32,6 +32,8 @@ _STEP_EVENTS = {
     "backlog.record_loop_state": "issue_status.changed",
     "cleanup.finalize": "workflow.completed",
 }
+
+AsyncPredicate = Callable[[], Awaitable[bool]]
 
 
 def event_for_step(
@@ -93,17 +95,25 @@ async def sse_events(
     repository: DashboardRepository,
     *,
     after_id: int,
-    disconnected: Any,
+    disconnected: AsyncPredicate,
+    authorized: AsyncPredicate,
     poll_seconds: float = 1.0,
     heartbeat_seconds: float = 15.0,
+    authorization_seconds: float = 5.0,
     maximum_iterations: int | None = None,
 ) -> AsyncIterator[str]:
     cursor = max(0, after_id)
     since_heartbeat = 0.0
+    loop = asyncio.get_running_loop()
+    next_authorization = loop.time()
     iterations = 0
     while maximum_iterations is None or iterations < maximum_iterations:
         if await disconnected():
             return
+        if loop.time() >= next_authorization:
+            if not await authorized():
+                return
+            next_authorization = loop.time() + max(0.0, authorization_seconds)
         events = await repository.recent_events(limit=100, after_id=cursor)
         if events:
             for event in events:
@@ -124,17 +134,25 @@ async def transcript_sse(
     execution_id: UUID,
     *,
     after_sequence: int,
-    disconnected: Any,
+    disconnected: AsyncPredicate,
+    authorized: AsyncPredicate,
     poll_seconds: float = 1.0,
     heartbeat_seconds: float = 15.0,
+    authorization_seconds: float = 5.0,
     maximum_iterations: int | None = None,
 ) -> AsyncIterator[str]:
     cursor = max(0, after_sequence)
     since_heartbeat = 0.0
+    loop = asyncio.get_running_loop()
+    next_authorization = loop.time()
     iterations = 0
     while maximum_iterations is None or iterations < maximum_iterations:
         if await disconnected():
             return
+        if loop.time() >= next_authorization:
+            if not await authorized():
+                return
+            next_authorization = loop.time() + max(0.0, authorization_seconds)
         result = await asyncio.to_thread(
             projection.execution_logs,
             execution_id,

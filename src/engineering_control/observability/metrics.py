@@ -83,6 +83,28 @@ class ControlPlaneMetrics:
             ("project", "retention_class"),
             registry=self.registry,
         )
+        self.dashboard_session_revocations = Gauge(
+            "engineering_dashboard_session_revocations",
+            "Persisted dashboard session revocations by active or expired state.",
+            ("state",),
+            registry=self.registry,
+        )
+        self.dashboard_session_revocation_cleanup_truncated = Gauge(
+            "engineering_dashboard_session_revocation_cleanup_truncated",
+            "One when expired dashboard session revocations exceed one cleanup batch.",
+            registry=self.registry,
+        )
+        self.notification_outbox = Gauge(
+            "engineering_notification_outbox",
+            "Durable notification outbox records by delivery status.",
+            ("status",),
+            registry=self.registry,
+        )
+        self.notification_oldest_pending_age = Gauge(
+            "engineering_notification_oldest_pending_age_seconds",
+            "Age in seconds of the oldest pending durable notification.",
+            registry=self.registry,
+        )
 
     def render(self, snapshot: dict[str, Any], *, heartbeat_ttl_seconds: int) -> tuple[bytes, str]:
         gauges = (
@@ -98,9 +120,17 @@ class ControlPlaneMetrics:
             self.deployment_failures,
             self.verification_failures,
             self.evidence_storage,
+            self.dashboard_session_revocations,
+            self.dashboard_session_revocation_cleanup_truncated,
+            self.notification_outbox,
+            self.notification_oldest_pending_age,
         )
         for gauge in gauges:
             gauge.clear()
+        # Gauge.clear() only removes labelled children. Establish an explicit
+        # baseline for unlabelled gauges before applying authoritative rows.
+        self.dashboard_session_revocation_cleanup_truncated.set(0)
+        self.notification_oldest_pending_age.set(0)
         self._rows(self.active_campaigns, snapshot.get("active_campaigns"), 2)
         self._rows(self.queued_findings, snapshot.get("queued_findings"), 3)
         self._rows(self.active_implementations, snapshot.get("active_implementations"), 3)
@@ -111,6 +141,22 @@ class ControlPlaneMetrics:
         self._rows(self.deployment_failures, snapshot.get("deployment_failures"), 3)
         self._rows(self.verification_failures, snapshot.get("verification_failures"), 3)
         self._rows(self.evidence_storage, snapshot.get("evidence_storage"), 3)
+        self._rows(
+            self.dashboard_session_revocations,
+            snapshot.get("dashboard_session_revocations"),
+            2,
+        )
+        self._rows(
+            self.dashboard_session_revocation_cleanup_truncated,
+            snapshot.get("dashboard_session_revocation_cleanup_truncated"),
+            1,
+        )
+        self._rows(self.notification_outbox, snapshot.get("notification_outbox"), 2)
+        self._rows(
+            self.notification_oldest_pending_age,
+            snapshot.get("notification_oldest_pending_age_seconds"),
+            1,
+        )
         now = datetime.now(UTC).timestamp()
         heartbeats = snapshot.get("worker_heartbeats")
         if isinstance(heartbeats, list):
@@ -145,4 +191,7 @@ class ControlPlaneMetrics:
                 continue
             if not isinstance(number, int | float):
                 continue
-            gauge.labels(*(str(label) for label in labels)).set(float(number))
+            if labels:
+                gauge.labels(*(str(label) for label in labels)).set(float(number))
+            else:
+                gauge.set(float(number))

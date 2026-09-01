@@ -133,6 +133,35 @@ class FakeMetadataRepository(EmptyMetadataRepository):
             }
         }
 
+    async def list_campaigns(self, limit: int = 50) -> list[dict[str, Any]]:
+        assert limit == 50
+        return [
+            {
+                "campaign_id": "11111111-1111-4111-8111-111111111111",
+                "name": "terminal-with-active-cell",
+                "project": "llmwiki",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "IN_PROGRESS",
+                "status": "BLOCKED",
+            },
+            {
+                "campaign_id": "22222222-2222-4222-8222-222222222222",
+                "name": "terminal-with-no-cells",
+                "project": "falcone",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "NOT_RUN",
+                "status": "NOT_RUN",
+            },
+            {
+                "campaign_id": "33333333-3333-4333-8333-333333333333",
+                "name": "terminal-with-partial-blocker",
+                "project": "musematic",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "PARTIAL_BLOCKED",
+                "status": "PARTIAL_BLOCKED",
+            },
+        ]
+
 
 def test_api_requires_bearer_auth() -> None:
     app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
@@ -593,6 +622,10 @@ def test_internal_metrics_expose_named_control_plane_families() -> None:
     assert "engineering_active_campaigns" in response.text
     assert "engineering_worker_health" in response.text
     assert "engineering_evidence_storage_bytes" in response.text
+    assert "engineering_dashboard_session_revocations" in response.text
+    assert "engineering_dashboard_session_revocation_cleanup_truncated" in response.text
+    assert "engineering_notification_outbox" in response.text
+    assert "engineering_notification_oldest_pending_age_seconds" in response.text
 
 
 def test_api_rejects_extra_fields() -> None:
@@ -829,6 +862,35 @@ def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:
         assert usage.json()["codex"]["source"] == "cli-does-not-report"
         assert usage.json()["codex"]["authenticated"] is True
         assert usage.json()["codex"]["cli_present"] is True
+
+        campaigns = client.get("/v1/campaigns", headers=headers)
+        assert campaigns.status_code == 200
+        assert campaigns.json()["items"] == [
+            {
+                "campaign_id": "11111111-1111-4111-8111-111111111111",
+                "name": "terminal-with-active-cell",
+                "project": "llmwiki",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "IN_PROGRESS",
+                "status": "BLOCKED",
+            },
+            {
+                "campaign_id": "22222222-2222-4222-8222-222222222222",
+                "name": "terminal-with-no-cells",
+                "project": "falcone",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "NOT_RUN",
+                "status": "NOT_RUN",
+            },
+            {
+                "campaign_id": "33333333-3333-4333-8333-333333333333",
+                "name": "terminal-with-partial-blocker",
+                "project": "musematic",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "PARTIAL_BLOCKED",
+                "status": "PARTIAL_BLOCKED",
+            },
+        ]
         assert usage.json()["codex"]["status"] == "AVAILABLE"
         assert usage.json()["codex"]["running_jobs"] == 1
         assert usage.json()["codex"]["history"]["roles"]["implementer"]["success_rate"] == 0.5

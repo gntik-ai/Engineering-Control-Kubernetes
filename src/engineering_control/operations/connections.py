@@ -14,6 +14,10 @@ from engineering_control.operations.repository import OperationsRepository
 from engineering_control.workflows.worker_registry import ROLE_TASK_QUEUES
 
 
+def _utc(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
 class ConnectionHealthProjector:
     """Runs only fixed read-only probes and consumes safe persisted component snapshots."""
 
@@ -348,8 +352,28 @@ class ConnectionHealthProjector:
                 }
             )
         events = sources["events"]
+        gateway_success = next(
+            (event for event in events if event.event_type == "telegram.response_delivered"), None
+        )
+        gateway_failure = next(
+            (event for event in events if event.event_type == "telegram.response_delivery_failed"),
+            None,
+        )
+        gateway_inbound = next(
+            (event for event in events if event.event_type == "telegram.command_received"), None
+        )
         gateway = next(
-            (event for event in events if event.event_type.startswith("telegram.")), None
+            (
+                event
+                for event in events
+                if event.event_type
+                in {
+                    "telegram.response_delivered",
+                    "telegram.response_delivery_failed",
+                    "telegram.command_received",
+                }
+            ),
+            None,
         )
         gateway_age = (
             int(
@@ -365,11 +389,24 @@ class ConnectionHealthProjector:
             if gateway is not None
             else None
         )
+        gateway_recent = gateway_age is not None and gateway_age <= 600
+        failure_is_latest = gateway_failure is not None and (
+            gateway_success is None
+            or _utc(gateway_failure.occurred_at) >= _utc(gateway_success.occurred_at)
+        )
+        reply_follows_inbound = gateway_success is not None and (
+            gateway_inbound is None
+            or _utc(gateway_success.occurred_at) >= _utc(gateway_inbound.occurred_at)
+        )
         gateway_status = (
-            "CONNECTED"
-            if gateway_age is not None and gateway_age <= 86400
-            else "STALE"
-            if gateway
+            "STALE"
+            if gateway is not None and not gateway_recent
+            else "DEGRADED"
+            if gateway is not None and (failure_is_latest or not reply_follows_inbound)
+            else "CONNECTED"
+            if gateway_success is not None
+            else "DEGRADED"
+            if gateway is not None
             else "NOT_CONFIGURED"
         )
         for component, target in (
@@ -382,12 +419,18 @@ class ConnectionHealthProjector:
                     "logical_target": target,
                     "status": gateway_status,
                     "checked_at": gateway.occurred_at if gateway else now,
-                    "last_success_at": gateway.occurred_at if gateway else None,
-                    "last_failure_at": None,
+                    "last_success_at": (
+                        gateway_success.occurred_at if gateway_success is not None else None
+                    ),
+                    "last_failure_at": (
+                        gateway_failure.occurred_at if gateway_failure is not None else None
+                    ),
                     "latency_ms": None,
                     "safe_error": None
                     if gateway_status == "CONNECTED"
-                    else "safe gateway event is stale or absent",
+                    else "latest Telegram delivery failed"
+                    if failure_is_latest and gateway_recent
+                    else "safe gateway event is stale or incomplete",
                     "source": "redacted-gateway-events",
                     "next_action": None
                     if gateway_status == "CONNECTED"
@@ -505,9 +548,9 @@ class ConnectionHealthProjector:
             {
                 "component": "engineering-cli",
                 "logical_target": str(cli_path),
-                "status": "CONNECTED" if cli_path.is_file() else "NOT_INSTALLED",
+                "status": "PRESENT" if cli_path.is_file() else "NOT_INSTALLED",
                 "checked_at": now,
-                "last_success_at": now if cli_path.is_file() else None,
+                "last_success_at": None,
                 "last_failure_at": None,
                 "latency_ms": None,
                 "safe_error": None if cli_path.is_file() else "engineering-ctl is not installed",

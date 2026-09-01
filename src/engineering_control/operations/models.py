@@ -22,6 +22,7 @@ ConnectionStatus = Literal[
     "BLOCKED_BY_POLICY",
     "NOT_CONFIGURED",
     "NOT_INSTALLED",
+    "PRESENT",
 ]
 
 

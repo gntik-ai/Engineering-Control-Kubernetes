@@ -171,6 +171,9 @@ async def test_transcript_redacted_before_db_ordered_resumable_and_idempotent(
     async def connected() -> bool:
         return False
 
+    async def authorized() -> bool:
+        return True
+
     frames = [
         frame
         async for frame in transcript_sse(
@@ -178,6 +181,7 @@ async def test_transcript_redacted_before_db_ordered_resumable_and_idempotent(
             execution_id,  # type: ignore[arg-type]
             after_sequence=1,
             disconnected=connected,
+            authorized=authorized,
             poll_seconds=0,
             heartbeat_seconds=0,
             maximum_iterations=2,
@@ -186,6 +190,49 @@ async def test_transcript_redacted_before_db_ordered_resumable_and_idempotent(
     assert any("id: 2" in frame and "pytest completed" in frame for frame in frames)
     assert all(secret not in frame for frame in frames)
     assert any("heartbeat" in frame for frame in frames)
+
+    async def revoked() -> bool:
+        return False
+
+    assert [
+        frame
+        async for frame in transcript_sse(
+            dashboard.observability,
+            execution_id,  # type: ignore[arg-type]
+            after_sequence=0,
+            disconnected=connected,
+            authorized=revoked,
+            poll_seconds=0,
+            heartbeat_seconds=0,
+            authorization_seconds=0,
+            maximum_iterations=2,
+        )
+    ] == []
+
+    authorization_calls = 0
+
+    async def authorized_then_revoked() -> bool:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        return authorization_calls == 1
+
+    bounded_frames = [
+        frame
+        async for frame in transcript_sse(
+            dashboard.observability,
+            execution_id,  # type: ignore[arg-type]
+            after_sequence=2,
+            disconnected=connected,
+            authorized=authorized_then_revoked,
+            poll_seconds=0.001,
+            heartbeat_seconds=0,
+            authorization_seconds=0.005,
+            maximum_iterations=8,
+        )
+    ]
+    assert authorization_calls == 2
+    assert len(bounded_frames) <= 5
+    assert all("heartbeat" in frame for frame in bounded_frames)
 
 
 @pytest.mark.asyncio
