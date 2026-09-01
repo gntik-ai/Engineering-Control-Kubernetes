@@ -333,11 +333,13 @@ not expose `journalctl` through a web route.
 Before installation, take fresh root-owned runtime, configuration and PostgreSQL backups. Install
 only the exact committed tree using the existing commit-addressed controller bootstrap. Because
 provider adapters and worker instrumentation are part of this release, controller and worker must
-run the exact same committed tree. Apply migrations through `0013` only after the database backup, then
-restart only the affected controller, provider, scan, evidence-ingest and dashboard services.
-Preserve the current password hash/version, session key, DNS, Caddy and TLS state. Apply migration
-`0013` after `0012`; it is additive and does not alter authentication, workflow, campaign, finding,
-ChangeSet, evidence, transcript or session-key state.
+run the exact same committed tree. Apply the reviewed linear migration chain through `0014` only
+after the database backup and while the affected dashboard/API writers are stopped. Verify the
+`dashboard_session_revocations` table and both indexes before starting the candidate dashboard/API;
+candidate authentication fails closed when the table is unavailable. Preserve the current password
+hash/version, session key, DNS, Caddy and TLS state. Migration `0013` remains the additive bounded
+export projection; migration `0014` adds durable per-session revocations without changing product,
+workflow, campaign, finding, ChangeSet, evidence, transcript or session-key data.
 
 Normal rollback:
 
@@ -345,12 +347,16 @@ Normal rollback:
 2. Switch controller and worker `/opt/engineering-control/source` links to their recorded previous
    commit-addressed releases.
 3. Restart the previous controller, worker and dashboard services in controlled order.
-4. Leave `agent_executions`, `agent_log_chunks`, and `operation_exports` in place by default; the
-   previous release ignores additive tables.
-5. If a database downgrade is explicitly required, back up PostgreSQL again, stop all writers, and
-   downgrade `0013` to `0012`; this removes only bounded downloadable export projections. Do not
-   remove operation audit records. Leave `0012` command candidates, operation correlation,
-   connection snapshots, and `0011` transcript data in place.
+4. Do not start pre-`0014` dashboard/API code while revocation rows are merely being ignored. Before
+   that code rollback, use the reviewed `0014` downgrade while all writers are stopped; it increments
+   the global password version before dropping the revocation table so old cookies cannot revive.
+   Verify denial of an acceptance-owned old cookie before reopening the console. If that forward-safe
+   rollback cannot be completed, keep the public console in maintenance and repair forward.
+5. Leave `agent_executions`, `agent_log_chunks`, and `operation_exports` in place by default; the
+   previous release ignores those additive tables. A separate downgrade from `0013` to `0012` is not
+   part of normal rollback and requires its own reviewed database change because it removes bounded
+   export projections. Do not remove operation audit records. Leave `0012` command candidates,
+   operation correlation, connection snapshots, and `0011` transcript data in place.
 6. Preserve the dashboard password row/version and `/etc/engineering-control/dashboard/session.key`.
 7. Do not change DNS, Caddy or TLS for a normal observability rollback.
 
