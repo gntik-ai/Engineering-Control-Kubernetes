@@ -51,6 +51,10 @@ class LLMWikiFalconeConsumerSuite:
             "FALCONE_API_BASE_URL": falcone_api_base_url,
             "ENGINEERING_E2E_CAMPAIGN_ID": campaign_id,
             "JOURNEY_SAFE_E2E_MUTATION": "false",
+            # Run the reviewed browser-worker pnpm binary. pnpm 10 otherwise
+            # self-provisions the target repository's packageManager version,
+            # which can silently reintroduce an older vulnerable executable.
+            "npm_config_manage_package_manager_versions": "false",
         }
         for value in environment.values():
             self.runner.redactor.register_secret(value)
