@@ -5,6 +5,7 @@ import signal
 
 import pytest
 
+from engineering_control.workflows import supervision
 from engineering_control.workflows.supervision import run_worker_until_signal
 
 
@@ -47,6 +48,7 @@ async def test_service_sigterm_requests_orderly_temporal_worker_shutdown(
 
     callback = callbacks[signal.SIGTERM]
     assert callable(callback)
+    callback()
     callback()
     await asyncio.wait_for(task, timeout=1)
 
@@ -109,3 +111,44 @@ async def test_outer_cancellation_collects_the_worker_task(
         await task
 
     assert worker.run_cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_deadline_collects_worker_and_removes_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    callbacks: dict[signal.Signals, object] = {}
+    removed: list[signal.Signals] = []
+    shutdown_cancelled = asyncio.Event()
+
+    class SlowWorker(_Worker):
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                shutdown_cancelled.set()
+                raise
+
+    monkeypatch.setattr(
+        loop,
+        "add_signal_handler",
+        lambda selected, callback, *_args: callbacks.__setitem__(selected, callback),
+    )
+    monkeypatch.setattr(loop, "remove_signal_handler", lambda value: removed.append(value))
+    monkeypatch.setattr(supervision, "SHUTDOWN_TIMEOUT_SECONDS", 0.01)
+    worker = SlowWorker()
+    task = asyncio.create_task(run_worker_until_signal(worker))
+    await worker.running.wait()
+    callback = callbacks[signal.SIGTERM]
+    assert callable(callback)
+    callback()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert shutdown_cancelled.is_set()
+    assert worker.run_cancelled is True
+    assert worker.shutdown_calls == 1
+    assert set(removed) == {signal.SIGTERM, signal.SIGINT}

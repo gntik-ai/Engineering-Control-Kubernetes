@@ -50,7 +50,17 @@ async def run_worker_until_signal(
             await worker_task
             return
         LOGGER.info("Temporal worker shutdown requested")
-        await asyncio.wait_for(worker.shutdown(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        try:
+            await asyncio.wait_for(worker.shutdown(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            LOGGER.warning(
+                "Temporal worker shutdown exceeded application bound; seconds=%s",
+                SHUTDOWN_TIMEOUT_SECONDS,
+            )
+            raise
+        except BaseException:
+            LOGGER.exception("Temporal worker shutdown failed")
+            raise
         await worker_task
         LOGGER.info("Temporal worker drain complete")
     finally:

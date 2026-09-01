@@ -6,14 +6,20 @@
 4. Pull new pinned image digests and CLI/scanner checksums.
 5. Stop schedulers, drain role workers, and let in-flight activities heartbeat or cancel safely.
    Worker entry points translate systemd's `SIGTERM` into a bounded 30-second
-   `Worker.shutdown()` before exiting. The installed worker units allow at least 60 seconds, so
+   `Worker.shutdown()` before exiting. `engineering-temporal-worker.service`,
+   `engineering-acceptance-worker.service`, `engineering-github-worker.service`, and
+   `engineering-worker@.service` specify `TimeoutStopSec=60`; the release worker specifies 90.
+   Verify those installed values and the default systemd control-group kill behavior before each
+   maintenance window. This leaves at least 30 seconds after the application shutdown deadline, so
    native CLI activity cancellation has time to terminate its owned process group before systemd
    can escalate. Temporal retries the activity on another worker; heartbeat details from the lost
    attempt are available if the implementation supports resumption. A worker that exits while an
    owned child remains alive fails the maintenance gate even if a later idempotent retry succeeds.
    Verify one audit-owned in-flight retry against an idempotent controlled sink before restarting
-   shared workers. Repeated termination signals do not shorten the 30-second application bound;
-   use the unit's normal timeout rather than manually sending `SIGKILL` during a drain.
+   shared workers. Repeated termination signals, including interactive `SIGINT`, do not shorten the
+   30-second application bound; use the unit's normal timeout rather than manually sending
+   `SIGKILL` during a drain. The deadline bounds the shutdown request, not non-preemptible thread
+   work; an exceeded deadline is a failed maintenance gate and must retain its journal evidence.
 6. Run database migrations once; never edit a released migration. Migration `0005` adds nullable
    artifact purge tombstones. Migration `0006` adds nullable native-provider presence,
    authentication, and status fields to quota snapshots. Migration `0007` adds nullable immutable
