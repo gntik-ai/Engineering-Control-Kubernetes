@@ -16,13 +16,16 @@ from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.db.models import (
+    ACTIVE_OPERATION_STATUSES,
+    ActionCandidate,
     DashboardSessionRevocation,
     NotificationOutbox,
     OperationRequest,
+    ReauthenticationBinding,
     Run,
 )
 from engineering_control.db.repository import SQLMetadataRepository
-from engineering_control.operations.models import SolveIssueCommand
+from engineering_control.operations.models import RefreshConnectionsCommand, SolveIssueCommand
 from engineering_control.operations.repository import OperationsRepository
 
 
@@ -108,6 +111,8 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
 
     command.upgrade(config, "0014")
     assert inspect(engine).has_table("dashboard_session_revocations")
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX uq_operation_requests_active_target"))
     command.upgrade(config, "0015")
     active_owner_index = next(
         index
@@ -117,6 +122,14 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
     assert active_owner_index["unique"] is True
     assert active_owner_index["column_names"] == ["action", "target_id"]
     with engine.connect() as connection:
+        active_owner_predicate = connection.scalar(
+            text(
+                "SELECT pg_get_expr(index.indpred, index.indrelid) "
+                "FROM pg_class AS relation "
+                "JOIN pg_index AS index ON index.indexrelid = relation.oid "
+                "WHERE relation.relname = 'uq_operation_requests_active_target'"
+            )
+        )
         server_version_num = int(connection.scalar(text("SHOW server_version_num")))
         invalid_indexes = connection.scalar(
             text("SELECT count(*) FROM pg_index WHERE NOT indisvalid")
@@ -125,8 +138,19 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
             text("SELECT count(*) FROM pg_constraint WHERE NOT convalidated")
         )
     assert 170_000 <= server_version_num < 180_000
+    assert isinstance(active_owner_predicate, str)
+    assert all(status in active_owner_predicate for status in ACTIVE_OPERATION_STATUSES)
     assert invalid_indexes == 0
     assert unvalidated_constraints == 0
+
+    command.downgrade(config, "0014")
+    assert "uq_operation_requests_active_target" not in {
+        index["name"] for index in inspect(engine).get_indexes("operation_requests")
+    }
+    command.upgrade(config, "0015")
+    assert "uq_operation_requests_active_target" in {
+        index["name"] for index in inspect(engine).get_indexes("operation_requests")
+    }
 
     dashboard = DashboardRepository(database_url)
     session_binding_hash = "a" * 64
@@ -236,19 +260,24 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
 @pytest.mark.asyncio
 async def test_postgresql_simultaneous_issue_starts_return_one_active_owner() -> None:
     repository = OperationsRepository(_postgresql_url())
+    issue_number = 100_000 + (uuid4().int % 800_000)
     command_value = SolveIssueCommand(
         project="falcone",
         backlog_campaign_id=uuid5(NAMESPACE_URL, "hermes-owner-race-campaign"),
         repository="gntik-ai/falcone",
-        issue_number=424242,
+        issue_number=issue_number,
         delivery_mode="source-pr",
     )
     original = repository._active_target
     barrier = threading.Barrier(2, timeout=10)
+    barrier_hits: list[str] = []
+    hits_lock = threading.Lock()
 
     def synchronized_active_target(*args: object, **kwargs: object) -> bool:
         value = original(*args, **kwargs)
         if not value:
+            with hits_lock:
+                barrier_hits.append(str(threading.get_ident()))
             barrier.wait()
         return value
 
@@ -258,23 +287,99 @@ async def test_postgresql_simultaneous_issue_starts_return_one_active_owner() ->
             command_value,
             source_channel="telegram",
             operator_class="telegram:allowlisted",
-            idempotency_key="telegram-owner-race-000001",
+            idempotency_key=f"telegram-owner-race-{issue_number}",
         ),
         repository.create_external(
             command_value,
             source_channel="cli",
             operator_class="local-operator",
-            idempotency_key="cli-owner-race-00000000001",
+            idempotency_key=f"cli-owner-race-{issue_number:012d}",
         ),
     )
+    assert len(barrier_hits) == 2
     assert first.operation_id == second.operation_id
     with repository.sessions() as session:
         rows = session.scalars(
             select(OperationRequest).where(
                 OperationRequest.action == "solve_issue",
-                OperationRequest.target_id == "gntik-ai/falcone#424242",
-                OperationRequest.status.in_(("PENDING", "DISPATCHING", "STARTED", "RUNNING")),
+                OperationRequest.target_id == f"gntik-ai/falcone#{issue_number}",
+                OperationRequest.status.in_(ACTIVE_OPERATION_STATUSES),
             )
         ).all()
     assert len(rows) == 1
+    await repository.finish(first.operation_id, status="COMPLETED")
+    repository._active_target = original  # type: ignore[method-assign]
+    third = await repository.create_external(
+        command_value,
+        source_channel="cli",
+        operator_class="local-operator",
+        idempotency_key=f"cli-owner-race-after-terminal-{issue_number}",
+    )
+    assert third.operation_id != first.operation_id
+    repository.engine.dispose()
+
+
+@pytest.mark.postgresql
+@pytest.mark.asyncio
+async def test_postgresql_dashboard_owner_race_consumes_both_reauth_bindings() -> None:
+    repository = OperationsRepository(_postgresql_url())
+    command_value = RefreshConnectionsCommand(scope="all")
+    first_session = "c" * 64
+    second_session = "d" * 64
+    first_candidate = await repository.candidate(command_value, first_session)
+    second_candidate = await repository.candidate(command_value, second_session)
+    first_token = await repository.create_reauthentication(
+        first_candidate.candidate_id, first_session
+    )
+    second_token = await repository.create_reauthentication(
+        second_candidate.candidate_id, second_session
+    )
+    original = repository._active_target
+    barrier = threading.Barrier(2, timeout=10)
+    barrier_hits: list[str] = []
+    hits_lock = threading.Lock()
+
+    def synchronized_active_target(*args: object, **kwargs: object) -> bool:
+        value = original(*args, **kwargs)
+        if not value:
+            with hits_lock:
+                barrier_hits.append(str(threading.get_ident()))
+            barrier.wait()
+        return value
+
+    repository._active_target = synchronized_active_target  # type: ignore[method-assign]
+    first, second = await asyncio.gather(
+        repository.queue_candidate(
+            first_candidate.candidate_id,
+            first_token,
+            first_session,
+            first_candidate.confirmation_phrase,
+        ),
+        repository.queue_candidate(
+            second_candidate.candidate_id,
+            second_token,
+            second_session,
+            second_candidate.confirmation_phrase,
+        ),
+    )
+    assert len(barrier_hits) == 2
+    assert first.operation_id == second.operation_id
+    with repository.sessions() as session:
+        candidates = [
+            session.get(ActionCandidate, candidate_id)
+            for candidate_id in (
+                first_candidate.candidate_id,
+                second_candidate.candidate_id,
+            )
+        ]
+        bindings = session.scalars(
+            select(ReauthenticationBinding).where(
+                ReauthenticationBinding.candidate_id.in_(
+                    (first_candidate.candidate_id, second_candidate.candidate_id)
+                )
+            )
+        ).all()
+    assert all(candidate is not None and candidate.used_at is not None for candidate in candidates)
+    assert len(bindings) == 2
+    assert all(binding.used_at is not None for binding in bindings)
     repository.engine.dispose()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from engineering_control.api.schemas import MultiProjectAuditStart, OperationAccepted
 from engineering_control.config import Settings
@@ -51,7 +53,10 @@ from engineering_control.operations.models import (
     parse_command,
 )
 from engineering_control.operations.registry import COMMAND_REGISTRY
-from engineering_control.operations.repository import OperationsRepository
+from engineering_control.operations.repository import (
+    OperationsRepository,
+    _operation_integrity_conflict,
+)
 from engineering_control.operations.service import TypedCommandBus
 from engineering_control.workflows import definitions as workflow_definitions
 from engineering_control.workflows.definitions import (
@@ -196,6 +201,29 @@ def _solve_issue() -> SolveIssueCommand:
 
 def _idempotency_fixture(channel: str, ordinal: int) -> str:
     return f"{channel}-test-{ordinal:012d}"
+
+
+def test_operation_integrity_conflict_classifier_is_constraint_specific() -> None:
+    active_owner = IntegrityError(
+        "INSERT",
+        {},
+        sqlite3.IntegrityError(
+            "UNIQUE constraint failed: operation_requests.action, operation_requests.target_id"
+        ),
+    )
+    idempotency = IntegrityError(
+        "INSERT",
+        {},
+        sqlite3.IntegrityError("UNIQUE constraint failed: operation_requests.idempotency_key"),
+    )
+    unrelated = IntegrityError(
+        "INSERT",
+        {},
+        sqlite3.IntegrityError("FOREIGN KEY constraint failed"),
+    )
+    assert _operation_integrity_conflict(active_owner) == "active_owner"
+    assert _operation_integrity_conflict(idempotency) == "idempotency"
+    assert _operation_integrity_conflict(unrelated) is None
 
 
 def _seed_enhancement(repository: OperationsRepository, *, ordinal: int = 1) -> str:

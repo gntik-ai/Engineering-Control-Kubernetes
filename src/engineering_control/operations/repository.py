@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.db.models import (
+    ACTIVE_OPERATION_STATUSES,
     ActionCandidate,
     Artifact,
     BacklogIssueRecord,
@@ -79,7 +80,7 @@ from engineering_control.retention_limits import NOTIFICATION_OUTBOX_PENDING_STA
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
-_ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNNING"})
+_ACTIVE_OPERATION_STATES = frozenset(ACTIVE_OPERATION_STATUSES)
 _CAMPAIGN_EXPORT_COLLECTIONS = ("root_blockers", "findings", "runs", "artifacts")
 _TERMINAL_WORKFLOW_STATES = frozenset(
     {
@@ -94,6 +95,28 @@ _TERMINAL_WORKFLOW_STATES = frozenset(
         "TIMED_OUT",
     }
 )
+
+
+def _operation_integrity_conflict(error: IntegrityError) -> str | None:
+    """Classify only the two uniqueness failures that are safe to deduplicate."""
+    diagnostic = getattr(error.orig, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    if constraint_name == "uq_operation_requests_active_target":
+        return "active_owner"
+    if constraint_name in {
+        "operation_requests_idempotency_key_key",
+        "ix_operation_requests_idempotency_key",
+    }:
+        return "idempotency"
+    message = str(error.orig).lower()
+    if (
+        "unique constraint failed: operation_requests.action, operation_requests.target_id"
+        in message
+    ):
+        return "active_owner"
+    if "unique constraint failed: operation_requests.idempotency_key" in message:
+        return "idempotency"
+    return None
 
 
 def _global_inventory_approval_current(
@@ -1163,20 +1186,33 @@ class OperationsRepository:
         action: str,
         target_id: str,
         idempotency_key: str,
+        conflict_kind: str,
     ) -> OperationRequest | None:
         """Resolve an idempotency or active-owner race after the loser rolls back."""
         existing = session.scalar(
             select(OperationRequest).where(OperationRequest.idempotency_key == idempotency_key)
         )
-        if existing is not None:
+        if existing is not None or conflict_kind == "idempotency":
             return existing
+        active = session.scalar(
+            select(OperationRequest)
+            .where(
+                OperationRequest.action == action,
+                OperationRequest.target_id == target_id,
+                OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
+            )
+            .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
+            .limit(1)
+        )
+        if active is not None:
+            return active
         return session.scalar(
             select(OperationRequest)
             .where(
                 OperationRequest.action == action,
                 OperationRequest.target_id == target_id,
             )
-            .order_by(desc(OperationRequest.created_at))
+            .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
             .limit(1)
         )
 
@@ -1332,7 +1368,10 @@ class OperationsRepository:
                 candidate.used_at = now
                 binding.used_at = now
                 return self._operation_view(existing)
-        except IntegrityError:
+        except IntegrityError as error:
+            conflict_kind = _operation_integrity_conflict(error)
+            if conflict_kind is None:
+                raise
             with self.sessions.begin() as session:
                 candidate = session.get(ActionCandidate, candidate_id)
                 if candidate is None:
@@ -1342,6 +1381,7 @@ class OperationsRepository:
                     action=candidate.action,
                     target_id=candidate.target_id,
                     idempotency_key=candidate.binding_hash,
+                    conflict_kind=conflict_kind,
                 )
                 if existing is None:
                     raise
@@ -1652,13 +1692,17 @@ class OperationsRepository:
                     session.add(existing)
                     session.flush()
                 return self._operation_view(existing)
-        except IntegrityError:
+        except IntegrityError as error:
+            conflict_kind = _operation_integrity_conflict(error)
+            if conflict_kind is None:
+                raise
             with self.sessions() as session:
                 existing = self._operation_after_insert_conflict(
                     session,
                     action=command.action,
                     target_id=target_id,
                     idempotency_key=digest,
+                    conflict_kind=conflict_kind,
                 )
                 if existing is None:
                     raise

@@ -10,7 +10,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
-from engineering_control.db.models import OperationRequest
+from engineering_control.db.models import ACTIVE_OPERATION_STATUSES, OperationRequest
 
 
 def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
@@ -33,14 +33,27 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     engine = create_engine(database_url)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head
+    active_owner_index = next(
+        index
+        for index in inspect(engine).get_indexes("operation_requests")
+        if index["name"] == "uq_operation_requests_active_target"
+    )
+    predicate = str(active_owner_index["dialect_options"]["sqlite_where"])
+    assert all(status in predicate for status in ACTIVE_OPERATION_STATUSES)
 
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
+    assert "uq_operation_requests_active_target" not in {
+        index["name"] for index in inspect(engine).get_indexes("operation_requests")
+    }
 
     command.upgrade(config, head)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head
+    assert "uq_operation_requests_active_target" in {
+        index["name"] for index in inspect(engine).get_indexes("operation_requests")
+    }
     engine.dispose()
 
 
@@ -125,4 +138,29 @@ def test_active_owner_migration_refuses_ambiguous_existing_rows(
     assert "uq_operation_requests_active_target" not in {
         index["name"] for index in inspect(engine).get_indexes("operation_requests")
     }
+    engine.dispose()
+
+
+def test_active_owner_migration_rejects_same_named_full_unique_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'active-owner-wrong-index.sqlite3'}"
+    monkeypatch.setenv("ENGINEERING_DATABASE_URL", database_url)
+    root = Path(__file__).resolve().parents[1]
+    config = Config(root / "alembic.ini")
+    config.set_main_option("script_location", str(root / "migrations"))
+    command.upgrade(config, "0014")
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX uq_operation_requests_active_target"))
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX uq_operation_requests_active_target "
+                "ON operation_requests (action, target_id)"
+            )
+        )
+    with pytest.raises(RuntimeError, match="incompatible active-owner predicate"):
+        command.upgrade(config, "0015")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
     engine.dispose()

@@ -593,6 +593,9 @@ class ReauthenticationBinding(UUIDPrimaryKey, Base):
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+ACTIVE_OPERATION_STATUSES = ("PENDING", "DISPATCHING", "STARTED", "RUNNING")
+
+
 class OperationRequest(UUIDPrimaryKey, Base):
     __tablename__ = "operation_requests"
     action: Mapped[str] = mapped_column(String(80), index=True)
@@ -686,6 +689,6 @@ Index(
     OperationRequest.action,
     OperationRequest.target_id,
     unique=True,
-    postgresql_where=OperationRequest.status.in_(("PENDING", "DISPATCHING", "STARTED", "RUNNING")),
-    sqlite_where=OperationRequest.status.in_(("PENDING", "DISPATCHING", "STARTED", "RUNNING")),
+    postgresql_where=OperationRequest.status.in_(ACTIVE_OPERATION_STATUSES),
+    sqlite_where=OperationRequest.status.in_(ACTIVE_OPERATION_STATUSES),
 )
