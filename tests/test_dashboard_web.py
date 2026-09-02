@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
@@ -19,6 +20,7 @@ from engineering_control.db.models import (
     OperationRequest,
     Run,
 )
+from engineering_control.operations.models import AuditPlanCommand
 from engineering_control.operations.repository import OperationsRepository
 
 PASSWORD = "correct horse battery staple"  # noqa: S105 - deterministic test fixture
@@ -83,16 +85,42 @@ def test_protected_pages_local_assets_and_observational_controls(tmp_path: Path)
         audit_page = client.get("/audits")
         assert 'id="plan-all-audits"' in audit_page.text
         assert 'id="start-all-audits"' in audit_page.text
+        assert 'pattern="[a-z][a-z0-9\\-]{0,119}"' in audit_page.text
+        rendered_pattern = re.search(r'pattern="([^"]+)"', audit_page.text)
+        assert rendered_pattern
+        browser_pattern = re.compile(rendered_pattern.group(1))
+        accepted_environments = [
+            "a",
+            "staging",
+            "prod-eu-1",
+            "a" + ("1" * 119),
+        ]
+        rejected_environments = ["", "Prod", "-x", "1staging", "prod_eu", "a" * 121]
+        for environment in accepted_environments:
+            assert browser_pattern.fullmatch(environment)
+            AuditPlanCommand(project="falcone", preset="snapshot", environment=environment)
+        for environment in rejected_environments:
+            assert browser_pattern.fullmatch(environment) is None
+            try:
+                AuditPlanCommand(project="falcone", preset="snapshot", environment=environment)
+            except ValidationError:
+                pass
+            else:
+                raise AssertionError(f"server accepted invalid environment: {environment!r}")
         assert "Audit all projects unavailable" not in audit_page.text
         stylesheet = client.get("/static/dashboard.css")
         assert stylesheet.status_code == 200
         assert ".status-present" in stylesheet.text
+        assert ".audit-summary-label { min-width: 0; overflow-wrap: anywhere; }" in stylesheet.text
         status_selectors = re.findall(r"\.status-([A-Za-z0-9_-]+)", stylesheet.text)
         assert status_selectors
         assert all(value == value.lower() for value in status_selectors)
         javascript = client.get("/static/dashboard.js")
         assert javascript.status_code == 200
         assert "status status-${String(label).toLowerCase()}" in javascript.text
+        assert (
+            'summary.append(node("span", "audit-summary-label", `${item.project}' in javascript.text
+        )
         assert client.get("/robots.txt").text == "User-agent: *\nDisallow: /\n"
     finally:
         client.__exit__(None, None, None)

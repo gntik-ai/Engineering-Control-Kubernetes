@@ -68,6 +68,7 @@ tbody tr:hover { background: #172331; }
 .audit-list { display: grid; gap: 1rem; }
 .audit { background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; padding: 1rem; }
 .audit summary { cursor: pointer; display: flex; justify-content: space-between; gap: 1rem; font-weight: 700; }
+.audit-summary-label { min-width: 0; overflow-wrap: anywhere; }
 .audit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .8rem; margin-top: 1rem; }
 .audit-grid dt { color: var(--muted); font-size: .8rem; }
 .audit-grid dd { margin: .1rem 0 0; overflow-wrap: anywhere; }
