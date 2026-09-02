@@ -58,20 +58,53 @@ def test_postgresql_fresh_bootstrap_accepts_model_created_0015_index(
         root = Path(__file__).resolve().parents[1]
         config = Config(root / "alembic.ini")
         config.set_main_option("script_location", str(root / "migrations"))
-        command.upgrade(config, "head")
+        command.upgrade(config, "0001")
         bootstrap = create_engine(bootstrap_url)
+        bootstrap_index = next(
+            index
+            for index in inspect(bootstrap).get_indexes("operation_requests")
+            if index["name"] == "uq_operation_requests_active_target"
+        )
+        assert bootstrap_index["unique"] is True
+        assert bootstrap_index["column_names"] == ["action", "target_id"]
+        with bootstrap.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0001"
+            before_index = connection.execute(
+                text(
+                    "SELECT index_relation.oid, "
+                    "pg_get_expr(index.indpred, index.indrelid), index.indisvalid "
+                    "FROM pg_class AS index_relation "
+                    "JOIN pg_index AS index ON index.indexrelid = index_relation.oid "
+                    "JOIN pg_class AS table_relation ON table_relation.oid = index.indrelid "
+                    "JOIN pg_namespace AS namespace ON namespace.oid = table_relation.relnamespace "
+                    "WHERE namespace.nspname = current_schema() "
+                    "AND table_relation.relname = 'operation_requests' "
+                    "AND index_relation.relkind = 'i' "
+                    "AND index_relation.relname = 'uq_operation_requests_active_target'"
+                )
+            ).one()
+        assert before_index[2] is True
+        assert isinstance(before_index[1], str)
+        assert all(status in before_index[1] for status in ACTIVE_OPERATION_STATUSES)
+
+        command.upgrade(config, "head")
         with bootstrap.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
-            predicate = connection.scalar(
+            after_index = connection.execute(
                 text(
-                    "SELECT pg_get_expr(index.indpred, index.indrelid) "
-                    "FROM pg_class AS relation "
-                    "JOIN pg_index AS index ON index.indexrelid = relation.oid "
-                    "WHERE relation.relname = 'uq_operation_requests_active_target'"
+                    "SELECT index_relation.oid, "
+                    "pg_get_expr(index.indpred, index.indrelid), index.indisvalid "
+                    "FROM pg_class AS index_relation "
+                    "JOIN pg_index AS index ON index.indexrelid = index_relation.oid "
+                    "JOIN pg_class AS table_relation ON table_relation.oid = index.indrelid "
+                    "JOIN pg_namespace AS namespace ON namespace.oid = table_relation.relnamespace "
+                    "WHERE namespace.nspname = current_schema() "
+                    "AND table_relation.relname = 'operation_requests' "
+                    "AND index_relation.relkind = 'i' "
+                    "AND index_relation.relname = 'uq_operation_requests_active_target'"
                 )
-            )
-        assert isinstance(predicate, str)
-        assert all(status in predicate for status in ACTIVE_OPERATION_STATUSES)
+            ).one()
+        assert after_index == before_index
     finally:
         if bootstrap is not None:
             bootstrap.dispose()
