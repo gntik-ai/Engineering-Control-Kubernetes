@@ -204,6 +204,12 @@ def _idempotency_fixture(channel: str, ordinal: int) -> str:
 
 
 def test_operation_integrity_conflict_classifier_is_constraint_specific() -> None:
+    class PostgreSQLDiagnostic:
+        constraint_name = "uq_operation_requests_idempotency_key"
+
+    class PostgreSQLUniqueViolation(Exception):
+        diag = PostgreSQLDiagnostic()
+
     active_owner = IntegrityError(
         "INSERT",
         {},
@@ -223,6 +229,12 @@ def test_operation_integrity_conflict_classifier_is_constraint_specific() -> Non
     )
     assert _operation_integrity_conflict(active_owner) == "active_owner"
     assert _operation_integrity_conflict(idempotency) == "idempotency"
+    assert (
+        _operation_integrity_conflict(
+            IntegrityError("INSERT", {}, PostgreSQLUniqueViolation("duplicate key"))
+        )
+        == "idempotency"
+    )
     assert _operation_integrity_conflict(unrelated) is None
 
 

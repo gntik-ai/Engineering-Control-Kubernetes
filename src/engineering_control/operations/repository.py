@@ -104,6 +104,7 @@ def _operation_integrity_conflict(error: IntegrityError) -> str | None:
     if constraint_name == "uq_operation_requests_active_target":
         return "active_owner"
     if constraint_name in {
+        "uq_operation_requests_idempotency_key",
         "operation_requests_idempotency_key_key",
         "ix_operation_requests_idempotency_key",
     }:
@@ -1162,7 +1163,7 @@ class OperationsRepository:
                 OperationRequest.target_id == target_id,
                 OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
             )
-            .order_by(desc(OperationRequest.created_at))
+            .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
         )
         if exclude_operation_id is not None:
             statement = statement.where(OperationRequest.id != exclude_operation_id)
@@ -1340,7 +1341,7 @@ class OperationsRepository:
                             OperationRequest.target_id == candidate.target_id,
                             OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
                         )
-                        .order_by(desc(OperationRequest.created_at))
+                        .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
                         .limit(1)
                     )
                 if existing is None:
@@ -1666,7 +1667,7 @@ class OperationsRepository:
                             OperationRequest.target_id == target_id,
                             OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
                         )
-                        .order_by(desc(OperationRequest.created_at))
+                        .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
                         .limit(1)
                     )
                 if existing is None:

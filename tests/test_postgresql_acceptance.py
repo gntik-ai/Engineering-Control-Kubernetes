@@ -316,6 +316,23 @@ async def test_postgresql_simultaneous_issue_starts_return_one_active_owner() ->
         idempotency_key=f"cli-owner-race-after-terminal-{issue_number}",
     )
     assert third.operation_id != first.operation_id
+    await repository.finish(third.operation_id, status="FAILED")
+    fourth = await repository.create_external(
+        command_value,
+        source_channel="cli",
+        operator_class="local-operator",
+        idempotency_key=f"cli-owner-race-after-failed-{issue_number}",
+    )
+    assert fourth.operation_id != third.operation_id
+    await repository.finish(fourth.operation_id, status="BLOCKED")
+    fifth = await repository.create_external(
+        command_value,
+        source_channel="cli",
+        operator_class="local-operator",
+        idempotency_key=f"cli-owner-race-after-blocked-{issue_number}",
+    )
+    assert fifth.operation_id != fourth.operation_id
+    await repository.finish(fifth.operation_id, status="COMPLETED")
     repository.engine.dispose()
 
 
@@ -328,6 +345,7 @@ async def test_postgresql_dashboard_owner_race_consumes_both_reauth_bindings() -
     second_session = "d" * 64
     first_candidate = await repository.candidate(command_value, first_session)
     second_candidate = await repository.candidate(command_value, second_session)
+    assert first_candidate.binding_hash != second_candidate.binding_hash
     first_token = await repository.create_reauthentication(
         first_candidate.candidate_id, first_session
     )
@@ -382,4 +400,5 @@ async def test_postgresql_dashboard_owner_race_consumes_both_reauth_bindings() -
     assert all(candidate is not None and candidate.used_at is not None for candidate in candidates)
     assert len(bindings) == 2
     assert all(binding.used_at is not None for binding in bindings)
+    await repository.finish(first.operation_id, status="COMPLETED")
     repository.engine.dispose()

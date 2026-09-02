@@ -164,3 +164,29 @@ def test_active_owner_migration_rejects_same_named_full_unique_index(
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
     engine.dispose()
+
+
+def test_active_owner_migration_rejects_negated_partial_predicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'active-owner-negated-index.sqlite3'}"
+    monkeypatch.setenv("ENGINEERING_DATABASE_URL", database_url)
+    root = Path(__file__).resolve().parents[1]
+    config = Config(root / "alembic.ini")
+    config.set_main_option("script_location", str(root / "migrations"))
+    command.upgrade(config, "0014")
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX uq_operation_requests_active_target"))
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX uq_operation_requests_active_target "
+                "ON operation_requests (action, target_id) "
+                "WHERE status NOT IN ('PENDING', 'DISPATCHING', 'STARTED', 'RUNNING')"
+            )
+        )
+    with pytest.raises(RuntimeError, match="incompatible active-owner predicate"):
+        command.upgrade(config, "0015")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+    engine.dispose()
