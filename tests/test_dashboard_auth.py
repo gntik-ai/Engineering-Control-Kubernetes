@@ -279,6 +279,48 @@ def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Pa
             ).status_code
             == 403
         )
+        assert (
+            client.post(
+                "/logout",
+                data={"csrf_token": csrf},
+                headers={"Origin": "null"},
+                follow_redirects=False,
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/logout",
+                data={"csrf_token": csrf},
+                headers={
+                    "Origin": "null",
+                    "Sec-Fetch-Site": "cross-site",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Dest": "document",
+                },
+                follow_redirects=False,
+            ).status_code
+            == 403
+        )
+        allowed_opaque_same_origin_navigation = client.post(
+            "/logout",
+            data={"csrf_token": csrf},
+            headers={
+                "Origin": "null",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+            },
+            follow_redirects=False,
+        )
+        assert allowed_opaque_same_origin_navigation.status_code == 303
+
+    # A fresh session proves the explicit Referer fallback independently after
+    # the opaque same-origin navigation revoked the previous test session.
+    with _client(repository) as client:
+        assert _login(client).status_code == 303
+        settings = client.get("/settings")
+        csrf = _csrf(settings.text)
         allowed_referer = client.post(
             "/logout",
             data={"csrf_token": csrf},
@@ -289,6 +331,59 @@ def test_host_origin_and_pre_authentication_boundaries_are_enforced(tmp_path: Pa
             follow_redirects=False,
         )
         assert allowed_referer.status_code == 303
+
+
+def test_opaque_origin_browser_login_requires_exact_fetch_metadata_and_csrf(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with _client(repository) as client:
+        login = client.get("/login")
+        login_csrf = _csrf(login.text)
+        form = {
+            "csrf_token": login_csrf,
+            "password": PASSWORD,
+            "next_path": "/overview",
+        }
+        accepted_metadata = {
+            "Origin": "null",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+        }
+        rejected_metadata = (
+            {"Origin": "null"},
+            {**accepted_metadata, "Sec-Fetch-Site": "cross-site"},
+            {**accepted_metadata, "Sec-Fetch-Site": "same-site"},
+            {**accepted_metadata, "Sec-Fetch-Mode": "cors"},
+            {**accepted_metadata, "Sec-Fetch-Mode": "same-origin"},
+            {**accepted_metadata, "Sec-Fetch-Dest": "empty"},
+            {**accepted_metadata, "Sec-Fetch-Site": "Same-Origin"},
+        )
+        for headers in rejected_metadata:
+            denied = client.post("/login", data=form, headers=headers, follow_redirects=False)
+            assert denied.status_code == 403
+            assert denied.json() == {"detail": "invalid request origin"}
+
+        invalid_csrf = client.post(
+            "/login",
+            data={**form, "csrf_token": "invalid"},
+            headers=accepted_metadata,
+            follow_redirects=False,
+        )
+        assert invalid_csrf.status_code == 401
+        assert "Unable to sign in" in invalid_csrf.text
+
+        # The failed login rotates its login-CSRF token, just as the real page
+        # does, so use the fresh value for the accepted browser navigation.
+        accepted = client.post(
+            "/login",
+            data={**form, "csrf_token": _csrf(invalid_csrf.text)},
+            headers=accepted_metadata,
+            follow_redirects=False,
+        )
+        assert accepted.status_code == 303
+        assert accepted.headers["location"] == "/overview"
 
 
 def test_r3_candidate_authentication_precedes_query_and_body_validation(tmp_path: Path) -> None:

@@ -1216,6 +1216,20 @@ def _request_host(value: str | None) -> str:
 def _trusted_origin(request: Request, allowed: tuple[str, ...]) -> bool:
     supplied = request.headers.get("origin")
     if supplied:
+        # Chromium serializes the Origin of a same-origin form navigation as
+        # ``null`` when the response has Referrer-Policy: no-referrer.  Keep
+        # rejecting opaque cross-site and programmatic requests, but allow the
+        # browser's narrowly attested same-origin document navigation.  The
+        # middleware's preceding exact Host allowlist remains the canonical
+        # target binding, and CSRF validation still runs independently in each
+        # form handler.  Fetch Metadata is defense in depth, not authentication:
+        # a non-browser client can forge it but cannot derive the CSRF secret.
+        if supplied == "null":
+            return (
+                request.headers.get("sec-fetch-site") == "same-origin"
+                and request.headers.get("sec-fetch-mode") == "navigate"
+                and request.headers.get("sec-fetch-dest") == "document"
+            )
         return _canonical_origin(supplied, allow_path=False) in allowed
     referer = request.headers.get("referer")
     if not referer:
