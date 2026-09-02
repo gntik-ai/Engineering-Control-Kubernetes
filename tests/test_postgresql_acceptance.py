@@ -11,6 +11,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, func, inspect, select, text
+from sqlalchemy.engine import make_url
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
@@ -36,6 +37,49 @@ def _postgresql_url() -> str:
     if not value.startswith("postgresql+psycopg://"):
         raise AssertionError("PostgreSQL acceptance refuses a non-PostgreSQL target")
     return value
+
+
+@pytest.mark.postgresql
+def test_postgresql_fresh_bootstrap_accepts_model_created_0015_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_url = make_url(_postgresql_url())
+    database_name = "engineering_control_bootstrap_ci"
+    admin = create_engine(base_url.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    bootstrap = None
+    with admin.connect() as connection:
+        connection.execute(
+            text("DROP DATABASE IF EXISTS engineering_control_bootstrap_ci WITH (FORCE)")
+        )
+        connection.execute(text("CREATE DATABASE engineering_control_bootstrap_ci"))
+    try:
+        bootstrap_url = base_url.set(database=database_name)
+        monkeypatch.setenv("ENGINEERING_DATABASE_URL", bootstrap_url.render_as_string(False))
+        root = Path(__file__).resolve().parents[1]
+        config = Config(root / "alembic.ini")
+        config.set_main_option("script_location", str(root / "migrations"))
+        command.upgrade(config, "head")
+        bootstrap = create_engine(bootstrap_url)
+        with bootstrap.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+            predicate = connection.scalar(
+                text(
+                    "SELECT pg_get_expr(index.indpred, index.indrelid) "
+                    "FROM pg_class AS relation "
+                    "JOIN pg_index AS index ON index.indexrelid = relation.oid "
+                    "WHERE relation.relname = 'uq_operation_requests_active_target'"
+                )
+            )
+        assert isinstance(predicate, str)
+        assert all(status in predicate for status in ACTIVE_OPERATION_STATUSES)
+    finally:
+        if bootstrap is not None:
+            bootstrap.dispose()
+        with admin.connect() as connection:
+            connection.execute(
+                text("DROP DATABASE IF EXISTS engineering_control_bootstrap_ci WITH (FORCE)")
+            )
+        admin.dispose()
 
 
 @pytest.mark.postgresql
