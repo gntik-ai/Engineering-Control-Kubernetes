@@ -1156,6 +1156,30 @@ class OperationsRepository:
             return operation
         return None
 
+    def _operation_after_insert_conflict(
+        self,
+        session: Session,
+        *,
+        action: str,
+        target_id: str,
+        idempotency_key: str,
+    ) -> OperationRequest | None:
+        """Resolve an idempotency or active-owner race after the loser rolls back."""
+        existing = session.scalar(
+            select(OperationRequest).where(OperationRequest.idempotency_key == idempotency_key)
+        )
+        if existing is not None:
+            return existing
+        return session.scalar(
+            select(OperationRequest)
+            .where(
+                OperationRequest.action == action,
+                OperationRequest.target_id == target_id,
+            )
+            .order_by(desc(OperationRequest.created_at))
+            .limit(1)
+        )
+
     async def capability(
         self,
         command: Command,
@@ -1309,17 +1333,27 @@ class OperationsRepository:
                 binding.used_at = now
                 return self._operation_view(existing)
         except IntegrityError:
-            with self.sessions() as session:
+            with self.sessions.begin() as session:
                 candidate = session.get(ActionCandidate, candidate_id)
                 if candidate is None:
                     raise
-                existing = session.scalar(
-                    select(OperationRequest).where(
-                        OperationRequest.idempotency_key == candidate.binding_hash
-                    )
+                existing = self._operation_after_insert_conflict(
+                    session,
+                    action=candidate.action,
+                    target_id=candidate.target_id,
+                    idempotency_key=candidate.binding_hash,
                 )
                 if existing is None:
                     raise
+                binding = session.scalar(
+                    select(ReauthenticationBinding).where(
+                        ReauthenticationBinding.candidate_id == candidate_id
+                    )
+                )
+                if candidate.used_at is None:
+                    candidate.used_at = now
+                if binding is not None and binding.used_at is None:
+                    binding.used_at = now
                 return self._operation_view(existing)
 
     async def operation(self, operation_id: UUID) -> OperationView | None:
@@ -1538,72 +1572,97 @@ class OperationsRepository:
         target_type, target_id, project = command_target(command)
         payload = command.model_dump(mode="json")
         digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
-        with self.sessions.begin() as session:
-            resolved_binding: dict[str, Any] = {}
-            if isinstance(command, (EvidenceExportCampaignCommand, EvidenceExportWorkflowCommand)):
-                capability, resolved_binding = self._capability(session, command, datetime.now(UTC))
-                project = project or capability.project
-            if (
-                isinstance(
+        try:
+            with self.sessions.begin() as session:
+                resolved_binding: dict[str, Any] = {}
+                if isinstance(
                     command,
-                    (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
-                )
-                and command.approval_binding is None
-            ):
-                enhancement = session.scalar(
-                    select(Enhancement).where(Enhancement.enhancement_key == command.enhancement_id)
-                )
-                if enhancement is not None and isinstance(enhancement.approval_binding_sha256, str):
-                    payload["approval_binding"] = enhancement.approval_binding_sha256
-            binding_hash = canonical_sha256(
-                {
-                    "payload": payload,
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "project": project,
-                    "resolved": resolved_binding,
-                    "production": False,
-                }
-                if resolved_binding
-                else payload
-            )
-            existing = session.scalar(
-                select(OperationRequest).where(OperationRequest.idempotency_key == digest)
-            )
-            if existing is None and self._active_target(session, command.action, target_id):
-                existing = session.scalar(
-                    select(OperationRequest)
-                    .where(
-                        OperationRequest.action == command.action,
-                        OperationRequest.target_id == target_id,
-                        OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
+                    (EvidenceExportCampaignCommand, EvidenceExportWorkflowCommand),
+                ):
+                    capability, resolved_binding = self._capability(
+                        session, command, datetime.now(UTC)
                     )
-                    .order_by(desc(OperationRequest.created_at))
-                    .limit(1)
+                    project = project or capability.project
+                if (
+                    isinstance(
+                        command,
+                        (
+                            EnhancementApproveCommand,
+                            EnhancementRejectCommand,
+                            EnhancementRunCommand,
+                        ),
+                    )
+                    and command.approval_binding is None
+                ):
+                    enhancement = session.scalar(
+                        select(Enhancement).where(
+                            Enhancement.enhancement_key == command.enhancement_id
+                        )
+                    )
+                    if enhancement is not None and isinstance(
+                        enhancement.approval_binding_sha256, str
+                    ):
+                        payload["approval_binding"] = enhancement.approval_binding_sha256
+                binding_hash = canonical_sha256(
+                    {
+                        "payload": payload,
+                        "target_type": target_type,
+                        "target_id": target_id,
+                        "project": project,
+                        "resolved": resolved_binding,
+                        "production": False,
+                    }
+                    if resolved_binding
+                    else payload
                 )
-            if existing is None:
-                existing = OperationRequest(
+                existing = session.scalar(
+                    select(OperationRequest).where(OperationRequest.idempotency_key == digest)
+                )
+                if existing is None and self._active_target(session, command.action, target_id):
+                    existing = session.scalar(
+                        select(OperationRequest)
+                        .where(
+                            OperationRequest.action == command.action,
+                            OperationRequest.target_id == target_id,
+                            OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
+                        )
+                        .order_by(desc(OperationRequest.created_at))
+                        .limit(1)
+                    )
+                if existing is None:
+                    existing = OperationRequest(
+                        action=command.action,
+                        project=project,
+                        target_type=target_type,
+                        target_id=target_id,
+                        payload_json=payload,
+                        source_channel=source_channel,
+                        operator_class=operator_class[:80],
+                        idempotency_key=digest,
+                        binding_hash=binding_hash,
+                        workflow_id=None,
+                        temporal_run_id=None,
+                        status="PENDING",
+                        safe_error=None,
+                        created_at=datetime.now(UTC),
+                        confirmed_at=datetime.now(UTC),
+                        started_at=None,
+                        completed_at=None,
+                    )
+                    session.add(existing)
+                    session.flush()
+                return self._operation_view(existing)
+        except IntegrityError:
+            with self.sessions() as session:
+                existing = self._operation_after_insert_conflict(
+                    session,
                     action=command.action,
-                    project=project,
-                    target_type=target_type,
                     target_id=target_id,
-                    payload_json=payload,
-                    source_channel=source_channel,
-                    operator_class=operator_class[:80],
                     idempotency_key=digest,
-                    binding_hash=binding_hash,
-                    workflow_id=None,
-                    temporal_run_id=None,
-                    status="PENDING",
-                    safe_error=None,
-                    created_at=datetime.now(UTC),
-                    confirmed_at=datetime.now(UTC),
-                    started_at=None,
-                    completed_at=None,
                 )
-                session.add(existing)
-                session.flush()
-            return self._operation_view(existing)
+                if existing is None:
+                    raise
+                return self._operation_view(existing)
 
     async def upsert_connection(self, value: dict[str, Any]) -> None:
         await asyncio.to_thread(self._upsert_connection, value)

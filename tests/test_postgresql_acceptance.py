@@ -18,9 +18,12 @@ from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.db.models import (
     DashboardSessionRevocation,
     NotificationOutbox,
+    OperationRequest,
     Run,
 )
 from engineering_control.db.repository import SQLMetadataRepository
+from engineering_control.operations.models import SolveIssueCommand
+from engineering_control.operations.repository import OperationsRepository
 
 
 def _postgresql_url() -> str:
@@ -105,6 +108,14 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
 
     command.upgrade(config, "0014")
     assert inspect(engine).has_table("dashboard_session_revocations")
+    command.upgrade(config, "0015")
+    active_owner_index = next(
+        index
+        for index in inspect(engine).get_indexes("operation_requests")
+        if index["name"] == "uq_operation_requests_active_target"
+    )
+    assert active_owner_index["unique"] is True
+    assert active_owner_index["column_names"] == ["action", "target_id"]
     with engine.connect() as connection:
         server_version_num = int(connection.scalar(text("SHOW server_version_num")))
         invalid_indexes = connection.scalar(
@@ -219,3 +230,51 @@ def test_postgresql_migration_reader_concurrency_rollback_and_reupgrade(
     handler.engine.dispose()
     dashboard.engine.dispose()
     engine.dispose()
+
+
+@pytest.mark.postgresql
+@pytest.mark.asyncio
+async def test_postgresql_simultaneous_issue_starts_return_one_active_owner() -> None:
+    repository = OperationsRepository(_postgresql_url())
+    command_value = SolveIssueCommand(
+        project="falcone",
+        backlog_campaign_id=uuid5(NAMESPACE_URL, "hermes-owner-race-campaign"),
+        repository="gntik-ai/falcone",
+        issue_number=424242,
+        delivery_mode="source-pr",
+    )
+    original = repository._active_target
+    barrier = threading.Barrier(2, timeout=10)
+
+    def synchronized_active_target(*args: object, **kwargs: object) -> bool:
+        value = original(*args, **kwargs)
+        if not value:
+            barrier.wait()
+        return value
+
+    repository._active_target = synchronized_active_target  # type: ignore[method-assign]
+    first, second = await asyncio.gather(
+        repository.create_external(
+            command_value,
+            source_channel="telegram",
+            operator_class="telegram:allowlisted",
+            idempotency_key="telegram-owner-race-000001",
+        ),
+        repository.create_external(
+            command_value,
+            source_channel="cli",
+            operator_class="local-operator",
+            idempotency_key="cli-owner-race-00000000001",
+        ),
+    )
+    assert first.operation_id == second.operation_id
+    with repository.sessions() as session:
+        rows = session.scalars(
+            select(OperationRequest).where(
+                OperationRequest.action == "solve_issue",
+                OperationRequest.target_id == "gntik-ai/falcone#424242",
+                OperationRequest.status.in_(("PENDING", "DISPATCHING", "STARTED", "RUNNING")),
+            )
+        ).all()
+    assert len(rows) == 1
+    repository.engine.dispose()

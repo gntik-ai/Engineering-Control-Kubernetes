@@ -681,3 +681,11 @@ Index(
     OperationRequest.target_id,
     OperationRequest.status,
 )
+Index(
+    "uq_operation_requests_active_target",
+    OperationRequest.action,
+    OperationRequest.target_id,
+    unique=True,
+    postgresql_where=OperationRequest.status.in_(("PENDING", "DISPATCHING", "STARTED", "RUNNING")),
+    sqlite_where=OperationRequest.status.in_(("PENDING", "DISPATCHING", "STARTED", "RUNNING")),
+)

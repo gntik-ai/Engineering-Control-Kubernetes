@@ -8,6 +8,9 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import Session
+
+from engineering_control.db.models import OperationRequest
 
 
 def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
@@ -73,4 +76,53 @@ def test_session_revocation_downgrade_invalidates_all_outstanding_sessions(
     assert not inspect(engine).has_table("dashboard_session_revocations")
     command.upgrade(config, "0014")
     assert inspect(engine).has_table("dashboard_session_revocations")
+    engine.dispose()
+
+
+def test_active_owner_migration_refuses_ambiguous_existing_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'active-owner-duplicates.sqlite3'}"
+    monkeypatch.setenv("ENGINEERING_DATABASE_URL", database_url)
+    root = Path(__file__).resolve().parents[1]
+    config = Config(root / "alembic.ini")
+    config.set_main_option("script_location", str(root / "migrations"))
+    command.upgrade(config, "0014")
+    engine = create_engine(database_url)
+    # Revision 0001 bootstraps current model metadata on a fresh fixture. Remove
+    # the future index to reproduce an actual predecessor (0014) installation.
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX uq_operation_requests_active_target"))
+    now = datetime.now(UTC)
+    with Session(engine) as session:
+        with session.begin():
+            for ordinal in (1, 2):
+                session.add(
+                    OperationRequest(
+                        action="solve_issue",
+                        project="falcone",
+                        target_type="github_issue",
+                        target_id="gntik-ai/falcone#42",
+                        payload_json={"ordinal": ordinal},
+                        source_channel="cli",
+                        operator_class="synthetic-fixture",
+                        idempotency_key=f"{ordinal:064x}",
+                        binding_hash=f"{ordinal + 2:064x}",
+                        workflow_id=None,
+                        temporal_run_id=None,
+                        status="PENDING",
+                        safe_error=None,
+                        created_at=now,
+                        confirmed_at=now,
+                        started_at=None,
+                        completed_at=None,
+                    )
+                )
+    with pytest.raises(RuntimeError, match="refuses active-owner duplicates"):
+        command.upgrade(config, "0015")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+    assert "uq_operation_requests_active_target" not in {
+        index["name"] for index in inspect(engine).get_indexes("operation_requests")
+    }
     engine.dispose()
