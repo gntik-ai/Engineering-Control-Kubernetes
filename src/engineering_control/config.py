@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     watchdog_state_file: Path = Path("/var/lib/engineering-watchdog/state.json")
     watchdog_backup_status_file: Path = Path("/var/lib/engineering-backup/status.json")
     watchdog_probe_seconds: int = Field(default=60, ge=30, le=120)
-    watchdog_repeat_seconds: int = Field(default=3600, ge=300, le=86400)
+    watchdog_repeat_seconds: int = Field(default=3900, ge=300, le=86400)
     watchdog_backup_max_age_seconds: int = Field(default=4500, ge=3600, le=86400)
     watchdog_restore_max_age_seconds: int = Field(default=691200, ge=86400, le=2678400)
     watchdog_cleanup_max_age_seconds: int = Field(default=93600, ge=3600, le=172800)

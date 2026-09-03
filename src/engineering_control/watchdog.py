@@ -210,6 +210,12 @@ class OperationalWatchdog:
                     .order_by(desc(Run.updated_at))
                     .limit(1)
                 )
+                latest_cleanup_success = session.scalar(
+                    select(Run)
+                    .where(Run.run_type == "cleanup", Run.status == "SUCCESS")
+                    .order_by(desc(Run.finished_at), desc(Run.updated_at))
+                    .limit(1)
+                )
                 heartbeats = list(session.scalars(select(WorkerHeartbeat)).all())
                 pending = list(
                     session.scalars(
@@ -241,6 +247,16 @@ class OperationalWatchdog:
                 else cleanup.finished_at or cleanup.updated_at
             )
             age = max(0, int((now - _utc(observed)).total_seconds()))
+            success_observed = (
+                latest_cleanup_success.finished_at or latest_cleanup_success.updated_at
+                if latest_cleanup_success is not None
+                else None
+            )
+            success_current = (
+                success_observed is not None
+                and max(0, int((now - _utc(success_observed)).total_seconds()))
+                <= self.settings.watchdog_cleanup_max_age_seconds
+            )
             cleanup_ok = (
                 cleanup.status == "SUCCESS"
                 and age <= self.settings.watchdog_cleanup_max_age_seconds
@@ -248,15 +264,16 @@ class OperationalWatchdog:
                 cleanup.status == "RUNNING"
                 and cleanup.started_at is not None
                 and age <= self.settings.watchdog_cleanup_running_max_age_seconds
+                and success_current
             )
             results.append(
                 ProbeResult(
                     "cleanup-schedule",
                     cleanup_ok,
                     "CURRENT_OR_RUNNING" if cleanup_ok else "FAILED_OR_MISSED",
-                    "latest cleanup run is current, successful, or bounded in progress"
+                    "latest cleanup run is current with a recent successful baseline"
                     if cleanup_ok
-                    else "latest cleanup run failed, blocked, or exceeded its freshness bound",
+                    else "cleanup failed, lacks a recent success, or exceeded its freshness bound",
                 )
             )
 
@@ -346,17 +363,26 @@ class OperationalWatchdog:
             return value
         except (OSError, ValueError, TypeError):
             quarantine = path.with_name(f"{path.name}.invalid-{uuid4().hex}")
-            os.replace(path, quarantine)
-            if stat.S_ISREG(metadata.st_mode):
-                quarantine.chmod(0o600)
-            quarantined = sorted(
-                path.parent.glob(f"{path.name}.invalid-*"),
-                key=lambda candidate: candidate.stat().st_mtime,
-                reverse=True,
-            )
-            for stale in quarantined[3:]:
-                stale.unlink(missing_ok=True)
-            return {"version": 1, "probes": {}, "state_recovered": True}
+            quarantine_failed = False
+            try:
+                os.replace(path, quarantine)
+                if stat.S_ISREG(metadata.st_mode):
+                    quarantine.chmod(0o600)
+                quarantined = sorted(
+                    path.parent.glob(f"{path.name}.invalid-*"),
+                    key=lambda candidate: candidate.lstat().st_mtime,
+                    reverse=True,
+                )
+                for stale in quarantined[3:]:
+                    stale.unlink(missing_ok=True)
+            except OSError:
+                quarantine_failed = True
+            return {
+                "version": 1,
+                "probes": {},
+                "state_recovered": True,
+                "state_quarantine_failed": quarantine_failed,
+            }
 
     def _save_state(self, value: dict[str, Any]) -> None:
         path = self.settings.watchdog_state_file
@@ -386,6 +412,7 @@ class OperationalWatchdog:
         now = self.now()
         state = self._load_state()
         state_recovered = state.pop("state_recovered", False) is True
+        state_quarantine_failed = state.pop("state_quarantine_failed", False) is True
         previous = state.setdefault("probes", {})
         if not isinstance(previous, dict):
             raise ValueError("watchdog probe state is malformed")
@@ -410,10 +437,20 @@ class OperationalWatchdog:
             ProbeResult(
                 "watchdog-state",
                 not state_recovered,
-                "RECOVERED_CORRUPTION" if state_recovered else "VALID",
-                "invalid watchdog state was quarantined and reset"
-                if state_recovered
-                else "watchdog state is valid",
+                (
+                    "RESET_WITHOUT_QUARANTINE"
+                    if state_quarantine_failed
+                    else "RECOVERED_CORRUPTION"
+                    if state_recovered
+                    else "VALID"
+                ),
+                (
+                    "invalid watchdog state was reset but could not be quarantined"
+                    if state_quarantine_failed
+                    else "invalid watchdog state was quarantined and reset"
+                    if state_recovered
+                    else "watchdog state is valid"
+                ),
             ),
         )
         for probe in results:

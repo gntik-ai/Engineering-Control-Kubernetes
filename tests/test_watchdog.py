@@ -151,6 +151,32 @@ def test_watchdog_quarantines_corrupt_state_and_emits_recovery(tmp_path: Path) -
     assert sink.calls[-1]["payload"]["event_type"] == "RECOVERY"  # type: ignore[index]
 
 
+def test_watchdog_quarantine_failure_resets_in_memory_without_crashing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state = tmp_path / "state.json"
+    state.write_text("not-json", encoding="utf-8")
+    state.chmod(0o600)
+    watchdog = OperationalWatchdog(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'watchdog.sqlite'}",
+            watchdog_state_file=state,
+        ),
+        sink=RecordingSink(),  # type: ignore[arg-type]
+        probe_provider=lambda: [],
+    )
+
+    def fail_replace(*_args) -> None:
+        raise OSError("fixture")
+
+    monkeypatch.setattr("engineering_control.watchdog.os.replace", fail_replace)
+    recovered = watchdog._load_state()
+
+    assert recovered["state_recovered"] is True
+    assert recovered["state_quarantine_failed"] is True
+    assert recovered["probes"] == {}
+
+
 def test_watchdog_health_flip_drops_stale_pending_label(tmp_path: Path) -> None:
     observed = [datetime(2026, 9, 3, 11, 55, tzinfo=UTC)]
     probes = [ProbeResult("database", False, "UNREACHABLE", "database failed")]
@@ -354,9 +380,18 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
 
     with watchdog.engine.begin() as connection:
         connection.execute(
-            Run.__table__.update()
-            .where(Run.workflow_id == "cleanup-current-fixture")
-            .values(status="RUNNING", finished_at=None, updated_at=now - timedelta(minutes=5))
+            Run.__table__.insert(),
+            {
+                "id": uuid4(),
+                "workflow_id": "cleanup-running-fixture",
+                "run_type": "cleanup",
+                "status": "RUNNING",
+                "project": "platform",
+                "started_at": now - timedelta(minutes=5),
+                "finished_at": None,
+                "created_at": now - timedelta(minutes=5),
+                "updated_at": now,
+            },
         )
     running = {probe.key: probe for probe in watchdog._database(now)}
     assert running["cleanup-schedule"].healthy is True
@@ -364,7 +399,7 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
     with watchdog.engine.begin() as connection:
         connection.execute(
             Run.__table__.update()
-            .where(Run.workflow_id == "cleanup-current-fixture")
+            .where(Run.workflow_id == "cleanup-running-fixture")
             .values(started_at=now - timedelta(hours=2), updated_at=now)
         )
     wedged = {probe.key: probe for probe in watchdog._database(now)}
@@ -373,11 +408,29 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
     with watchdog.engine.begin() as connection:
         connection.execute(
             Run.__table__.update()
-            .where(Run.workflow_id == "cleanup-current-fixture")
+            .where(Run.workflow_id == "cleanup-running-fixture")
             .values(started_at=None, updated_at=now)
         )
     missing_start = {probe.key: probe for probe in watchdog._database(now)}
     assert missing_start["cleanup-schedule"].healthy is False
+
+    with watchdog.engine.begin() as connection:
+        connection.execute(
+            Run.__table__.update()
+            .where(Run.workflow_id == "cleanup-current-fixture")
+            .values(
+                started_at=now - timedelta(days=3),
+                finished_at=now - timedelta(days=3),
+                updated_at=now - timedelta(days=3),
+            )
+        )
+        connection.execute(
+            Run.__table__.update()
+            .where(Run.workflow_id == "cleanup-running-fixture")
+            .values(started_at=now - timedelta(minutes=1), updated_at=now)
+        )
+    running_without_recent_success = {probe.key: probe for probe in watchdog._database(now)}
+    assert running_without_recent_success["cleanup-schedule"].healthy is False
 
     duplicate_kind = next(iter(ROLE_WORKER_REGISTRY))
     with watchdog.engine.begin() as connection:
