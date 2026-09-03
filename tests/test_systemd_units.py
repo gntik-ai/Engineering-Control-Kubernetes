@@ -178,6 +178,20 @@ def test_worker_shared_tool_runtimes_are_traversable_but_not_made_writable() -> 
     assert "a+w" not in scanners
 
 
+def test_worker_browser_runtime_is_lock_bound_root_owned_and_atomically_selected() -> None:
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+
+    assert "/opt/engineering-browser-runtimes/${RELEASE_ID}" in worker
+    assert "ci --omit=dev --ignore-scripts --no-audit --no-fund" in worker
+    assert 'chown -R root:root "${BROWSER_STAGING}"' in worker
+    assert 'mv -T -- "${BROWSER_STAGING}" "${BROWSER_RELEASE_ROOT}"' in worker
+    assert "mv -Tf -- /opt/engineering-browser/.runtime.new" in worker
+    assert worker.index("install chromium firefox") < worker.index(
+        'ln -sfn "${BROWSER_RELEASE_ROOT}" /opt/engineering-browser/.runtime.new'
+    )
+    assert "trap 'rm -rf -- \"${BROWSER_STAGING}\"' EXIT" in worker
+
+
 def test_worker_parent_state_and_platform_roots_are_identity_traversable() -> None:
     worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
 
@@ -268,6 +282,9 @@ def test_worker_verification_uses_a_neutral_non_home_directory() -> None:
     assert "all credential-independent checks passed" in verification
     assert "/scripts/browser-runtime-smoke.py" in verification
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers" in verification
+    assert "/opt/engineering-browser/runtime/node_modules" in verification
+    assert "10.34.5" in verification
+    assert "env -i" in verification
     for version in (
         "codex-cli 0.149.0",
         "2.1.239 (Claude Code)",

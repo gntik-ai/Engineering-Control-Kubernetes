@@ -56,7 +56,12 @@ if ! sudo -u claude-runner -H env -i \
   echo "BLOCKED MANUAL_AUTH_REQUIRED_CLAUDE"
   blocked=1
 fi
-sudo -u browser-runner test -r /opt/engineering-browser/node_modules/@playwright/test/package.json
+sudo -u browser-runner test -r \
+  /opt/engineering-browser/runtime/node_modules/@playwright/test/package.json
+[[ $(sudo -u browser-runner -H env -i \
+  HOME=/var/lib/engineering-control/identities/browser-runner \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  /opt/engineering-browser/runtime/node_modules/.bin/pnpm --version) == "10.34.5" ]]
 sudo -u browser-runner -H env -i \
   HOME=/var/lib/engineering-control/identities/browser-runner \
   PATH=/usr/local/bin:/usr/bin:/bin \

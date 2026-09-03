@@ -72,8 +72,9 @@ Component guidance:
   digests, run supported schema updates, test namespace/workflow resume, then retain old images.
 - Codex/Claude: install exact npm versions, authenticate per worker identity, run structured smoke
   output, and keep paid API variables absent.
-- Playwright/scanners: update package/release checksum locks, reinstall browsers/dependencies, and
-  run synthetic evidence checks.
+- Playwright/scanners: update package/release checksum locks, build the root-owned versioned
+  browser runtime, atomically switch `/opt/engineering-browser/runtime`, reinstall browser
+  binaries/dependencies where required, and run synthetic evidence checks under `browser-runner`.
 - Agent pack: edit neutral catalogs, regenerate all providers, validate, review generated diff,
   deploy its commit-addressed release on both hosts, and verify invocation provenance.
 - Project adapters: validate against repository and dry-run output before enabling mutation.

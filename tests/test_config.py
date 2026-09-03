@@ -46,6 +46,15 @@ def test_dashboard_host_and_origin_allowlists_are_bounded_and_production_safe() 
         Settings(dashboard_allowed_origins=("https://ade.musematic.ai/path",))
 
 
+def test_default_browser_runtime_uses_the_immutable_release_link() -> None:
+    settings = Settings()
+
+    assert settings.pnpm_executable == Path(
+        "/opt/engineering-browser/runtime/node_modules/.bin/pnpm"
+    )
+    assert settings.browser_script == Path("/opt/engineering-browser/runtime/run-journey.mjs")
+
+
 def test_evidence_ingest_tokens_include_every_worker_identity(tmp_path: Path) -> None:
     identities = {
         "codex-runner",

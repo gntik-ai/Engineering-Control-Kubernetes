@@ -46,6 +46,12 @@ Trivy 0.74.0, Semgrep 1.174.0, kubeconform 0.8.0, and Syft 1.51.0. Release archi
 against upstream checksum manifests. It also pins the deterministic adapters to kubectl 1.36.3,
 Helm 4.2.3, and Argo CD CLI 3.5.1 with upstream checksums.
 
+The Playwright driver and its pnpm consumer executable are installed as a root-owned,
+commit-addressed tree below `/opt/engineering-browser-runtimes`. The fixed
+`/opt/engineering-browser/runtime` link is switched with the worker release; the browser service
+can read but cannot rewrite its executable dependency tree. Browser binaries remain in the
+separate shared `/opt/engineering-browser/browsers` cache.
+
 It also normalizes the operator-owned `/home/hermes/engineering/{bootstrap,docs,project-config}`
 directories, installs inspectable unit snapshots under `/etc/engineering-control/systemd`, and
 reserves `/var/log/engineering-control`. The active unit copies must match the snapshots; worker
