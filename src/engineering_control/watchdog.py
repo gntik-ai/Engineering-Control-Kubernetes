@@ -246,6 +246,7 @@ class OperationalWatchdog:
                 and age <= self.settings.watchdog_cleanup_max_age_seconds
             ) or (
                 cleanup.status == "RUNNING"
+                and cleanup.started_at is not None
                 and age <= self.settings.watchdog_cleanup_running_max_age_seconds
             )
             results.append(
@@ -294,7 +295,7 @@ class OperationalWatchdog:
             )
         )
 
-        exhausted = any(
+        exhausted = len(pending) > 20 or any(
             row.attempts >= 10
             or max(0, int((now - _utc(row.created_at)).total_seconds()))
             > self.settings.watchdog_notification_max_age_seconds
@@ -429,6 +430,9 @@ class OperationalWatchdog:
             prior_pending_fingerprint = (
                 prior.get("pending_fingerprint") if isinstance(prior, dict) else None
             )
+            prior_pending_observed = (
+                prior.get("pending_observed_at") if isinstance(prior, dict) else None
+            )
             prior_fingerprint = prior.get("fingerprint") if isinstance(prior, dict) else None
             event: str | None = None
             if not probe.healthy:
@@ -511,7 +515,11 @@ class OperationalWatchdog:
                                 if same_pending_event and isinstance(prior_pending_summary, str)
                                 else probe.summary
                             ),
-                            "observed_at": now.isoformat(),
+                            "observed_at": (
+                                prior_pending_observed
+                                if same_pending_event and isinstance(prior_pending_observed, str)
+                                else now.isoformat()
+                            ),
                             "release": self._release(),
                             "source": "engineering-independent-watchdog",
                             "synthetic": False,
@@ -532,6 +540,11 @@ class OperationalWatchdog:
                         else probe.summary
                     )
                     pending_fingerprint: str | None = probe.fingerprint
+                    pending_observed_at: str | None = (
+                        prior_pending_observed
+                        if same_pending_event and isinstance(prior_pending_observed, str)
+                        else now.isoformat()
+                    )
                 else:
                     delivered += 1
                     alert_time = now.isoformat()
@@ -540,17 +553,19 @@ class OperationalWatchdog:
                     pending_status = None
                     pending_summary = None
                     pending_fingerprint = None
+                    pending_observed_at = None
             else:
                 pending_request_id = None
                 pending_event = None
                 pending_status = None
                 pending_summary = None
                 pending_fingerprint = None
+                pending_observed_at = None
             missed_alert_delivered = (
                 probe.healthy and prior_active and event == "ALERT" and pending_event is None
             )
             previous[probe.key] = {
-                "active": not probe.healthy or missed_alert_delivered,
+                "active": not probe.healthy or missed_alert_delivered or pending_event == "ALERT",
                 "episode_started_at": prior_episode if missed_alert_delivered else episode_time,
                 "last_alerted_at": alert_time,
                 "last_observed_at": now.isoformat(),
@@ -558,6 +573,7 @@ class OperationalWatchdog:
                 "pending_status": pending_status,
                 "pending_summary": pending_summary,
                 "pending_fingerprint": pending_fingerprint,
+                "pending_observed_at": pending_observed_at,
                 "pending_request_id": pending_request_id,
                 "fingerprint": probe.fingerprint,
                 "status": probe.status,

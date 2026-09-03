@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import Run, WorkerHeartbeat
+from engineering_control.db.models import NotificationOutbox, Run, WorkerHeartbeat
 from engineering_control.watchdog import OperationalWatchdog, ProbeResult
 from engineering_control.workflows.worker_registry import ROLE_WORKER_REGISTRY
 
@@ -177,6 +177,39 @@ def test_watchdog_health_flip_drops_stale_pending_label(tmp_path: Path) -> None:
     assert sink.calls[-1]["payload"]["event_type"] == "RECOVERY"  # type: ignore[index]
 
 
+def test_watchdog_keeps_recovered_alert_pending_until_delivery(tmp_path: Path) -> None:
+    observed = [datetime(2026, 9, 3, 11, 56, tzinfo=UTC)]
+    probes = [ProbeResult("database", False, "UNREACHABLE", "database failed")]
+    sink = RecordingSink(fail=True)
+    watchdog = OperationalWatchdog(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'watchdog.sqlite'}",
+            watchdog_state_file=tmp_path / "state.json",
+        ),
+        sink=sink,  # type: ignore[arg-type]
+        probe_provider=lambda: probes,
+        now=lambda: observed[0],
+    )
+
+    assert watchdog.run_once()["delivery_failure_count"] == 1
+    first_id = sink.calls[-1]["request_id"]
+    first_payload = sink.calls[-1]["payload"]
+    probes[0] = ProbeResult("database", True, "REACHABLE", "database passed")
+    observed[0] += timedelta(seconds=60)
+    assert watchdog.run_once()["delivery_failure_count"] == 1
+    assert sink.calls[-1]["request_id"] == first_id
+    assert sink.calls[-1]["payload"] == first_payload
+
+    sink.fail = False
+    observed[0] += timedelta(seconds=60)
+    assert watchdog.run_once()["delivered_count"] == 1
+    assert sink.calls[-1]["request_id"] == first_id
+    assert sink.calls[-1]["payload"] == first_payload
+    observed[0] += timedelta(seconds=60)
+    assert watchdog.run_once()["delivered_count"] == 1
+    assert sink.calls[-1]["payload"]["event_type"] == "RECOVERY"  # type: ignore[index]
+
+
 def test_watchdog_new_failure_supersedes_failed_recovery_label(tmp_path: Path) -> None:
     observed = [datetime(2026, 9, 3, 11, 57, tzinfo=UTC)]
     probes = [ProbeResult("database", False, "UNREACHABLE", "database failed")]
@@ -337,6 +370,15 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
     wedged = {probe.key: probe for probe in watchdog._database(now)}
     assert wedged["cleanup-schedule"].healthy is False
 
+    with watchdog.engine.begin() as connection:
+        connection.execute(
+            Run.__table__.update()
+            .where(Run.workflow_id == "cleanup-current-fixture")
+            .values(started_at=None, updated_at=now)
+        )
+    missing_start = {probe.key: probe for probe in watchdog._database(now)}
+    assert missing_start["cleanup-schedule"].healthy is False
+
     duplicate_kind = next(iter(ROLE_WORKER_REGISTRY))
     with watchdog.engine.begin() as connection:
         connection.execute(
@@ -362,6 +404,26 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
         )
     stale_predecessor = {probe.key: probe for probe in watchdog._database(now)}
     assert stale_predecessor["worker-capacity"].healthy is True
+
+    with watchdog.engine.begin() as connection:
+        connection.execute(
+            NotificationOutbox.__table__.insert(),
+            [
+                {
+                    "id": uuid4(),
+                    "topic": "telegram.synthetic",
+                    "status": "PENDING",
+                    "payload_json": {},
+                    "attempts": 0,
+                    "next_attempt_at": now,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                for _ in range(21)
+            ],
+        )
+    young_volume = {probe.key: probe for probe in watchdog._database(now)}
+    assert young_volume["notification-outbox"].healthy is False
 
 
 def test_probe_provider_exception_becomes_an_alert(tmp_path: Path) -> None:

@@ -362,3 +362,22 @@ def test_hmac_sink_requires_explicit_delivery_acknowledgement(tmp_path: Path) ->
         assert stored is not None
         assert stored.status == "PENDING"
         assert stored.attempts == 1
+
+
+def test_notification_token_accepts_read_only_owner_mode_and_rejects_broad_mode(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "notification.token"
+    token_file.write_text("fixture-hmac-secret-0123456789abcdef", encoding="utf-8")
+    token_file.chmod(0o400)
+    service = NotificationService(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'token.sqlite'}",
+            notification_sink_url="http://127.0.0.1:8644/webhooks/engineering-alerts",
+            notification_token_file=token_file,
+        )
+    )
+    assert service.sink._token(token_file) == "fixture-hmac-secret-0123456789abcdef"
+    token_file.chmod(0o644)
+    with pytest.raises(PermissionError, match="too broad"):
+        service.sink._token(token_file)

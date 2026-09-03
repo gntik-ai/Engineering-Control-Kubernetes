@@ -81,10 +81,10 @@ class NotificationSink:
             if (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino):
                 raise RuntimeError("notification token file changed during protected read")
             mode = stat.S_IMODE(metadata.st_mode)
-            if mode == 0o600:
+            if mode in {0o400, 0o600}:
                 if metadata.st_uid not in {0, os.geteuid()}:
                     raise PermissionError("notification token owner is not trusted")
-            elif mode == 0o640:
+            elif mode in {0o440, 0o640}:
                 if metadata.st_uid != 0 or metadata.st_gid != os.getegid():
                     raise PermissionError("group-readable notification token custody is invalid")
             else:

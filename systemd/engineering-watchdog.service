@@ -2,6 +2,7 @@
 Description=Independent bounded Hermes operational watchdog
 After=network-online.target engineering-migrate.service
 Wants=network-online.target engineering-migrate.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
