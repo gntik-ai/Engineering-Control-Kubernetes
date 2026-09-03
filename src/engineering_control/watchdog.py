@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 import structlog
@@ -105,21 +105,29 @@ class OperationalWatchdog:
 
     @staticmethod
     def _unit(unit: str) -> ProbeResult:
-        result = subprocess.run(  # noqa: S603 - unit is selected only from fixed constants
-            [
-                "/usr/bin/systemctl",
-                "show",
-                "--property=ActiveState",
-                "--property=SubState",
-                "--property=InvocationID",
-                unit,
-            ],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-        )
+        try:
+            result = subprocess.run(  # noqa: S603 - unit is selected only from fixed constants
+                [
+                    "/usr/bin/systemctl",
+                    "show",
+                    "--property=ActiveState",
+                    "--property=SubState",
+                    "--property=InvocationID",
+                    unit,
+                ],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ProbeResult(
+                f"unit:{unit}",
+                False,
+                "UNKNOWN",
+                "fixed system unit metadata probe failed",
+            )
         values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
         active = (
             result.returncode == 0
@@ -224,30 +232,40 @@ class OperationalWatchdog:
             cleanup_ok = (
                 cleanup.status == "SUCCESS"
                 and age <= self.settings.watchdog_cleanup_max_age_seconds
+            ) or (
+                cleanup.status == "RUNNING"
+                and age <= self.settings.watchdog_cleanup_running_max_age_seconds
             )
             results.append(
                 ProbeResult(
                     "cleanup-schedule",
                     cleanup_ok,
-                    "CURRENT" if cleanup_ok else "FAILED_OR_MISSED",
-                    "latest cleanup run is current and successful"
+                    "CURRENT_OR_RUNNING" if cleanup_ok else "FAILED_OR_MISSED",
+                    "latest cleanup run is current, successful, or bounded in progress"
                     if cleanup_ok
                     else "latest cleanup run failed, blocked, or exceeded its freshness bound",
                 )
             )
 
-        heartbeat_by_kind = {heartbeat.worker_kind: heartbeat for heartbeat in heartbeats}
+        heartbeat_by_kind: dict[str, list[WorkerHeartbeat]] = {}
+        for heartbeat in heartbeats:
+            heartbeat_by_kind.setdefault(heartbeat.worker_kind, []).append(heartbeat)
         missing: list[str] = []
         stale: list[str] = []
+        duplicate: list[str] = []
         for kind in sorted(ROLE_WORKER_REGISTRY):
-            heartbeat = heartbeat_by_kind.get(kind)
-            if heartbeat is None:
+            candidates = heartbeat_by_kind.get(kind, [])
+            if not candidates:
                 missing.append(kind)
                 continue
+            if len(candidates) != 1:
+                duplicate.append(kind)
+                continue
+            heartbeat = candidates[0]
             age = max(0, int((now - _utc(heartbeat.observed_at)).total_seconds()))
             if age > self.settings.watchdog_heartbeat_max_age_seconds:
                 stale.append(kind)
-        workers_ok = not missing and not stale
+        workers_ok = not missing and not stale and not duplicate
         results.append(
             ProbeResult(
                 "worker-capacity",
@@ -259,7 +277,12 @@ class OperationalWatchdog:
             )
         )
 
-        exhausted = len(pending) > 20 or any(row.attempts >= 10 for row in pending)
+        exhausted = any(
+            row.attempts >= 10
+            or max(0, int((now - _utc(row.created_at)).total_seconds()))
+            > self.settings.watchdog_notification_max_age_seconds
+            for row in pending
+        )
         results.append(
             ProbeResult(
                 "notification-outbox",
@@ -294,35 +317,65 @@ class OperationalWatchdog:
             metadata = path.lstat()
         except FileNotFoundError:
             return {"version": 1, "probes": {}}
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
-            raise PermissionError("watchdog state must be an owner-only non-symlink regular file")
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or value.get("version") != 1:
-            raise ValueError("watchdog state version is unsupported")
-        return value
+        try:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+                raise PermissionError(
+                    "watchdog state must be an owner-only non-symlink regular file"
+                )
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or value.get("version") != 1:
+                raise ValueError("watchdog state version is unsupported")
+            return value
+        except (OSError, ValueError, TypeError):
+            quarantine = path.with_name(f"{path.name}.invalid-{uuid4().hex}")
+            os.replace(path, quarantine)
+            if stat.S_ISREG(metadata.st_mode):
+                quarantine.chmod(0o600)
+            return {"version": 1, "probes": {}, "state_recovered": True}
 
     def _save_state(self, value: dict[str, Any]) -> None:
         path = self.settings.watchdog_state_file
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         try:
-            payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+                os.write(descriptor, payload)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
         finally:
-            os.close(descriptor)
-        os.replace(temporary, path)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
     def run_once(self) -> dict[str, Any]:
         now = self.now()
         state = self._load_state()
+        state_recovered = state.pop("state_recovered", False) is True
         previous = state.setdefault("probes", {})
         if not isinstance(previous, dict):
             raise ValueError("watchdog probe state is malformed")
         delivered = 0
         failures = 0
-        results = self.probe_provider()
+        # Probe providers may reuse a list (including in dependency-injected
+        # fixtures).  Keep our synthetic state probe local so one cycle cannot
+        # mutate and duplicate the provider's next cycle.
+        results = list(self.probe_provider())
+        results.insert(
+            0,
+            ProbeResult(
+                "watchdog-state",
+                not state_recovered,
+                "RECOVERED_CORRUPTION" if state_recovered else "VALID",
+                "invalid watchdog state was quarantined and reset"
+                if state_recovered
+                else "watchdog state is valid",
+            ),
+        )
         for probe in results:
             prior = previous.get(probe.key, {})
             prior_active = bool(prior.get("active", False)) if isinstance(prior, dict) else False
@@ -331,43 +384,32 @@ class OperationalWatchdog:
             prior_pending_id = prior.get("pending_request_id") if isinstance(prior, dict) else None
             prior_pending_event = prior.get("pending_event") if isinstance(prior, dict) else None
             prior_fingerprint = prior.get("fingerprint") if isinstance(prior, dict) else None
-            due = False
-            recovery = False
-            change = False
-            pending_retry = isinstance(prior_pending_id, str) and prior_pending_event in {
-                "ALERT",
-                "CHANGE",
-                "RECOVERY",
-            }
-            if probe.healthy and pending_retry:
-                due = True
-                change = prior_pending_event == "CHANGE"
-                recovery = prior_pending_event == "RECOVERY"
-            if (
-                probe.healthy
-                and not pending_retry
-                and isinstance(prior_fingerprint, str)
-                and probe.fingerprint is not None
-                and probe.fingerprint != prior_fingerprint
-            ):
-                due = True
-                change = True
+            event: str | None = None
             if not probe.healthy:
-                due = not prior_active
-                if prior_active and isinstance(prior_pending_id, str):
-                    due = True
+                if not prior_active or prior_pending_event == "ALERT":
+                    event = "ALERT"
                 elif prior_active and isinstance(prior_alerted, str):
                     try:
                         alerted_at = datetime.fromisoformat(prior_alerted)
                     except ValueError:
-                        due = True
+                        event = "ALERT"
                     else:
-                        due = (
+                        if (
                             now - _utc(alerted_at)
-                        ).total_seconds() >= self.settings.watchdog_repeat_seconds
+                        ).total_seconds() >= self.settings.watchdog_repeat_seconds:
+                            event = "ALERT"
             elif prior_active and isinstance(prior_alerted, str):
-                due = True
-                recovery = True
+                event = "RECOVERY"
+            elif prior_pending_event in {"CHANGE", "RECOVERY"} and isinstance(
+                prior_pending_id, str
+            ):
+                event = str(prior_pending_event)
+            elif (
+                isinstance(prior_fingerprint, str)
+                and probe.fingerprint is not None
+                and probe.fingerprint != prior_fingerprint
+            ):
+                event = "CHANGE"
 
             alert_time = prior_alerted if isinstance(prior_alerted, str) else None
             if not probe.healthy:
@@ -378,16 +420,7 @@ class OperationalWatchdog:
                 )
             else:
                 episode_time = None
-            if due:
-                event = (
-                    str(prior_pending_event)
-                    if pending_retry
-                    else "CHANGE"
-                    if change
-                    else "RECOVERY"
-                    if recovery
-                    else "ALERT"
-                )
+            if event is not None:
                 if isinstance(prior_pending_id, str) and prior_pending_event == event:
                     request_id = prior_pending_id
                 else:
@@ -450,15 +483,29 @@ def serve() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     watchdog = OperationalWatchdog(settings)
+    _systemd_notify("READY=1\nSTATUS=operational watchdog initialized")
     while True:
         started = time.monotonic()
         try:
             result = watchdog.run_once()
             logger.info("operational_watchdog_completed", **result)
+            _systemd_notify("WATCHDOG=1\nSTATUS=operational watchdog cycle completed")
         except Exception as error:  # noqa: BLE001 - persistent process must remain observable
             logger.error("operational_watchdog_failed", error_type=type(error).__name__)
         elapsed = time.monotonic() - started
         time.sleep(max(1, settings.watchdog_probe_seconds - elapsed))
+
+
+def _systemd_notify(value: str) -> None:
+    address = os.getenv("NOTIFY_SOCKET")
+    if not address:
+        return
+    target = f"\0{address[1:]}" if address.startswith("@") else address
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.sendto(value.encode("utf-8"), target)
+    except OSError:
+        return
 
 
 def run() -> None:

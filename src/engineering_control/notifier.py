@@ -46,12 +46,22 @@ class NotificationSink:
             return
         if not self.settings.notification_token_file:
             raise ValueError("notification sink requires a token file")
-        if self.settings.notification_auth_mode != "hmac-sha256-v2":
-            return
         parsed = urlsplit(self.settings.notification_sink_url)
+        credential_free = (
+            parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+        )
+        if self.settings.notification_auth_mode == "bearer":
+            if parsed.scheme != "https" or not credential_free:
+                raise ValueError("bearer notification sink must use credential-free HTTPS")
+            return
         if (
             parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or parsed.port != 8644
+            or parsed.path != "/webhooks/engineering-alerts"
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
@@ -63,8 +73,6 @@ class NotificationSink:
         before = path.lstat()
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("notification token path must be a non-symlink regular file")
-        if before.st_mode & (stat.S_IWGRP | stat.S_IXGRP | stat.S_IRWXO):
-            raise PermissionError("notification token file permissions are too broad")
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
             metadata = os.fstat(descriptor)
@@ -72,6 +80,15 @@ class NotificationSink:
                 raise ValueError("notification token path must remain a regular file")
             if (metadata.st_dev, metadata.st_ino) != (before.st_dev, before.st_ino):
                 raise RuntimeError("notification token file changed during protected read")
+            mode = stat.S_IMODE(metadata.st_mode)
+            if mode == 0o600:
+                if metadata.st_uid not in {0, os.geteuid()}:
+                    raise PermissionError("notification token owner is not trusted")
+            elif mode == 0o640:
+                if metadata.st_uid != 0 or metadata.st_gid != os.getegid():
+                    raise PermissionError("group-readable notification token custody is invalid")
+            else:
+                raise PermissionError("notification token file permissions are too broad")
             raw = os.read(descriptor, 4097)
         finally:
             os.close(descriptor)
@@ -114,7 +131,14 @@ class NotificationSink:
             headers["Authorization"] = f"Bearer {token}"
         return body, headers
 
-    def deliver(self, *, topic: str, request_id: str, payload: dict[str, Any]) -> None:
+    def deliver(
+        self,
+        *,
+        topic: str,
+        request_id: str,
+        payload: dict[str, Any],
+        client: httpx.Client | None = None,
+    ) -> None:
         if not self.settings.notification_sink_url:
             raise RuntimeError("notification sink is disabled")
         if not self.settings.notification_token_file:
@@ -130,8 +154,10 @@ class NotificationSink:
             token=token,
             payload=payload,
         )
-        with self.client_factory() as client:
-            response = client.post(
+        owned_client = client is None
+        active_client = client or self.client_factory()
+        try:
+            response = active_client.post(
                 self.settings.notification_sink_url,
                 headers=headers,
                 content=body,
@@ -149,6 +175,9 @@ class NotificationSink:
                     "duplicate",
                 }:
                     raise httpx.HTTPError("notification sink did not acknowledge delivery")
+        finally:
+            if owned_client:
+                active_client.close()
 
 
 class NotificationService:
@@ -180,28 +209,30 @@ class NotificationService:
                 .limit(20)
                 .with_for_update(skip_locked=True)
             ).all()
-            for row in rows:
-                payload: dict[str, Any] = self.redactor.redact(row.payload_json).value
-                try:
-                    self.sink.deliver(
-                        topic=row.topic,
-                        request_id=str(row.id),
-                        payload=payload,
-                    )
-                except httpx.HTTPError as error:
-                    row.attempts += 1
-                    row.last_error_code = (
-                        "SINK_HTTP_STATUS_ERROR"
-                        if isinstance(error, httpx.HTTPStatusError)
-                        else "SINK_TRANSPORT_ERROR"
-                    )
-                    row.next_attempt_at = datetime.now(UTC) + timedelta(
-                        seconds=min(3600, 2 ** min(row.attempts, 10))
-                    )
-                else:
-                    row.status = NOTIFICATION_OUTBOX_DELIVERED_STATUS
-                    row.delivered_at = datetime.now(UTC)
-                    delivered += 1
+            with self.sink.client_factory() as client:
+                for row in rows:
+                    payload: dict[str, Any] = self.redactor.redact(row.payload_json).value
+                    try:
+                        self.sink.deliver(
+                            topic=row.topic,
+                            request_id=str(row.id),
+                            payload=payload,
+                            client=client,
+                        )
+                    except httpx.HTTPError as error:
+                        row.attempts += 1
+                        row.last_error_code = (
+                            "SINK_HTTP_STATUS_ERROR"
+                            if isinstance(error, httpx.HTTPStatusError)
+                            else "SINK_TRANSPORT_ERROR"
+                        )
+                        row.next_attempt_at = datetime.now(UTC) + timedelta(
+                            seconds=min(3600, 2 ** min(row.attempts, 10))
+                        )
+                    else:
+                        row.status = NOTIFICATION_OUTBOX_DELIVERED_STATUS
+                        row.delivered_at = datetime.now(UTC)
+                        delivered += 1
         return delivered
 
 

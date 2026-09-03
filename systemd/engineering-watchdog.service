@@ -1,11 +1,12 @@
 [Unit]
 Description=Independent bounded Hermes operational watchdog
 After=network-online.target engineering-migrate.service
-Wants=network-online.target
-Requires=engineering-migrate.service
+Wants=network-online.target engineering-migrate.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=300
 User=engineering-control
 Group=engineering-control
 WorkingDirectory=/var/lib/engineering-watchdog

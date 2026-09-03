@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -129,6 +130,88 @@ def test_watchdog_retries_a_failed_process_generation_change(tmp_path: Path) -> 
     assert sink.calls[-1]["payload"]["event_type"] == "CHANGE"  # type: ignore[index]
 
 
+def test_watchdog_quarantines_corrupt_state_and_emits_recovery(tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    state.write_text("not-json", encoding="utf-8")
+    state.chmod(0o600)
+    sink = RecordingSink()
+    watchdog = OperationalWatchdog(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'watchdog.sqlite'}", watchdog_state_file=state
+        ),
+        sink=sink,  # type: ignore[arg-type]
+        probe_provider=lambda: [],
+        now=lambda: datetime(2026, 9, 3, 11, 50, tzinfo=UTC),
+    )
+
+    assert watchdog.run_once()["delivered_count"] == 1
+    assert sink.calls[-1]["payload"]["event_type"] == "ALERT"  # type: ignore[index]
+    assert len(list(tmp_path.glob("state.json.invalid-*"))) == 1
+    assert watchdog.run_once()["delivered_count"] == 1
+    assert sink.calls[-1]["payload"]["event_type"] == "RECOVERY"  # type: ignore[index]
+
+
+def test_watchdog_health_flip_drops_stale_pending_label(tmp_path: Path) -> None:
+    observed = [datetime(2026, 9, 3, 11, 55, tzinfo=UTC)]
+    probes = [ProbeResult("database", False, "UNREACHABLE", "database failed")]
+    sink = RecordingSink(fail=True)
+    watchdog = OperationalWatchdog(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'watchdog.sqlite'}",
+            watchdog_state_file=tmp_path / "state.json",
+        ),
+        sink=sink,  # type: ignore[arg-type]
+        probe_provider=lambda: probes,
+        now=lambda: observed[0],
+    )
+
+    assert watchdog.run_once()["delivery_failure_count"] == 1
+    probes[0] = ProbeResult("database", True, "REACHABLE", "database passed")
+    sink.fail = False
+    observed[0] += timedelta(seconds=60)
+    assert watchdog.run_once()["delivered_count"] == 0
+    assert len(sink.calls) == 1
+
+
+def test_watchdog_new_failure_supersedes_failed_recovery_label(tmp_path: Path) -> None:
+    observed = [datetime(2026, 9, 3, 11, 57, tzinfo=UTC)]
+    probes = [ProbeResult("database", False, "UNREACHABLE", "database failed")]
+    sink = RecordingSink()
+    watchdog = OperationalWatchdog(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'watchdog.sqlite'}",
+            watchdog_state_file=tmp_path / "state.json",
+        ),
+        sink=sink,  # type: ignore[arg-type]
+        probe_provider=lambda: probes,
+        now=lambda: observed[0],
+    )
+    assert watchdog.run_once()["delivered_count"] == 1
+    probes[0] = ProbeResult("database", True, "REACHABLE", "database passed")
+    sink.fail = True
+    observed[0] += timedelta(seconds=60)
+    assert watchdog.run_once()["delivery_failure_count"] == 1
+    probes[0] = ProbeResult("database", False, "UNREACHABLE", "database failed again")
+    sink.fail = False
+    observed[0] += timedelta(seconds=60)
+    assert watchdog.run_once()["delivered_count"] == 1
+    assert [call["payload"]["event_type"] for call in sink.calls] == [  # type: ignore[index]
+        "ALERT",
+        "RECOVERY",
+        "ALERT",
+    ]
+
+
+def test_unit_probe_failure_is_bounded(monkeypatch) -> None:
+    def unavailable(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("systemctl", 5)
+
+    monkeypatch.setattr(subprocess, "run", unavailable)
+    result = OperationalWatchdog._unit("engineering-api.service")
+    assert result.healthy is False
+    assert result.status == "UNKNOWN"
+
+
 def test_backup_probe_requires_current_transfer_and_restore(tmp_path: Path) -> None:
     now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
     status_file = tmp_path / "backup-status.json"
@@ -231,3 +314,29 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
     accepted = {probe.key: probe for probe in watchdog._database(now)}
     assert accepted["cleanup-schedule"].healthy is True
     assert accepted["worker-capacity"].healthy is True
+
+    with watchdog.engine.begin() as connection:
+        connection.execute(
+            Run.__table__.update()
+            .where(Run.workflow_id == "cleanup-current-fixture")
+            .values(status="RUNNING", finished_at=None, updated_at=now - timedelta(minutes=5))
+        )
+    running = {probe.key: probe for probe in watchdog._database(now)}
+    assert running["cleanup-schedule"].healthy is True
+
+    duplicate_kind = next(iter(ROLE_WORKER_REGISTRY))
+    with watchdog.engine.begin() as connection:
+        connection.execute(
+            WorkerHeartbeat.__table__.insert(),
+            {
+                "id": uuid4(),
+                "identity": f"{duplicate_kind}-duplicate-fixture",
+                "hostname": "fixture-worker-two",
+                "worker_kind": duplicate_kind,
+                "observed_at": now - timedelta(seconds=5),
+                "created_at": now - timedelta(seconds=5),
+                "updated_at": now - timedelta(seconds=5),
+            },
+        )
+    duplicated = {probe.key: probe for probe in watchdog._database(now)}
+    assert duplicated["worker-capacity"].healthy is False

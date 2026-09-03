@@ -35,6 +35,7 @@ def test_cleanup_limit_alert_uses_durable_notification_delivery(
             database_url=f"sqlite:///{tmp_path / 'notifier.sqlite'}",
             notification_sink_url="https://notification.invalid/events",
             notification_token_file=token_file,
+            notification_auth_mode="bearer",
         )
     )
     Base.metadata.create_all(service.engine)
@@ -105,6 +106,7 @@ def test_notification_failure_remains_pending_with_bounded_backoff(
             database_url=f"sqlite:///{tmp_path / 'notifier-failure.sqlite'}",
             notification_sink_url="https://notification.invalid/events",
             notification_token_file=token_file,
+            notification_auth_mode="bearer",
         )
     )
     Base.metadata.create_all(service.engine)
@@ -151,6 +153,7 @@ def test_notification_transport_failure_remains_pending(
             database_url=f"sqlite:///{tmp_path / 'notifier-transport.sqlite'}",
             notification_sink_url="https://notification.invalid/events",
             notification_token_file=token_file,
+            notification_auth_mode="bearer",
         )
     )
     Base.metadata.create_all(service.engine)
@@ -286,6 +289,41 @@ def test_hmac_sink_is_loopback_only_and_token_is_not_a_symlink(tmp_path: Path) -
         )
     with pytest.raises(ValueError, match="non-symlink"):
         service.run_once()
+
+
+def test_default_auth_mode_cannot_send_a_token_to_a_remote_sink(tmp_path: Path) -> None:
+    token_file = tmp_path / "notification.token"
+    token_file.write_text("fixture-hmac-secret-0123456789abcdef", encoding="utf-8")
+    token_file.chmod(0o600)
+
+    with pytest.raises(ValueError, match="loopback"):
+        NotificationService(
+            Settings(
+                database_url=f"sqlite:///{tmp_path / 'remote.sqlite'}",
+                notification_sink_url="https://notification.invalid/events",
+                notification_token_file=token_file,
+            )
+        )
+
+
+def test_bearer_sink_rejects_cleartext_or_embedded_credentials(tmp_path: Path) -> None:
+    token_file = tmp_path / "notification.token"
+    token_file.write_text("fixture-bearer-token", encoding="utf-8")
+    token_file.chmod(0o600)
+    for url in (
+        "http://notification.invalid/events",
+        "https://user@notification.invalid/events",
+        "https://notification.invalid/events?token=fixture",
+    ):
+        with pytest.raises(ValueError, match="credential-free HTTPS"):
+            NotificationService(
+                Settings(
+                    database_url=f"sqlite:///{tmp_path / 'remote.sqlite'}",
+                    notification_sink_url=url,
+                    notification_token_file=token_file,
+                    notification_auth_mode="bearer",
+                )
+            )
 
 
 def test_hmac_sink_requires_explicit_delivery_acknowledgement(tmp_path: Path) -> None:

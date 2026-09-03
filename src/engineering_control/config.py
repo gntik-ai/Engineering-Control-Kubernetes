@@ -101,16 +101,18 @@ class Settings(BaseSettings):
     worker_kind: WorkerKind = "controller"
     notification_sink_url: str | None = None
     notification_token_file: Path | None = None
-    notification_auth_mode: Literal["bearer", "hmac-sha256-v2"] = "bearer"
+    notification_auth_mode: Literal["bearer", "hmac-sha256-v2"] = "hmac-sha256-v2"
     notification_poll_seconds: int = Field(default=10, ge=2, le=300)
     watchdog_state_file: Path = Path("/var/lib/engineering-watchdog/state.json")
-    watchdog_backup_status_file: Path = Path("/var/lib/engineering-watchdog/backup-status.json")
+    watchdog_backup_status_file: Path = Path("/var/lib/engineering-backup/status.json")
     watchdog_probe_seconds: int = Field(default=60, ge=30, le=300)
     watchdog_repeat_seconds: int = Field(default=3600, ge=300, le=86400)
     watchdog_backup_max_age_seconds: int = Field(default=4500, ge=3600, le=86400)
     watchdog_restore_max_age_seconds: int = Field(default=691200, ge=86400, le=2678400)
     watchdog_cleanup_max_age_seconds: int = Field(default=93600, ge=3600, le=172800)
+    watchdog_cleanup_running_max_age_seconds: int = Field(default=3600, ge=300, le=86400)
     watchdog_heartbeat_max_age_seconds: int = Field(default=180, ge=60, le=900)
+    watchdog_notification_max_age_seconds: int = Field(default=900, ge=60, le=86400)
     watchdog_gateway_required: bool = False
     cleanup_execution_enabled: bool = False
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
