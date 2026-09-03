@@ -127,7 +127,7 @@ persisted when exposed. Unknown capacity, reset time, token counts, and estimate
 `null`; the control plane never converts missing provider data into an estimate. Invocation starts
 and terminal results are idempotently bound to the Temporal workflow and normalized provider run
 IDs. The durable provider refresh schedule runs every 240 seconds, inside the 300-second provider
-freshness window, and bounds each scheduled workflow to 180 seconds. Runs do not overlap, and a
+freshness window, and bounds each scheduled workflow to 45 seconds. Runs do not overlap, and a
 failed run remains visible without permanently pausing later refresh attempts. A missed, slow, or
 failed refresh therefore becomes `STALE` instead of retaining a false-green provider card.
 

@@ -11,6 +11,7 @@ from temporalio.client import (
     ScheduleOverlapPolicy,
     SchedulePolicy,
     ScheduleSpec,
+    ScheduleState,
     ScheduleUpdate,
 )
 from temporalio.service import RPCError, RPCStatusCode
@@ -43,6 +44,7 @@ def schedules(task_queue: str, *, cleanup_execution_enabled: bool = False) -> di
                 ]
             ),
             policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP, pause_on_failure=False),
+            state=ScheduleState(paused=False, note="managed provider readiness refresh"),
         ),
         "engineering-safe-cleanup": Schedule(
             action=ScheduleActionStartWorkflow(
