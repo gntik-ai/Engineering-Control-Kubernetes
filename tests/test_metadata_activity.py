@@ -27,6 +27,7 @@ from engineering_control.db.models import (
     Finding,
     FindingVerification,
     Incident,
+    NotificationOutbox,
     QuotaSnapshot,
     Run,
     WorktreeLease,
@@ -2001,6 +2002,43 @@ async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(tmp_path
     with handler.sessions() as session:
         cleanup_run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
         assert cleanup_run is not None and cleanup_run.status == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_blocked_enqueues_one_idempotent_failure_notification(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'cleanup-blocked.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    workflow_id = "cleanup-blocked-notification-test"
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=uuid4(),
+                change_set_id=None,
+                workflow_id=workflow_id,
+                run_type="cleanup",
+                status="RUNNING",
+                project="platform",
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    payload = {
+        "orchestration": {"workflow_id": workflow_id},
+        "terminal_status": "BLOCKED",
+        "blocker": "CLEANUP_ACTIVITY_FAILED",
+    }
+    first = await handler.handle("cleanup.finalize", payload)
+    second = await handler.handle("cleanup.finalize", payload)
+    assert first["status"] == second["status"] == "BLOCKED"
+    with handler.sessions() as session:
+        rows = list(session.scalars(select(NotificationOutbox)).all())
+        run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+    assert len(rows) == 1
+    assert rows[0].topic == "telegram.engineering-cleanup-failed"
+    assert rows[0].payload_json["error_code"] == "CLEANUP_ACTIVITY_FAILED"
+    assert run is not None and run.status == "BLOCKED"
 
 
 @pytest.mark.asyncio

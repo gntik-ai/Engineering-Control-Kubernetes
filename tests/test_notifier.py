@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -66,7 +69,7 @@ def test_cleanup_limit_alert_uses_durable_notification_delivery(
         return httpx.Response(204)
 
     client = httpx.Client(transport=httpx.MockTransport(deliver))
-    monkeypatch.setattr("engineering_control.notifier.httpx.Client", lambda timeout: client)
+    monkeypatch.setattr("engineering_control.notifier.httpx.Client", lambda **_kwargs: client)
 
     assert service.run_once() == 1
     assert requests == [
@@ -120,7 +123,7 @@ def test_notification_failure_remains_pending_with_bounded_backoff(
         )
 
     client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(503)))
-    monkeypatch.setattr("engineering_control.notifier.httpx.Client", lambda timeout: client)
+    monkeypatch.setattr("engineering_control.notifier.httpx.Client", lambda **_kwargs: client)
 
     assert service.run_once() == 0
     with Session(service.engine) as session:
@@ -169,7 +172,7 @@ def test_notification_transport_failure_remains_pending(
         raise httpx.ConnectError("synthetic transport unavailable", request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(unavailable))
-    monkeypatch.setattr("engineering_control.notifier.httpx.Client", lambda timeout: client)
+    monkeypatch.setattr("engineering_control.notifier.httpx.Client", lambda **_kwargs: client)
 
     assert service.run_once() == 0
     with Session(service.engine) as session:
@@ -189,3 +192,135 @@ def test_notifier_writable_status_domain_is_metric_bounded() -> None:
     assert NOTIFICATION_OUTBOX_WRITE_STATUSES == ("PENDING", "DELIVERED")
     assert NOTIFICATION_OUTBOX_UNKNOWN_STATUS == "UNKNOWN"
     assert NOTIFICATION_OUTBOX_METRIC_STATUSES == ("PENDING", "DELIVERED", "UNKNOWN")
+
+
+def test_hmac_v2_notification_is_signed_idempotent_and_redacted(tmp_path: Path) -> None:
+    token_file = tmp_path / "notification.token"
+    secret = "fixture-hmac-secret-0123456789abcdef"  # noqa: S105 - synthetic canary
+    token_file.write_text(secret, encoding="utf-8")
+    token_file.chmod(0o600)
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request, json={"status": "delivered"})
+
+    service = NotificationService(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'hmac.sqlite'}",
+            notification_sink_url="http://127.0.0.1:8644/webhooks/engineering-alerts",
+            notification_token_file=token_file,
+            notification_auth_mode="hmac-sha256-v2",
+        ),
+        client_factory=lambda: httpx.Client(
+            transport=httpx.MockTransport(respond), trust_env=False
+        ),
+    )
+    Base.metadata.create_all(service.engine)
+    row_id = uuid4()
+    sensitive = "fixture-sensitive-value"
+    with Session(service.engine) as session, session.begin():
+        session.add(
+            NotificationOutbox(
+                id=row_id,
+                topic="telegram.engineering-cleanup-failed",
+                status="PENDING",
+                payload_json={"error_code": "CLEANUP_ACTIVITY_FAILED", "token": sensitive},
+                attempts=0,
+                next_attempt_at=datetime.now(UTC),
+                delivered_at=None,
+                last_error_code=None,
+            )
+        )
+
+    assert service.run_once() == 1
+    assert service.run_once() == 0
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.headers["X-Request-ID"] == str(row_id)
+    assert "Authorization" not in request.headers
+    assert sensitive.encode() not in request.content
+    timestamp = request.headers["X-Webhook-Timestamp"]
+    expected = hmac.new(
+        secret.encode(),
+        timestamp.encode() + b"." + request.content,
+        hashlib.sha256,
+    ).hexdigest()
+    assert hmac.compare_digest(request.headers["X-Webhook-Signature-V2"], expected)
+
+
+def test_hmac_sink_is_loopback_only_and_token_is_not_a_symlink(tmp_path: Path) -> None:
+    token_file = tmp_path / "notification.token"
+    token_file.write_text("fixture-hmac-secret-0123456789abcdef", encoding="utf-8")
+    token_file.chmod(0o600)
+    with pytest.raises(ValueError, match="loopback"):
+        NotificationService(
+            Settings(
+                database_url=f"sqlite:///{tmp_path / 'external.sqlite'}",
+                notification_sink_url="https://example.invalid/engineering-alerts",
+                notification_token_file=token_file,
+                notification_auth_mode="hmac-sha256-v2",
+            )
+        )
+
+    link = tmp_path / "link.token"
+    link.symlink_to(token_file)
+    service = NotificationService(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'symlink.sqlite'}",
+            notification_sink_url="http://127.0.0.1:8644/webhooks/engineering-alerts",
+            notification_token_file=link,
+            notification_auth_mode="hmac-sha256-v2",
+        )
+    )
+    Base.metadata.create_all(service.engine)
+    with Session(service.engine) as session, session.begin():
+        session.add(
+            NotificationOutbox(
+                topic="telegram.test",
+                status="PENDING",
+                payload_json={},
+                attempts=0,
+                next_attempt_at=datetime.now(UTC),
+            )
+        )
+    with pytest.raises(ValueError, match="non-symlink"):
+        service.run_once()
+
+
+def test_hmac_sink_requires_explicit_delivery_acknowledgement(tmp_path: Path) -> None:
+    token_file = tmp_path / "notification.token"
+    token_file.write_text("fixture-hmac-secret-0123456789abcdef", encoding="utf-8")
+    token_file.chmod(0o600)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json={"status": "ignored"})
+
+    service = NotificationService(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'ack.sqlite'}",
+            notification_sink_url="http://127.0.0.1:8644/webhooks/engineering-alerts",
+            notification_token_file=token_file,
+            notification_auth_mode="hmac-sha256-v2",
+        ),
+        client_factory=lambda: httpx.Client(
+            transport=httpx.MockTransport(respond), trust_env=False
+        ),
+    )
+    Base.metadata.create_all(service.engine)
+    with Session(service.engine) as session, session.begin():
+        session.add(
+            NotificationOutbox(
+                topic="telegram.engineering-cleanup-failed",
+                status="PENDING",
+                payload_json={"error_code": "CLEANUP_ACTIVITY_FAILED"},
+                attempts=0,
+                next_attempt_at=datetime.now(UTC),
+            )
+        )
+    assert service.run_once() == 0
+    with Session(service.engine) as session:
+        stored = session.scalar(select(NotificationOutbox))
+        assert stored is not None
+        assert stored.status == "PENDING"
+        assert stored.attempts == 1

@@ -7146,6 +7146,26 @@ class MetadataActivityHandler:
                 run.status = "BLOCKED"
                 run.error_code = str(payload.get("blocker", "CLEANUP_BLOCKED"))
                 run.summary = "cleanup blocked without mutation"
+                topic = "telegram.engineering-cleanup-failed"
+                alert_id = uuid5(NAMESPACE_URL, f"notification:{topic}:{workflow_id}")
+                if session.get(NotificationOutbox, alert_id) is None:
+                    session.add(
+                        NotificationOutbox(
+                            id=alert_id,
+                            topic=topic,
+                            status=NOTIFICATION_OUTBOX_PENDING_STATUS,
+                            payload_json={
+                                "workflow_id": workflow_id,
+                                "status": "BLOCKED",
+                                "error_code": run.error_code,
+                                "finished_at": now.isoformat(),
+                            },
+                            attempts=0,
+                            next_attempt_at=now,
+                            delivered_at=None,
+                            last_error_code=None,
+                        )
+                    )
             if payload.get("dashboard_session_revocation_cleanup_truncated") is True:
                 topic = "alerts.dashboard-session-revocation-cleanup-truncated"
                 alert_id = uuid5(NAMESPACE_URL, f"notification:{topic}:{workflow_id}")
