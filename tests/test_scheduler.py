@@ -1,8 +1,13 @@
 import asyncio
+from datetime import timedelta
 
 import pytest
 
 from engineering_control import scheduler
+from engineering_control.operations.connection_status import (
+    PROVIDER_FRESHNESS_SECONDS,
+    PROVIDER_REFRESH_INTERVAL_SECONDS,
+)
 from engineering_control.scheduler import schedules
 from engineering_control.workflows.inputs import CleanupInput
 
@@ -18,6 +23,13 @@ def test_periodic_cleanup_is_dry_run_unless_execution_is_explicitly_enabled() ->
     assert enabled.action.id == "cleanup-scheduled"
     assert default.action.args == [CleanupInput(dry_run=True)]
     assert enabled.action.args == [CleanupInput(dry_run=False)]
+
+
+def test_provider_refresh_schedule_stays_inside_provider_freshness_window() -> None:
+    refresh = schedules("engineering-control")["engineering-quota-refresh"]
+
+    assert PROVIDER_REFRESH_INTERVAL_SECONDS < PROVIDER_FRESHNESS_SECONDS
+    assert refresh.spec.intervals[0].every == timedelta(seconds=PROVIDER_REFRESH_INTERVAL_SECONDS)
 
 
 @pytest.mark.asyncio

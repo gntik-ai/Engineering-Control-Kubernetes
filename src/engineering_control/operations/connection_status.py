@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 PROVIDER_FRESHNESS_SECONDS = 300
+PROVIDER_REFRESH_INTERVAL_SECONDS = 240
 
 _FRESHNESS_SECONDS = {
     "dashboard-sse": 300,

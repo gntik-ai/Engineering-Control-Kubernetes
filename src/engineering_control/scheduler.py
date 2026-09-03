@@ -17,6 +17,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
+from engineering_control.operations.connection_status import PROVIDER_REFRESH_INTERVAL_SECONDS
 from engineering_control.workflows.inputs import CleanupInput, QuotaRefreshInput
 from engineering_control.workflows.names import WorkflowName
 
@@ -32,7 +33,11 @@ def schedules(task_queue: str, *, cleanup_execution_enabled: bool = False) -> di
                 id="quota-refresh-scheduled",
                 task_queue=task_queue,
             ),
-            spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(minutes=30))]),
+            spec=ScheduleSpec(
+                intervals=[
+                    ScheduleIntervalSpec(every=timedelta(seconds=PROVIDER_REFRESH_INTERVAL_SECONDS))
+                ]
+            ),
             policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP, pause_on_failure=True),
         ),
         "engineering-safe-cleanup": Schedule(

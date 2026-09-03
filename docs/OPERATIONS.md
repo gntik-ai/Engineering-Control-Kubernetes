@@ -126,7 +126,9 @@ a seven-day, PostgreSQL-derived history by role. Native CLI presence and authent
 persisted when exposed. Unknown capacity, reset time, token counts, and estimated cost remain
 `null`; the control plane never converts missing provider data into an estimate. Invocation starts
 and terminal results are idempotently bound to the Temporal workflow and normalized provider run
-IDs.
+IDs. The durable provider refresh schedule runs every 240 seconds, inside the 300-second provider
+freshness window. A missed or failed refresh therefore becomes `STALE` instead of retaining a
+false-green provider card.
 
 Back up PostgreSQL and `/etc/engineering-control` before upgrades. Do not back up provider OAuth or
 SSH private keys into general platform archives. Temporal and PostgreSQL must be healthy before
