@@ -169,8 +169,12 @@ def test_watchdog_health_flip_drops_stale_pending_label(tmp_path: Path) -> None:
     probes[0] = ProbeResult("database", True, "REACHABLE", "database passed")
     sink.fail = False
     observed[0] += timedelta(seconds=60)
-    assert watchdog.run_once()["delivered_count"] == 0
-    assert len(sink.calls) == 1
+    assert watchdog.run_once()["delivered_count"] == 1
+    assert sink.calls[-1]["payload"]["event_type"] == "ALERT"  # type: ignore[index]
+    assert sink.calls[-1]["payload"]["status"] == "UNREACHABLE"  # type: ignore[index]
+    observed[0] += timedelta(seconds=60)
+    assert watchdog.run_once()["delivered_count"] == 1
+    assert sink.calls[-1]["payload"]["event_type"] == "RECOVERY"  # type: ignore[index]
 
 
 def test_watchdog_new_failure_supersedes_failed_recovery_label(tmp_path: Path) -> None:
@@ -324,6 +328,15 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
     running = {probe.key: probe for probe in watchdog._database(now)}
     assert running["cleanup-schedule"].healthy is True
 
+    with watchdog.engine.begin() as connection:
+        connection.execute(
+            Run.__table__.update()
+            .where(Run.workflow_id == "cleanup-current-fixture")
+            .values(started_at=now - timedelta(hours=2), updated_at=now)
+        )
+    wedged = {probe.key: probe for probe in watchdog._database(now)}
+    assert wedged["cleanup-schedule"].healthy is False
+
     duplicate_kind = next(iter(ROLE_WORKER_REGISTRY))
     with watchdog.engine.begin() as connection:
         connection.execute(
@@ -340,3 +353,33 @@ def test_database_probe_requires_current_cleanup_and_all_role_workers(tmp_path: 
         )
     duplicated = {probe.key: probe for probe in watchdog._database(now)}
     assert duplicated["worker-capacity"].healthy is False
+
+    with watchdog.engine.begin() as connection:
+        connection.execute(
+            WorkerHeartbeat.__table__.update()
+            .where(WorkerHeartbeat.identity == f"{duplicate_kind}-duplicate-fixture")
+            .values(observed_at=now - timedelta(hours=1))
+        )
+    stale_predecessor = {probe.key: probe for probe in watchdog._database(now)}
+    assert stale_predecessor["worker-capacity"].healthy is True
+
+
+def test_probe_provider_exception_becomes_an_alert(tmp_path: Path) -> None:
+    def failed_probe_provider() -> list[ProbeResult]:
+        raise RuntimeError("synthetic probe failure")
+
+    sink = RecordingSink()
+    watchdog = OperationalWatchdog(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'watchdog.sqlite'}",
+            watchdog_state_file=tmp_path / "state.json",
+        ),
+        sink=sink,  # type: ignore[arg-type]
+        probe_provider=failed_probe_provider,
+        now=lambda: datetime(2026, 9, 3, 12, 0, tzinfo=UTC),
+    )
+    result = watchdog.run_once()
+    assert result["status"] == "PASS"
+    assert result["unhealthy_count"] == 1
+    assert result["delivered_count"] == 1
+    assert sink.calls[-1]["payload"]["probe"] == "probe-provider"  # type: ignore[index]

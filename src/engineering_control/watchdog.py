@@ -152,7 +152,15 @@ class OperationalWatchdog:
         path = self.settings.watchdog_backup_status_file
         try:
             metadata = path.lstat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022:
+            parent = path.parent.stat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_mode & 0o022
+                or metadata.st_uid not in {0, os.geteuid()}
+                or not stat.S_ISDIR(parent.st_mode)
+                or parent.st_mode & 0o022
+                or parent.st_uid not in {0, os.geteuid()}
+            ):
                 raise PermissionError
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:
@@ -227,7 +235,11 @@ class OperationalWatchdog:
                 ProbeResult("cleanup-schedule", False, "MISSING", "no cleanup run is recorded")
             )
         else:
-            observed = cleanup.finished_at or cleanup.updated_at
+            observed = (
+                cleanup.started_at or cleanup.updated_at
+                if cleanup.status == "RUNNING"
+                else cleanup.finished_at or cleanup.updated_at
+            )
             age = max(0, int((now - _utc(observed)).total_seconds()))
             cleanup_ok = (
                 cleanup.status == "SUCCESS"
@@ -255,16 +267,21 @@ class OperationalWatchdog:
         duplicate: list[str] = []
         for kind in sorted(ROLE_WORKER_REGISTRY):
             candidates = heartbeat_by_kind.get(kind, [])
+            fresh = [
+                heartbeat
+                for heartbeat in candidates
+                if max(0, int((now - _utc(heartbeat.observed_at)).total_seconds()))
+                <= self.settings.watchdog_heartbeat_max_age_seconds
+            ]
             if not candidates:
                 missing.append(kind)
                 continue
-            if len(candidates) != 1:
+            if not fresh:
+                stale.append(kind)
+                continue
+            if len(fresh) != 1:
                 duplicate.append(kind)
                 continue
-            heartbeat = candidates[0]
-            age = max(0, int((now - _utc(heartbeat.observed_at)).total_seconds()))
-            if age > self.settings.watchdog_heartbeat_max_age_seconds:
-                stale.append(kind)
         workers_ok = not missing and not stale and not duplicate
         results.append(
             ProbeResult(
@@ -331,6 +348,13 @@ class OperationalWatchdog:
             os.replace(path, quarantine)
             if stat.S_ISREG(metadata.st_mode):
                 quarantine.chmod(0o600)
+            quarantined = sorted(
+                path.parent.glob(f"{path.name}.invalid-*"),
+                key=lambda candidate: candidate.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in quarantined[3:]:
+                stale.unlink(missing_ok=True)
             return {"version": 1, "probes": {}, "state_recovered": True}
 
     def _save_state(self, value: dict[str, Any]) -> None:
@@ -346,6 +370,11 @@ class OperationalWatchdog:
             finally:
                 os.close(descriptor)
             os.replace(temporary, path)
+            parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
         finally:
             try:
                 temporary.unlink()
@@ -364,7 +393,17 @@ class OperationalWatchdog:
         # Probe providers may reuse a list (including in dependency-injected
         # fixtures).  Keep our synthetic state probe local so one cycle cannot
         # mutate and duplicate the provider's next cycle.
-        results = list(self.probe_provider())
+        try:
+            results = list(self.probe_provider())
+        except Exception:  # noqa: BLE001 - preserve independent failure notification
+            results = [
+                ProbeResult(
+                    "probe-provider",
+                    False,
+                    "FAILED",
+                    "one or more bounded operational probes raised unexpectedly",
+                )
+            ]
         results.insert(
             0,
             ProbeResult(
@@ -383,6 +422,13 @@ class OperationalWatchdog:
             prior_episode = prior.get("episode_started_at") if isinstance(prior, dict) else None
             prior_pending_id = prior.get("pending_request_id") if isinstance(prior, dict) else None
             prior_pending_event = prior.get("pending_event") if isinstance(prior, dict) else None
+            prior_pending_status = prior.get("pending_status") if isinstance(prior, dict) else None
+            prior_pending_summary = (
+                prior.get("pending_summary") if isinstance(prior, dict) else None
+            )
+            prior_pending_fingerprint = (
+                prior.get("pending_fingerprint") if isinstance(prior, dict) else None
+            )
             prior_fingerprint = prior.get("fingerprint") if isinstance(prior, dict) else None
             event: str | None = None
             if not probe.healthy:
@@ -398,12 +444,25 @@ class OperationalWatchdog:
                             now - _utc(alerted_at)
                         ).total_seconds() >= self.settings.watchdog_repeat_seconds:
                             event = "ALERT"
+            elif (
+                prior_active
+                and prior_pending_event == "ALERT"
+                and isinstance(prior_pending_id, str)
+            ):
+                event = "ALERT"
             elif prior_active and isinstance(prior_alerted, str):
                 event = "RECOVERY"
             elif prior_pending_event in {"CHANGE", "RECOVERY"} and isinstance(
                 prior_pending_id, str
             ):
-                event = str(prior_pending_event)
+                if (
+                    prior_pending_event == "CHANGE"
+                    and probe.fingerprint is not None
+                    and probe.fingerprint != prior_pending_fingerprint
+                ):
+                    event = "CHANGE"
+                else:
+                    event = str(prior_pending_event)
             elif (
                 isinstance(prior_fingerprint, str)
                 and probe.fingerprint is not None
@@ -421,8 +480,13 @@ class OperationalWatchdog:
             else:
                 episode_time = None
             if event is not None:
-                if isinstance(prior_pending_id, str) and prior_pending_event == event:
-                    request_id = prior_pending_id
+                same_pending_event = (
+                    isinstance(prior_pending_id, str)
+                    and prior_pending_event == event
+                    and (event != "CHANGE" or probe.fingerprint == prior_pending_fingerprint)
+                )
+                if same_pending_event:
+                    request_id = str(prior_pending_id)
                 else:
                     request_id = str(
                         uuid5(
@@ -437,8 +501,16 @@ class OperationalWatchdog:
                         payload={
                             "event_type": event,
                             "probe": probe.key,
-                            "status": probe.status,
-                            "summary": probe.summary,
+                            "status": (
+                                prior_pending_status
+                                if same_pending_event and isinstance(prior_pending_status, str)
+                                else probe.status
+                            ),
+                            "summary": (
+                                prior_pending_summary
+                                if same_pending_event and isinstance(prior_pending_summary, str)
+                                else probe.summary
+                            ),
                             "observed_at": now.isoformat(),
                             "release": self._release(),
                             "source": "engineering-independent-watchdog",
@@ -449,20 +521,43 @@ class OperationalWatchdog:
                     failures += 1
                     pending_request_id: str | None = request_id
                     pending_event: str | None = event
+                    pending_status: str | None = (
+                        prior_pending_status
+                        if same_pending_event and isinstance(prior_pending_status, str)
+                        else probe.status
+                    )
+                    pending_summary: str | None = (
+                        prior_pending_summary
+                        if same_pending_event and isinstance(prior_pending_summary, str)
+                        else probe.summary
+                    )
+                    pending_fingerprint: str | None = probe.fingerprint
                 else:
                     delivered += 1
                     alert_time = now.isoformat()
                     pending_request_id = None
                     pending_event = None
+                    pending_status = None
+                    pending_summary = None
+                    pending_fingerprint = None
             else:
                 pending_request_id = None
                 pending_event = None
+                pending_status = None
+                pending_summary = None
+                pending_fingerprint = None
+            missed_alert_delivered = (
+                probe.healthy and prior_active and event == "ALERT" and pending_event is None
+            )
             previous[probe.key] = {
-                "active": not probe.healthy,
-                "episode_started_at": episode_time,
+                "active": not probe.healthy or missed_alert_delivered,
+                "episode_started_at": prior_episode if missed_alert_delivered else episode_time,
                 "last_alerted_at": alert_time,
                 "last_observed_at": now.isoformat(),
                 "pending_event": pending_event,
+                "pending_status": pending_status,
+                "pending_summary": pending_summary,
+                "pending_fingerprint": pending_fingerprint,
                 "pending_request_id": pending_request_id,
                 "fingerprint": probe.fingerprint,
                 "status": probe.status,
