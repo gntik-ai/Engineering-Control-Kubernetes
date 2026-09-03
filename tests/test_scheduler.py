@@ -6,6 +6,7 @@ import pytest
 from engineering_control import scheduler
 from engineering_control.operations.connection_status import (
     PROVIDER_FRESHNESS_SECONDS,
+    PROVIDER_REFRESH_EXECUTION_TIMEOUT_SECONDS,
     PROVIDER_REFRESH_INTERVAL_SECONDS,
 )
 from engineering_control.scheduler import schedules
@@ -28,8 +29,14 @@ def test_periodic_cleanup_is_dry_run_unless_execution_is_explicitly_enabled() ->
 def test_provider_refresh_schedule_stays_inside_provider_freshness_window() -> None:
     refresh = schedules("engineering-control")["engineering-quota-refresh"]
 
-    assert PROVIDER_REFRESH_INTERVAL_SECONDS < PROVIDER_FRESHNESS_SECONDS
+    assert PROVIDER_REFRESH_INTERVAL_SECONDS <= PROVIDER_FRESHNESS_SECONDS - 60
+    assert PROVIDER_REFRESH_EXECUTION_TIMEOUT_SECONDS < PROVIDER_REFRESH_INTERVAL_SECONDS
     assert refresh.spec.intervals[0].every == timedelta(seconds=PROVIDER_REFRESH_INTERVAL_SECONDS)
+    assert refresh.action.execution_timeout == timedelta(
+        seconds=PROVIDER_REFRESH_EXECUTION_TIMEOUT_SECONDS
+    )
+    assert refresh.policy.overlap is scheduler.ScheduleOverlapPolicy.SKIP
+    assert refresh.policy.pause_on_failure is False
 
 
 @pytest.mark.asyncio
