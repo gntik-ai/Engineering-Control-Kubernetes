@@ -20,6 +20,11 @@ class FakeReleaseHandler:
         return {**payload, "status": "RELEASE_HANDLER_REACHED", "step": step}
 
 
+class FakeCleanupScanHandler:
+    async def handle(self, step: str, payload: dict[str, object]) -> dict[str, object]:
+        return {**payload, "status": "SCAN_HANDLER_REACHED", "step": step}
+
+
 @pytest.mark.asyncio
 async def test_production_activity_rejects_invalid_authoritative_metadata(
     monkeypatch: pytest.MonkeyPatch,
@@ -43,6 +48,30 @@ async def test_synthetic_activity_is_explicit(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert result["status"] == "PASS"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_aggregate_survives_control_activity_redaction_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
+    activities = ControlActivities(Settings(synthetic_mode=False), "scan")
+    activities.scan_handler = FakeCleanupScanHandler()  # type: ignore[assignment]
+
+    result = await activities.execute_control_step(
+        {
+            "step": "cleanup.protect_active",
+            "payload": {
+                "cleanup_candidates": [],
+                "dashboard_session_revocation_cleanup_count": 28,
+                "dashboard_session_revocation_cleanup_truncated": False,
+            },
+        }
+    )
+
+    assert result["status"] == "SCAN_HANDLER_REACHED"
+    assert result["dashboard_session_revocation_cleanup_count"] == 28
+    assert result["dashboard_session_revocation_cleanup_truncated"] is False
 
 
 def test_audit_blocker_persistence_is_controller_only() -> None:
