@@ -282,11 +282,13 @@ def test_backup_probe_requires_current_transfer_and_restore(tmp_path: Path) -> N
         json.dumps(
             {
                 "version": 1,
+                "identifier": "20260903T112900Z-0123456789ab",
                 "status": "PASS",
                 "last_backup_completed_at_utc": (now - timedelta(minutes=30)).isoformat(),
                 "last_transfer_verified_at_utc": (now - timedelta(minutes=29)).isoformat(),
                 "last_restore_verified_at_utc": (now - timedelta(days=1)).isoformat(),
                 "worker_mirror_verified": True,
+                "worker_receipt_signature_verified": True,
             }
         ),
         encoding="utf-8",
@@ -307,7 +309,8 @@ def test_backup_probe_requires_current_transfer_and_restore(tmp_path: Path) -> N
     stale = json.loads(status_file.read_text(encoding="utf-8"))
     stale["last_transfer_verified_at_utc"] = (now - timedelta(hours=2)).isoformat()
     status_file.write_text(json.dumps(stale), encoding="utf-8")
-    assert watchdog._backup(now).status == "STALE_OR_FAILED"
+    # A transfer preceding this recovery point is inconsistent, not merely old.
+    assert watchdog._backup(now).status == "MISSING_OR_INVALID"
 
     link = tmp_path / "backup-link.json"
     link.symlink_to(status_file)

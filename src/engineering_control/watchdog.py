@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -172,15 +173,33 @@ class OperationalWatchdog:
             value = json.loads(raw)
             if not isinstance(value, dict) or value.get("version") != 1:
                 raise ValueError
+            # The fixed backup writer creates this identifier before pg_basebackup.
+            # Its UTC timestamp is a conservative recovery-point lower bound;
+            # later transfer/restore completion must not make old data look fresh.
+            identifier = value.get("identifier")
+            if not isinstance(identifier, str) or not re.fullmatch(
+                r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}", identifier
+            ):
+                raise ValueError
+            recovery_at = datetime.strptime(identifier[:16], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
             backup_at = datetime.fromisoformat(str(value["last_backup_completed_at_utc"]))
             transfer_at = datetime.fromisoformat(str(value["last_transfer_verified_at_utc"]))
             restore_at = datetime.fromisoformat(str(value["last_restore_verified_at_utc"]))
-            backup_age = max(0, int((now - _utc(backup_at)).total_seconds()))
-            transfer_age = max(0, int((now - _utc(transfer_at)).total_seconds()))
-            restore_age = max(0, int((now - _utc(restore_at)).total_seconds()))
+            observed_times = (recovery_at, backup_at, transfer_at, restore_at)
+            if (
+                now.utcoffset() is None
+                or any(observed.utcoffset() is None for observed in observed_times)
+                or any(observed > now for observed in observed_times)
+                or recovery_at > min(backup_at, transfer_at)
+            ):
+                raise ValueError
+            backup_age = (now - recovery_at).total_seconds()
+            transfer_age = (now - transfer_at).total_seconds()
+            restore_age = (now - restore_at).total_seconds()
             healthy = (
                 value.get("status") == "PASS"
                 and value.get("worker_mirror_verified") is True
+                and value.get("worker_receipt_signature_verified") is True
                 and backup_age <= self.settings.watchdog_backup_max_age_seconds
                 and transfer_age <= self.settings.watchdog_backup_max_age_seconds
                 and restore_age <= self.settings.watchdog_restore_max_age_seconds
@@ -196,9 +215,9 @@ class OperationalWatchdog:
             "backup-recovery",
             healthy,
             "CURRENT" if healthy else "STALE_OR_FAILED",
-            "backup, worker transfer, and restore rehearsal are within approved bounds"
+            "recovery-point lower bound, signed mirror, and restore are within approved bounds"
             if healthy
-            else "backup, worker transfer, or restore rehearsal exceeded its approved bound",
+            else "recovery-point age, signed mirror, or restore failed its approved requirement",
         )
 
     def _database(self, now: datetime) -> list[ProbeResult]:
