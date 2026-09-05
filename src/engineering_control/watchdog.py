@@ -67,6 +67,8 @@ class OperationalWatchdog:
         self.sink = sink or NotificationSink(settings)
         self.probe_provider = probe_provider or self._collect
         self.now = now or (lambda: datetime.now(UTC))
+        self._http_client: httpx.Client | None = None
+        self._closed = False
 
     def _release(self) -> str:
         target = Path("/opt/engineering-control/source")
@@ -78,11 +80,28 @@ class OperationalWatchdog:
             return release
         return "unresolved"
 
-    @staticmethod
-    def _http(key: str, url: str) -> ProbeResult:
+    def _http(self, key: str, url: str) -> ProbeResult:
+        if self._closed:
+            raise RuntimeError("watchdog is closed")
         try:
-            with httpx.Client(timeout=5, trust_env=False) as client:
+            if self._http_client is None:
+                # Keep TLS/pool construction out of the repeated probe path.
+                # Initialization remains inside the retry boundary: a temporary
+                # construction failure must not permanently disable monitoring.
+                self._http_client = httpx.Client(
+                    timeout=5,
+                    trust_env=False,
+                    limits=httpx.Limits(max_connections=3, max_keepalive_connections=3),
+                )
+            client = self._http_client
+            # All fixed services use loopback, but different ports are different
+            # trust boundaries. HTTP cookies are not port scoped; never carry
+            # one service's cookie into another service's health request.
+            client.cookies.clear()
+            try:
                 response = client.get(url, follow_redirects=False)
+            finally:
+                client.cookies.clear()
             healthy = response.status_code == 200
         except (httpx.HTTPError, OSError):
             return ProbeResult(key, False, "UNREACHABLE", "bounded loopback HTTP probe failed")
@@ -94,6 +113,17 @@ class OperationalWatchdog:
             if healthy
             else f"loopback endpoint returned HTTP {response.status_code}",
         )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        client, self._http_client = self._http_client, None
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            self.engine.dispose()
 
     @staticmethod
     def _tcp(key: str, host: str, port: int) -> ProbeResult:
@@ -650,17 +680,20 @@ def serve() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     watchdog = OperationalWatchdog(settings)
-    _systemd_notify("READY=1\nSTATUS=operational watchdog initialized")
-    while True:
-        started = time.monotonic()
-        try:
-            result = watchdog.run_once()
-            logger.info("operational_watchdog_completed", **result)
-            _systemd_notify("WATCHDOG=1\nSTATUS=operational watchdog cycle completed")
-        except Exception as error:  # noqa: BLE001 - persistent process must remain observable
-            logger.error("operational_watchdog_failed", error_type=type(error).__name__)
-        elapsed = time.monotonic() - started
-        time.sleep(max(1, settings.watchdog_probe_seconds - elapsed))
+    try:
+        _systemd_notify("READY=1\nSTATUS=operational watchdog initialized")
+        while True:
+            started = time.monotonic()
+            try:
+                result = watchdog.run_once()
+                logger.info("operational_watchdog_completed", **result)
+                _systemd_notify("WATCHDOG=1\nSTATUS=operational watchdog cycle completed")
+            except Exception as error:  # noqa: BLE001 - persistent process must remain observable
+                logger.error("operational_watchdog_failed", error_type=type(error).__name__)
+            elapsed = time.monotonic() - started
+            time.sleep(max(1, settings.watchdog_probe_seconds - elapsed))
+    finally:
+        watchdog.close()
 
 
 def _systemd_notify(value: str) -> None:
