@@ -861,7 +861,10 @@ class FindingVerificationWorkflow(ControlledWorkflow):
 class IssueDeliveryWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
-        context = await self._step("delivery.load_confirmed_finding", asdict(request))
+        delivery_request = request.payload()
+        context = await self._step("delivery.load_confirmed_finding", delivery_request)
+        if context.get("status") == "BLOCKED":
+            return context
         ordered_steps = (
             "delivery.ensure_issue",
             "delivery.acquire_leases",
@@ -886,7 +889,7 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
         for step in ordered_steps:
             if not await self._checkpoint(step.upper().replace(".", "_")):
                 return {"status": "CANCELLED", "context": context}
-            step_payload = {**context, "delivery_request": asdict(request)}
+            step_payload = {**context, "delivery_request": delivery_request}
             if step in {
                 "delivery.invoke_spec",
                 "delivery.invoke_maker",
@@ -1678,7 +1681,7 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
                             finding_id=str(item["finding_id"]),
                             risk_class=str(item["risk_class"]),
                             dry_run=request.dry_run or request.execution_mode == "plan-only",
-                        ),
+                        ).payload(),
                         id=f"{workflow.info().workflow_id}-issue-{ordinal}-review-{review_attempt}",
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
@@ -2026,8 +2029,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     delivery_workflow_id = (
                         f"{workflow.info().workflow_id}-issue-{ordinal}-attempt-{attempt}"
                     )
+                    child_approval_id = None
                     if register_child_runs:
-                        await self._step(
+                        child_registration = await self._step(
                             "backlog.register_child_run",
                             {
                                 **_backlog_execution_payload(request),
@@ -2036,13 +2040,15 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                 "finding_id": str(gate["finding_id"]),
                             },
                         )
+                        child_approval_id = child_registration.get("issue_approval_id")
                     delivery = await workflow.execute_child_workflow(
                         "IssueDeliveryWorkflow",
                         IssueDeliveryInput(
                             finding_id=str(gate["finding_id"]),
                             risk_class=str(gate["risk_class"]),
                             dry_run=False,
-                        ),
+                            issue_approval_id=child_approval_id,
+                        ).payload(),
                         id=delivery_workflow_id,
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
@@ -2052,8 +2058,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         break
             else:
                 delivery_workflow_id = f"{workflow.info().workflow_id}-issue-{ordinal}"
+                child_approval_id = None
                 if register_child_runs:
-                    await self._step(
+                    child_registration = await self._step(
                         "backlog.register_child_run",
                         {
                             **_backlog_execution_payload(request),
@@ -2062,13 +2069,15 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             "finding_id": str(gate["finding_id"]),
                         },
                     )
+                    child_approval_id = child_registration.get("issue_approval_id")
                 delivery = await workflow.execute_child_workflow(
                     "IssueDeliveryWorkflow",
                     IssueDeliveryInput(
                         finding_id=str(gate["finding_id"]),
                         risk_class=str(gate["risk_class"]),
                         dry_run=False,
-                    ),
+                        issue_approval_id=child_approval_id,
+                    ).payload(),
                     id=delivery_workflow_id,
                     task_queue=workflow.info().task_queue,
                     execution_timeout=timedelta(hours=12),

@@ -702,7 +702,6 @@ class OperationsRepository:
                     "issue_state": issue.state,
                     "issue_body_sha256": issue.body_sha256,
                     "risk": issue.calculated_risk,
-                    "eligibility": issue.eligibility_status,
                 }
                 if issue.state.upper() != "OPEN":
                     blockers.append("GITHUB_ISSUE_NOT_OPEN")

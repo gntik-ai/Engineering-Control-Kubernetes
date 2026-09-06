@@ -47,6 +47,7 @@ from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
 )
+from engineering_control.operations.issue_delivery_approval import register_child_issue_approval
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -1929,18 +1930,38 @@ class EngineeringActivityHandler:
                 raise ValueError("backlog delivery-stage ChangeSet binding is invalid")
             existing = session.scalar(select(db.Run).where(db.Run.workflow_id == child_workflow_id))
             if existing is not None:
+                existing_change_set = (
+                    session.get(db.ChangeSet, existing.change_set_id)
+                    if existing.change_set_id is not None
+                    else None
+                )
+                change_set_matches = existing.change_set_id == change_set_id or (
+                    child_kind == "issue-delivery"
+                    and existing_change_set is not None
+                    and existing_change_set.finding_id == finding.id
+                    and existing_change_set.project == finding.project
+                )
                 if (
                     existing.run_type != child_kind
                     or existing.project != finding.project
-                    or existing.change_set_id != change_set_id
+                    or not change_set_matches
                     or (
                         child_kind == "finding-verification" and existing.summary != str(finding.id)
                     )
                 ):
                     raise ValueError("backlog child run idempotency binding changed")
+                approval = (
+                    register_child_issue_approval(session, payload, existing, finding)
+                    if child_kind == "issue-delivery"
+                    else None
+                )
                 return self._envelope(
                     "backlog.register_child_run",
-                    {**payload, "run_id": str(existing.id)},
+                    {
+                        **payload,
+                        "run_id": str(existing.id),
+                        **({"issue_approval_id": str(approval.id)} if approval else {}),
+                    },
                     "REGISTERED",
                 )
             run = db.Run(
@@ -1954,9 +1975,18 @@ class EngineeringActivityHandler:
             )
             session.add(run)
             session.flush()
+            approval = (
+                register_child_issue_approval(session, payload, run, finding)
+                if child_kind == "issue-delivery"
+                else None
+            )
             return self._envelope(
                 "backlog.register_child_run",
-                {**payload, "run_id": str(run.id)},
+                {
+                    **payload,
+                    "run_id": str(run.id),
+                    **({"issue_approval_id": str(approval.id)} if approval else {}),
+                },
                 "REGISTERED",
             )
 

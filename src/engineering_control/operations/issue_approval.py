@@ -56,7 +56,6 @@ def current_issue_approval_binding(session: Session, command: SolveIssueCommand)
                 "issue_state": issue.state,
                 "issue_body_sha256": issue.body_sha256,
                 "risk": issue.calculated_risk,
-                "eligibility": issue.eligibility_status,
             },
             "production": False,
         }

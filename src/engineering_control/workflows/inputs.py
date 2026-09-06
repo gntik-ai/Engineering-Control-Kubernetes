@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -48,6 +49,14 @@ class IssueDeliveryInput:
     finding_id: str
     risk_class: str
     dry_run: bool = True
+    issue_approval_id: str | None = None
+
+    def payload(self) -> dict[str, Any]:
+        """Preserve legacy command bytes when no child approval was supplied."""
+        value = asdict(self)
+        if self.issue_approval_id is None:
+            value.pop("issue_approval_id")
+        return value
 
 
 @dataclass

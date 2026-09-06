@@ -194,7 +194,7 @@ class TemporalControlService:
         await self.repository.create_delivery_run(workflow_id, request)
         handle = await self.client.start_workflow(
             WorkflowName.ISSUE_DELIVERY.value,
-            IssueDeliveryInput(**request.model_dump()),
+            IssueDeliveryInput(**request.model_dump()).payload(),
             id=workflow_id,
             task_queue=self.task_queue,
         )

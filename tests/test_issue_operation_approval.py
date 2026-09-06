@@ -120,9 +120,13 @@ async def test_delayed_all_channel_dispatch_denies_changed_approval(
     repository.engine.dispose()
 
 
-async def _approved_direct_request(tmp_path: Path):
+async def _approved_direct_request(tmp_path: Path, *, eligibility: str = "READY"):
     operations = _repository(tmp_path)
     _seed_ready_issue(operations)
+    with operations.sessions.begin() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert issue is not None
+        issue.eligibility_status = eligibility
     operation = await operations.create_external(
         _solve_issue(),
         source_channel="cli",

@@ -92,6 +92,11 @@ from engineering_control.models.reconciliation import (
     PromotionPublication,
 )
 from engineering_control.observability.agent import normalize_agent_role
+from engineering_control.operations.issue_delivery_approval import (
+    bind_change_set_issue_approval,
+    validate_change_set_issue_approval,
+    validate_child_issue_approval,
+)
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
@@ -422,6 +427,37 @@ class MetadataActivityHandler:
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            # Preparation gates may block, but post-effect persistence must remain truthful.
+            if (
+                step
+                in {
+                    "delivery.ensure_issue",
+                    "delivery.acquire_leases",
+                    "delivery.route_providers",
+                    "delivery.prepare_spec",
+                    "delivery.prepare_maker",
+                    "delivery.prepare_deployment_maker",
+                    "delivery.prepare_checker",
+                    "reconcile.prepare",
+                    "reconcile.prepare_promotion",
+                    "reconcile.prepare_release_review",
+                    "final.prepare",
+                    "final.authorize_deployment_merge",
+                    "final.prepare_issue_close",
+                    "staging.prepare",
+                    "staging.preflight",
+                    "staging.validate_approval",
+                }
+                and payload.get("change_set_id") is not None
+            ):
+                try:
+                    payload = await asyncio.to_thread(self._issue_approval_preparation, payload)
+                except ValueError:
+                    return {
+                        **payload,
+                        "status": "BLOCKED",
+                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                    }
             if step == "audit.prepare_agent_cell":
                 return await asyncio.to_thread(self._prepare_agent_cell, payload)
             if step == "campaign.persist_coverage":
@@ -2408,6 +2444,32 @@ class MetadataActivityHandler:
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
                 raise ValueError("delivery run metadata is missing")
+            issue_approval = None
+            if (
+                payload.get("issue_approval_id") is not None
+                or session.scalar(
+                    select(BacklogIssueRecord.id)
+                    .where(BacklogIssueRecord.finding_id == finding.id)
+                    .limit(1)
+                )
+                is not None
+            ):
+                try:
+                    issue_approval = validate_child_issue_approval(
+                        session,
+                        UUID(str(payload.get("issue_approval_id"))),
+                        finding=finding,
+                        run=run,
+                    )
+                except ValueError:
+                    run.status = "BLOCKED"
+                    run.finished_at = datetime.now(UTC)
+                    run.error_code = "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED"
+                    return {
+                        **payload,
+                        "status": "BLOCKED",
+                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                    }
             project = Project(finding.project)
             source_repository, deployment_repository = {
                 Project.FALCONE: ("falcone", "falcone-charts"),
@@ -2427,7 +2489,9 @@ class MetadataActivityHandler:
             if issue_repository is None:
                 raise ValueError("confirmed finding repository surface is invalid")
             change_set_id = uuid5(NAMESPACE_URL, f"changeset:{finding.id}")
-            change_set = session.get(ChangeSet, change_set_id)
+            change_set = session.scalar(
+                select(ChangeSet).where(ChangeSet.id == change_set_id).with_for_update()
+            )
             if change_set is None:
                 change_set = ChangeSet(
                     id=change_set_id,
@@ -2452,6 +2516,11 @@ class MetadataActivityHandler:
                     recovery_json={},
                 )
                 session.add(change_set)
+            issue_reference = (
+                bind_change_set_issue_approval(session, change_set, issue_approval)
+                if issue_approval is not None
+                else None
+            )
             run.change_set_id = change_set_id
             run.status = "RUNNING"
             run.project = project.value
@@ -2487,6 +2556,11 @@ class MetadataActivityHandler:
                 ),
                 "issue_number": issue.number if issue else None,
                 "issue_url": issue.url if issue else None,
+                **(
+                    {"issue_execution_approval": issue_reference}
+                    if issue_reference is not None
+                    else {}
+                ),
             }
 
     def _ensure_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2788,7 +2862,25 @@ class MetadataActivityHandler:
             "checker_request": request.model_dump(mode="json"),
         }
 
+    def _issue_approval_preparation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.sessions() as session:
+            reference = validate_change_set_issue_approval(
+                session, UUID(str(payload["change_set_id"]))
+            )
+        supplied = payload.get("issue_execution_approval")
+        if supplied is not None and supplied != reference:
+            raise ValueError("supplied delivery approval differs from durable custody")
+        return {**payload, **({"issue_execution_approval": reference} if reference else {})}
+
     def _prepare_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            payload = self._issue_approval_preparation(payload)
+        except ValueError:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+            }
         evidence = self._object(payload.get("change_evidence"), "change_evidence")
         source = self._object(evidence.get("source"), "source change evidence")
         deployment = self._object(evidence.get("deployment"), "deployment change evidence")

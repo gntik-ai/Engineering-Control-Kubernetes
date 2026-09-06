@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from jsonschema.validators import Draft202012Validator
@@ -97,6 +97,55 @@ def audit_cell() -> dict[str, str]:
         "lens": "correctness",
         "environment": "snapshot",
     }
+
+
+def add_changeset_finding(handler: MetadataActivityHandler, change_set_id: UUID) -> None:
+    """Give standalone staging fixtures the real finding their ChangeSet references."""
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        project = change_set.project
+    campaign = add_campaign(handler, project)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        coverage = CoverageCell(
+            id=uuid4(),
+            campaign_id=campaign.id,
+            domain="api",
+            persona="operator",
+            lens="correctness",
+            environment="staging",
+            status="CONFIRMED_FINDING",
+            evidence_json=[],
+            result_json={},
+        )
+        session.add(coverage)
+        session.flush()
+        session.add(
+            Finding(
+                id=change_set.finding_id,
+                campaign_id=campaign.id,
+                coverage_cell_id=coverage.id,
+                fingerprint=uuid4().hex * 2,
+                project=project,
+                domain="api",
+                persona="operator",
+                severity="medium",
+                confidence=0.9,
+                risk_class=change_set.risk_class,
+                disposition="CONFIRMED",
+                expected_behavior="fixture contract",
+                actual_behavior="fixture mismatch",
+                evidence_json=[],
+                minimal_reproduction=["fixture only"],
+                affected_source_sha=change_set.source_base_sha,
+                affected_deployment_sha=change_set.deployment_base_sha,
+                affected_component="api",
+                impact_json={},
+                recommended_action="fixture repair",
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -935,6 +984,7 @@ configuration: {}
     with handler.sessions.begin() as session:
         session.add_all([change_set, run])
 
+    add_changeset_finding(handler, change_set_id)
     result = await handler.handle(
         "staging.prepare",
         {
@@ -1230,6 +1280,7 @@ configuration:
     with handler.sessions.begin() as session:
         session.add_all([change_set, run, lease])
 
+    add_changeset_finding(handler, change_set_id)
     prepared = await handler.handle(
         "staging.prepare",
         {
@@ -1396,6 +1447,7 @@ configuration:
             )
         )
 
+    add_changeset_finding(handler, change_set_id)
     result = await handler.handle(
         "staging.prepare",
         {
