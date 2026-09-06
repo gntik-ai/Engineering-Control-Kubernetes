@@ -11,9 +11,12 @@ The first Step remains the ChangeSet's originating authority. Bounded correction
 children retain separate immutable Step records under the same parent/request/
 snapshot scope, with a bounded reference list. They cannot replace the origin,
 change parent, exceed the correction count or enter from a non-correction state.
-The ChangeSet row is locked for binding updates. This records custody; Temporal
-sequential execution and component/active-owner leases still provide execution
-ordering and fencing. SQLite tests do not prove PostgreSQL lock concurrency.
+The Finding row is locked before reading the Run/approval identity map, then the
+ChangeSet is locked for binding updates. This ordering prevents a waiting load
+from validating a newer correction list against its cached, older Run object.
+The Finding exists before the first ChangeSet, so it also serializes initial
+creation. This records custody; Temporal sequential execution and component/
+active-owner leases still provide execution ordering and fencing.
 
 Controller metadata preparation and publication-plan preparation recheck the
 stored authority, even if the caller omits the reference. Post-effect persistence
@@ -33,12 +36,22 @@ and typed decoding; they do not establish complete historical replay compatibili
 Legacy backlog-derived children without the durable reference fail closed and
 require explicitly reviewed recovery/adoption, not an inferred approval.
 
-Mandatory remaining release work: real parent-to-child Temporal execution/replay,
-PostgreSQL child-lineage concurrency, alternative global/R3 child paths, final
-worker/GitHub broker enforcement with fresh typed GitHub issue observations,
-check-to-effect/fencing windows, complete background crash recovery and matching
-assembled/live acceptance. This source follow-up does not close HERMES-2026-014,
-authorize #1119 or a project pilot, or establish any production GO.
+Seven real isolated PostgreSQL 17.11 scenarios now cover simultaneous initial
+loads, late registration retry, correction-load lock waits, the final correction
+slot race, revision drift during a wait, pre-publication denial and origin
+preservation. They supplement SQLite tests, not replace external-effect fencing.
+A real isolated Temporal parent/child fixture carries the durable approval through
+the actual control service and metadata handlers. Both histories replay; a fixed
+fixture boundary stops before leases/providers/GitHub. Business PAUSED/BLOCKED is
+not delivery success even though those Temporal executions complete.
+
+Mandatory remaining release work: representative legacy and recovery histories,
+alternative global/R3 child paths, final worker/GitHub broker enforcement with
+fresh typed GitHub issue observations, check-to-effect/fencing windows, complete
+background crash recovery and matching assembled/live acceptance. The scoped
+concurrency/dispatch fixtures are not universal concurrency or replay acceptance.
+This source follow-up does not close HERMES-2026-014, authorize #1119 or a project
+pilot, or establish any production GO.
 
 Hermes platform/console production authority is separate. Falcone, Musematic and
 LLMWiki targets remain the verified existing development/staging Kubernetes

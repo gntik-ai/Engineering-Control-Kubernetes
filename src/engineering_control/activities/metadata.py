@@ -2434,7 +2434,13 @@ class MetadataActivityHandler:
         if not workflow_id:
             raise ValueError("delivery workflow identity is missing")
         with self.sessions.begin() as session:
-            finding = session.get(Finding, finding_id)
+            # Serialize initialization before populating this session's Run/approval
+            # identity map. Locking only the later ChangeSet leaves cached pre-wait
+            # Run state stale when a concurrent correction load commits first.
+            # The Finding also exists before the first ChangeSet can be inserted.
+            finding = session.scalar(
+                select(Finding).where(Finding.id == finding_id).with_for_update()
+            )
             if finding is None or finding.disposition != "CONFIRMED":
                 raise ValueError("delivery requires a CONFIRMED finding")
             if requested_risk.value != finding.risk_class:
