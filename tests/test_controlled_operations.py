@@ -416,6 +416,56 @@ async def test_issue_candidate_reauth_is_session_bound_one_use_and_idempotent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed_field", ["body", "risk", "source_head"])
+async def test_issue_confirmation_rejects_changed_approved_snapshot(
+    tmp_path: Path, changed_field: str
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    candidate = await repository.candidate(_solve_issue(), SESSION_A)
+    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
+    with repository.sessions.begin() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        campaign = session.get(GitHubBacklogCampaign, CAMPAIGN_ID)
+        assert issue is not None and campaign is not None
+        if changed_field == "body":
+            issue.body_sha256 = "9" * 64
+        elif changed_field == "risk":
+            issue.calculated_risk = "R3"
+        else:
+            campaign.source_head_at_import = "9" * 40
+    with pytest.raises(ValueError, match="approval snapshot changed"):
+        await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, None)
+    with repository.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(OperationRequest)) == 0
+        binding = session.scalar(select(ReauthenticationBinding))
+        assert binding is not None and binding.used_at is None
+
+
+@pytest.mark.asyncio
+async def test_issue_approval_is_revalidated_after_queue_before_dispatch(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    command = _solve_issue()
+    candidate = await repository.candidate(command, SESSION_A)
+    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
+    operation = await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, None)
+    await repository.validate_issue_approval(operation.operation_id, command)
+    with repository.sessions.begin() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert issue is not None
+        issue.body_sha256 = "9" * 64
+    control = Mock()
+    control.start_existing_backlog_loop = AsyncMock()
+    bus = TypedCommandBus(control, Mock(), repository)
+    assert await bus.dispatch_pending()
+    current = await repository.operation(operation.operation_id)
+    assert current is not None and current.status == "BLOCKED"
+    assert current.safe_error is not None and "approval snapshot changed" in current.safe_error
+    control.start_existing_backlog_loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_backlog_requires_server_phrase_and_prevents_duplicate_active_operation(
     tmp_path: Path,
 ) -> None:

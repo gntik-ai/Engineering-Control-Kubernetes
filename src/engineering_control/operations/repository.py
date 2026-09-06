@@ -1245,6 +1245,54 @@ class OperationsRepository:
             self._create_reauthentication, candidate_id, session_binding_hash
         )
 
+    def _require_current_issue_approval(
+        self,
+        session: Session,
+        command: SolveIssueCommand,
+        expected_binding_hash: str,
+        *,
+        exclude_operation_id: UUID | None = None,
+    ) -> None:
+        """Recheck the issue snapshot without making ownership revision-dependent."""
+        target_type, target_id, project = command_target(command)
+        _capability, resolved = self._capability(
+            session, command, datetime.now(UTC), exclude_operation_id=exclude_operation_id
+        )
+        # Ownership is checked/deduplicated separately. A concurrent owner must not
+        # turn an otherwise identical confirmation into another operation or bind
+        # the approval to an incidental operation/workflow identifier.
+        resolved.pop("existing_operation_id", None)
+        resolved.pop("existing_workflow_id", None)
+        current_binding = canonical_sha256(
+            {
+                "action": command.action,
+                "target_type": target_type,
+                "target_id": target_id,
+                "project": project,
+                "payload": command.model_dump(mode="json"),
+                "resolved": resolved,
+                "production": False,
+            }
+        )
+        if not hmac.compare_digest(expected_binding_hash, current_binding):
+            raise ValueError("issue approval snapshot changed; prepare and confirm a new action")
+
+    async def validate_issue_approval(self, operation_id: UUID, command: SolveIssueCommand) -> None:
+        await asyncio.to_thread(self._validate_issue_approval, operation_id, command)
+
+    def _validate_issue_approval(self, operation_id: UUID, command: SolveIssueCommand) -> None:
+        with self.sessions.begin() as session:
+            operation = session.get(OperationRequest, operation_id)
+            if operation is None:
+                raise ValueError("operation disappeared before approval validation")
+            if operation.source_channel != "dashboard":
+                return
+            if operation.payload_json != command.model_dump(mode="json"):
+                raise ValueError("issue operation command changed before approval validation")
+            self._require_current_issue_approval(
+                session, command, operation.binding_hash, exclude_operation_id=operation_id
+            )
+
     def _create_reauthentication(self, candidate_id: UUID, session_binding_hash: str) -> str:
         now = datetime.now(UTC)
         token = secrets.token_urlsafe(32)
@@ -1345,6 +1393,11 @@ class OperationsRepository:
                         .limit(1)
                     )
                 if existing is None:
+                    command = parse_command(candidate.payload_json)
+                    if isinstance(command, SolveIssueCommand):
+                        self._require_current_issue_approval(
+                            session, command, candidate.binding_hash
+                        )
                     existing = OperationRequest(
                         action=candidate.action,
                         project=candidate.project,

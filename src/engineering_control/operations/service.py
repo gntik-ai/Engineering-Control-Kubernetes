@@ -98,6 +98,8 @@ class TypedCommandBus:
             if capability.status != "AVAILABLE":
                 blocker = capability.blockers[0] if capability.blockers else capability.status
                 raise ValueError(f"operation preflight changed: {blocker}")
+            if isinstance(command, SolveIssueCommand):
+                await self.operations.validate_issue_approval(operation_id, command)
             accepted = await self._execute(
                 command,
                 operator_class=operator_class,
