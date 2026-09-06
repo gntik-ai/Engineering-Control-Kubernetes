@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8740, ge=1024, le=65535)
+    api_admission_mode: Literal["normal", "synthetic-only"] = "normal"
     api_token_file: Path = Path("/etc/engineering-control/env/api.token")
     temporal_target: str = "127.0.0.1:7233"
     temporal_namespace: str = "engineering-control"

@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
+from engineering_control.api.admission import MaintenanceAdmission
 from engineering_control.api.auth import bearer_auth
 from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
@@ -75,6 +76,7 @@ def create_app(
     command_bus: TypedCommandBus | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
+    admission_mode = resolved.api_admission_mode
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -122,9 +124,10 @@ def create_app(
         stop = asyncio.Event()
         dispatcher = (
             asyncio.create_task(operation_dispatch_loop(resolved_bus, stop))
-            if resolved_bus is not None
+            if resolved_bus is not None and admission_mode == "normal"
             else None
         )
+        app.state.operation_dispatcher = dispatcher
         yield
         stop.set()
         if dispatcher is not None:
@@ -145,6 +148,7 @@ def create_app(
     expected_token = token if token is not None else resolved.read_api_token()
     authenticated = bearer_auth(expected_token)
     auth_dependency = Depends(authenticated)
+    app.add_middleware(MaintenanceAdmission, mode=admission_mode, authenticate=authenticated)
 
     def control(request: Request) -> ControlService:
         return cast(ControlService, request.app.state.control_service)
@@ -220,6 +224,19 @@ def create_app(
     @app.get("/health/live")
     async def live() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/v1/admission")
+    async def admission_get(
+        request: Request,
+        _subject: str = auth_dependency,
+    ) -> dict[str, str | bool]:
+        dispatcher = request.app.state.operation_dispatcher
+        return {
+            "scope": "private-api-only",
+            "mode": admission_mode,
+            "pending_operation_dispatcher_running": dispatcher is not None
+            and not dispatcher.done(),
+        }
 
     @app.get("/health/ready")
     async def ready(request: Request) -> dict[str, str]:
