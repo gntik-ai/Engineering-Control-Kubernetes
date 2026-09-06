@@ -7,7 +7,15 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 BACKLOG_PROJECT_PAIRS: dict[str, tuple[str, str]] = {
     "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
@@ -245,6 +253,11 @@ class BacklogIssueRecord(BacklogModel):
         return self
 
 
+class IssueApprovalReference(BacklogModel):
+    operation_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    binding_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class BacklogApprovalBinding(BacklogModel):
     backlog_campaign_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
     project: Literal["falcone", "musematic", "llmwiki"]
@@ -269,6 +282,14 @@ class BacklogApprovalBinding(BacklogModel):
     merge_policy: Literal["protected-explicit", "no-merge"]
     issue_close_policy: Literal["verified-final-runtime", "never"]
     expires_at: datetime
+    issue_approval: IssueApprovalReference | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_binding(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        value: dict[str, Any] = handler(self)
+        if self.issue_approval is None:
+            value.pop("issue_approval", None)
+        return value
 
     @model_validator(mode="after")
     def exact_pair(self) -> BacklogApprovalBinding:
@@ -278,6 +299,8 @@ class BacklogApprovalBinding(BacklogModel):
             self.merge_policy != "no-merge" or self.issue_close_policy != "never"
         ):
             raise ValueError("source-pr approval cannot permit merge or issue closure")
+        if self.issue_approval is not None and self.maximum_items != 1:
+            raise ValueError("issue operation approval must remain bound to one item")
         return self
 
     def sha256(self) -> str:

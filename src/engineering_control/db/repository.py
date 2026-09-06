@@ -19,6 +19,7 @@ from engineering_control.api.schemas import (
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
+    ExistingBacklogLoopStart,
     MultiProjectAuditStart,
     RollbackRequest,
     RuntimeVerificationStart,
@@ -47,12 +48,17 @@ from engineering_control.db.models import (
 )
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
+    BacklogApprovalBinding,
     approval_binding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
 )
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
+from engineering_control.operations.issue_approval import (
+    require_backlog_issue_approval,
+    require_issue_request_approval,
+)
 from engineering_control.retention_limits import (
     DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
     NOTIFICATION_OUTBOX_METRIC_STATUSES,
@@ -114,11 +120,18 @@ class MetadataRepository(Protocol):
         self, project: str, surface: str, issue_number: int
     ) -> dict[str, Any] | None: ...
     async def prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]: ...
     async def approve_backlog_campaign(
         self, campaign_id: UUID, project: str, binding: str, actor: str
     ) -> dict[str, Any]: ...
+    async def validate_issue_operation_approval(
+        self, request: ExistingBacklogLoopStart
+    ) -> None: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
     async def list_findings(self, limit: int) -> list[dict[str, Any]]: ...
     async def list_enhancements(
@@ -611,14 +624,56 @@ class SQLMetadataRepository:
             }
 
     async def prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self._prepare_backlog_approval, campaign_id, request)
+        return await asyncio.to_thread(
+            self._prepare_backlog_approval, campaign_id, request, issue_request=issue_request
+        )
+
+    async def validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:
+        await asyncio.to_thread(self._validate_issue_operation_approval, request)
+
+    def _validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:
+        with self.sessions() as session:
+            require_issue_request_approval(session, request)
+            campaign = session.get(GitHubBacklogCampaign, request.backlog_campaign_id)
+            raw = campaign.approval_json.get("binding") if campaign is not None else None
+            if not isinstance(raw, dict):
+                raise ValueError("direct issue campaign approval is unavailable")
+            binding = BacklogApprovalBinding.model_validate(raw)
+            reference = binding.issue_approval
+            if (
+                reference is None
+                or reference.operation_id != str(request.issue_operation_id)
+                or reference.binding_sha256 != request.issue_approval_binding
+                or campaign is None
+                or binding.sha256() != campaign.approval_binding
+            ):
+                raise ValueError("direct issue campaign approval binding changed")
+            require_backlog_issue_approval(session, binding)
 
     def _prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
         with self.sessions.begin() as session:
+            if issue_request is not None:
+                require_issue_request_approval(session, issue_request)
+                if (
+                    campaign_id != issue_request.backlog_campaign_id
+                    or request.project != issue_request.project
+                    or request.delivery_mode != issue_request.delivery_mode
+                    or request.maximum_risk != issue_request.maximum_risk
+                    or request.maximum_items != 1
+                ):
+                    raise ValueError("issue approval campaign request changed scope")
             campaign = session.get(GitHubBacklogCampaign, campaign_id)
             if campaign is None or campaign.project != request.project:
                 raise ValueError("backlog approval campaign does not exist")
@@ -634,6 +689,16 @@ class SQLMetadataRepository:
                 delivery_mode=request.delivery_mode,
                 include_enhancements=campaign.import_filter == "enhancements",
             )
+            if issue_request is not None:
+                binding = BacklogApprovalBinding.model_validate(
+                    {
+                        **binding.model_dump(mode="json"),
+                        "issue_approval": {
+                            "operation_id": str(issue_request.issue_operation_id),
+                            "binding_sha256": issue_request.issue_approval_binding,
+                        },
+                    }
+                )
             digest = binding.sha256()
             campaign.approval_binding = digest
             campaign.approval_json = {"binding": binding.model_dump(mode="json")}
@@ -743,6 +808,9 @@ class SQLMetadataRepository:
             raw_binding = campaign.approval_json.get("binding")
             if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
                 raise ValueError("existing-backlog approval candidate changed")
+            require_backlog_issue_approval(
+                session, BacklogApprovalBinding.model_validate(raw_binding)
+            )
             expires_at = datetime.fromisoformat(str(raw_binding["expires_at"]))
             if expires_at <= now:
                 raise ValueError("existing-backlog approval candidate expired")
@@ -1501,7 +1569,11 @@ class EmptyMetadataRepository:
         return None
 
     async def prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
         raise ValueError("backlog metadata store is unavailable")
 
@@ -1509,6 +1581,9 @@ class EmptyMetadataRepository:
         self, campaign_id: UUID, project: str, binding: str, actor: str
     ) -> dict[str, Any]:
         raise ValueError("backlog metadata store is unavailable")
+
+    async def validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:
+        raise ValueError("issue approval metadata store is unavailable")
 
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None:
         return None

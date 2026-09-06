@@ -27,6 +27,7 @@ from engineering_control.engineering.backlog import (
     canonical_sha256,
     is_reauthenticated_backlog_operator,
 )
+from engineering_control.operations.issue_approval import require_backlog_issue_approval
 from engineering_control.policy.github_write import GitHubWritePolicyDocument
 
 SAFE_REPOSITORIES = (
@@ -164,6 +165,8 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
         raise ValueError("GitHub campaign approval evidence is incomplete") from error
     if canonical_sha256(exact_binding.model_dump(mode="json")) != request["approval_binding"]:
         raise ValueError("GitHub campaign approval binding changed")
+    if request["action"] == "enable-existing-backlog":
+        require_backlog_issue_approval(session, exact_binding)
     approved_by = approval.get("approved_by")
     if not isinstance(approved_by, str) or not is_reauthenticated_backlog_operator(approved_by):
         raise ValueError("GitHub campaign approval actor is noncanonical")

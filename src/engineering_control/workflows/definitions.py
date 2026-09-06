@@ -1798,6 +1798,15 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
         return context
 
 
+def _backlog_execution_payload(request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+    value = asdict(request)
+    # Preserve the exact legacy activity payload when replaying old inputs.
+    for key in ("issue_operation_id", "issue_approval_binding"):
+        if value[key] is None:
+            value.pop(key)
+    return value
+
+
 @workflow.defn(name="ExistingGitHubBacklogLoopWorkflow")
 class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     """Durably control imported issues; fail closed until current reproduction is proven."""
@@ -1821,7 +1830,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         after_current_controls = workflow.patched("existing-backlog-after-current-controls-v1")
         final_closure_enabled = workflow.patched("existing-backlog-final-closure-v1")
         global_child_blocker_return = workflow.patched("global-backlog-child-blocker-return-v1")
-        context = await self._step("backlog.load_execution", asdict(request))
+        context = await self._step("backlog.load_execution", _backlog_execution_payload(request))
         if context.get("status") == "BLOCKED":
             return context
         raw_items = context.get("items")
@@ -1836,12 +1845,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
                     await self._step(
                         "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "CANCELLED"},
+                        {**_backlog_execution_payload(request), "loop_status": "CANCELLED"},
                     )
                     return {"status": "CANCELLED", "results": results}
                 gate = await self._step(
                     "backlog.revalidate_gate",
-                    {**asdict(request), "item": item},
+                    {**_backlog_execution_payload(request), "item": item},
                 )
                 if gate.get("status") == "READY":
                     break
@@ -1852,7 +1861,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 }:
                     candidate = await self._step(
                         "backlog.materialize_candidate",
-                        {**asdict(request), "item": item},
+                        {**_backlog_execution_payload(request), "item": item},
                     )
                     verification_workflow_id = (
                         f"{workflow.info().workflow_id}-issue-{ordinal}-"
@@ -1862,7 +1871,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         await self._step(
                             "backlog.register_child_run",
                             {
-                                **asdict(request),
+                                **_backlog_execution_payload(request),
                                 "child_kind": "finding-verification",
                                 "child_workflow_id": verification_workflow_id,
                                 "finding_id": str(candidate["finding_id"]),
@@ -1882,12 +1891,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     await self._step(
                         "backlog.record_revalidation",
                         {
-                            **asdict(request),
+                            **_backlog_execution_payload(request),
                             "item": item,
                             "verification": verification,
                         },
                     )
-                    refreshed = await self._step("backlog.load_execution", asdict(request))
+                    refreshed = await self._step(
+                        "backlog.load_execution", _backlog_execution_payload(request)
+                    )
                     candidates = refreshed.get("items")
                     if isinstance(candidates, list):
                         item = next(
@@ -1915,7 +1926,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                     await self._step(
                         "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                        {
+                            **_backlog_execution_payload(request),
+                            "loop_status": "PAUSED",
+                            "blocker": blocker,
+                        },
                     )
                     return {"status": "BLOCKED", "blocker": blocker, "results": results}
                 if (
@@ -1938,7 +1953,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 self._retry_step = None
                 await self._step(
                     "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "PAUSED",
+                        "blocker": blocker,
+                    },
                 )
                 await workflow.wait_condition(
                     lambda: (
@@ -1950,7 +1969,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if self._cancelled:
                     await self._step(
                         "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "CANCELLED"},
+                        {**_backlog_execution_payload(request), "loop_status": "CANCELLED"},
                     )
                     return {"status": "CANCELLED", "results": results}
                 if self._skip_reason is not None:
@@ -1962,7 +1981,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     skipped = await self._step(
                         "backlog.record_skip",
                         {
-                            **asdict(request),
+                            **_backlog_execution_payload(request),
                             "repository": item["repository"],
                             "issue_number": item["issue_number"],
                             "reason_code": reason,
@@ -1975,7 +1994,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     self._retry_step = None
                     continue
                 self._retry_step = None
-                refreshed = await self._step("backlog.load_execution", asdict(request))
+                refreshed = await self._step(
+                    "backlog.load_execution", _backlog_execution_payload(request)
+                )
                 candidates = refreshed.get("items")
                 if isinstance(candidates, list):
                     item = next(
@@ -2009,7 +2030,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         await self._step(
                             "backlog.register_child_run",
                             {
-                                **asdict(request),
+                                **_backlog_execution_payload(request),
                                 "child_kind": "issue-delivery",
                                 "child_workflow_id": delivery_workflow_id,
                                 "finding_id": str(gate["finding_id"]),
@@ -2035,7 +2056,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     await self._step(
                         "backlog.register_child_run",
                         {
-                            **asdict(request),
+                            **_backlog_execution_payload(request),
                             "child_kind": "issue-delivery",
                             "child_workflow_id": delivery_workflow_id,
                             "finding_id": str(gate["finding_id"]),
@@ -2058,7 +2079,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if global_child_blocker_return and request.global_campaign_id is not None:
                     await self._step(
                         "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                        {
+                            **_backlog_execution_payload(request),
+                            "loop_status": "PAUSED",
+                            "blocker": blocker,
+                        },
                     )
                     return {"status": "BLOCKED", "blocker": blocker, "results": results}
                 if (
@@ -2077,7 +2102,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     continue
                 await self._step(
                     "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "PAUSED",
+                        "blocker": blocker,
+                    },
                 )
                 return {"status": "PAUSED", "results": results}
             if sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
@@ -2085,7 +2114,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     await self._step(
                         "backlog.record_loop_state",
                         {
-                            **asdict(request),
+                            **_backlog_execution_payload(request),
                             "loop_status": "PAUSED",
                             "blocker": "CORRECTION_LIMIT_EXHAUSTED",
                         },
@@ -2098,7 +2127,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step(
                     "backlog.record_loop_state",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "loop_status": "PAUSED",
                         "blocker": "CORRECTION_LIMIT_EXHAUSTED",
                     },
@@ -2134,7 +2163,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step(
                     "backlog.record_loop_state",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "loop_status": "PAUSED",
                         "blocker": full_delivery["blocker"],
                     },
@@ -2148,7 +2177,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 blocker = "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
                 await self._step(
                     "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "PAUSED",
+                        "blocker": blocker,
+                    },
                 )
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
             closure_id = f"{workflow.info().workflow_id}-issue-{ordinal}-final-closure"
@@ -2176,7 +2209,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 await self._step(
                     "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "PAUSED",
+                        "blocker": blocker,
+                    },
                 )
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
             boundary = await self._after_issue_boundary(
@@ -2188,7 +2225,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if boundary is not None:
                 return boundary
         await self._step(
-            "backlog.record_loop_state", {**asdict(request), "loop_status": "COMPLETE"}
+            "backlog.record_loop_state",
+            {**_backlog_execution_payload(request), "loop_status": "COMPLETE"},
         )
         return {"status": "COMPLETE", "results": results}
 
@@ -2234,7 +2272,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step(
                     "backlog.register_child_run",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "child_kind": child_kind,
                         "child_workflow_id": child_id,
                         "finding_id": finding_id,
@@ -2264,7 +2302,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             await self._step(
                 "backlog.register_child_run",
                 {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "child_kind": "staging-deployment",
                     "child_workflow_id": staging_id,
                     "finding_id": finding_id,
@@ -2302,7 +2340,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             await self._step(
                 "backlog.register_child_run",
                 {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "child_kind": "runtime-verification",
                     "child_workflow_id": verification_id,
                     "finding_id": finding_id,
@@ -2351,7 +2389,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             await self._step(
                 "backlog.record_loop_state",
                 {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "loop_status": "STOPPED",
                     "control_state": "STOPPED_AFTER_CURRENT",
                 },
@@ -2365,7 +2403,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         await self._step(
             "backlog.record_loop_state",
             {
-                **asdict(request),
+                **_backlog_execution_payload(request),
                 "loop_status": "PAUSED",
                 "control_state": "PAUSED_AFTER_CURRENT",
             },
@@ -2375,7 +2413,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             return None
         await self._step(
             "backlog.record_loop_state",
-            {**asdict(request), "loop_status": "CANCELLED"},
+            {**_backlog_execution_payload(request), "loop_status": "CANCELLED"},
         )
         return {"status": "CANCELLED", "results": results}
 

@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.engineering.backlog import (
@@ -37,6 +38,10 @@ from engineering_control.identity.attestation import (
 )
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
+from engineering_control.operations.issue_approval import (
+    require_backlog_issue_approval,
+    require_issue_request_approval,
+)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -948,6 +953,14 @@ class EngineeringActivityHandler:
         if maximum is None:
             raise ValueError("backlog execution maximum risk is invalid")
         with self.sessions.begin() as session:
+            try:
+                self._require_direct_issue_operation(session, payload)
+            except ValueError:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "DIRECT_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                }
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             global_campaign = None
             raw_global_id = payload.get("global_campaign_id")
@@ -981,6 +994,20 @@ class EngineeringActivityHandler:
                     **payload,
                     "status": "BLOCKED",
                     "blocker": "CURRENT_BACKLOG_APPROVAL_REQUIRED",
+                }
+            try:
+                require_backlog_issue_approval(session, approval)
+                reference = approval.issue_approval
+                if reference is not None and (
+                    reference.operation_id != payload.get("issue_operation_id")
+                    or reference.binding_sha256 != payload.get("issue_approval_binding")
+                ):
+                    raise ValueError("issue campaign and workflow approval differ")
+            except ValueError:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "DIRECT_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
                 }
             rows = session.scalars(
                 select(db.BacklogIssueRecord)
@@ -1630,6 +1657,15 @@ class EngineeringActivityHandler:
         return {**payload, "status": terminal}
 
     def _backlog_revalidate_gate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.sessions() as session:
+            try:
+                self._require_direct_issue_operation(session, payload)
+            except ValueError:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "DIRECT_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                }
         item = payload.get("item")
         if not isinstance(item, dict):
             raise ValueError("backlog revalidation requires one typed issue record")
@@ -1687,6 +1723,29 @@ class EngineeringActivityHandler:
             {**payload, "finding_id": finding_id, "risk_class": item["calculated_risk"]},
             "READY",
         )
+
+    @staticmethod
+    def _require_direct_issue_operation(session: Session, payload: dict[str, Any]) -> None:
+        operation_id = payload.get("issue_operation_id")
+        binding = payload.get("issue_approval_binding")
+        direct = (
+            payload.get("target_repository") is not None
+            or payload.get("target_issue_number") is not None
+        )
+        if operation_id is None and binding is None:
+            if (
+                direct
+                and payload.get("global_campaign_id") is None
+                and payload.get("r3_approval_binding") is None
+            ):
+                raise ValueError("direct issue execution has no durable approval")
+            return
+        if not direct or not isinstance(binding, str) or operation_id is None:
+            raise ValueError("direct issue approval binding is incomplete")
+        request = ExistingBacklogLoopStart.model_validate(
+            {key: payload[key] for key in ExistingBacklogLoopStart.model_fields if key in payload}
+        )
+        require_issue_request_approval(session, request)
 
     def _materialize_backlog_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
         item = payload.get("item")

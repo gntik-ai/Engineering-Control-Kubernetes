@@ -426,6 +426,12 @@ class TemporalControlService:
     async def start_existing_backlog_loop(
         self, request: ExistingBacklogLoopStart
     ) -> OperationAccepted:
+        if request.issue_operation_id is not None or (
+            request.target_repository is not None
+            and request.global_campaign_id is None
+            and request.r3_approval_binding is None
+        ):
+            await self.repository.validate_issue_operation_approval(request)
         campaign = await self.repository.get_backlog_campaign(request.backlog_campaign_id)
         if campaign is None or campaign.get("project") != request.project:
             raise ValueError("existing backlog campaign does not exist")
@@ -437,6 +443,8 @@ class TemporalControlService:
             raise ValueError("existing backlog delivery mode changed after approval")
         if request.maximum_items > int(campaign.get("maximum_items") or 0):
             raise ValueError("existing backlog item bound exceeds its approval")
+        if request.issue_operation_id is not None:
+            await self.repository.validate_issue_operation_approval(request)
         workflow_id = f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
         handle = await self.client.start_workflow(
             WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,

@@ -182,6 +182,8 @@ class ExistingBacklogLoopStart(APIModel):
     correction_limit: int = Field(default=2, ge=0, le=5)
     global_campaign_id: UUID | None = None
     r3_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    issue_operation_id: UUID | None = None
+    issue_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def exact_issue_binding(self) -> ExistingBacklogLoopStart:
@@ -189,6 +191,16 @@ class ExistingBacklogLoopStart(APIModel):
             raise ValueError("target repository and issue number must be supplied together")
         if self.target_repository is not None and self.maximum_items != 1:
             raise ValueError("a direct issue operation must remain bound to one item")
+        if (self.issue_operation_id is None) != (self.issue_approval_binding is None):
+            raise ValueError("issue operation and approval binding must be supplied together")
+        if self.issue_operation_id is not None and self.target_repository is None:
+            raise ValueError("issue approval must bind one exact issue")
+        if self.issue_operation_id is not None and (
+            self.global_campaign_id is not None
+            or self.r3_approval_binding is not None
+            or self.continue_after_blocked_issue
+        ):
+            raise ValueError("direct issue approval cannot widen its execution scope")
         return self
 
 

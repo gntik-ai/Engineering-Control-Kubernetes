@@ -161,6 +161,22 @@ class TypedCommandBus:
                 AutonomousBacklogStart.model_validate(command.model_dump(mode="json"))
             )
         if isinstance(command, SolveIssueCommand):
+            operation = await self.operations.operation(operation_id)
+            if operation is None:
+                raise ValueError("issue operation disappeared before durable handoff")
+            request = ExistingBacklogLoopStart(
+                project=command.project.value,
+                backlog_campaign_id=command.backlog_campaign_id,
+                maximum_risk=command.maximum_risk,
+                delivery_mode=command.delivery_mode,
+                maximum_items=1,
+                target_repository=command.repository,
+                target_issue_number=command.issue_number,
+                continue_after_blocked_issue=False,
+                correction_limit=command.correction_limit,
+                issue_operation_id=operation_id,
+                issue_approval_binding=operation.binding_hash,
+            )
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
                 BacklogApprovalCandidateRequest(
@@ -169,6 +185,7 @@ class TypedCommandBus:
                     maximum_risk=command.maximum_risk,
                     maximum_items=1,
                 ),
+                issue_request=request,
             )
             await self.metadata.approve_backlog_campaign(
                 command.backlog_campaign_id,
@@ -176,19 +193,7 @@ class TypedCommandBus:
                 str(candidate["approval_binding"]),
                 self._approval_actor(operator_class),
             )
-            return await self.control.start_existing_backlog_loop(
-                ExistingBacklogLoopStart(
-                    project=command.project.value,
-                    backlog_campaign_id=command.backlog_campaign_id,
-                    maximum_risk=command.maximum_risk,
-                    delivery_mode=command.delivery_mode,
-                    maximum_items=1,
-                    target_repository=command.repository,
-                    target_issue_number=command.issue_number,
-                    continue_after_blocked_issue=False,
-                    correction_limit=command.correction_limit,
-                )
-            )
+            return await self.control.start_existing_backlog_loop(request)
         if isinstance(command, SolveBacklogCommand):
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
