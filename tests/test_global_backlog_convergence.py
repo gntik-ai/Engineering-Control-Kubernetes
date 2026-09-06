@@ -164,7 +164,7 @@ def test_nested_inventory_approval_is_current_without_owning_shared_policy() -> 
     campaign = _campaign(FALCONE_ID, "falcone", status="APPROVED")
     flat = dict(campaign.approval_json)
     campaign.approval_json = {
-        "binding": {key: flat[key] for key in BacklogApprovalBinding.model_fields},
+        "binding": {key: flat[key] for key in BacklogApprovalBinding.model_fields if key in flat},
         "policy_role": "inventory",
         "approval": {
             "approved_by": flat["approved_by"],

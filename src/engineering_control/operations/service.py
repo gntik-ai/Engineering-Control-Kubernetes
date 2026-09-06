@@ -143,9 +143,15 @@ class TypedCommandBus:
                 )
                 await self.operations.record_dispatch_event(
                     operation_id,
-                    event_type="operation.started",
+                    event_type="operation.linked"
+                    if accepted.status == "EXISTING"
+                    else "operation.started",
                     level="INFO",
-                    message="Typed operation started one durable workflow",
+                    message=(
+                        "Typed operation linked an existing durable workflow"
+                        if accepted.status == "EXISTING"
+                        else "Typed operation started one durable workflow"
+                    ),
                     workflow_id=accepted.workflow_id,
                 )
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hmac
+from datetime import timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from temporalio.client import Client
+from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from engineering_control.api.schemas import (
@@ -426,12 +428,14 @@ class TemporalControlService:
     async def start_existing_backlog_loop(
         self, request: ExistingBacklogLoopStart
     ) -> OperationAccepted:
-        if request.issue_operation_id is not None or (
-            request.target_repository is not None
-            and request.global_campaign_id is None
-            and request.r3_approval_binding is None
-        ):
+        direct = request.target_repository is not None or request.issue_operation_id is not None
+        if direct:
             await self.repository.validate_issue_operation_approval(request)
+            if request.issue_operation_id is None:
+                raise ValueError(
+                    "approved global/R3 issue execution is owned by its durable parent; "
+                    "direct API starts require an originating typed issue operation"
+                )
         campaign = await self.repository.get_backlog_campaign(request.backlog_campaign_id)
         if campaign is None or campaign.get("project") != request.project:
             raise ValueError("existing backlog campaign does not exist")
@@ -443,15 +447,42 @@ class TemporalControlService:
             raise ValueError("existing backlog delivery mode changed after approval")
         if request.maximum_items > int(campaign.get("maximum_items") or 0):
             raise ValueError("existing backlog item bound exceeds its approval")
-        if request.issue_operation_id is not None:
+        if direct:
             await self.repository.validate_issue_operation_approval(request)
-        workflow_id = f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
-        handle = await self.client.start_workflow(
-            WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,
-            ExistingGitHubBacklogLoopInput(**request.model_dump(mode="json")),
-            id=workflow_id,
-            task_queue=self.task_queue,
+        workflow_id = (
+            f"backlog-loop-{request.project}-{request.backlog_campaign_id}"
+            f"-operation-{request.issue_operation_id}"
+            if request.issue_operation_id is not None
+            else f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
         )
+        try:
+            handle = await self.client.start_workflow(
+                WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,
+                ExistingGitHubBacklogLoopInput(**request.model_dump(mode="json")),
+                id=workflow_id,
+                task_queue=self.task_queue,
+                id_reuse_policy=(
+                    WorkflowIDReusePolicy.REJECT_DUPLICATE
+                    if direct
+                    else WorkflowIDReusePolicy.ALLOW_DUPLICATE
+                ),
+                rpc_timeout=timedelta(seconds=30),
+            )
+        except WorkflowAlreadyStartedError as error:
+            if not direct:
+                raise
+            existing = self.client.get_workflow_handle(workflow_id, run_id=error.run_id)
+            description = await existing.describe(rpc_timeout=timedelta(seconds=30))
+            if (
+                description.id != workflow_id
+                or description.workflow_type != WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value
+            ):
+                raise ValueError(
+                    "existing issue workflow identity does not match the operation"
+                ) from None
+            return OperationAccepted(
+                workflow_id=workflow_id, run_id=description.run_id, status="EXISTING"
+            )
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )

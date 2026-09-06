@@ -53,6 +53,7 @@ from engineering_control.engineering.backlog import (
     canonical_sha256,
     is_reauthenticated_backlog_operator,
 )
+from engineering_control.engineering.backlog_authority import require_alternative_issue_authority
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
 from engineering_control.operations.issue_approval import (
@@ -639,6 +640,9 @@ class SQLMetadataRepository:
 
     def _validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:
         with self.sessions() as session:
+            if request.issue_operation_id is None:
+                require_alternative_issue_authority(session, request)
+                return
             require_issue_request_approval(session, request)
             campaign = session.get(GitHubBacklogCampaign, request.backlog_campaign_id)
             raw = campaign.approval_json.get("binding") if campaign is not None else None

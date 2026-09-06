@@ -18,7 +18,6 @@ from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_PROJECT_PAIRS,
     BACKLOG_SKIP_REASONS,
-    BacklogApprovalBinding,
     BacklogIssueRecord,
     BacklogIssueType,
     GitHubBacklogImportSnapshot,
@@ -27,6 +26,12 @@ from engineering_control.engineering.backlog import (
     classify_issue,
     is_reauthenticated_backlog_operator,
     plan_records,
+)
+from engineering_control.engineering.backlog_authority import (
+    _current_backlog_approval,
+    _global_campaign_authorizes,
+    _valid_r3_candidate,
+    require_alternative_issue_authority,
 )
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import EnhancementProposal
@@ -59,55 +64,6 @@ _TERMINAL_GLOBAL_BLOCKERS = frozenset(
         "NEEDS_PRODUCT_DECISION",
     }
 )
-
-
-def _current_backlog_approval(
-    campaign: db.GitHubBacklogCampaign | None,
-    *,
-    delivery_mode: str,
-    maximum_risk: str,
-    now: datetime,
-) -> BacklogApprovalBinding | None:
-    if (
-        campaign is None
-        or campaign.status
-        not in {"APPROVED_POLICY_PENDING", "APPROVED_INVENTORY", "APPROVED", "RUNNING"}
-        or campaign.delivery_mode != delivery_mode
-        or campaign.maximum_risk != maximum_risk
-        or not campaign.approval_binding
-        or not isinstance(campaign.approval_json, dict)
-    ):
-        return None
-    approval = campaign.approval_json
-    raw_binding = approval.get("binding")
-    binding_value = raw_binding if isinstance(raw_binding, dict) else approval
-    raw_approval = approval.get("approval")
-    approval_record = raw_approval if isinstance(raw_approval, dict) else approval
-    if (
-        approval_record.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
-        or not isinstance(approval_record.get("approved_by"), str)
-        or not approval_record.get("approved_at")
-    ):
-        return None
-    try:
-        binding = BacklogApprovalBinding.model_validate(
-            {field: binding_value.get(field) for field in BacklogApprovalBinding.model_fields}
-        )
-    except ValueError:
-        return None
-    if (
-        binding.sha256() != campaign.approval_binding
-        or binding.backlog_campaign_id != str(campaign.id)
-        or binding.project != campaign.project
-        or binding.source_head != campaign.source_head_at_import
-        or binding.deployment_head != campaign.deployment_head_at_import
-        or binding.dependency_plan_hash != campaign.plan_hash
-        or binding.delivery_mode != delivery_mode
-        or binding.maximum_risk != maximum_risk
-        or _as_utc(binding.expires_at) <= now
-    ):
-        return None
-    return binding
 
 
 class EngineeringActivityHandler:
@@ -988,7 +944,7 @@ class EngineeringActivityHandler:
                 or campaign.project != payload.get("project")
                 or approval is None
                 or (global_campaign is None and campaign.status == "APPROVED_INVENTORY")
-                or (global_campaign is not None and not globally_authorized)
+                or (raw_global_id is not None and not globally_authorized)
             ):
                 return {
                     **payload,
@@ -1074,75 +1030,15 @@ class EngineeringActivityHandler:
         target_issue_number: int,
         r3_approval_binding: str,
     ) -> bool:
-        if (
-            campaign is None
-            or campaign.project != "platform"
-            or campaign.status
-            not in {
-                "RUNNING",
-                "PAUSED",
-            }
-        ):
-            return False
-        metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
-        ids = metadata.get("backlog_campaign_ids")
-        delivery_modes = metadata.get("delivery_modes")
-        approval_bindings = metadata.get("inventory_approval_bindings")
-        project = (
-            next(
-                (
-                    str(name)
-                    for name, value in ids.items()
-                    if str(value) == str(backlog_campaign_id)
-                ),
-                None,
-            )
-            if isinstance(ids, dict)
-            else None
-        )
-        backlog = session.get(db.GitHubBacklogCampaign, backlog_campaign_id)
-        current_approval = _current_backlog_approval(
-            backlog,
-            delivery_mode=delivery_mode,
-            maximum_risk="R2",
-            now=datetime.now(UTC),
-        )
-        return (
-            metadata.get("kind") == "autonomous-global-backlog"
-            and metadata.get("environment") == "staging"
-            and metadata.get("maximum_risk") == "R2"
-            and maximum_risk in {"R2", "R3"}
-            and project in {"falcone", "musematic", "llmwiki"}
-            and isinstance(delivery_modes, dict)
-            and delivery_modes.get(project) == delivery_mode
-            and delivery_mode in {"source-pr", "full-delivery"}
-            and isinstance(approval_bindings, dict)
-            and current_approval is not None
-            and approval_bindings.get(project) == current_approval.sha256()
-            and metadata.get("production") is False
-            and isinstance(ids, dict)
-            and str(ids.get(project)) == str(backlog_campaign_id)
-            and (
-                maximum_risk == "R2"
-                or (
-                    bool(target_repository)
-                    and target_issue_number > 0
-                    and bool(r3_approval_binding)
-                    and session.scalar(
-                        select(db.ActionCandidate.id)
-                        .where(
-                            db.ActionCandidate.action == "r3_issue_approval",
-                            db.ActionCandidate.target_id
-                            == f"{target_repository}#{target_issue_number}",
-                            db.ActionCandidate.binding_hash == r3_approval_binding,
-                            db.ActionCandidate.used_at.is_not(None),
-                            db.ActionCandidate.expires_at > datetime.now(UTC),
-                        )
-                        .limit(1)
-                    )
-                    is not None
-                )
-            )
+        return _global_campaign_authorizes(
+            session,
+            campaign,
+            backlog_campaign_id,
+            maximum_risk,
+            delivery_mode,
+            target_repository,
+            target_issue_number,
+            r3_approval_binding,
         )
 
     @staticmethod
@@ -1151,26 +1047,7 @@ class EngineeringActivityHandler:
         issue: db.BacklogIssueRecord,
         binding: str | None = None,
     ) -> db.ActionCandidate | None:
-        query = select(db.ActionCandidate).where(
-            db.ActionCandidate.action == "r3_issue_approval",
-            db.ActionCandidate.target_id == f"{issue.repository}#{issue.issue_number}",
-            db.ActionCandidate.used_at.is_not(None),
-            db.ActionCandidate.expires_at > datetime.now(UTC),
-        )
-        if binding:
-            query = query.where(db.ActionCandidate.binding_hash == binding)
-        candidates = session.scalars(
-            query.order_by(db.ActionCandidate.created_at.desc()).limit(10)
-        ).all()
-        for candidate in candidates:
-            payload = candidate.payload_json
-            if (
-                payload.get("issue_body_sha256") == issue.body_sha256
-                and payload.get("issue_updated_at") == issue.github_updated_at.isoformat()
-                and payload.get("production") is False
-            ):
-                return candidate
-        return None
+        return _valid_r3_candidate(session, issue, binding)
 
     def _register_global_backlog(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["campaign_id"]))
@@ -1733,12 +1610,15 @@ class EngineeringActivityHandler:
             or payload.get("target_issue_number") is not None
         )
         if operation_id is None and binding is None:
-            if (
-                direct
-                and payload.get("global_campaign_id") is None
-                and payload.get("r3_approval_binding") is None
-            ):
-                raise ValueError("direct issue execution has no durable approval")
+            if direct:
+                request = ExistingBacklogLoopStart.model_validate(
+                    {
+                        key: payload[key]
+                        for key in ExistingBacklogLoopStart.model_fields
+                        if key in payload
+                    }
+                )
+                require_alternative_issue_authority(session, request)
             return
         if not direct or not isinstance(binding, str) or operation_id is None:
             raise ValueError("direct issue approval binding is incomplete")

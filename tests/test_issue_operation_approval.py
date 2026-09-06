@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
+from temporalio.common import WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
 from test_controlled_operations import (
     CAMPAIGN_ID,
     _idempotency_fixture,
@@ -33,6 +35,52 @@ from engineering_control.workflows.definitions import _backlog_execution_payload
 from engineering_control.workflows.inputs import ExistingGitHubBacklogLoopInput
 
 POLICY_SCRIPT = Path(__file__).resolve().parents[1] / "scripts/reconcile-backlog-github-policy.py"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_matches", [True, False])
+async def test_repeated_direct_handoff_uses_one_durable_workflow_id(
+    tmp_path: Path, identity_matches: bool
+) -> None:
+    operations, metadata, handler, request = await _approved_direct_request(tmp_path)
+    workflow_id = (
+        f"backlog-loop-{request.project}-{request.backlog_campaign_id}"
+        f"-operation-{request.issue_operation_id}"
+    )
+    workflow_type = "ExistingGitHubBacklogLoopWorkflow"
+    client = Mock()
+    client.start_workflow = AsyncMock(
+        side_effect=[
+            SimpleNamespace(first_execution_run_id="fixture-run"),
+            WorkflowAlreadyStartedError(workflow_id, workflow_type, run_id="fixture-run"),
+        ]
+    )
+    client.get_workflow_handle.return_value.describe = AsyncMock(
+        return_value=SimpleNamespace(
+            id=workflow_id,
+            run_id="fixture-run",
+            workflow_type=workflow_type if identity_matches else "UnrelatedWorkflow",
+        )
+    )
+    service = TemporalControlService(client, "isolated-recorder-only", metadata)
+    first = await service.start_existing_backlog_loop(request)
+    if identity_matches:
+        second = await service.start_existing_backlog_loop(request)
+        assert first.workflow_id == second.workflow_id == workflow_id
+        assert first.run_id == second.run_id == "fixture-run"
+        assert second.status == "EXISTING"
+    else:
+        with pytest.raises(ValueError, match="identity does not match"):
+            await service.start_existing_backlog_loop(request)
+    assert len(client.start_workflow.await_args_list) == 2
+    assert all(call.kwargs["id"] == workflow_id for call in client.start_workflow.await_args_list)
+    assert all(
+        call.kwargs["id_reuse_policy"] == WorkflowIDReusePolicy.REJECT_DUPLICATE
+        for call in client.start_workflow.await_args_list
+    )
+    handler.engine.dispose()
+    metadata.engine.dispose()
+    operations.engine.dispose()
 
 
 @pytest.mark.asyncio
