@@ -7,14 +7,17 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import create_engine, func, or_, select
-from sqlalchemy.dialects.postgresql import insert as postgresql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.coverage_outcome import coverage_outcome, normalized_coverage_status
 from engineering_control.dashboard.auth import PasswordService
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.schemas import ActivityEventInput
+from engineering_control.dashboard.session_store import (
+    SessionAuthorization,
+    lock_authentication,
+    retire_session,
+)
 from engineering_control.dashboard.status_mapping import (
     TERMINAL_STATUSES,
     map_status,
@@ -193,31 +196,28 @@ class DashboardRepository:
     ) -> None:
         if _SESSION_BINDING_DIGEST.fullmatch(session_binding_hash) is None:
             raise ValueError("dashboard session binding is invalid")
-        now = datetime.now(UTC)
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=UTC)
         with self.sessions.begin() as session:
-            values = {
-                "session_binding_hash": session_binding_hash,
-                "password_version": password_version,
-                "revoked_at": now,
-                "expires_at": expires_at,
-            }
-            statement: Any
-            if self._session_revocation_dialect == "postgresql":
-                statement = postgresql_insert(DashboardSessionRevocation).values(**values)
-            else:
-                statement = sqlite_insert(DashboardSessionRevocation).values(**values)
-            session.execute(
-                statement.on_conflict_do_update(
-                    index_elements=[DashboardSessionRevocation.session_binding_hash],
-                    set_={
-                        "password_version": password_version,
-                        "revoked_at": now,
-                        "expires_at": expires_at,
-                    },
-                )
+            lock_authentication(session)
+            retire_session(
+                session, SessionAuthorization(session_binding_hash, password_version, expires_at)
             )
+
+    async def confirm_login(
+        self, password_version: int, previous: SessionAuthorization | None
+    ) -> None:
+        await asyncio.to_thread(self._confirm_login, password_version, previous)
+
+    def _confirm_login(self, password_version: int, previous: SessionAuthorization | None) -> None:
+        with self.sessions.begin() as session:
+            row = lock_authentication(session)
+            if row.password_version != password_version:
+                raise ValueError("dashboard authentication changed; sign in again")
+            # A valid password can recover from a lost rotation response even if
+            # the presented old cookie was already revoked. Other sessions stay.
+            if previous is not None:
+                retire_session(session, previous)
 
     async def verify_password(self, password: str) -> int | None:
         return await asyncio.to_thread(self._verify_password, password)

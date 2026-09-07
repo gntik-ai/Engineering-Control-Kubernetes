@@ -691,6 +691,9 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
             },
         )
         assert authorized.status_code == 200
+        assert authorized.json()["session_rotated"] is True
+        assert authorized.json()["csrf_token"] != csrf
+        csrf = authorized.json()["csrf_token"]
         queued = client.post(
             "/api/dashboard/actions/execute",
             json={

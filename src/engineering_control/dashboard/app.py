@@ -31,7 +31,6 @@ from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard.admission import AdmissionReader
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
-    SESSION_CLOCK_SKEW_SECONDS,
     SESSION_COOKIE,
     LoginFailureLimiter,
     SignedSessionManager,
@@ -49,6 +48,7 @@ from engineering_control.dashboard.schemas import (
     R3CandidateCreateInput,
 )
 from engineering_control.dashboard.service import DashboardService
+from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
 from engineering_control.dashboard.streaming import RevocableStreamingResponse, StreamAuthorization
 from engineering_control.logging import configure_logging
@@ -195,6 +195,13 @@ def create_app(
 
     def operations(request: Request) -> OperationsRepository:
         return cast(OperationsRepository, request.app.state.operations_repository)
+
+    def session_authorization(authenticated: AuthenticatedSession) -> SessionAuthorization:
+        return SessionAuthorization(
+            sessions.binding_digest(authenticated.token),
+            authenticated.data.password_version,
+            datetime.fromtimestamp(authenticated.data.expires_at, UTC),
+        )
 
     async def current_session(request: Request) -> AuthenticatedSession | None:
         if getattr(request.state, "dashboard_session_checked", False):
@@ -386,8 +393,22 @@ def create_app(
             )
             _set_cookie(response, LOGIN_CSRF_COOKIE, fresh_csrf, max_age=900)
             return response
-        login_limiter.success(address)
         token = sessions.create(version)
+        previous_token = request.cookies.get(SESSION_COOKIE, "")
+        previous_data = sessions.verify(previous_token) if previous_token else None
+        previous = (
+            session_authorization(AuthenticatedSession(token=previous_token, data=previous_data))
+            if previous_data is not None
+            else None
+        )
+        try:
+            await repo(request).confirm_login(version, previous)
+        except Exception as error:  # noqa: BLE001 - never issue a cookie on uncertain rotation
+            log_failure("session-validation", "dashboard login rotation failed", error)
+            return PlainTextResponse(
+                "Sign-in is temporarily unavailable; try again.", status_code=503
+            )
+        login_limiter.success(address)
         redirect = RedirectResponse(next_path or "/overview", status_code=303)
         _set_cookie(
             redirect, SESSION_COOKIE, token, max_age=resolved.dashboard_session_hours * 3600
@@ -413,10 +434,9 @@ def create_app(
         if not _valid_csrf(authenticated, form.get("csrf_token")):
             return PlainTextResponse("invalid request", status_code=403)
         now = datetime.now(UTC)
-        grace = timedelta(seconds=SESSION_CLOCK_SKEW_SECONDS)
         expires_at = min(
-            datetime.fromtimestamp(authenticated.data.expires_at, UTC) + grace,
-            now + timedelta(seconds=sessions.lifetime_seconds) + grace,
+            datetime.fromtimestamp(authenticated.data.expires_at, UTC),
+            now + timedelta(seconds=sessions.lifetime_seconds),
         )
         try:
             await repo(request).revoke_session(
@@ -994,11 +1014,31 @@ def create_app(
             if version != authenticated.data.password_version:
                 login_limiter.failure(f"reauth:{address}")
                 return JSONResponse({"detail": "unable to authorize action"}, status_code=401)
-            token = await operations(request).create_reauthentication(
-                body.candidate_id, sessions.binding_digest(authenticated.token)
+            replacement = sessions.create(version)
+            replacement_data = sessions.verify(replacement)
+            if replacement_data is None:
+                raise ValueError("replacement session is invalid")
+            token = await operations(request).rotate_reauthentication(
+                body.candidate_id,
+                session_authorization(authenticated),
+                sessions.binding_digest(replacement),
             )
             login_limiter.success(f"reauth:{address}")
-            return JSONResponse({"reauthentication_token": token, "expires_in": 300})
+            response = JSONResponse(
+                {
+                    "reauthentication_token": token,
+                    "expires_in": 300,
+                    "csrf_token": replacement_data.csrf_token,
+                    "session_rotated": True,
+                }
+            )
+            _set_cookie(
+                response,
+                SESSION_COOKIE,
+                replacement,
+                max_age=resolved.dashboard_session_hours * 3600,
+            )
+            return response
         except Exception:  # noqa: BLE001 - never reflect password values
             return JSONResponse({"detail": "unable to authorize action"}, status_code=400)
 
@@ -1016,6 +1056,7 @@ def create_app(
                 body.reauthentication_token,
                 sessions.binding_digest(authenticated.token),
                 body.confirmation_phrase,
+                authorization=session_authorization(authenticated),
             )
             return JSONResponse(value.model_dump(mode="json"), status_code=202)
         except ValueError as error:

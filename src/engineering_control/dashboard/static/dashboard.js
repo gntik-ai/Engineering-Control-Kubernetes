@@ -65,6 +65,13 @@ const timestampCell = (value) => {
 };
 
 const csrfToken = () => document.body.dataset.csrfToken || "";
+const adoptSessionRotation = (authorized) => {
+  if (authorized.session_rotated !== true || typeof authorized.csrf_token !== "string" || authorized.csrf_token.length < 20) {
+    throw new Error("Session renewal was not confirmed. Reload and sign in before retrying.");
+  }
+  document.body.dataset.csrfToken = authorized.csrf_token;
+  document.querySelectorAll('input[name="csrf_token"]').forEach((field) => { field.value = authorized.csrf_token; });
+};
 let pendingCandidate = null;
 
 const actionEffect = (action) => {
@@ -115,6 +122,7 @@ async function confirmAction(event) {
     const authorized = await reauth.json();
     if (!reauth.ok) throw new Error(authorized.detail || "Unable to authorize operation.");
     byId("action-password").value = "";
+    adoptSessionRotation(authorized);
     const response = await fetch("/api/dashboard/actions/execute", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, reauthentication_token: authorized.reauthentication_token, confirmation_phrase: byId("action-phrase").value || null}),
@@ -132,7 +140,7 @@ async function confirmAction(event) {
     else if (operation.result_available) location.assign(`/api/dashboard/operations/${operation.operation_id}/export`);
     else location.reload();
   } catch (error) { setError("action-blockers", error.message); }
-  finally { execute.disabled = false; }
+  finally { byId("action-password").value = ""; execute.disabled = false; }
 }
 
 function setupActionDialog() {
