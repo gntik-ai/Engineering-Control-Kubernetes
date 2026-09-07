@@ -1,23 +1,32 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from publication_fixture import approved_publication
+from sqlalchemy import select
 
 from engineering_control.activities.delivery import DeliveryActivityHandler
 from engineering_control.adapters.command import CommandResult
 from engineering_control.config import Settings
+from engineering_control.db.models import BacklogIssueRecord, ComponentLease, OperationRequest
 
 
 class FakePublicationRunner:
-    def __init__(self, branch: str, heads: dict[str, str]) -> None:
+    def __init__(
+        self, branch: str, heads: dict[str, str], *, issue_snapshot: dict[str, Any] | None = None
+    ) -> None:
         self.branch = branch
         self.heads = heads
         self.created: set[str] = set()
         self.pushes: list[str] = []
+        self.issue_snapshot = issue_snapshot
+        self.issue_reads = 0
 
     def run(
         self,
@@ -27,6 +36,19 @@ class FakePublicationRunner:
         cwd: Path,
         **kwargs: Any,
     ) -> CommandResult:
+        if executable == "gh" and arguments[:2] == ["issue", "view"]:
+            assert self.issue_snapshot is not None
+            assert arguments == [
+                "issue",
+                "view",
+                "42",
+                "--repo",
+                "gntik-ai/falcone",
+                "--json",
+                "number,url,state,title,body,updatedAt",
+            ]
+            self.issue_reads += 1
+            return CommandResult(0, json.dumps(self.issue_snapshot), "")
         if executable == "git" and "branch" in arguments:
             return CommandResult(0, self.branch + "\n", "")
         if executable == "git" and "rev-parse" in arguments:
@@ -34,6 +56,7 @@ class FakePublicationRunner:
         if executable == "git" and "status" in arguments:
             return CommandResult(0, "", "")
         if executable == "git" and "push" in arguments:
+            assert arguments[-1] == f"{self.heads[cwd.parent.name]}:refs/heads/{self.branch}"
             self.pushes.append(cwd.parent.name)
             environment = kwargs.get("environment")
             assert isinstance(environment, dict)
@@ -136,28 +159,35 @@ async def test_delivery_publishes_exact_heads_as_draft_prs_without_merging(
     tmp_path: Path,
 ) -> None:
     worktree_root = tmp_path / "worktrees"
-    payload, branch, heads = publication_payload(worktree_root)
-    runner = FakePublicationRunner(branch, heads)
     project_root, policy = enabled_write_policy(
         tmp_path, ("gntik-ai/falcone", "gntik-ai/falcone-charts")
     )
-    handler = DeliveryActivityHandler(
-        Settings(
+    async with approved_publication(tmp_path) as fixture:
+        runner = FakePublicationRunner(
+            fixture.branch, fixture.heads, issue_snapshot=fixture.issue_snapshot
+        )
+        settings = Settings(
+            _env_file=None,
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             github_writes_enabled=True,
             project_config_root=project_root,
             github_issue_write_validation_file=policy,
-        ),
-        runner,  # type: ignore[arg-type]
-    )
-
-    result = await handler.handle("delivery.publish", payload)
-
-    assert result["status"] == "SOURCE_PRS_CREATED"
-    assert len(result["publication_results"]) == 2
-    assert runner.pushes == ["falcone", "falcone-charts"]
-    assert all(item["draft"] is True for item in result["publication_results"])
+        )
+        with fixture.worker(runner, settings) as handler:
+            result = await handler.handle("delivery.publish", fixture.prepared)
+            assert result["status"] == "SOURCE_PRS_CREATED"
+            assert len(result["publication_results"]) == 2
+            assert runner.pushes == ["falcone", "falcone-charts"]
+            assert all(item["draft"] is True for item in result["publication_results"])
+            assert runner.issue_reads == 4
+            assert len(fixture.receipts()) == 4
+            assert all(row["status"] == "COMPLETE" for row in fixture.receipts())
+            again = await handler.handle("delivery.publish", fixture.prepared)
+            assert again["status"] == "SOURCE_PRS_CREATED"
+            assert runner.pushes == ["falcone", "falcone-charts"]
+            assert len(runner.created) == 2
+        assert not (tmp_path / "publication-fixture.token").exists()
 
 
 @pytest.mark.asyncio
@@ -218,34 +248,91 @@ async def test_delivery_write_policy_blocks_before_git_push(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_source_only_publication_binds_deferred_deployment(tmp_path: Path) -> None:
     worktree_root = tmp_path / "worktrees"
-    payload, branch, heads = publication_payload(worktree_root)
-    plan = payload["publication_plan"]
-    deployment = plan["publications"].pop()
-    plan["deferred_deployment"] = {
-        "repository_slug": "falcone-charts",
-        "branch": branch,
-        "head_sha": deployment["head_sha"],
-        "base_sha": deployment["head_sha"],
-        "reason": "AWAITING_IMMUTABLE_ARTIFACT",
-    }
-    runner = FakePublicationRunner(branch, heads)
     project_root, policy = enabled_write_policy(tmp_path, ("gntik-ai/falcone",))
-    handler = DeliveryActivityHandler(
-        Settings(
+    async with approved_publication(tmp_path, deployment_changed=False) as fixture:
+        runner = FakePublicationRunner(
+            fixture.branch, fixture.heads, issue_snapshot=fixture.issue_snapshot
+        )
+        settings = Settings(
+            _env_file=None,
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             github_writes_enabled=True,
             project_config_root=project_root,
             github_issue_write_validation_file=policy,
-        ),
-        runner,  # type: ignore[arg-type]
+        )
+        with fixture.worker(runner, settings) as handler:
+            result = await handler.handle("delivery.publish", fixture.prepared)
+        assert result["status"] == "SOURCE_PRS_CREATED"
+        assert [item["repository_slug"] for item in result["publication_results"]] == ["falcone"]
+        assert runner.pushes == ["falcone"]
+        assert runner.created == {"gntik-ai/falcone"}
+        assert runner.issue_reads == 2
+        assert len(fixture.receipts()) == 2
+        assert all(row["status"] == "COMPLETE" for row in fixture.receipts())
+        assert (
+            result["publication_plan"]["deferred_deployment"]["reason"]
+            == "AWAITING_IMMUTABLE_ARTIFACT"
+        )
+        assert not (tmp_path / "publication-fixture.token").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "missing_intent",
+        "database_revision",
+        "remote_revision",
+        "workflow_run",
+        "lease",
+        "operation",
+        "plan",
+    ],
+)
+async def test_approved_publication_rechecks_authority_before_any_effect(
+    tmp_path: Path, changed: str
+) -> None:
+    project_root, policy = enabled_write_policy(
+        tmp_path, ("gntik-ai/falcone", "gntik-ai/falcone-charts")
     )
-
-    result = await handler.handle("delivery.publish", payload)
-
-    assert result["status"] == "SOURCE_PRS_CREATED"
-    assert [item["repository_slug"] for item in result["publication_results"]] == ["falcone"]
-    assert runner.pushes == ["falcone"]
+    async with approved_publication(tmp_path) as fixture:
+        payload = deepcopy(fixture.prepared)
+        snapshot = deepcopy(fixture.issue_snapshot)
+        if changed == "missing_intent":
+            payload.pop("publication_intent")
+        elif changed == "remote_revision":
+            snapshot["body"] = "A different inert issue revision."
+        elif changed == "workflow_run":
+            payload["orchestration"]["workflow_run_id"] = str(uuid4())
+        elif changed == "plan":
+            payload["publication_plan"]["publications"][0]["body"] += " Changed after approval."
+        else:
+            with fixture.metadata.sessions.begin() as session:
+                if changed == "database_revision":
+                    session.scalar(select(BacklogIssueRecord)).body_sha256 = "9" * 64
+                elif changed == "lease":
+                    session.get(ComponentLease, UUID(payload["component_lease_id"])).expires_at = (
+                        datetime.now(UTC) - timedelta(seconds=1)
+                    )
+                elif changed == "operation":
+                    session.scalar(select(OperationRequest)).status = "BLOCKED"
+        runner = FakePublicationRunner(fixture.branch, fixture.heads, issue_snapshot=snapshot)
+        settings = Settings(
+            _env_file=None,
+            worktree_root=tmp_path / "worktrees",
+            run_root=tmp_path / "runs",
+            github_writes_enabled=True,
+            project_config_root=project_root,
+            github_issue_write_validation_file=policy,
+        )
+        with fixture.worker(runner, settings) as handler:
+            result = await handler.handle("delivery.publish", payload)
+        assert result["status"] == "BLOCKED"
+        assert result["blocker"] == "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED"
+        assert runner.pushes == [] and runner.created == set()
+        assert fixture.receipts() == []
+        assert not (tmp_path / "publication-fixture.token").exists()
 
 
 @pytest.mark.asyncio

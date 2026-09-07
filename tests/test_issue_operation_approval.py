@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import runpy
 from dataclasses import asdict
@@ -120,13 +121,18 @@ async def test_delayed_all_channel_dispatch_denies_changed_approval(
     repository.engine.dispose()
 
 
-async def _approved_direct_request(tmp_path: Path, *, eligibility: str = "READY"):
+async def _approved_direct_request(
+    tmp_path: Path, *, eligibility: str = "READY", issue_body: str | None = None
+):
     operations = _repository(tmp_path)
     _seed_ready_issue(operations)
     with operations.sessions.begin() as session:
         issue = session.scalar(select(BacklogIssueRecord))
         assert issue is not None
         issue.eligibility_status = eligibility
+        if issue_body is not None:
+            # Bind a recoverable inert body before creating the approved operation.
+            issue.body_sha256 = hashlib.sha256(issue_body.encode()).hexdigest()
     operation = await operations.create_external(
         _solve_issue(),
         source_channel="cli",

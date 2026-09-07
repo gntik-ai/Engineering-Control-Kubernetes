@@ -45,8 +45,10 @@ STARTED describes dispatch acknowledgement, not terminal workflow success.
   effects, console/Telegram consistency and matching assembled/live acceptance
   retain their existing required gates. No unknown effect may be manually cleared
   on the strength of these tests.
-- The previous three positive publication-fixture failures must be retained and
-  resolved with legitimate originating authority, not deleted or bypassed.
+- The previous three positive publication-fixture failures are retained in audit
+  history. Their tests now obtain legitimate originating authority through the
+  [approved publication fixture](publication-positive-fixtures.md). This closes
+  that test-contract gap, not the missing importer/loop or live-delivery gates.
 
 Schema0015 and Agent Pack are unchanged. This is not a replacement for the
 separately prepared memory-release artifact or its exact change-control binding.

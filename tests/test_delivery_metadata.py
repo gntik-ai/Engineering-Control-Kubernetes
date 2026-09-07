@@ -7,8 +7,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from publication_fixture import approved_publication
 from sqlalchemy import select
-from test_metadata_activity import add_changeset_finding
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
@@ -94,62 +94,20 @@ def checker_result() -> dict[str, object]:
 async def test_publication_plan_defers_unchanged_deployment_repository(
     tmp_path: Path,
 ) -> None:
-    handler = MetadataActivityHandler(
-        Settings(database_url=f"sqlite:///{tmp_path / 'plan.sqlite'}")
-    )
-    change_set_id = uuid4()
-    branch = f"agent/falcone/123/{change_set_id}"
-    Base.metadata.create_all(handler.engine)
-    with handler.sessions.begin() as session:
-        session.add(
-            ChangeSet(
-                id=change_set_id,
-                finding_id=uuid4(),
-                project="falcone",
-                risk_class="R1",
-                state="IMPLEMENTING",
-                version=1,
-                source_repository="falcone",
-                source_base_sha="a" * 40,
-                deployment_repository="falcone-charts",
-                deployment_base_sha="c" * 40,
-                image_digests={},
-                recovery_json={},
-            )
-        )
-    add_changeset_finding(handler, change_set_id)
-    result = await handler.handle(
-        "delivery.prepare_publication",
-        {
-            "change_set_id": str(change_set_id),
-            "change_evidence": {
-                "source": {"head_sha": "b" * 40, "changed_file_count": 1},
-                "deployment": {"head_sha": "c" * 40, "changed_file_count": 0},
-            },
-            "source_base_sha": "a" * 40,
-            "deployment_base_sha": "c" * 40,
-            "source_repository": "falcone",
-            "deployment_repository": "falcone-charts",
-            "source_worktree": str(tmp_path / "source"),
-            "deployment_worktree": str(tmp_path / "deployment"),
-            "source_branch": branch,
-            "deployment_branch": branch,
-            "issue_url": "https://github.com/gntik-ai/falcone/issues/123",
-            "openspec_identifier": f"engineering/{change_set_id}",
-            "risk_class": "R1",
-            "domain": "gateway",
-        },
-    )
-
-    plan = result["publication_plan"]
-    assert [item["repository_slug"] for item in plan["publications"]] == ["falcone"]
-    assert plan["deferred_deployment"] == {
-        "repository_slug": "falcone-charts",
-        "branch": branch,
-        "head_sha": "c" * 40,
-        "base_sha": "c" * 40,
-        "reason": "AWAITING_IMMUTABLE_ARTIFACT",
-    }
+    async with approved_publication(tmp_path, deployment_changed=False) as fixture:
+        result = await fixture.metadata.handle("delivery.prepare_publication", fixture.input)
+        assert result["status"] == "PUBLICATION_READY"
+        assert result["publication_intent"] == fixture.prepared["publication_intent"]
+        plan = result["publication_plan"]
+        assert [item["repository_slug"] for item in plan["publications"]] == ["falcone"]
+        assert plan["deferred_deployment"] == {
+            "repository_slug": "falcone-charts",
+            "branch": fixture.branch,
+            "head_sha": fixture.heads["falcone-charts"],
+            "base_sha": fixture.input["deployment_base_sha"],
+            "reason": "AWAITING_IMMUTABLE_ARTIFACT",
+        }
+        assert fixture.receipts() == []
 
 
 @pytest.mark.asyncio

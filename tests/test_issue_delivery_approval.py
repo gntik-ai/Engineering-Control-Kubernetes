@@ -40,15 +40,17 @@ def test_delivery_payload_preserves_legacy_serialized_fields(approval: str | Non
     ) == [request]
 
 
-async def _child(tmp_path: Path, *, eligibility: str = "READY"):
+async def _child(tmp_path: Path, *, eligibility: str = "READY", issue_body: str | None = None):
     operations, metadata, engineering, request = await _approved_direct_request(
-        tmp_path, eligibility=eligibility
+        tmp_path, eligibility=eligibility, issue_body=issue_body
     )
     handler = MetadataActivityHandler(
         Settings(
             _env_file=None,
             database_url=str(operations.engine.url),
             state_root=tmp_path / "state",
+            worktree_root=tmp_path / "worktrees",
+            run_root=tmp_path / "runs",
             project_config_root=Path(__file__).parents[1] / "config/projects",
         )
     )
