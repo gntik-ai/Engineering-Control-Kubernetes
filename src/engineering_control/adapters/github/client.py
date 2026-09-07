@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
+from engineering_control.models.publication_authority import IssueRevisionObservation
 
 ALLOWED_REPOSITORIES = frozenset(
     {
@@ -242,6 +245,49 @@ class GhCliBroker:
         if not isinstance(comments, list) or len(comments) > 500:
             raise GhCliPolicyError("issue comments response is unbounded")
         return value
+
+    def observe_issue_revision(self, repository: str, number: int) -> IssueRevisionObservation:
+        """One fixed allowlisted read; only revision digests leave this method."""
+        if type(number) is not int or not 1 <= number <= 2_147_483_647:
+            raise GhCliPolicyError("issue observation number is invalid")
+        repository = self._batch(repository)
+        value = self._json(
+            self._run(
+                [
+                    "issue",
+                    "view",
+                    str(number),
+                    "--repo",
+                    repository,
+                    "--json",
+                    "number,url,state,title,body,updatedAt",
+                ]
+            ).stdout,
+            "issue revision",
+        )
+        if (
+            not isinstance(value, dict)
+            or type(value.get("number")) is not int
+            or value["number"] != number
+            or value.get("url") != f"https://github.com/{repository}/issues/{number}"
+            or not isinstance(value.get("title"), str)
+            or not isinstance(value.get("body"), str)
+            or len(value["title"]) > 300
+            or len(value["body"].encode()) > 262144
+            or not isinstance(value.get("updatedAt"), str)
+        ):
+            raise GhCliPolicyError("issue observation does not match its bounded target")
+        return IssueRevisionObservation.model_validate(
+            {
+                "repository": repository,
+                "number": number,
+                "state": value.get("state"),
+                "title_sha256": hashlib.sha256(value["title"].encode()).hexdigest(),
+                "body_sha256": hashlib.sha256(value["body"].encode()).hexdigest(),
+                "updated_at": value["updatedAt"],
+                "observed_at": datetime.now(UTC),
+            }
+        )
 
     def list_workflow_runs(
         self,

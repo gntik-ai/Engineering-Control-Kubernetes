@@ -15,6 +15,10 @@ from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker, GhCliPolicyError
+from engineering_control.adapters.publication_authority import (
+    PublicationAuthorityClient,
+    PublicationAuthorityError,
+)
 from engineering_control.config import Settings
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.evidence.transfer import EvidencePublisher
@@ -137,8 +141,10 @@ class DeliveryActivityHandler:
         settings: Settings,
         runner: SafeCommandRunner | None = None,
         broker: GhCliBroker | None = None,
+        publication_authority: PublicationAuthorityClient | None = None,
     ) -> None:
         self.settings = settings
+        self.publication_authority = publication_authority
         self.runner = runner or SafeCommandRunner(
             {"git": settings.git_executable, "gh": settings.github_executable}
         )
@@ -191,8 +197,25 @@ class DeliveryActivityHandler:
             raise ApplicationError("unsupported delivery activity", non_retryable=True)
         try:
             plan = PublicationPlan.model_validate(payload.get("publication_plan"))
+            if not isinstance(payload.get("publication_intent"), dict):
+                raise PublicationAuthorityError("publication requires its durable intent")
+            authority = self.publication_authority or PublicationAuthorityClient(
+                self.settings, self.broker
+            )
             self.broker.preflight(tuple(item.repository for item in plan.publications))
-            results = [self._publish(item) for item in plan.publications]
+            results = [
+                self._publish(
+                    item, publication_context=(authority, payload, plan.model_dump(mode="json"))
+                )
+                for item in plan.publications
+            ]
+        except PublicationAuthorityError as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED",
+                "publication_effect_unknown": error.unknown,
+            }
         except GhCliAuthError:
             return {
                 **payload,
@@ -835,7 +858,13 @@ class DeliveryActivityHandler:
             raise ValueError("GitHub registry auth file permissions are invalid")
         return resolved
 
-    def _publish(self, plan: RepositoryPublication) -> dict[str, Any]:
+    def _publish(
+        self,
+        plan: RepositoryPublication,
+        *,
+        publication_context: tuple[PublicationAuthorityClient, dict[str, Any], dict[str, Any]]
+        | None = None,
+    ) -> dict[str, Any]:
         worktree = self._bounded_worktree(plan)
         git_arguments = ["-c", f"safe.directory={worktree}"]
         branch = self.runner.run(
@@ -856,33 +885,71 @@ class DeliveryActivityHandler:
             "GIT_CONFIG_KEY_0": "safe.directory",
             "GIT_CONFIG_VALUE_0": str(worktree),
         }
-        self.runner.run(
-            "git",
-            [
-                *git_arguments,
-                "push",
-                "--porcelain",
-                f"https://github.com/{plan.repository}.git",
-                f"HEAD:refs/heads/{plan.branch}",
-            ],
-            cwd=worktree,
-            timeout_seconds=900,
-            environment=environment,
-        )
+
+        def push() -> Any:
+            denial = self.write_policy.evaluate(lambda: (plan.repository,))
+            if denial is not None:
+                raise PublicationAuthorityError("publication write policy changed before push")
+            return self.runner.run(
+                "git",
+                [
+                    *git_arguments,
+                    "push",
+                    "--porcelain",
+                    f"https://github.com/{plan.repository}.git",
+                    f"{plan.head_sha}:refs/heads/{plan.branch}",
+                ],
+                cwd=worktree,
+                timeout_seconds=900,
+                environment=environment,
+            )
+
+        if publication_context is None:
+            # Promotion's distinct immutable artifact/approval path is not silently
+            # declared accepted by the initial-publication authority follow-up.
+            push()
+        else:
+            authority, payload, full_plan = publication_context
+            authority.execute(
+                payload=payload,
+                plan=full_plan,
+                repository=plan.repository,
+                action="git_push",
+                operation=push,
+            )
         existing = self._existing_pull_request(plan)
         if existing is None:
             body_path = self._body_file(plan)
             try:
-                created = self.broker.create_pull_request(
-                    repository=plan.repository,
-                    head=plan.branch,
-                    base=plan.base_branch,
-                    title=plan.title,
-                    body_file=body_path,
-                    change_binding=f"changeset:{plan.branch.rsplit('/', 1)[-1]}",
-                    draft=True,
-                )
-                if not re.fullmatch(
+
+                def create_pr() -> str:
+                    denial = self.write_policy.evaluate(lambda: (plan.repository,))
+                    if denial is not None:
+                        raise PublicationAuthorityError(
+                            "publication write policy changed before PR creation"
+                        )
+                    return self.broker.create_pull_request(
+                        repository=plan.repository,
+                        head=plan.branch,
+                        base=plan.base_branch,
+                        title=plan.title,
+                        body_file=body_path,
+                        change_binding=f"changeset:{plan.branch.rsplit('/', 1)[-1]}",
+                        draft=True,
+                    )
+
+                created: str | None
+                if publication_context is None:
+                    created = create_pr()
+                else:
+                    created = authority.execute(
+                        payload=payload,
+                        plan=full_plan,
+                        repository=plan.repository,
+                        action="pr_create",
+                        operation=create_pr,
+                    )
+                if created is not None and not re.fullmatch(
                     rf"https://github\.com/{re.escape(plan.repository)}/pull/[1-9][0-9]*",
                     created,
                 ):

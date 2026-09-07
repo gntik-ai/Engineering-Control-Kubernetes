@@ -322,6 +322,9 @@ def install_policy(path: Path, backup_root: Path, group_id: int, *, enabled: boo
         0o640,
     )
     try:
+        # systemd deliberately sets UMask=0077. os.open(..., 0o640) alone
+        # therefore creates 0600 and makes the next strict validation fail.
+        os.fchmod(descriptor, 0o640)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(content)
             stream.flush()

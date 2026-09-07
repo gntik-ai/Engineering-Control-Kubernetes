@@ -51,6 +51,7 @@ from engineering_control.db.models import (
     ProviderUsage,
     QuotaSnapshot,
     Run,
+    Step,
     VerificationResult,
     WorktreeLease,
 )
@@ -97,6 +98,7 @@ from engineering_control.operations.issue_delivery_approval import (
     validate_change_set_issue_approval,
     validate_child_issue_approval,
 )
+from engineering_control.operations.publication_authority import persist_publication_intent
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
@@ -2968,14 +2970,25 @@ class MetadataActivityHandler:
                 "base_sha": str(payload["deployment_base_sha"]),
                 "reason": "AWAITING_IMMUTABLE_ARTIFACT",
             }
+        publication_plan = {
+            "change_set_id": str(change_set_id),
+            "publications": publications,
+            "deferred_deployment": deferred_deployment,
+        }
+        try:
+            with self.sessions.begin() as session:
+                intent = persist_publication_intent(session, payload, publication_plan)
+        except (ValueError, KeyError, TypeError):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "PUBLICATION_AUTHORITY_REQUIRED_OR_CHANGED",
+            }
         return {
             **payload,
             "status": "PUBLICATION_READY",
-            "publication_plan": {
-                "change_set_id": str(change_set_id),
-                "publications": publications,
-                "deferred_deployment": deferred_deployment,
-            },
+            "publication_plan": publication_plan,
+            "publication_intent": intent,
         }
 
     def _persist_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -7671,6 +7684,20 @@ class MetadataActivityHandler:
 
     @staticmethod
     def _release_implementation_leases(session: Any, run: Run) -> None:
+        ComponentLeaseManager()._serialize_scope(session, f"implementation:{run.project}")
+        if (
+            session.scalar(
+                select(Step.id)
+                .where(
+                    Step.run_id == run.id,
+                    Step.name == "delivery.publication_effect",
+                    Step.status.in_(("STARTED", "UNKNOWN")),
+                )
+                .limit(1)
+            )
+            is not None
+        ):
+            return
         now = datetime.now(UTC)
         leases = session.scalars(
             select(ComponentLease).where(
