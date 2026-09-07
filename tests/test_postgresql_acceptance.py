@@ -19,13 +19,16 @@ from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.db.models import (
     ACTIVE_OPERATION_STATUSES,
     ActionCandidate,
+    BacklogIssueRecord,
     DashboardSessionRevocation,
+    GitHubBacklogCampaign,
     NotificationOutbox,
     OperationRequest,
     ReauthenticationBinding,
     Run,
 )
 from engineering_control.db.repository import SQLMetadataRepository
+from engineering_control.operations.issue_approval import current_issue_approval_binding
 from engineering_control.operations.models import RefreshConnectionsCommand, SolveIssueCommand
 from engineering_control.operations.repository import OperationsRepository
 
@@ -340,11 +343,84 @@ async def test_postgresql_simultaneous_issue_starts_return_one_active_owner() ->
     issue_number = 100_000 + (uuid4().int % 800_000)
     command_value = SolveIssueCommand(
         project="falcone",
-        backlog_campaign_id=uuid5(NAMESPACE_URL, "hermes-owner-race-campaign"),
+        backlog_campaign_id=uuid4(),
         repository="gntik-ai/falcone",
         issue_number=issue_number,
         delivery_mode="source-pr",
     )
+    # The current admission contract binds an authoritative imported snapshot.
+    # A synthetic command alone is not an approval and must still be rejected.
+    with pytest.raises(ValueError, match="authoritative project backlog"):
+        await repository.create_external(
+            command_value,
+            source_channel="cli",
+            operator_class="local-operator",
+            idempotency_key=f"missing-backlog-owner-race-{issue_number}",
+        )
+    now = datetime.now(UTC)
+    issue_id = uuid4()
+    with repository.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=command_value.backlog_campaign_id,
+                project="falcone",
+                source_repository="gntik-ai/falcone",
+                deployment_repository="gntik-ai/falcone-charts",
+                imported_at=now,
+                issue_query="is:issue is:open",
+                import_filter="bugs-and-docs",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=1,
+                eligible_count=1,
+                deferred_count=0,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                maximum_items=1,
+                maximum_concurrency=1,
+                status="PLANNED",
+                workflow_id=f"inert-backlog-owner-race-{issue_id}",
+            )
+        )
+        # These mappers have no ORM relationship; insert the FK parent first.
+        session.flush()
+        session.add(
+            BacklogIssueRecord(
+                id=issue_id,
+                backlog_campaign_id=command_value.backlog_campaign_id,
+                repository=command_value.repository,
+                issue_number=issue_number,
+                issue_url_reference=f"https://github.com/gntik-ai/falcone/issues/{issue_number}",
+                title="Synthetic PostgreSQL ownership fixture; no external operation",
+                state="OPEN",
+                issue_type="PRODUCT_BUG",
+                severity="medium",
+                calculated_risk="R1",
+                component="api",
+                source_or_deployment_owner="source",
+                current_source_reproduction="REPRODUCED_CURRENT_SOURCE",
+                current_runtime_reproduction="NOT_REQUIRED",
+                current_runtime_required=False,
+                reproduction_mode="SOURCE_ONLY",
+                candidate_status="READY",
+                eligibility_status="READY",
+                eligibility_reason="CURRENT_SOURCE_REVALIDATION_PASS",
+                planned_wave="W1",
+                planned_order=1,
+                delivery_status="NOT_STARTED",
+                final_closure_status="OPEN",
+                documentation_impact="DOCUMENTATION_NOT_REQUIRED_WITH_EVIDENCE",
+                body_sha256="e" * 64,
+                github_updated_at=now,
+            )
+        )
     original = repository._active_target
     barrier = threading.Barrier(2, timeout=10)
     barrier_hits: list[str] = []
@@ -384,8 +460,24 @@ async def test_postgresql_simultaneous_issue_starts_return_one_active_owner() ->
             )
         ).all()
     assert len(rows) == 1
-    await repository.finish(first.operation_id, status="COMPLETED")
+    with repository.sessions.begin() as session:
+        assert rows[0].binding_hash == current_issue_approval_binding(session, command_value)
+        issue = session.get(BacklogIssueRecord, issue_id)
+        assert issue is not None
+        issue.body_sha256 = "f" * 64
     repository._active_target = original  # type: ignore[method-assign]
+    after_body_edit = await repository.create_external(
+        command_value,
+        source_channel="cli",
+        operator_class="local-operator",
+        idempotency_key=f"cli-owner-race-body-edited-{issue_number}",
+    )
+    assert after_body_edit.operation_id == first.operation_id
+    with repository.sessions() as session:
+        retained = session.get(OperationRequest, first.operation_id)
+        assert retained is not None and retained.binding_hash == rows[0].binding_hash
+        assert retained.binding_hash != current_issue_approval_binding(session, command_value)
+    await repository.finish(first.operation_id, status="COMPLETED")
     third = await repository.create_external(
         command_value,
         source_channel="cli",
