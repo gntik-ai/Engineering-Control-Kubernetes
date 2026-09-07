@@ -215,6 +215,10 @@ class DeliveryActivityHandler:
                 "status": "BLOCKED",
                 "blocker": "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED",
                 "publication_effect_unknown": error.unknown,
+                # Refers to the current effect, not earlier completed effects
+                # within a paired publication. Unknown may still describe lost
+                # receipt custody even when this callback never began.
+                "publication_effect_not_attempted": error.not_attempted,
             }
         except GhCliAuthError:
             return {

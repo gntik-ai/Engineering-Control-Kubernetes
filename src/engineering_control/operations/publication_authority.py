@@ -37,7 +37,11 @@ from engineering_control.operations.issue_delivery_approval import (
 
 INTENT_STEP = "delivery.publication_intent"
 EFFECT_STEP = "delivery.publication_effect"
+ATTEMPT_STEP = "delivery.publication_attempt"
 UNRESOLVED_EFFECT_STATES = ("STARTED", "UNKNOWN")
+# A non-attempt does not grant unlimited retries. This bound is independent of
+# activity retry numbering, which can change across workflow recovery.
+MAX_EFFECT_ADMISSIONS = 5
 
 
 class PublicationEffectUnresolved(ValueError):
@@ -255,7 +259,12 @@ class PublicationAuthorityRepository:
                 item["repository"] for item in value["plan"]["publications"]
             }:
                 raise ValueError("publication effect target is outside its intent")
-            # Time sampled before waiting for the ownership lock can admit an
+            effect_id = uuid5(
+                NAMESPACE_URL,
+                f"publication-effect:{intent.id}:{request.repository}:{request.action}",
+            )
+            previous = session.scalar(select(Step).where(Step.id == effect_id).with_for_update())
+            # Time sampled before waiting for ownership or receipt locks can admit an
             # already expired lease. Re-evaluate against post-lock wall time.
             now = datetime.now(UTC)
             run, issue = _current_authority(session, change_set, value, now)
@@ -271,11 +280,7 @@ class PublicationAuthorityRepository:
                 or _utc(observation.updated_at) != _utc(issue.github_updated_at)
             ):
                 raise ValueError("fresh GitHub issue observation differs from approval")
-            effect_id = uuid5(
-                NAMESPACE_URL,
-                f"publication-effect:{intent.id}:{request.repository}:{request.action}",
-            )
-            previous = session.get(Step, effect_id)
+            admission_number = 1
             if previous is not None:
                 if previous.name != EFFECT_STEP or previous.run_id != run.id:
                     raise ValueError("publication effect custody changed")
@@ -283,9 +288,24 @@ class PublicationAuthorityRepository:
                     return {"status": "ALREADY_COMPLETE", "effect_id": str(effect_id)}
                 # Includes lost claim/ack response, worker death and stale attempt.
                 # Do not infer absence of an external effect from a timeout.
-                raise PublicationEffectUnresolved(
-                    "publication effect requires reconciliation before retry"
+                if previous.status != "NOT_ATTEMPTED":
+                    raise PublicationEffectUnresolved(
+                        "publication effect requires reconciliation before retry"
+                    )
+                terminal = PublicationEffectReceipt.model_validate(
+                    previous.result_json.get("receipt")
                 )
+                if (
+                    terminal.outcome != "NOT_ATTEMPTED"
+                    or terminal.effect_id != effect_id
+                    or str(terminal.claim_id) != previous.result_json.get("claim_id")
+                    or previous.result_json.get("subject") != subject
+                ):
+                    raise ValueError("publication non-attempt custody changed")
+                count = previous.result_json.get("admission_number", 1)
+                if type(count) is not int or not 1 <= count < MAX_EFFECT_ADMISSIONS:
+                    raise ValueError("publication admission budget is exhausted or invalid")
+                admission_number = count + 1
             unresolved = session.scalar(
                 select(Step.id)
                 .join(Run, Run.id == Step.run_id)
@@ -302,24 +322,48 @@ class PublicationAuthorityRepository:
                 )
             claim_id = uuid4()
             deadline = now + timedelta(seconds=15)
-            session.add(
-                Step(
+            if previous is not None:
+                # Preserve the complete predecessor observation before replacing
+                # only the current projection. Old claim IDs cannot acknowledge
+                # this new attempt, including delayed worker completions.
+                archive_id = uuid5(
+                    NAMESPACE_URL,
+                    f"publication-attempt:{effect_id}:{previous.result_json['claim_id']}",
+                )
+                if session.get(Step, archive_id) is not None:
+                    raise ValueError("publication attempt archive already exists")
+                session.add(
+                    Step(
+                        id=archive_id,
+                        run_id=previous.run_id,
+                        name=ATTEMPT_STEP,
+                        ordinal=previous.ordinal,
+                        status=previous.status,
+                        idempotency_key=f"publication-attempt:{archive_id}",
+                        attempt=previous.attempt,
+                        result_json=previous.result_json,
+                    )
+                )
+                effect = previous
+            else:
+                effect = Step(
                     id=effect_id,
                     run_id=run.id,
                     name=EFFECT_STEP,
                     ordinal=0,
-                    status="STARTED",
                     idempotency_key=f"publication-effect:{effect_id}",
-                    attempt=request.execution.attempt,
-                    result_json=dict(
-                        intent_id=str(intent.id),
-                        subject=subject,
-                        claim_id=str(claim_id),
-                        request=request.model_dump(mode="json"),
-                        admitted_at=now.isoformat(),
-                        start_before=deadline.isoformat(),
-                    ),
                 )
+                session.add(effect)
+            effect.status = "STARTED"
+            effect.attempt = request.execution.attempt
+            effect.result_json = dict(
+                intent_id=str(intent.id),
+                subject=subject,
+                claim_id=str(claim_id),
+                request=request.model_dump(mode="json"),
+                admitted_at=now.isoformat(),
+                start_before=deadline.isoformat(),
+                admission_number=admission_number,
             )
             session.flush()
             return {
@@ -340,11 +384,28 @@ class PublicationAuthorityRepository:
                 effect is None
                 or effect.name != EFFECT_STEP
                 or effect.result_json.get("subject") != subject
-                or effect.result_json.get("claim_id") != str(request.claim_id)
             ):
                 raise ValueError("publication receipt does not own the effect")
-            previous = effect.result_json.get("receipt")
             value = request.model_dump(mode="json")
+            if effect.result_json.get("claim_id") != str(request.claim_id):
+                archive_id = uuid5(
+                    NAMESPACE_URL, f"publication-attempt:{effect.id}:{request.claim_id}"
+                )
+                archived = session.get(Step, archive_id)
+                if (
+                    archived is None
+                    or archived.name != ATTEMPT_STEP
+                    or archived.run_id != effect.run_id
+                    or archived.status != "NOT_ATTEMPTED"
+                    or archived.result_json.get("subject") != subject
+                    or archived.result_json.get("claim_id") != str(request.claim_id)
+                    or archived.result_json.get("receipt") != value
+                ):
+                    raise ValueError("publication receipt does not own this attempt")
+                # Exact delayed receipt replay is harmless; never overwrite the
+                # retained terminal observation or the newer current claim.
+                return {"status": "NOT_ATTEMPTED", "effect_id": str(effect.id)}
+            previous = effect.result_json.get("receipt")
             if previous is not None:
                 if previous != value:
                     raise ValueError("publication effect receipt cannot be rewritten")

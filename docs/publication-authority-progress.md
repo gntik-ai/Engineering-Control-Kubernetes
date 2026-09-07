@@ -12,8 +12,24 @@ before the worker command. Its receipt survives retries. STARTED/UNKNOWN records
 block blind repetition and lease reassignment; expiry is not proof of no effect.
 
 The lease lock is shared with acquisition and both release paths. Time is sampled
-after waiting for the Finding/project locks. Malformed grants and lost replies are
+after waiting for the Finding/project and current-effect row locks. Malformed grants and lost replies are
 reported as unverified, not successful starts or safely unperformed commands.
+
+An expired admission detected before entering the command callback records
+`NOT_ATTEMPTED`, not `UNKNOWN`. Only its durable receipt permits another claim;
+the current approval, issue revision and leases are validated again. Each new claim
+gets a fresh identifier, while the entire previous non-attempt record is retained
+as an immutable attempt Step. Exact old receipts replay idempotently; stale or
+changed completions cannot acknowledge the new claim. Admission is capped at five
+per logical effect independently of workflow/activity retry numbering.
+
+The worker's `publication_effect_not_attempted` describes only the current callback,
+not earlier completed effects in a paired publication. If that receipt is lost,
+`publication_effect_unknown` additionally signals unverified durable custody:
+STARTED remains fenced unless the actual receipt committed. Neither elapsed time
+nor worker death is automatically converted to NOT_ATTEMPTED. A complete safe
+workflow/operator resumption path is still required; this bounded effect retry
+contract alone does not establish it.
 
 The following remain mandatory, not waived:
 

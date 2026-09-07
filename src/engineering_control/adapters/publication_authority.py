@@ -30,9 +30,10 @@ T = TypeVar("T")
 
 
 class PublicationAuthorityError(ValueError):
-    def __init__(self, message: str, *, unknown: bool = False) -> None:
+    def __init__(self, message: str, *, unknown: bool = False, not_attempted: bool = False) -> None:
         super().__init__(message)
         self.unknown = unknown
+        self.not_attempted = not_attempted
 
 
 class PublicationAuthorityClient:
@@ -152,11 +153,40 @@ class PublicationAuthorityClient:
                 "publication admission response is unverified", unknown=True
             ) from error
         effect_id, claim_id = admitted.effect_id, admitted.claim_id
-        try:
-            if datetime.now(UTC) >= admitted.start_before or time.monotonic() - started >= 15:
-                raise PublicationAuthorityError(
-                    "publication admission expired before effect", unknown=True
+        if datetime.now(UTC) >= admitted.start_before or time.monotonic() - started >= 15:
+            # The callback has not been entered. This is positive non-attempt
+            # knowledge, unlike an exception after starting the command. Only a
+            # durably acknowledged receipt permits a fresh, separately fenced
+            # claim; a lost receipt must not silently release STARTED custody.
+            try:
+                receipt = self._request(
+                    "/v1/publications/receipt",
+                    dict(
+                        effect_id=str(effect_id),
+                        claim_id=str(claim_id),
+                        outcome="NOT_ATTEMPTED",
+                        result_sha256=hashlib.sha256(
+                            b"admission-expired-before-command"
+                        ).hexdigest(),
+                    ),
                 )
+                acknowledgement = PublicationReceiptAcknowledgement.model_validate(receipt)
+                if (
+                    acknowledgement.status != "NOT_ATTEMPTED"
+                    or acknowledgement.effect_id != effect_id
+                ):
+                    raise PublicationAuthorityError("publication non-attempt is not durable")
+            except (PublicationAuthorityError, ValidationError) as error:
+                raise PublicationAuthorityError(
+                    "publication did not start but its receipt is unverified",
+                    unknown=True,
+                    not_attempted=True,
+                ) from error
+            raise PublicationAuthorityError(
+                "publication admission expired before command; non-attempt is durable",
+                not_attempted=True,
+            )
+        try:
             result = operation()
         except BaseException as error:
             try:

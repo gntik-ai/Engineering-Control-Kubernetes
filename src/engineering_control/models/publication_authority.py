@@ -55,7 +55,7 @@ class PublicationEffectReceipt(BaseModel):
 
     effect_id: UUID
     claim_id: UUID
-    outcome: Literal["COMPLETE", "UNKNOWN"]
+    outcome: Literal["COMPLETE", "UNKNOWN", "NOT_ATTEMPTED"]
     # An effect receipt stores only the digest of bounded typed output, not a
     # raw command transcript, issue body, credential, or caller-supplied status.
     result_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -80,5 +80,5 @@ class PublicationAlreadyComplete(BaseModel):
 class PublicationReceiptAcknowledgement(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    status: Literal["COMPLETE", "UNKNOWN"]
+    status: Literal["COMPLETE", "UNKNOWN", "NOT_ATTEMPTED"]
     effect_id: UUID
