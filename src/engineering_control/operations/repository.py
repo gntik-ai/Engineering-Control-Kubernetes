@@ -1494,8 +1494,13 @@ class OperationsRepository:
         workflow_id: str | None = None,
         run_id: str | None = None,
         safe_error: str | None = None,
-    ) -> None:
-        await asyncio.to_thread(
+    ) -> bool:
+        """Record the first dispatch outcome, not the workflow's eventual result.
+
+        False means a durable receipt or later state already superseded this
+        dispatch response. Callers must not emit a success/failure event for it.
+        """
+        return await asyncio.to_thread(
             self._finish,
             operation_id,
             status,
@@ -1511,13 +1516,32 @@ class OperationsRepository:
         workflow_id: str | None,
         run_id: str | None,
         safe_error: str | None,
-    ) -> None:
+    ) -> bool:
         if status not in {"STARTED", "COMPLETED", "FAILED", "BLOCKED"}:
             raise ValueError("operation terminal dispatch status is invalid")
+        if status == "STARTED" and (
+            not isinstance(workflow_id, str) or not workflow_id.strip() or len(workflow_id) > 240
+        ):
+            raise ValueError("operation dispatch workflow identity is invalid")
+        if run_id is not None and (not isinstance(run_id, str) or len(run_id) > 240):
+            raise ValueError("operation dispatch run identity is invalid")
+        if status != "STARTED" and (workflow_id is not None or run_id is not None):
+            raise ValueError("non-workflow dispatch outcome cannot replace a workflow receipt")
         with self.sessions.begin() as session:
             row = session.get(OperationRequest, operation_id, with_for_update=True)
             if row is None:
                 raise ValueError("operation disappeared during dispatch")
+            # Recheck after acquiring the row lock: another transaction may
+            # have persisted the accepted workflow or reconciled its result
+            # while the caller was awaiting Temporal. Never clear that receipt,
+            # roll back run lineage, reopen a terminal owner, or rewrite history.
+            if (
+                row.status not in {"PENDING", "DISPATCHING"}
+                or row.workflow_id is not None
+                or row.temporal_run_id is not None
+                or row.completed_at is not None
+            ):
+                return False
             row.status = status
             row.workflow_id = workflow_id
             row.temporal_run_id = run_id
@@ -1526,6 +1550,7 @@ class OperationsRepository:
             )
             if status in {"COMPLETED", "FAILED", "BLOCKED"}:
                 row.completed_at = datetime.now(UTC)
+            return True
 
     async def record_dispatch_event(
         self,

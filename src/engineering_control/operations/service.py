@@ -106,7 +106,10 @@ class TypedCommandBus:
                 operation_id=operation_id,
             )
         except ValueError as error:
-            await self.operations.finish(operation_id, status="BLOCKED", safe_error=str(error))
+            if not await self.operations.finish(
+                operation_id, status="BLOCKED", safe_error=str(error)
+            ):
+                return
             await self.operations.record_dispatch_event(
                 operation_id,
                 event_type="operation.blocked",
@@ -114,11 +117,12 @@ class TypedCommandBus:
                 message="Typed operation was blocked by current policy or state",
             )
         except Exception:  # noqa: BLE001 - safe error boundary must not expose provider details
-            await self.operations.finish(
+            if not await self.operations.finish(
                 operation_id,
                 status="FAILED",
                 safe_error="typed application operation failed",
-            )
+            ):
+                return
             await self.operations.record_dispatch_event(
                 operation_id,
                 event_type="operation.failed",
@@ -127,7 +131,8 @@ class TypedCommandBus:
             )
         else:
             if accepted is None:
-                await self.operations.finish(operation_id, status="COMPLETED")
+                if not await self.operations.finish(operation_id, status="COMPLETED"):
+                    return
                 await self.operations.record_dispatch_event(
                     operation_id,
                     event_type="operation.completed",
@@ -135,12 +140,13 @@ class TypedCommandBus:
                     message="Typed operation completed without starting a workflow",
                 )
             else:
-                await self.operations.finish(
+                if not await self.operations.finish(
                     operation_id,
                     status="STARTED",
                     workflow_id=accepted.workflow_id,
                     run_id=accepted.run_id,
-                )
+                ):
+                    return
                 await self.operations.record_dispatch_event(
                     operation_id,
                     event_type="operation.linked"
