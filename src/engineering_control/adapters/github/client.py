@@ -21,6 +21,7 @@ ALLOWED_REPOSITORIES = frozenset(
 )
 READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'-]{1,500}$")
+_SAFE_PULL_REQUEST_TITLE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'()-]{1,240}$")
 
 
 class GhCliAuthError(RuntimeError):
@@ -440,7 +441,7 @@ class GhCliBroker:
             "--base",
             self._value(base, "pull request base"),
             "--title",
-            self._value(title, "pull request title", maximum=240),
+            self._pull_request_title(title),
             "--body-file",
             str(self._bounded_file(body_file)),
         ]
@@ -683,6 +684,14 @@ class GhCliBroker:
         if repository not in ALLOWED_REPOSITORIES:
             raise GhCliPolicyError("repository is outside the GitHub allowlist")
         return repository
+
+    @staticmethod
+    def _pull_request_title(value: str) -> str:
+        # Metadata emits the fixed " (deployment)" suffix. Permit parentheses only
+        # in this display field, not in branch, query, route, or authority inputs.
+        if value.startswith("-") or not _SAFE_PULL_REQUEST_TITLE.fullmatch(value):
+            raise GhCliPolicyError("pull request title contains unsupported characters")
+        return value
 
     @staticmethod
     def _value(value: str, label: str, *, maximum: int = 500) -> str:

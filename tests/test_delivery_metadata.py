@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
+from test_metadata_activity import add_changeset_finding
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
@@ -98,6 +99,25 @@ async def test_publication_plan_defers_unchanged_deployment_repository(
     )
     change_set_id = uuid4()
     branch = f"agent/falcone/123/{change_set_id}"
+    Base.metadata.create_all(handler.engine)
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                project="falcone",
+                risk_class="R1",
+                state="IMPLEMENTING",
+                version=1,
+                source_repository="falcone",
+                source_base_sha="a" * 40,
+                deployment_repository="falcone-charts",
+                deployment_base_sha="c" * 40,
+                image_digests={},
+                recovery_json={},
+            )
+        )
+    add_changeset_finding(handler, change_set_id)
     result = await handler.handle(
         "delivery.prepare_publication",
         {
