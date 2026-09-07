@@ -1651,6 +1651,48 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
         if not 1 <= request.maximum_items <= 100 or not 1 <= request.component_concurrency <= 4:
             raise ValueError("issue-loop bounds are invalid")
         context = await self._step("loop.load_selection", asdict(request))
+        if workflow.patched("issue-loop-selection-outcomes-v1"):
+            selection_status = context.get("status")
+            if isinstance(selection_status, str) and selection_status in {"BLOCKED", "FAILED"}:
+                blocker = context.get("blocker")
+                if not (
+                    isinstance(blocker, str)
+                    and 1 <= len(blocker) <= 120
+                    and blocker.isascii()
+                    and blocker.isupper()
+                    and blocker.replace("_", "").isalnum()
+                ):
+                    blocker = f"LOOP_SELECTION_{selection_status}"
+                self._phase = f"SELECTION_{selection_status}"
+                return {"status": selection_status, "blocker": blocker, "results": []}
+            if not isinstance(selection_status, str) or selection_status not in {
+                "SELECTED",
+                "PASS",
+            }:
+                self._phase = "SELECTION_FAILED"
+                return {
+                    "status": "FAILED",
+                    "blocker": "LOOP_SELECTION_STATUS_INVALID",
+                    "results": [],
+                }
+            selection_items = context.get("items")
+            if not isinstance(selection_items, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("finding_id"), str)
+                or not item.get("finding_id")
+                or not isinstance(item.get("risk_class"), str)
+                or item.get("risk_class") not in {"R0", "R1", "R2", "R3"}
+                for item in selection_items[: request.maximum_items]
+            ):
+                self._phase = "SELECTION_FAILED"
+                return {
+                    "status": "FAILED",
+                    "blocker": "LOOP_SELECTION_SCHEMA_INVALID",
+                    "results": [],
+                }
+            if not selection_items:
+                self._phase = "EMPTY"
+                return {"status": "EMPTY", "reason": "NO_ELIGIBLE_FINDINGS", "results": []}
         raw_items = context.get("items", [])
         if not isinstance(raw_items, list):
             raise TypeError("issue-loop selection must be a list")
