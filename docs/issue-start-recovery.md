@@ -30,12 +30,21 @@ Ordinary iteration failures no longer kill the dispatcher permanently. They emit
 a bounded safe error-type event and wait before retrying; cancellation still
 propagates. A repeated database failure can therefore remain degraded, not green.
 
+For an approved direct delivery, Temporal acknowledgement followed by a failed
+receipt write returns HTTP503 `START_UNCONFIRMED` with the existing operation and
+canonical workflow IDs. This includes approval drift after acknowledgement and a
+lost response after receipt commit. It is not a409 pre-start denial or a202 claim
+that persistence succeeded. The service neither starts again nor attempts another
+write to a failing database. Existing committed receipts remain intact; otherwise
+the receipt-less DISPATCHING owner remains eligible for bounded read-only recovery.
+Approval failures before submission still deny work. Cancellation propagates.
+
 Limits: this is not a Temporal start-intent outbox for every workflow family.
 It does not automatically retry an absent execution, resolve expired history,
 verify original history input bytes or Continue-As-New lineage, clear leases,
 backfill historical terminal rows, or make external effects exactly-once. The
-canonical ID/type observation is not full input-lineage attestation. A database
-failure after a direct request obtains an acknowledgement may still return an
-ordinary unavailable response before later observation links its receipt.
+canonical ID/type observation is not full input-lineage attestation. Persistent
+database or history unavailability may still prevent linking a receipt; an explicit
+unknown response does not resolve that dependency or authorize replacement work.
 Real process-loss/Temporal, all-channel operator rendering, full assembled
 release and live recovery acceptance remain separate. Schema0015 is unchanged.

@@ -313,7 +313,10 @@ async def test_receipt_loss_returns_no_false_success_and_retry_links_one_operati
                 json=body.model_dump(mode="json"),
                 headers={"Authorization": "Bearer " + "x" * 32},
             )
-        assert response.status_code == 500
+        assert response.status_code == 503
+        assert response.json()["status"] == "START_UNCONFIRMED"
+        assert response.json()["operation_id"] == str(request.issue_operation_id)
+        assert response.json()["expected_workflow_id"] == expected
         assert "inert receipt" not in response.text and "Traceback" not in response.text
         with metadata.sessions() as session:
             operation = session.get(OperationRequest, request.issue_operation_id)

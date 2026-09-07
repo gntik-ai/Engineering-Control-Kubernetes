@@ -200,7 +200,14 @@ class TemporalControlService:
             await self.repository.validate_delivery_issue_request(request)
             assert request.approved_issue is not None
             accepted = await self.start_existing_backlog_loop(request.approved_issue)
-            await self.repository.record_delivery_issue_start(request, accepted)
+            try:
+                await self.repository.record_delivery_issue_start(request, accepted)
+            except Exception as error:
+                # Temporal already accepted or identified the canonical execution.
+                # A missing receipt is not a pre-start denial, even if approval
+                # changed during persistence. Preserve its owner for observation;
+                # do not retry the start or try another write to an unavailable DB.
+                raise IssueStartUnconfirmedError(request.approved_issue) from error
             return accepted
         workflow_id = f"delivery-{request.finding_id}-{uuid4()}"
         await self.repository.create_delivery_run(workflow_id, request)
