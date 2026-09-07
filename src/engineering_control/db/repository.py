@@ -21,6 +21,7 @@ from engineering_control.api.schemas import (
     DeploymentPrepare,
     ExistingBacklogLoopStart,
     MultiProjectAuditStart,
+    OperationAccepted,
     RollbackRequest,
     RuntimeVerificationStart,
 )
@@ -40,6 +41,7 @@ from engineering_control.db.models import (
     Finding,
     GitHubBacklogCampaign,
     NotificationOutbox,
+    OperationRequest,
     ProviderUsage,
     QuotaSnapshot,
     Run,
@@ -94,6 +96,10 @@ class MetadataRepository(Protocol):
     ) -> None: ...
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
+    async def validate_delivery_issue_request(self, request: DeliveryStart) -> None: ...
+    async def record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None: ...
     async def create_finding_verification_run(
         self, workflow_id: str, finding_id: UUID
     ) -> Project: ...
@@ -299,6 +305,85 @@ class SQLMetadataRepository:
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         await asyncio.to_thread(self._create_delivery_run, workflow_id, request)
+
+    async def validate_delivery_issue_request(self, request: DeliveryStart) -> None:
+        await asyncio.to_thread(self._validate_delivery_issue_request, request)
+
+    def _validate_delivery_issue_request(self, request: DeliveryStart) -> None:
+        request = DeliveryStart.model_validate(request.model_dump(mode="json"))
+        approved = request.approved_issue
+        if request.dry_run or approved is None:
+            raise ValueError("real delivery requires an approved issue request")
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            require_issue_request_approval(session, approved)
+            operation = session.get(OperationRequest, approved.issue_operation_id)
+            expected = (
+                f"backlog-loop-{approved.project}-{approved.backlog_campaign_id}"
+                f"-operation-{approved.issue_operation_id}"
+            )
+            if operation is None or operation.workflow_id not in {None, expected}:
+                raise ValueError("delivery operation is already bound to another workflow")
+            finding = session.get(Finding, request.finding_id)
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == approved.backlog_campaign_id,
+                    BacklogIssueRecord.repository == approved.target_repository,
+                    BacklogIssueRecord.issue_number == approved.target_issue_number,
+                )
+            )
+            ranks = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+            if (
+                finding is None
+                or finding.disposition != "CONFIRMED"
+                or finding.project != approved.project
+                or finding.risk_class != request.risk_class.value
+                or issue is None
+                or issue.finding_id != finding.id
+                or issue.state != "OPEN"
+                or issue.eligibility_status == "DEFERRED"
+                or issue.calculated_risk != finding.risk_class
+                or ranks[finding.risk_class] > ranks[approved.maximum_risk.value]
+            ):
+                raise ValueError("delivery finding differs from its approved issue target")
+
+    async def record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None:
+        await asyncio.to_thread(self._record_delivery_issue_start, request, accepted)
+
+    def _record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None:
+        request = DeliveryStart.model_validate(request.model_dump(mode="json"))
+        approved = request.approved_issue
+        if request.dry_run or approved is None or approved.issue_operation_id is None:
+            raise ValueError("delivery start receipt requires its exact approved operation")
+        expected = (
+            f"backlog-loop-{approved.project}-{approved.backlog_campaign_id}"
+            f"-operation-{approved.issue_operation_id}"
+        )
+        if accepted.workflow_id != expected or accepted.status not in {"ACCEPTED", "EXISTING"}:
+            raise ValueError("delivery start receipt does not identify the approved workflow")
+        run_id = str(UUID(accepted.run_id))
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                session.execute(text("SET LOCAL statement_timeout = '10s'"))
+            operation = session.get(
+                OperationRequest, approved.issue_operation_id, with_for_update=True
+            )
+            require_issue_request_approval(session, approved)
+            if operation is None or operation.workflow_id not in {None, expected}:
+                raise ValueError("delivery operation changed before start acknowledgement")
+            # Durable dispatch acknowledgement, not a claim of workflow completion.
+            # Retry resolves the same Temporal workflow before recording this link.
+            operation.workflow_id = expected
+            operation.temporal_run_id = run_id
+            operation.status = "STARTED"
+            if operation.started_at is None:
+                operation.started_at = datetime.now(UTC)
 
     async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
         return await asyncio.to_thread(
@@ -1530,6 +1615,14 @@ class EmptyMetadataRepository:
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         return None
+
+    async def validate_delivery_issue_request(self, request: DeliveryStart) -> None:
+        raise ValueError("durable delivery approval store is unavailable")
+
+    async def record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None:
+        raise ValueError("durable delivery approval store is unavailable")
 
     async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
         raise ValueError("finding verification metadata store is unavailable")

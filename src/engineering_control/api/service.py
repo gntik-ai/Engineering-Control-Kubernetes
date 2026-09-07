@@ -190,11 +190,25 @@ class TemporalControlService:
         )
 
     async def start_delivery(self, request: DeliveryStart) -> OperationAccepted:
+        # Also validate internally constructed/model_copy callers. A real direct
+        # entrypoint adopts the approved single-issue operation, not a second
+        # unbound child Run with its own random workflow ID.
+        request = DeliveryStart.model_validate(request.model_dump(mode="json"))
+        if not request.dry_run:
+            await self.repository.validate_delivery_issue_request(request)
+            assert request.approved_issue is not None
+            accepted = await self.start_existing_backlog_loop(request.approved_issue)
+            await self.repository.record_delivery_issue_start(request, accepted)
+            return accepted
         workflow_id = f"delivery-{request.finding_id}-{uuid4()}"
         await self.repository.create_delivery_run(workflow_id, request)
         handle = await self.client.start_workflow(
             WorkflowName.ISSUE_DELIVERY.value,
-            IssueDeliveryInput(**request.model_dump()).payload(),
+            IssueDeliveryInput(
+                finding_id=str(request.finding_id),
+                risk_class=request.risk_class.value,
+                dry_run=True,
+            ).payload(),
             id=workflow_id,
             task_queue=self.task_queue,
         )
@@ -439,7 +453,9 @@ class TemporalControlService:
         campaign = await self.repository.get_backlog_campaign(request.backlog_campaign_id)
         if campaign is None or campaign.get("project") != request.project:
             raise ValueError("existing backlog campaign does not exist")
-        if campaign.get("status") not in {"APPROVED_POLICY_PENDING", "APPROVED"}:
+        if campaign.get("status") not in {"APPROVED_POLICY_PENDING", "APPROVED"} and not (
+            direct and campaign.get("status") == "RUNNING"
+        ):
             raise ValueError("existing backlog campaign requires its exact Telegram approval")
         if campaign.get("maximum_risk") != request.maximum_risk.value:
             raise ValueError("existing backlog maximum risk changed after approval")
@@ -455,6 +471,11 @@ class TemporalControlService:
             if request.issue_operation_id is not None
             else f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
         )
+        if campaign.get("status") == "RUNNING":
+            # Only an exact approved direct operation can reach this branch.
+            # Resolve its actual existing execution; missing/wrong history is
+            # not permission to start another workflow from a running projection.
+            return await self._existing_issue_workflow(workflow_id)
         try:
             handle = await self.client.start_workflow(
                 WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,
@@ -471,20 +492,23 @@ class TemporalControlService:
         except WorkflowAlreadyStartedError as error:
             if not direct:
                 raise
-            existing = self.client.get_workflow_handle(workflow_id, run_id=error.run_id)
-            description = await existing.describe(rpc_timeout=timedelta(seconds=30))
-            if (
-                description.id != workflow_id
-                or description.workflow_type != WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value
-            ):
-                raise ValueError(
-                    "existing issue workflow identity does not match the operation"
-                ) from None
-            return OperationAccepted(
-                workflow_id=workflow_id, run_id=description.run_id, status="EXISTING"
-            )
+            return await self._existing_issue_workflow(workflow_id, run_id=error.run_id)
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        )
+
+    async def _existing_issue_workflow(
+        self, workflow_id: str, *, run_id: str | None = None
+    ) -> OperationAccepted:
+        existing = self.client.get_workflow_handle(workflow_id, run_id=run_id)
+        description = await existing.describe(rpc_timeout=timedelta(seconds=30))
+        if (
+            description.id != workflow_id
+            or description.workflow_type != WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value
+        ):
+            raise ValueError("existing issue workflow identity does not match the operation")
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=description.run_id, status="EXISTING"
         )
 
     async def start_autonomous_backlog(self, request: AutonomousBacklogStart) -> OperationAccepted:

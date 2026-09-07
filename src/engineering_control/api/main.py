@@ -987,7 +987,13 @@ def create_app(
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
-        return await service.start_delivery(body)
+        try:
+            return await service.start_delivery(body)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="delivery approval or finding target is unavailable or changed",
+            ) from error
 
     @app.post("/v1/deliveries/reconcile", response_model=OperationAccepted, status_code=202)
     async def delivery_reconcile(

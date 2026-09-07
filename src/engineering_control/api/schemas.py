@@ -302,6 +302,20 @@ class DeliveryStart(APIModel):
     finding_id: UUID
     risk_class: RiskClass
     dry_run: bool = True
+    approved_issue: ExistingBacklogLoopStart | None = None
+
+    @model_validator(mode="after")
+    def real_delivery_has_exact_origin(self) -> DeliveryStart:
+        if self.dry_run:
+            if self.approved_issue is not None:
+                raise ValueError("dry-run delivery must not carry a mutating issue request")
+            return self
+        request = self.approved_issue
+        if request is None or request.issue_operation_id is None:
+            raise ValueError("real delivery requires its approved typed issue operation")
+        if request.delivery_mode != "source-pr":
+            raise ValueError("delivery publishes source PRs; full delivery uses solve-issue")
+        return self
 
 
 class FindingVerificationStart(APIModel):
