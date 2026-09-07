@@ -29,7 +29,6 @@ from engineering_control.db.models import (
     Enhancement,
     Finding,
     GitHubBacklogCampaign,
-    NotificationOutbox,
     OperationExport,
     OperationRequest,
     ProjectSnapshot,
@@ -50,6 +49,7 @@ from engineering_control.operations.connection_status import (
     PROVIDER_FRESHNESS_SECONDS,
     effective_connection_status,
 )
+from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
 from engineering_control.operations.issue_approval import current_issue_approval_binding
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
@@ -77,7 +77,6 @@ from engineering_control.operations.models import (
     WorkflowControlCommand,
     parse_command,
 )
-from engineering_control.retention_limits import NOTIFICATION_OUTBOX_PENDING_STATUS
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
@@ -1494,19 +1493,11 @@ class OperationsRepository:
         workflow_id: str | None = None,
         run_id: str | None = None,
         safe_error: str | None = None,
+        linked: bool = False,
     ) -> bool:
-        """Record the first dispatch outcome, not the workflow's eventual result.
-
-        False means a durable receipt or later state already superseded this
-        dispatch response. Callers must not emit a success/failure event for it.
-        """
+        """Commit the first dispatch receipt, dashboard event and outbox together."""
         return await asyncio.to_thread(
-            self._finish,
-            operation_id,
-            status,
-            workflow_id,
-            run_id,
-            safe_error,
+            self._finish, operation_id, status, workflow_id, run_id, safe_error, linked
         )
 
     def _finish(
@@ -1516,127 +1507,18 @@ class OperationsRepository:
         workflow_id: str | None,
         run_id: str | None,
         safe_error: str | None,
+        linked: bool = False,
     ) -> bool:
-        if status not in {"STARTED", "COMPLETED", "FAILED", "BLOCKED"}:
-            raise ValueError("operation terminal dispatch status is invalid")
-        if status == "STARTED" and (
-            not isinstance(workflow_id, str) or not workflow_id.strip() or len(workflow_id) > 240
-        ):
-            raise ValueError("operation dispatch workflow identity is invalid")
-        if run_id is not None and (not isinstance(run_id, str) or len(run_id) > 240):
-            raise ValueError("operation dispatch run identity is invalid")
-        if status != "STARTED" and (workflow_id is not None or run_id is not None):
-            raise ValueError("non-workflow dispatch outcome cannot replace a workflow receipt")
         with self.sessions.begin() as session:
-            row = session.get(OperationRequest, operation_id, with_for_update=True)
-            if row is None:
-                raise ValueError("operation disappeared during dispatch")
-            # Recheck after acquiring the row lock: another transaction may
-            # have persisted the accepted workflow or reconciled its result
-            # while the caller was awaiting Temporal. Never clear that receipt,
-            # roll back run lineage, reopen a terminal owner, or rewrite history.
-            if (
-                row.status not in {"PENDING", "DISPATCHING"}
-                or row.workflow_id is not None
-                or row.temporal_run_id is not None
-                or row.completed_at is not None
-            ):
-                return False
-            row.status = status
-            row.workflow_id = workflow_id
-            row.temporal_run_id = run_id
-            row.safe_error = (
-                str(self.redactor.redact(safe_error[:2000]).value)[:500] if safe_error else None
+            return record_dispatch_receipt(
+                session,
+                operation_id,
+                status=status,
+                workflow_id=workflow_id,
+                run_id=run_id,
+                safe_error=safe_error,
+                linked=linked,
             )
-            if status in {"COMPLETED", "FAILED", "BLOCKED"}:
-                row.completed_at = datetime.now(UTC)
-            return True
-
-    async def record_dispatch_event(
-        self,
-        operation_id: UUID,
-        *,
-        event_type: str,
-        level: str,
-        message: str,
-        workflow_id: str | None = None,
-    ) -> None:
-        await asyncio.to_thread(
-            self._record_dispatch_event,
-            operation_id,
-            event_type,
-            level,
-            message,
-            workflow_id,
-        )
-
-    def _record_dispatch_event(
-        self,
-        operation_id: UUID,
-        event_type: str,
-        level: str,
-        message: str,
-        workflow_id: str | None,
-    ) -> None:
-        with self.sessions.begin() as session:
-            operation = session.get(OperationRequest, operation_id)
-            if operation is None:
-                return
-            redacted = str(self.redactor.redact(message).value)[:500]
-            session.add(
-                DashboardEvent(
-                    occurred_at=datetime.now(UTC),
-                    level=level,
-                    event_type=event_type,
-                    source="controller",
-                    host=None,
-                    worker_kind="controller",
-                    project=operation.project,
-                    workflow_id=(
-                        workflow_id
-                        or (operation.target_id if operation.target_type == "workflow" else None)
-                    ),
-                    temporal_run_id=operation.temporal_run_id,
-                    issue_number=(
-                        int(operation.target_id.rsplit("#", 1)[1])
-                        if operation.target_type == "github_issue"
-                        and operation.target_id.rsplit("#", 1)[-1].isdigit()
-                        else None
-                    ),
-                    campaign_id=(
-                        operation.target_id
-                        if operation.target_type in {"backlog_campaign", "audit", "audit_campaign"}
-                        else None
-                    ),
-                    entity_type="operation",
-                    entity_id=str(operation.id),
-                    current_phase=operation.status,
-                    message=redacted,
-                    metadata_json={
-                        "action": operation.action,
-                        "status": operation.status,
-                        "operation": str(operation.id),
-                    },
-                )
-            )
-            if event_type == "operation.started" and workflow_id:
-                session.add(
-                    NotificationOutbox(
-                        topic="telegram.engineering-operation-started",
-                        status=NOTIFICATION_OUTBOX_PENDING_STATUS,
-                        payload_json={
-                            "operation_id": str(operation.id),
-                            "project": operation.project,
-                            "target": operation.target_id,
-                            "workflow_id": workflow_id,
-                            "phase": "QUEUED",
-                        },
-                        attempts=0,
-                        next_attempt_at=datetime.now(UTC),
-                        delivered_at=None,
-                        last_error_code=None,
-                    )
-                )
 
     async def create_external(
         self,

@@ -106,59 +106,23 @@ class TypedCommandBus:
                 operation_id=operation_id,
             )
         except ValueError as error:
-            if not await self.operations.finish(
-                operation_id, status="BLOCKED", safe_error=str(error)
-            ):
-                return
-            await self.operations.record_dispatch_event(
-                operation_id,
-                event_type="operation.blocked",
-                level="WARNING",
-                message="Typed operation was blocked by current policy or state",
-            )
+            await self.operations.finish(operation_id, status="BLOCKED", safe_error=str(error))
         except Exception:  # noqa: BLE001 - safe error boundary must not expose provider details
-            if not await self.operations.finish(
+            await self.operations.finish(
                 operation_id,
                 status="FAILED",
                 safe_error="typed application operation failed",
-            ):
-                return
-            await self.operations.record_dispatch_event(
-                operation_id,
-                event_type="operation.failed",
-                level="ERROR",
-                message="Typed application operation failed",
             )
         else:
             if accepted is None:
-                if not await self.operations.finish(operation_id, status="COMPLETED"):
-                    return
-                await self.operations.record_dispatch_event(
-                    operation_id,
-                    event_type="operation.completed",
-                    level="INFO",
-                    message="Typed operation completed without starting a workflow",
-                )
+                await self.operations.finish(operation_id, status="COMPLETED")
             else:
-                if not await self.operations.finish(
+                await self.operations.finish(
                     operation_id,
                     status="STARTED",
                     workflow_id=accepted.workflow_id,
                     run_id=accepted.run_id,
-                ):
-                    return
-                await self.operations.record_dispatch_event(
-                    operation_id,
-                    event_type="operation.linked"
-                    if accepted.status == "EXISTING"
-                    else "operation.started",
-                    level="INFO",
-                    message=(
-                        "Typed operation linked an existing durable workflow"
-                        if accepted.status == "EXISTING"
-                        else "Typed operation started one durable workflow"
-                    ),
-                    workflow_id=accepted.workflow_id,
+                    linked=accepted.status == "EXISTING",
                 )
 
     async def _execute(

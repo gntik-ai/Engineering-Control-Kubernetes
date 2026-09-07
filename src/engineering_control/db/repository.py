@@ -58,6 +58,7 @@ from engineering_control.engineering.backlog import (
 from engineering_control.engineering.backlog_authority import require_alternative_issue_authority
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
+from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
 from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
@@ -377,13 +378,16 @@ class SQLMetadataRepository:
             require_issue_request_approval(session, approved)
             if operation is None or operation.workflow_id not in {None, expected}:
                 raise ValueError("delivery operation changed before start acknowledgement")
-            # Durable dispatch acknowledgement, not a claim of workflow completion.
-            # Retry resolves the same Temporal workflow before recording this link.
-            operation.workflow_id = expected
-            operation.temporal_run_id = run_id
-            operation.status = "STARTED"
-            if operation.started_at is None:
-                operation.started_at = datetime.now(UTC)
+            # Approval validation, receipt, dashboard event and notification
+            # intent share this transaction. A retry cannot emit them twice.
+            record_dispatch_receipt(
+                session,
+                approved.issue_operation_id,
+                status="STARTED",
+                workflow_id=expected,
+                run_id=run_id,
+                linked=accepted.status == "EXISTING",
+            )
 
     async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
         return await asyncio.to_thread(
