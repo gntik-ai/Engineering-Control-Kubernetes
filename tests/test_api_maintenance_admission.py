@@ -180,6 +180,39 @@ def test_normal_mode_keeps_dispatch_and_existing_typed_route_semantics() -> None
     assert bus.dispatch_pending.await_count >= 1
 
 
+@pytest.mark.parametrize("mode", ["normal", "synthetic-only"])
+def test_value_free_health_admission_matches_protected_route(mode: str) -> None:
+    app, service, _bus = build(mode)
+    with TestClient(app) as client:
+        health = client.get("/health/ready")
+        assert health.status_code == 200
+        assert health.headers["cache-control"] == "no-store"
+        assert set(health.json()) == {"status", "admission"}
+        assert health.json()["status"] == "ready"
+        assert health.json()["admission"] == client.get("/v1/admission", headers=HEADERS).json()
+        assert set(health.json()["admission"]) == {
+            "scope",
+            "mode",
+            "pending_operation_dispatcher_running",
+        }
+        assert client.get("/v1/admission").status_code == 401
+        assert TOKEN not in health.text
+    assert service.mock_calls == []
+
+
+def test_health_admission_observes_a_dispatcher_that_has_stopped() -> None:
+    app, _service, _bus = build()
+    with TestClient(app) as client:
+        stopped_dispatcher = Mock()
+        stopped_dispatcher.done.return_value = True
+        app.state.operation_dispatcher = stopped_dispatcher
+        assert (
+            client.get("/health/ready").json()["admission"]["pending_operation_dispatcher_running"]
+            is False
+        )
+        app.state.operation_dispatcher = None
+
+
 def test_invalid_config_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENGINEERING_API_ADMISSION_MODE", "normal-ish")
     with pytest.raises(ValidationError):

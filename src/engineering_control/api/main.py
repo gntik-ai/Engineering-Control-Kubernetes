@@ -244,11 +244,7 @@ def create_app(
     async def live() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/v1/admission")
-    async def admission_get(
-        request: Request,
-        _subject: str = auth_dependency,
-    ) -> dict[str, str | bool]:
+    def admission_snapshot(request: Request) -> dict[str, str | bool]:
         dispatcher = request.app.state.operation_dispatcher
         return {
             "scope": "private-api-only",
@@ -257,11 +253,23 @@ def create_app(
             and not dispatcher.done(),
         }
 
+    @app.get("/v1/admission")
+    async def admission_get(
+        request: Request,
+        _subject: str = auth_dependency,
+    ) -> dict[str, str | bool]:
+        return admission_snapshot(request)
+
     @app.get("/health/ready")
-    async def ready(request: Request) -> dict[str, str]:
+    async def ready(request: Request) -> JSONResponse:
         if not hasattr(request.app.state, "control_service"):
             raise HTTPException(status_code=503, detail="control service unavailable")
-        return {"status": "ready"}
+        # Value-free process state on the existing private health surface, not
+        # approval or project readiness. The dashboard never needs the API token.
+        return JSONResponse(
+            {"status": "ready", "admission": admission_snapshot(request)},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/v1/readiness/{scope}")
     async def readiness_get(

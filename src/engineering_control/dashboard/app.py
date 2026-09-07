@@ -23,12 +23,12 @@ from fastapi.responses import (
     PlainTextResponse,
     RedirectResponse,
     Response,
-    StreamingResponse,
 )
 from jinja2 import StrictUndefined
 from starlette.templating import Jinja2Templates
 
 from engineering_control.config import Settings, get_settings
+from engineering_control.dashboard.admission import AdmissionReader
 from engineering_control.dashboard.auth import (
     LOGIN_CSRF_COOKIE,
     SESSION_CLOCK_SKEW_SECONDS,
@@ -50,6 +50,7 @@ from engineering_control.dashboard.schemas import (
 )
 from engineering_control.dashboard.service import DashboardService
 from engineering_control.dashboard.status_mapping import NORMALIZED_STATUSES
+from engineering_control.dashboard.streaming import RevocableStreamingResponse, StreamAuthorization
 from engineering_control.logging import configure_logging
 from engineering_control.operations.models import parse_command
 from engineering_control.operations.registry import COMMAND_REGISTRY
@@ -69,6 +70,7 @@ def create_app(
     session_key: bytes | None = None,
     limiter: LoginFailureLimiter | None = None,
     operations_repository: OperationsRepository | None = None,
+    admission_reader: AdmissionReader | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     key = session_key
@@ -122,7 +124,14 @@ def create_app(
             resolved.database_url.get_secret_value()
         )
         app.state.dashboard_repository = resolved_repository
-        app.state.dashboard_service = DashboardService(resolved_repository)
+        resolved_admission = admission_reader
+        # Injected fixture repositories must never fall back to live networking.
+        if resolved_admission is None and repository is None:
+            try:
+                resolved_admission = AdmissionReader(resolved.api_host, resolved.api_port)
+            except ValueError:
+                LOGGER.warning("dashboard local API admission observation is unavailable")
+        app.state.dashboard_service = DashboardService(resolved_repository, resolved_admission)
         resolved_operations = operations_repository or OperationsRepository(
             resolved.database_url.get_secret_value(),
             export_retention_days=resolved.dashboard_operation_export_retention_days,
@@ -131,6 +140,8 @@ def create_app(
         )
         app.state.operations_repository = resolved_operations
         yield
+        if admission_reader is None and resolved_admission is not None:
+            await resolved_admission.aclose()
         if repository is None:
             resolved_repository.engine.dispose()
         if operations_repository is None:
@@ -822,15 +833,16 @@ def create_app(
             after_sequence = max(0, int(raw_id))
         except ValueError:
             after_sequence = 0
-        response = StreamingResponse(
+        stream_authorization = StreamAuthorization(lambda: request_authorized(request))
+        response = RevocableStreamingResponse(
             transcript_sse(
                 repo(request).observability,
                 execution_id,
                 after_sequence=after_sequence,
                 disconnected=request.is_disconnected,
-                authorized=lambda: request_authorized(request),
+                authorized=stream_authorization.refresh,
             ),
-            media_type="text/event-stream",
+            stream_authorization,
         )
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Accel-Buffering"] = "no"
@@ -1076,14 +1088,15 @@ def create_app(
             after_id = max(0, int(raw_id))
         except ValueError:
             after_id = 0
-        response = StreamingResponse(
+        stream_authorization = StreamAuthorization(lambda: request_authorized(request))
+        response = RevocableStreamingResponse(
             sse_events(
                 repo(request),
                 after_id=after_id,
                 disconnected=request.is_disconnected,
-                authorized=lambda: request_authorized(request),
+                authorized=stream_authorization.refresh,
             ),
-            media_type="text/event-stream",
+            stream_authorization,
         )
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Accel-Buffering"] = "no"

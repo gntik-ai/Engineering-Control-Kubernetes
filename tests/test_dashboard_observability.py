@@ -116,7 +116,8 @@ def test_overview_workflow_projection_filtering_cursor_and_detail(tmp_path: Path
     overview = repository.observability.overview()
     assert overview["summary"] == {
         "active_workflows": 2,
-        "queued_issues": 0,
+        "pending_inventory_count": 0,
+        "ambiguous_inventory_count": 0,
         "blocked_workflows": 1,
         "failed_24h": 1,
         "active_audits": 0,

@@ -119,6 +119,128 @@ def _issue(campaign_id: object, number: int, title: str, status: str) -> Backlog
     )
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("state", "CLOSED"),
+        ("delivery_status", "COMPLETED"),
+        ("delivery_status", "RUNNING"),
+        ("delivery_status", "FAILED"),
+        ("final_closure_status", "CLOSED"),
+        ("eligibility_status", "DEFERRED"),
+    ],
+)
+def test_inventory_candidate_rejects_closed_delivered_or_nonpending_latest_membership(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    repository = _repository(tmp_path)
+    try:
+        with repository.sessions.begin() as session:
+            older = _backlog_campaign("falcone", "inventory-older")
+            older.imported_at -= timedelta(days=1)
+            latest = _backlog_campaign("falcone", "inventory-latest")
+            session.add_all([older, latest])
+            session.flush()
+            old_issue = _issue(older.id, 957, "old eligible snapshot", "NOT_STARTED")
+            latest_issue = _issue(latest.id, 957, "latest snapshot", "NOT_STARTED")
+            setattr(latest_issue, field, value)
+            session.add_all([old_issue, latest_issue])
+        result = repository.observability.overview()
+        assert result["summary"]["pending_inventory_count"] == 0
+        assert result["next_inventory_candidate"] is None
+        assert "next_eligible_issue" not in result
+        with repository.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 2
+    finally:
+        repository.engine.dispose()
+
+
+@pytest.mark.parametrize("campaign_status", ["COMPLETED", "CANCELLED", "FAILED", "UNKNOWN"])
+def test_terminal_or_unknown_latest_campaign_does_not_resurrect_old_inventory(
+    tmp_path: Path,
+    campaign_status: str,
+) -> None:
+    repository = _repository(tmp_path)
+    try:
+        with repository.sessions.begin() as session:
+            old = _backlog_campaign("falcone", "old-membership")
+            old.imported_at -= timedelta(days=1)
+            new = _backlog_campaign("falcone", "new-membership")
+            new.status = campaign_status
+            session.add_all([old, new])
+            session.flush()
+            session.add_all(
+                [
+                    _issue(old.id, 957, "older", "NOT_STARTED"),
+                    _issue(new.id, 957, "newer", "NOT_STARTED"),
+                ]
+            )
+        result = repository.observability.overview()
+        assert result["summary"]["pending_inventory_count"] == 0
+        assert result["next_inventory_candidate"] is None
+    finally:
+        repository.engine.dispose()
+
+
+def test_inventory_dedupes_history_but_not_paired_repository_issue_numbers(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    try:
+        with repository.sessions.begin() as session:
+            old = _backlog_campaign("falcone", "historical-inventory")
+            old.imported_at -= timedelta(days=1)
+            new = _backlog_campaign("falcone", "current-inventory")
+            new.status = "IMPORTED"
+            session.add_all([old, new])
+            session.flush()
+            latest_id = str(new.id)
+            old_issue = _issue(old.id, 957, "older title", "NOT_STARTED")
+            current = _issue(new.id, 957, "current title", "NOT_STARTED")
+            paired = _issue(new.id, 957, "paired title", "QUEUED")
+            paired.repository = "gntik-ai/falcone-charts"
+            paired.issue_url_reference = "https://github.com/gntik-ai/falcone-charts/issues/957"
+            session.add_all([old_issue, current, paired])
+        result = repository.observability.overview()
+        assert result["summary"]["pending_inventory_count"] == 2
+        candidate = result["next_inventory_candidate"]
+        assert candidate["repository"] == "gntik-ai/falcone"
+        assert candidate["title"] == "current title"
+        assert candidate["campaign_id"] == latest_id
+        assert candidate["campaign_status"] == "IMPORTED"
+        assert candidate["authorization"] == "NOT_EVALUATED"
+        assert candidate["inventory_observed_at"]
+        assert "not a dispatch queue" in result["inventory_semantics"]
+        with repository.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 3
+    finally:
+        repository.engine.dispose()
+
+
+def test_equal_latest_snapshot_timestamps_are_explicitly_ambiguous(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    try:
+        with repository.sessions.begin() as session:
+            first = _backlog_campaign("falcone", "same-time-first")
+            second = _backlog_campaign("falcone", "same-time-second")
+            second.imported_at = first.imported_at
+            session.add_all([first, second])
+            session.flush()
+            opened = _issue(first.id, 957, "open membership", "NOT_STARTED")
+            closed = _issue(second.id, 957, "closed membership", "COMPLETED")
+            closed.state = "CLOSED"
+            session.add_all([opened, closed])
+        for _ in range(2):
+            result = repository.observability.overview()
+            assert result["summary"]["pending_inventory_count"] == 0
+            assert result["summary"]["ambiguous_inventory_count"] == 1
+            assert result["next_inventory_candidate"] is None
+        with repository.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 2
+    finally:
+        repository.engine.dispose()
+
+
 def test_all_normalized_statuses_are_reachable() -> None:
     raw = {
         "backlog": "BACKLOG",

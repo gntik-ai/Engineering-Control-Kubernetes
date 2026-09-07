@@ -1,5 +1,49 @@
 # Hermes Engineering Operations Dashboard
 
+## Inventory and execution admission
+
+Overview separates **pending inventory** from a dispatch queue. Its candidate is
+the next pending OPEN issue in the latest recorded membership for each repository
+and issue number. Closed, delivered, owned-by-ChangeSet, terminal-campaign and
+superseded memberships are excluded from this projection, not deleted. Snapshot
+time ties across campaigns are counted as ambiguous and excluded from candidate
+selection: UUID ordering is deterministic, but does not establish chronology. Snapshot
+time and raw statuses are displayed. The candidate is **not approved**: current
+issue state, risk, policy, dependencies and approval must be revalidated by the
+typed execution path. A new inventory does not expand an approved campaign.
+
+The private API's existing `/health/ready` includes only a value-free admission
+summary: scope `private-api-only`, startup-bound mode, and whether its pending
+operation dispatcher is running. `/v1/admission` remains bearer-authenticated.
+The dashboard reads the health summary only from its configured literal loopback
+API endpoint, without API credentials, environment proxies or redirects. Reads
+have a one-second deadline, 4096-byte response limit and two-second in-process
+cache; failed/invalid reads become UNKNOWN rather than preserving a green result.
+Fixture repositories do not construct this network client unless explicitly
+injected. No database migration or additional credential is required.
+
+SYNTHETIC ONLY means product dispatch is fenced at the private API. DISPATCHING
+only attests that process's dispatcher; it is not project readiness or permission
+for a specific action. Dashboard candidate/queue preparation and other admission
+boundaries are separate: this observation must not be used as an authorization
+check. Per-action server gates remain mandatory, and project production
+deployment is prohibited. Browser refreshes time out after four seconds and mark
+admission UNKNOWN on failure. This is bounded status observation, not an approved
+performance SLO or the session/SSE revocation security contract.
+
+### Stream revocation
+
+Activity and transcript streams revalidate inside event batches. Their response
+also owns a separate durable-authorization watcher so an idle database fetch or
+a paused reader cannot defer checks until the next batch. Authorization results
+are observed for at most one second including query time; unavailable validation
+fails closed. Network sends and optional protocol/iterator cleanup have bounded
+waits, and owned watcher/response tasks are joined on termination. The five-second
+maximum revocation-exposure target is unchanged. Buffered bytes already accepted
+by the network cannot be recalled; newly sent payloads require a current stream
+authorization observation. This is not an in-memory revocation source of truth:
+session validity and revocation remain checked against the shared application DB.
+
 ## Architecture
 
 `engineering-dashboard` is a separate FastAPI process bound only to `127.0.0.1:8750`. It uses

@@ -81,6 +81,27 @@ def _login(client: TestClient, password: str = PASSWORD) -> object:
     )
 
 
+def test_injected_dashboard_repository_never_loads_live_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("fixture attempted live admission client construction")
+
+    monkeypatch.setattr(dashboard_app_module, "AdmissionReader", forbidden)
+    repository = _repository(tmp_path)
+    try:
+        with _client(repository) as client:
+            assert client.get("/api/dashboard/overview").status_code == 401
+            _login(client)
+            response = client.get("/api/dashboard/overview")
+            assert response.status_code == 200
+            assert response.json()["admission"]["status"] == "UNKNOWN"
+            assert response.json()["admission"]["observed_at"] is None
+    finally:
+        repository.engine.dispose()
+
+
 def test_argon2id_password_hash_and_session_expiration() -> None:
     passwords = PasswordService()
     password_hash = passwords.hash(PASSWORD)

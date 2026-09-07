@@ -144,14 +144,24 @@ function setupActionDialog() {
 function setupOverview() {
   if (!byId("summary-cards")) return;
   const load = async () => {
+    const controller = new AbortController();
+    const deadline = window.setTimeout(() => controller.abort(), 4000);
     try {
       const [response, connectionResponse] = await Promise.all([
-        fetch("/api/dashboard/overview", {cache: "no-store"}),
-        fetch("/api/dashboard/connections", {cache: "no-store"}),
+        fetch("/api/dashboard/overview", {cache: "no-store", signal: controller.signal}),
+        fetch("/api/dashboard/connections", {cache: "no-store", signal: controller.signal}),
       ]);
       if (!response.ok || !connectionResponse.ok) throw new Error("Overview data is temporarily unavailable.");
       const data = await response.json(); const connections = await connectionResponse.json();
-      const labels = [["active_workflows", "Active workflows"], ["queued_issues", "Queued issues"], ["blocked_workflows", "Blocked workflows"], ["failed_24h", "Failed in 24h"], ["active_audits", "Active audits"]];
+      const labels = [["active_workflows", "Active workflows"], ["pending_inventory_count", "Pending inventory (not a queue)"], ["ambiguous_inventory_count", "Ambiguous inventory snapshots"], ["blocked_workflows", "Blocked workflows"], ["failed_24h", "Failed in 24h"], ["active_audits", "Active audits"]];
+      const admission = data.admission;
+      const admissionLabels = {
+        SYNTHETIC_ONLY: "SYNTHETIC ONLY — product dispatch is fenced at the private API; pending-operation dispatcher is stopped.",
+        DISPATCHING: "DISPATCHING — the private API dispatcher is running. This is not an approval or project-readiness verdict.",
+        DISPATCHER_STOPPED: "DISPATCHER STOPPED — private API mode is normal, but queued operations are not being dispatched.",
+        UNKNOWN: "UNKNOWN — private API admission is not currently verified.",
+      };
+      byId("admission-state").textContent = `${admissionLabels[admission?.status] || admissionLabels.UNKNOWN}${admission?.observed_at ? ` Observed ${localTime(admission.observed_at)}.` : ""}`;
       byId("summary-cards").replaceChildren(...labels.map(([key, label]) => {
         const card = node("article", "summary-card"); card.append(node("p", "muted", label), node("strong", "summary-value", show(data.summary[key]))); return card;
       }));
@@ -165,7 +175,8 @@ function setupOverview() {
         return card;
       });
       byId("active-work").replaceChildren(...work); byId("idle-state").classList.toggle("hidden", !data.idle);
-      if (data.idle) byId("idle-details").replaceChildren(...list([["Queue depth", data.summary.queued_issues], ["Next eligible", data.next_eligible_issue ? `${data.next_eligible_issue.project} #${data.next_eligible_issue.issue_number}` : null], ["Active blockers", data.summary.blocked_workflows], ["Provider readiness", (data.providers || []).map((item) => `${item.provider}: ${item.available ? "available" : item.authentication_status}`).join(", ")]], "").children);
+      const candidate = data.next_inventory_candidate;
+      if (data.idle) byId("idle-details").replaceChildren(...list([["Pending inventory (not a queue)", data.summary.pending_inventory_count], ["Inventory candidate (not approved)", candidate ? `${candidate.repository} #${candidate.issue_number}` : "None in latest recorded snapshots"], ["Inventory observed", localTime(candidate?.inventory_observed_at)], ["Candidate status", candidate ? `${candidate.delivery_status} · ${candidate.eligibility_status} · approval not evaluated` : null], ["Active blockers", data.summary.blocked_workflows], ["Provider readiness", (data.providers || []).map((item) => `${item.provider}: ${item.available ? "available" : item.authentication_status}`).join(", ")]], "").children);
       const health = [...(data.services || []), ...(data.providers || [])].map((item) => {
         const card = node("article", `health-card${item.stale ? " stale" : ""}`); card.append(node("h4", "", item.name || item.provider), status(item.status || item.capacity_status || (item.available ? "ready" : "unknown")), list([["Kind", item.kind || "provider"], ["CLI", item.cli_version], ["Authentication", item.authentication_status], ["Active", item.active_executions], ["Queue", item.queue_depth], ["Last success", localTime(item.last_success)], ["Last failure", localTime(item.last_failure)], ["Observed", localTime(item.observed_at)], ["Freshness", item.freshness], ["Source", item.source]])); return card;
       });
@@ -175,7 +186,10 @@ function setupOverview() {
         const card = node("article", `health-card${item.status === "STALE" ? " stale" : ""}`); card.append(node("h4", "", item.component), status(item.status), list([["Checked", localTime(item.checked_at)], ["Freshness", elapsed(item.freshness_seconds)], ["Source", item.source], ["Next action", item.next_action]])); return card;
       });
       byId("overview-connections").replaceChildren(...connectionCards); byId("overview-freshness").textContent = `Observed ${localTime(data.observed_at)} · ${data.source}`; setError("overview-error");
-    } catch (error) { setError("overview-error", error.message); }
+    } catch (error) {
+      byId("admission-state").textContent = "UNKNOWN — overview refresh failed; previous admission is not current evidence.";
+      setError("overview-error", error.message);
+    } finally { window.clearTimeout(deadline); }
   };
   load(); window.setInterval(load, 5000);
 }

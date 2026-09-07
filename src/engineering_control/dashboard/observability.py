@@ -135,33 +135,89 @@ class DashboardObservabilityProjection:
                 .select_from(Campaign)
                 .where(~Campaign.status.in_(("COMPLETE", "COMPLETED", "FAILED", "CANCELLED")))
             )
-            queued_issues = session.scalar(
-                select(func.count())
-                .select_from(BacklogIssueRecord)
-                .where(
-                    BacklogIssueRecord.delivery_status.in_(("NOT_STARTED", "QUEUED")),
-                    BacklogIssueRecord.eligibility_status.in_(
-                        ("ELIGIBLE", "ELIGIBLE_FOR_REVALIDATION")
-                    ),
+            # Rank every membership before filtering: an older open/pending
+            # snapshot must not reappear after a newer closed/terminal one.
+            latest_memberships = (
+                select(
+                    BacklogIssueRecord.id.label("issue_id"),
+                    func.count()
+                    .over(
+                        partition_by=(
+                            BacklogIssueRecord.repository,
+                            BacklogIssueRecord.issue_number,
+                            GitHubBacklogCampaign.imported_at,
+                        )
+                    )
+                    .label("same_timestamp_count"),
+                    func.row_number()
+                    .over(
+                        partition_by=(
+                            BacklogIssueRecord.repository,
+                            BacklogIssueRecord.issue_number,
+                        ),
+                        order_by=(
+                            GitHubBacklogCampaign.imported_at.desc(),
+                            GitHubBacklogCampaign.id.desc(),
+                        ),
+                    )
+                    .label("membership_rank"),
                 )
+                .join(
+                    GitHubBacklogCampaign,
+                    BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
+                )
+                .subquery()
             )
-            next_issue = session.execute(
+            inventory = (
                 select(BacklogIssueRecord, GitHubBacklogCampaign)
                 .join(
                     GitHubBacklogCampaign,
                     BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
                 )
+                .join(latest_memberships, latest_memberships.c.issue_id == BacklogIssueRecord.id)
                 .where(
+                    latest_memberships.c.membership_rank == 1,
+                    latest_memberships.c.same_timestamp_count == 1,
+                    func.upper(BacklogIssueRecord.state) == "OPEN",
+                    BacklogIssueRecord.delivery_status.in_(("NOT_STARTED", "QUEUED")),
+                    BacklogIssueRecord.final_closure_status == "OPEN",
+                    BacklogIssueRecord.change_set_id.is_(None),
+                    GitHubBacklogCampaign.status.in_(
+                        (
+                            "IMPORTED",
+                            "QUEUED",
+                            "AWAITING_APPROVAL",
+                            "APPROVED_INVENTORY",
+                            "APPROVED_POLICY_PENDING",
+                            "APPROVED",
+                            "RUNNING",
+                            "PAUSED",
+                            "BLOCKED",
+                        )
+                    ),
                     BacklogIssueRecord.eligibility_status.in_(
                         ("ELIGIBLE", "ELIGIBLE_FOR_REVALIDATION")
-                    )
+                    ),
                 )
-                .order_by(
+            )
+            pending_inventory_count = session.scalar(
+                select(func.count()).select_from(inventory.subquery())
+            )
+            ambiguous_inventory_count = session.scalar(
+                select(func.count())
+                .select_from(latest_memberships)
+                .where(
+                    latest_memberships.c.membership_rank == 1,
+                    latest_memberships.c.same_timestamp_count > 1,
+                )
+            )
+            next_issue = session.execute(
+                inventory.order_by(
                     BacklogIssueRecord.planned_wave,
                     BacklogIssueRecord.planned_order,
+                    BacklogIssueRecord.repository,
                     BacklogIssueRecord.issue_number,
-                )
-                .limit(1)
+                ).limit(1)
             ).first()
             services = self._services(session)
             active_work = []
@@ -172,7 +228,8 @@ class DashboardObservabilityProjection:
             return {
                 "summary": {
                     "active_workflows": len(active),
-                    "queued_issues": int(queued_issues or 0),
+                    "pending_inventory_count": int(pending_inventory_count or 0),
+                    "ambiguous_inventory_count": int(ambiguous_inventory_count or 0),
                     "blocked_workflows": sum(
                         item["normalized_status"] == "blocked" for item in serialized
                     ),
@@ -185,16 +242,27 @@ class DashboardObservabilityProjection:
                 },
                 "active_work": active_work,
                 "idle": len(active) == 0,
-                "next_eligible_issue": (
+                "next_inventory_candidate": (
                     {
                         "project": next_issue[1].project,
                         "repository": next_issue[0].repository,
                         "issue_number": next_issue[0].issue_number,
-                        "title": next_issue[0].title,
+                        "title": self.redactor.redact_text(next_issue[0].title).value,
                         "issue_url": self._safe_issue_url(next_issue[0].issue_url_reference),
+                        "campaign_id": str(next_issue[1].id),
+                        "campaign_status": next_issue[1].status,
+                        "inventory_observed_at": utc_iso(next_issue[1].imported_at),
+                        "delivery_status": next_issue[0].delivery_status,
+                        "eligibility_status": next_issue[0].eligibility_status,
+                        "authorization": "NOT_EVALUATED",
                     }
                     if next_issue
                     else None
+                ),
+                "inventory_semantics": (
+                    "Latest recorded membership per repository and issue; not a dispatch queue "
+                    "or an approved next task. Current issue state and approval "
+                    "require revalidation. Equal latest snapshot times are ambiguous and excluded."
                 ),
                 "services": services["services"],
                 "providers": services["providers"],
