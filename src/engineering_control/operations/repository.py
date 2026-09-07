@@ -1250,17 +1250,12 @@ class OperationsRepository:
             )
             return capability
 
-    async def create_reauthentication(self, candidate_id: UUID, session_binding_hash: str) -> str:
-        return await asyncio.to_thread(
-            self._create_reauthentication, candidate_id, session_binding_hash
-        )
-
     async def rotate_reauthentication(
         self,
         candidate_id: UUID,
         authorization: SessionAuthorization,
         new_session_binding_hash: str,
-    ) -> str:
+    ) -> tuple[str, datetime]:
         return await asyncio.to_thread(
             self._rotate_reauthentication, candidate_id, authorization, new_session_binding_hash
         )
@@ -1270,7 +1265,7 @@ class OperationsRepository:
         candidate_id: UUID,
         authorization: SessionAuthorization,
         new_session_binding_hash: str,
-    ) -> str:
+    ) -> tuple[str, datetime]:
         if (
             len(new_session_binding_hash) != 64
             or any(char not in "0123456789abcdef" for char in new_session_binding_hash)
@@ -1292,34 +1287,7 @@ class OperationsRepository:
                 or candidate.capability_status != "AVAILABLE"
             ):
                 raise ValueError("action candidate is unavailable")
-            command = parse_command(candidate.payload_json)
-            capability, resolved = self._capability(session, command, now)
-            if capability.status != "AVAILABLE":
-                raise ValueError("action capability changed; prepare a new action")
-            target_type, target_id, project = command_target(command)
-            immutable = {
-                "action": command.action,
-                "target_type": target_type,
-                "target_id": target_id,
-                "project": project or capability.project,
-                "payload": candidate.payload_json,
-                "resolved": resolved,
-                "production": False,
-            }
-            # Refresh has a random candidate nonce, deliberately not reusable.
-            # Its typed, read-only target must still match; all other actions
-            # must retain the exact approved issue/artifact/risk snapshot.
-            if (
-                candidate.action != command.action
-                or candidate.target_type != target_type
-                or candidate.target_id != target_id
-                or candidate.project != immutable["project"]
-                or (
-                    not isinstance(command, RefreshConnectionsCommand)
-                    and not hmac.compare_digest(candidate.binding_hash, canonical_sha256(immutable))
-                )
-            ):
-                raise ValueError("action snapshot changed; prepare a new action")
+            self._validate_current_candidate(session, candidate, now)
             prior = session.scalar(
                 select(ReauthenticationBinding).where(
                     ReauthenticationBinding.candidate_id == candidate_id
@@ -1331,18 +1299,53 @@ class OperationsRepository:
             # These writes and the revocation commit together. No operation or
             # external effect is created during reauthentication.
             candidate.session_binding_hash = new_session_binding_hash
+            expires_at = min(_utc(candidate.expires_at), now + timedelta(minutes=5))
             session.add(
                 ReauthenticationBinding(
                     candidate_id=candidate_id,
                     token_digest=hashlib.sha256(token.encode()).hexdigest(),
                     session_binding_hash=new_session_binding_hash,
                     created_at=now,
-                    expires_at=min(_utc(candidate.expires_at), now + timedelta(minutes=5)),
+                    expires_at=expires_at,
                     used_at=None,
                 )
             )
             retire_session(session, authorization)
-        return token
+        return token, expires_at
+
+    def _validate_current_candidate(
+        self, session: Session, candidate: ActionCandidate, now: datetime
+    ) -> Command:
+        command = parse_command(candidate.payload_json)
+        if isinstance(command, SolveIssueCommand):
+            self._require_current_issue_approval(session, command, candidate.binding_hash)
+        capability, resolved = self._capability(session, command, now)
+        if capability.status != "AVAILABLE":
+            raise ValueError("action capability changed; prepare a new action")
+        target_type, target_id, project = command_target(command)
+        immutable = {
+            "action": command.action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "project": project or capability.project,
+            "payload": candidate.payload_json,
+            "resolved": resolved,
+            "production": False,
+        }
+        # Refresh has a random candidate nonce. Its typed read-only target still
+        # must match; every other action retains the exact approved snapshot.
+        if (
+            candidate.action != command.action
+            or candidate.target_type != target_type
+            or candidate.target_id != target_id
+            or candidate.project != immutable["project"]
+            or (
+                not isinstance(command, RefreshConnectionsCommand)
+                and not hmac.compare_digest(candidate.binding_hash, canonical_sha256(immutable))
+            )
+        ):
+            raise ValueError("action snapshot changed; prepare a new action")
+        return command
 
     def _require_current_issue_approval(
         self,
@@ -1367,40 +1370,6 @@ class OperationsRepository:
                 raise ValueError("issue operation command changed before approval validation")
             self._require_current_issue_approval(session, command, operation.binding_hash)
 
-    def _create_reauthentication(self, candidate_id: UUID, session_binding_hash: str) -> str:
-        now = datetime.now(UTC)
-        token = secrets.token_urlsafe(32)
-        digest = hashlib.sha256(token.encode()).hexdigest()
-        with self.sessions.begin() as session:
-            candidate = session.get(ActionCandidate, candidate_id, with_for_update=True)
-            if (
-                candidate is None
-                or candidate.used_at is not None
-                or _utc(candidate.expires_at) <= now
-                or not hmac.compare_digest(candidate.session_binding_hash, session_binding_hash)
-                or candidate.capability_status != "AVAILABLE"
-            ):
-                raise ValueError("action candidate is unavailable")
-            prior = session.scalar(
-                select(ReauthenticationBinding).where(
-                    ReauthenticationBinding.candidate_id == candidate_id
-                )
-            )
-            if prior is not None:
-                session.delete(prior)
-                session.flush()
-            session.add(
-                ReauthenticationBinding(
-                    candidate_id=candidate_id,
-                    token_digest=digest,
-                    session_binding_hash=session_binding_hash,
-                    created_at=now,
-                    expires_at=now + timedelta(minutes=5),
-                    used_at=None,
-                )
-            )
-        return token
-
     async def queue_candidate(
         self,
         candidate_id: UUID,
@@ -1408,7 +1377,7 @@ class OperationsRepository:
         session_binding_hash: str,
         confirmation_phrase: str | None,
         *,
-        authorization: SessionAuthorization | None = None,
+        authorization: SessionAuthorization,
     ) -> OperationView:
         return await asyncio.to_thread(
             self._queue_candidate,
@@ -1425,16 +1394,15 @@ class OperationsRepository:
         reauthentication_token: str,
         session_binding_hash: str,
         confirmation_phrase: str | None,
-        authorization: SessionAuthorization | None = None,
+        authorization: SessionAuthorization,
     ) -> OperationView:
         now = datetime.now(UTC)
         token_digest = hashlib.sha256(reauthentication_token.encode()).hexdigest()
         try:
             with self.sessions.begin() as session:
-                if authorization is not None:
-                    if not hmac.compare_digest(authorization.binding_hash, session_binding_hash):
-                        raise ValueError("dashboard session binding changed")
-                    require_authorization(session, authorization)
+                if not hmac.compare_digest(authorization.binding_hash, session_binding_hash):
+                    raise ValueError("dashboard session binding changed")
+                require_authorization(session, authorization)
                 now = datetime.now(UTC)
                 candidate = session.get(ActionCandidate, candidate_id, with_for_update=True)
                 binding = session.scalar(
@@ -1476,11 +1444,7 @@ class OperationsRepository:
                         .limit(1)
                     )
                 if existing is None:
-                    command = parse_command(candidate.payload_json)
-                    if isinstance(command, SolveIssueCommand):
-                        self._require_current_issue_approval(
-                            session, command, candidate.binding_hash
-                        )
+                    self._validate_current_candidate(session, candidate, now)
                     existing = OperationRequest(
                         action=candidate.action,
                         project=candidate.project,
@@ -1510,8 +1474,7 @@ class OperationsRepository:
             if conflict_kind is None:
                 raise
             with self.sessions.begin() as session:
-                if authorization is not None:
-                    require_authorization(session, authorization)
+                require_authorization(session, authorization)
                 candidate = session.get(ActionCandidate, candidate_id)
                 if candidate is None:
                     raise

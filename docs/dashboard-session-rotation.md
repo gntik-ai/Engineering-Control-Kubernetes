@@ -15,11 +15,18 @@ that candidate and its single-use reauthentication binding to a new session;
 revoke the old session. The candidate ID, payload, target, binding hash and expiry
 are not extended or replaced. Reauthentication does not create an operation.
 An action token lasts at most five minutes and never beyond the candidate expiry.
+The response exposes its actual UTC expiry and conservatively rounded-down
+remaining seconds, rather than reporting a fixed five minutes.
 
 PostgreSQL mutating session paths acquire the authentication singleton lock
 before candidate/binding locks. Logout and password change/reset share that
 ordering. Web action admission repeats session authorization under the same
 lock, after HTTP authentication, and commits the operation before releasing it.
+Every newly admitted candidate repeats its current capability and immutable
+snapshot check at execution, not only during reauthentication. An existing
+operation can be returned without authorizing another effect. The former
+nonrotating reauthentication entry point has been removed; action admission
+requires explicit session authorization, including repository-level callers.
 An action committed before a concurrent logout remains a durable accepted action;
 logout is not cancellation. A logout committed first denies stale admission.
 Lock waits are bounded to five seconds and statements to ten seconds on the
@@ -37,6 +44,13 @@ retain the existing maximum five-second revocation contract and may reconnect
 with the browser's new session cookie. Revoked-cookie reconnects remain denied.
 Authorization storage failure fails closed; no cookie is returned on an uncertain
 login rotation, and partial reauthentication writes roll back together.
+
+Existing cleanup discovers/counts expired session revocations, deletes at most
+10,000 expired rows per enabled metadata-cleanup execution, recounts the remainder,
+and persists a deduplicated alert when the limit is exceeded. Active revocations
+are preserved. Deletion requires enabled cleanup policy plus explicit dry_run=false;
+this session change neither enables live cleanup nor authorizes retention deletion.
+Recurring live cleanup/alert acceptance remains tracked under HERMES-2026-017.
 
 This source change uses the existing schema0015 tables. Source fixture acceptance
 is not installed/live acceptance, full browser action coverage or production GO.

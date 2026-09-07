@@ -508,48 +508,40 @@ async def test_postgresql_simultaneous_issue_starts_return_one_active_owner() ->
 @pytest.mark.postgresql
 @pytest.mark.asyncio
 async def test_postgresql_dashboard_owner_race_consumes_both_reauth_bindings() -> None:
+    from test_controlled_operations import _rotate_candidate
+
     repository = OperationsRepository(_postgresql_url())
     command_value = RefreshConnectionsCommand(scope="all")
-    first_session = "c" * 64
-    second_session = "d" * 64
+    first_session = uuid4().hex * 2
+    second_session = uuid4().hex * 2
     first_candidate = await repository.candidate(command_value, first_session)
     second_candidate = await repository.candidate(command_value, second_session)
     assert first_candidate.binding_hash != second_candidate.binding_hash
-    first_token = await repository.create_reauthentication(
-        first_candidate.candidate_id, first_session
+    first_token, first_auth = await _rotate_candidate(
+        repository, first_candidate.candidate_id, first_session
     )
-    second_token = await repository.create_reauthentication(
-        second_candidate.candidate_id, second_session
+    second_token, second_auth = await _rotate_candidate(
+        repository, second_candidate.candidate_id, second_session
     )
-    original = repository._active_target
-    barrier = threading.Barrier(2, timeout=10)
-    barrier_hits: list[str] = []
-    hits_lock = threading.Lock()
-
-    def synchronized_active_target(*args: object, **kwargs: object) -> bool:
-        value = original(*args, **kwargs)
-        if not value:
-            with hits_lock:
-                barrier_hits.append(str(threading.get_ident()))
-            barrier.wait()
-        return value
-
-    repository._active_target = synchronized_active_target  # type: ignore[method-assign]
+    # The common authentication lock now serializes these two actual Web
+    # admissions. A barrier INSIDE that lock would manufacture a deadlock.
+    # Cross-channel insert-conflict racing is tested separately above.
     first, second = await asyncio.gather(
         repository.queue_candidate(
             first_candidate.candidate_id,
             first_token,
-            first_session,
+            first_auth.binding_hash,
             first_candidate.confirmation_phrase,
+            authorization=first_auth,
         ),
         repository.queue_candidate(
             second_candidate.candidate_id,
             second_token,
-            second_session,
+            second_auth.binding_hash,
             second_candidate.confirmation_phrase,
+            authorization=second_auth,
         ),
     )
-    assert len(barrier_hits) == 2
     assert first.operation_id == second.operation_id
     with repository.sessions() as session:
         candidates = [

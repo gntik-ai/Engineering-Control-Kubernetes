@@ -1018,7 +1018,7 @@ def create_app(
             replacement_data = sessions.verify(replacement)
             if replacement_data is None:
                 raise ValueError("replacement session is invalid")
-            token = await operations(request).rotate_reauthentication(
+            token, expires_at = await operations(request).rotate_reauthentication(
                 body.candidate_id,
                 session_authorization(authenticated),
                 sessions.binding_digest(replacement),
@@ -1027,7 +1027,8 @@ def create_app(
             response = JSONResponse(
                 {
                     "reauthentication_token": token,
-                    "expires_in": 300,
+                    "expires_in": max(0, int((expires_at - datetime.now(UTC)).total_seconds())),
+                    "expires_at": expires_at.isoformat(),
                     "csrf_token": replacement_data.csrf_token,
                     "session_rotated": True,
                 }

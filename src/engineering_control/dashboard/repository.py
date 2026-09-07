@@ -257,9 +257,7 @@ class DashboardRepository:
         password_hash = self.passwords.hash(password)
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
-            row = session.get(DashboardAuthentication, 1, with_for_update=True)
-            if row is None:
-                raise ValueError("dashboard password is not initialized")
+            row = lock_authentication(session)
             row.password_hash = password_hash
             row.password_version += 1
             row.password_changed_at = now
@@ -277,8 +275,8 @@ class DashboardRepository:
     ) -> int | None:
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
-            row = session.get(DashboardAuthentication, 1, with_for_update=True)
-            if row is None or not self.passwords.verify(row.password_hash, current_password):
+            row = lock_authentication(session)
+            if not self.passwords.verify(row.password_hash, current_password):
                 return None
             if self.passwords.verify(row.password_hash, new_password):
                 raise ValueError("new password must differ from current password")

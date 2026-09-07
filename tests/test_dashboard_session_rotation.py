@@ -258,7 +258,7 @@ async def test_stale_execute_is_rejected_inside_transaction(repositories):
     )
     token2 = MANAGER.create(1)
     auth2 = authorization(token2)
-    reauth = await operations.rotate_reauthentication(
+    reauth, _expires_at = await operations.rotate_reauthentication(
         candidate_view.candidate_id, auth, auth2.binding_hash
     )
     await dashboard.revoke_session(
@@ -393,7 +393,7 @@ async def test_issue_rotation_preserves_exact_approval_snapshot(tmp_path, change
             elif changed == "source_head":
                 campaign.source_head_at_import = "9" * 40
         if changed == "unchanged":
-            proof = await operations.rotate_reauthentication(
+            proof, _expires_at = await operations.rotate_reauthentication(
                 prepared.candidate_id, auth, MANAGER.binding_digest(new)
             )
             queued = await operations.queue_candidate(
@@ -450,3 +450,103 @@ async def test_expired_authority_is_checked_at_transaction_time(repositories):
         await operations.rotate_reauthentication(prepared.candidate_id, expired, "d" * 64)
     with operations.sessions() as session:
         assert session.scalar(select(func.count()).select_from(DashboardSessionRevocation)) == 0
+
+
+def test_reauth_response_reports_actual_candidate_lifetime(repositories):
+    dashboard, operations = repositories
+    with client_for(dashboard, operations) as client:
+        assert login(client).status_code == 303
+        identifier = candidate(client)
+        expiry = datetime.now(UTC) + timedelta(seconds=25)
+        with operations.sessions.begin() as session:
+            session.get(ActionCandidate, UUID(identifier)).expires_at = expiry
+        response = reauthenticate(client, identifier)
+        assert response.status_code == 200
+        body = response.json()
+        assert 0 < body["expires_in"] <= 25
+        assert datetime.fromisoformat(body["expires_at"]) == expiry
+        with operations.sessions() as session:
+            binding = session.scalar(select(ReauthenticationBinding))
+            assert binding.expires_at.replace(tzinfo=UTC) == expiry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_state", ["RUNNING", "PAUSED", "FAILED"])
+async def test_nonissue_candidate_snapshot_rechecked_after_rotation(repositories, new_state):
+    from engineering_control.db.models import Run
+    from engineering_control.operations.models import WorkflowControlCommand
+
+    dashboard, operations = repositories
+    now = datetime.now(UTC)
+    with operations.sessions.begin() as session:
+        session.add(
+            Run(
+                id=uuid4(),
+                workflow_id="synthetic-session-workflow",
+                project="platform",
+                run_type="CleanupWorkflow",
+                status="RUNNING",
+                started_at=now,
+            )
+        )
+    old, new = MANAGER.create(1), MANAGER.create(1)
+    auth, new_auth = authorization(old), authorization(new)
+    prepared = await operations.candidate(
+        WorkflowControlCommand(action="pause", workflow_id="synthetic-session-workflow"),
+        auth.binding_hash,
+    )
+    assert prepared.capability.status == "AVAILABLE"
+    proof, _expiry = await operations.rotate_reauthentication(
+        prepared.candidate_id, auth, new_auth.binding_hash
+    )
+    with operations.sessions.begin() as session:
+        session.scalar(select(Run)).status = new_state
+    if new_state == "RUNNING":
+        accepted = await operations.queue_candidate(
+            prepared.candidate_id, proof, new_auth.binding_hash, None, authorization=new_auth
+        )
+        assert accepted.status == "PENDING"
+    else:
+        with pytest.raises(ValueError, match="changed"):
+            await operations.queue_candidate(
+                prepared.candidate_id, proof, new_auth.binding_hash, None, authorization=new_auth
+            )
+        with operations.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(OperationRequest)) == 0
+            assert session.scalar(select(ReauthenticationBinding)).used_at is None
+
+
+@pytest.mark.parametrize("method", ["reset", "change"])
+def test_postgres_password_mutation_lock_wait_is_bounded(postgres_repositories, method):
+    import time
+
+    from sqlalchemy.exc import OperationalError
+
+    from engineering_control.dashboard.session_store import lock_authentication
+
+    dashboard, _operations = postgres_repositories
+    replacement = "second isolated fixture password"
+    new_hash = dashboard.passwords.hash(replacement)
+    with ThreadPoolExecutor(max_workers=1) as executor, dashboard.sessions.begin() as session:
+        row = lock_authentication(session)
+        version = row.password_version
+        started = time.monotonic()
+        if method == "reset":
+            pending = executor.submit(dashboard.reset_password_sync, replacement)
+        else:
+            pending = executor.submit(dashboard._change_password, PASSWORD, replacement, new_hash)
+        with pytest.raises(OperationalError) as denied:
+            pending.result(timeout=9)
+        assert getattr(denied.value.orig, "sqlstate", None) == "55P03"
+        assert 4.5 <= time.monotonic() - started < 9
+        assert row.password_version == version
+
+
+def test_unrotated_reauthentication_path_is_removed_and_admission_requires_authority(repositories):
+    import inspect
+
+    _dashboard, operations = repositories
+    assert not hasattr(operations, "create_reauthentication")
+    assert not hasattr(operations, "_create_reauthentication")
+    parameter = inspect.signature(operations.queue_candidate).parameters["authorization"]
+    assert parameter.default is inspect.Parameter.empty

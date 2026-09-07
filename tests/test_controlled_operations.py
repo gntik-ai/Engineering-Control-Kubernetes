@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from engineering_control.api.schemas import MultiProjectAuditStart, OperationAcc
 from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
     BacklogIssueRecord,
@@ -74,6 +76,24 @@ SESSION_A = "a" * 64
 SESSION_B = "b" * 64
 PASSWORD = "bounded dashboard fixture password"  # noqa: S105
 PROJECT_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config" / "projects"
+
+
+async def _rotate_candidate(repository, candidate_id, previous_binding):
+    """Use the real rotating repository path with explicit synthetic session proof."""
+    dashboard = DashboardRepository(str(repository.engine.url))
+    try:
+        version = await dashboard.authentication_version()
+        if version is None:
+            version = await dashboard.initialize_password(PASSWORD)
+        expiry = datetime.now(UTC) + timedelta(hours=12)
+        previous = SessionAuthorization(previous_binding, version, expiry)
+        replacement = SessionAuthorization(secrets.token_hex(32), version, expiry)
+        token, _expires_at = await repository.rotate_reauthentication(
+            candidate_id, previous, replacement.binding_hash
+        )
+        return token, replacement
+    finally:
+        dashboard.engine.dispose()
 
 
 def _repository(tmp_path: Path) -> OperationsRepository:
@@ -398,17 +418,24 @@ async def test_issue_candidate_reauth_is_session_bound_one_use_and_idempotent(
     assert candidate.binding_hash == same_candidate_other_session.binding_hash
     assert candidate.candidate_id != same_candidate_other_session.candidate_id
 
-    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
     operation = await repository.queue_candidate(
         candidate.candidate_id,
         token,
-        SESSION_A,
+        authorization.binding_hash,
         None,
+        authorization=authorization,
     )
     assert operation.source_channel == "dashboard"
     assert operation.status == "PENDING"
     with pytest.raises(ValueError, match="already used"):
-        await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, None)
+        await repository.queue_candidate(
+            candidate.candidate_id,
+            token,
+            authorization.binding_hash,
+            None,
+            authorization=authorization,
+        )
     with repository.sessions() as session:
         binding = session.scalar(select(ReauthenticationBinding))
         assert binding is not None and binding.used_at is not None
@@ -423,7 +450,7 @@ async def test_issue_confirmation_rejects_changed_approved_snapshot(
     repository = _repository(tmp_path)
     _seed_ready_issue(repository)
     candidate = await repository.candidate(_solve_issue(), SESSION_A)
-    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
     with repository.sessions.begin() as session:
         issue = session.scalar(select(BacklogIssueRecord))
         campaign = session.get(GitHubBacklogCampaign, CAMPAIGN_ID)
@@ -435,7 +462,13 @@ async def test_issue_confirmation_rejects_changed_approved_snapshot(
         else:
             campaign.source_head_at_import = "9" * 40
     with pytest.raises(ValueError, match="approval snapshot changed"):
-        await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, None)
+        await repository.queue_candidate(
+            candidate.candidate_id,
+            token,
+            authorization.binding_hash,
+            None,
+            authorization=authorization,
+        )
     with repository.sessions() as session:
         assert session.scalar(select(func.count()).select_from(OperationRequest)) == 0
         binding = session.scalar(select(ReauthenticationBinding))
@@ -448,8 +481,10 @@ async def test_issue_approval_is_revalidated_after_queue_before_dispatch(tmp_pat
     _seed_ready_issue(repository)
     command = _solve_issue()
     candidate = await repository.candidate(command, SESSION_A)
-    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
-    operation = await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, None)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
+    operation = await repository.queue_candidate(
+        candidate.candidate_id, token, authorization.binding_hash, None, authorization=authorization
+    )
     await repository.validate_issue_approval(operation.operation_id, command)
     with repository.sessions.begin() as session:
         issue = session.scalar(select(BacklogIssueRecord))
@@ -479,16 +514,23 @@ async def test_backlog_requires_server_phrase_and_prevents_duplicate_active_oper
     candidate = await repository.candidate(command, SESSION_A)
     assert candidate.capability.status == "AVAILABLE"
     assert candidate.confirmation_phrase is not None
-    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
     with pytest.raises(ValueError, match="typed confirmation"):
-        await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, "WRONG")
+        await repository.queue_candidate(
+            candidate.candidate_id,
+            token,
+            authorization.binding_hash,
+            "WRONG",
+            authorization=authorization,
+        )
 
     # A failed phrase does not consume the one-use reauthentication binding.
     first = await repository.queue_candidate(
         candidate.candidate_id,
         token,
-        SESSION_A,
+        authorization.binding_hash,
         candidate.confirmation_phrase,
+        authorization=authorization,
     )
     second = await repository.create_external(
         command,
@@ -518,18 +560,28 @@ async def test_completed_connection_refresh_can_be_run_again(tmp_path: Path) -> 
     command = RefreshConnectionsCommand(scope="all")
 
     first_candidate = await repository.candidate(command, SESSION_A)
-    first_token = await repository.create_reauthentication(first_candidate.candidate_id, SESSION_A)
+    first_token, first_auth = await _rotate_candidate(
+        repository, first_candidate.candidate_id, SESSION_A
+    )
     first = await repository.queue_candidate(
-        first_candidate.candidate_id, first_token, SESSION_A, None
+        first_candidate.candidate_id,
+        first_token,
+        first_auth.binding_hash,
+        None,
+        authorization=first_auth,
     )
     await repository.finish(first.operation_id, status="COMPLETED")
 
-    second_candidate = await repository.candidate(command, SESSION_A)
-    second_token = await repository.create_reauthentication(
-        second_candidate.candidate_id, SESSION_A
+    second_candidate = await repository.candidate(command, first_auth.binding_hash)
+    second_token, second_auth = await _rotate_candidate(
+        repository, second_candidate.candidate_id, first_auth.binding_hash
     )
     second = await repository.queue_candidate(
-        second_candidate.candidate_id, second_token, SESSION_A, None
+        second_candidate.candidate_id,
+        second_token,
+        second_auth.binding_hash,
+        None,
+        authorization=second_auth,
     )
 
     assert second.operation_id != first.operation_id
