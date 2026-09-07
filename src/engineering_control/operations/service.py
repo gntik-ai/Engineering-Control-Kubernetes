@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import time
 from typing import Any
 from uuid import UUID
+
+import structlog
 
 from engineering_control.api.schemas import (
     AuditPlanRequest,
@@ -20,6 +23,7 @@ from engineering_control.api.schemas import (
 from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.operations.connections import ConnectionHealthProjector
+from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditAllProjectsCommand,
@@ -44,6 +48,8 @@ from engineering_control.operations.models import (
 )
 from engineering_control.operations.repository import OperationsRepository
 
+logger = structlog.get_logger()
+
 
 class TypedCommandBus:
     """One allowlisted application command path for dashboard, Telegram, and CLI."""
@@ -58,6 +64,8 @@ class TypedCommandBus:
         self.metadata = metadata
         self.operations = operations
         self.connections = ConnectionHealthProjector(operations)
+        self._next_issue_recovery_at = 0.0
+        self._issue_recovery_cursor: UUID | None = None
 
     async def submit(
         self,
@@ -83,11 +91,33 @@ class TypedCommandBus:
         return refreshed
 
     async def dispatch_pending(self) -> bool:
+        if time.monotonic() >= self._next_issue_recovery_at:
+            self._next_issue_recovery_at = time.monotonic() + 5.0
+            await self.recover_issue_start_once()
         claim = await self.operations.claim_pending()
         if claim is None:
             return False
         await self.dispatch_claim(claim)
         return True
+
+    async def recover_issue_start_once(self) -> None:
+        candidate = await self.operations.next_issue_start_recovery(self._issue_recovery_cursor)
+        if candidate is None:
+            self._issue_recovery_cursor = None
+            return
+        operation_id, request = candidate
+        self._issue_recovery_cursor = operation_id
+        if request is None:
+            logger.error("issue_start_recovery_invalid_binding", operation_id=str(operation_id))
+            return
+        try:
+            accepted = await self.control.observe_issue_start(request)
+        except Exception:  # noqa: BLE001 - observation failures never release or restart ownership
+            await self.operations.mark_issue_start_unconfirmed(
+                operation_id, issue_workflow_id(request)
+            )
+            return
+        await self.operations.record_issue_start_recovery(request, accepted)
 
     async def dispatch_claim(self, claim: tuple[UUID, Command, SourceChannel, str]) -> None:
         operation_id, command, _source_channel, operator_class = claim
@@ -105,6 +135,8 @@ class TypedCommandBus:
                 operator_class=operator_class,
                 operation_id=operation_id,
             )
+        except IssueStartUnconfirmedError as error:
+            await self.operations.mark_issue_start_unconfirmed(operation_id, error.workflow_id)
         except ValueError as error:
             await self.operations.finish(operation_id, status="BLOCKED", safe_error=str(error))
         except Exception:  # noqa: BLE001 - safe error boundary must not expose provider details
@@ -367,7 +399,11 @@ class TypedCommandBus:
 
 async def operation_dispatch_loop(bus: TypedCommandBus, stop: asyncio.Event) -> None:
     while not stop.is_set():
-        worked = await bus.dispatch_pending()
+        try:
+            worked = await bus.dispatch_pending()
+        except Exception as error:  # noqa: BLE001 - keep dispatcher alive without hiding cancellation
+            logger.error("operation_dispatch_iteration_failed", error_type=type(error).__name__)
+            worked = False
         if not worked:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=0.5)

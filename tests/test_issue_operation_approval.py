@@ -71,7 +71,9 @@ async def test_repeated_direct_handoff_uses_one_durable_workflow_id(
         assert first.run_id == second.run_id == "fixture-run"
         assert second.status == "EXISTING"
     else:
-        with pytest.raises(ValueError, match="identity does not match"):
+        from engineering_control.operations.issue_start import IssueStartUnconfirmedError
+
+        with pytest.raises(IssueStartUnconfirmedError, match="ISSUE_START_UNCONFIRMED"):
             await service.start_existing_backlog_loop(request)
     assert len(client.start_workflow.await_args_list) == 2
     assert all(call.kwargs["id"] == workflow_id for call in client.start_workflow.await_args_list)

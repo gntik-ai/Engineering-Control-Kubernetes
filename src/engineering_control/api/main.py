@@ -8,6 +8,7 @@ from uuid import UUID
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
@@ -60,6 +61,7 @@ from engineering_control.observability.agent import (
     GatewayEventInput,
 )
 from engineering_control.observability.metrics import ControlPlaneMetrics
+from engineering_control.operations.issue_start import IssueStartUnconfirmedError
 from engineering_control.operations.models import parse_command
 from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
@@ -149,6 +151,23 @@ def create_app(
     authenticated = bearer_auth(expected_token)
     auth_dependency = Depends(authenticated)
     app.add_middleware(MaintenanceAdmission, mode=admission_mode, authenticate=authenticated)
+
+    @app.exception_handler(IssueStartUnconfirmedError)
+    async def issue_start_unconfirmed(
+        _request: Request, error: IssueStartUnconfirmedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "START_UNCONFIRMED",
+                "operation_id": str(error.operation_id),
+                "expected_workflow_id": error.workflow_id,
+                "detail": (
+                    "Start acknowledgement is unconfirmed; preserve this operation and inspect "
+                    "its status. Do not start a replacement issue run."
+                ),
+            },
+        )
 
     def control(request: Request) -> ControlService:
         return cast(ControlService, request.app.state.control_service)

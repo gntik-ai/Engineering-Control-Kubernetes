@@ -35,6 +35,7 @@ from engineering_control.api.schemas import (
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.models.enums import Project
+from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
@@ -92,6 +93,7 @@ class ControlService(Protocol):
     async def start_existing_backlog_loop(
         self, request: ExistingBacklogLoopStart
     ) -> OperationAccepted: ...
+    async def observe_issue_start(self, request: ExistingBacklogLoopStart) -> OperationAccepted: ...
     async def start_autonomous_backlog(
         self, request: AutonomousBacklogStart
     ) -> OperationAccepted: ...
@@ -466,8 +468,7 @@ class TemporalControlService:
         if direct:
             await self.repository.validate_issue_operation_approval(request)
         workflow_id = (
-            f"backlog-loop-{request.project}-{request.backlog_campaign_id}"
-            f"-operation-{request.issue_operation_id}"
+            issue_workflow_id(request)
             if request.issue_operation_id is not None
             else f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
         )
@@ -475,7 +476,10 @@ class TemporalControlService:
             # Only an exact approved direct operation can reach this branch.
             # Resolve its actual existing execution; missing/wrong history is
             # not permission to start another workflow from a running projection.
-            return await self._existing_issue_workflow(workflow_id)
+            try:
+                return await self._existing_issue_workflow(workflow_id)
+            except Exception as error:
+                raise IssueStartUnconfirmedError(request) from error
         try:
             handle = await self.client.start_workflow(
                 WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,
@@ -492,16 +496,27 @@ class TemporalControlService:
         except WorkflowAlreadyStartedError as error:
             if not direct:
                 raise
-            return await self._existing_issue_workflow(workflow_id, run_id=error.run_id)
+            try:
+                return await self._existing_issue_workflow(workflow_id, run_id=error.run_id)
+            except Exception as lookup_error:
+                raise IssueStartUnconfirmedError(request) from lookup_error
+        except Exception as error:
+            if direct:
+                raise IssueStartUnconfirmedError(request) from error
+            raise
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def _existing_issue_workflow(
-        self, workflow_id: str, *, run_id: str | None = None
+        self,
+        workflow_id: str,
+        *,
+        run_id: str | None = None,
+        rpc_timeout: timedelta = timedelta(seconds=30),
     ) -> OperationAccepted:
         existing = self.client.get_workflow_handle(workflow_id, run_id=run_id)
-        description = await existing.describe(rpc_timeout=timedelta(seconds=30))
+        description = await existing.describe(rpc_timeout=rpc_timeout)
         if (
             description.id != workflow_id
             or description.workflow_type != WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value
@@ -510,6 +525,18 @@ class TemporalControlService:
         return OperationAccepted(
             workflow_id=workflow_id, run_id=description.run_id, status="EXISTING"
         )
+
+    async def observe_issue_start(self, request: ExistingBacklogLoopStart) -> OperationAccepted:
+        # Only describe an exact persisted attempt. No current-policy approval,
+        # new start, signal, cancellation or external write occurs here.
+        request = ExistingBacklogLoopStart.model_validate(request.model_dump(mode="json"))
+        if request.issue_operation_id is None or request.issue_approval_binding is None:
+            raise ValueError("issue observation requires an immutable operation reference")
+        accepted = await self._existing_issue_workflow(
+            issue_workflow_id(request), rpc_timeout=timedelta(seconds=5)
+        )
+        UUID(accepted.run_id)
+        return accepted
 
     async def start_autonomous_backlog(self, request: AutonomousBacklogStart) -> OperationAccepted:
         for project, campaign_id in request.backlog_campaign_ids.items():

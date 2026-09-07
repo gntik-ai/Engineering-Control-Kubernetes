@@ -242,7 +242,9 @@ async def test_running_projection_never_authorizes_a_new_or_unrelated_workflow(
                 else "ExistingGitHubBacklogLoopWorkflow",
                 run_id=RUN_ID,
             )
-        with pytest.raises((ValueError, LookupError)):
+        from engineering_control.operations.issue_start import IssueStartUnconfirmedError
+
+        with pytest.raises(IssueStartUnconfirmedError, match="ISSUE_START_UNCONFIRMED"):
             await TemporalControlService(temporal, "fixture-only", values[1]).start_delivery(body)
         temporal.start_workflow.assert_not_awaited()
     finally:

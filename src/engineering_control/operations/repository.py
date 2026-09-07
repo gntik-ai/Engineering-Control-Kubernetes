@@ -12,10 +12,11 @@ from typing import Any, cast
 from uuid import UUID
 
 import yaml
-from sqlalchemy import create_engine, desc, func, select
+from sqlalchemy import create_engine, desc, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.api.schemas import ExistingBacklogLoopStart, OperationAccepted
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.db.models import (
     ACTIVE_OPERATION_STATUSES,
@@ -51,6 +52,11 @@ from engineering_control.operations.connection_status import (
 )
 from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
 from engineering_control.operations.issue_approval import current_issue_approval_binding
+from engineering_control.operations.issue_start import (
+    ISSUE_START_UNCONFIRMED,
+    issue_request_from_operation,
+    issue_workflow_id,
+)
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditAllProjectsCommand,
@@ -1483,6 +1489,124 @@ class OperationsRepository:
                 parse_command(row.payload_json),
                 cast(SourceChannel, row.source_channel),
                 row.operator_class,
+            )
+
+    async def mark_issue_start_unconfirmed(self, operation_id: UUID, workflow_id: str) -> bool:
+        return await asyncio.to_thread(
+            self._mark_issue_start_unconfirmed, operation_id, workflow_id
+        )
+
+    def _mark_issue_start_unconfirmed(self, operation_id: UUID, workflow_id: str) -> bool:
+        with self.sessions.begin() as session:
+            row = self._lock_issue_dispatch(session, operation_id)
+            if row is None or row.status != "DISPATCHING" or row.workflow_id is not None:
+                return False
+            request = issue_request_from_operation(row)
+            if workflow_id != issue_workflow_id(request):
+                raise ValueError("uncertain issue start does not match its operation")
+            if row.temporal_run_id is not None or row.completed_at is not None:
+                return False
+            if row.safe_error == ISSUE_START_UNCONFIRMED:
+                return False
+            row.safe_error = ISSUE_START_UNCONFIRMED
+            session.add(
+                DashboardEvent(
+                    occurred_at=datetime.now(UTC),
+                    level="WARNING",
+                    event_type="operation.start_unconfirmed",
+                    source="controller",
+                    host=None,
+                    worker_kind="controller",
+                    project=row.project,
+                    workflow_id=None,
+                    temporal_run_id=None,
+                    entity_type="operation",
+                    entity_id=str(row.id),
+                    current_phase="DISPATCHING",
+                    message=ISSUE_START_UNCONFIRMED,
+                    metadata_json={"expected_workflow_id": workflow_id, "operation": str(row.id)},
+                )
+            )
+            return True
+
+    @staticmethod
+    def _lock_issue_dispatch(session: Session, operation_id: UUID) -> OperationRequest | None:
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            session.execute(text("SET LOCAL statement_timeout = '10s'"))
+        return session.get(
+            OperationRequest, operation_id, with_for_update=True, populate_existing=True
+        )
+
+    async def next_issue_start_recovery(
+        self,
+        after_id: UUID | None,
+    ) -> tuple[UUID, ExistingBacklogLoopStart | None] | None:
+        return await asyncio.to_thread(self._next_issue_start_recovery, after_id)
+
+    def _next_issue_start_recovery(
+        self,
+        after_id: UUID | None,
+    ) -> tuple[UUID, ExistingBacklogLoopStart | None] | None:
+        with self.sessions.begin() as session:
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            query = (
+                select(OperationRequest)
+                .where(
+                    OperationRequest.action == "solve_issue",
+                    OperationRequest.status == "DISPATCHING",
+                    OperationRequest.workflow_id.is_(None),
+                    OperationRequest.temporal_run_id.is_(None),
+                    OperationRequest.completed_at.is_(None),
+                    or_(
+                        OperationRequest.safe_error == ISSUE_START_UNCONFIRMED,
+                        OperationRequest.started_at <= datetime.now(UTC) - timedelta(seconds=60),
+                    ),
+                )
+                .order_by(OperationRequest.id)
+                .limit(1)
+            )
+            if after_id is not None:
+                query = query.where(OperationRequest.id > after_id)
+            row = session.scalar(query)
+            if row is None:
+                return None
+            try:
+                request = issue_request_from_operation(row)
+            except ValueError:
+                # Return its cursor even for malformed stored input, so one bad
+                # record cannot indefinitely starve other read-only observations.
+                request = None
+            return row.id, request
+
+    async def record_issue_start_recovery(
+        self,
+        request: ExistingBacklogLoopStart,
+        accepted: OperationAccepted,
+    ) -> bool:
+        return await asyncio.to_thread(self._record_issue_start_recovery, request, accepted)
+
+    def _record_issue_start_recovery(
+        self,
+        request: ExistingBacklogLoopStart,
+        accepted: OperationAccepted,
+    ) -> bool:
+        if request.issue_operation_id is None or accepted.workflow_id != issue_workflow_id(request):
+            raise ValueError("observed issue workflow does not match the attempted operation")
+        with self.sessions.begin() as session:
+            row = self._lock_issue_dispatch(session, request.issue_operation_id)
+            if row is None or row.status != "DISPATCHING":
+                return False
+            if issue_request_from_operation(row) != request:
+                raise ValueError("stored issue attempt changed during read-only observation")
+            return record_dispatch_receipt(
+                session,
+                row.id,
+                status="STARTED",
+                workflow_id=accepted.workflow_id,
+                run_id=accepted.run_id,
+                linked=True,
             )
 
     async def finish(

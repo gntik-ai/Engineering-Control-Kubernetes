@@ -7,6 +7,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from engineering_control.db.models import DashboardEvent, NotificationOutbox, OperationRequest
+from engineering_control.operations.issue_start import (
+    ISSUE_START_UNCONFIRMED,
+    issue_request_from_operation,
+    issue_workflow_id,
+)
 from engineering_control.retention_limits import NOTIFICATION_OUTBOX_PENDING_STATUS
 from engineering_control.security.redaction import SecretRedactor
 
@@ -53,6 +58,14 @@ def record_dispatch_receipt(
         or operation.completed_at is not None
     ):
         return False
+
+    if operation.safe_error == ISSUE_START_UNCONFIRMED:
+        # A delayed generic failure cannot release ownership of an execution
+        # whose remote start result is still unknown.
+        if status != "STARTED":
+            return False
+        if workflow_id != issue_workflow_id(issue_request_from_operation(operation)):
+            raise ValueError("issue start receipt does not match the canonical operation")
 
     now = datetime.now(UTC)
     operation.status = status
