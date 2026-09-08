@@ -73,6 +73,9 @@ const adoptSessionRotation = (authorized) => {
   document.querySelectorAll('input[name="csrf_token"]').forEach((field) => { field.value = authorized.csrf_token; });
 };
 let pendingCandidate = null;
+// Exact request proof stays in this tab's memory only, never browser storage.
+// A retry reads the durable acceptance receipt; it does not authorize a new effect.
+let pendingExecution = null;
 
 const actionEffect = (action) => {
   if (["refresh_connections", "audit_plan"].includes(action)) return "Read-only probe or metadata plan; no product mutation.";
@@ -82,6 +85,7 @@ const actionEffect = (action) => {
 };
 
 async function prepareAction(command, errorTarget = null) {
+  if (byId("action-execute")?.disabled) return;
   try {
     const response = await fetch("/api/dashboard/actions/candidates", {
       method: "POST", headers: {"Content-Type": "application/json"},
@@ -97,6 +101,9 @@ async function prepareAction(command, errorTarget = null) {
       throw new Error((candidate.capability.blockers || []).join(" · ") || `Capability is ${candidate.capability.status}.`);
     }
     pendingCandidate = candidate;
+    pendingExecution = null;
+    byId("action-password").required = true;
+    byId("action-execute").textContent = "Confirm operation";
     byId("action-effect").textContent = actionEffect(command.action);
     byId("action-binding").textContent = JSON.stringify(candidate.operation_binding, null, 2);
     byId("action-password").value = ""; byId("action-phrase").value = "";
@@ -113,19 +120,34 @@ async function prepareAction(command, errorTarget = null) {
 
 async function confirmAction(event) {
   event.preventDefault(); if (!pendingCandidate) return;
-  const execute = byId("action-execute"); execute.disabled = true;
+  const execute = byId("action-execute"); if (execute.disabled) return;
+  execute.disabled = true; byId("action-cancel").disabled = true;
   try {
-    const reauth = await fetch("/api/dashboard/actions/reauthenticate", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, current_password: byId("action-password").value}),
-    });
-    const authorized = await reauth.json();
-    if (!reauth.ok) throw new Error(authorized.detail || "Unable to authorize operation.");
-    byId("action-password").value = "";
-    adoptSessionRotation(authorized);
+    if (!pendingExecution) {
+      const reauth = await fetch("/api/dashboard/actions/reauthenticate", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, current_password: byId("action-password").value}),
+      });
+      const authorized = await reauth.json();
+      if (!reauth.ok) throw new Error(authorized.detail || "Unable to authorize operation.");
+      byId("action-password").value = "";
+      adoptSessionRotation(authorized);
+      const expiresAt = Date.parse(authorized.expires_at);
+      if (!Number.isFinite(expiresAt) || typeof authorized.reauthentication_token !== "string") {
+        throw new Error("Authorization response was incomplete. Reload and sign in before retrying.");
+      }
+      pendingExecution = Object.freeze({
+        expiresAt,
+        body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, reauthentication_token: authorized.reauthentication_token, confirmation_phrase: byId("action-phrase").value || null}),
+      });
+      byId("action-password").required = false;
+    }
+    if (Date.now() >= pendingExecution.expiresAt) {
+      throw new Error("Confirmation expired. Check operation status before preparing another action.");
+    }
     const response = await fetch("/api/dashboard/actions/execute", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, reauthentication_token: authorized.reauthentication_token, confirmation_phrase: byId("action-phrase").value || null}),
+      body: pendingExecution.body,
     });
     let operation = await response.json();
     if (!response.ok) throw new Error(operation.detail || "Operation was not accepted.");
@@ -135,18 +157,27 @@ async function confirmAction(event) {
       if (poll.ok) operation = await poll.json();
     }
     if (["FAILED", "BLOCKED"].includes(operation.status)) throw new Error(operation.safe_error || `Operation ${operation.status.toLowerCase()}.`);
-    byId("action-dialog").close(); pendingCandidate = null;
+    byId("action-dialog").close(); pendingCandidate = null; pendingExecution = null;
     if (operation.workflow_id) location.assign(`/workflows/${encodeURIComponent(operation.workflow_id)}`);
     else if (operation.result_available) location.assign(`/api/dashboard/operations/${operation.operation_id}/export`);
     else location.reload();
-  } catch (error) { setError("action-blockers", error.message); }
-  finally { byId("action-password").value = ""; execute.disabled = false; }
+  } catch (error) {
+    const suffix = pendingExecution ? " Retry checks this same operation; it will not create another." : "";
+    setError("action-blockers", error.message + suffix);
+  }
+  finally {
+    byId("action-password").value = ""; execute.disabled = false;
+    execute.textContent = pendingExecution ? "Retry same operation" : "Confirm operation";
+    byId("action-cancel").disabled = false;
+  }
 }
 
 function setupActionDialog() {
   const form = byId("action-confirmation"); if (!form) return;
   form.addEventListener("submit", confirmAction);
-  byId("action-cancel").addEventListener("click", () => { pendingCandidate = null; byId("action-password").value = ""; byId("action-dialog").close(); });
+  const clearPending = () => { pendingCandidate = null; pendingExecution = null; byId("action-password").value = ""; byId("action-password").required = true; };
+  byId("action-cancel").addEventListener("click", () => { if (byId("action-execute").disabled) return; clearPending(); byId("action-dialog").close(); });
+  byId("action-dialog").addEventListener("cancel", (event) => { if (byId("action-execute").disabled) event.preventDefault(); else clearPending(); });
 }
 
 function setupOverview() {

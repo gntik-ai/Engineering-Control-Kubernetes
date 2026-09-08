@@ -92,7 +92,7 @@ def test_postgresql_fresh_bootstrap_accepts_model_created_0015_index(
 
         command.upgrade(config, "head")
         with bootstrap.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0016"
             after_index = connection.execute(
                 text(
                     "SELECT index_relation.oid, "

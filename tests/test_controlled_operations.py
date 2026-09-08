@@ -428,14 +428,14 @@ async def test_issue_candidate_reauth_is_session_bound_one_use_and_idempotent(
     )
     assert operation.source_channel == "dashboard"
     assert operation.status == "PENDING"
-    with pytest.raises(ValueError, match="already used"):
-        await repository.queue_candidate(
-            candidate.candidate_id,
-            token,
-            authorization.binding_hash,
-            None,
-            authorization=authorization,
-        )
+    repeated = await repository.queue_candidate(
+        candidate.candidate_id,
+        token,
+        authorization.binding_hash,
+        None,
+        authorization=authorization,
+    )
+    assert repeated.operation_id == operation.operation_id
     with repository.sessions() as session:
         binding = session.scalar(select(ReauthenticationBinding))
         assert binding is not None and binding.used_at is not None
@@ -757,18 +757,17 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
         )
         assert queued.status_code == 202
         assert queued.json()["status"] == "PENDING"
-        assert (
-            client.post(
-                "/api/dashboard/actions/execute",
-                json={
-                    "csrf_token": csrf,
-                    "candidate_id": candidate["candidate_id"],
-                    "reauthentication_token": authorized.json()["reauthentication_token"],
-                    "confirmation_phrase": None,
-                },
-            ).status_code
-            == 409
+        repeated = client.post(
+            "/api/dashboard/actions/execute",
+            json={
+                "csrf_token": csrf,
+                "candidate_id": candidate["candidate_id"],
+                "reauthentication_token": authorized.json()["reauthentication_token"],
+                "confirmation_phrase": None,
+            },
         )
+        assert repeated.status_code == 202
+        assert repeated.json()["operation_id"] == queued.json()["operation_id"]
 
 
 @pytest.mark.asyncio

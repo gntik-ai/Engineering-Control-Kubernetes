@@ -52,5 +52,36 @@ are preserved. Deletion requires enabled cleanup policy plus explicit dry_run=fa
 this session change neither enables live cleanup nor authorizes retention deletion.
 Recurring live cleanup/alert acceptance remains tracked under HERMES-2026-017.
 
-This source change uses the existing schema0015 tables. Source fixture acceptance
-is not installed/live acceptance, full browser action coverage or production GO.
+## Recovering a lost action response
+
+Session rotation itself uses schema0015. Durable action acknowledgement recovery
+additionally requires migration0016: a nullable accepted-operation reference on
+the candidate. Its first successful use atomically stores that reference together
+with consumption of the candidate and reauthentication proof. This also records
+an existing active operation adopted from another allowed channel.
+
+The browser keeps the exact authorized execution request only in the current tab's
+memory. If its accepted response is lost, **Retry same operation** resends that
+request without reauthenticating the already consumed candidate. Concurrent clicks
+are suppressed. Password input is cleared; cancellation/dismissal clears the local
+proof. Browser storage, persisted cookies and reports must not contain that proof.
+
+Every retry still requires the same current, unrevoked session, current CSRF,
+unexpired candidate and reauthentication token, and exact typed confirmation.
+Authorization is repeated after candidate/binding lock waits and after insert
+conflict rollback. A valid receipt returns only its original operation and current
+status, including a completed/failed/blocked result. It never creates, restarts or
+signals an operation, and never substitutes a newer active owner. Accepted is not
+completed, and logout is not cancellation of previously accepted work.
+
+If the proof expires or the tab/session is lost, check operation status before
+preparing another action. A stale tab must reload its CSRF/session state. An
+absent, inconsistent or expired receipt fails closed; legacy used candidates are
+not backfilled or reopened. This retry mechanism does not approve stale issue
+revisions or waive the separate final worker/external-effect authorization gates.
+
+Migration0016 adds only the nullable UUID foreign key and index, with five-second
+PostgreSQL lock and thirty-second statement limits. No historical row is assigned
+a guessed operation. Downgrade refuses to discard any non-null acceptance receipt;
+use the reviewed forward-repair/rollback plan, not a destructive schema downgrade.
+Source/fixture acceptance is not installed/live acceptance or production GO.

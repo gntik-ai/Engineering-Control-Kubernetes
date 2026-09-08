@@ -572,6 +572,15 @@ class ActionCandidate(UUIDPrimaryKey, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_operation_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey(
+            "operation_requests.id",
+            name="fk_action_candidates_accepted_operation",
+            ondelete="SET NULL",
+        ),
+        index=True,
+    )
     __table_args__ = (
         UniqueConstraint(
             "binding_hash",

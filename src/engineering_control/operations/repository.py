@@ -1396,35 +1396,20 @@ class OperationsRepository:
         confirmation_phrase: str | None,
         authorization: SessionAuthorization,
     ) -> OperationView:
-        now = datetime.now(UTC)
         token_digest = hashlib.sha256(reauthentication_token.encode()).hexdigest()
         try:
             with self.sessions.begin() as session:
-                if not hmac.compare_digest(authorization.binding_hash, session_binding_hash):
-                    raise ValueError("dashboard session binding changed")
-                require_authorization(session, authorization)
-                now = datetime.now(UTC)
-                candidate = session.get(ActionCandidate, candidate_id, with_for_update=True)
-                binding = session.scalar(
-                    select(ReauthenticationBinding)
-                    .where(ReauthenticationBinding.candidate_id == candidate_id)
-                    .with_for_update()
+                candidate, binding, now = self._authorized_candidate(
+                    session,
+                    candidate_id,
+                    token_digest,
+                    session_binding_hash,
+                    confirmation_phrase,
+                    authorization,
                 )
-                if candidate is None or binding is None:
-                    raise ValueError("reauthentication binding is unavailable")
-                if candidate.used_at is not None or _utc(candidate.expires_at) <= now:
-                    raise ValueError("action candidate expired or was already used")
-                if binding.used_at is not None or _utc(binding.expires_at) <= now:
-                    raise ValueError("reauthentication expired or was already used")
-                if not hmac.compare_digest(candidate.session_binding_hash, session_binding_hash):
-                    raise ValueError("action candidate session binding changed")
-                if not hmac.compare_digest(binding.session_binding_hash, session_binding_hash):
-                    raise ValueError("reauthentication session binding changed")
-                if not hmac.compare_digest(binding.token_digest, token_digest):
-                    raise ValueError("reauthentication token is invalid")
-                expected_phrase = candidate.confirmation_phrase or ""
-                if not hmac.compare_digest(expected_phrase, confirmation_phrase or ""):
-                    raise ValueError("typed confirmation does not match the operation binding")
+                receipt = self._accepted_candidate_operation(session, candidate, binding)
+                if receipt is not None:
+                    return self._operation_result_view(session, receipt)
                 existing = session.scalar(
                     select(OperationRequest).where(
                         OperationRequest.idempotency_key == candidate.binding_hash
@@ -1466,18 +1451,30 @@ class OperationsRepository:
                     )
                     session.add(existing)
                     session.flush()
+                self._require_candidate_operation_target(candidate, existing)
                 candidate.used_at = now
                 binding.used_at = now
-                return self._operation_view(existing)
+                candidate.accepted_operation_id = existing.id
+                return self._operation_result_view(session, existing)
         except IntegrityError as error:
             conflict_kind = _operation_integrity_conflict(error)
             if conflict_kind is None:
                 raise
             with self.sessions.begin() as session:
-                require_authorization(session, authorization)
-                candidate = session.get(ActionCandidate, candidate_id)
-                if candidate is None:
-                    raise
+                # A conflicting insert rolled back the entire first attempt.
+                # Reacquire locks and recheck every authority field, including
+                # expiry after the wait. Never reuse the pre-conflict decision.
+                candidate, binding, now = self._authorized_candidate(
+                    session,
+                    candidate_id,
+                    token_digest,
+                    session_binding_hash,
+                    confirmation_phrase,
+                    authorization,
+                )
+                receipt = self._accepted_candidate_operation(session, candidate, binding)
+                if receipt is not None:
+                    return self._operation_result_view(session, receipt)
                 existing = self._operation_after_insert_conflict(
                     session,
                     action=candidate.action,
@@ -1487,16 +1484,82 @@ class OperationsRepository:
                 )
                 if existing is None:
                     raise
-                binding = session.scalar(
-                    select(ReauthenticationBinding).where(
-                        ReauthenticationBinding.candidate_id == candidate_id
-                    )
-                )
-                if candidate.used_at is None:
-                    candidate.used_at = now
-                if binding is not None and binding.used_at is None:
-                    binding.used_at = now
-                return self._operation_view(existing)
+                self._require_candidate_operation_target(candidate, existing)
+                candidate.used_at = now
+                binding.used_at = now
+                candidate.accepted_operation_id = existing.id
+                return self._operation_result_view(session, existing)
+
+    def _authorized_candidate(
+        self,
+        session: Session,
+        candidate_id: UUID,
+        token_digest: str,
+        session_binding_hash: str,
+        confirmation_phrase: str | None,
+        authorization: SessionAuthorization,
+    ) -> tuple[ActionCandidate, ReauthenticationBinding, datetime]:
+        if not hmac.compare_digest(authorization.binding_hash, session_binding_hash):
+            raise ValueError("dashboard session binding changed")
+        require_authorization(session, authorization)
+        candidate = session.get(ActionCandidate, candidate_id, with_for_update=True)
+        binding = session.scalar(
+            select(ReauthenticationBinding)
+            .where(ReauthenticationBinding.candidate_id == candidate_id)
+            .with_for_update()
+        )
+        # Candidate/binding locks may also have waited. A session that expired
+        # during that wait must not admit or disclose an acceptance receipt.
+        require_authorization(session, authorization)
+        now = datetime.now(UTC)
+        if candidate is None or binding is None:
+            raise ValueError("reauthentication binding is unavailable")
+        if _utc(candidate.expires_at) <= now:
+            raise ValueError("action candidate expired")
+        if _utc(binding.expires_at) <= now:
+            raise ValueError("reauthentication expired")
+        if not hmac.compare_digest(candidate.session_binding_hash, session_binding_hash):
+            raise ValueError("action candidate session binding changed")
+        if not hmac.compare_digest(binding.session_binding_hash, session_binding_hash):
+            raise ValueError("reauthentication session binding changed")
+        if not hmac.compare_digest(binding.token_digest, token_digest):
+            raise ValueError("reauthentication token is invalid")
+        if not hmac.compare_digest(candidate.confirmation_phrase or "", confirmation_phrase or ""):
+            raise ValueError("typed confirmation does not match the operation binding")
+        return candidate, binding, now
+
+    @staticmethod
+    def _require_candidate_operation_target(
+        candidate: ActionCandidate, operation: OperationRequest
+    ) -> None:
+        if (candidate.action, candidate.target_type, candidate.target_id, candidate.project) != (
+            operation.action,
+            operation.target_type,
+            operation.target_id,
+            operation.project,
+        ):
+            raise ValueError("accepted operation target does not match candidate")
+
+    def _accepted_candidate_operation(
+        self, session: Session, candidate: ActionCandidate, binding: ReauthenticationBinding
+    ) -> OperationRequest | None:
+        if candidate.used_at is None and binding.used_at is None:
+            if candidate.accepted_operation_id is not None:
+                raise ValueError("action receipt has inconsistent consumption state")
+            return None
+        if (
+            candidate.used_at is None
+            or binding.used_at is None
+            or candidate.accepted_operation_id is None
+        ):
+            raise ValueError("action was already used without a recoverable acceptance receipt")
+        accepted = session.get(OperationRequest, candidate.accepted_operation_id)
+        if accepted is None:
+            raise ValueError("accepted operation is no longer available")
+        self._require_candidate_operation_target(candidate, accepted)
+        # This is a read of a prior acceptance, not permission to repeat any
+        # external effect. Never look up a newer active owner on this path.
+        return accepted
 
     async def operation(self, operation_id: UUID) -> OperationView | None:
         return await asyncio.to_thread(self._operation, operation_id)
@@ -1506,16 +1569,19 @@ class OperationsRepository:
             row = session.get(OperationRequest, operation_id)
             if row is None:
                 return None
-            result_available = False
-            if row.status == "COMPLETED" and row.action in {
-                "evidence_export_campaign",
-                "evidence_export_workflow",
-            }:
-                operation_export = session.scalar(
-                    select(OperationExport).where(OperationExport.operation_id == row.id)
-                )
-                result_available = self._valid_export(operation_export, datetime.now(UTC))
-            return self._operation_view(row, result_available=result_available)
+            return self._operation_result_view(session, row)
+
+    def _operation_result_view(self, session: Session, row: OperationRequest) -> OperationView:
+        result_available = False
+        if row.status == "COMPLETED" and row.action in {
+            "evidence_export_campaign",
+            "evidence_export_workflow",
+        }:
+            operation_export = session.scalar(
+                select(OperationExport).where(OperationExport.operation_id == row.id)
+            )
+            result_available = self._valid_export(operation_export, datetime.now(UTC))
+        return self._operation_view(row, result_available=result_available)
 
     async def claim_pending(self) -> tuple[UUID, Command, SourceChannel, str] | None:
         return await asyncio.to_thread(self._claim_pending)

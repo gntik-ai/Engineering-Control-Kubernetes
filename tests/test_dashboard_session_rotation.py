@@ -162,7 +162,9 @@ def test_reauth_transfers_exact_candidate_and_rotates_before_execute(repositorie
         body["csrf_token"] = authorized["csrf_token"]
         queued = client.post("/api/dashboard/actions/execute", json=body)
         assert queued.status_code == 202 and queued.json()["status"] == "PENDING"
-        assert client.post("/api/dashboard/actions/execute", json=body).status_code == 409
+        retried = client.post("/api/dashboard/actions/execute", json=body)
+        assert retried.status_code == 202
+        assert retried.json()["operation_id"] == queued.json()["operation_id"]
         assert sibling.get("/overview").status_code == 200
         assert_denied(client, old)
 
@@ -363,7 +365,7 @@ def test_browser_adopts_csrf_before_execute_and_clears_password():
     execute = script.index('fetch("/api/dashboard/actions/execute"', start)
     assert handoff < execute
     assert 'input[name="csrf_token"]' in script
-    assert 'finally { byId("action-password").value = "";' in script
+    assert re.search(r'finally\s*\{\s*byId\("action-password"\)\.value = "";', script)
     # This is source contract evidence; real browser interaction remains separate.
 
 
