@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,7 +42,9 @@ def migration_database(request, tmp_path, monkeypatch):
         url = make_url(URL).set(database=database).render_as_string(False)
     monkeypatch.setenv("ENGINEERING_DATABASE_URL", url)
     root = Path(__file__).resolve().parents[1]
-    config = Config(str(root / "alembic.ini"))
+    # No fileConfig(): a fixture migration must not disable existing app
+    # loggers or replace the embedding test runner's logging configuration.
+    config = Config()
     config.set_main_option("script_location", str(root / "migrations"))
     engine = create_engine(url)
     try:
@@ -156,3 +159,16 @@ def test_fresh_model_bootstrap_and_exact_migration_chain_are_compatible(migratio
         if c["name"] == "accepted_operation_id"
     )
     assert column["nullable"] is True
+
+
+def test_migration_preserves_application_logging(migration_database, caplog):
+    config, _engine = migration_database
+    logger = logging.getLogger("engineering_control.dashboard.app")
+    caplog.set_level(logging.INFO, logger=logger.name)
+    assert logger.disabled is False
+    logger.info("synthetic migration logging before")
+    command.upgrade(config, "0016")
+    assert logger.disabled is False
+    logger.info("synthetic migration logging after")
+    assert "synthetic migration logging before" in caplog.text
+    assert "synthetic migration logging after" in caplog.text

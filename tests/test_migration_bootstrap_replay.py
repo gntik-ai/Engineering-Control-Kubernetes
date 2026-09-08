@@ -28,6 +28,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
+    assert (head, parent) == ("0016", "0015")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -40,12 +41,19 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     )
     predicate = str(active_owner_index["dialect_options"]["sqlite_where"])
     assert all(status in predicate for status in ACTIVE_OPERATION_STATUSES)
+    assert "accepted_operation_id" in {
+        column["name"] for column in inspect(engine).get_columns("action_candidates")
+    }
 
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
-    assert "uq_operation_requests_active_target" not in {
+    # Only0016 is downgraded:0015's active-owner fence must remain intact.
+    assert "uq_operation_requests_active_target" in {
         index["name"] for index in inspect(engine).get_indexes("operation_requests")
+    }
+    assert "accepted_operation_id" not in {
+        column["name"] for column in inspect(engine).get_columns("action_candidates")
     }
 
     command.upgrade(config, head)
@@ -53,6 +61,9 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head
     assert "uq_operation_requests_active_target" in {
         index["name"] for index in inspect(engine).get_indexes("operation_requests")
+    }
+    assert "accepted_operation_id" in {
+        column["name"] for column in inspect(engine).get_columns("action_candidates")
     }
     engine.dispose()
 
