@@ -10,6 +10,7 @@ import stat
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,7 @@ _MESSAGE_LIMIT = 3500
 _PAGE_CACHE_MAX_ENTRIES = 256
 _CURSOR_PLACEHOLDER = "0" * 32
 _PAGE_CACHE: dict[str, tuple[datetime, str, str, list[Any]]] = {}
+_RECEIPT_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("receipt_context", default=None)
 
 
 def _private_api_url() -> None:
@@ -168,7 +170,7 @@ def _request(
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "X-Engineering-Actor": actor,
-            **({"Idempotency-Key": f"telegram-{uuid4()}"} if path == "/v1/commands" else {}),
+            **({"Idempotency-Key": _command_idempotency_key()} if path == "/v1/commands" else {}),
         },
     )
     try:
@@ -190,6 +192,7 @@ def _gateway_event(
     raw_args: str = "",
     result: Any = None,
     outcome: str | None = None,
+    receipt: dict[str, Any] | None = None,
 ) -> None:
     """Best-effort safe event; command text, actor identity, and credentials never leave memory."""
     try:
@@ -231,6 +234,8 @@ def _gateway_event(
             "issue_number": issue_number,
             "mode": mode,
             "workflow_id": workflow_id,
+            **(_RECEIPT_CONTEXT.get() or {}),
+            **(receipt or {}),
         }
         request = urllib.request.Request(  # noqa: S310 - loopback URL is validated above
             f"{API_URL}/v1/observability/gateway-events",
@@ -1252,7 +1257,87 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
     raise ValueError("unsupported Engineering Control command")
 
 
-def handle(event_type: str, context: dict[str, Any]) -> dict[str, str] | None:
+def _command_idempotency_key() -> str:
+    context = _RECEIPT_CONTEXT.get() or {}
+    correlation = context.get("delivery_correlation_id")
+    if context.get("platform_update_id") is not None and correlation:
+        return f"telegram-{correlation}"
+    # Legacy callers have no platform update identity. Do not pretend their
+    # random key protects duplicate updates across gateway restarts.
+    return f"telegram-{uuid4()}"
+
+
+def _receipt_identity(context: dict[str, Any]) -> dict[str, Any]:
+    update_id = context.get("platform_update_id")
+    correlation = context.get("delivery_correlation_id")
+    if type(update_id) is not int or not 0 <= update_id <= 2**53 - 1:
+        return {}
+    try:
+        correlation = str(UUID(str(correlation)))
+    except ValueError:
+        return {}
+    return {"platform_update_id": update_id, "delivery_correlation_id": correlation}
+
+
+def _transport_receipt(context: dict[str, Any]) -> None:
+    command = context.get("command")
+    identity = _receipt_identity(context)
+    if context.get("platform") != "telegram" or command not in COMMANDS or not identity:
+        return
+    try:
+        if not _authorized(str(context.get("user_id", ""))):
+            return
+    except (OSError, ValueError):
+        return
+    status = context.get("delivery_status")
+    allowed = {
+        "ACKNOWLEDGED",
+        "UNACKNOWLEDGED",
+        "UNKNOWN",
+        "UNAVAILABLE",
+        "EMPTY",
+        "REJECTED_OVERSIZE",
+    }
+    if status not in allowed:
+        return
+    ids = context.get("acknowledged_message_ids")
+    valid_ids = (
+        isinstance(ids, list)
+        and 1 <= len(ids) <= 64
+        and all(isinstance(value, str) and re.fullmatch(r"[0-9]{1,20}", value) for value in ids)
+        and len(set(ids)) == len(ids)
+    )
+    if status == "ACKNOWLEDGED" and not valid_ids:
+        status = "UNKNOWN"
+    _gateway_event(
+        "telegram.response_delivered"
+        if status == "ACKNOWLEDGED"
+        else "telegram.response_delivery_failed",
+        str(command),
+        outcome=str(status),
+        receipt={
+            **identity,
+            "delivery_status": status,
+            "acknowledged_message_ids": ids if status == "ACKNOWLEDGED" else [],
+        },
+    )
+
+
+def handle(event_type: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    if event_type == "command-reply:completed":
+        _transport_receipt(context)
+        return None
+    token = _RECEIPT_CONTEXT.set(_receipt_identity(context))
+    try:
+        result = _handle_command(event_type, context)
+        if result is not None and context.get("platform") == "telegram":
+            result["observe_delivery"] = True
+        return result
+    finally:
+        _RECEIPT_CONTEXT.reset(token)
+
+
+def _handle_command(event_type: str, context: dict[str, Any]) -> dict[str, Any] | None:
     command = event_type.removeprefix("command:").replace("_", "-")
     if command not in COMMANDS:
         if event_type.startswith("command:"):

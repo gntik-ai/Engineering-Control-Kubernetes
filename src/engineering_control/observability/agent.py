@@ -5,12 +5,12 @@ import ipaddress
 import socket
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -112,6 +112,34 @@ class GatewayEventInput(ObservabilityModel):
     issue_number: int | None = Field(default=None, ge=1)
     mode: str | None = Field(default=None, max_length=40, pattern=r"^[a-z0-9-]+$")
     workflow_id: str | None = Field(default=None, max_length=240)
+    platform_update_id: int | None = Field(default=None, strict=True, ge=0, le=2**53 - 1)
+    delivery_correlation_id: UUID | None = None
+    delivery_status: (
+        Literal[
+            "ACKNOWLEDGED", "UNACKNOWLEDGED", "UNKNOWN", "UNAVAILABLE", "EMPTY", "REJECTED_OVERSIZE"
+        ]
+        | None
+    ) = None
+    acknowledged_message_ids: list[Annotated[str, Field(pattern=r"^[0-9]{1,20}$")]] = Field(
+        default_factory=list, max_length=64
+    )
+
+    @model_validator(mode="after")
+    def validate_delivery_receipt(self) -> Self:
+        if self.event_type == "telegram.response_delivered":
+            if (
+                self.delivery_status != "ACKNOWLEDGED"
+                or self.delivery_correlation_id is None
+                or self.platform_update_id is None
+                or not self.acknowledged_message_ids
+                or len(set(self.acknowledged_message_ids)) != len(self.acknowledged_message_ids)
+            ):
+                raise ValueError(
+                    "delivery success requires a correlated complete transport receipt"
+                )
+        elif self.delivery_status == "ACKNOWLEDGED" or self.acknowledged_message_ids:
+            raise ValueError("only a delivery-success event may carry acknowledgement IDs")
+        return self
 
 
 @dataclass(frozen=True)
@@ -470,6 +498,24 @@ class AgentObservabilityRepository:
                     "mode": values.mode,
                     "outcome": values.outcome,
                     "gateway": "hermes-gateway",
+                    **(
+                        {"platform_update_id": values.platform_update_id}
+                        if values.platform_update_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"delivery_correlation_id": str(values.delivery_correlation_id)}
+                        if values.delivery_correlation_id
+                        else {}
+                    ),
+                    **(
+                        {
+                            "delivery_status": values.delivery_status,
+                            "acknowledged_message_ids": values.acknowledged_message_ids,
+                        }
+                        if values.delivery_status is not None
+                        else {}
+                    ),
                 },
             )
             session.add(row)

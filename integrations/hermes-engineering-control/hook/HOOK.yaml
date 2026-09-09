@@ -2,3 +2,4 @@ name: engineering-control
 description: "Authenticated, allowlisted Telegram bridge to the private Engineering Control API."
 events:
   - command:*
+  - command-reply:completed
