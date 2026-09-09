@@ -141,6 +141,7 @@ def test_hook_manifest_owns_exact_typed_command_catalog() -> None:
     routes = manifest["command_routes"]
     assert len(routes) == len(set(routes))
     assert set(routes) == load_handler().COMMANDS
+    assert manifest["execution"] == "threaded"
     assert set(manifest["events"]) >= {"command:*", "command-reply:completed"}
 
 

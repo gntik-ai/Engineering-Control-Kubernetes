@@ -1,4 +1,5 @@
 name: engineering-control
+execution: threaded
 command_routes:
   - audit
   - audit-all
