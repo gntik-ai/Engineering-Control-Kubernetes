@@ -1,5 +1,6 @@
 name: engineering-control
 execution: threaded
+command_delivery: durable
 command_routes:
   - audit
   - audit-all
