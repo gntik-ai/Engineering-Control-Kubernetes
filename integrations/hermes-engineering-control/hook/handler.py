@@ -1293,13 +1293,16 @@ def handle(event_type: str, context: dict[str, Any]) -> dict[str, str] | None:
                 "engineering.workflow_returned", command, raw_args=raw_args, result=result
             )
         _record_acceptance(command, raw_args, result)
-        _gateway_event("telegram.response_delivered", command, raw_args=raw_args, result=result)
+        # The platform adapter sends this text only after the hook returns.
+        # Preparation (including successful formatting) is not a transport ACK.
+        message = _format(result, command=command, actor=f"telegram:{user_id}")
+        _gateway_event("telegram.response_prepared", command, raw_args=raw_args, result=result)
         return {
             "decision": "handled",
-            "message": _format(result, command=command, actor=f"telegram:{user_id}"),
+            "message": message,
         }
     except (OSError, RuntimeError, ValueError) as error:
-        _gateway_event("telegram.response_delivery_failed", command, outcome="REQUEST_FAILED")
+        _gateway_event("engineering.request_failed", command, outcome="REQUEST_FAILED")
         return {
             "decision": "handled",
             "message": _safe_error(f"Engineering Control: {error}"),

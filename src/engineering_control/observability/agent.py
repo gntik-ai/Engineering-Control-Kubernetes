@@ -101,6 +101,8 @@ class GatewayEventInput(ObservabilityModel):
         "engineering.api_request_started",
         "engineering.api_response_completed",
         "engineering.workflow_returned",
+        "engineering.request_failed",
+        "telegram.response_prepared",
         "telegram.response_delivered",
         "telegram.response_delivery_failed",
     ]
@@ -436,6 +438,8 @@ class AgentObservabilityRepository:
             "engineering.api_request_started": "Engineering Control API request started",
             "engineering.api_response_completed": "Engineering Control API response completed",
             "engineering.workflow_returned": "Engineering Control workflow identifier returned",
+            "engineering.request_failed": "Engineering Control request failed",
+            "telegram.response_prepared": "Telegram response prepared; delivery not acknowledged",
             "telegram.response_delivered": "Telegram response delivered",
             "telegram.response_delivery_failed": "Telegram response delivery failed",
         }
@@ -447,6 +451,7 @@ class AgentObservabilityRepository:
                     if values.event_type
                     in {
                         "telegram.command_rejected",
+                        "engineering.request_failed",
                         "telegram.response_delivery_failed",
                     }
                     else "INFO"
