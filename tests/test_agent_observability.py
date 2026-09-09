@@ -528,7 +528,18 @@ async def test_gateway_event_persists_only_safe_bounded_arguments(tmp_path: Path
         serialized = str(event.metadata_json)
         assert event.source == "hermes"
         assert event.issue_number == 1119
-        assert set(event.metadata_json) == {"command", "mode", "outcome", "gateway"}
+        assert set(event.metadata_json) == {
+            "command",
+            "mode",
+            "outcome",
+            "gateway",
+            "event_contract",
+            "event_received_at",
+            "ingestion_payload_sha256",
+        }
+        assert event.metadata_json["event_contract"] == "legacy-unattested"
+        assert len(event.metadata_json["ingestion_payload_sha256"]) == 64
+        assert datetime.fromisoformat(event.metadata_json["event_received_at"]).tzinfo is not None
         assert "user" not in serialized.lower()
         assert "token" not in serialized.lower()
 

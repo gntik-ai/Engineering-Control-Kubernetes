@@ -28,7 +28,7 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    assert (head, parent) == ("0016", "0015")
+    assert (head, parent) == ("0017", "0016")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -44,16 +44,22 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     assert "accepted_operation_id" in {
         column["name"] for column in inspect(engine).get_columns("action_candidates")
     }
+    assert "gateway_ingestion_key" in {
+        column["name"] for column in inspect(engine).get_columns("dashboard_events")
+    }
 
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
-    # Only0016 is downgraded:0015's active-owner fence must remain intact.
+    # Only0017 is downgraded:0015 ownership and0016 operation receipts remain intact.
     assert "uq_operation_requests_active_target" in {
         index["name"] for index in inspect(engine).get_indexes("operation_requests")
     }
-    assert "accepted_operation_id" not in {
+    assert "accepted_operation_id" in {
         column["name"] for column in inspect(engine).get_columns("action_candidates")
+    }
+    assert "gateway_ingestion_key" not in {
+        column["name"] for column in inspect(engine).get_columns("dashboard_events")
     }
 
     command.upgrade(config, head)
@@ -64,6 +70,9 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     }
     assert "accepted_operation_id" in {
         column["name"] for column in inspect(engine).get_columns("action_candidates")
+    }
+    assert "gateway_ingestion_key" in {
+        column["name"] for column in inspect(engine).get_columns("dashboard_events")
     }
     engine.dispose()
 

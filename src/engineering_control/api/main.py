@@ -58,6 +58,7 @@ from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project, RiskClass
 from engineering_control.observability.agent import (
     AgentObservabilityRepository,
+    GatewayEventConflict,
     GatewayEventInput,
 )
 from engineering_control.observability.metrics import ControlPlaneMetrics
@@ -1165,7 +1166,12 @@ def create_app(
     ) -> dict[str, object]:
         if subject != "hermes-gateway":
             raise HTTPException(status_code=403, detail="gateway event identity required")
-        return await gateway_events(request).gateway_event(subject, body)
+        try:
+            return await gateway_events(request).gateway_event(subject, body)
+        except GatewayEventConflict as error:
+            raise HTTPException(
+                status_code=409, detail="gateway event identity conflict"
+            ) from error
 
     @app.get("/v1/evidence/{artifact_id}")
     async def evidence_get(

@@ -555,6 +555,12 @@ class DashboardEvent(Base):
     current_phase: Mapped[str | None] = mapped_column(String(120))
     message: Mapped[str] = mapped_column(String(500))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Only correlated gateway-ingest events use this key. Historical rows are
+    # left NULL; no old event or supposed acknowledgement is reconstructed.
+    gateway_ingestion_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    __table_args__ = (
+        Index("uq_dashboard_events_gateway_ingestion_key", "gateway_ingestion_key", unique=True),
+    )
 
 
 class ActionCandidate(UUIDPrimaryKey, Base):

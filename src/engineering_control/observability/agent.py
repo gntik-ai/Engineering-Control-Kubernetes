@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
+import json
 import socket
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -10,8 +12,9 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import create_engine, delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.config import Settings
@@ -114,6 +117,7 @@ class GatewayEventInput(ObservabilityModel):
     workflow_id: str | None = Field(default=None, max_length=240)
     platform_update_id: int | None = Field(default=None, strict=True, ge=0, le=2**53 - 1)
     delivery_correlation_id: UUID | None = None
+    event_observed_at: AwareDatetime | None = None
     delivery_status: (
         Literal[
             "ACKNOWLEDGED", "UNACKNOWLEDGED", "UNKNOWN", "UNAVAILABLE", "EMPTY", "REJECTED_OVERSIZE"
@@ -126,6 +130,13 @@ class GatewayEventInput(ObservabilityModel):
 
     @model_validator(mode="after")
     def validate_delivery_receipt(self) -> Self:
+        if (self.delivery_correlation_id is None) != (self.platform_update_id is None):
+            raise ValueError("gateway event requires a complete correlation identity")
+        if self.event_observed_at is not None:
+            if self.delivery_correlation_id is None:
+                raise ValueError("observed gateway event time requires correlation identity")
+            if self.event_observed_at > datetime.now(UTC) + timedelta(seconds=5):
+                raise ValueError("gateway event observation is in the future")
         if self.event_type == "telegram.response_delivered":
             if (
                 self.delivery_status != "ACKNOWLEDGED"
@@ -140,6 +151,24 @@ class GatewayEventInput(ObservabilityModel):
         elif self.delivery_status == "ACKNOWLEDGED" or self.acknowledged_message_ids:
             raise ValueError("only a delivery-success event may carry acknowledgement IDs")
         return self
+
+
+class GatewayEventConflict(ValueError):
+    """One correlated event identity was presented with different content."""
+
+
+def _gateway_key_violation(error: IntegrityError) -> bool:
+    original = error.orig
+    diagnostic = getattr(original, "diag", None)
+    if getattr(original, "sqlstate", None) == "23505":
+        return (
+            getattr(diagnostic, "constraint_name", None)
+            == "uq_dashboard_events_gateway_ingestion_key"
+        )
+    return (
+        getattr(original, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE"
+        and str(original) == "UNIQUE constraint failed: dashboard_events.gateway_ingestion_key"
+    )
 
 
 @dataclass(frozen=True)
@@ -458,6 +487,19 @@ class AgentObservabilityRepository:
         if subject != "hermes-gateway":
             raise ValueError("gateway event identity is not authorized")
         now = datetime.now(UTC)
+        canonical = values.model_dump(mode="json")
+        if values.event_observed_at is not None:
+            canonical["event_observed_at"] = values.event_observed_at.astimezone(UTC).isoformat()
+        payload_digest = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        key = (
+            hashlib.sha256(
+                f"gateway-event-v1:{subject}:{values.delivery_correlation_id}:{values.event_type}".encode()
+            ).hexdigest()
+            if values.delivery_correlation_id is not None
+            else None
+        )
         labels = {
             "telegram.command_received": "Telegram command received",
             "telegram.command_recognized": "Telegram command route recognized",
@@ -473,7 +515,8 @@ class AgentObservabilityRepository:
         }
         with self.sessions.begin() as session:
             row = DashboardEvent(
-                occurred_at=now,
+                occurred_at=values.event_observed_at or now,
+                gateway_ingestion_key=key,
                 level=(
                     "WARNING"
                     if values.event_type
@@ -498,6 +541,9 @@ class AgentObservabilityRepository:
                     "mode": values.mode,
                     "outcome": values.outcome,
                     "gateway": "hermes-gateway",
+                    "event_contract": "correlated-v1" if key else "legacy-unattested",
+                    "event_received_at": now.isoformat(),
+                    "ingestion_payload_sha256": payload_digest,
                     **(
                         {"platform_update_id": values.platform_update_id}
                         if values.platform_update_id is not None
@@ -518,9 +564,26 @@ class AgentObservabilityRepository:
                     ),
                 },
             )
-            session.add(row)
-            session.flush()
-            return {"status": "ACCEPTED", "event_id": row.id}
+            try:
+                with session.begin_nested():
+                    session.add(row)
+                    session.flush()
+            except IntegrityError as error:
+                if key is None or not _gateway_key_violation(error):
+                    raise
+                existing = session.scalar(
+                    select(DashboardEvent).where(DashboardEvent.gateway_ingestion_key == key)
+                )
+                if existing is None:
+                    raise
+                if existing.metadata_json.get("ingestion_payload_sha256") != payload_digest:
+                    raise GatewayEventConflict(
+                        "gateway event identity has different content"
+                    ) from None
+                # Never update the original event, its observation/receipt time,
+                # or freshness evidence when an HTTP acknowledgement was lost.
+                return {"status": "ACCEPTED", "event_id": existing.id, "duplicate": True}
+            return {"status": "ACCEPTED", "event_id": row.id, "duplicate": False}
 
     def _cleanup(self, log_days: int, execution_days: int, limit: int) -> dict[str, int]:
         now = datetime.now(UTC)
