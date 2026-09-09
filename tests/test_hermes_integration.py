@@ -10,6 +10,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 
 @pytest.fixture(autouse=True)
@@ -132,6 +133,15 @@ def test_non_telegram_command_is_denied() -> None:
         "decision": "deny",
         "message": "Engineering Control chat commands are restricted to Telegram.",
     }
+
+
+def test_hook_manifest_owns_exact_typed_command_catalog() -> None:
+    path = Path(__file__).parents[1] / "integrations/hermes-engineering-control/hook/HOOK.yaml"
+    manifest = yaml.safe_load(path.read_text())
+    routes = manifest["command_routes"]
+    assert len(routes) == len(set(routes))
+    assert set(routes) == load_handler().COMMANDS
+    assert set(manifest["events"]) >= {"command:*", "command-reply:completed"}
 
 
 def test_authorized_command_records_telegram_actor(monkeypatch: pytest.MonkeyPatch) -> None:
