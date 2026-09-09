@@ -166,8 +166,11 @@ def deliver_event(payload: dict[str, Any], observed_at: str) -> dict[str, str]:
                 or type(result.get("duplicate")) is not bool
             ):
                 return {"status": "RETRY"}
-            receipt = str(UUID(str(result.get("event_id"))))
-            return {"status": "ACKNOWLEDGED", "receipt": receipt}
+            # DashboardEvent.id is a positive BIGINT, not a workflow UUID.
+            receipt = result.get("event_id")
+            if type(receipt) is not int or not 0 < receipt <= 2**63 - 1:
+                return {"status": "RETRY"}
+            return {"status": "ACKNOWLEDGED", "receipt": str(receipt)}
     except urllib.error.HTTPError as error:
         error.close()
         return {"status": "BLOCKED" if error.code in {400, 409, 422} else "RETRY"}
