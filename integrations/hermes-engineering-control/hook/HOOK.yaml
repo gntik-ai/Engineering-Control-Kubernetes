@@ -1,6 +1,7 @@
 name: engineering-control
 execution: threaded
 command_delivery: durable
+durable_events: true
 command_routes:
   - audit
   - audit-all

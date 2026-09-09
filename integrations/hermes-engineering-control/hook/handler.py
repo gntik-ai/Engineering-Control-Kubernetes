@@ -104,6 +104,75 @@ _PAGE_CACHE_MAX_ENTRIES = 256
 _CURSOR_PLACEHOLDER = "0" * 32
 _PAGE_CACHE: dict[str, tuple[datetime, str, str, list[Any]]] = {}
 _RECEIPT_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("receipt_context", default=None)
+_EVENT_OUTBOX: Any = None
+_EVENT_TYPES = {
+    "telegram.command_received",
+    "telegram.command_recognized",
+    "telegram.command_rejected",
+    "engineering.request_accepted",
+    "engineering.api_request_started",
+    "engineering.api_response_completed",
+    "engineering.workflow_returned",
+    "engineering.request_failed",
+    "telegram.response_prepared",
+    "telegram.response_delivered",
+    "telegram.response_delivery_failed",
+}
+
+
+def bind_event_outbox(outbox: Any) -> None:
+    global _EVENT_OUTBOX
+    if _EVENT_OUTBOX is not None or not callable(getattr(outbox, "enqueue", None)):
+        raise ValueError("durable event outbox binding is invalid")
+    _EVENT_OUTBOX = outbox
+
+
+class _NoEventRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
+def deliver_event(payload: dict[str, Any], observed_at: str) -> dict[str, str]:
+    """Fixed private consumer only. No proxy/redirect or response-body error log."""
+    try:
+        _private_api_url()
+        token = _read_protected(TOKEN_FILE)
+        if len(token) < 32:
+            return {"status": "RETRY"}
+        body = {**payload, "event_observed_at": observed_at}
+        request = urllib.request.Request(  # noqa: S310 - fixed loopback endpoint, redirects/proxies disabled
+            f"{API_URL}/v1/observability/gateway-events",
+            method="POST",
+            data=json.dumps(body, separators=(",", ":"), allow_nan=False).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-Engineering-Actor": "hermes-gateway",
+            },
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoEventRedirect())
+        with opener.open(request, timeout=2) as response:  # noqa: S310
+            if response.status != 202:
+                return {"status": "RETRY"}
+            raw = response.read(4097)
+            if len(raw) > 4096:
+                return {"status": "RETRY"}
+            result = json.loads(raw)
+            if (
+                not isinstance(result, dict)
+                or result.get("status") != "ACCEPTED"
+                or type(result.get("duplicate")) is not bool
+            ):
+                return {"status": "RETRY"}
+            receipt = str(UUID(str(result.get("event_id"))))
+            return {"status": "ACKNOWLEDGED", "receipt": receipt}
+    except urllib.error.HTTPError as error:
+        error.close()
+        return {"status": "BLOCKED" if error.code in {400, 409, 422} else "RETRY"}
+    except (OSError, RuntimeError, ValueError, urllib.error.URLError):
+        return {"status": "RETRY"}
 
 
 def _private_api_url() -> None:
@@ -185,7 +254,7 @@ def _request(
         raise RuntimeError("Engineering API is unavailable on loopback") from error
 
 
-def _gateway_event(
+def _event_payload(
     event_type: str,
     command: str,
     *,
@@ -193,64 +262,98 @@ def _gateway_event(
     result: Any = None,
     outcome: str | None = None,
     receipt: dict[str, Any] | None = None,
-) -> None:
-    """Best-effort safe event; command text, actor identity, and credentials never leave memory."""
+) -> dict[str, Any]:
+    """Build minimized metadata; no configuration reads or persistence."""
+    if event_type not in _EVENT_TYPES:
+        raise ValueError("invalid gateway event type")
+    details = dict(receipt or {})
+    identity = _receipt_identity({**(_RECEIPT_CONTEXT.get() or {}), **details})
+    if not identity:
+        raise ValueError("gateway event correlation is unavailable")
+    if outcome is not None and not re.fullmatch(r"[A-Z0-9_]{1,40}", outcome):
+        raise ValueError("invalid gateway event outcome")
     try:
-        _private_api_url()
-        token = _read_protected(TOKEN_FILE)
-        if len(token) < 32:
-            return
-        try:
-            args = shlex.split(raw_args)
-        except ValueError:
-            args = []
-        project = next((value for value in args[:3] if value in _PROJECTS), None)
-        mode = next(
-            (
-                value
-                for value in args[:6]
-                if value in (_LOOP_MODES | _BACKLOG_MODES | {"full-delivery"})
-            ),
-            None,
+        args = shlex.split(raw_args[:65536])
+    except ValueError:
+        args = []
+    project = next((value for value in args[:3] if value in _PROJECTS), None)
+    mode = next((value for value in args[:6] if value in (_LOOP_MODES | _BACKLOG_MODES)), None)
+    issue_number = next(
+        (
+            int(value)
+            for value in args[:6]
+            if value.isascii()
+            and value.isdigit()
+            and len(value) <= 10
+            and 0 < int(value) <= 2**31 - 1
+        ),
+        None,
+    )
+    result_value = result if isinstance(result, dict) else {}
+    workflow_id = next(
+        (
+            value
+            for key in ("workflow_id", "temporal_workflow_id")
+            if isinstance((value := result_value.get(key)), str)
+            and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,240}", value)
+        ),
+        None,
+    )
+    delivery_status = details.get("delivery_status")
+    ids = details.get("acknowledged_message_ids", [])
+    if delivery_status is not None and delivery_status not in {
+        "ACKNOWLEDGED",
+        "UNACKNOWLEDGED",
+        "UNKNOWN",
+        "UNAVAILABLE",
+        "EMPTY",
+        "REJECTED_OVERSIZE",
+    }:
+        raise ValueError("invalid delivery status")
+    if (
+        not isinstance(ids, list)
+        or len(ids) > 64
+        or any(
+            not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,20}", value) for value in ids
         )
-        issue_number = next(
-            (int(value) for value in args[:6] if value.isdigit() and int(value) > 0),
-            None,
-        )
-        result_value = result if isinstance(result, dict) else {}
-        workflow_id = next(
-            (
-                value
-                for key in ("workflow_id", "temporal_workflow_id")
-                if isinstance((value := result_value.get(key)), str) and value
-            ),
-            None,
-        )
-        payload = {
-            "event_type": event_type,
-            "command": command if command in COMMANDS else "unknown",
-            "outcome": outcome,
-            "project": project,
-            "issue_number": issue_number,
-            "mode": mode,
-            "workflow_id": workflow_id,
-            **(_RECEIPT_CONTEXT.get() or {}),
-            **(receipt or {}),
-        }
-        request = urllib.request.Request(  # noqa: S310 - loopback URL is validated above
-            f"{API_URL}/v1/observability/gateway-events",
-            data=json.dumps(payload, separators=(",", ":")).encode(),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "X-Engineering-Actor": "hermes-gateway",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=2) as response:  # noqa: S310
-            response.read(4096)
-    except (OSError, RuntimeError, ValueError, urllib.error.URLError):
-        return
+        or len(set(ids)) != len(ids)
+    ):
+        raise ValueError("invalid delivery identifiers")
+    if event_type == "telegram.response_delivered":
+        if delivery_status != "ACKNOWLEDGED" or not ids:
+            raise ValueError("complete delivery receipt required")
+    elif delivery_status == "ACKNOWLEDGED" or ids:
+        raise ValueError("unexpected delivery acknowledgement")
+    payload = dict(
+        event_type=event_type,
+        command=command if command in COMMANDS else "unknown",
+        outcome=outcome,
+        project=project,
+        issue_number=issue_number,
+        mode=mode,
+        workflow_id=workflow_id,
+        **identity,
+        delivery_status=delivery_status,
+        acknowledged_message_ids=ids,
+    )
+    return payload
+
+
+def _gateway_event(event_type: str, command: str, **kwargs: Any) -> None:
+    if _EVENT_OUTBOX is None:
+        raise RuntimeError("durable gateway event storage is unavailable")
+    payload = _event_payload(event_type, command, **kwargs)
+    _EVENT_OUTBOX.enqueue(payload["delivery_correlation_id"] + ":" + event_type, payload)
+
+
+def prepare_terminal_event(context: dict[str, Any]) -> dict[str, Any]:
+    payload = _transport_receipt(context, persist=False)
+    if payload is None:
+        raise ValueError("terminal event identity or authorization unavailable")
+    return {
+        "identity": payload["delivery_correlation_id"] + ":" + payload["event_type"],
+        "payload": payload,
+    }
 
 
 def _uuid(value: str, label: str) -> str:
@@ -1279,7 +1382,7 @@ def _receipt_identity(context: dict[str, Any]) -> dict[str, Any]:
     return {"platform_update_id": update_id, "delivery_correlation_id": correlation}
 
 
-def _transport_receipt(context: dict[str, Any]) -> None:
+def _transport_receipt(context: dict[str, Any], *, persist: bool = True) -> dict[str, Any] | None:
     command = context.get("command")
     identity = _receipt_identity(context)
     if context.get("platform") != "telegram" or command not in COMMANDS or not identity:
@@ -1309,7 +1412,8 @@ def _transport_receipt(context: dict[str, Any]) -> None:
     )
     if status == "ACKNOWLEDGED" and not valid_ids:
         status = "UNKNOWN"
-    _gateway_event(
+    publisher = _gateway_event if persist else _event_payload
+    return publisher(
         "telegram.response_delivered"
         if status == "ACKNOWLEDGED"
         else "telegram.response_delivery_failed",

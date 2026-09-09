@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import urllib.error
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -182,121 +181,61 @@ def test_unknown_command_is_denied() -> None:
     ]
 
 
-def test_gateway_event_uses_protected_token_and_bounded_loopback_payload(
+def test_gateway_event_persists_minimized_payload_without_loading_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     handler = load_handler(replace_gateway_event=False)
-    token_file = tmp_path / "gateway-event.token"
-    token_file.write_text("synthetic-gateway-event-token-1234567890\n", encoding="utf-8")
-    token_file.chmod(0o600)
-    handler.TOKEN_FILE = token_file
-    handler.API_URL = "http://127.0.0.1:8740"
+    handler.TOKEN_FILE = tmp_path / "absent-token"
     captured: dict[str, Any] = {}
 
-    class Response:
-        def __enter__(self) -> Response:
-            return self
+    class Outbox:
+        def enqueue(self, identity: str, payload: dict[str, Any]) -> None:
+            captured.update(identity=identity, payload=payload)
 
-        def __exit__(self, *_args: Any) -> None:
-            return None
-
-        def read(self, limit: int) -> bytes:
-            captured["read_limit"] = limit
-            return b"{}"
-
-    def urlopen(request: Any, *, timeout: int) -> Response:
-        captured.update(
-            url=request.full_url,
-            method=request.method,
-            authorization=request.get_header("Authorization"),
-            actor=request.get_header("X-engineering-actor"),
-            content_type=request.get_header("Content-type"),
-            payload=json.loads(request.data),
-            timeout=timeout,
-        )
-        return Response()
-
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-    handler._gateway_event(
-        "telegram.command_completed",
-        "status",
-        raw_args="musematic 1119 staging ignored-extra-data",
-        result={
-            "workflow_id": "synthetic-workflow-123",
-            "secret": "must-not-leave-memory",
-        },
-        outcome="COMPLETED",
+    handler.bind_event_outbox(Outbox())
+    correlation = "711efd27-79e1-45af-92ee-3f7790c1e8ba"
+    token = handler._RECEIPT_CONTEXT.set(
+        {"platform_update_id": 42, "delivery_correlation_id": correlation}
     )
-
-    assert captured == {
-        "url": "http://127.0.0.1:8740/v1/observability/gateway-events",
-        "method": "POST",
-        "authorization": "Bearer synthetic-gateway-event-token-1234567890",
-        "actor": "hermes-gateway",
-        "content_type": "application/json",
-        "payload": {
-            "event_type": "telegram.command_completed",
-            "command": "status",
-            "outcome": "COMPLETED",
-            "project": "musematic",
-            "issue_number": 1119,
-            "mode": "staging",
-            "workflow_id": "synthetic-workflow-123",
-        },
-        "timeout": 2,
-        "read_limit": 4096,
+    try:
+        handler._gateway_event(
+            "engineering.api_response_completed",
+            "status",
+            raw_args="musematic 1119 staging ignored-extra-data",
+            result={"workflow_id": "synthetic-workflow-123", "secret": "must-not-leave-memory"},
+            outcome="COMPLETED",
+        )
+    finally:
+        handler._RECEIPT_CONTEXT.reset(token)
+    assert captured["identity"] == correlation + ":engineering.api_response_completed"
+    assert captured["payload"] == {
+        "event_type": "engineering.api_response_completed",
+        "command": "status",
+        "outcome": "COMPLETED",
+        "project": "musematic",
+        "issue_number": 1119,
+        "mode": "staging",
+        "workflow_id": "synthetic-workflow-123",
+        "platform_update_id": 42,
+        "delivery_correlation_id": correlation,
+        "delivery_status": None,
+        "acknowledged_message_ids": [],
     }
+    assert "must-not-leave-memory" not in json.dumps(captured)
 
 
-def test_gateway_event_failures_are_best_effort_and_do_not_change_hook_decision(
+def test_missing_outbox_denies_before_config_or_network_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     handler = load_handler(replace_gateway_event=False)
-    handler.API_URL = "http://127.0.0.1:8740"
-    attempts = 0
-
-    def unavailable(*_args: Any, **_kwargs: Any) -> Any:
-        nonlocal attempts
-        attempts += 1
-        raise urllib.error.URLError("synthetic transport unavailable")
-
-    monkeypatch.setattr("urllib.request.urlopen", unavailable)
-    handler.TOKEN_FILE = tmp_path / "missing-gateway-event.token"
-    assert handler.handle("command:help", {}) == {
-        "decision": "deny",
-        "message": "Unknown engineering command denied.",
-    }
-    assert attempts == 0
-
-    token_file = tmp_path / "gateway-event.token"
-    token_file.write_text("synthetic-gateway-event-token-1234567890\n", encoding="utf-8")
-    token_file.chmod(0o600)
-    handler.TOKEN_FILE = token_file
-    assert handler.handle("command:help", {}) == {
-        "decision": "deny",
-        "message": "Unknown engineering command denied.",
-    }
-    assert attempts == 1
-
-    def rejected(*_args: Any, **_kwargs: Any) -> Any:
-        nonlocal attempts
-        attempts += 1
-        raise urllib.error.HTTPError(
-            "http://127.0.0.1:8740/v1/observability/gateway-events",
-            503,
-            "synthetic unavailable",
-            {},
-            None,
-        )
-
-    monkeypatch.setattr("urllib.request.urlopen", rejected)
-    assert handler.handle("command:help", {}) == {
-        "decision": "deny",
-        "message": "Unknown engineering command denied.",
-    }
-    assert attempts == 2
+    handler.TOKEN_FILE = tmp_path / "absent-token"
+    monkeypatch.setattr(
+        handler, "_read_protected", lambda *_args: pytest.fail("no config fallback")
+    )
+    with pytest.raises(RuntimeError, match="durable gateway event storage"):
+        handler.handle("command:help", {})
 
 
 def test_validate_command_starts_only_bounded_synthetic_lifecycle(
