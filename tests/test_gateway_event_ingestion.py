@@ -17,6 +17,7 @@ from sqlalchemy.engine import make_url
 from engineering_control.api.main import create_app
 from engineering_control.db.base import Base
 from engineering_control.db.models import DashboardEvent
+from engineering_control.observability import agent as observability
 from engineering_control.observability.agent import (
     AgentObservabilityRepository,
     GatewayEventConflict,
@@ -143,7 +144,6 @@ async def test_equivalent_timezone_forms_have_same_canonical_binding(repository)
     "changes",
     [
         {"event_observed_at": "2026-08-01T12:00:00"},
-        {"event_observed_at": datetime.now(UTC) + timedelta(minutes=1)},
         {"platform_update_id": None},
         {"delivery_correlation_id": None},
         {
@@ -156,6 +156,27 @@ async def test_equivalent_timezone_forms_have_same_canonical_binding(repository)
 def test_incomplete_identity_or_invalid_observation_time_is_rejected(changes):
     with pytest.raises(ValidationError):
         event(**changes)
+
+
+@pytest.mark.parametrize(
+    "offset_seconds,allowed", [(-1, True), (0, True), (5, True), (5.000001, False)]
+)
+def test_future_observation_boundary_uses_validation_time(monkeypatch, offset_seconds, allowed):
+    boundary = datetime(2026, 9, 12, 23, tzinfo=UTC)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            return boundary
+
+    monkeypatch.setattr(observability, "datetime", FrozenDateTime)
+    observed = boundary + timedelta(seconds=offset_seconds)
+    if allowed:
+        assert event(event_observed_at=observed).event_observed_at == observed
+    else:
+        with pytest.raises(ValidationError, match="observation is in the future"):
+            event(event_observed_at=observed)
 
 
 @pytest.mark.asyncio
