@@ -76,6 +76,35 @@ let pendingCandidate = null;
 // Exact request proof stays in this tab's memory only, never browser storage.
 // A retry reads the durable acceptance receipt; it does not authorize a new effect.
 let pendingExecution = null;
+let acceptedOperationId = null;
+
+const pendingOperationMessage = (operation) => {
+  const receipt = `Operation ${operation.operation_id}: ${operation.status}. `;
+  if (operation.status === "DISPATCHING") {
+    return receipt + "Execution has been claimed; completion is not yet confirmed. Closing this dialog does not cancel it.";
+  }
+  const observation = operation.dispatch_observation;
+  const explanations = {
+    SYNTHETIC_ONLY: "The private API dispatcher is paused for maintenance; this accepted operation has not started.",
+    DISPATCHER_STOPPED: "The private API dispatcher is stopped; this accepted operation has not started.",
+    DISPATCHING: "The dispatcher was observed running, but this operation has not yet been claimed.",
+    UNKNOWN: "Dispatcher availability cannot currently be verified; execution is not confirmed.",
+  };
+  return receipt + (explanations[observation?.status] || explanations.UNKNOWN) +
+    " Check this same operation below; do not submit another. Closing this dialog does not cancel it.";
+};
+
+async function readAcceptedOperation() {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`/api/dashboard/operations/${acceptedOperationId}`, {cache: "no-store", signal: controller.signal});
+    if (!response.ok) throw new Error(`Status for operation ${acceptedOperationId} is unavailable. Its outcome is unknown; do not submit another.`);
+    const operation = await response.json();
+    if (operation.operation_id !== acceptedOperationId) throw new Error("Operation status identity mismatch; execution is not confirmed.");
+    return operation;
+  } finally { clearTimeout(deadline); }
+}
 
 const actionEffect = (action) => {
   if (["refresh_connections", "audit_plan"].includes(action)) return "Read-only probe or metadata plan; no product mutation.";
@@ -102,6 +131,9 @@ async function prepareAction(command, errorTarget = null) {
     }
     pendingCandidate = candidate;
     pendingExecution = null;
+    acceptedOperationId = null;
+    setError("action-progress");
+    byId("action-cancel").textContent = "Cancel";
     byId("action-password").required = true;
     byId("action-execute").textContent = "Confirm operation";
     byId("action-effect").textContent = actionEffect(command.action);
@@ -123,6 +155,11 @@ async function confirmAction(event) {
   const execute = byId("action-execute"); if (execute.disabled) return;
   execute.disabled = true; byId("action-cancel").disabled = true;
   try {
+    setError("action-blockers");
+    let operation;
+    if (acceptedOperationId) {
+      operation = await readAcceptedOperation();
+    } else {
     if (!pendingExecution) {
       const reauth = await fetch("/api/dashboard/actions/reauthenticate", {
         method: "POST", headers: {"Content-Type": "application/json"},
@@ -149,25 +186,39 @@ async function confirmAction(event) {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: pendingExecution.body,
     });
-    let operation = await response.json();
+    operation = await response.json();
     if (!response.ok) throw new Error(operation.detail || "Operation was not accepted.");
-    for (let attempt = 0; attempt < 20 && ["PENDING", "DISPATCHING"].includes(operation.status); attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 500));
-      const poll = await fetch(`/api/dashboard/operations/${operation.operation_id}`, {cache: "no-store"});
-      if (poll.ok) operation = await poll.json();
+    if (typeof operation.operation_id !== "string" || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(operation.operation_id)) {
+      throw new Error("Acceptance receipt was incomplete. Retry this same request; do not prepare another operation.");
     }
-    if (["FAILED", "BLOCKED"].includes(operation.status)) throw new Error(operation.safe_error || `Operation ${operation.status.toLowerCase()}.`);
-    byId("action-dialog").close(); pendingCandidate = null; pendingExecution = null;
+    acceptedOperationId = operation.operation_id;
+    pendingExecution = null;
+    byId("action-cancel").textContent = "Close (does not cancel)";
+    }
+    for (let attempt = 0; attempt < 20 && ["PENDING", "DISPATCHING"].includes(operation.status); attempt += 1) {
+      setError("action-progress", pendingOperationMessage(operation));
+      if (operation.status === "PENDING" && ["SYNTHETIC_ONLY", "DISPATCHER_STOPPED"].includes(operation.dispatch_observation?.status)) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      operation = await readAcceptedOperation();
+    }
+    if (["PENDING", "DISPATCHING"].includes(operation.status)) {
+      setError("action-progress", pendingOperationMessage(operation));
+      return;
+    }
+    setError("action-progress");
+    if (["FAILED", "BLOCKED"].includes(operation.status)) throw new Error(`Operation ${operation.operation_id}: ${operation.status}. ${operation.safe_error || "Inspect its evidence before taking another action."}`);
+    if (!["COMPLETED", "STARTED"].includes(operation.status)) throw new Error(`Operation ${operation.operation_id}: unrecognized state; execution is not confirmed.`);
+    byId("action-dialog").close(); pendingCandidate = null; pendingExecution = null; acceptedOperationId = null;
     if (operation.workflow_id) location.assign(`/workflows/${encodeURIComponent(operation.workflow_id)}`);
     else if (operation.result_available) location.assign(`/api/dashboard/operations/${operation.operation_id}/export`);
     else location.reload();
   } catch (error) {
-    const suffix = pendingExecution ? " Retry checks this same operation; it will not create another." : "";
+    const suffix = acceptedOperationId ? ` Checking operation ${acceptedOperationId} is read-only; it will not submit another.` : (pendingExecution ? " Retry checks this same operation; it will not create another." : "");
     setError("action-blockers", error.message + suffix);
   }
   finally {
     byId("action-password").value = ""; execute.disabled = false;
-    execute.textContent = pendingExecution ? "Retry same operation" : "Confirm operation";
+    execute.textContent = acceptedOperationId ? "Check operation status" : (pendingExecution ? "Retry same operation" : "Confirm operation");
     byId("action-cancel").disabled = false;
   }
 }
@@ -175,7 +226,7 @@ async function confirmAction(event) {
 function setupActionDialog() {
   const form = byId("action-confirmation"); if (!form) return;
   form.addEventListener("submit", confirmAction);
-  const clearPending = () => { pendingCandidate = null; pendingExecution = null; byId("action-password").value = ""; byId("action-password").required = true; };
+  const clearPending = () => { pendingCandidate = null; pendingExecution = null; acceptedOperationId = null; setError("action-progress"); byId("action-password").value = ""; byId("action-password").required = true; };
   byId("action-cancel").addEventListener("click", () => { if (byId("action-execute").disabled) return; clearPending(); byId("action-dialog").close(); });
   byId("action-dialog").addEventListener("cancel", (event) => { if (byId("action-execute").disabled) event.preventDefault(); else clearPending(); });
 }

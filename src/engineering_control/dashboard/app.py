@@ -1059,7 +1059,10 @@ def create_app(
                 body.confirmation_phrase,
                 authorization=session_authorization(authenticated),
             )
-            return JSONResponse(value.model_dump(mode="json"), status_code=202)
+            return JSONResponse(
+                await service(request).operation_response(value.model_dump(mode="json")),
+                status_code=202,
+            )
         except ValueError as error:
             return JSONResponse({"detail": str(error)}, status_code=409)
         except Exception:  # noqa: BLE001 - safe action boundary
@@ -1073,7 +1076,9 @@ def create_app(
         value = await operations(request).operation(operation_id)
         if value is None:
             raise HTTPException(status_code=404, detail="operation not found")
-        return JSONResponse(value.model_dump(mode="json"))
+        return JSONResponse(
+            await service(request).operation_response(value.model_dump(mode="json"))
+        )
 
     @app.get("/api/dashboard/operations/{operation_id}/export")
     async def dashboard_operation_export_api(operation_id: UUID, request: Request) -> Response:

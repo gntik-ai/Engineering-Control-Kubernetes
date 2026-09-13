@@ -44,6 +44,26 @@ class DashboardService:
         )
         return value
 
+    async def operation_response(self, value: dict[str, object]) -> dict[str, object]:
+        """Keep the durable receipt authoritative when dispatcher observation fails.
+
+        This is observational, not authorization. Never change an operation's
+        status or turn an already accepted write into an apparent failed submit.
+        """
+        result = dict(value)
+        if value.get("status") in {"PENDING", "DISPATCHING"}:
+            try:
+                async with asyncio.timeout(2):
+                    observation = (
+                        await self.admission_reader.read()
+                        if self.admission_reader
+                        else unknown_admission()
+                    )
+            except Exception:  # noqa: BLE001 - receipt must survive observation failure
+                observation = unknown_admission()
+            result["dispatch_observation"] = observation
+        return result
+
     async def workflows(
         self,
         *,
