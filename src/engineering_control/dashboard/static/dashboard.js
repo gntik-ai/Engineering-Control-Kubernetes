@@ -86,6 +86,8 @@ const pendingOperationMessage = (operation) => {
   const observation = operation.dispatch_observation;
   const explanations = {
     SYNTHETIC_ONLY: "The private API dispatcher is paused for maintenance; this accepted operation has not started.",
+    DIAGNOSTICS_ONLY: "Only connection diagnostics may execute; product operations remain fenced during acceptance.",
+    DIAGNOSTICS_STOPPED: "The diagnostic dispatcher is stopped; product operations remain fenced.",
     DISPATCHER_STOPPED: "The private API dispatcher is stopped; this accepted operation has not started.",
     DISPATCHING: "The dispatcher was observed running, but this operation has not yet been claimed.",
     UNKNOWN: "Dispatcher availability cannot currently be verified; execution is not confirmed.",
@@ -197,7 +199,7 @@ async function confirmAction(event) {
     }
     for (let attempt = 0; attempt < 20 && ["PENDING", "DISPATCHING"].includes(operation.status); attempt += 1) {
       setError("action-progress", pendingOperationMessage(operation));
-      if (operation.status === "PENDING" && ["SYNTHETIC_ONLY", "DISPATCHER_STOPPED"].includes(operation.dispatch_observation?.status)) break;
+      if (operation.status === "PENDING" && (["SYNTHETIC_ONLY", "DISPATCHER_STOPPED", "DIAGNOSTICS_STOPPED"].includes(operation.dispatch_observation?.status) || (operation.dispatch_observation?.status === "DIAGNOSTICS_ONLY" && operation.action !== "refresh_connections"))) break;
       await new Promise((resolve) => window.setTimeout(resolve, 500));
       operation = await readAcceptedOperation();
     }
@@ -247,6 +249,8 @@ function setupOverview() {
       const admission = data.admission;
       const admissionLabels = {
         SYNTHETIC_ONLY: "SYNTHETIC ONLY — product dispatch is fenced at the private API; pending-operation dispatcher is stopped.",
+        DIAGNOSTICS_ONLY: "DIAGNOSTICS ONLY — telemetry and connection diagnostics are enabled; issue and deployment execution remain fenced.",
+        DIAGNOSTICS_STOPPED: "DIAGNOSTICS STOPPED — diagnostic processing is unavailable; product execution remains fenced.",
         DISPATCHING: "DISPATCHING — the private API dispatcher is running. This is not an approval or project-readiness verdict.",
         DISPATCHER_STOPPED: "DISPATCHER STOPPED — private API mode is normal, but queued operations are not being dispatched.",
         UNKNOWN: "UNKNOWN — private API admission is not currently verified.",
@@ -266,7 +270,7 @@ function setupOverview() {
       });
       byId("active-work").replaceChildren(...work); byId("idle-state").classList.toggle("hidden", !data.idle);
       const candidate = data.next_inventory_candidate;
-      if (data.idle) byId("idle-details").replaceChildren(...list([["Pending inventory (not a queue)", data.summary.pending_inventory_count], ["Inventory candidate (not approved)", candidate ? `${candidate.repository} #${candidate.issue_number}` : "None in latest recorded snapshots"], ["Inventory observed", localTime(candidate?.inventory_observed_at)], ["Candidate status", candidate ? `${candidate.delivery_status} · ${candidate.eligibility_status} · approval not evaluated` : null], ["Active blockers", data.summary.blocked_workflows], ["Provider readiness", (data.providers || []).map((item) => `${item.provider}: ${item.available ? "available" : item.authentication_status}`).join(", ")]], "").children);
+      if (data.idle) byId("idle-details").replaceChildren(...list([["Pending inventory (not a queue)", data.summary.pending_inventory_count], ["Inventory candidate (not approved)", candidate ? `${candidate.repository} #${candidate.issue_number}` : "None in latest recorded snapshots"], ["Inventory observed", localTime(candidate?.inventory_observed_at)], ["Candidate status", candidate ? `${candidate.delivery_status} · ${candidate.eligibility_status} · approval not evaluated` : null], ["Active blockers", data.summary.blocked_workflows], ["Provider readiness", (data.providers || []).map((item) => `${item.provider}: authentication ${item.authentication_status || "unknown"}; capacity ${item.capacity_status || "UNKNOWN"}`).join(", ")]], "").children);
       const health = [...(data.services || []), ...(data.providers || [])].map((item) => {
         const card = node("article", `health-card${item.stale ? " stale" : ""}`); card.append(node("h4", "", item.name || item.provider), status(item.status || item.capacity_status || (item.available ? "ready" : "unknown")), list([["Kind", item.kind || "provider"], ["CLI", item.cli_version], ["Authentication", item.authentication_status], ["Active", item.active_executions], ["Queue", item.queue_depth], ["Last success", localTime(item.last_success)], ["Last failure", localTime(item.last_failure)], ["Observed", localTime(item.observed_at)], ["Freshness", item.freshness], ["Source", item.source]])); return card;
       });

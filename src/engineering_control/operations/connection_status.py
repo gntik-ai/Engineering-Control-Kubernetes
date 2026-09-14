@@ -6,6 +6,28 @@ PROVIDER_FRESHNESS_SECONDS = 300
 PROVIDER_REFRESH_INTERVAL_SECONDS = 240
 PROVIDER_REFRESH_EXECUTION_TIMEOUT_SECONDS = 45
 
+
+def provider_observation_current(captured_at: datetime, now: datetime) -> bool:
+    captured = captured_at if captured_at.tzinfo else captured_at.replace(tzinfo=UTC)
+    return -5 <= (now - captured).total_seconds() <= PROVIDER_FRESHNESS_SECONDS
+
+
+def provider_connection_status(
+    *,
+    captured_at: datetime,
+    authenticated: bool | None,
+    cli_present: bool | None,
+    rate_limited: bool,
+    now: datetime,
+) -> str:
+    """Current authentication evidence, never a claim of known subscription capacity."""
+    if not provider_observation_current(captured_at, now):
+        return "STALE"
+    if authenticated is True and cli_present is True and not rate_limited:
+        return "CONNECTED"
+    return "DEGRADED"
+
+
 _FRESHNESS_SECONDS = {
     "dashboard-sse": 300,
     "engineering-api": 300,

@@ -51,9 +51,14 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
+from engineering_control.operations.connection_budget import (
+    install_diagnostic_sql_budget,
+    joined_diagnostic_thread,
+)
 from engineering_control.operations.connection_status import (
-    PROVIDER_FRESHNESS_SECONDS,
     effective_connection_status,
+    provider_connection_status,
+    provider_observation_current,
 )
 from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
 from engineering_control.operations.issue_approval import current_issue_approval_binding
@@ -257,6 +262,7 @@ class OperationsRepository:
             connect_args={"connect_timeout": 5} if database_url.startswith("postgresql") else {},
         )
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+        install_diagnostic_sql_budget(self.engine)
         self.redactor = SecretRedactor()
         self.observability = DashboardObservabilityProjection(self.sessions, self.redactor)
         self.export_retention_days = export_retention_days
@@ -1583,10 +1589,16 @@ class OperationsRepository:
             result_available = self._valid_export(operation_export, datetime.now(UTC))
         return self._operation_view(row, result_available=result_available)
 
-    async def claim_pending(self) -> tuple[UUID, Command, SourceChannel, str] | None:
-        return await asyncio.to_thread(self._claim_pending)
+    async def claim_pending(
+        self, *, diagnostics_only: bool = False
+    ) -> tuple[UUID, Command, SourceChannel, str] | None:
+        return await asyncio.to_thread(self._claim_pending, diagnostics_only)
 
-    def _claim_pending(self) -> tuple[UUID, Command, SourceChannel, str] | None:
+    def _claim_pending(
+        self, diagnostics_only: bool = False
+    ) -> tuple[UUID, Command, SourceChannel, str] | None:
+        if type(diagnostics_only) is not bool:
+            raise ValueError("invalid dispatcher scope")
         with self.sessions.begin() as session:
             statement = (
                 select(OperationRequest)
@@ -1594,16 +1606,34 @@ class OperationsRepository:
                 .order_by(OperationRequest.created_at)
                 .limit(1)
             )
+            if diagnostics_only:
+                statement = statement.where(OperationRequest.action == "refresh_connections")
             if self.engine.dialect.name == "postgresql":
                 statement = statement.with_for_update(skip_locked=True)
             row = session.scalar(statement)
             if row is None:
                 return None
+            try:
+                command = parse_command(row.payload_json)
+            except ValueError:
+                if not diagnostics_only:
+                    raise
+                row.status = "BLOCKED"
+                row.safe_error = "invalid diagnostic command payload"
+                row.completed_at = datetime.now(UTC)
+                return None
+            if diagnostics_only and not isinstance(command, RefreshConnectionsCommand):
+                # Preserve a corrupt/inconsistent diagnostic record truthfully; do not
+                # execute a product payload merely because its projection says refresh.
+                row.status = "BLOCKED"
+                row.safe_error = "diagnostic action and payload disagree"
+                row.completed_at = datetime.now(UTC)
+                return None
             row.status = "DISPATCHING"
             row.started_at = datetime.now(UTC)
             return (
                 row.id,
-                parse_command(row.payload_json),
+                command,
                 cast(SourceChannel, row.source_channel),
                 row.operator_class,
             )
@@ -1905,7 +1935,7 @@ class OperationsRepository:
                 return self._operation_view(existing)
 
     async def upsert_connection(self, value: dict[str, Any]) -> None:
-        await asyncio.to_thread(self._upsert_connection, value)
+        await joined_diagnostic_thread(self._upsert_connection, value)
 
     def _upsert_connection(self, value: dict[str, Any]) -> None:
         now = datetime.now(UTC)
@@ -1929,12 +1959,21 @@ class OperationsRepository:
                 )
                 session.add(row)
             else:
+                for timestamp in ("last_success_at", "last_failure_at"):
+                    incoming = value.get(timestamp)
+                    previous = getattr(row, timestamp)
+                    if incoming is not None and (
+                        previous is None or _utc(incoming) > _utc(previous)
+                    ):
+                        setattr(row, timestamp, incoming)
+                if _utc(value.get("checked_at", now)) < _utc(row.checked_at):
+                    # Preserve historical success/failure, never regress current state
+                    # because a delayed diagnostic finished after a newer observation.
+                    return
                 for key, target in (
                     ("logical_target", "logical_target"),
                     ("status", "status"),
                     ("checked_at", "checked_at"),
-                    ("last_success_at", "last_success_at"),
-                    ("last_failure_at", "last_failure_at"),
                     ("latency_ms", "latency_ms"),
                     ("safe_error", "safe_error"),
                     ("source", "source"),
@@ -2009,12 +2048,14 @@ class OperationsRepository:
             provider_current: dict[str, bool] = {}
             for provider, quota_row in quotas.items():
                 age = (
-                    max(0, int((now - _utc(quota_row.captured_at)).total_seconds()))
+                    int((now - _utc(quota_row.captured_at)).total_seconds())
                     if quota_row is not None
                     else None
                 )
-                freshness_seconds[provider] = age
-                provider_current[provider] = age is not None and age <= PROVIDER_FRESHNESS_SECONDS
+                freshness_seconds[provider] = max(0, age) if age is not None else None
+                provider_current[provider] = quota_row is not None and provider_observation_current(
+                    quota_row.captured_at, now
+                )
             return {
                 "status": "READY"
                 if all(
@@ -2038,6 +2079,12 @@ class OperationsRepository:
                                 "STALE" if not provider_current[provider] else quota_row.status
                             ),
                             "captured_at": quota_row.captured_at.isoformat(),
+                            "raw_status": quota_row.status,
+                            "capacity_status": "UNKNOWN"
+                            if quota_row.total_capacity is None
+                            else "STALE"
+                            if not provider_current[provider]
+                            else quota_row.status,
                             "freshness_seconds": freshness_seconds[provider],
                             "source": quota_row.source,
                         }
@@ -2539,6 +2586,10 @@ class OperationsRepository:
             ).all()
             values: list[ConnectionView] = []
             for row in rows:
+                if row.component in {"provider-codex", "provider-claude"}:
+                    # These cards derive from the durable auth observations, not an
+                    # independently timed cache that can lag a successful refresh.
+                    continue
                 effective = effective_connection_status(
                     row.component, row.status, row.checked_at, now
                 )
@@ -2567,7 +2618,95 @@ class OperationsRepository:
                         details=row.detail_json,
                     )
                 )
-            return values
+            for provider in ("codex", "claude"):
+                snapshot = session.scalar(
+                    select(QuotaSnapshot)
+                    .where(QuotaSnapshot.provider == provider)
+                    .order_by(QuotaSnapshot.captured_at.desc())
+                    .limit(1)
+                )
+                if snapshot is None:
+                    values.append(
+                        ConnectionView(
+                            component=f"provider-{provider}",
+                            logical_target=f"native-{provider}-cli",
+                            status="NOT_CONFIGURED",
+                            checked_at=now,
+                            last_success_at=None,
+                            last_failure_at=None,
+                            latency_ms=None,
+                            freshness_seconds=0,
+                            safe_error="no persisted native auth observation",
+                            source="quota-snapshots",
+                            next_action="Inspect the native provider worker.",
+                            details={},
+                        )
+                    )
+                    continue
+                successful = session.scalar(
+                    select(QuotaSnapshot.captured_at)
+                    .where(
+                        QuotaSnapshot.provider == provider,
+                        QuotaSnapshot.authenticated.is_(True),
+                        QuotaSnapshot.cli_present.is_(True),
+                        QuotaSnapshot.rate_limited.is_(False),
+                    )
+                    .order_by(QuotaSnapshot.captured_at.desc())
+                    .limit(1)
+                )
+                failed = session.scalar(
+                    select(QuotaSnapshot.captured_at)
+                    .where(
+                        QuotaSnapshot.provider == provider,
+                        or_(
+                            QuotaSnapshot.authenticated.is_(False),
+                            QuotaSnapshot.cli_present.is_(False),
+                            QuotaSnapshot.rate_limited.is_(True),
+                        ),
+                    )
+                    .order_by(QuotaSnapshot.captured_at.desc())
+                    .limit(1)
+                )
+                status = provider_connection_status(
+                    captured_at=snapshot.captured_at,
+                    authenticated=snapshot.authenticated,
+                    cli_present=snapshot.cli_present,
+                    rate_limited=snapshot.rate_limited,
+                    now=now,
+                )
+                values.append(
+                    ConnectionView(
+                        component=f"provider-{provider}",
+                        logical_target=f"native-{provider}-cli",
+                        status=cast(Any, status),
+                        checked_at=snapshot.captured_at,
+                        last_success_at=successful,
+                        last_failure_at=failed,
+                        latency_ms=None,
+                        freshness_seconds=max(
+                            0, int((now - _utc(snapshot.captured_at)).total_seconds())
+                        ),
+                        safe_error=None
+                        if status == "CONNECTED"
+                        else "native auth observation is stale or not ready",
+                        source="quota-snapshots",
+                        next_action=None
+                        if status == "CONNECTED"
+                        else "Inspect the native provider worker.",
+                        details={
+                            "authentication_status": "READY" if status == "CONNECTED" else status,
+                            "capacity_status": "UNKNOWN"
+                            if snapshot.total_capacity is None
+                            else "STALE"
+                            if status == "STALE"
+                            else snapshot.status,
+                            "remaining_capacity": snapshot.remaining_capacity,
+                            "total_capacity": snapshot.total_capacity,
+                            "readiness_scope": "native_cli_authentication_only",
+                        },
+                    )
+                )
+            return sorted(values, key=lambda value: value.component)
 
     @staticmethod
     def _operation_view(

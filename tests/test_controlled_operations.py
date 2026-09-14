@@ -792,10 +792,16 @@ async def test_connection_snapshot_reports_freshness_without_sensitive_probe_out
         }
     )
     values = await repository.connections()
-    assert len(values) == 1
-    assert values[0].status == "STALE"
-    assert values[0].freshness_seconds >= 599
-    assert values[0].details == {"authentication_status": "READY"}
+    by_component = {value.component: value for value in values}
+    assert set(by_component) == {"synthetic-safe-probe", "provider-codex", "provider-claude"}
+    value = by_component["synthetic-safe-probe"]
+    assert value.status == "STALE"
+    assert value.freshness_seconds >= 599
+    assert value.details == {"authentication_status": "READY"}
+    for provider in ("codex", "claude"):
+        missing = by_component[f"provider-{provider}"]
+        assert missing.status == "NOT_CONFIGURED"
+        assert missing.last_success_at is None
 
 
 @pytest.mark.asyncio

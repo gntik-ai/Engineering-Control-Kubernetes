@@ -59,11 +59,15 @@ class TypedCommandBus:
         control: ControlService,
         metadata: MetadataRepository,
         operations: OperationsRepository,
+        *,
+        diagnostics_only: bool = False,
     ) -> None:
         self.control = control
         self.metadata = metadata
         self.operations = operations
         self.connections = ConnectionHealthProjector(operations)
+        self.diagnostics_only = diagnostics_only
+        self._next_connection_refresh_at = 0.0
         self._next_issue_recovery_at = 0.0
         self._issue_recovery_cursor: UUID | None = None
 
@@ -75,6 +79,8 @@ class TypedCommandBus:
         operator_class: str,
         idempotency_key: str,
     ) -> OperationView:
+        if self.diagnostics_only and not isinstance(command, RefreshConnectionsCommand):
+            raise ValueError("product operation admission is disabled during diagnostics")
         operation = await self.operations.create_external(
             command,
             source_channel=source_channel,
@@ -91,6 +97,15 @@ class TypedCommandBus:
         return refreshed
 
     async def dispatch_pending(self) -> bool:
+        if self.diagnostics_only:
+            if time.monotonic() >= self._next_connection_refresh_at:
+                self._next_connection_refresh_at = time.monotonic() + 120.0
+                await self.connections.refresh("all")
+            claim = await self.operations.claim_pending(diagnostics_only=True)
+            if claim is None:
+                return False
+            await self.dispatch_claim(claim)
+            return True
         if time.monotonic() >= self._next_issue_recovery_at:
             self._next_issue_recovery_at = time.monotonic() + 5.0
             await self.recover_issue_start_once()
@@ -122,6 +137,8 @@ class TypedCommandBus:
     async def dispatch_claim(self, claim: tuple[UUID, Command, SourceChannel, str]) -> None:
         operation_id, command, _source_channel, operator_class = claim
         try:
+            if self.diagnostics_only and not isinstance(command, RefreshConnectionsCommand):
+                raise ValueError("product operation admission is disabled during diagnostics")
             capability = await self.operations.capability(
                 command, exclude_operation_id=operation_id
             )

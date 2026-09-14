@@ -27,6 +27,8 @@ def payload(mode: str = "synthetic-only", running: Any = False) -> dict[str, Any
     "mode,running,expected",
     [
         ("synthetic-only", False, "SYNTHETIC_ONLY"),
+        ("diagnostics-only", True, "DIAGNOSTICS_ONLY"),
+        ("diagnostics-only", False, "DIAGNOSTICS_STOPPED"),
         ("normal", True, "DISPATCHING"),
         ("normal", False, "DISPATCHER_STOPPED"),
     ],

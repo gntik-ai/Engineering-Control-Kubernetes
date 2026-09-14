@@ -891,7 +891,9 @@ def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:
                 "status": "PARTIAL_BLOCKED",
             },
         ]
-        assert usage.json()["codex"]["status"] == "AVAILABLE"
+        # This historical fixture has no timestamp, so it is not current readiness.
+        assert usage.json()["codex"]["status"] == "STALE"
+        assert usage.json()["codex"]["raw_status"] == "AVAILABLE"
         assert usage.json()["codex"]["running_jobs"] == 1
         assert usage.json()["codex"]["history"]["roles"]["implementer"]["success_rate"] == 0.5
         assert usage.json()["claude"]["source"] == "not-reported"

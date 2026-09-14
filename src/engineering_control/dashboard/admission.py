@@ -99,7 +99,7 @@ class AdmissionReader:
             running = admission["pending_operation_dispatcher_running"]
             if (
                 admission["scope"] != "private-api-only"
-                or mode not in ("normal", "synthetic-only")
+                or mode not in ("normal", "synthetic-only", "diagnostics-only")
                 or type(running) is not bool
                 or (mode == "synthetic-only" and running)
             ):
@@ -107,6 +107,8 @@ class AdmissionReader:
             state = (
                 "SYNTHETIC_ONLY"
                 if mode == "synthetic-only"
+                else ("DIAGNOSTICS_ONLY" if running else "DIAGNOSTICS_STOPPED")
+                if mode == "diagnostics-only"
                 else ("DISPATCHING" if running else "DISPATCHER_STOPPED")
             )
             return {

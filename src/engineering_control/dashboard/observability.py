@@ -32,6 +32,10 @@ from engineering_control.db.models import (
     VerificationResult,
     WorkerHeartbeat,
 )
+from engineering_control.operations.connection_status import (
+    PROVIDER_FRESHNESS_SECONDS,
+    provider_connection_status,
+)
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
@@ -933,18 +937,40 @@ class DashboardObservabilityProjection:
             observed = (
                 quota.captured_at if quota else executions[0].updated_at if executions else None
             )
+            provider_status = (
+                provider_connection_status(
+                    captured_at=quota.captured_at,
+                    authenticated=quota.authenticated,
+                    cli_present=quota.cli_present,
+                    rate_limited=quota.rate_limited,
+                    now=datetime.now(UTC),
+                )
+                if quota
+                else "NOT_CONFIGURED"
+            )
             providers.append(
                 {
                     "provider": provider,
-                    "available": bool(quota and quota.cli_present and quota.authenticated),
+                    "available": provider_status == "CONNECTED",
                     "authentication_status": (
-                        "authenticated"
+                        "stale"
+                        if provider_status == "STALE"
+                        else "authenticated"
                         if quota and quota.authenticated is True
                         else "required"
                         if quota and quota.authenticated is False
                         else "unknown"
                     ),
-                    "capacity_status": quota.status if quota else "NOT_REPORTED",
+                    "capacity_status": (
+                        "UNKNOWN"
+                        if quota.total_capacity is None
+                        else "STALE"
+                        if provider_status == "STALE"
+                        else quota.status
+                    )
+                    if quota
+                    else "NOT_REPORTED",
+                    "status": provider_status,
                     "rate_limited": quota.rate_limited if quota else None,
                     "active_executions": len(active),
                     "queue_depth": sum(value.status == "QUEUED" for value in executions),
@@ -954,7 +980,7 @@ class DashboardObservabilityProjection:
                     "last_success": utc_iso(success.ended_at) if success else None,
                     "last_failure": utc_iso(failure.ended_at) if failure else None,
                     "source": "quota_snapshots/agent_executions",
-                    **freshness(observed, stale_seconds=max(self.stale_seconds, 3600)),
+                    **freshness(observed, stale_seconds=PROVIDER_FRESHNESS_SECONDS),
                 }
             )
         return {

@@ -29,6 +29,7 @@ FIXTURE_PORT = 18740
     "mode,expected",
     [
         ("synthetic-only", "SYNTHETIC_ONLY"),
+        ("diagnostics-only", "DIAGNOSTICS_ONLY"),
         ("normal", "DISPATCHING"),
     ],
 )

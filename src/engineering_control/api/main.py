@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -62,6 +63,7 @@ from engineering_control.observability.agent import (
     GatewayEventInput,
 )
 from engineering_control.observability.metrics import ControlPlaneMetrics
+from engineering_control.operations.connection_status import provider_observation_current
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError
 from engineering_control.operations.models import parse_command
 from engineering_control.operations.repository import OperationsRepository
@@ -122,12 +124,16 @@ def create_app(
                 cast(ControlService, app.state.control_service),
                 resolved_repository,
                 resolved_operations,
+                diagnostics_only=admission_mode == "diagnostics-only",
             )
+        if resolved_bus is not None:
+            # The startup boundary also applies to an explicitly supplied bus.
+            resolved_bus.diagnostics_only = admission_mode == "diagnostics-only"
         app.state.command_bus = resolved_bus
         stop = asyncio.Event()
         dispatcher = (
             asyncio.create_task(operation_dispatch_loop(resolved_bus, stop))
-            if resolved_bus is not None and admission_mode == "normal"
+            if resolved_bus is not None and admission_mode in {"normal", "diagnostics-only"}
             else None
         )
         app.state.operation_dispatcher = dispatcher
@@ -1155,6 +1161,26 @@ def create_app(
                 int(value.get("running_jobs") or 0), int(provider_history["running_jobs"])
             )
             value["history"] = provider_history
+            value["raw_status"] = value["status"]
+            observed = value.get("captured_at")
+            try:
+                captured = (
+                    observed
+                    if isinstance(observed, datetime)
+                    else datetime.fromisoformat(str(observed))
+                )
+                current = provider_observation_current(captured, datetime.now(UTC))
+            except (TypeError, ValueError, OverflowError):
+                current = False
+            if provider in snapshots and not current:
+                value["status"] = "STALE"
+            value["capacity_status"] = (
+                "UNKNOWN"
+                if value.get("total_capacity") is None
+                else "STALE"
+                if not current
+                else value["raw_status"]
+            )
             response[provider] = value
         return response
 
