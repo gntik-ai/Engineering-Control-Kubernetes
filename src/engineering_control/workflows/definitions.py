@@ -1498,6 +1498,18 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step("identity.inspect_stale", context)
             context = await self._step("cleanup.inspect_codex_files", context)
             context = await self._step("cleanup.inspect_preview_namespaces", context)
+            if workflow.patched("cleanup-inspection-outcome-v1") and context.get(
+                "identity_recovery_blockers"
+            ):
+                context = await self._step(
+                    "cleanup.finalize",
+                    {
+                        **context,
+                        "terminal_status": "BLOCKED",
+                        "blocker": "CLEANUP_IDENTITY_INSPECTION_BLOCKED",
+                    },
+                )
+                return {"status": "BLOCKED", "context": context}
             if request.dry_run:
                 context = await self._step(
                     "cleanup.finalize", {**context, "terminal_status": "DRY_RUN"}
