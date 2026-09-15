@@ -139,10 +139,13 @@ def test_isolation_denies_live_address_egress() -> None:
     for host, port in [("138.199.173.27", 443), ("10.10.0.3", 8740), ("127.0.0.1", 8740)]:
         # Bypass only the optional Python attempt recorder for these intentional
         # negative sentinels: test the independent kernel boundary itself.
-        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
             sock.settimeout(0.1)
             with pytest.raises(OSError):
                 sock.connect((host, port))
+        finally:
+            sock.close()
 
 
 def test_pending_generation_and_release_are_retried_before_new_change(
