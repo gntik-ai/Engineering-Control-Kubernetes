@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
 
+from engineering_control.adapters.auth_probe import AuthProbeError, run_auth_probe
 from engineering_control.adapters.process import (
     EventCallback,
     classify_failure,
     run_jsonl_process,
-    subscription_only_environment,
 )
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
@@ -23,23 +22,25 @@ class ClaudeCLIAdapter:
         self.executable = executable
 
     async def authenticated(self) -> bool:
-        process = await asyncio.create_subprocess_exec(
-            self.executable,
-            "auth",
-            "status",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=subscription_only_environment(self.provider.value),
+        result = await run_auth_probe(
+            [self.executable, "auth", "status"],
+            provider=self.provider.value,
+            capture_stdout=True,
         )
-        stdout, _ = await process.communicate()
-        if process.returncode != 0:
+        if result.failure is not None:
+            raise AuthProbeError(result.failure)
+        if result.exit_code != 0:
             return False
         try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError:
-            return bool(stdout.strip())
-        return bool(payload.get("loggedIn") or payload.get("authenticated"))
+            payload = json.loads(result.stdout)
+        except (ValueError, UnicodeDecodeError):
+            raise AuthProbeError("INVALID_RESPONSE") from None
+        if not isinstance(payload, dict):
+            raise AuthProbeError("INVALID_RESPONSE")
+        states = [payload[key] for key in ("loggedIn", "authenticated") if key in payload]
+        if not states or any(not isinstance(state, bool) for state in states):
+            raise AuthProbeError("INVALID_RESPONSE")
+        return all(state is True for state in states)
 
     async def execute(
         self, request: AgentRequest, on_event: EventCallback | None = None

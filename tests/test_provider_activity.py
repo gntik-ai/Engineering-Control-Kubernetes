@@ -9,6 +9,7 @@ import pytest
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.provider import ProviderActivityHandler
+from engineering_control.adapters.auth_probe import AuthProbeError
 from engineering_control.agents.instructions import InstructionBundle
 from engineering_control.config import Settings
 from engineering_control.models.core import AgentRequest, AgentResult
@@ -305,6 +306,37 @@ async def test_provider_activity_reports_manual_auth_requirement(tmp_path: Path)
     assert result["provider"] == "codex"
     assert result["instruction_bundle"]["sha256"] == "a" * 64
     assert "agent_result" not in result
+
+
+@pytest.mark.asyncio
+async def test_auth_probe_timeout_is_not_reported_as_password_or_quota_failure(
+    tmp_path: Path,
+) -> None:
+    class UnavailableAdapter(FakeAdapter):
+        async def authenticated(self) -> bool:
+            raise AuthProbeError("TIMED_OUT")
+
+        async def execute(self, request: AgentRequest, on_event: Any = None) -> AgentResult:
+            raise AssertionError("model work must not start after an indeterminate auth check")
+
+    root = tmp_path / "worktrees"
+    worktree = root / "falcone" / "change-set"
+    worktree.mkdir(parents=True)
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=root, run_root=tmp_path / "runs"),
+        "codex",
+        UnavailableAdapter(),
+        FakeInstructionPack(),
+    )
+    result = await handler.handle(
+        "delivery.invoke_maker", {"maker_request": request_for(worktree).model_dump(mode="json")}
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "AUTH_STATUS_TIMED_OUT_CODEX"
+    quota = await handler.handle("quota.refresh", {"provider": "codex"})
+    assert quota["authenticated"] is None and quota["cli_present"] is True
+    assert quota["status"] == "AUTH_STATUS_TIMED_OUT_CODEX"
+    assert quota["remaining_capacity"] is None and quota["rate_limited"] is False
 
 
 @pytest.mark.asyncio

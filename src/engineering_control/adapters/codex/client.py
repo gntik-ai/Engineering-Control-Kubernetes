@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from engineering_control.adapters.auth_probe import AuthProbeError, run_auth_probe
 from engineering_control.adapters.process import (
     EventCallback,
     classify_failure,
     run_jsonl_process,
-    subscription_only_environment,
 )
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
@@ -28,18 +28,12 @@ class CodexCLIAdapter:
         self.temp_root = temp_root
 
     async def authenticated(self) -> bool:
-        import asyncio
-
-        process = await asyncio.create_subprocess_exec(
-            self.executable,
-            "login",
-            "status",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=subscription_only_environment(self.provider.value),
+        result = await run_auth_probe(
+            [self.executable, "login", "status"], provider=self.provider.value
         )
-        return await process.wait() == 0
+        if result.failure is not None:
+            raise AuthProbeError(result.failure)
+        return result.exit_code == 0
 
     async def execute(
         self, request: AgentRequest, on_event: EventCallback | None = None
