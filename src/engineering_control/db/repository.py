@@ -69,6 +69,7 @@ from engineering_control.retention_limits import (
     NOTIFICATION_OUTBOX_PENDING_STATUS,
     NOTIFICATION_OUTBOX_UNKNOWN_STATUS,
 )
+from engineering_control.workflow_outcome import RunOutcomeRow
 
 
 def serialize_row(row: Any) -> dict[str, Any]:
@@ -88,6 +89,8 @@ class MetadataRepository(Protocol):
     async def create_campaign(
         self, campaign_id: UUID, workflow_id: str, request: CampaignStart
     ) -> None: ...
+
+    async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]: ...
 
     async def create_multi_project_audit(
         self,
@@ -200,6 +203,36 @@ class SQLMetadataRepository:
         self, campaign_id: UUID, workflow_id: str, request: CampaignStart
     ) -> None:
         await asyncio.to_thread(self._create_campaign, campaign_id, workflow_id, request)
+
+    async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
+        return await asyncio.to_thread(self._get_workflow_projection, workflow_id)
+
+    def _get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
+        with self.sessions() as session:
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET TRANSACTION READ ONLY"))
+                session.execute(text("SET LOCAL statement_timeout = '3000ms'"))
+            rows = session.execute(
+                select(
+                    Run.status,
+                    Run.error_code,
+                    Run.started_at,
+                    Run.finished_at,
+                    Run.updated_at,
+                )
+                .where(Run.workflow_id == workflow_id)
+                .limit(2)
+            ).all()
+        return [
+            RunOutcomeRow(
+                status=row.status,
+                error_code=row.error_code,
+                started_at=row.started_at,
+                finished_at=row.finished_at,
+                updated_at=row.updated_at,
+            )
+            for row in rows
+        ]
 
     async def create_multi_project_audit(
         self,
@@ -1619,6 +1652,9 @@ class EmptyMetadataRepository:
 
     async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
         return None
+
+    async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
+        raise ValueError("durable run metadata store is unavailable")
 
     async def validate_delivery_issue_request(self, request: DeliveryStart) -> None:
         raise ValueError("durable delivery approval store is unavailable")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
-from datetime import timedelta
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
@@ -37,6 +39,7 @@ from engineering_control.engineering.models import CampaignPlan
 from engineering_control.models.enums import Project
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.policy.approvals import ApprovalService
+from engineering_control.workflow_outcome import derive_workflow_application_projection
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
@@ -360,6 +363,25 @@ class TemporalControlService:
                     "redaction_status",
                 )
                 response["validation"] = {key: result.get(key) for key in allowed}
+        try:
+            async with asyncio.timeout(5):
+                rows = await self.repository.get_workflow_projection(workflow_id)
+            projection = derive_workflow_application_projection(rows)
+            response["application"] = asdict(projection)
+        except Exception:
+            response["application"] = {
+                "run_association": "UNAVAILABLE",
+                "persisted_status": None,
+                "business_status": None,
+                "error_code": None,
+                "run_projection": None,
+                "observed_at": datetime.now(UTC).isoformat(),
+                "updated_at": None,
+                "started_at": None,
+                "finished_at": None,
+                "source": "APPLICATION_RUN_PROJECTION",
+                "scope": "WORKFLOW_ID_ONLY",
+            }
         return response
 
     async def start_acceptance(
