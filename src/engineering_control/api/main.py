@@ -10,6 +10,7 @@ from uuid import UUID
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
@@ -24,6 +25,7 @@ from engineering_control.api.schemas import (
     BacklogDeliveryApprovalRequest,
     BacklogImportAccepted,
     BacklogIssueAction,
+    CampaignReconciliationApply,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
@@ -66,6 +68,7 @@ from engineering_control.observability.metrics import ControlPlaneMetrics
 from engineering_control.operations.connection_status import provider_observation_current
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError
 from engineering_control.operations.models import parse_command
+from engineering_control.operations.reconciliation import decide_reconciliation, observation_token
 from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
 
@@ -330,14 +333,29 @@ def create_app(
     ) -> dict[str, Any]:
         return await repository.operator_snapshot("temporal")
 
+    @app.get("/v1/campaigns/reconcile")
     @app.post("/v1/campaigns/reconcile")
     async def campaigns_reconcile(
+        request: Request,
+        confirmation: CampaignReconciliationApply | None = None,
         limit: int = Query(default=100, ge=1, le=200),
         offset: int = Query(default=0, ge=0, le=10_000),
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
         repository: OperationsRepository = operations_dependency,
     ) -> dict[str, Any]:
+        if request.method == "POST" and confirmation is None:
+            raise HTTPException(
+                status_code=400, detail="Preview and confirm exact reconciliation rows first"
+            )
+        selected = (
+            {
+                str(row.campaign_id): (row.snapshot_token, row.observation_token)
+                for row in confirmation.rows
+            }
+            if request.method == "POST" and confirmation is not None
+            else {}
+        )
         results: list[dict[str, Any]] = []
         terminal = {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
         awaiting = {"AWAITING_APPROVAL", "AWAITING_HUMAN", "PAUSED"}
@@ -382,9 +400,13 @@ def create_app(
             for candidate in candidates
             if isinstance((workflow_id := candidate.get("workflow_id")), str)
         }
+        deadline = asyncio.get_running_loop().time() + 20
         for workflow_id in workflow_ids:
             try:
-                observed_by_workflow[workflow_id] = await service.get_workflow(workflow_id)
+                async with asyncio.timeout_at(deadline):
+                    observed_by_workflow[
+                        workflow_id
+                    ] = await service.get_reconciliation_observation(workflow_id)
             except RPCError as error:
                 if error.status == RPCStatusCode.NOT_FOUND:
                     missing_workflows.add(workflow_id)
@@ -433,16 +455,40 @@ def create_app(
             if workflow_binding_counts.get(workflow_id, 0) > 1:
                 changed = False
                 classification = "INCONSISTENT_STATE"
-            elif temporal_status in terminal and not projected_terminal:
-                try:
-                    changed = await repository.reconcile_terminal_campaign(
-                        UUID(str(candidate["campaign_id"])), workflow_id, temporal_status
-                    )
-                except ValueError:
-                    changed = False
-                    classification = "INCONSISTENT_STATE"
-                else:
-                    classification = "TERMINAL_NOT_RECONCILED"
+            elif temporal_status in terminal:
+                decision = decide_reconciliation(candidate, observed)
+                changed = False
+                classification = decision.classification
+                campaign_key = str(candidate["campaign_id"])
+                if campaign_key in selected:
+                    if selected[campaign_key] != (
+                        candidate.get("snapshot_token"),
+                        observation_token(observed),
+                    ):
+                        classification = "PREVIEW_STALE"
+                    elif decision.classification == "TERMINAL_REPAIR_AVAILABLE":
+                        try:
+                            changed = await repository.reconcile_terminal_campaign(
+                                UUID(campaign_key),
+                                workflow_id,
+                                temporal_status,
+                                expected_snapshot=selected[campaign_key][0],
+                                observed=observed,
+                            )
+                        except ValueError:
+                            classification = "PREVIEW_STALE"
+                        except SQLAlchemyError as error:
+                            raise HTTPException(
+                                status_code=503,
+                                detail=(
+                                    "Reconciliation transaction was not accepted; "
+                                    "refresh the preview"
+                                ),
+                            ) from error
+                        else:
+                            classification = (
+                                "TERMINAL_RECONCILED" if changed else "REPAIR_NOT_APPLIED"
+                            )
             elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"} and projected_terminal:
                 changed = False
                 classification = "INCONSISTENT_STATE"
@@ -484,14 +530,19 @@ def create_app(
                 {
                     **candidate,
                     "temporal_status": temporal_status,
+                    "observation_token": observation_token(observed),
+                    "observed_run_id": observed.get("run_id"),
                     "classification": classification,
                     "projection_repaired": changed,
                 }
             )
         return {
-            "status": "COMPLETE",
+            "status": "PREVIEW" if request.method == "GET" else "RECONCILIATION_EVALUATED",
             "items": results,
             "deleted": 0,
+            "unobserved_targets": sorted(
+                set(selected) - {str(row["campaign_id"]) for row in candidates}
+            ),
             "classification_scope": {
                 "kind": "BOUNDED_PAGE",
                 "offset": offset,

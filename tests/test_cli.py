@@ -159,8 +159,9 @@ def test_cli_direct_issue_and_operator_surfaces_use_only_typed_routes() -> None:
     assert client.calls[3][2] == {"action": "refresh_connections", "scope": "all"}
     assert client.calls[4][1:] == (
         "/v1/campaigns/reconcile?limit=20&offset=40",
-        {},
+        None,
     )
+    assert client.calls[4][0] == "GET"
 
     full_delivery = parser().parse_args(
         [

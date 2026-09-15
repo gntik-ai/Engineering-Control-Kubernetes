@@ -79,6 +79,7 @@ class ControlService(Protocol):
         self, request: RuntimeVerificationStart
     ) -> OperationAccepted: ...
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]: ...
+    async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]: ...
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
     async def start_acceptance(
         self, request: AcceptanceLifecycleStart, validation_root: str
@@ -162,6 +163,10 @@ class TemporalControlService:
             id=workflow_id,
             task_queue=self.task_queue,
         )
+        if handle.first_execution_run_id:
+            await self.repository.bind_campaign_execution(
+                campaign_id, workflow_id, handle.first_execution_run_id
+            )
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
@@ -341,6 +346,40 @@ class TemporalControlService:
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
+
+    async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]:
+        """Bounded, pinned result read; never follow a different execution implicitly."""
+        async with asyncio.timeout(10):
+            description = await self.client.get_workflow_handle(workflow_id).describe()
+            info = description.raw_description.workflow_execution_info
+            value: dict[str, Any] = {
+                "workflow_id": workflow_id,
+                "run_id": description.run_id,
+                "first_execution_run_id": info.first_run_id,
+                "status": description.status.name if description.status else "UNKNOWN",
+                "identity_verified": False,
+                "business_status": None,
+                "result_campaign_id": None,
+            }
+            if value["status"] == "COMPLETED":
+                pinned = self.client.get_workflow_handle(workflow_id, run_id=description.run_id)
+                result = await pinned.result(follow_runs=False, rpc_timeout=timedelta(seconds=5))
+                if isinstance(result, dict):
+                    status, campaign_id = result.get("status"), result.get("campaign_id")
+                    from engineering_control.operations.reconciliation import TERMINAL_OUTCOMES
+
+                    if isinstance(status, str) and status in TERMINAL_OUTCOMES:
+                        value["business_status"] = status
+                    if isinstance(campaign_id, str) and len(campaign_id) <= 36:
+                        value["result_campaign_id"] = campaign_id
+            latest = await self.client.get_workflow_handle(workflow_id).describe()
+            value["identity_verified"] = (
+                bool(info.first_run_id)
+                and latest.run_id == description.run_id
+                and latest.raw_description.workflow_execution_info.first_run_id == info.first_run_id
+                and latest.status == description.status
+            )
+            return value
 
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         handle = self.client.get_workflow_handle(workflow_id)

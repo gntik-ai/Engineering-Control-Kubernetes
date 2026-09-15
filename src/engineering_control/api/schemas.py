@@ -17,6 +17,23 @@ class APIModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CampaignReconciliationRow(APIModel):
+    campaign_id: UUID
+    snapshot_token: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observation_token: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class CampaignReconciliationApply(APIModel):
+    confirmation: Literal["APPLY_EXACT_RECONCILIATION_ROWS"]
+    rows: list[CampaignReconciliationRow] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def unique_rows(self) -> CampaignReconciliationApply:
+        if len({row.campaign_id for row in self.rows}) != len(self.rows):
+            raise ValueError("duplicate reconciliation target")
+        return self
+
+
 class CampaignStart(APIModel):
     project: Project
     name: str = Field(default="audit", min_length=1, max_length=200)

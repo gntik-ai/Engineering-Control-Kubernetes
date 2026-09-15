@@ -93,6 +93,12 @@ from engineering_control.operations.models import (
     WorkflowControlCommand,
     parse_command,
 )
+from engineering_control.operations.reconciliation import (
+    decide_reconciliation,
+    safe_execution_binding,
+    snapshot_token,
+    utc_text,
+)
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
@@ -2783,12 +2789,12 @@ class OperationsRepository:
                 metadata = (
                     campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
                 )
-                run = session.scalar(
-                    select(Run)
-                    .where(Run.campaign_id == campaign.id)
-                    .order_by(desc(Run.updated_at))
-                    .limit(1)
+                runs = list(
+                    session.scalars(
+                        select(Run).where(Run.campaign_id == campaign.id).order_by(Run.id).limit(2)
+                    )
                 )
+                run = runs[0] if len(runs) == 1 else None
                 workflow_id = metadata.get("workflow_id")
                 if not isinstance(workflow_id, str) or not workflow_id:
                     workflow_id = run.workflow_id if run is not None else None
@@ -2801,6 +2807,12 @@ class OperationsRepository:
                         "workflow_id": workflow_id,
                         "run_type": run.run_type if run is not None else None,
                         "run_status": run.status if run is not None else None,
+                        "run_count": len(runs),
+                        "application_run_id": str(run.id) if run is not None else None,
+                        "run_error_code": run.error_code if run is not None else None,
+                        "run_finished_at": utc_text(run.finished_at) if run is not None else None,
+                        "execution_binding": safe_execution_binding(metadata),
+                        "snapshot_token": snapshot_token(campaign, runs),
                         "blocker": metadata.get("blocker"),
                         "age_seconds": max(
                             0,
@@ -2860,41 +2872,84 @@ class OperationsRepository:
             ]
 
     async def reconcile_terminal_campaign(
-        self, campaign_id: UUID, workflow_id: str, temporal_status: str
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        temporal_status: str,
+        *,
+        expected_snapshot: str | None = None,
+        observed: dict[str, Any] | None = None,
     ) -> bool:
         return await asyncio.to_thread(
-            self._reconcile_terminal_campaign, campaign_id, workflow_id, temporal_status
+            self._reconcile_terminal_campaign,
+            campaign_id,
+            workflow_id,
+            temporal_status,
+            expected_snapshot,
+            observed,
         )
 
     def _reconcile_terminal_campaign(
-        self, campaign_id: UUID, workflow_id: str, temporal_status: str
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        temporal_status: str,
+        expected_snapshot: str | None = None,
+        observed: dict[str, Any] | None = None,
     ) -> bool:
-        terminal = {
-            "COMPLETED": "COMPLETE",
-            "FAILED": "FAILED",
-            "CANCELED": "CANCELLED",
-            "TERMINATED": "FAILED",
-            "TIMED_OUT": "FAILED",
-        }.get(temporal_status)
-        if terminal is None:
+        # Historical callers with only a workflow ID/raw status cannot authorize a write.
+        if (
+            expected_snapshot is None
+            or observed is None
+            or observed.get("status") != temporal_status
+        ):
             return False
         with self.sessions.begin() as session:
-            campaign = session.get(Campaign, campaign_id)
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+                session.execute(text("SET LOCAL lock_timeout = '1s'"))
+            campaign = session.scalar(
+                select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+            )
             if campaign is None:
                 return False
             metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
-            run = session.scalar(
-                select(Run)
-                .where(Run.campaign_id == campaign_id, Run.workflow_id == workflow_id)
-                .limit(1)
+            runs = list(
+                session.scalars(
+                    select(Run)
+                    .where(Run.campaign_id == campaign_id)
+                    .order_by(Run.id)
+                    .limit(2)
+                    .with_for_update()
+                )
             )
+            if len(runs) != 1 or snapshot_token(campaign, runs) != expected_snapshot:
+                raise ValueError("campaign reconciliation snapshot changed")
+            run = runs[0]
             bound_workflow = metadata.get("workflow_id") or (run.workflow_id if run else None)
-            if bound_workflow != workflow_id:
+            if bound_workflow != workflow_id or run.workflow_id != workflow_id:
                 raise ValueError("campaign workflow binding changed during reconciliation")
-            changed = campaign.status != terminal
-            campaign.status = terminal
-            if run is not None:
-                changed = changed or run.status != terminal
-                run.status = terminal
-                run.finished_at = run.finished_at or datetime.now(UTC)
-            return changed
+            candidate = {
+                "campaign_id": str(campaign_id),
+                "workflow_id": workflow_id,
+                "status": campaign.status,
+                "run_status": run.status,
+                "run_count": 1,
+                "application_run_id": str(run.id),
+                "run_error_code": run.error_code,
+                "run_finished_at": utc_text(run.finished_at),
+                "execution_binding": safe_execution_binding(metadata),
+            }
+            decision = decide_reconciliation(candidate, observed)
+            if decision.classification != "TERMINAL_REPAIR_AVAILABLE":
+                return False
+            assert (
+                decision.target_campaign_status is not None
+                and decision.target_run_status is not None
+            )
+            campaign.status = decision.target_campaign_status
+            run.status = decision.target_run_status
+            # Orchestration close time is not a business completion timestamp.
+            # Keep the actual persisted finished_at (including None) unchanged.
+            return True

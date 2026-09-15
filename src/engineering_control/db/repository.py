@@ -92,6 +92,10 @@ class MetadataRepository(Protocol):
 
     async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]: ...
 
+    async def bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None: ...
+
     async def create_multi_project_audit(
         self,
         workflow_id: str,
@@ -206,6 +210,40 @@ class SQLMetadataRepository:
 
     async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
         return await asyncio.to_thread(self._get_workflow_projection, workflow_id)
+
+    async def bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._bind_campaign_execution, campaign_id, workflow_id, first_run_id
+        )
+
+    def _bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        UUID(first_run_id)
+        with self.sessions.begin() as session:
+            campaign = session.scalar(
+                select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+            )
+            runs = list(
+                session.scalars(select(Run).where(Run.campaign_id == campaign_id).with_for_update())
+            )
+            if campaign is None or len(runs) != 1 or runs[0].workflow_id != workflow_id:
+                raise ValueError("campaign execution binding is ambiguous")
+            binding = {
+                "version": 1,
+                "workflow_id": workflow_id,
+                "first_execution_run_id": first_run_id,
+                "application_run_id": str(runs[0].id),
+            }
+            metadata = dict(campaign.metadata_json or {})
+            previous = metadata.get("reconciliation_binding")
+            if previous is not None and previous != binding:
+                raise ValueError("campaign execution binding is immutable")
+            if previous is None:
+                metadata["reconciliation_binding"] = binding
+                campaign.metadata_json = metadata
 
     def _get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
         with self.sessions() as session:
@@ -1637,6 +1675,11 @@ class SQLMetadataRepository:
 
 
 class EmptyMetadataRepository:
+    async def bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        return None
+
     async def create_campaign(
         self, campaign_id: UUID, workflow_id: str, request: CampaignStart
     ) -> None:

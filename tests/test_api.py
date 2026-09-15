@@ -14,6 +14,9 @@ from engineering_control.operations.models import OperationView
 
 
 class FakeService:
+    async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]:
+        return await self.get_workflow(workflow_id)
+
     async def plan_campaign(self, request: Any) -> dict[str, Any]:
         return {
             "project": request.project.value,
@@ -229,7 +232,7 @@ def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> No
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile?limit=2&offset=0", headers=headers)
+        response = client.get("/v1/campaigns/reconcile?limit=2&offset=0", headers=headers)
         assert response.status_code == 200
         assert len(response.json()["items"]) == 2
         assert response.json()["classification_scope"] == {
@@ -240,7 +243,7 @@ def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> No
         }
         assert response.json()["has_more"] is True
         assert response.json()["next_offset"] == 2
-        assert client.post("/v1/campaigns/reconcile?limit=201", headers=headers).status_code == 422
+        assert client.get("/v1/campaigns/reconcile?limit=201", headers=headers).status_code == 422
 
     operations.campaign_reconciliation_candidates.assert_awaited_once_with(3, 0)
 
@@ -324,19 +327,17 @@ def test_campaign_reconciliation_repairs_terminal_before_scoping_duplicate_canar
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
     items = {item["workflow_id"]: item for item in response.json()["items"]}
-    assert items["terminal-canary"]["classification"] == "TERMINAL_NOT_RECONCILED"
-    assert items["terminal-canary"]["projection_repaired"] is True
+    assert items["terminal-canary"]["classification"] == "EXECUTION_BINDING_UNVERIFIED"
+    assert items["terminal-canary"]["projection_repaired"] is False
     assert items["active-canary-0"]["classification"] == "DUPLICATE_CANARY"
     assert items["active-canary-1"]["classification"] == "DUPLICATE_CANARY"
     assert items["different-project-canary"]["classification"] == "RUNNING_HEALTHY"
     assert items["different-name-canary"]["classification"] == "RUNNING_HEALTHY"
-    operations.reconcile_terminal_campaign.assert_awaited_once_with(
-        terminal_campaign_id, "terminal-canary", "COMPLETED"
-    )
+    operations.reconcile_terminal_campaign.assert_not_awaited()
 
 
 def test_campaign_reconciliation_distinguishes_missing_from_unavailable_temporal() -> None:
@@ -370,9 +371,9 @@ def test_campaign_reconciliation_distinguishes_missing_from_unavailable_temporal
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        missing = client.post("/v1/campaigns/reconcile", headers=headers)
+        missing = client.get("/v1/campaigns/reconcile", headers=headers)
         service.get_workflow.side_effect = RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
-        unavailable = client.post("/v1/campaigns/reconcile", headers=headers)
+        unavailable = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert missing.status_code == 200
     assert missing.json()["items"][0]["classification"] == "TEMPORAL_WORKFLOW_MISSING"
@@ -416,7 +417,7 @@ def test_campaign_reconciliation_never_repairs_a_shared_terminal_workflow_bindin
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
     assert [item["classification"] for item in response.json()["items"]] == [
@@ -466,7 +467,7 @@ def test_shared_projection_rows_do_not_make_a_distinct_canary_look_duplicate() -
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
     assert [item["classification"] for item in response.json()["items"]] == [
@@ -477,7 +478,7 @@ def test_shared_projection_rows_do_not_make_a_distinct_canary_look_duplicate() -
     assert service.get_workflow.await_count == 2
 
 
-def test_campaign_reconciliation_maps_a_concurrent_rebind_to_inconsistent_state() -> None:
+def test_campaign_reconciliation_unbound_preview_does_not_reach_writer() -> None:
     candidate = {
         "campaign_id": str(uuid4()),
         "project": "falcone",
@@ -511,11 +512,12 @@ def test_campaign_reconciliation_maps_a_concurrent_rebind_to_inconsistent_state(
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
-    assert response.json()["items"][0]["classification"] == "INCONSISTENT_STATE"
+    assert response.json()["items"][0]["classification"] == "EXECUTION_BINDING_UNVERIFIED"
     assert response.json()["items"][0]["projection_repaired"] is False
+    operations.reconcile_terminal_campaign.assert_not_awaited()
 
 
 def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
