@@ -236,7 +236,7 @@ def test_watchdog_keeps_recovered_alert_pending_until_delivery(tmp_path: Path) -
     assert sink.calls[-1]["payload"]["event_type"] == "RECOVERY"  # type: ignore[index]
 
 
-def test_watchdog_new_failure_supersedes_failed_recovery_label(tmp_path: Path) -> None:
+def test_watchdog_resolves_uncertain_recovery_before_new_failure(tmp_path: Path) -> None:
     observed = [datetime(2026, 9, 3, 11, 57, tzinfo=UTC)]
     probes = [ProbeResult("database", False, "UNREACHABLE", "database failed")]
     sink = RecordingSink()
@@ -254,12 +254,19 @@ def test_watchdog_new_failure_supersedes_failed_recovery_label(tmp_path: Path) -
     sink.fail = True
     observed[0] += timedelta(seconds=60)
     assert watchdog.run_once()["delivery_failure_count"] == 1
+    recovery_call = sink.calls[-1]
     probes[0] = ProbeResult("database", False, "UNREACHABLE", "database failed again")
     sink.fail = False
     observed[0] += timedelta(seconds=60)
     assert watchdog.run_once()["delivered_count"] == 1
+    # An exception can mean an acknowledgement was lost after delivery. Resolve
+    # the same ID and original timestamped payload before publishing a new event.
+    assert sink.calls[-1] == recovery_call
+    observed[0] += timedelta(seconds=1)
+    assert watchdog.run_once()["delivered_count"] == 1
     assert [call["payload"]["event_type"] for call in sink.calls] == [  # type: ignore[index]
         "ALERT",
+        "RECOVERY",
         "RECOVERY",
         "ALERT",
     ]

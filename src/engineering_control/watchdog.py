@@ -441,7 +441,12 @@ class OperationalWatchdog:
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
-                os.write(descriptor, payload)
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("watchdog state write made no progress")
+                    remaining = remaining[written:]
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
@@ -467,6 +472,7 @@ class OperationalWatchdog:
             raise ValueError("watchdog probe state is malformed")
         delivered = 0
         failures = 0
+        unverifiable_pending = 0
         # Probe providers may reuse a list (including in dependency-injected
         # fixtures).  Keep our synthetic state probe local so one cycle cannot
         # mutate and duplicate the provider's next cycle.
@@ -521,7 +527,16 @@ class OperationalWatchdog:
             )
             prior_fingerprint = prior.get("fingerprint") if isinstance(prior, dict) else None
             event: str | None = None
-            if not probe.healthy:
+            if isinstance(prior_pending_id, str) and prior_pending_event in {
+                "ALERT",
+                "RECOVERY",
+                "CHANGE",
+            }:
+                # Resolve the durable event before observing a newer transition.
+                # In particular, a new generation must not overwrite an uncertain
+                # delivery for the preceding generation.
+                event = str(prior_pending_event)
+            elif not probe.healthy:
                 if not prior_active or prior_pending_event == "ALERT":
                     event = "ALERT"
                 elif prior_active and isinstance(prior_alerted, str):
@@ -534,25 +549,8 @@ class OperationalWatchdog:
                             now - _utc(alerted_at)
                         ).total_seconds() >= self.settings.watchdog_repeat_seconds:
                             event = "ALERT"
-            elif (
-                prior_active
-                and prior_pending_event == "ALERT"
-                and isinstance(prior_pending_id, str)
-            ):
-                event = "ALERT"
             elif prior_active and isinstance(prior_alerted, str):
                 event = "RECOVERY"
-            elif prior_pending_event in {"CHANGE", "RECOVERY"} and isinstance(
-                prior_pending_id, str
-            ):
-                if (
-                    prior_pending_event == "CHANGE"
-                    and probe.fingerprint is not None
-                    and probe.fingerprint != prior_pending_fingerprint
-                ):
-                    event = "CHANGE"
-                else:
-                    event = str(prior_pending_event)
             elif (
                 isinstance(prior_fingerprint, str)
                 and probe.fingerprint is not None
@@ -569,11 +567,11 @@ class OperationalWatchdog:
                 )
             else:
                 episode_time = None
+            same_pending_event = False
+            delivery_payload: dict[str, Any] = {}
             if event is not None:
                 same_pending_event = (
-                    isinstance(prior_pending_id, str)
-                    and prior_pending_event == event
-                    and (event != "CHANGE" or probe.fingerprint == prior_pending_fingerprint)
+                    isinstance(prior_pending_id, str) and prior_pending_event == event
                 )
                 if same_pending_event:
                     request_id = str(prior_pending_id)
@@ -584,32 +582,59 @@ class OperationalWatchdog:
                             f"engineering-watchdog:{probe.key}:{event}:{now.isoformat()}",
                         )
                     )
+                if same_pending_event:
+                    saved_payload = prior.get("pending_payload")
+                    if (
+                        not isinstance(saved_payload, dict)
+                        or saved_payload.get("event_type") != event
+                        or saved_payload.get("probe") != probe.key
+                        or saved_payload.get("source") != "engineering-independent-watchdog"
+                        or saved_payload.get("synthetic") is not False
+                        or any(
+                            not isinstance(saved_payload.get(key), str)
+                            for key in ("status", "summary", "observed_at", "release")
+                        )
+                    ):
+                        # Older releases did not retain the release-bound payload.
+                        # Reconstructing it could reuse an ID with different bytes.
+                        # Preserve the unresolved legacy row without sending it.
+                        failures += 1
+                        unverifiable_pending += 1
+                        continue
+                    delivery_payload = dict(saved_payload)
+                else:
+                    delivery_payload = {
+                        "event_type": event,
+                        "probe": probe.key,
+                        "status": probe.status,
+                        "summary": probe.summary,
+                        "observed_at": now.isoformat(),
+                        "release": self._release(),
+                        "source": "engineering-independent-watchdog",
+                        "synthetic": False,
+                    }
+                # This durable write is outside the delivery exception handler:
+                # if storage fails there must be no external send at all.
+                previous[probe.key] = {
+                    **prior,
+                    "active": prior_active or event == "ALERT",
+                    "episode_started_at": episode_time or prior_episode,
+                    "pending_request_id": request_id,
+                    "pending_event": event,
+                    "pending_payload": delivery_payload,
+                    "pending_status": delivery_payload.get("status"),
+                    "pending_summary": delivery_payload.get("summary"),
+                    "pending_observed_at": delivery_payload.get("observed_at"),
+                    "pending_fingerprint": (
+                        prior_pending_fingerprint if same_pending_event else probe.fingerprint
+                    ),
+                }
+                self._save_state(state)
                 try:
                     self.sink.deliver(
                         topic="telegram.engineering-operational-watchdog",
                         request_id=request_id,
-                        payload={
-                            "event_type": event,
-                            "probe": probe.key,
-                            "status": (
-                                prior_pending_status
-                                if same_pending_event and isinstance(prior_pending_status, str)
-                                else probe.status
-                            ),
-                            "summary": (
-                                prior_pending_summary
-                                if same_pending_event and isinstance(prior_pending_summary, str)
-                                else probe.summary
-                            ),
-                            "observed_at": (
-                                prior_pending_observed
-                                if same_pending_event and isinstance(prior_pending_observed, str)
-                                else now.isoformat()
-                            ),
-                            "release": self._release(),
-                            "source": "engineering-independent-watchdog",
-                            "synthetic": False,
-                        },
+                        payload=delivery_payload,
                     )
                 except Exception:  # noqa: BLE001 - caller receives a bounded failure count
                     failures += 1
@@ -625,7 +650,9 @@ class OperationalWatchdog:
                         if same_pending_event and isinstance(prior_pending_summary, str)
                         else probe.summary
                     )
-                    pending_fingerprint: str | None = probe.fingerprint
+                    pending_fingerprint: str | None = (
+                        prior_pending_fingerprint if same_pending_event else probe.fingerprint
+                    )
                     pending_observed_at: str | None = (
                         prior_pending_observed
                         if same_pending_event and isinstance(prior_pending_observed, str)
@@ -650,8 +677,14 @@ class OperationalWatchdog:
             missed_alert_delivered = (
                 probe.healthy and prior_active and event == "ALERT" and pending_event is None
             )
+            if event is not None and pending_event is None:
+                # Use the acknowledged event, not an observation that may have
+                # overtaken it. The next cycle then reports the newer transition.
+                active = event == "ALERT"
+            else:
+                active = not probe.healthy or missed_alert_delivered or pending_event == "ALERT"
             previous[probe.key] = {
-                "active": not probe.healthy or missed_alert_delivered or pending_event == "ALERT",
+                "active": active,
                 "episode_started_at": prior_episode if missed_alert_delivered else episode_time,
                 "last_alerted_at": alert_time,
                 "last_observed_at": now.isoformat(),
@@ -661,9 +694,18 @@ class OperationalWatchdog:
                 "pending_fingerprint": pending_fingerprint,
                 "pending_observed_at": pending_observed_at,
                 "pending_request_id": pending_request_id,
-                "fingerprint": probe.fingerprint,
+                "pending_payload": delivery_payload if pending_event is not None else None,
+                "fingerprint": (
+                    prior_pending_fingerprint
+                    if event is not None and same_pending_event
+                    else probe.fingerprint
+                ),
                 "status": probe.status,
             }
+            if event is not None:
+                # An acknowledgement-save failure leaves the write-ahead intent
+                # intact, so restart retries the same ID and complete payload.
+                self._save_state(state)
         state["updated_at"] = now.isoformat()
         self._save_state(state)
         return {
@@ -672,6 +714,7 @@ class OperationalWatchdog:
             "unhealthy_count": sum(not result.healthy for result in results),
             "delivered_count": delivered,
             "delivery_failure_count": failures,
+            "unverifiable_pending_count": unverifiable_pending,
             "values_emitted": False,
         }
 
