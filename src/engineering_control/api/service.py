@@ -38,6 +38,7 @@ from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.models.enums import Project
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
+from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.workflow_outcome import derive_workflow_application_projection
 from engineering_control.workflows.inputs import (
@@ -150,25 +151,63 @@ class TemporalControlService:
             mode="json"
         )
 
+    async def _start_recorded_workflow(
+        self,
+        application_run_id: UUID,
+        workflow_id: str,
+        workflow_name: str,
+        workflow_input: Any,
+        *,
+        campaign_id: UUID | None = None,
+    ) -> OperationAccepted:
+        try:
+            async with asyncio.timeout(15):
+                handle = await self.client.start_workflow(
+                    workflow_name,
+                    workflow_input,
+                    id=workflow_id,
+                    task_queue=self.task_queue,
+                    rpc_timeout=timedelta(seconds=5),
+                    id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                    memo={
+                        "engineering_application_run_id": str(application_run_id),
+                        "engineering_binding_version": 1,
+                    },
+                )
+                first_run_id = handle.first_execution_run_id
+                try:
+                    parsed = UUID(first_run_id)
+                except (TypeError, ValueError):
+                    raise ValueError("invalid first_execution_run_id") from None
+                if str(parsed) != first_run_id or parsed.int == 0:
+                    raise ValueError("invalid first_execution_run_id")
+                await self.repository.bind_recorded_run(
+                    application_run_id, workflow_id, first_run_id
+                )
+                if campaign_id is not None:
+                    await self.repository.bind_campaign_execution(
+                        campaign_id, workflow_id, first_run_id
+                    )
+        except Exception:
+            raise RecordedRunStartUnconfirmedError(workflow_id, application_run_id) from None
+        return OperationAccepted(workflow_id=workflow_id, run_id=first_run_id)
+
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted:
         campaign_id = uuid4()
         workflow_id = f"audit-{request.project.value}-{campaign_id}"
-        await self.repository.create_campaign(campaign_id, workflow_id, request)
+        application_run_id = uuid4()
+        await self.repository.create_campaign(
+            campaign_id, workflow_id, request, application_run_id=application_run_id
+        )
         value = request.model_dump(mode="json")
         value["preset"] = request.preset or "static-full"
         value["environment"] = request.environment or request.environments[0]
-        handle = await self.client.start_workflow(
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.AUDIT_CAMPAIGN.value,
             AuditCampaignInput(**value, campaign_id=str(campaign_id)),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        if handle.first_execution_run_id:
-            await self.repository.bind_campaign_execution(
-                campaign_id, workflow_id, handle.first_execution_run_id
-            )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+            campaign_id=campaign_id,
         )
 
     async def start_all_project_audits(self, request: MultiProjectAuditStart) -> OperationAccepted:
@@ -182,8 +221,13 @@ class TemporalControlService:
             )
             for project in projects
         }
-        await self.repository.create_multi_project_audit(workflow_id, campaigns, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        await self.repository.create_multi_project_audit(
+            workflow_id, campaigns, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.MULTI_PROJECT_AUDIT.value,
             MultiProjectAuditInput(
                 preset=request.preset,
@@ -191,12 +235,8 @@ class TemporalControlService:
                 publish_findings=request.publish_findings,
                 campaign_ids={project.value: str(campaigns[project][0]) for project in projects},
                 child_workflow_ids={project.value: campaigns[project][1] for project in projects},
+                application_run_id=str(application_run_id),
             ),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def start_delivery(self, request: DeliveryStart) -> OperationAccepted:
@@ -218,49 +258,49 @@ class TemporalControlService:
                 raise IssueStartUnconfirmedError(request.approved_issue) from error
             return accepted
         workflow_id = f"delivery-{request.finding_id}-{uuid4()}"
-        await self.repository.create_delivery_run(workflow_id, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        await self.repository.create_delivery_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.ISSUE_DELIVERY.value,
             IssueDeliveryInput(
                 finding_id=str(request.finding_id),
                 risk_class=request.risk_class.value,
                 dry_run=True,
             ).payload(),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted:
         workflow_id = f"finding-verify-{finding_id}-{uuid4()}"
-        project = await self.repository.create_finding_verification_run(workflow_id, finding_id)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        project = await self.repository.create_finding_verification_run(
+            workflow_id, finding_id, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.FINDING_VERIFICATION.value,
             FindingVerificationInput(
                 finding_id=str(finding_id),
                 project=project.value,
                 fresh_snapshot=True,
             ),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted:
         workflow_id = f"reconcile-{request.change_set_id}-{uuid4()}"
-        await self.repository.create_delivery_reconciliation_run(workflow_id, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        await self.repository.create_delivery_reconciliation_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.DELIVERY_RECONCILIATION.value,
             DeliveryReconciliationInput(**request.model_dump(mode="json")),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None:
@@ -293,58 +333,57 @@ class TemporalControlService:
 
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted:
         workflow_id = f"deploy-{request.environment}-{request.change_set_id}-{uuid4()}"
-        project = await self.repository.create_deployment_run(workflow_id, request)
+        application_run_id = uuid4()
+        project = await self.repository.create_deployment_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
         if request.environment == "preview":
-            handle = await self.client.start_workflow(
+            return await self._start_recorded_workflow(
+                application_run_id,
+                workflow_id,
                 WorkflowName.PREVIEW_DEPLOYMENT.value,
                 PreviewDeploymentInput(
                     change_set_id=str(request.change_set_id),
                     project=project.value,
                     dry_run=request.dry_run,
                 ),
-                id=workflow_id,
-                task_queue=self.task_queue,
             )
-        else:
-            handle = await self.client.start_workflow(
-                WorkflowName.STAGING_DEPLOYMENT.value,
-                StagingDeploymentInput(**request.model_dump()),
-                id=workflow_id,
-                task_queue=self.task_queue,
-            )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
+            WorkflowName.STAGING_DEPLOYMENT.value,
+            StagingDeploymentInput(**request.model_dump()),
         )
 
     async def rollback(self, request: RollbackRequest) -> OperationAccepted:
         workflow_id = f"recovery-{request.deployment_id}-{uuid4()}"
-        await self.repository.create_recovery_run(workflow_id, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        await self.repository.create_recovery_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.RECOVERY.value,
             RecoveryInput(**request.model_dump()),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def start_runtime_verification(
         self, request: RuntimeVerificationStart
     ) -> OperationAccepted:
         workflow_id = f"runtime-verify-{request.deployment_id}-{uuid4()}"
-        project = await self.repository.create_runtime_verification_run(workflow_id, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        project = await self.repository.create_runtime_verification_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.RUNTIME_VERIFICATION.value,
             RuntimeVerificationInput(
                 deployment_id=str(request.deployment_id),
                 project=project.value,
             ),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]:

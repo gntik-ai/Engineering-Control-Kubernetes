@@ -236,19 +236,18 @@ async def test_controller_plan_consumes_worker_observer_attestation(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_controller_activity_redaction_preserves_observer_denial_booleans(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binding_activity_environment
 ) -> None:
     credentials = tmp_path / "credentials"
     credentials.mkdir()
     attestations = tmp_path / "attestations"
     attestations.mkdir()
     monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
-    monkeypatch.setattr(
-        "engineering_control.activities.core.MetadataActivityHandler", lambda _settings: None
-    )
+    from engineering_control.db.models import Base
+
     activities = ControlActivities(
         Settings(
-            database_url="sqlite://",
+            database_url=f"sqlite:///{tmp_path / 'metadata.db'}",
             project_config_root=ROOT / "config/projects",
             persona_config_root=ROOT / "config/personas",
             flow_config_root=ROOT / "config/flows",
@@ -259,7 +258,9 @@ async def test_controller_activity_redaction_preserves_observer_denial_booleans(
         "controller",
     )
 
-    result = await activities.execute_control_step(
+    Base.metadata.create_all(activities.metadata_handler.engine)
+    result = await binding_activity_environment.run(
+        activities.execute_control_step,
         {
             "step": "campaign.plan",
             "payload": {
@@ -268,13 +269,15 @@ async def test_controller_activity_redaction_preserves_observer_denial_booleans(
                 "environment": "staging",
                 "observer_attestation": observer_attestation(),
             },
-        }
+        },
     )
 
     assert result["blockers"] == []
     assert result["kubernetes_readiness"] == "OPERATIONAL"
     assert result["observer_attestation"]["forbidden_resource_read_denied"] is True
     assert result["observer_attestation"]["mutation_access_denied"] is True
+    activities.metadata_handler.engine.dispose()
+    activities.engineering_handler.engine.dispose()
 
 
 class ExecuteWorkflowClient:

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.config import Settings
 from engineering_control.db import models as db
+from engineering_control.db.runtime_binding import new_bound_run
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_PROJECT_PAIRS,
@@ -743,7 +744,7 @@ class EngineeringActivityHandler:
         now = datetime.now(UTC)
         run = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id).limit(1))
         if run is None:
-            run = db.Run(
+            run = new_bound_run(
                 id=uuid5(NAMESPACE_URL, f"backlog-import-run:{workflow_id}"),
                 workflow_id=workflow_id,
                 run_type="github-backlog-import",
@@ -1187,7 +1188,7 @@ class EngineeringActivityHandler:
             run = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id).limit(1))
             if run is None:
                 session.add(
-                    db.Run(
+                    new_bound_run(
                         id=uuid5(NAMESPACE_URL, f"global-backlog-run:{workflow_id}"),
                         campaign_id=campaign_id,
                         workflow_id=workflow_id,
@@ -1964,7 +1965,7 @@ class EngineeringActivityHandler:
                     },
                     "REGISTERED",
                 )
-            run = db.Run(
+            run = new_bound_run(
                 campaign_id=(finding.campaign_id if child_kind == "finding-verification" else None),
                 change_set_id=change_set_id,
                 workflow_id=child_workflow_id,

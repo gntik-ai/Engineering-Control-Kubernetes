@@ -66,6 +66,6 @@ def effective_connection_status(
     if limit is None or status not in {"CONNECTED", "DEGRADED"}:
         return status
     observed = checked_at if checked_at.tzinfo else checked_at.replace(tzinfo=UTC)
-    if max(0, int((now - observed).total_seconds())) > limit:
+    if not -5 <= (now - observed).total_seconds() <= limit:
         return "STALE"
     return status

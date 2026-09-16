@@ -257,7 +257,7 @@ async def test_legacy_dry_run_does_not_dispatch_mutating_backlog(tmp_path: Path)
     try:
         temporal = Mock()
         temporal.start_workflow = AsyncMock(
-            return_value=SimpleNamespace(first_execution_run_id="dry-fixture")
+            return_value=SimpleNamespace(first_execution_run_id=RUN_ID)
         )
         body = DeliveryStart(finding_id=values[6]["finding_id"], risk_class="R1")
         result = await TemporalControlService(temporal, "fixture-only", values[1]).start_delivery(
@@ -267,6 +267,11 @@ async def test_legacy_dry_run_does_not_dispatch_mutating_backlog(tmp_path: Path)
         assert call.args[0] == "IssueDeliveryWorkflow" and call.args[1]["dry_run"] is True
         assert set(call.args[1]) == {"finding_id", "risk_class", "dry_run"}
         assert result.workflow_id.startswith("delivery-")
+        assert result.run_id == RUN_ID
+        with values[1].sessions() as session:
+            run = session.scalar(select(Run).where(Run.workflow_id == result.workflow_id))
+            assert run is not None and run.temporal_first_execution_run_id == RUN_ID
+            assert str(run.id) == call.kwargs["memo"]["engineering_application_run_id"]
     finally:
         _dispose(values)
 

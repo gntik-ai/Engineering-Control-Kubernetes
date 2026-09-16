@@ -20,9 +20,15 @@ from sqlalchemy import create_engine, desc, select
 from sqlalchemy.orm import Session
 
 from engineering_control.config import Settings, get_settings
-from engineering_control.db.models import NotificationOutbox, Run, WorkerHeartbeat
+from engineering_control.db.models import (
+    ConnectionSnapshot,
+    NotificationOutbox,
+    Run,
+    WorkerHeartbeat,
+)
 from engineering_control.logging import configure_logging
 from engineering_control.notifier import NotificationSink
+from engineering_control.operations.projection_health import projection_connection_status
 from engineering_control.workflows.worker_registry import ROLE_WORKER_REGISTRY
 
 logger = structlog.get_logger()
@@ -250,6 +256,38 @@ class OperationalWatchdog:
             else "recovery-point age, signed mirror, or restore failed its approved requirement",
         )
 
+    def _projection_reconciliation(
+        self, row: ConnectionSnapshot | None, now: datetime
+    ) -> ProbeResult:
+        if row is None:
+            return ProbeResult(
+                "projection-reconciliation",
+                False,
+                "MISSING",
+                "enabled projection reconciler has no completed observation",
+            )
+        healthy = (
+            projection_connection_status(
+                status=row.status,
+                checked_at=row.checked_at,
+                last_success_at=row.last_success_at,
+                detail=row.detail_json,
+                now=now,
+                interval_seconds=self.settings.projection_reconciliation_interval_seconds,
+                cycle_seconds=self.settings.projection_reconciliation_cycle_seconds,
+                max_sweep_age_seconds=self.settings.projection_reconciliation_max_sweep_age_seconds,
+            )
+            == "CONNECTED"
+        )
+        return ProbeResult(
+            "projection-reconciliation",
+            healthy,
+            "CURRENT" if healthy else "FAILED_OR_STALE",
+            "execution-bound projection sweep is current"
+            if healthy
+            else "projection sweep failed, has unresolved rows, or exceeded freshness",
+        )
+
     def _database(self, now: datetime) -> list[ProbeResult]:
         try:
             with Session(self.engine) as session:
@@ -274,6 +312,15 @@ class OperationalWatchdog:
                         .limit(21)
                     ).all()
                 )
+                projection = (
+                    session.scalar(
+                        select(ConnectionSnapshot).where(
+                            ConnectionSnapshot.component == "projection-reconciler"
+                        )
+                    )
+                    if self.settings.projection_reconciliation_enabled
+                    else None
+                )
         except Exception:  # noqa: BLE001 - independent probe exposes only a fixed safe status
             return [
                 ProbeResult(
@@ -285,6 +332,8 @@ class OperationalWatchdog:
             ]
 
         results = [ProbeResult("database", True, "REACHABLE", "application database probe passed")]
+        if self.settings.projection_reconciliation_enabled:
+            results.append(self._projection_reconciliation(projection, now))
         if cleanup is None:
             results.append(
                 ProbeResult("cleanup-schedule", False, "MISSING", "no cleanup run is recorded")

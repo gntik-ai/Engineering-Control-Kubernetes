@@ -137,6 +137,10 @@ def create_app(
             export_retention_days=resolved.dashboard_operation_export_retention_days,
             export_max_bytes=resolved.dashboard_operation_export_max_bytes,
             project_config_root=resolved.project_config_root,
+            projection_reconciliation_enabled=resolved.projection_reconciliation_enabled,
+            projection_reconciliation_interval_seconds=resolved.projection_reconciliation_interval_seconds,
+            projection_reconciliation_cycle_seconds=resolved.projection_reconciliation_cycle_seconds,
+            projection_reconciliation_max_sweep_age_seconds=resolved.projection_reconciliation_max_sweep_age_seconds,
         )
         app.state.operations_repository = resolved_operations
         yield

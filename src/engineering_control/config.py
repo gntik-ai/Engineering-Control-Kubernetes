@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8740, ge=1024, le=65535)
     api_admission_mode: Literal["normal", "synthetic-only", "diagnostics-only"] = "normal"
+    projection_reconciliation_enabled: bool = False
+    projection_reconciliation_interval_seconds: int = Field(default=30, ge=5, le=300)
+    projection_reconciliation_batch_size: int = Field(default=25, ge=1, le=100)
+    projection_reconciliation_cycle_seconds: int = Field(default=30, ge=10, le=120)
+    projection_reconciliation_max_sweep_age_seconds: int = Field(default=300, ge=30, le=3600)
     api_token_file: Path = Path("/etc/engineering-control/env/api.token")
     temporal_target: str = "127.0.0.1:7233"
     temporal_namespace: str = "engineering-control"

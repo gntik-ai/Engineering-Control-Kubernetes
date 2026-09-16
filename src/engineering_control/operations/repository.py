@@ -93,6 +93,7 @@ from engineering_control.operations.models import (
     WorkflowControlCommand,
     parse_command,
 )
+from engineering_control.operations.projection_health import projection_connection_status
 from engineering_control.operations.reconciliation import (
     decide_reconciliation,
     safe_execution_binding,
@@ -255,6 +256,10 @@ class OperationsRepository:
         export_retention_days: int = 7,
         export_max_bytes: int = 1024 * 1024,
         project_config_root: Path | None = None,
+        projection_reconciliation_enabled: bool = False,
+        projection_reconciliation_interval_seconds: int = 30,
+        projection_reconciliation_cycle_seconds: int = 30,
+        projection_reconciliation_max_sweep_age_seconds: int = 300,
     ) -> None:
         if not 1 <= export_retention_days <= 30:
             raise ValueError("operation export retention is outside its safety bound")
@@ -275,6 +280,20 @@ class OperationsRepository:
         self.export_max_bytes = export_max_bytes
         self.project_config_root = (
             project_config_root.absolute() if project_config_root is not None else None
+        )
+        self.projection_reconciliation_enabled = projection_reconciliation_enabled
+        self.projection_policy = {
+            "interval_seconds": projection_reconciliation_interval_seconds,
+            "cycle_seconds": projection_reconciliation_cycle_seconds,
+            "max_sweep_age_seconds": projection_reconciliation_max_sweep_age_seconds,
+        }
+        projection_connection_status(
+            status="DEGRADED",
+            checked_at=None,
+            last_success_at=None,
+            detail=None,
+            now=datetime.now(UTC),
+            **self.projection_policy,
         )
 
     async def candidate(self, command: Command, session_binding_hash: str) -> CandidateView:
@@ -2204,15 +2223,16 @@ class OperationsRepository:
             and row.component != "engineering-cli"
             and (surface != "readiness-core" or not row.component.startswith("project-"))
         ]
-        statuses = [
-            effective_connection_status(row.component, row.status, row.checked_at, now)
-            for row in required_connections
-        ]
+        statuses = [self._connection_status(row, now) for row in required_connections]
+        if self.projection_reconciliation_enabled and not any(
+            row.component == "projection-reconciler" for row in required_connections
+        ):
+            statuses.append("DEGRADED")
         return {
             "status": "READY"
             if statuses and all(value == "CONNECTED" for value in statuses)
             else "DEGRADED",
-            "connection_count": len(required_connections),
+            "connection_count": len(statuses),
             "connected_count": sum(value == "CONNECTED" for value in statuses),
             "worker_count": len(heartbeats),
             "checked_at": now.isoformat(),
@@ -2584,6 +2604,20 @@ class OperationsRepository:
             hashlib.sha256(encoded).hexdigest(),
         )
 
+    def _connection_status(self, row: ConnectionSnapshot, now: datetime) -> str:
+        if row.component == "projection-reconciler":
+            if not self.projection_reconciliation_enabled:
+                return "NOT_CONFIGURED"
+            return projection_connection_status(
+                status=row.status,
+                checked_at=row.checked_at,
+                last_success_at=row.last_success_at,
+                detail=row.detail_json,
+                now=now,
+                **self.projection_policy,
+            )
+        return effective_connection_status(row.component, row.status, row.checked_at, now)
+
     def _connections(self) -> list[ConnectionView]:
         now = datetime.now(UTC)
         with self.sessions() as session:
@@ -2596,8 +2630,9 @@ class OperationsRepository:
                     # These cards derive from the durable auth observations, not an
                     # independently timed cache that can lag a successful refresh.
                     continue
-                effective = effective_connection_status(
-                    row.component, row.status, row.checked_at, now
+                effective = self._connection_status(row, now)
+                projection_not_ready = (
+                    row.component == "projection-reconciler" and effective != "CONNECTED"
                 )
                 became_stale = effective == "STALE" and row.status != "STALE"
                 values.append(
@@ -2611,17 +2646,42 @@ class OperationsRepository:
                         latency_ms=row.latency_ms,
                         freshness_seconds=max(0, int((now - _utc(row.checked_at)).total_seconds())),
                         safe_error=(
-                            "persisted connection snapshot exceeded its freshness limit"
+                            "Projection reconciliation is disabled, stale, inconsistent, "
+                            "or has unresolved rows."
+                            if projection_not_ready
+                            else "persisted connection snapshot exceeded its freshness limit"
                             if became_stale
                             else row.safe_error
                         ),
                         source=row.source,
                         next_action=(
-                            "Refresh the owning fixed probe or persisted publisher."
+                            "Inspect the fixed reconciler configuration and execution bindings; "
+                            "do not start replacement runs."
+                            if projection_not_ready
+                            else "Refresh the owning fixed probe or persisted publisher."
                             if became_stale
                             else row.next_action
                         ),
                         details=row.detail_json,
+                    )
+                )
+            if self.projection_reconciliation_enabled and not any(
+                row.component == "projection-reconciler" for row in rows
+            ):
+                values.append(
+                    ConnectionView(
+                        component="projection-reconciler",
+                        logical_target="engineering_control.runs",
+                        status="DEGRADED",
+                        checked_at=now,
+                        last_success_at=None,
+                        last_failure_at=None,
+                        latency_ms=None,
+                        freshness_seconds=0,
+                        safe_error="Enabled reconciler has no persisted observation.",
+                        source="configuration/expected-component",
+                        next_action="Inspect the fixed reconciler before admitting dependent work.",
+                        details={"observation_present": False},
                     )
                 )
             for provider in ("codex", "claude"):

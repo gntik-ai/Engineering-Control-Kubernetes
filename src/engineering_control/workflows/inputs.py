@@ -35,6 +35,7 @@ class MultiProjectAuditInput:
     publish_findings: bool = False
     campaign_ids: dict[str, str] = field(default_factory=dict)
     child_workflow_ids: dict[str, str] = field(default_factory=dict)
+    application_run_id: str | None = None
 
 
 @dataclass

@@ -28,14 +28,25 @@ class FakeCleanupScanHandler:
 @pytest.mark.asyncio
 async def test_production_activity_rejects_invalid_authoritative_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    binding_activity_environment,
+    tmp_path,
 ) -> None:
     monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
-    activities = ControlActivities(Settings(synthetic_mode=False), "controller")
+    from engineering_control.db.models import Base
+
+    activities = ControlActivities(
+        Settings(synthetic_mode=False, database_url=f"sqlite:///{tmp_path / 'metadata.db'}"),
+        "controller",
+    )
+    Base.metadata.create_all(activities.metadata_handler.engine)
 
     with pytest.raises(ApplicationError, match="invalid metadata activity input"):
-        await activities.execute_control_step(
-            {"step": "campaign.finalize", "payload": {"campaign_id": "test"}}
+        await binding_activity_environment.run(
+            activities.execute_control_step,
+            {"step": "campaign.finalize", "payload": {"campaign_id": "test"}},
         )
+    activities.metadata_handler.engine.dispose()
+    activities.engineering_handler.engine.dispose()
 
 
 @pytest.mark.asyncio

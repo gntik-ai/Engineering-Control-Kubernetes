@@ -15,6 +15,7 @@ from engineering_control.dashboard.status_mapping import (
     expected_next_step,
     map_status,
 )
+from engineering_control.dashboard.time_projection import project_duration
 from engineering_control.db.models import (
     AgentExecution,
     AgentLogChunk,
@@ -680,17 +681,28 @@ class DashboardObservabilityProjection:
             updated_at=run.updated_at,
             now=datetime.now(UTC),
         )
+        terminal_requires_review = (
+            projection_state == "TERMINAL" and mapped.normalized not in TERMINAL_STATUSES
+        )
         normalized_status = (
-            "blocked" if projection_state == "ORPHANED_START_INTENT" else mapped.normalized
+            "blocked"
+            if projection_state == "ORPHANED_START_INTENT" or terminal_requires_review
+            else mapped.normalized
         )
         blocker_code = (
             run.error_code
             or ("ORPHANED_START_INTENT" if projection_state == "ORPHANED_START_INTENT" else None)
+            or ("TERMINAL_OUTCOME_REQUIRES_REVIEW" if terminal_requires_review else None)
             or (active_execution.blocker_code if active_execution else None)
             or mapped.blocker_code
         )
-        start = run.started_at or run.created_at
-        end = run.finished_at or datetime.now(UTC)
+        start = run.started_at
+        timing = project_duration(
+            start,
+            run.finished_at,
+            running=projection_state not in {"TERMINAL", "ORPHANED_START_INTENT"},
+            now=datetime.now(UTC),
+        )
         item: dict[str, Any] = {
             "workflow_id": run.workflow_id,
             "temporal_run_id": temporal_run_id,
@@ -728,10 +740,12 @@ class DashboardObservabilityProjection:
             "worker": active_execution.worker_kind if active_execution else run.worker,
             "task_queue": active_execution.task_queue if active_execution else None,
             "started_at": utc_iso(start),
+            "queued_at": utc_iso(run.created_at),
+            "ended_at": utc_iso(run.finished_at),
             "last_activity_at": utc_iso(last_activity),
             "updated_at": utc_iso(run.updated_at),
             "updated_datetime": current_utc(run.updated_at) or datetime.min.replace(tzinfo=UTC),
-            "duration_seconds": duration_seconds(start, end),
+            **timing,
             "last_heartbeat": utc_iso(
                 active_execution.last_heartbeat_at if active_execution else None
             ),
@@ -748,6 +762,8 @@ class DashboardObservabilityProjection:
             "expected_next_step": (
                 "Reconcile the durable start intent against Temporal before retrying."
                 if projection_state == "ORPHANED_START_INTENT"
+                else "Review the recorded terminal outcome; no replacement run is implied."
+                if terminal_requires_review
                 else expected_next_step(mapped.normalized, blocker_code)
             ),
             "execution_id": str(active_execution.id) if active_execution else None,
@@ -803,8 +819,12 @@ class DashboardObservabilityProjection:
 
     def _execution(self, row: AgentExecution, *, include_internal: bool = True) -> dict[str, Any]:
         mapped = map_status(row.status, phase=row.phase, entity_type="agent_execution")
-        end = row.ended_at or datetime.now(UTC)
-        start = row.started_at or row.created_at
+        timing = project_duration(
+            row.started_at,
+            row.ended_at,
+            running=mapped.normalized not in TERMINAL_STATUSES,
+            now=datetime.now(UTC),
+        )
         item = {
             "execution_id": str(row.id),
             "workflow_id": row.workflow_id,
@@ -831,7 +851,7 @@ class DashboardObservabilityProjection:
             "started_at": utc_iso(row.started_at),
             "last_heartbeat": utc_iso(row.last_heartbeat_at),
             "ended_at": utc_iso(row.ended_at),
-            "duration_seconds": duration_seconds(start, end),
+            **timing,
             "exit_code": row.exit_code,
             "retryable": row.retryable,
             "blocker_code": row.blocker_code or mapped.blocker_code,

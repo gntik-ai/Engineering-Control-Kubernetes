@@ -69,7 +69,9 @@ from engineering_control.operations.connection_status import provider_observatio
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError
 from engineering_control.operations.models import parse_command
 from engineering_control.operations.reconciliation import decide_reconciliation, observation_token
+from engineering_control.operations.recurring_reconciliation import RecurringRunReconciler
 from engineering_control.operations.repository import OperationsRepository
+from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
 
 
@@ -119,6 +121,10 @@ def create_app(
                 export_retention_days=resolved.dashboard_operation_export_retention_days,
                 export_max_bytes=resolved.dashboard_operation_export_max_bytes,
                 project_config_root=resolved.project_config_root,
+                projection_reconciliation_enabled=resolved.projection_reconciliation_enabled,
+                projection_reconciliation_interval_seconds=resolved.projection_reconciliation_interval_seconds,
+                projection_reconciliation_cycle_seconds=resolved.projection_reconciliation_cycle_seconds,
+                projection_reconciliation_max_sweep_age_seconds=resolved.projection_reconciliation_max_sweep_age_seconds,
             )
         app.state.operations_repository = resolved_operations
         resolved_bus = command_bus
@@ -134,20 +140,47 @@ def create_app(
             resolved_bus.diagnostics_only = admission_mode == "diagnostics-only"
         app.state.command_bus = resolved_bus
         stop = asyncio.Event()
+        reconciler = None
+        if resolved.projection_reconciliation_enabled and admission_mode in {
+            "normal",
+            "diagnostics-only",
+        }:
+            if resolved_operations is None:
+                raise RuntimeError("enabled reconciliation requires an operations repository")
+            reconciler = RecurringRunReconciler(
+                app.state.control_service,
+                resolved_operations,
+                resolved.temporal_namespace,
+                interval_seconds=resolved.projection_reconciliation_interval_seconds,
+                batch_size=resolved.projection_reconciliation_batch_size,
+                cycle_seconds=resolved.projection_reconciliation_cycle_seconds,
+                max_sweep_age_seconds=resolved.projection_reconciliation_max_sweep_age_seconds,
+            )
         dispatcher = (
             asyncio.create_task(operation_dispatch_loop(resolved_bus, stop))
             if resolved_bus is not None and admission_mode in {"normal", "diagnostics-only"}
             else None
         )
         app.state.operation_dispatcher = dispatcher
-        yield
-        stop.set()
-        if dispatcher is not None:
-            await dispatcher
-        if gateway_repository is None:
-            cast(AgentObservabilityRepository, app.state.gateway_repository).engine.dispose()
-        if operations_repository is None and resolved_operations is not None:
-            resolved_operations.engine.dispose()
+        reconciliation = (
+            asyncio.create_task(reconciler.serve(stop), name="projection-reconciliation")
+            if reconciler is not None
+            else None
+        )
+        app.state.projection_reconciler = reconciliation
+        try:
+            yield
+        finally:
+            stop.set()
+            # Every SQL operation is joined before the reconciler releases its
+            # leadership lock; engines remain alive until all owned tasks stop.
+            tasks = [task for task in (dispatcher, reconciliation) if task is not None]
+            if tasks:
+                await asyncio.gather(*tasks)
+            if gateway_repository is None:
+                cast(AgentObservabilityRepository, app.state.gateway_repository).engine.dispose()
+            if operations_repository is None and resolved_operations is not None:
+                resolved_operations.engine.dispose()
 
     app = FastAPI(
         title="Engineering Control API",
@@ -175,6 +208,24 @@ def create_app(
                 "detail": (
                     "Start acknowledgement is unconfirmed; preserve this operation and inspect "
                     "its status. Do not start a replacement issue run."
+                ),
+            },
+        )
+
+    @app.exception_handler(RecordedRunStartUnconfirmedError)
+    async def recorded_run_start_unconfirmed(
+        _request: Request, error: RecordedRunStartUnconfirmedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            headers={"Cache-Control": "no-store"},
+            content={
+                "status": "START_UNCONFIRMED",
+                "application_run_id": str(error.application_run_id),
+                "expected_workflow_id": error.workflow_id,
+                "detail": (
+                    "Start acknowledgement is unconfirmed; preserve this Run and inspect "
+                    "its status. Do not start a replacement workflow."
                 ),
             },
         )

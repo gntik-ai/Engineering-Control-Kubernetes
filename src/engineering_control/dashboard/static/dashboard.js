@@ -17,7 +17,7 @@ const localTime = (value) => {
     : "—";
 };
 const elapsed = (seconds) => {
-  if (!Number.isFinite(Number(seconds))) return "—";
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "Unknown";
   let rest = Math.max(0, Number(seconds));
   const parts = [[Math.floor(rest / 86400), "d"]]; rest %= 86400;
   parts.push([Math.floor(rest / 3600), "h"]); rest %= 3600;

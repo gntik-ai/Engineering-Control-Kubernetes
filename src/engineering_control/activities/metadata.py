@@ -55,6 +55,7 @@ from engineering_control.db.models import (
     VerificationResult,
     WorktreeLease,
 )
+from engineering_control.db.runtime_binding import new_bound_run
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BacklogApprovalBinding,
@@ -764,7 +765,7 @@ class MetadataActivityHandler:
                 .limit(1)
             )
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
                     workflow_id=workflow_id,
                     run_type="synthetic-observability",
@@ -1233,7 +1234,7 @@ class MetadataActivityHandler:
             if run.project != request.project.value:
                 raise ValueError("provider telemetry project does not match its control run")
             return run
-        run = Run(
+        run = new_bound_run(
             id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
             campaign_id=request.campaign_id,
             change_set_id=request.change_set_id,
@@ -1953,7 +1954,7 @@ class MetadataActivityHandler:
                 .limit(1)
             )
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
                     campaign_id=finding.campaign_id,
                     workflow_id=workflow_id,
@@ -3314,7 +3315,7 @@ class MetadataActivityHandler:
             run_id = uuid5(NAMESPACE_URL, f"final-closure:{workflow_id}:{change_set.id}")
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=run_id,
                     campaign_id=None,
                     change_set_id=change_set.id,
@@ -6585,7 +6586,7 @@ class MetadataActivityHandler:
         with self.sessions.begin() as session:
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=uuid5(NAMESPACE_URL, f"cleanup-run:{workflow_id}"),
                     campaign_id=None,
                     change_set_id=None,

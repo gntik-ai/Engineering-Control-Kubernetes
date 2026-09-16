@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-_TERMINAL = frozenset(
+TERMINAL_RUN_OUTCOMES = frozenset(
     {
         "BLOCKED",
         "CANCELLED",
@@ -16,6 +16,13 @@ _TERMINAL = frozenset(
         "SUCCESS",
         "TERMINATED",
         "TIMED_OUT",
+        "EMPTY",
+        "NOT_RUN",
+        "DRY_RUN",
+        "INCOMPLETE",
+        "VERIFICATION_REQUIRED",
+        "PARTIAL_BLOCKED",
+        "COMPLETED_WITH_FINDINGS",
     }
 )
 _DURABLE_WAIT = frozenset(
@@ -40,7 +47,7 @@ def classify_run_projection(
     queued_stale_seconds: int = 900,
 ) -> str:
     normalized = status.upper()
-    if finished_at is not None or normalized in _TERMINAL:
+    if finished_at is not None or normalized in TERMINAL_RUN_OUTCOMES:
         return "TERMINAL"
     if normalized in _DURABLE_WAIT:
         return "DURABLE_WAIT"

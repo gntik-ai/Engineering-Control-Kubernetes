@@ -37,8 +37,11 @@ def _postgresql_url() -> str:
     value = os.getenv("ENGINEERING_TEST_POSTGRES_URL")
     if not value:
         pytest.skip("ENGINEERING_TEST_POSTGRES_URL is required for real PostgreSQL acceptance")
-    if not value.startswith("postgresql+psycopg://"):
-        raise AssertionError("PostgreSQL acceptance refuses a non-PostgreSQL target")
+    if (
+        value != "postgresql+psycopg://engineering_ci@127.0.0.1:5432/engineering_control_ci"
+        or os.getenv("HERMES_RECONCILIATION_PG_FIXTURE") != "network-none"
+    ):
+        raise AssertionError("PostgreSQL acceptance requires the owned network-none fixture")
     return value
 
 
@@ -90,9 +93,9 @@ def test_postgresql_fresh_bootstrap_accepts_model_created_0015_index(
         assert isinstance(before_index[1], str)
         assert all(status in before_index[1] for status in ACTIVE_OPERATION_STATUSES)
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "0018")
         with bootstrap.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0017"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0018"
             after_index = connection.execute(
                 text(
                     "SELECT index_relation.oid, "

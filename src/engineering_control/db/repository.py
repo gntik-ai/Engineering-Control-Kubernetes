@@ -7,7 +7,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4, uuid5
 
 from sqlalchemy import case, create_engine, func, or_, select, text
 from sqlalchemy.orm import sessionmaker
@@ -48,6 +48,7 @@ from engineering_control.db.models import (
     VerificationResult,
     WorkerHeartbeat,
 )
+from engineering_control.db.run_binding import bind_run_execution as bind_run_row
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BacklogApprovalBinding,
@@ -87,7 +88,12 @@ def serialize_row(row: Any) -> dict[str, Any]:
 
 class MetadataRepository(Protocol):
     async def create_campaign(
-        self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None: ...
 
     async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]: ...
@@ -101,26 +107,44 @@ class MetadataRepository(Protocol):
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None: ...
 
-    async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
+    async def create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None: ...
     async def validate_delivery_issue_request(self, request: DeliveryStart) -> None: ...
     async def record_delivery_issue_start(
         self, request: DeliveryStart, accepted: OperationAccepted
     ) -> None: ...
     async def create_finding_verification_run(
-        self, workflow_id: str, finding_id: UUID
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
     ) -> Project: ...
     async def create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None: ...
     async def create_deployment_run(
-        self, workflow_id: str, request: DeploymentPrepare
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project: ...
     async def create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project: ...
-    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project: ...
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project: ...
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
     async def list_backlog_campaigns(
@@ -182,6 +206,9 @@ class MetadataRepository(Protocol):
     async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]: ...
     async def persist_worker_heartbeat(self, identity: str, hostname: str) -> dict[str, Any]: ...
     async def metrics_snapshot(self) -> dict[str, Any]: ...
+    async def bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None: ...
 
 
 class SQLMetadataRepository:
@@ -204,9 +231,20 @@ class SQLMetadataRepository:
         self.github_policy_request_root = github_policy_request_root
 
     async def create_campaign(
-        self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
-        await asyncio.to_thread(self._create_campaign, campaign_id, workflow_id, request)
+        await asyncio.to_thread(
+            self._create_campaign,
+            campaign_id,
+            workflow_id,
+            request,
+            application_run_id=application_run_id,
+        )
 
     async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
         return await asyncio.to_thread(self._get_workflow_projection, workflow_id)
@@ -223,6 +261,9 @@ class SQLMetadataRepository:
     ) -> None:
         UUID(first_run_id)
         with self.sessions.begin() as session:
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '3s'"))
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
             campaign = session.scalar(
                 select(Campaign).where(Campaign.id == campaign_id).with_for_update()
             )
@@ -277,12 +318,15 @@ class SQLMetadataRepository:
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._create_multi_project_audit,
             workflow_id,
             campaigns,
             request,
+            application_run_id=application_run_id,
         )
 
     def _create_multi_project_audit(
@@ -290,13 +334,17 @@ class SQLMetadataRepository:
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
         expected = {Project.FALCONE, Project.MUSEMATIC, Project.LLMWIKI}
         if set(campaigns) != expected:
             raise ValueError("all-project audit requires the exact project catalog")
+        parent_run_id = _application_run_id(application_run_id)
         with self.sessions.begin() as session:
             session.add(
                 Run(
+                    id=parent_run_id,
                     workflow_id=workflow_id,
                     run_type="multi-project-audit",
                     status="QUEUED",
@@ -330,6 +378,7 @@ class SQLMetadataRepository:
                 )
                 session.add(
                     Run(
+                        id=uuid5(parent_run_id, project.value),
                         campaign_id=campaign_id,
                         workflow_id=child_workflow_id,
                         run_type="audit-campaign",
@@ -338,7 +387,14 @@ class SQLMetadataRepository:
                     )
                 )
 
-    def _create_campaign(self, campaign_id: UUID, workflow_id: str, request: CampaignStart) -> None:
+    def _create_campaign(
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> None:
         with self.sessions.begin() as session:
             session.add(
                 Campaign(
@@ -367,6 +423,7 @@ class SQLMetadataRepository:
             )
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     campaign_id=campaign_id,
                     workflow_id=workflow_id,
                     run_type="audit-campaign",
@@ -375,8 +432,12 @@ class SQLMetadataRepository:
                 )
             )
 
-    async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
-        await asyncio.to_thread(self._create_delivery_run, workflow_id, request)
+    async def create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None:
+        await asyncio.to_thread(
+            self._create_delivery_run, workflow_id, request, application_run_id=application_run_id
+        )
 
     async def validate_delivery_issue_request(self, request: DeliveryStart) -> None:
         await asyncio.to_thread(self._validate_delivery_issue_request, request)
@@ -460,12 +521,19 @@ class SQLMetadataRepository:
                 linked=accepted.status == "EXISTING",
             )
 
-    async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+    async def create_finding_verification_run(
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
+    ) -> Project:
         return await asyncio.to_thread(
-            self._create_finding_verification_run, workflow_id, finding_id
+            self._create_finding_verification_run,
+            workflow_id,
+            finding_id,
+            application_run_id=application_run_id,
         )
 
-    def _create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+    def _create_finding_verification_run(
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
+    ) -> Project:
         with self.sessions.begin() as session:
             finding = session.get(Finding, finding_id)
             if finding is None or finding.disposition not in {"CANDIDATE", "FLAKY", "BLOCKED"}:
@@ -483,6 +551,7 @@ class SQLMetadataRepository:
             project = Project(finding.project)
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     campaign_id=finding.campaign_id,
                     workflow_id=workflow_id,
                     run_type="finding-verification",
@@ -493,13 +562,16 @@ class SQLMetadataRepository:
             )
             return project
 
-    def _create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
+    def _create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None:
         with self.sessions.begin() as session:
             finding = session.get(Finding, request.finding_id)
             if finding is None or finding.disposition != "CONFIRMED":
                 raise ValueError("delivery requires a CONFIRMED finding")
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     workflow_id=workflow_id,
                     run_type="issue-delivery",
                     status="QUEUED",
@@ -508,12 +580,25 @@ class SQLMetadataRepository:
             )
 
     async def create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
-        await asyncio.to_thread(self._create_delivery_reconciliation_run, workflow_id, request)
+        await asyncio.to_thread(
+            self._create_delivery_reconciliation_run,
+            workflow_id,
+            request,
+            application_run_id=application_run_id,
+        )
 
     def _create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
         allowed_states = {"SOURCE_PR", "CI_VALIDATED", "CANDIDATE_BUILT"}
         with self.sessions.begin() as session:
@@ -533,6 +618,7 @@ class SQLMetadataRepository:
                 raise ValueError("an active reconciliation already owns this ChangeSet")
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=change_set.id,
                     workflow_id=workflow_id,
                     run_type="delivery-reconciliation",
@@ -546,10 +632,24 @@ class SQLMetadataRepository:
                 )
             )
 
-    async def create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
-        return await asyncio.to_thread(self._create_deployment_run, workflow_id, request)
+    async def create_deployment_run(
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> Project:
+        return await asyncio.to_thread(
+            self._create_deployment_run, workflow_id, request, application_run_id=application_run_id
+        )
 
-    def _create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
+    def _create_deployment_run(
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> Project:
         deployable_states = {
             "preview": {
                 "CANDIDATE_BUILT",
@@ -585,6 +685,7 @@ class SQLMetadataRepository:
                 raise ValueError("LLMWiki is staging-only")
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=change_set.id,
                     workflow_id=workflow_id,
                     run_type=f"{request.environment}-deployment",
@@ -595,12 +696,25 @@ class SQLMetadataRepository:
             return project
 
     async def create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project:
-        return await asyncio.to_thread(self._create_runtime_verification_run, workflow_id, request)
+        return await asyncio.to_thread(
+            self._create_runtime_verification_run,
+            workflow_id,
+            request,
+            application_run_id=application_run_id,
+        )
 
     def _create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project:
         with self.sessions.begin() as session:
             deployment = session.get(Deployment, request.deployment_id)
@@ -620,6 +734,7 @@ class SQLMetadataRepository:
             project = Project(deployment.project)
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=deployment.change_set_id,
                     workflow_id=workflow_id,
                     run_type="runtime-verification",
@@ -630,10 +745,16 @@ class SQLMetadataRepository:
             )
             return project
 
-    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
-        return await asyncio.to_thread(self._create_recovery_run, workflow_id, request)
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project:
+        return await asyncio.to_thread(
+            self._create_recovery_run, workflow_id, request, application_run_id=application_run_id
+        )
 
-    def _create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
+    def _create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project:
         with self.sessions.begin() as session:
             deployment = session.get(Deployment, request.deployment_id)
             if deployment is None:
@@ -658,6 +779,7 @@ class SQLMetadataRepository:
             project = Project(deployment.project)
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=deployment.change_set_id,
                     workflow_id=workflow_id,
                     run_type="recovery",
@@ -1673,6 +1795,25 @@ class SQLMetadataRepository:
                 )
             )
 
+    async def bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._bind_recorded_run, application_run_id, workflow_id, first_run_id
+        )
+
+    def _bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        with self.sessions.begin() as session:
+            bind = session.get_bind()
+            if bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '3s'"))
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            elif bind.dialect.name != "sqlite":
+                raise ValueError("unsupported run binding database")
+            bind_run_row(session, application_run_id, workflow_id, first_run_id)
+
 
 class EmptyMetadataRepository:
     async def bind_campaign_execution(
@@ -1681,8 +1822,15 @@ class EmptyMetadataRepository:
         return None
 
     async def create_campaign(
-        self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
     async def create_multi_project_audit(
@@ -1690,10 +1838,18 @@ class EmptyMetadataRepository:
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
-    async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
+    async def create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
     async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
@@ -1707,23 +1863,51 @@ class EmptyMetadataRepository:
     ) -> None:
         raise ValueError("durable delivery approval store is unavailable")
 
-    async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+    async def create_finding_verification_run(
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
+    ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("finding verification metadata store is unavailable")
 
     async def create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
-    async def create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
+    async def create_deployment_run(
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("deployment metadata store is unavailable")
 
     async def create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("runtime verification metadata store is unavailable")
 
-    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("recovery metadata store is unavailable")
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
@@ -1832,3 +2016,16 @@ class EmptyMetadataRepository:
 
     async def metrics_snapshot(self) -> dict[str, Any]:
         return {}
+
+    async def bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        raise ValueError("durable run metadata store is unavailable")
+
+
+def _application_run_id(value: UUID | None) -> UUID:
+    if value is None:
+        return uuid4()
+    if type(value) is not UUID or value.int == 0:
+        raise ValueError("application_run_id must be a non-nil UUID")
+    return value

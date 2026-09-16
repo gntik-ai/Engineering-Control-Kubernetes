@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 from datetime import timedelta
 from typing import Any
+from uuid import UUID, uuid5
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -65,6 +66,7 @@ class ControlledWorkflow:
     )
 
     def __init__(self) -> None:
+        self._child_run_ids: dict[str, str] = {}
         self._paused = False
         self._cancelled = False
         self._pause_after_current = False
@@ -147,7 +149,84 @@ class ControlledWorkflow:
         )
         if not isinstance(result, dict):
             raise TypeError(f"activity {step} returned a non-object result")
+        if step == "backlog.register_child_run" and workflow.patched("child-run-start-memo-v1"):
+            status = result.get("status")
+            result_child_id = result.get("child_workflow_id")
+            run_id = result.get("run_id")
+            payload_child_id = payload.get("child_workflow_id")
+            if (
+                status != "REGISTERED"
+                or result_child_id != payload_child_id
+                or type(payload_child_id) is not str
+            ):
+                raise ApplicationError(
+                    "child Run registration is invalid",
+                    type="PolicyViolation",
+                    non_retryable=True,
+                )
+            self._remember_child_run(payload_child_id, run_id)
         return result
+
+    def _remember_child_run(self, workflow_id: str, run_id: Any) -> None:
+        if type(workflow_id) is not str or not (1 <= len(workflow_id) <= 240):
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if not workflow_id.isprintable():
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if type(run_id) is not str or len(run_id) != 36:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        try:
+            parsed = UUID(run_id)
+        except ValueError:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            ) from None
+        if str(parsed) != run_id or parsed.int == 0:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        existing = self._child_run_ids.get(workflow_id)
+        if existing == run_id:
+            return
+        if existing is not None:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if len(self._child_run_ids) >= 1024:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        self._child_run_ids[workflow_id] = run_id
+
+    def _child_run_options(self, workflow_id: str) -> dict[str, Any]:
+        run_id = self._child_run_ids.get(workflow_id)
+        if run_id is None:
+            return {}
+        return {
+            "memo": {
+                "engineering_application_run_id": run_id,
+                "engineering_binding_version": 1,
+            }
+        }
 
     async def _observability_terminal_run(
         self, context: dict[str, Any], *, reverse: bool = False
@@ -683,6 +762,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     id=f"finding-verify-{finding_id}",
                     task_queue=workflow.info().task_queue,
                     execution_timeout=timedelta(hours=4),
+                    **self._child_run_options(f"finding-verify-{finding_id}"),
                 )
                 if verification.get("status") in {"RATE_LIMITED", "BLOCKED", "FAILED"}:
                     continue
@@ -795,6 +875,21 @@ class MultiProjectAuditWorkflow(ControlledWorkflow):
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        if request.application_run_id is not None:
+            try:
+                if type(request.application_run_id) is not str:
+                    raise ValueError
+                parent_run_id = UUID(request.application_run_id)
+                if str(parent_run_id) != request.application_run_id or parent_run_id.int == 0:
+                    raise ValueError
+            except (TypeError, ValueError, AttributeError):
+                raise ApplicationError(
+                    "all-project Run binding is invalid", type="PolicyViolation", non_retryable=True
+                ) from None
+            for project in self._projects:
+                self._remember_child_run(
+                    request.child_workflow_ids[project], str(uuid5(parent_run_id, project))
+                )
         parent_workflow_id = workflow.info().workflow_id
         await self._step(
             "campaign.group_status",
@@ -835,6 +930,7 @@ class MultiProjectAuditWorkflow(ControlledWorkflow):
                     id=request.child_workflow_ids[project],
                     task_queue=workflow.info().task_queue,
                     execution_timeout=timedelta(days=7),
+                    **self._child_run_options(request.child_workflow_ids[project]),
                 )
             except ChildWorkflowError:
                 child = {"status": "FAILED", "blocker": "AUDIT_CHILD_WORKFLOW_FAILED"}
@@ -1211,6 +1307,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
             id=staging_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(staging_id),
         )
         if staging.get("status") != "STAGING_DEPLOYED":
             return {
@@ -1244,6 +1341,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
             id=verification_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(verification_id),
         )
         if verified.get("status") != "RUNTIME_VERIFIED":
             return {
@@ -1820,6 +1918,9 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
                         id=f"{workflow.info().workflow_id}-issue-{ordinal}-review-{review_attempt}",
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(
+                            f"{workflow.info().workflow_id}-issue-{ordinal}-review-{review_attempt}"
+                        ),
                     )
                     if delivery.get("status") != "REQUEST_CHANGES":
                         break
@@ -1856,6 +1957,9 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
                         id=f"{workflow.info().workflow_id}-issue-{ordinal}-reconcile",
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(
+                            f"{workflow.info().workflow_id}-issue-{ordinal}-reconcile"
+                        ),
                     )
                     if reconciled.get("status") not in {"READY", "COMPLETE", "PASS"}:
                         return {
@@ -1881,6 +1985,9 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
                         id=f"{workflow.info().workflow_id}-issue-{ordinal}-deploy",
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(
+                            f"{workflow.info().workflow_id}-issue-{ordinal}-deploy"
+                        ),
                     )
                     if deployment.get("status") not in {"COMPLETE", "PASS", "VERIFIED"}:
                         return {
@@ -2025,6 +2132,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         id=verification_workflow_id,
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=4),
+                        **self._child_run_options(verification_workflow_id),
                     )
                     await self._step(
                         "backlog.record_revalidation",
@@ -2187,6 +2295,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         id=delivery_workflow_id,
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(delivery_workflow_id),
                     )
                     results.append({**delivery, "attempt": attempt})
                     if delivery.get("status") != "REQUEST_CHANGES":
@@ -2216,6 +2325,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     id=delivery_workflow_id,
                     task_queue=workflow.info().task_queue,
                     execution_timeout=timedelta(hours=12),
+                    **self._child_run_options(delivery_workflow_id),
                 )
                 results.append(delivery)
             if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
@@ -2345,6 +2455,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 id=closure_id,
                 task_queue=workflow.info().task_queue,
                 execution_timeout=timedelta(days=7),
+                **self._child_run_options(closure_id),
             )
             results.append({**closure, "stage": "final-closure"})
             if closure.get("status") != "FIXED":
@@ -2429,6 +2540,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 id=child_id,
                 task_queue=task_queue,
                 execution_timeout=timedelta(hours=12),
+                **self._child_run_options(child_id),
             )
             results.append({**current, "stage": child_kind})
             if current.get("status") != "DEPLOY_PR":
@@ -2461,6 +2573,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             id=staging_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(staging_id),
         )
         results.append({**staging, "stage": "staging-deployment"})
         if staging.get("status") != "STAGING_DEPLOYED":
@@ -2498,6 +2611,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             id=verification_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(verification_id),
         )
         results.append({**verified, "stage": "runtime-verification"})
         if verified.get("status") != "RUNTIME_VERIFIED":
@@ -2657,6 +2771,7 @@ class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
                 id=child_id,
                 task_queue=workflow.info().task_queue,
                 execution_timeout=timedelta(days=7),
+                **self._child_run_options(child_id),
             )
             context = await self._step(
                 "global_backlog.record_result", {**context, "item": item, "result": result}
@@ -2760,6 +2875,7 @@ class EnhancementSolutionLoopWorkflow(ControlledWorkflow):
             id=f"{workflow.info().workflow_id}-solution",
             task_queue=workflow.info().task_queue,
             execution_timeout=timedelta(days=7),
+            **self._child_run_options(f"{workflow.info().workflow_id}-solution"),
         )
         if not isinstance(result, dict):
             raise RuntimeError("enhancement solution child returned an invalid result")

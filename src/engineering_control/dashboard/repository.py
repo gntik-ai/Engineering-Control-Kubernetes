@@ -22,6 +22,7 @@ from engineering_control.dashboard.status_mapping import (
     TERMINAL_STATUSES,
     map_status,
 )
+from engineering_control.dashboard.time_projection import project_duration
 from engineering_control.db.models import (
     AgentExecution,
     BacklogIssueRecord,
@@ -40,6 +41,7 @@ from engineering_control.db.models import (
     Step,
     VerificationResult,
 )
+from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
 from engineering_control.security.redaction import SecretRedactor
 
 _EVENT_METADATA_KEYS = frozenset(
@@ -554,9 +556,16 @@ class DashboardRepository:
         start = execution.started_at if execution else run.started_at if run else None
         end = execution.ended_at if execution else run.finished_at if run else None
         now = datetime.now(UTC)
-        start_utc = start if start is None or start.tzinfo else start.replace(tzinfo=UTC)
-        end_utc = end if end is None or end.tzinfo else end.replace(tzinfo=UTC)
-        duration = int(((end_utc or now) - start_utc).total_seconds()) if start_utc else None
+        selected_status = execution.status if execution else run.status if run else "UNKNOWN"
+        timing = project_duration(
+            start,
+            end,
+            running=(
+                selected_status.upper() not in TERMINAL_RUN_OUTCOMES
+                and map_status(selected_status).normalized not in TERMINAL_STATUSES
+            ),
+            now=now,
+        )
         recovery = change_set.recovery_json if change_set else {}
         recovery = recovery if isinstance(recovery, dict) else {}
         return {
@@ -564,7 +573,7 @@ class DashboardRepository:
             "provider_role": execution.role if execution else None,
             "worker": execution.worker_kind if execution else run.worker if run else None,
             "last_heartbeat": _utc_iso(execution.last_heartbeat_at if execution else None),
-            "duration_seconds": max(0, duration) if duration is not None else None,
+            **timing,
             "attempt": execution.attempt if execution else 1,
             "max_attempts": execution.max_attempts if execution else 1,
             "execution_id": str(execution.id) if execution else None,

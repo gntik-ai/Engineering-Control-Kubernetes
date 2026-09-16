@@ -137,6 +137,8 @@ class ChangeSet(UUIDPrimaryKey, Timestamps, Base):
 
 class Run(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "runs"
+    # Trusted Temporal start/registration binding only; no historical backfill.
+    temporal_first_execution_run_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
     campaign_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("campaigns.id"), index=True)
     change_set_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("change_sets.id"), index=True
