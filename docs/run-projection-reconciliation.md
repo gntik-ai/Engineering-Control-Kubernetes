@@ -74,7 +74,7 @@ healthy if:
 
 ### Status Presentation Rules
 
-- Missing `ENABLED` flag renders as `DEGRADED`.
+- When reconciliation is enabled but its snapshot is missing, readers report `DEGRADED`.
 - Explicitly disabled renders as `NOT_CONFIGURED`.
 - Raw status and blocker details are always retained and surfaced, not summarized away.
 - Unknown recorded start/finish/duration values remain `unknown` — never defaulted to `0` or computed as "growing from now."
