@@ -149,6 +149,83 @@ class ControlledWorkflow:
             raise TypeError(f"activity {step} returned a non-object result")
         return result
 
+    async def _observability_terminal_run(
+        self, context: dict[str, Any], *, reverse: bool = False
+    ) -> dict[str, Any]:
+        """Finalize a registered canary after cleanup; retain real activity failures."""
+        context = await self._step("observability.register", context)
+        primary_error: ActivityError | None = None
+        cleanup_error: ActivityError | None = None
+        terminal = "FAILED"
+        blocker: str | None = None
+        try:
+            context = await self._step("observability.prepare_workspace", context)
+            maker_prepare, maker_invoke, checker_prepare, checker_invoke = (
+                (
+                    "observability.prepare_claude_maker",
+                    "observability.invoke_claude_maker",
+                    "observability.prepare_codex_checker",
+                    "observability.invoke_codex_checker",
+                )
+                if reverse
+                else (
+                    "observability.prepare_codex",
+                    "observability.invoke_codex",
+                    "observability.prepare_claude",
+                    "observability.invoke_claude",
+                )
+            )
+            context = await self._step(maker_prepare, context)
+            context = await self._agent_step(maker_invoke, context, timeout_minutes=10)
+            if context.get("status") == "SUCCESS":
+                context = await self._step(checker_prepare, context)
+                context = await self._agent_step(checker_invoke, context, timeout_minutes=10)
+                terminal = "COMPLETED" if context.get("status") == "SUCCESS" else "FAILED"
+            if terminal == "FAILED":
+                safe_blockers = {
+                    "MANUAL_AUTH_REQUIRED_CODEX",
+                    "MANUAL_AUTH_REQUIRED_CLAUDE",
+                    "PROVIDER_CLI_MISSING_CODEX",
+                    "PROVIDER_CLI_MISSING_CLAUDE",
+                    "RATE_LIMITED",
+                    "SchemaViolation",
+                    "PolicyViolation",
+                    "PROVIDER_ACTIVITY_FAILED",
+                }
+                raw_blocker = context.get("blocker")
+                blocker = (
+                    raw_blocker
+                    if isinstance(raw_blocker, str) and raw_blocker in safe_blockers
+                    else "OBSERVABILITY_PROVIDER_NON_SUCCESS"
+                )
+        except ActivityError as error:
+            primary_error = error
+            blocker = "OBSERVABILITY_ACTIVITY_FAILED"
+        finally:
+            # A failed prepare may have created part of the owned workspace.
+            # The existing cleanup activity derives its confined path from workspace_id.
+            # Cancellation is not swallowed or converted into a successful result.
+            try:
+                await self._step("observability.cleanup_workspace", context)
+            except ActivityError as error:
+                cleanup_error = error
+        if cleanup_error is not None:
+            terminal = "FAILED"
+            blocker = (
+                "OBSERVABILITY_ACTIVITY_AND_CLEANUP_FAILED"
+                if primary_error is not None
+                else "OBSERVABILITY_CLEANUP_FAILED"
+            )
+        finalized = await self._step(
+            "observability.finalize",
+            {**context, "terminal_status": terminal, "blocker": blocker},
+        )
+        if primary_error is not None:
+            raise primary_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        return finalized
+
     async def _github_write_step(
         self, step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
     ) -> dict[str, Any]:
@@ -1597,6 +1674,8 @@ class ObservabilityAcceptanceWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: ObservabilityAcceptanceInput) -> dict[str, Any]:
         context: dict[str, Any] = asdict(request)
+        if workflow.patched("observability-terminal-finalization-v1"):
+            return await self._observability_terminal_run(context)
         context = await self._step("observability.register", context)
         context = await self._step("observability.prepare_workspace", context)
         try:
@@ -1628,6 +1707,8 @@ class ReverseObservabilityAcceptanceWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: ObservabilityAcceptanceInput) -> dict[str, Any]:
         context: dict[str, Any] = {**asdict(request), "provider_direction": "claude-to-codex"}
+        if workflow.patched("observability-terminal-finalization-v1"):
+            return await self._observability_terminal_run(context, reverse=True)
         context = await self._step("observability.register", context)
         context = await self._step("observability.prepare_workspace", context)
         try:
