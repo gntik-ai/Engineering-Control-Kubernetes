@@ -570,6 +570,21 @@
     "needs_user_decision": true
   },
   {
+    "id": "NEW-11",
+    "title": "GitHub write-policy reconciler's path-watcher is permanently fenced by a leftover startup marker, so approved policy activations never actually apply",
+    "area": "github",
+    "severity": "blocker",
+    "blocks_go": true,
+    "claimed_status": "Not previously identified; extends F-02/F-26/NEW-08's picture with the specific mechanism.",
+    "claimed_source": "Discovered live 2026-09-17: after the operator successfully ran backlog-approve for the musematic campaign (status flipped to APPROVED_POLICY_PENDING, policy_activation: QUEUED_ROOT_RECONCILER), a subsequent `issue-start llmwiki source 7` for an unrelated, real R0 issue was BLOCKED with safe_error 'another backlog campaign policy activation is pending' -- the activation never actually completed.",
+    "real_status": "OPEN",
+    "evidence": "`systemctl status engineering-github-policy-reconciler.path` shows Active: inactive (dead) since 2026-09-07 07:28:08 -- 10+ days, never restarted. Its currently-winning drop-in (same escalating z-prefix convention as NEW-08, /etc/systemd/system/engineering-github-policy-reconciler.path.d/zzzzzzzzzzzzzzzzzzzzz-hermes-2b678d9-maintenance.conf) sets `ConditionPathExists=!/var/lib/hermes-change-control/HERMES-FINDINGS-CLOSURE-20260901/ec-h001-2b678d9/controller/services/startup-fenced`. That exact marker file exists (root:root 0600, created 2026-09-16T20:48:10Z by the same archived self-review loop), so systemd refuses to (re)activate the path unit -- nothing is watching /var/lib/engineering-control/github-policy-requests/activate.json for new approved requests, so the campaign's approval never reaches the reconciler, and the live policy YAML is never actually rewritten to enabled:true.",
+    "root_cause": "Same pattern as NEW-08: the self-review loop fenced this path unit off (probably deliberately, to freeze GitHub policy changes during its own testing) and never lifted the fence afterward. It is a companion to, not the same fix as, NEW-08 -- fixing the API's admission mode did not touch this path unit at all.",
+    "proposed_fix": "Move the startup-fenced marker aside (not delete -- rename with a .disabled-by-go-status-20260917 suffix, reversible), then `systemctl daemon-reload && systemctl start engineering-github-policy-reconciler.path`, then re-trigger the pending activation (e.g. by re-running the already-approved backlog-approve for the musematic campaign, or touching the activate.json request file if it still exists) so the reconciler actually processes it. Verify by re-reading the live policy YAML (needs sudo) and re-attempting the blocked issue-start.",
+    "irreversible": false,
+    "needs_user_decision": true
+  },
+  {
     "id": "NEW-08",
     "title": "Private API has been stuck in diagnostics-only admission mode since 2026-09-01, blocking essentially all real mutating operations",
     "area": "engineering-control",
