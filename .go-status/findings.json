@@ -540,6 +540,21 @@
     "needs_user_decision": false
   },
   {
+    "id": "NEW-09",
+    "title": "The R3-approval mechanism needed by the entire real backlog is hardcoded to a single issue (musematic #1119) and was never generalized",
+    "area": "temporal",
+    "severity": "blocker",
+    "blocks_go": true,
+    "claimed_status": "Not previously identified. Related to but more specific than F-03's '0 executions' claim.",
+    "claimed_source": "Discovered live 2026-09-17 while selecting a pilot issue for D6, after opening the GitHub write policy gate (NEW-08) and importing real backlogs for falcone (15 issues) and llmwiki (0 issues), plus musematic (1 issue, imported as a side effect of the NEW-08 checker's test).",
+    "real_status": "OPEN",
+    "evidence": "Every open issue across all 3 target projects that the platform's own risk engine actually scored (16 total: 15 falcone, 1 musematic; llmwiki has 0) came back calculated_risk=R3, eligibility_status=DEFERRED, eligibility_reason=R3_REQUIRES_OPERATOR (source: engineering-ctl backlog-inventory). The only code path that can move an R3 item out of DEFERRED is activities/engineering.py's `_valid_r3_candidate(session, row, r3_approval_binding)` check inside `loop.load_selection`, fed by `POST/GET /v1/r3-issues/candidate` (api/main.py) -- which is hardcoded with `project: str = Query(pattern=r'^musematic$')` and `issue_number: int = Query(ge=1119, le=1119)`. `engineering-ctl r3-candidate`/`r3-approve`'s argparse choices are generated from this same hardcoded set and show literally only `{musematic} {source} {1119}`. There is no generic per-issue R3-approval path for any other issue in any project -- confirmed by reading api/main.py directly (not inferred). The general-purpose single-issue starter (`IssueLoopStart` / `IssueSolutionLoopWorkflow`, api/schemas.py:123) does not bypass this -- it funnels through the identical `loop.load_selection` step and therefore the identical R3 gate.",
+    "root_cause": "musematic #1119 (tracked as HERMES-2026-014 'Musematic #1119 gated/duplicated in historical inventory' in the archived self-review loop) got a bespoke, narrowly-scoped unblock instead of a general capability; no one came back to generalize it once that one issue's need was met, presumably because no real end-to-end pilot was ever actually attempted afterward.",
+    "proposed_fix": "Either (a) use musematic #1119 as the pilot, since it is the only issue the platform can currently process end to end, or (b) generalize the r3-issues/candidate endpoint and CLI to accept any project/issue_number (a real code change requiring its own review, not a config flip) if a different pilot issue is preferred.",
+    "irreversible": false,
+    "needs_user_decision": true
+  },
+  {
     "id": "NEW-08",
     "title": "Private API has been stuck in diagnostics-only admission mode since 2026-09-01, blocking essentially all real mutating operations",
     "area": "engineering-control",
