@@ -540,6 +540,21 @@
     "needs_user_decision": false
   },
   {
+    "id": "NEW-08",
+    "title": "Private API has been stuck in diagnostics-only admission mode since 2026-09-01, blocking essentially all real mutating operations",
+    "area": "engineering-control",
+    "severity": "blocker",
+    "blocks_go": true,
+    "claimed_status": "Not previously identified by name in any report — the prior audit's F-11 'deployed release drifts 7 files from repo HEAD' is the closest ancestor claim, but did not identify this specific mechanism or its consequence.",
+    "claimed_source": "Discovered live 2026-09-17 while executing D3 (opening GitHub write policy) via engineering-ctl backlog-import, which failed with HTTP 503 'private API is restricted to synthetic acceptance during maintenance'.",
+    "real_status": "OPEN",
+    "evidence": "src/engineering_control/api/admission.py (present ONLY in the deployed release at /opt/engineering-control/source, NOT in this git repo's HEAD — confirmed via `git log`/`git show origin/main:...` both empty) installs a MaintenanceAdmission ASGI middleware gated by `settings.api_admission_mode` (config.py:28, default 'normal'). Live, this is overridden by systemd drop-in EnvironmentFile= chains on engineering-api.service: 16 stacked drop-ins under /etc/systemd/system/engineering-api.service.d/99-hermes-<zzz...>-<sha>-admission.conf, one per commit of the archived HERMES-FINDINGS-CLOSURE-20260901 self-review loop (2026-09-07 through 2026-09-16), each pointing at its own /var/lib/hermes-change-control/HERMES-FINDINGS-CLOSURE-20260901/<name>/controller/api-admission.env. Read all 16 live (sudo): EVERY SINGLE ONE sets ENGINEERING_API_ADMISSION_MODE to either 'synthetic-only' or 'diagnostics-only' -- none ever restores 'normal'. The last one by the platform's own escalating-z-prefix convention (99-hermes-zzzzzzzzzzzzzzzzzzzzz-2b678d9-admission.conf, matching the currently-deployed release) wins with 'diagnostics-only', which per admission.py only allows GET/HEAD, three synthetic validation POST paths, and two narrow diagnostic POST paths (/v1/commands, /v1/observability/gateway-events) -- every other mutating endpoint (backlog import, campaign start, issue-loop start, enhancement discovery, etc.) gets an unconditional 503 before auth/body/route logic ever runs. This plausibly explains F-03's '0 executions in 30 days' far more directly than F-01/F-02 alone: even with GitHub policy open and K8s fixed, no real mission could ever have started through the API while this has been in effect.",
+    "root_cause": "The self-review loop put the API into a restricted admission mode for its own acceptance testing (reasonably, to avoid mixing real and synthetic traffic during that testing) but never added a step to restore 'normal' mode afterward, and each subsequent closure commit re-applied a restrictive mode rather than checking whether it was still needed.",
+    "proposed_fix": "Add one new additive systemd drop-in (does not delete the 16 historical ones, which remain as an audit trail) with a filename that wins by the same z-prefix convention, pointing at a new env file setting ENGINEERING_API_ADMISSION_MODE=normal; daemon-reload; restart engineering-api.service; reverify a real POST (e.g. backlog-import) no longer gets a 503 maintenance denial. This action was blocked by the harness's permission classifier ('Modify Shared Resources') pending explicit operator confirmation, since it changes admission behavior for the entire private API, not just the GitHub backlog flow discussed in D3.",
+    "irreversible": false,
+    "needs_user_decision": true
+  },
+  {
     "id": "NEW-07",
     "title": "A Hermes skill describes a parallel/legacy mission-execution path that appears to bypass the Temporal control plane",
     "area": "hermes",
