@@ -555,6 +555,21 @@
     "needs_user_decision": true
   },
   {
+    "id": "NEW-10",
+    "title": "R3 issues can never be delivered automatically — no override exists anywhere in the deployed code, and the entire real backlog is R3",
+    "area": "temporal",
+    "severity": "blocker",
+    "blocks_go": true,
+    "claimed_status": "Not previously identified; supersedes/completes NEW-09's picture.",
+    "claimed_source": "Discovered live 2026-09-17: after the operator ran backlog-approve (campaign) and r3-approve (musematic #1119) successfully, the follow-up `backlog-start musematic <campaign> R3 source-pr --max-items 1` returned status=BLOCKED, safe_error='operation preflight changed: R3_OPERATOR_ACTION_REQUIRED', workflow_id=null -- no Temporal workflow was started despite both approvals succeeding.",
+    "real_status": "OPEN",
+    "evidence": "src/engineering_control/operations/repository.py:645-646 and :697-698: inside capability()'s blocker computation for both SolveIssueCommand and SolveBacklogCommand, `if command.maximum_risk.value == \"R3\": blockers.append(\"R3_OPERATOR_ACTION_REQUIRED\")` fires UNCONDITIONALLY -- it does not check the r3_approval_binding, the campaign's approval status, or anything else; there is no field on SolveIssueCommand/SolveBacklogCommand (operations/models.py:32-63) to suppress it, and grep across the entire src/ tree found zero 'override'/'unblock' endpoint or mechanism for a BLOCKED operation. Confirmed structurally: `AutonomousBacklogCommand.maximum_risk` (models.py:72) is hardcoded `Literal[RiskClass.R2] = RiskClass.R2` -- the fully-autonomous path cannot even request R3. Cross-referenced with the live backlog data gathered for NEW-09: falcone (15 issues), musematic (1 issue) are 100% calculated_risk=R3; llmwiki has 0 issues. Net: there is no currently-open real issue in any target repo that the automated pipeline can deliver, end to end, under any combination of approvals available today.",
+    "root_cause": "This is very likely deliberate, conservative design rather than a bug: the r3-candidate/r3-approve flow's output (a detailed plan with rollback steps, tenant-safety requirements, verification checklist) reads like a briefing generated FOR a human engineer to execute manually, not an artifact meant to unlock further automation. R3 (highest risk, often security-adjacent) appears intentionally walled off from the Claude/Codex delivery pipeline, full stop.",
+    "proposed_fix": "Do not remove or weaken this gate -- it looks intentional and correctly conservative. To get real G7 evidence, create one new, deliberately low-risk (R0-R1) test issue in a target repo (llmwiki has zero open issues today, a clean slate) specifically to prove the pipeline end-to-end, rather than trying to force a real R3 production issue through. This is a scope/expectations question for the operator, not a code fix.",
+    "irreversible": false,
+    "needs_user_decision": true
+  },
+  {
     "id": "NEW-08",
     "title": "Private API has been stuck in diagnostics-only admission mode since 2026-09-01, blocking essentially all real mutating operations",
     "area": "engineering-control",
