@@ -2,12 +2,13 @@
   "mission": "GO status remediation for engineering-control",
   "branch": "go-status/2026-09-17",
   "started": "2026-09-17",
-  "phase": "1-complete-awaiting-GO-B",
+  "phase": "2-remediation-in-progress",
   "phase_history": [
     {"phase": "0-discovery", "started": "2026-09-17T00:00:00Z", "status": "complete", "deliverable": "docs/ARCHITECTURE-VERIFIED.md"},
-    {"phase": "1-reconcile", "started": "2026-09-17T00:00:00Z", "status": "complete", "deliverable": "docs/GO-STATUS.md, .go-status/findings.json, docs/BACKLOG.md"}
+    {"phase": "1-reconcile", "started": "2026-09-17T00:00:00Z", "status": "complete", "deliverable": "docs/GO-STATUS.md, .go-status/findings.json, docs/BACKLOG.md"},
+    {"phase": "2-remediation", "started": "2026-09-17T00:00:00Z", "status": "in_progress", "notes": "Operator answered D1-D8. F-04 fixed+checked (PASS). D7 archived. D2/D4 decisions applied. D3 blocked mid-execution by newly discovered NEW-08 (private API stuck in diagnostics-only admission mode) — awaiting operator confirmation to apply the fix (blocked by harness permission classifier, correctly, since it's a bigger change than D3 alone)."}
   ],
-  "gate": "GATE 1 — waiting for operator GO on decisions D1-D8 in docs/GO-STATUS.md section 4",
+  "gate": "Mid-Phase-2 pause: waiting for explicit operator confirmation on NEW-08 fix before resuming D3 (open GitHub write policy) and D6 (falcone pilot)",
   "prior_audit_reference": "docs/audit/{00-triage,01-inventory,02-findings,03-remediation-plan}.md (2026-09-01, reverified live 2026-09-17, see findings.json real_status per item)",
   "parallel_self_review_loop": "~/engineering/go-live/20260901T193928Z-findings-closure/ — still writing files as of 2026-09-17, uses its own HERMES-2026-001..021 numbering, not cross-referenced with this ledger. See NEW-03 and GO-STATUS.md decision D7 (recommend freezing it once operator agrees).",
   "verdict": "NO-GO",
