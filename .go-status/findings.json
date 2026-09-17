@@ -1,18 +1,78 @@
 [
   {
+    "id": "F-21",
+    "title": "Two gh CLI installs on worker (harmless duplication)",
+    "area": "worker",
+    "severity": "minor",
+    "blocks_go": false,
+    "claimed_status": "LOW/PASS w/ note — two gh installs on worker (harmless duplication).",
+    "claimed_source": "docs/audit/02-findings.md:F-21 (2026-09-01)",
+    "real_status": "UNVERIFIED",
+    "evidence": "Not reverified live this pass.",
+    "root_cause": "Not reconfirmed this pass.",
+    "proposed_fix": "Backlog; low priority hygiene.",
+    "irreversible": false,
+    "needs_user_decision": false
+  },
+  {
+    "id": "F-22",
+    "title": "No release-directory retention policy (100 release dirs)",
+    "area": "worker",
+    "severity": "minor",
+    "blocks_go": false,
+    "claimed_status": "LOW/PASS w/ note — disk fine today; 100 release dirs, no retention policy.",
+    "claimed_source": "docs/audit/02-findings.md:F-22 (2026-09-01)",
+    "real_status": "UNVERIFIED",
+    "evidence": "Not reverified live this pass.",
+    "root_cause": "Not reconfirmed this pass.",
+    "proposed_fix": "Backlog.",
+    "irreversible": false,
+    "needs_user_decision": false
+  },
+  {
+    "id": "F-23",
+    "title": "hermes-gateway.service exits 1 on SIGTERM; Telegram toolset config quirk",
+    "area": "hermes",
+    "severity": "minor",
+    "blocks_go": false,
+    "claimed_status": "LOW/PARTIAL — platform_toolsets.telegram: [] still yields 14 kanban tools (upstream quirk); gateway exits 1 on SIGTERM.",
+    "claimed_source": "docs/audit/02-findings.md:F-23 (2026-09-01)",
+    "real_status": "OPEN",
+    "evidence": "Live 2026-09-17 CONFIRMED during the F-04 remediation restart: journalctl shows 'hermes-gateway.service: Main process exited, code=exited, status=1/FAILURE' on a clean, intentional `systemctl restart`. Gateway's own log: 'WARNING gateway.run: Shutdown context: signal=SIGTERM ...' followed by exit code 1 instead of 0. Did not re-check the Telegram toolset quirk.",
+    "root_cause": "Gateway's SIGTERM handler does not exit 0 on a clean, intentional shutdown.",
+    "proposed_fix": "Backlog — cosmetic (systemd still reports the unit as successfully restarted/active afterward; NRestarts stayed 0), but should be fixed so monitoring doesn't alert on routine restarts.",
+    "irreversible": false,
+    "needs_user_decision": false
+  },
+  {
+    "id": "F-24",
+    "title": "kind missing on worker; argocd CLI missing on controller",
+    "area": "worker",
+    "severity": "minor",
+    "blocks_go": false,
+    "claimed_status": "LOW/PARTIAL — kind missing on worker; argocd missing on controller.",
+    "claimed_source": "docs/audit/02-findings.md:F-24 (2026-09-01)",
+    "real_status": "UNVERIFIED",
+    "evidence": "Not reverified live this pass.",
+    "root_cause": "Not reconfirmed this pass.",
+    "proposed_fix": "Backlog; only matters if a mission needs local kind clusters or ArgoCD CLI access.",
+    "irreversible": false,
+    "needs_user_decision": false
+  },
+  {
     "id": "F-01",
     "title": "No scoped Kubernetes observer credential; cluster-admin kubeconfig sits in its place",
     "area": "k8s",
     "severity": "blocker",
-    "blocks_go": true,
+    "blocks_go": false,
     "claimed_status": "BLOCKER/FAIL — no scoped K8s observer credential exists; every AuditCampaign plan ends OBSERVER_AUTHORIZATION_INVALID; llmwiki RBAC manifest never written.",
     "claimed_source": "docs/audit/02-findings.md:F-01 (2026-09-01)",
     "real_status": "OPEN",
     "evidence": "Live 2026-09-17: `kubectl --kubeconfig /home/hermes/.kube/config auth can-i --list` on worker returns `*.* -> [*]` (cluster-admin). `/etc/engineering-control/credentials/<project>/*.kubeconfig` (the scoped-credential location per config/credentials/contracts.yaml) is `drwx--x--x root:root`, permission-denied to hermes — cannot confirm any scoped credential was ever provisioned there. See .go-status/notes/worker.md rows 'Kubeconfigs found' and 'Kubeconfig — is it what the automation actually uses?'.",
     "root_cause": "No least-privilege observer kubeconfig was ever provisioned for falcone/musematic/llmwiki; the only reachable kubeconfig on the worker is a leftover cluster-admin credential in hermes's own home dir.",
-    "proposed_fix": "Operator provisions a scoped, read-only observer ServiceAccount/kubeconfig per target project and installs it at the path config/credentials/contracts.yaml expects; then remove the cluster-admin kubeconfig from /home/hermes/.kube/config on the worker.",
+    "proposed_fix": "Operator decision D2 (2026-09-17): declined to provision scoped credentials or remove the cluster-admin kubeconfig in this engagement. Accepted as a known, deliberate gap for this GO cycle — G8 (audit mission) and the K8s-observer half of G9 remain FAIL/blocked by choice, not by oversight. Revisit in a future engagement.",
     "irreversible": true,
-    "needs_user_decision": true
+    "needs_user_decision": false
   },
   {
     "id": "F-02",
@@ -52,12 +112,12 @@
     "blocks_go": true,
     "claimed_status": "BLOCKER-decision — Hermes's own chat loop runs through the built-in openai-codex HTTP provider (Python process to chatgpt.com, spoofed originator) instead of shelling out to a CLI; violates CLI-only rule. Recommended: switch to codex_app_server subprocess runtime.",
     "claimed_source": "docs/audit/02-findings.md:F-04 (2026-09-01)",
-    "real_status": "OPEN",
-    "evidence": "Live 2026-09-17: hermes-gateway.service (PID active since 13:32 UTC today, release fecf78726c170f1f5fdadec7156c52ea3de4651b) runs auxiliary_client.py which POSTs to https://chatgpt.com/backend-api/codex with User-Agent 'codex_cli_rs/0.0.0 (Hermes Agent)' and header originator: codex_cli_rs to impersonate the real Codex CLI. ~/.hermes/config.yaml still has provider: openai-codex on lines 3/113/116/119. Auth is OAuth device-code (not a raw key) but this is still a direct HTTP call to an LLM backend, not a CLI subprocess. See .go-status/notes/security-surface.md row 16 and .go-status/notes/controller.md rows 37/39. NOTE: this is DISTINCT from the Temporal mission-execution layer, which independently verifies CLI-backed today (engineering-ctl connections all: provider-claude/provider-codex -> native-claude-cli/native-codex-cli, CONNECTED).",
-    "root_cause": "Hermes agent's chat/model layer was built against Codex's own web backend for feature parity before the CLI-subprocess runtime (codex_app_server) was ready; the switch was designed (scripts/prepare-hermes-c01-cutover.py, tests/test_hermes_c01_cutover.py exist in-repo) but never applied.",
-    "proposed_fix": "Run the existing scripts/prepare-hermes-c01-cutover.py cutover to flip Hermes's model.provider from openai-codex to the CLI-subprocess runtime, restart hermes-gateway.service, and reverify via engineering-ctl / a real chat turn that no HTTP call to chatgpt.com/backend-api/codex occurs.",
+    "real_status": "FIXED",
+    "evidence": "CORRECTION during remediation: scripts/prepare-hermes-c01-cutover.py is NOT the right tool — reading it live showed it actually sets model.provider TO openai-codex (it is unrelated cutover tooling for an earlier OmniRoute-removal migration). The real mechanism is Hermes's own first-class opt-in runtime switch: model.openai_runtime: codex_app_server (agent/transports/codex_app_server.py, hermes_cli/codex_runtime_switch.py, 20+ existing tests), which makes OpenAI/Codex turns spawn `codex app-server` as a subprocess instead of calling chatgpt.com/backend-api/codex over HTTP. Applied live 2026-09-17 by invoking hermes_cli.codex_runtime_switch.apply(..., 'codex_app_server') via hermes_cli.config.load_config/save_config (the same code path the built-in /codex-runtime slash command uses) for BOTH identities: (1) interactive ~/.hermes/config.yaml (operator, uid 1000) — confirmed `openai_runtime: codex_app_server` written, and DIRECTLY VERIFIED live: `hermes -z \"reply with the single word: pong\"` returned 'pong' while a `codex app-server` subprocess (PID 2713858) was observed spawned under the hermes process tree — no HTTP call needed. (2) production gateway /var/lib/hermes-gateway/home/config.yaml (uid 972) — found ALREADY set to codex_app_server since 2026-09-15 (an earlier unrelated change had set the config value, but the live process apparently never picked it up — see root_cause); hermes-gateway.service was restarted (sudo, `systemctl restart`, clean start confirmed via journalctl: NRestarts=0, Telegram reconnected, no crash) so it now boots with an empty in-memory agent cache and the correct config. Live Telegram-triggered confirmation for the gateway specifically was not performed this pass (would require injecting a message as the operator's Telegram account, which this session cannot do) — this will be directly exercised by Phase 3's G5 proof (a real Telegram-triggered mission).",
+    "root_cause": "Hermes agent's chat/model layer defaults to an HTTP provider (openai-codex, OAuth-authenticated against chatgpt.com) unless the opt-in codex_app_server runtime is both configured AND the in-memory per-session agent cache is rebuilt from that config (a bare config edit without a process/session refresh is not enough, per the switch's own 'effective on next session' warning) — the gateway's config was edited on 2026-09-15 but nothing evicted/rebuilt its live in-memory session, so it kept using the old HTTP transport for 2 more days.",
+    "proposed_fix": "Applied. Remaining follow-up (non-blocking): after Phase 3's G5 Telegram test, confirm no chatgpt.com/backend-api/codex call occurs for that real triggered turn; if it still does, the persisted session (not just config/process) needs an explicit reset.",
     "irreversible": false,
-    "needs_user_decision": true
+    "needs_user_decision": false
   },
   {
     "id": "F-05",
@@ -79,15 +139,15 @@
     "title": "Worker's ~/.kube/config for hermes is cluster-admin",
     "area": "k8s",
     "severity": "blocker",
-    "blocks_go": true,
+    "blocks_go": false,
     "claimed_status": "HIGH/FAIL — worker's ~/.kube/config for user hermes is cluster-admin (system:masters), violating the non-admin requirement.",
     "claimed_source": "docs/audit/02-findings.md:F-06 (2026-09-01)",
     "real_status": "OPEN",
     "evidence": "Same live evidence as F-01: `kubectl auth can-i --list` against /home/hermes/.kube/config on worker returns wildcard resource/verb (*.* -> [*]). config/kubernetes/README.md in-repo explicitly calls this exact credential 'prohibited'. Duplicate of F-01's root cause; tracked separately for traceability to the original ledger.",
     "root_cause": "Same as F-01.",
-    "proposed_fix": "Same as F-01 — remove this credential once scoped observer credentials are provisioned and verified working.",
+    "proposed_fix": "Same as F-01 — operator decision D2 (2026-09-17) declined to act on this in this engagement; revisit in a future engagement.",
     "irreversible": true,
-    "needs_user_decision": true
+    "needs_user_decision": false
   },
   {
     "id": "F-07",
@@ -139,15 +199,15 @@
     "title": "GitHub access uses the operator's personal admin OAuth token; no bot identity or branch protection",
     "area": "github",
     "severity": "major",
-    "blocks_go": true,
+    "blocks_go": false,
     "claimed_status": "HIGH/FAIL — GitHub access uses the operator's personal admin OAuth token (no bot identity, no project scope, no branch protection on any repo).",
     "claimed_source": "docs/audit/02-findings.md:F-10 (2026-09-01)",
     "real_status": "UNVERIFIED",
     "evidence": "Worker agent found /etc/engineering-control/credentials/ (likely home for GitHub App/PAT/deploy-key material) permission-denied; adapters/github/client.py was not read in depth this pass. hermes's own personal `gh` config exists but is not evidence of what the runner (github role, unix_user=hermes per worker_registry.py) actually uses at write time. See .go-status/notes/worker.md 'GitHub auth mechanism'.",
     "root_cause": "Not reconfirmed this pass — needs either sudo-free code inspection of adapters/github/client.py + operations/connections.py, or a live `gh auth status`/`GET /user` check run as the github role worker.",
-    "proposed_fix": "Read adapters/github/client.py to see how it resolves its token; if it is the operator's personal token, provision a dedicated GitHub App or machine bot account and repo branch protection before opening G2 (write policy).",
+    "proposed_fix": "Operator decision D4 (2026-09-17): continue using the personal token; no bot identity will be provisioned in this engagement. Documented, accepted exception — does not block GO for the falcone pilot.",
     "irreversible": false,
-    "needs_user_decision": true
+    "needs_user_decision": false
   },
   {
     "id": "F-11",
@@ -427,12 +487,12 @@
     "blocks_go": false,
     "claimed_status": "Related to F-27 but describes the specific mechanism (parallel ledgers), not previously named.",
     "claimed_source": "Discovered live 2026-09-17 by reports/claims reconciliation",
-    "real_status": "OPEN",
+    "real_status": "FIXED",
     "evidence": "docs/audit/02-findings.md (F-01..F-30, 2026-09-01) and go-live/20260901T193928Z-findings-closure/ (HERMES-2026-001..021, 2026-09-01 through 2026-09-17, still being written) run independently, use different IDs and vocabulary, and never state 'F-0N is now fixed/still open' in either direction.",
     "root_cause": "The go-live self-review loop was started (by a concurrent interactive session) instead of executing the audit's own remediation plan, and no process exists to reconcile the two.",
-    "proposed_fix": "This .go-status/findings.json becomes the single ledger going forward; explicitly close out or archive the go-live loop's tracking files at the end of this engagement (do not delete history — move/label as superseded) so future sessions do not spin up a third parallel ledger.",
+    "proposed_fix": "Applied per operator decision D7 (2026-09-17): confirmed no process was still actively writing to it (no cron/timer, no live PID with cwd under go-live/, last write predated this session), then renamed ~/engineering/go-live/20260901T193928Z-findings-closure/ to .../20260901T193928Z-findings-closure.SUPERSEDED-20260917/ (contents untouched, nothing deleted) and added a SUPERSEDED.md marker pointing to .go-status/ as the sole source of truth going forward.",
     "irreversible": false,
-    "needs_user_decision": true
+    "needs_user_decision": false
   },
   {
     "id": "NEW-04",

@@ -18,3 +18,14 @@ Re-triage after Phase 3 in case any of these turn out to matter for the specific
 | F-29 | SSH password auth enabled on controller | Quick fix, but not related to mission correctness; do during a Phase 2 hardening pass |
 | F-30 | Hermes would read Anthropic creds if configured (not configured today) | Not applicable until someone configures an anthropic provider; add a guard opportunistically |
 | NEW-06 | No `temporal`/`tctl` CLI on the host | SDK-based evidence already proven sufficient for this audit; install the CLI as a convenience, not a requirement |
+| F-21 | Two `gh` CLI installs on worker | Harmless duplication |
+| F-22 | No release-directory retention policy (100 dirs) | Disk fine today |
+| F-23 | `hermes-gateway.service` exits 1 on SIGTERM | Cosmetic — confirmed live 2026-09-17 during the F-04 restart; systemd still reports success, just a noisy exit code |
+| F-24 | `kind` missing on worker; `argocd` CLI missing on controller | Only matters if a mission needs local kind clusters or ArgoCD CLI access |
+
+## Declined by operator decision (accepted risk, not scheduled)
+
+| ID | Title | Decision |
+|---|---|---|
+| F-01 / F-06 | Cluster-admin kubeconfig on worker; no scoped observer credential | D2 (2026-09-17): declined to provision/remove in this engagement. G8 (audit mission) and the K8s half of G9 remain FAIL by choice. |
+| F-10 | GitHub access via operator's personal token, no bot identity | D4 (2026-09-17): continue with personal token. |
