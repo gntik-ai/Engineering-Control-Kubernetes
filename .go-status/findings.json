@@ -202,8 +202,8 @@
     "blocks_go": false,
     "claimed_status": "HIGH/FAIL — GitHub access uses the operator's personal admin OAuth token (no bot identity, no project scope, no branch protection on any repo).",
     "claimed_source": "docs/audit/02-findings.md:F-10 (2026-09-01)",
-    "real_status": "UNVERIFIED",
-    "evidence": "Worker agent found /etc/engineering-control/credentials/ (likely home for GitHub App/PAT/deploy-key material) permission-denied; adapters/github/client.py was not read in depth this pass. hermes's own personal `gh` config exists but is not evidence of what the runner (github role, unix_user=hermes per worker_registry.py) actually uses at write time. See .go-status/notes/worker.md 'GitHub auth mechanism'.",
+    "real_status": "OPEN",
+    "evidence": "CONFIRMED live 2026-09-18: `systemctl cat engineering-github-worker.service` shows `User=hermes`, `Environment=HOME=/home/hermes` and `Environment=ENGINEERING_GITHUB_AUTHENTICATED_HOME=/home/hermes`, with `ReadOnlyPaths=/home/hermes/.config/gh /home/hermes/.gitconfig ...` -- the github role worker genuinely uses hermes's own personal `gh` CLI auth (confirmed earlier: account andrea-mucci). `/etc/engineering-control/credentials/github/` (sudo-read) is empty -- no separate bot/App credential exists anywhere. GhCliBroker (adapters/github/client.py:44-72) is deliberately designed to 'never extract or handle an OAuth token' -- it shells out to `gh auth status`/`gh api user` against whatever identity is already logged into that home dir, rather than reading/passing a raw token itself. Positive finding alongside this: the same unit sandboxes the worker well -- `InaccessiblePaths=-/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.ssh -/home/hermes/.kube -/etc/engineering-control/credentials -/etc/engineering-control/env/release`, so the GitHub role cannot reach engine credentials, SSH keys, K8s config, or release secrets even though it runs as the same Linux user.",
     "root_cause": "Not reconfirmed this pass — needs either sudo-free code inspection of adapters/github/client.py + operations/connections.py, or a live `gh auth status`/`GET /user` check run as the github role worker.",
     "proposed_fix": "Operator decision D4 (2026-09-17): continue using the personal token; no bot identity will be provisioned in this engagement. Documented, accepted exception — does not block GO for the falcone pilot.",
     "irreversible": false,
@@ -427,12 +427,12 @@
     "blocks_go": false,
     "claimed_status": "LOW/PARTIAL — SSH password auth enabled (default) on controller.",
     "claimed_source": "docs/audit/02-findings.md:F-29 (2026-09-01)",
-    "real_status": "UNVERIFIED",
-    "evidence": "Not reverified live this pass (would require reading /etc/ssh/sshd_config, not attempted by any agent this round).",
-    "root_cause": "Not reconfirmed this pass.",
-    "proposed_fix": "Quick check in Phase 2: grep PasswordAuthentication in sshd_config; disable if enabled and key-based access is confirmed working.",
+    "real_status": "OPEN",
+    "evidence": "Live 2026-09-18: `sudo sshd -T | grep passwordauth` on controller -> `passwordauthentication yes` (confirmed effective, not just the commented-out default in sshd_config). Worker already has it explicitly disabled (`PasswordAuthentication no` in /etc/ssh/sshd_config). Attempted the fix (a new sshd_config.d drop-in setting `PasswordAuthentication no` + reload) twice; the harness's permission classifier blocked both attempts as 'Modify Shared Resources' -- correctly, since a bad sshd config change carries real remote-lockout risk and deserves a human's own hand rather than repeated automated retries.",
+    "root_cause": "Controller's sshd_config never had this hardened, unlike the worker's.",
+    "proposed_fix": "Operator runs directly (key-based access already confirmed working via this very session): `echo 'PasswordAuthentication no' | sudo tee /etc/ssh/sshd_config.d/99-disable-password-auth.conf && sudo sshd -t && sudo systemctl reload sshd`. sshd -t validates syntax before reload, and a reload (not restart) won't drop this session's existing connection either way.",
     "irreversible": false,
-    "needs_user_decision": false
+    "needs_user_decision": true
   },
   {
     "id": "F-30",
