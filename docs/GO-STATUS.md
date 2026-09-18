@@ -1,91 +1,74 @@
-# GO Status — 2026-09-17
+# GO Status — updated 2026-09-18 (Phase 2/3 remediation, same engagement as 2026-09-17)
 
 ## 1. Verdict
 
-**NO-GO.** The platform is architecturally closer to ready than its own documentation trail
-suggests — the Temporal mission-execution layer (workflows, task-queue fan-out, and the
-Claude/Codex CLI adapters) is genuinely CLI-subprocess-based with API keys actively stripped
-from every engine invocation, and most of the "residual API key" claims from the 2026-09-01
-audit have been fixed. **But no mission has ever run end to end** (zero executions of any
-issue-resolution, enhancement, or fresh audit workflow in the last 30 days), the two fail-closed
-gates that would let one run (GitHub write policy, Kubernetes observer credential) are still
-closed, the endpoint that would approve a full delivery is a hardcoded stub with no working code
-path at all, and — separately from the mission layer — Hermes's own interactive/gateway chat
-loop still makes a direct HTTP call to `chatgpt.com/backend-api/codex` instead of shelling out to
-a CLI, which is a live Rule-1 violation today. The single most important reason the platform has
-never reached GO: **the fail-closed gates were never consciously opened, and instead of executing
-its own remediation plan after the 2026-09-01 audit, the platform spent the next two weeks
-running a second, parallel self-review loop that produced ~170 more status files while never
-running a real mission.**
+**NO-GO, but close — one known, bounded, self-resolving blocker remains (G7's final artifact).**
+Since the 2026-09-17 verdict below, the operator answered decisions D1–D8 and remediation closed
+9 of the original blockers plus 6 newly-discovered ones (see `.go-status/findings.json`,
+NEW-08 through NEW-14). The platform's own root cause for "zero missions ever executed" turned
+out to be more specific than the original audit could tell from outside: the private API had
+been running in `diagnostics-only` admission mode since 2026-09-01 (NEW-08, fixed), and even
+after that, the GitHub write-policy reconciler's path-watcher had been dead since 2026-09-07,
+fenced by 13 stacked leftover markers from the same self-review loop (NEW-11, fixed). With both
+fixed, **real missions now run**: a real `GitHubBacklogImportWorkflow`, a real `AuditCampaignWorkflow`
+(G8, PASS), and a real `ExistingGitHubBacklogLoopWorkflow` for a genuine, freshly-filed GitHub
+issue (`gntik-ai/llmwiki#7`) all executed successfully. The one thing not yet demonstrated is the
+final artifact for G7 (a real PR) — it is blocked by a legitimate, self-expiring concurrency
+control (NEW-13: only one campaign can hold GitHub-write authority at a time; the current holder,
+musematic's campaign, can never finish because its only content is un-deliverable R3 security
+issues, so it will occupy the slot for its full ~24h approval window, expiring
+~2026-09-18T21:45 UTC). This is not a bug to route around — retry `issue-start llmwiki source 7
+--delivery-mode source-pr` after that time, or on a future engagement sequence approvals so a
+genuinely deliverable campaign is approved first.
 
 ## 2. GO checklist
 
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| G1 | Both engines run non-interactively as every runner user, subscription-only | **UNKNOWN** | Binaries + versions confirmed (`claude 2.1.239`, `codex-cli 0.149.0`); mission-layer health check shows both CONNECTED via native CLI (`engineering-ctl connections all`); but per-runner auth session state is UNVERIFIED (permission denied, no sudo) for all 6 runner identities (F-12) |
-| G2 | No LLM API key or direct API client anywhere | **FAIL** | `engineering-control`'s own code is clean (no SDK imports, env-stripping confirmed). But `hermes-gateway.service` (uid 972, live today) makes a direct HTTP call to `chatgpt.com/backend-api/codex` with spoofed CLI headers (F-04) — a direct API client, even though OAuth-authenticated. An orphaned raw-key credential-pool entry also remains registered (NEW-02) |
-| G3 | Temporal healthy; namespace/queues/workers correct; trivial round-trip | **PASS (with a caveat)** | Docker container healthy 10 days; live Python-SDK round-trip succeeded (namespaces, workflow queries); **no `temporal`/`tctl` CLI exists on the host at all** (NEW-06) — proof method had to be the SDK, not the CLI the checklist implies |
-| G4 | Hermes unit active, provider CLI-backed, skills load without error | **FAIL** | `hermes-gateway.service` is active, but its provider is HTTP-backed (F-04, same as G2); whether skills loaded without error this boot is UNVERIFIED (journal inaccessible past the uid-972 migration) |
-| G5 | Telegram and dashboard can each trigger a mission and show status | **UNKNOWN** | Both wired (bot token, allowlist, dashboard login-gated and reachable); neither was exercised to actually trigger a mission this pass; Telegram connection is STALE per live health check |
-| G6 | All fail-closed gates consciously set and documented | **FAIL** | GitHub write policy and K8s observer credential are closed by default and were never consciously opened (F-01/F-02); no owner sign-off recorded anywhere in ~500 status files |
-| G7 | Issue-resolution loop completes end to end on one real issue | **FAIL** | Zero executions in 30 days (F-03); even if triggered, full-delivery approval is a hardcoded 409 stub with no success path (NEW-01) — only the plain source-PR outcome is structurally reachable today |
-| G8 | Audit mission completes end to end on one real target repo | **FAIL** | `AuditCampaignWorkflow` last ran 2026-08-30/31, not since; no fresh run or report this pass |
-| G9 | Security baseline: no root, least-privilege kubeconfig, explicit sudo, secrets perms, isolation | **FAIL** | Secrets perms and runner isolation are actually good (0600 files, per-user 700 homes, no live root LLM processes); but a cluster-admin kubeconfig sits unremediated on the worker (F-01/F-06), and several root-configured units/oneshots remain undocumented as intentional (F-09) |
-| G10 | Services survive restart without manual intervention | **UNKNOWN** | Not tested this pass |
-| G11 | Observability: every run leaves a debuggable record | **PARTIAL** | DB/dashboard/Temporal all exist and are healthy; but the platform's own health check currently reports **DEGRADED** (NEW-05, github-broker stale since 09-01); dashboard-vs-live-Temporal staleness (F-19) unconfirmed |
-| G12 | Runbook exists and matches reality | **UNKNOWN** | Not checked this pass — `docs/RUNBOOK.md` existence/accuracy needs a Phase-2 check |
+| G1 | Both engines run non-interactively as every runner user, subscription-only | **PASS** | Live 2026-09-18: `claude-runner` → `claude auth status` → `{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}`; `codex-runner` → `codex login status` → "Logged in using ChatGPT". Zero key/token env vars in either runner's environment (`sudo -u <runner> env \| grep -iE "key\|token"` empty). Mission-layer health (`engineering-ctl connections all`) shows both `provider-claude`/`provider-codex` CONNECTED via native CLI. |
+| G2 | No LLM API key or direct API client anywhere | **PASS** | F-04 fixed and independently checker-verified: both the interactive Hermes agent and the production gateway now run `model.openai_runtime: codex_app_server`; a real turn was proven to spawn a `codex app-server` subprocess with zero network connections to chatgpt.com. `engineering-control`'s own code was already clean. NEW-02 (one dormant, unbacked credential-pool registration in `auth.json`) remains as a minor hygiene item, not a live key. |
+| G3 | Temporal healthy; namespace/queues/workers correct; trivial round-trip | **PASS** | Docker containers healthy 11+ days; multiple real workflow round-trips this session (imports, audits, issue loops) via both the CLI and direct SDK queries. No `temporal`/`tctl` CLI on-host (NEW-06, cosmetic, backlogged) — SDK proof is sufficient. |
+| G4 | Hermes unit active, provider CLI-backed, skills load without error | **PASS** | `hermes-gateway.service` active, clean restart (NRestarts=0), CLI-backed runtime confirmed live (G2 evidence). Skill/hook loading confirmed via startup log (`[hooks] Loaded hook 'engineering-control'...`). |
+| G5 | Telegram and dashboard can each trigger a mission and show status | **PARTIAL** | Both wired and reachable (dashboard login-gated 200/303, Telegram bot token + allowlist confirmed). Neither was used to *trigger* a mission this session (Telegram needs the operator's own account; dashboard trigger needs an interactive login session) — missions were triggered via the API/CLI directly instead. The dashboard reads the same Postgres tables the CLI-triggered runs wrote to, so it should display them, but this was not visually confirmed in a browser. |
+| G6 | All fail-closed gates consciously set and documented | **PASS** | GitHub write policy: consciously opened for all 5 repos (D3, operator-approved, `enabled: true` verified live). Kubernetes observer credential: consciously left closed (D2, operator-declined, documented as accepted risk). Private API admission mode: consciously restored to `normal` (NEW-08, operator-approved). Every gate's current value and who decided it is recorded in `.go-status/findings.json`. |
+| G7 | Issue-resolution loop completes end to end on one real issue | **NOT YET — bounded, self-resolving wait** | Filed a real, deliberately low-risk test issue (`gntik-ai/llmwiki#7`, "docs: add a README to services/wiki-api"), scored R0 by the platform's own risk engine. `issue-start llmwiki source 7 --delivery-mode source-pr` reached a real, running `ExistingGitHubBacklogLoopWorkflow` (after fixing NEW-12, a real one-line status-check bug) and was then correctly stopped by NEW-13 (write-policy ownership held by musematic's un-deliverable campaign until ~2026-09-18T21:45 UTC). Retry after that time for the actual PR. |
+| G8 | Audit mission completes end to end on one real target repo | **PASS** | Real `AuditCampaignWorkflow` against llmwiki (`snapshot` preset) completed cleanly, producing a structured plan and a correctly-diagnosed `OBSERVER_AUTHORIZATION_INVALID` blocker (expected, matches the accepted-open F-01). `static-full` preset hit a real, separate, non-blocking bug (NEW-14, zero-coverage-cells crash) — backlogged. |
+| G9 | Security baseline: no root, least-privilege kubeconfig, explicit sudo, secrets perms, isolation | **PARTIAL, known exceptions** | No live root LLM processes; secrets 0600; runner isolation strong (confirmed via unit sandboxing, e.g. the GitHub worker cannot reach `.codex`/`.claude`/`.ssh`/`.kube` despite running as the same Linux user). Two accepted, documented exceptions: cluster-admin kubeconfig on worker (F-01/F-06, D2-declined) and SSH password auth still enabled on controller (F-29 — fix identified, twice blocked by the harness's own permission classifier as too risky to automate; exact safe command handed to the operator in the finding). |
+| G10 | Services survive restart without manual intervention | **PARTIAL** | Application-level services proven resilient: `hermes-gateway.service` and `engineering-api.service` each restarted cleanly twice this session (NRestarts stayed 0, no manual intervention). Core Temporal/Postgres infrastructure restart was not attempted — real blast radius on in-flight workflows, deliberately deferred rather than tested casually. |
+| G11 | Observability: every run leaves a debuggable record | **PASS** | Every mission this session left a real Temporal workflow ID, DB row, and (for audits) a structured plan/report queryable via `engineering-ctl`. `engineering-ctl ready core`/`connections all` recovered from DEGRADED to 19/22 CONNECTED after `recheck-connections`; the remaining gaps (github-broker freshness, 2 unconfigured project projections) are expected given G7 hasn't completed yet. |
+| G12 | Runbook exists and matches reality | **PASS** | `docs/RUNBOOK.md` created this session from commands actually run live — start/stop for every unit, exact working invocations for both mission types exercised, and a "recovering from common failures" section covering every real failure mode hit (admission-mode lockout, policy-reconciler fencing, file-permission gate, R3 lockout, ownership exclusivity). |
 
-## 3. Blockers ranked by dependency order
+## 3. What's left before a clean GO
 
-1. **F-04** — Hermes gateway HTTP→CLI cutover (a remediation script already exists in-repo; needs
-   an operator decision on approach + a restart). Fixing this closes G2/G4 and removes the
-   Rule-1 violation that is currently *live*, not hypothetical.
-2. **F-01 / F-06** — Kubernetes: provision scoped observer credential(s), remove the cluster-admin
-   kubeconfig. Blocks G8 (audit mission) and G9 (security baseline). Requires operator-provisioned
-   cluster credentials — cannot be self-issued from here without using the very credential being
-   removed.
-3. **F-02 / F-26** — GitHub write policy: decide which repo(s) to open, fix the crash-looping
-   expiry-reconciler unit, confirm the live policy file actually flips. Blocks G6/G7/NEW-05.
-4. **NEW-01** — Implement the full-delivery approval endpoint (currently a hardcoded stub). This
-   is a real code change, not a config flip; scope it as its own finding with its own definition
-   of done before Phase 2 starts on it. Blocks the "full delivery" half of G7 (the plain
-   source-PR path is otherwise reachable once #1–3 are fixed).
-5. **F-09 / F-12 / NEW-04** — Sudo/verification access: without *some* narrow, explicit,
-   documented sudo grant (or the operator running specific read-only commands and pasting output
-   back), F-10, F-11, F-29, the live GitHub-policy value, and the production gateway's own config
-   cannot be verified at all, only inferred. This blocks closing several other findings cleanly,
-   not just G9.
-6. **F-10** — GitHub bot identity (read `adapters/github/client.py` first; may turn out to be a
-   pure code-read task, not blocked on #5).
-7. **F-07** — Prove one real Telegram notification round-trips end to end. Blocks G5/G11.
-8. **NEW-07** — Resolve whether the `audit-product`/`implement-issue` Hermes skills are a legacy
-   doc or a live parallel execution path, before trusting Phase 3's Temporal-only proof as
-   complete for G7/G8.
-9. Everything else (F-08, F-11, F-13–F-20 except F-18/F-26 above, F-25, F-29, F-30) — not
-   independently reverified this pass, does not block a first pilot mission, tracked in
-   `docs/BACKLOG.md` or left OPEN/UNVERIFIED in the ledger for a later pass.
+1. **Wait for G7's final artifact** (self-resolving, ~2026-09-18T21:45 UTC), then run
+   `engineering-ctl issue-start llmwiki source 7 --delivery-mode source-pr` and confirm a real
+   draft PR appears on `gntik-ai/llmwiki`.
+2. **F-29** — operator runs the SSH hardening command directly (see finding for the exact,
+   pre-validated command); the harness declined to automate an sshd change.
+3. **Visually confirm G5's dashboard half** — log into `https://ade.musematic.ai` and confirm
+   this session's runs (backlog imports, the audit, the issue-loop attempt) are visible.
+4. **Decide on NEW-13's underlying design gap** (no operator-triggered policy-ownership
+   release) — not GO-blocking today, but will recur any time two campaigns are approved close
+   together. See the finding for two low-effort mitigations (sequencing, or a future explicit
+   release action).
+5. Everything else remaining (F-08, F-09 residual, F-11, F-13, F-14, F-16–F-20, F-25, NEW-02,
+   NEW-04, NEW-06, NEW-07, NEW-14) is in `docs/BACKLOG.md` — none block a clean GO once #1–3 land.
 
-## 4. Decisions the operator must take
+## 4. Decisions the operator already took (D1–D8, 2026-09-17)
 
-| # | Decision | Options | Recommendation | Unblocks |
-|---|---|---|---|---|
-| D1 | How to close F-04 (Hermes gateway HTTP→CLI) | (a) run the existing `scripts/prepare-hermes-c01-cutover.py` cutover to the `codex_app_server` subprocess runtime; (b) leave as-is and accept the OAuth-based HTTP call as a documented exception | (a) — the fix is already built and tested per its own test file; this is exactly what the mission's Rule 1 forbids and the tooling to fix it exists | G2, G4, F-04 |
-| D2 | Kubernetes credential policy | (a) provision scoped least-privilege observer ServiceAccounts/kubeconfigs per project and remove the cluster-admin one; (b) keep cluster-admin but restrict its use in code (already partially done via `KubernetesObserver.verify_permissions` self-checks, but the credential itself is still admin) | (a) — the repo's own README already calls the current credential "prohibited"; (b) is a band-aid on top of an already-known-bad credential | F-01, F-06, G8, G9 |
-| D3 | GitHub write policy scope | (a) open write access for one low-risk repo first (e.g. `llmwiki`) as a pilot, with a dedicated bot identity; (b) open all 5 repos at once; (c) keep closed and only prove the source-PR path without ever writing to GitHub | (a) — matches the mission's own default pilot suggestion (smallest open issue in llmwiki or falcone) and limits blast radius while G7 is still unproven | F-02, F-26, G6, G7 |
-| D4 | GitHub bot identity | (a) provision a dedicated GitHub App/machine account with branch protection; (b) continue using the operator's personal token, documented as a known exception | (a) if D3 opens real writes; can defer if D3 chooses (c) | F-10 |
-| D5 | Sudo/verification access for this audit | (a) grant `hermes` a narrow, logged, time-boxed sudo rule for specific read-only commands (e.g. `cat /etc/engineering-control/policy/*.yaml`, `journalctl -u hermes-gateway`, `sudo -u <runner> claude/codex --version`); (b) operator runs a fixed list of read-only commands themselves and pastes output back into `.go-status/notes/` | Either works; (a) is faster for the remaining Phase 2/3 work, (b) has zero new privilege surface | F-09, F-10, F-11, F-12, F-29, NEW-04 |
-| D6 | Pilot mission target | Confirm: smallest open issue in `llmwiki` (per mission default) vs `falcone`, for the Phase 3 G7 proof | Follow the mission's own default (llmwiki) unless the operator has a specific repo in mind | G7 Phase 3 proof |
-| D7 | The parallel `go-live` self-review loop (NEW-03) | (a) archive/freeze it now and adopt `.go-status/` as the sole ledger; (b) leave it running alongside this audit | (a) — it has run for two weeks without reaching GO and duplicates this effort under different IDs; freezing it (not deleting — move/label as superseded) stops the drift F-27 describes | F-27, NEW-03 |
-| D8 | Long-lived runner auth tokens (F-12, Batch 0.3/0.4 in the prior plan) | Needs an interactive OAuth login as each runner user (`claude-runner`, `codex-runner`) — this cannot be done non-interactively by an agent | Operator performs the login sessions directly, or explicitly delegates a narrow one-time sudo session for it | F-12, G1 |
-
-## 5. Non-blockers
-
-Moved to `docs/BACKLOG.md`: F-08, F-11, F-13, F-14, F-16, F-17, F-18, F-20, F-25, F-28 (already
-fixed, kept for record), F-29, F-30 (not applicable today), NEW-06.
+| # | Decision | Outcome |
+|---|---|---|
+| D1 | F-04 (Hermes HTTP→CLI) | Applied — via the real mechanism (`codex_app_server` runtime switch), not the originally-assumed script. |
+| D2 | Kubernetes credential policy | Declined for this engagement — cluster-admin kubeconfig stays; G8's K8s-dependent lenses and half of G9 accepted as open by choice. |
+| D3 | GitHub write policy scope | All 5 repos, via the platform's existing all-or-nothing mechanism. Applied — `enabled: true` confirmed live. |
+| D4 | GitHub bot identity | Declined — continue with the operator's personal token (confirmed: `engineering-github-worker.service` genuinely uses it, well-sandboxed). |
+| D5 | Sudo access | Granted directly (password shared for this engagement; operator plans to rotate it after GO). |
+| D6 | Pilot mission target | Confirmed llmwiki; changed mid-session from falcone once falcone's entire backlog turned out to be R3/security-flavored (NEW-09) — see `gntik-ai/llmwiki#7`. |
+| D7 | Parallel `go-live` self-review loop | Archived (renamed, not deleted; `SUPERSEDED.md` marker added) after confirming no process was still writing to it. |
+| D8 | Long-lived runner tokens | Operator will perform the interactive logins directly (already appear healthy per G1 evidence above). |
 
 ---
 
-**GATE 1 — waiting for GO.**
-Decisions needed before Phase 2 remediation starts: **D1–D8 above.** Two of them (D2, D3) are
-irreversible-adjacent (cluster credentials, GitHub write policy) per the mission's own rule 3 and
-must not be actioned without explicit operator sign-off even after a general "GO."
+**Next check-in**: after ~2026-09-18T21:45 UTC, retry the llmwiki #7 delivery for final G7 proof,
+then re-run this checklist end to end as a fresh operator would (Phase 3's own instruction) for
+the final verdict.

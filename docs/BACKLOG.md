@@ -15,13 +15,19 @@ Re-triage after Phase 3 in case any of these turn out to matter for the specific
 | F-20 | OpenSpec templates missing in llmwiki/engineering-control | Process hygiene |
 | F-25 | Prompt-injection surface not explicitly wrapped | Mitigated today by process/user isolation; revisit once real untrusted issue text flows through the pilot |
 | F-28 | Secrets hygiene (already reverified FIXED) | Kept for record; no action needed |
-| F-29 | SSH password auth enabled on controller | Quick fix, but not related to mission correctness; do during a Phase 2 hardening pass |
+| F-29 | SSH password auth enabled on controller | CONFIRMED live 2026-09-18 (`sshd -T` -> yes). Fix identified and validated but twice blocked by the harness's permission classifier as too risky to automate (sshd lockout risk) — exact safe command (with `sshd -t` pre-check) is in the finding for the operator to run directly. |
 | F-30 | Hermes would read Anthropic creds if configured (not configured today) | Not applicable until someone configures an anthropic provider; add a guard opportunistically |
 | NEW-06 | No `temporal`/`tctl` CLI on the host | SDK-based evidence already proven sufficient for this audit; install the CLI as a convenience, not a requirement |
 | F-21 | Two `gh` CLI installs on worker | Harmless duplication |
 | F-22 | No release-directory retention policy (100 dirs) | Disk fine today |
 | F-23 | `hermes-gateway.service` exits 1 on SIGTERM | Cosmetic — confirmed live 2026-09-17 during the F-04 restart; systemd still reports success, just a noisy exit code |
 | F-24 | `kind` missing on worker; `argocd` CLI missing on controller | Only matters if a mission needs local kind clusters or ArgoCD CLI access |
+| F-09 | Root-configured oneshot units (backup, gateway-credentials); no sudo scripts run this session | Not currently a live violation; document as intentional in a future pass |
+| NEW-02 | Orphaned raw-API-key credential-pool entry in Hermes `auth.json` | Dormant, unbacked (no env var behind it); purge opportunistically |
+| NEW-04 | Production Hermes gateway's own config unverifiable without sudo/journal access | Mitigated this session (sudo was available); revisit read-access design for future audits without sudo |
+| NEW-07 | Hermes skills (`audit-product`/`implement-issue`) may describe a parallel execution path outside Temporal | Not resolved this session — read both SKILL.md files in full and trace whether their "typed /run request" lands on the same API endpoints traced in ARCHITECTURE-VERIFIED.md, or is genuinely separate |
+| NEW-13 | GitHub-write-policy ownership has no operator-triggered release, only ~24h TTL expiry | Self-resolving (not urgent); see the finding for two low-effort mitigations if it recurs |
+| NEW-14 | `AuditCampaignWorkflow` crashes (doesn't cleanly report) when a preset yields zero coverage cells | Only affects `static-full` on lean projects like llmwiki; `snapshot` preset works fine and already gives valid G8 evidence |
 
 ## Declined by operator decision (accepted risk, not scheduled)
 
