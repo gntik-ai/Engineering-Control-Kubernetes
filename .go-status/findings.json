@@ -615,6 +615,21 @@
     "needs_user_decision": false
   },
   {
+    "id": "NEW-14",
+    "title": "AuditCampaignWorkflow crashes (not a clean BLOCKED result) when a preset produces zero coverage cells",
+    "area": "temporal",
+    "severity": "minor",
+    "blocks_go": false,
+    "claimed_status": "Not previously identified.",
+    "claimed_source": "Discovered live 2026-09-18 during the G8 (audit mission) proof: audit-start llmwiki static-full staging (after audit-plan) failed with WorkflowFailureError -> ActivityError -> ApplicationError PolicyViolation -> ValueError: 'coverage batch and total are inconsistent'.",
+    "real_status": "OPEN",
+    "evidence": "activities/metadata.py:1322-1327 `_persist_coverage`: `if not isinstance(raw_cells, list) or total < len(raw_cells) or total < 1: raise ValueError(...)`. For llmwiki under the static-full preset, the plan showed empty personas/lenses/domains lists (same pattern seen in the snapshot-preset plan), which most likely yields total=0 coverage cells -- a legitimate 'nothing applicable to this preset for this project' case -- but the persist step treats total<1 as an error rather than a valid empty-campaign outcome. The lighter 'snapshot' preset for the same project completed cleanly (produced a plan + a diagnosed OBSERVER_AUTHORIZATION_INVALID blocker), so this is preset/cell-count-specific, not a total audit-pipeline break.",
+    "root_cause": "The persist-coverage guard was written assuming every audit produces at least one cell; it wasn't updated for projects/presets that legitimately produce zero (e.g. a leaner project like llmwiki under a preset built with falcone's richer domain/persona set in mind).",
+    "proposed_fix": "Backlog -- not a GO blocker (the snapshot preset already gives valid G8 evidence for llmwiki). If static-full audits on lean projects are needed later, change the guard to accept total==0 with an explicit empty-result path instead of raising.",
+    "irreversible": false,
+    "needs_user_decision": false
+  },
+  {
     "id": "NEW-08",
     "title": "Private API has been stuck in diagnostics-only admission mode since 2026-09-01, blocking essentially all real mutating operations",
     "area": "engineering-control",
