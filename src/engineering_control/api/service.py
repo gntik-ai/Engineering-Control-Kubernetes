@@ -429,7 +429,11 @@ class TemporalControlService:
         campaign = await self.repository.get_backlog_campaign(request.backlog_campaign_id)
         if campaign is None or campaign.get("project") != request.project:
             raise ValueError("existing backlog campaign does not exist")
-        if campaign.get("status") not in {"APPROVED_POLICY_PENDING", "APPROVED"}:
+        if campaign.get("status") not in {
+            "APPROVED_POLICY_PENDING",
+            "APPROVED",
+            "APPROVED_INVENTORY",
+        }:
             raise ValueError("existing backlog campaign requires its exact Telegram approval")
         if campaign.get("maximum_risk") != request.maximum_risk.value:
             raise ValueError("existing backlog maximum risk changed after approval")
