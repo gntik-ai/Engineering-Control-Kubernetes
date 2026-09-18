@@ -158,11 +158,11 @@
     "claimed_status": "HIGH/FAIL — no progress/result notifications reach Telegram; notifier sink URL defaults None; never wired by bootstrap.",
     "claimed_source": "docs/audit/02-findings.md:F-07 (2026-09-01)",
     "real_status": "UNVERIFIED",
-    "evidence": "Live 2026-09-17: TELEGRAM_BOT_TOKEN populated in ~/.hermes/.env, allowlist file matches operator's bound chat id (685699815), delivery-acceptance log path configured. But engineering-ctl connections all reports telegram = STALE (last success 2026-09-17T15:56Z, ~4.5h stale at check time; last_failure 2026-08-31). No end-to-end send was attempted this pass. See .go-status/notes/controller.md row 'Telegram integration'.",
-    "root_cause": "Wiring appears more complete than the prior audit found, but freshness/staleness suggests it is not being exercised regularly and has not been proven end-to-end since 2026-08-31.",
-    "proposed_fix": "Send one real test notification through the notifier path and confirm delivery + a fresh 'last_success' timestamp (Phase 3, G5/G11).",
+    "evidence": "Live 2026-09-17: TELEGRAM_BOT_TOKEN populated in ~/.hermes/.env, allowlist file matches operator's bound chat id (685699815), delivery-acceptance log path configured. engineering-ctl connections all reports telegram = STALE. PARTIAL new evidence 2026-09-18: journalctl for engineering-notifier.service shows 3 real `POST http://127.0.0.1:8644/webhooks/engineering-alerts -> 200 OK` events at 06:20/06:39/06:41, timed exactly to this session's real workflow activity (the llmwiki issue-start and audit-start attempts) -- confirming the notifier DOES fire real webhook deliveries for real mission events, and that port 8644 is hermes-gateway.service itself (confirmed via `ss -tlnp`, matching PID). Could NOT confirm the next hop (did hermes-gateway actually relay to the real Telegram API/chat) -- no journal entries exist for hermes-gateway.service in that exact window (nothing logged at INFO for a routine successful relay, or journald's per-UID visibility limits apply), and delivery-state/acceptance.jsonl only logs INBOUND operator commands, not outbound alert relays. Still missing: an actual message arriving in the operator's Telegram client.",
+    "root_cause": "Wiring appears more complete than the prior audit found, and now confirmed to fire for real events; the only unconfirmed hop is whether hermes-gateway's own Telegram relay actually completed, which requires the operator's own phone to confirm.",
+    "proposed_fix": "Operator confirms: did a Telegram message actually arrive around 2026-09-18T06:20-06:41 UTC? If yes, F-07 is fully closed. If no, check hermes-gateway's Telegram adapter specifically (not the webhook receipt, which is confirmed working).",
     "irreversible": false,
-    "needs_user_decision": false
+    "needs_user_decision": true
   },
   {
     "id": "F-08",
