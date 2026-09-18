@@ -51,8 +51,20 @@ genuinely deliverable campaign is approved first.
    release) — not GO-blocking today, but will recur any time two campaigns are approved close
    together. See the finding for two low-effort mitigations (sequencing, or a future explicit
    release action).
-5. Everything else remaining (F-08, F-09 residual, F-11, F-13, F-14, F-16–F-20, F-25, NEW-02,
-   NEW-04, NEW-06, NEW-07, NEW-14) is in `docs/BACKLOG.md` — none block a clean GO once #1–3 land.
+5. **Decide on NEW-07** — `audit-product`/`audit-cluster` (Hermes skills) are a real, live,
+   ungated parallel path with direct superadmin/cluster/GitHub access, entirely outside this
+   engagement's gate work (write policy, R3, ownership exclusivity). This materially qualifies
+   the GO verdict: G6's gate verification covers the Temporal control plane only. Needs an
+   explicit operator decision (restrict access / add technical gates / accept as a documented
+   human-supervised-only escape hatch) — see the finding for detail.
+6. **Confirm F-07** — a real notifier webhook delivery to hermes-gateway was directly observed
+   this session (3 events, 200 OK, timed to real workflow activity); only unconfirmed hop is
+   whether it actually reached the operator's Telegram client.
+7. **F-26** — same permission bug as NEW-11, already fixed; operator just needs to run
+   `sudo systemctl start engineering-github-policy-expiry.timer` (two automated attempts were
+   blocked by the harness).
+8. Everything else remaining (F-08, F-11, F-13, F-14, F-16–F-20, F-25, NEW-02, NEW-04, NEW-06,
+   NEW-14) is in `docs/BACKLOG.md` — none block a clean GO.
 
 ## 4. Decisions the operator already took (D1–D8, 2026-09-17)
 
