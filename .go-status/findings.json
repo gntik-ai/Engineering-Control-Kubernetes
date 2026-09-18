@@ -585,6 +585,21 @@
     "needs_user_decision": true
   },
   {
+    "id": "NEW-12",
+    "title": "start_existing_backlog_loop's status check omits APPROVED_INVENTORY, blocking any campaign approved after another campaign already owns the active policy",
+    "area": "github",
+    "severity": "major",
+    "blocks_go": true,
+    "claimed_status": "Not previously identified.",
+    "claimed_source": "Discovered live 2026-09-18 while running the llmwiki #7 pilot: backlog-approve for llmwiki's campaign succeeded (policy_activation: EXISTING_ACTIVE_POLICY, status: APPROVED_INVENTORY, since musematic's campaign already owns the active GitHub write policy), but both `issue-start llmwiki source 7` and `backlog-start llmwiki <campaign> R1 source-pr` were BLOCKED with safe_error 'existing backlog campaign requires its exact Telegram approval'.",
+    "real_status": "OPEN",
+    "evidence": "src/engineering_control/api/service.py:431-432 `start_existing_backlog_loop`: `if campaign.get(\"status\") not in {\"APPROVED_POLICY_PENDING\", \"APPROVED\"}: raise ValueError(...)`. But `APPROVED_INVENTORY` is a legitimate, fully-approved terminal status used elsewhere in the same codebase as equivalent to APPROVED for execution purposes -- e.g. operations/repository.py:104 and activities/engineering.py:69 both include APPROVED_INVENTORY alongside APPROVED_POLICY_PENDING/APPROVED/RUNNING in their valid-status sets; db/repository.py:727 explicitly assigns APPROVED_INVENTORY (instead of APPROVED_POLICY_PENDING) precisely when a campaign is approved while a different campaign already owns (`active_owner is not None`) the live policy -- i.e. this is the EXPECTED status for the second-or-later approved campaign, not an error state. start_existing_backlog_loop's guard simply never got updated to include it.",
+    "root_cause": "The multi-campaign 'policy ownership' concept (one campaign owns the live policy file; later campaigns get APPROVED_INVENTORY instead of re-triggering the reconciler) was added to db/repository.py and the preflight blocker logic, but the actual execution-time status guard in api/service.py was not updated to match -- a one-line oversight, not a deliberate gate.",
+    "proposed_fix": "Add \"APPROVED_INVENTORY\" to the set at api/service.py:432 (`{\"APPROVED_POLICY_PENDING\", \"APPROVED\", \"APPROVED_INVENTORY\"}`). This is a real one-line application-logic bug fix, not a security-gate change. Needs operator confirmation because applying it to the live system means either hot-patching the deployed release (fast, but reintroduces deployed-vs-repo drift that F-11 already flags as a problem) or fixing it only in git and deferring an actual redeploy (safer for consistency, but leaves the pilot blocked this session).",
+    "irreversible": false,
+    "needs_user_decision": true
+  },
+  {
     "id": "NEW-08",
     "title": "Private API has been stuck in diagnostics-only admission mode since 2026-09-01, blocking essentially all real mutating operations",
     "area": "engineering-control",
