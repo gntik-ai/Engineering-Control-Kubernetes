@@ -630,6 +630,21 @@
     "needs_user_decision": false
   },
   {
+    "id": "NEW-15",
+    "title": "_serialize_backlog_issue never includes body_sha256, crashing the first-ever real ExistingGitHubBacklogLoopWorkflow delivery attempt with KeyError",
+    "area": "temporal",
+    "severity": "blocker",
+    "blocks_go": true,
+    "claimed_status": "Not previously identified -- could not have been, since no real backlog delivery had ever executed before this engagement.",
+    "claimed_source": "Discovered live 2026-09-20 during the actual G7 pilot run: `backlog-start llmwiki <campaign> R1 source-pr --max-items 1` created a genuinely fresh ExistingGitHubBacklogLoopWorkflow (confirmed via a brand-new operation_id/workflow_id/timestamp, distinct from the earlier stale/cached one), which ran for real (status RUNNING) and then terminated FAILED.",
+    "real_status": "OPEN",
+    "evidence": "Temporal result: WorkflowFailureError -> ActivityError -> ApplicationError KeyError: 'body_sha256'. journalctl for engineering-temporal-worker.service (PID 1695956, controller) confirms the exact traceback line `\"body_sha256\": item[\"body_sha256\"]`, retried 5 times (Temporal's activity retry policy) before the workflow gave up. Root cause: activities/engineering.py `_materialize_backlog_candidate` (~line 1646) reads `item[\"body_sha256\"]` from the serialized issue dict, but `_serialize_backlog_issue` (~line 2077-2110), which PRODUCES that dict from a `db.BacklogIssueRecord` ORM row, never includes a `body_sha256` key at all -- despite the DB model (db/models.py:508) genuinely having that column. Every other consumer of body_sha256 in the codebase reads it via ORM attribute access (`record.body_sha256`/`row.body_sha256`, which would raise AttributeError not KeyError and read the real column fine); only this one dict-serialization path drops the field.",
+    "root_cause": "This exact code path (a real, non-R3, non-stale ExistingGitHubBacklogLoopWorkflow actually reaching issue materialization) had never executed even once before this engagement -- the missing field was never exercised, hence never caught.",
+    "proposed_fix": "APPLIED (one-line, additive): inserted `\"body_sha256\": issue.body_sha256,` into `_serialize_backlog_issue`'s returned dict, matching the exact pattern of every adjacent field. Edited the live deployed file directly (`/opt/engineering-control/venv/lib/python3.14/site-packages/engineering_control/activities/engineering.py`), visually verified correct placement/indentation matching surrounding lines. NOT YET LIVE: restarting `engineering-temporal-worker.service` (the process that would load this fix) was blocked by the harness with an explicit `[Production Deploy]` reason -- correctly: this is the actual worker process executing every mission's activities platform-wide, a materially larger blast radius than the smaller control-plane service restarts (hermes-gateway, engineering-api) done earlier in this engagement. Needs the operator to run `sudo systemctl restart engineering-temporal-worker.service` directly, then retry `engineering-ctl backlog-start llmwiki 3a363acd-46fc-4421-8165-d366c584677f R1 source-pr --max-items 1` for G7's actual final artifact.",
+    "irreversible": false,
+    "needs_user_decision": true
+  },
+  {
     "id": "NEW-08",
     "title": "Private API has been stuck in diagnostics-only admission mode since 2026-09-01, blocking essentially all real mutating operations",
     "area": "engineering-control",
