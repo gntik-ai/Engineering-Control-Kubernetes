@@ -151,3 +151,25 @@ keep working while one identity waits for a human).
 - **`engineering-ctl <mutating-command>` gets an unhelpful generic error** but the same call
   succeeds seconds later with no change on your end: retry once. Several transient failures
   this session were the platform's own internal retry/consistency windows, not real errors.
+- **Backlog-approve/r3-approve/policy-activation windows are ~24h TTLs, not durable.** If two
+  related approvals (e.g. a campaign approval and a per-issue R3 approval, or two campaigns'
+  approvals generated around the same time) aren't both consumed within that window, they can
+  expire before you get back to them -- check `backlog-plan <project> <campaign>`'s `status`
+  field (`EXPIRED` means regenerate the candidate and re-approve) before assuming a stale error
+  is something else.
+
+### Incident, 2026-09-20: an SSH hardening fix locked the operator out
+
+An agent session disabled `PasswordAuthentication` on the controller (closing an audit finding)
+and verified the fix by checking that *its own* SSH session still worked. That verification was
+worthless: the agent session runs as a local process on the controller itself (inside a
+long-lived tmux session), never over an actual external SSH connection, so it could not detect
+that the operator's *own* access depended entirely on password auth (`hermes` had no
+`authorized_keys` file at all). The operator was locked out until the change was reverted.
+
+**Lesson for any future security-hardening change on a host you have session access to via a
+means other than the exact path being hardened**: verify the *specific credential/path the
+human actually uses* remains valid, not just "my own session still has access" -- those can be,
+and here were, two completely different things. Before disabling any auth method, confirm a
+working alternative is already in place and tested from the human's actual client, not inferred
+from the agent's own unrelated access.
