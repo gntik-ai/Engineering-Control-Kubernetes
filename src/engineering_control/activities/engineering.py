@@ -128,7 +128,6 @@ class EngineeringActivityHandler:
             "backlog.record_approval",
             "backlog.record_skip",
             "backlog.record_retry",
-            "backlog.delivery_candidate",
             "backlog.load_execution",
             "backlog.materialize_candidate",
             "backlog.record_revalidation",
@@ -258,8 +257,6 @@ class EngineeringActivityHandler:
             return self._record_backlog_skip(payload)
         if step == "backlog.record_retry":
             return self._record_backlog_retry(payload)
-        if step == "backlog.delivery_candidate":
-            return self._backlog_delivery_candidate(payload)
         if step == "backlog.load_execution":
             return self._load_backlog_execution(payload)
         if step == "backlog.materialize_candidate":
@@ -932,20 +929,6 @@ class EngineeringActivityHandler:
             row.eligibility_reason = "OPERATOR_RETRY_REQUESTED"
             row.delivery_status = "NOT_STARTED"
         return self._envelope("backlog.record_retry", payload, "RETRY_QUEUED")
-
-    def _backlog_delivery_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        issue = self._backlog_issue_for_update(payload)
-        return self._envelope(
-            "backlog.delivery_candidate",
-            {
-                **payload,
-                "issue": self._serialize_backlog_issue(issue),
-                "blockers": self._delivery_blockers(issue),
-            },
-            "AWAITING_STAGING_DELIVERY"
-            if not self._delivery_blockers(issue)
-            else "BLOCKED_BY_DELIVERY",
-        )
 
     def _load_backlog_execution(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
@@ -2108,19 +2091,6 @@ class EngineeringActivityHandler:
                 raise ValueError("backlog issue record does not exist")
             session.expunge(row)
             return row
-
-    @staticmethod
-    def _delivery_blockers(issue: db.BacklogIssueRecord) -> list[str]:
-        blockers: list[str] = []
-        if issue.change_set_id is None:
-            blockers.append("CHANGE_SET_NOT_CREATED")
-        if issue.documentation_impact == "BLOCKED_BY_UNRESOLVED_DOCUMENTATION_IMPACT":
-            blockers.append("DOCUMENTATION_IMPACT_UNRESOLVED")
-        if issue.current_runtime_required and issue.current_runtime_reproduction != (
-            "REPRODUCED_CURRENT_RUNTIME"
-        ):
-            blockers.append("CURRENT_RUNTIME_REPRODUCTION_REQUIRED")
-        return blockers
 
     @staticmethod
     def _serialize_backlog_campaign(campaign: db.GitHubBacklogCampaign) -> dict[str, Any]:

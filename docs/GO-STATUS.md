@@ -27,7 +27,7 @@ crash tonight would self-heal instead of permanently burning the fresh campaign'
 
 ## Verdict
 
-**NO-GO by exactly one item.** 46 findings tracked; 24 FIXED, 3 re-scoped NOT_APPLICABLE, 5
+**NO-GO by exactly one item.** 46 findings tracked; 26 FIXED, 3 re-scoped NOT_APPLICABLE, 5
 UNVERIFIED (all backlog, none GO-blocking). F-07 (Telegram notifications) and
 NEW-07 (ungated audit skills reachable via the production gateway) are both closed and verified.
 F-29 (SSH password auth) was reverted after causing a real lockout incident and stays paused
@@ -127,6 +127,21 @@ passed clean on this branch before deploying. Full detail and rationale for each
   operator voluntarily give up GitHub write-policy ownership of a not-yet-executing campaign
   early, instead of waiting out the full ~24h TTL when it's clear that campaign's content can
   never actually execute.
+
+## NEW-01: reframed and closed (written, tested, not deployed)
+
+The finding assumed `approve-delivery`/`delivery-candidate` were an unfinished feature. Tracing
+every path that could reach the workflow state they act on (`AWAITING_STAGING_DELIVERY`) found
+none exist anymore, for either delivery mode: `source-pr`'s branch to that state is dead behind
+a `workflow.patched()` flag that's always `True` now (the loop auto-continues instead), and
+`full-delivery` fully self-orchestrates through child workflows with no approval gate in the
+path at all. The backing activity was never called by any workflow either. Removed the dead API
+endpoints, schema, activity, and constant, and — found while checking for other callers — the
+matching `/loop delivery-candidate` / `/loop approve-delivery` Telegram commands in this repo's
+own `integrations/hermes-engineering-control/hook/handler.py`, plus fixed a stale doc note
+claiming `full-delivery` was still fail-closed. Bonus fix in the same file: `/loop r3-candidate`
+and `/loop approve-r3` had their own separate hardcoded `musematic`/`1119` check that NEW-09's
+earlier API/CLI generalization had missed — fixed to match.
 
 ## GO checklist status
 

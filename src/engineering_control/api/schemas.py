@@ -261,11 +261,6 @@ class BacklogIssueAction(APIModel):
     ) = None
 
 
-class BacklogDeliveryApprovalRequest(APIModel):
-    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
-    typed_confirmation: Literal["APPROVE_STAGING_ISSUE_DELIVERY"]
-
-
 class EnhancementDiscover(APIModel):
     project: Project
     campaign_id: UUID

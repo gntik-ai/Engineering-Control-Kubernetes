@@ -749,8 +749,7 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if not args:
             raise ValueError(
                 "usage: /loop <import|inventory|plan|queue|issue|approval-candidate|approve|"
-                "start|status|pause|resume|cancel|skip|retry|delivery-candidate|"
-                "approve-delivery> ..."
+                "start|status|pause|resume|cancel|skip|retry> ..."
             )
         action = args[0]
         if action == "global-start":
@@ -872,9 +871,17 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
             )
         if action in {"r3-candidate", "approve-r3"}:
             expected = 6 if action == "approve-r3" else 4
-            if len(args) != expected or args[1:4] != ["musematic", "source", "1119"]:
+            if (
+                len(args) != expected
+                or args[1] not in _BACKLOG_PROJECTS
+                or args[2] not in {"source", "deployment"}
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+            ):
                 suffix = " <binding> <confirmation-phrase>" if action == "approve-r3" else ""
-                raise ValueError(f"usage: /loop {action} musematic source 1119{suffix}")
+                raise ValueError(
+                    f"usage: /loop {action} <project> <source|deployment> <issue-number>{suffix}"
+                )
             if action == "r3-candidate":
                 query = urllib.parse.urlencode(
                     {"project": args[1], "surface": args[2], "issue_number": int(args[3])}
@@ -1097,41 +1104,6 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                     "repository": args[2],
                     "issue_number": int(args[3]),
                 },
-            )
-        if action == "delivery-candidate":
-            if (
-                len(args) != 4
-                or args[2] not in _BACKLOG_REPOSITORIES
-                or not args[3].isdigit()
-                or int(args[3]) < 1
-            ):
-                raise ValueError(
-                    "usage: /loop delivery-candidate <workflow-id> <repository-short-name> "
-                    "<issue-number>"
-                )
-            workflow_id = urllib.parse.quote(args[1], safe="")
-            return _request(
-                "GET",
-                f"/v1/backlog-loops/{workflow_id}/delivery-candidate?"
-                f"repository={args[2]}&issue_number={int(args[3])}",
-                actor,
-            )
-        if action == "approve-delivery":
-            if (
-                len(args) != 4
-                or not _DIGEST.fullmatch(args[2])
-                or args[3] != "APPROVE_STAGING_ISSUE_DELIVERY"
-            ):
-                raise ValueError(
-                    "usage: /loop approve-delivery <workflow-id> <binding-sha256> "
-                    "APPROVE_STAGING_ISSUE_DELIVERY"
-                )
-            workflow_id = urllib.parse.quote(args[1], safe="")
-            return _request(
-                "POST",
-                f"/v1/backlog-loops/{workflow_id}/approve-delivery",
-                actor,
-                {"approval_binding": args[2], "typed_confirmation": args[3]},
             )
         raise ValueError("unsupported /loop action")
     if command == "enhancements":

@@ -18,7 +18,6 @@ from engineering_control.api.schemas import (
     AuditPlanRequest,
     BacklogApprovalCandidateRequest,
     BacklogApprovalRequest,
-    BacklogDeliveryApprovalRequest,
     BacklogImportAccepted,
     BacklogIssueAction,
     BacklogOwnershipReleaseRequest,
@@ -838,40 +837,6 @@ def create_app(
             )
             return {"status": "ACCEPTED"}
         raise HTTPException(status_code=404, detail="unknown backlog loop action")
-
-    @app.post("/v1/backlog-loops/{workflow_id}/approve-delivery")
-    async def backlog_delivery_approve(
-        workflow_id: str,
-        body: BacklogDeliveryApprovalRequest,
-        _subject: str = auth_dependency,
-    ) -> dict[str, str]:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "staging approval candidate is not yet available; the campaign remains "
-                f"bound to workflow {workflow_id}"
-            ),
-        )
-
-    @app.get("/v1/backlog-loops/{workflow_id}/delivery-candidate")
-    async def backlog_delivery_candidate(
-        workflow_id: str,
-        repository: str = Query(
-            pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-        ),
-        issue_number: int = Query(ge=1),
-        _subject: str = auth_dependency,
-        service: ControlService = control_dependency,
-    ) -> dict[str, Any]:
-        state = await service.get_workflow(workflow_id)
-        return {
-            "status": "BLOCKED_BY_DELIVERY",
-            "workflow_id": workflow_id,
-            "repository": f"gntik-ai/{repository}",
-            "issue_number": issue_number,
-            "blocker": "ISSUE_HAS_NOT_REACHED_AWAITING_STAGING_DELIVERY",
-            "workflow_state": state,
-        }
 
     @app.get("/v1/loops/{workflow_id}")
     async def issue_loop_get(

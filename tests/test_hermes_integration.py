@@ -244,6 +244,12 @@ def test_acceptance_receipt_is_bounded_and_secret_free(tmp_path: Path) -> None:
             "GET",
             "/v1/backlogs/locate?project=musematic&surface=source&issue_number=1119",
         ),
+        (
+            "loop",
+            "r3-candidate falcone source 953",
+            "POST",
+            "/v1/r3-issues/candidate?project=falcone&surface=source&issue_number=953",
+        ),
         ("loop", "diagnose loop-safe-id", "GET", "/v1/runs/loop-safe-id"),
         (
             "loop",
@@ -442,7 +448,6 @@ def test_telegram_all_project_audit_rejects_untyped_targets(
         "skip loop-id falcone 1 arbitrary-reason",
         "skip loop-id outside-repository 1 DUPLICATE",
         "approve falcone 11111111-1111-4111-8111-111111111111 " + "a" * 64 + " NOT_APPROVED",
-        "approve-delivery loop-id " + "a" * 64 + " NOT_APPROVED",
         "import falcone github-open bugs 1;gh",
         "issue-locate falcone source 953 source-pr",
         "issue-start falcone source 953 arbitrary-mode",
@@ -467,6 +472,40 @@ def test_backlog_telegram_parser_rejects_untyped_or_unbounded_input(
     )
     assert result is not None and result["decision"] == "handled"
     assert "usage" in result["message"].lower() or "invalid" in result["message"].lower()
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    "raw_args",
+    [
+        "delivery-candidate loop-id falcone 953",
+        "approve-delivery loop-id " + "a" * 64 + " APPROVE_STAGING_ISSUE_DELIVERY",
+    ],
+)
+def test_backlog_telegram_parser_rejects_removed_delivery_approval_actions(
+    monkeypatch: pytest.MonkeyPatch, raw_args: str
+) -> None:
+    """NEW-01: these actions targeted a workflow state (AWAITING_STAGING_DELIVERY) that no
+    currently- or future-started backlog loop can ever reach -- sequential_source_pr and
+    full-delivery-orchestration fully automate both delivery modes without an operator
+    approval gate. Removed rather than "implemented for real" against a dead state.
+    """
+    handler = load_handler()
+    called = False
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+
+    def request(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        nonlocal called
+        called = True
+        return {"status": "UNEXPECTED"}
+
+    monkeypatch.setattr(handler, "_request", request)
+    result = handler.handle(
+        "command:loop",
+        {"platform": "telegram", "user_id": "42", "raw_args": raw_args},
+    )
+    assert result is not None and result["decision"] == "handled"
+    assert "unsupported" in result["message"].lower()
     assert called is False
 
 

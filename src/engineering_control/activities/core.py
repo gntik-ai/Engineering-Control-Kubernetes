@@ -193,7 +193,6 @@ class ControlActivities:
         "backlog.record_approval",
         "backlog.record_skip",
         "backlog.record_retry",
-        "backlog.delivery_candidate",
         "backlog.load_execution",
         "backlog.materialize_candidate",
         "backlog.record_revalidation",
