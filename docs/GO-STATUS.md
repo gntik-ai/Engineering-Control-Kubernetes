@@ -208,7 +208,7 @@ Ruff, mypy, and the full test suite (766 tests) pass clean on this branch.
 | G4 | Hermes unit active, CLI-backed, skills load | **PASS** |
 | G5 | Telegram + dashboard can trigger/show missions | **PASS** (Telegram confirmed end-to-end; dashboard wired, not visually re-checked) |
 | G6 | Fail-closed gates consciously set | **PASS** (Temporal control plane fully gated; NEW-07's parallel path now also gated) |
-| G7 | Issue-resolution loop completes end to end | **PENDING** — the one remaining item, self-resolving ~21:45→22:32 UTC window |
+| G7 | Issue-resolution loop completes end to end | **PENDING** — retry attempt 1 (2026-09-21T22:34 UTC) failed at step 3/5 (backlog-approval-candidate, 409 Conflict) before ever reaching NEW-16's fix; needs root-causing, not just more waiting (see NEW-16 in findings.json) |
 | G8 | Audit mission completes end to end | **PASS** |
 | G9 | Security baseline | **PASS, one paused item** (F-29 reverted after incident, needs an SSH key prerequisite before retry) |
 | G10 | Restart resilience | **PARTIAL** (app-level proven; core infra restart not tested, real blast radius) |
@@ -222,5 +222,40 @@ evidence trails. `docs/BACKLOG.md` has every non-blocking finding for future wor
 
 ---
 
-**Next check-in**: after ~2026-09-21 22:32 UTC, run the sequence above for G7's final artifact,
-then this platform should be at a clean, fully-evidenced GO.
+## NEW-16 retry attempt 1 (2026-09-21T22:34 UTC) — did not resolve G7
+
+The ~22:32 UTC TTL-timing theory has now actually been tested, and it wasn't enough by itself.
+`.go-status/run-new16-retry.sh` ran against a brand-new llmwiki campaign
+(`defef39e-b0ae-4a36-8863-dd59f08e960c`):
+
+- **1/5 backlog-import**: succeeded.
+- **2/5 backlog-plan**: succeeded (async — returns immediately, real planning happens in the
+  dispatched Temporal workflow).
+- **3/5 backlog-approval-candidate**: **failed, 409 Conflict**, no further detail in the CLI's
+  error output. The script correctly aborted rather than continuing to approve/start.
+
+This never reached the code NEW-16's fix actually touches (the Run-row self-registration only
+fires inside the workflow `backlog-start` triggers) — it's a new, different blocker, not a
+recurrence of the original bug. Two attempts to narrow down the cause (`backlog-status`, a direct
+API query) were blocked by the harness's own permission classifier; did not attempt to work
+around either.
+
+Two unconfirmed hypotheses, in order of likelihood:
+
+1. **Script race**: `run-new16-retry.sh` calls `backlog-approval-candidate` immediately after
+   `backlog-plan`'s async `ACCEPTED` response, with no wait for the campaign to actually finish
+   planning. If the campaign isn't past that state yet, this conflict is exactly what you'd
+   expect — not a real problem, just a missing poll/wait in the script.
+2. **Ownership contention**: `db/repository.py`'s policy-ownership binding logic explicitly
+   rejects a new approval candidate while a different campaign holds active
+   `APPROVED_POLICY_PENDING` status. If some other campaign still holds it, this is what NEW-13's
+   release-ownership action exists to clear.
+
+**Before retrying**: run `engineering-ctl backlog-status defef39e-b0ae-4a36-8863-dd59f08e960c` and
+`engineering-ctl connections all` yourself to see which of the two it is, then either patch the
+script to wait for plan-ready, or clear the actual blocking owner.
+
+---
+
+**Status**: G7/NEW-16 remains the sole GO-blocking item. Not resolved by waiting alone this time —
+needs the root-cause check above before the next attempt.
