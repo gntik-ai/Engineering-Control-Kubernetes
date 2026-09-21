@@ -54,10 +54,12 @@ from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.service import TypedCommandBus
 from engineering_control.workflows import definitions as workflow_definitions
 from engineering_control.workflows.definitions import (
+    AuditCampaignWorkflow,
     ExistingGitHubBacklogLoopWorkflow,
     MultiProjectAuditWorkflow,
 )
 from engineering_control.workflows.inputs import (
+    AuditCampaignInput,
     ExistingGitHubBacklogLoopInput,
     MultiProjectAuditInput,
 )
@@ -665,6 +667,45 @@ def test_r3_issue_candidate_rejects_unknown_project_and_fails_closed_without_man
     unconfigured = OperationsRepository(f"sqlite+pysqlite:///{tmp_path / 'unconfigured.db'}")
     with pytest.raises(ValueError, match="unconfigured or invalid"):
         unconfigured._r3_issue_candidate("falcone", "source", 1)
+
+
+@pytest.mark.asyncio
+async def test_audit_campaign_reports_clean_blocker_for_zero_coverage_cells() -> None:
+    """NEW-14: a leaner project's plan can legitimately yield zero domains/personas/lenses
+    for a preset built with a richer project in mind. That must surface as a diagnosed
+    BLOCKED result, not a crash from persist_coverage rejecting total=0.
+    """
+    instance = AuditCampaignWorkflow()
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    persist_coverage_called = False
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if name == "campaign.plan":
+            return {"domains": [], "personas": ["anonymous"], "lenses": ["correctness"]}
+        if name == "project.snapshot":
+            return {"campaign_id": "11111111-1111-4111-8111-111111111111"}
+        if name == "project.persist_snapshot":
+            return {}
+        if name == "github.refresh_mirrors":
+            return {}
+        if name == "campaign.persist_coverage":
+            nonlocal persist_coverage_called
+            persist_coverage_called = True
+            return {"status": "COVERAGE_PERSISTED"}
+        return {"status": "OK"}
+
+    instance._step = step  # type: ignore[method-assign]
+
+    result = await instance.run(
+        AuditCampaignInput(project="llmwiki", preset="static-full", environment="staging")
+    )
+
+    assert result == {
+        "status": "BLOCKED",
+        "campaign_id": "11111111-1111-4111-8111-111111111111",
+        "blocker": "NO_APPLICABLE_COVERAGE_CELLS",
+    }
+    assert persist_coverage_called is False
 
 
 def test_audit_publication_is_opt_in_and_full_audit_requires_phrase() -> None:

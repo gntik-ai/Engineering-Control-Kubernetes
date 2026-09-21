@@ -532,6 +532,17 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "blocker": stage_context.get("blocker", stage_context["status"]),
                     "context": stage_context,
                 }
+        if not cells:
+            # NEW-14: a leaner project's manifest can legitimately produce zero domains/
+            # personas/lenses for this preset (e.g. llmwiki under static-full, which was
+            # built with falcone's richer set in mind) -- report it as a clean, diagnosed
+            # outcome instead of calling persist_coverage with total=0, which it correctly
+            # rejects as inconsistent input and crashes the workflow.
+            return {
+                "status": "BLOCKED",
+                "campaign_id": campaign_id,
+                "blocker": "NO_APPLICABLE_COVERAGE_CELLS",
+            }
         await self._step(
             "campaign.persist_coverage",
             {"campaign_id": campaign_id, "cells": batch, "total": len(cells)},
