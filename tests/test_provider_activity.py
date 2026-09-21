@@ -118,6 +118,41 @@ async def test_provider_activity_executes_only_in_bounded_worktree(
 
 
 @pytest.mark.asyncio
+async def test_provider_activity_does_not_echo_prompt_text_back_into_its_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-14: the rendered prompt (up to 200_000 chars) must not be echoed back into the
+    activity's own result -- nothing reads it from there, and it dominates Temporal
+    history-accretion cost for every maker/checker/agent invocation."""
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.activity.heartbeat", lambda _: None
+    )
+    worktree_root = tmp_path / "worktrees"
+    worktree = worktree_root / "falcone" / "change-set"
+    worktree.mkdir(parents=True)
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
+        "codex",
+        FakeAdapter(),
+        FakeInstructionPack(),
+    )
+    original_prompt = "make one bounded synthetic change" * 100
+
+    result = await handler.handle(
+        "delivery.invoke_maker",
+        {"maker_request": request_for(worktree).model_dump(mode="json") | {
+            "prompt": original_prompt
+        }},
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert "prompt" not in result["maker_request"]
+    # every other field survives the trim untouched
+    assert result["maker_request"]["role"] == "implementer"
+    assert result["maker_request"]["working_directory"] == str(worktree)
+
+
+@pytest.mark.asyncio
 async def test_observability_persistence_failure_does_not_fail_provider_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

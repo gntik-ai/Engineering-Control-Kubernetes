@@ -63,7 +63,7 @@ from engineering_control.engineering.backlog import (
 from engineering_control.engineering.github import FindingPublication
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
-from engineering_control.models.core import AgentRequest, AgentResult
+from engineering_control.models.core import AgentRequest, AgentResult, resolve_agent_effort
 from engineering_control.models.core import ChangeSet as ChangeSetModel
 from engineering_control.models.enums import (
     AuditLens,
@@ -802,7 +802,7 @@ class MetadataActivityHandler:
             working_directory=str(workspace),
             output_schema=self._observability_schema("codex"),
             timeout_seconds=300,
-            effort="low",
+            effort=resolve_agent_effort(ModelClass.WORKER, trivial=True),
             writable=False,
             skip_git_repository_check=True,
             allowed_tools=("Read", "Glob", "Grep"),
@@ -841,7 +841,7 @@ class MetadataActivityHandler:
             working_directory=str(workspace),
             output_schema=self._observability_schema("claude"),
             timeout_seconds=300,
-            effort="low",
+            effort=resolve_agent_effort(ModelClass.JUDGE, trivial=True),
             writable=False,
             allowed_tools=("Read", "Glob", "Grep"),
         )
@@ -872,7 +872,7 @@ class MetadataActivityHandler:
             working_directory=str(workspace),
             output_schema=self._observability_schema("claude"),
             timeout_seconds=300,
-            effort="low",
+            effort=resolve_agent_effort(ModelClass.WORKER, trivial=True),
             writable=False,
             allowed_tools=("Read", "Glob", "Grep"),
         )
@@ -912,7 +912,7 @@ class MetadataActivityHandler:
             working_directory=str(workspace),
             output_schema=self._observability_schema("codex"),
             timeout_seconds=300,
-            effort="low",
+            effort=resolve_agent_effort(ModelClass.JUDGE, trivial=True),
             writable=False,
             skip_git_repository_check=True,
             allowed_tools=("Read", "Glob", "Grep"),
@@ -1597,7 +1597,7 @@ class MetadataActivityHandler:
             working_directory=str(snapshot["source_worktree"]),
             output_schema=self._audit_output_schema(),
             timeout_seconds=3600,
-            effort="high" if risk is RiskClass.R3 else "medium",
+            effort=resolve_agent_effort(model_class, risk=risk),
             writable=False,
             campaign_id=campaign_id,
         )
@@ -2017,7 +2017,7 @@ class MetadataActivityHandler:
             working_directory=str(snapshot["source_worktree"]),
             output_schema=self._verification_output_schema(),
             timeout_seconds=3600,
-            effort="high",
+            effort=resolve_agent_effort(ModelClass.JUDGE),
             writable=False,
             campaign_id=UUID(str(finding["campaign_id"])),
         )
@@ -2660,7 +2660,7 @@ class MetadataActivityHandler:
             working_directory=str(payload["source_worktree"]),
             output_schema=self._spec_output_schema(),
             timeout_seconds=3600,
-            effort="high",
+            effort=resolve_agent_effort(ModelClass.JUDGE),
             writable=False,
             change_set_id=change_set_id,
         )
@@ -2740,7 +2740,7 @@ class MetadataActivityHandler:
             working_directory=str(payload[worktree_key]),
             output_schema=self._maker_output_schema(),
             timeout_seconds=7200,
-            effort="high",
+            effort=resolve_agent_effort(ModelClass.WORKER, writable=True),
             writable=True,
             change_set_id=change_set_id,
         )
@@ -2793,7 +2793,7 @@ class MetadataActivityHandler:
             working_directory=str(payload["source_worktree"]),
             output_schema=self._checker_output_schema(),
             timeout_seconds=5400,
-            effort="high",
+            effort=resolve_agent_effort(ModelClass.JUDGE),
             writable=False,
             change_set_id=change_set_id,
         )
@@ -4624,7 +4624,7 @@ class MetadataActivityHandler:
                 working_directory=lease.worktree_path,
                 output_schema=self._release_review_output_schema(),
                 timeout_seconds=5400,
-                effort="high",
+                effort=resolve_agent_effort(ModelClass.JUDGE),
                 writable=False,
                 change_set_id=change_set.id,
             )
@@ -5806,7 +5806,7 @@ class MetadataActivityHandler:
                 working_directory=str(payload["source_worktree"]),
                 output_schema=self._runtime_verification_output_schema(),
                 timeout_seconds=3600,
-                effort="high",
+                effort=resolve_agent_effort(ModelClass.JUDGE),
                 writable=False,
                 change_set_id=UUID(str(payload["change_set_id"])),
             )

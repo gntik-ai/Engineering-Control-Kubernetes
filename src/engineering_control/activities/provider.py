@@ -102,16 +102,24 @@ class ProviderActivityHandler:
             return await self._quota_snapshot(payload)
         request = self._request(step, payload)
         self._validate_boundary(step, request)
+        # F-14: request.prompt (up to 200_000 chars) is already fully captured on `request`
+        # above -- nothing reads it back out of this activity's own echoed result (verified:
+        # instructions.py/the CLI adapters consume it from `request` during this same call;
+        # _persist_handoff receives `request` directly for the real handoff record, and only
+        # reads decisions/source_refs/diff/test_results/open_questions from the echoed
+        # payload). Dropping it from every echo below is the dominant fix for this step's
+        # contribution to Temporal history accretion.
+        echo_payload = self._without_prompt(payload, self._request_keys[step])
         try:
             request, bundle = self.instruction_pack.enrich(request, step)
         except (OSError, ValueError) as error:
             return self._blocked(
-                payload,
+                echo_payload,
                 "AGENT_PACK_INVALID",
                 detail=type(error).__name__,
             )
         runtime_payload = {
-            **payload,
+            **echo_payload,
             "instruction_bundle": {
                 "sha256": bundle.sha256,
                 "revision": bundle.revision,
@@ -460,6 +468,17 @@ class ProviderActivityHandler:
             test_results=self._object(self._find_value(payload, "test_results", {})),
             open_questions=self._string_list(self._find_value(payload, "open_questions", [])),
         )
+
+    @classmethod
+    def _without_prompt(cls, value: Any, key: str) -> Any:
+        """Return a copy of value with key's nested "prompt" field removed, if present."""
+        if not isinstance(value, dict):
+            return value
+        if key in value and isinstance(value[key], dict):
+            trimmed = dict(value[key])
+            trimmed.pop("prompt", None)
+            return {**value, key: trimmed}
+        return {inner_key: cls._without_prompt(inner, key) for inner_key, inner in value.items()}
 
     @classmethod
     def _find_mapping(cls, value: Any, key: str) -> dict[str, Any] | None:

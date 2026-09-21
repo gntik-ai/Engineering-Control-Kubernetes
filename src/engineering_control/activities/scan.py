@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -179,41 +180,41 @@ class ScanActivityHandler:
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             if step == "project.snapshot":
-                return self._snapshot(payload)
+                return await asyncio.to_thread(self._snapshot, payload)
             if step == "project.snapshot_pair":
-                return self._snapshot_pair(payload)
+                return await asyncio.to_thread(self._snapshot_pair, payload)
             if step in {"audit.static_source", "audit.static_deployment"}:
-                return self._static_surface(step, payload)
+                return await asyncio.to_thread(self._static_surface, step, payload)
             if step == "deployment.compare_live":
-                return self._compare_live(payload)
+                return await asyncio.to_thread(self._compare_live, payload)
             if step == "audit.kubernetes_observe":
-                return self._kubernetes_observe(payload)
+                return await asyncio.to_thread(self._kubernetes_observe, payload)
             if step == "audit.correlate_runtime":
-                return self._correlate_runtime(payload)
+                return await asyncio.to_thread(self._correlate_runtime, payload)
             if step == "audit.deterministic_cell":
-                return self._deterministic_cell(payload)
+                return await asyncio.to_thread(self._deterministic_cell, payload)
             if step == "finding.fresh_snapshot":
-                return self._fresh_finding_snapshot(payload)
+                return await asyncio.to_thread(self._fresh_finding_snapshot, payload)
             if step == "delivery.allocate_worktrees":
-                return self._allocate(payload)
+                return await asyncio.to_thread(self._allocate, payload)
             if step == "delivery.deterministic_prechecks":
-                return self._delivery_prechecks(payload)
+                return await asyncio.to_thread(self._delivery_prechecks, payload)
             if step == "runtime.deterministic_checks":
-                return self._runtime_deterministic_checks(payload)
+                return await asyncio.to_thread(self._runtime_deterministic_checks, payload)
             if step == "identity.observer_attest":
-                return self._observer_attestation(payload)
+                return await asyncio.to_thread(self._observer_attestation, payload)
             if step == "cleanup.protect_active":
-                return self._protect_cleanup_candidates(payload)
+                return await asyncio.to_thread(self._protect_cleanup_candidates, payload)
             if step == "cleanup.execute":
-                return self._execute_cleanup(payload)
+                return await asyncio.to_thread(self._execute_cleanup, payload)
             if step == "reconcile.apply_promotion":
-                return self._apply_promotion(payload)
+                return await asyncio.to_thread(self._apply_promotion, payload)
             if step == "delivery.validate_changeset":
-                return self._validate_changeset(payload)
+                return await asyncio.to_thread(self._validate_changeset, payload)
             if step == "observability.prepare_workspace":
-                return self._prepare_observability_workspace(payload)
+                return await asyncio.to_thread(self._prepare_observability_workspace, payload)
             if step == "observability.cleanup_workspace":
-                return self._cleanup_observability_workspace(payload)
+                return await asyncio.to_thread(self._cleanup_observability_workspace, payload)
         except PermissionError as error:
             raise ApplicationError(
                 "runtime observer credential violates least-privilege policy",

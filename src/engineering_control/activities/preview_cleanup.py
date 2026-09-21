@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import stat
@@ -38,11 +39,13 @@ class PreviewCleanupActivityHandler:
         self.runner = runner or SafeCommandRunner({"kubectl": settings.kubectl_executable})
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # F-08: _inspect/_execute do blocking kubectl subprocess work through a sync
+        # runner; run them off the event loop in a worker thread.
         try:
             if step == "cleanup.inspect_preview_namespaces":
-                return self._inspect(payload)
+                return await asyncio.to_thread(self._inspect, payload)
             if step == "cleanup.execute_preview_namespaces":
-                return self._execute(payload)
+                return await asyncio.to_thread(self._execute, payload)
         except (OSError, ValueError, ValidationError) as error:
             raise ApplicationError(
                 "preview cleanup failed bounded policy validation",

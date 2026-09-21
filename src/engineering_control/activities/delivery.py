@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -164,35 +165,34 @@ class DeliveryActivityHandler:
             if denial is not None:
                 return denial.model_dump(mode="json")
         if step == "finding.dedupe":
-            return self._dedupe_finding(payload)
+            return await asyncio.to_thread(self._dedupe_finding, payload)
         if step == "enhancement.github_dedupe":
-            return self._dedupe_enhancement(payload)
+            return await asyncio.to_thread(self._dedupe_enhancement, payload)
         if step == "enhancement.publish":
-            return self._publish_enhancement(payload)
+            return await asyncio.to_thread(self._publish_enhancement, payload)
         if step == "finding.publish":
-            return self._publish_finding(payload)
+            return await asyncio.to_thread(self._publish_finding, payload)
         if step == "reconcile.inspect_ci":
-            return self._inspect_ci(payload)
+            return await asyncio.to_thread(self._inspect_ci, payload)
         if step == "reconcile.publish_promotion":
-            return self._publish_promotion(payload)
+            return await asyncio.to_thread(self._publish_promotion, payload)
         if step == "final.merge_source":
-            return self._merge_bound_pull_request(payload, source=True)
+            return await asyncio.to_thread(self._merge_bound_pull_request, payload, source=True)
         if step == "final.inspect_artifact":
-            return self._inspect_final_artifact(payload)
+            return await asyncio.to_thread(self._inspect_final_artifact, payload)
         if step == "final.merge_deployment":
-            return self._merge_bound_pull_request(payload, source=False)
+            return await asyncio.to_thread(self._merge_bound_pull_request, payload, source=False)
         if step == "final.sync_worktrees":
-            return self._sync_final_worktrees(payload)
+            return await asyncio.to_thread(self._sync_final_worktrees, payload)
         if step == "final.comment_issue":
-            return self._comment_final_evidence(payload)
+            return await asyncio.to_thread(self._comment_final_evidence, payload)
         if step == "final.close_issue":
-            return self._close_final_issue(payload)
+            return await asyncio.to_thread(self._close_final_issue, payload)
         if step != "delivery.publish":
             raise ApplicationError("unsupported delivery activity", non_retryable=True)
         try:
             plan = PublicationPlan.model_validate(payload.get("publication_plan"))
-            self.broker.preflight(tuple(item.repository for item in plan.publications))
-            results = [self._publish(item) for item in plan.publications]
+            results = await asyncio.to_thread(self._publish_all, plan)
         except GhCliAuthError:
             return {
                 **payload,
@@ -834,6 +834,10 @@ class DeliveryActivityHandler:
         elif permissions not in {0o600, 0o640}:
             raise ValueError("GitHub registry auth file permissions are invalid")
         return resolved
+
+    def _publish_all(self, plan: PublicationPlan) -> list[dict[str, Any]]:
+        self.broker.preflight(tuple(item.repository for item in plan.publications))
+        return [self._publish(item) for item in plan.publications]
 
     def _publish(self, plan: RepositoryPublication) -> dict[str, Any]:
         worktree = self._bounded_worktree(plan)

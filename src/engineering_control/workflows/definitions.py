@@ -13,6 +13,7 @@ from engineering_control.workflows.inputs import (
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
     CleanupInput,
+    ConnectionsRefreshInput,
     DeliveryReconciliationInput,
     EnhancementDeliveryInput,
     EnhancementDiscoveryInput,
@@ -1492,6 +1493,20 @@ class QuotaRefreshWorkflow(ControlledWorkflow):
         return {"status": "COMPLETE", "snapshots": snapshots}
 
 
+@workflow.defn(name="ConnectionsRefreshWorkflow")
+class ConnectionsRefreshWorkflow(ControlledWorkflow):
+    """NEW-05: keep the connection-health snapshot from decaying to DEGRADED between
+
+    missions by periodically re-running the same bounded read-only probes
+    `recheck-connections` already performs on demand.
+    """
+
+    @workflow.run
+    async def run(self, request: ConnectionsRefreshInput) -> dict[str, Any]:
+        result = await self._step("connections.refresh", {"scope": request.scope})
+        return {"status": "COMPLETE", "scope": request.scope, "result": result}
+
+
 @workflow.defn(name="CleanupWorkflow")
 class CleanupWorkflow(ControlledWorkflow):
     @workflow.run
@@ -2683,6 +2698,7 @@ ALL_WORKFLOWS = [
     RuntimeVerificationWorkflow,
     RecoveryWorkflow,
     QuotaRefreshWorkflow,
+    ConnectionsRefreshWorkflow,
     CleanupWorkflow,
     AcceptanceLifecycleWorkflow,
     ObservabilityAcceptanceWorkflow,

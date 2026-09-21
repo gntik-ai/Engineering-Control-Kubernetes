@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
@@ -38,51 +39,13 @@ class GitHubActivityHandler:
         self.git = SafeCommandRunner({"git": settings.git_executable})
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # F-08: every branch here does blocking gh/git subprocess work through sync
+        # broker/runner methods; run each off the event loop in a worker thread rather
+        # than converting the whole synchronous call graph to async/await.
         if step == "backlog.github_import":
-            return self._import_backlog(payload)
+            return await asyncio.to_thread(self._import_backlog, payload)
         if step == "github.refresh_mirrors":
-            project = payload.get("project")
-            mapping = {
-                "falcone": ("falcone", "falcone-charts"),
-                "musematic": ("musematic", "musematic-deploy"),
-                "llmwiki": ("llmwiki",),
-            }
-            repositories = mapping.get(str(project))
-            if repositories is None:
-                raise ApplicationError("mirror refresh project is invalid", non_retryable=True)
-            full_names = tuple(f"gntik-ai/{item}" for item in repositories)
-            self.broker.preflight(full_names)
-            refreshed = []
-            for slug, repository in zip(repositories, full_names, strict=True):
-                mirror = (self.settings.mirror_root / f"{slug}.git").resolve()
-                if not mirror.is_dir() or not mirror.is_relative_to(
-                    self.settings.mirror_root.resolve()
-                ):
-                    raise ApplicationError("canonical mirror is unavailable", type="NotConfigured")
-                remote = self.git.run(
-                    "git", ["remote", "get-url", "origin"], cwd=mirror
-                ).stdout.strip()
-                if remote != f"https://github.com/{repository}.git":
-                    raise ApplicationError(
-                        "canonical mirror origin changed", type="PolicyViolation"
-                    )
-                self.git.run(
-                    "git",
-                    [
-                        "fetch",
-                        "--prune",
-                        "origin",
-                        "+refs/heads/*:refs/remotes/origin/*",
-                        "+refs/tags/*:refs/tags/*",
-                    ],
-                    cwd=mirror,
-                    environment={
-                        "HOME": str(self.broker.authenticated_home),
-                        "GIT_TERMINAL_PROMPT": "0",
-                    },
-                )
-                refreshed.append(repository)
-            return {**payload, "status": "PASS", "refreshed_repositories": refreshed}
+            return await asyncio.to_thread(self._refresh_mirrors, payload)
         if step != "llmwiki.bootstrap.plan":
             raise ApplicationError("unsupported GitHub broker activity", non_retryable=True)
         if payload.get("project") != "llmwiki" or payload.get("environment") != "staging":
@@ -91,6 +54,51 @@ class GitHubActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        return await asyncio.to_thread(self._plan_llmwiki_bootstrap, payload)
+
+    def _refresh_mirrors(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project = payload.get("project")
+        mapping = {
+            "falcone": ("falcone", "falcone-charts"),
+            "musematic": ("musematic", "musematic-deploy"),
+            "llmwiki": ("llmwiki",),
+        }
+        repositories = mapping.get(str(project))
+        if repositories is None:
+            raise ApplicationError("mirror refresh project is invalid", non_retryable=True)
+        full_names = tuple(f"gntik-ai/{item}" for item in repositories)
+        self.broker.preflight(full_names)
+        refreshed = []
+        for slug, repository in zip(repositories, full_names, strict=True):
+            mirror = (self.settings.mirror_root / f"{slug}.git").resolve()
+            if not mirror.is_dir() or not mirror.is_relative_to(
+                self.settings.mirror_root.resolve()
+            ):
+                raise ApplicationError("canonical mirror is unavailable", type="NotConfigured")
+            remote = self.git.run(
+                "git", ["remote", "get-url", "origin"], cwd=mirror
+            ).stdout.strip()
+            if remote != f"https://github.com/{repository}.git":
+                raise ApplicationError("canonical mirror origin changed", type="PolicyViolation")
+            self.git.run(
+                "git",
+                [
+                    "fetch",
+                    "--prune",
+                    "origin",
+                    "+refs/heads/*:refs/remotes/origin/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+                cwd=mirror,
+                environment={
+                    "HOME": str(self.broker.authenticated_home),
+                    "GIT_TERMINAL_PROMPT": "0",
+                },
+            )
+            refreshed.append(repository)
+        return {**payload, "status": "PASS", "refreshed_repositories": refreshed}
+
+    def _plan_llmwiki_bootstrap(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             llmwiki = self.broker.branch_commit("gntik-ai/llmwiki", "master")
             falcone = self.broker.branch_commit("gntik-ai/falcone", "main")

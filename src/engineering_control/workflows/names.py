@@ -13,6 +13,7 @@ class WorkflowName(StrEnum):
     RUNTIME_VERIFICATION = "RuntimeVerificationWorkflow"
     RECOVERY = "RecoveryWorkflow"
     QUOTA_REFRESH = "QuotaRefreshWorkflow"
+    CONNECTIONS_REFRESH = "ConnectionsRefreshWorkflow"
     CLEANUP = "CleanupWorkflow"
     ACCEPTANCE_LIFECYCLE = "AcceptanceLifecycleWorkflow"
     OBSERVABILITY_ACCEPTANCE = "ObservabilityAcceptanceWorkflow"

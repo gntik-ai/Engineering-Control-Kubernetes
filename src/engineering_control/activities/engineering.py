@@ -35,7 +35,7 @@ from engineering_control.identity.attestation import (
     observer_contract_hash,
     superadmin_contract_hash,
 )
-from engineering_control.models.core import AgentRequest
+from engineering_control.models.core import AgentRequest, resolve_agent_effort
 from engineering_control.models.enums import ModelClass, Project, Provider
 
 
@@ -396,7 +396,7 @@ class EngineeringActivityHandler:
             working_directory=worktree,
             output_schema=schema,
             timeout_seconds=3600,
-            effort="medium",
+            effort=resolve_agent_effort(ModelClass.WORKER),
             writable=False,
             campaign_id=campaign_id,
         )
@@ -434,7 +434,7 @@ class EngineeringActivityHandler:
             working_directory=str(discovery["working_directory"]),
             output_schema=self._enhancement_review_schema(),
             timeout_seconds=3600,
-            effort="high",
+            effort=resolve_agent_effort(ModelClass.JUDGE),
             writable=False,
             campaign_id=campaign_id,
         )

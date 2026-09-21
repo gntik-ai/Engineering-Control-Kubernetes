@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import stat
 from pathlib import Path
@@ -66,16 +67,22 @@ class ReleaseActivityHandler:
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # F-08: every branch does blocking helm/argocd/gitops subprocess work through
+        # sync helpers; run each off the event loop in a worker thread rather than
+        # converting the whole synchronous call graph to async/await.
         if step == "deployment.render":
-            return self._render(payload)
+            return await asyncio.to_thread(self._render, payload)
         if step == "recovery.execute":
-            return self._recover(payload)
+            return await asyncio.to_thread(self._recover, payload)
         if step in {"preview.preflight", "staging.preflight"}:
-            return self._preflight(payload)
+            return await asyncio.to_thread(self._preflight, payload)
         if step == "preview.verify":
-            return self._verify_preview(payload)
+            return await asyncio.to_thread(self._verify_preview, payload)
         if step not in {"preview.deploy", "staging.deploy"}:
             raise ApplicationError("unsupported release activity", non_retryable=True)
+        return await asyncio.to_thread(self._deploy, payload)
+
+    def _deploy(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw_plan = payload.get("release_plan")
         approval = payload.get("approval_validation")
         if not isinstance(raw_plan, dict) or not isinstance(approval, dict):

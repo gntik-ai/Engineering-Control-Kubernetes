@@ -13,6 +13,7 @@ from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
 
 from .browser import BrowserActivityHandler
+from .connections import ConnectionsActivityHandler
 from .delivery import DeliveryActivityHandler
 from .engineering import EngineeringActivityHandler
 from .github import GitHubActivityHandler
@@ -146,6 +147,7 @@ class ControlActivities:
         "recovery.record_failure",
         "quota.refresh",
         "quota.persist",
+        "connections.refresh",
         "cleanup.discover",
         "cleanup.protect_active",
         "cleanup.authorize",
@@ -455,6 +457,9 @@ class ControlActivities:
         self.github_handler = (
             GitHubActivityHandler(settings) if self.worker_kind == "github" else None
         )
+        self.connections_handler = (
+            ConnectionsActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -525,6 +530,11 @@ class ControlActivities:
             return await self.preview_cleanup_handler.handle(step, safe_payload)
         if self.release_handler is not None and step in self.release_handler.supported_steps:
             return await self.release_handler.handle(step, safe_payload)
+        if (
+            self.connections_handler is not None
+            and step in self.connections_handler.supported_steps
+        ):
+            return await self.connections_handler.handle(step, safe_payload)
         if self.provider_handler is not None:
             return await self.provider_handler.handle(step, safe_payload)
         if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:

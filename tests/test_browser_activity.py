@@ -45,6 +45,9 @@ class FailingBrowserRunner:
         assert executable == "node"
         return CommandResult(1, "", "synthetic runner failure")
 
+    async def run_async(self, executable: str, arguments: Any, **kwargs: Any) -> CommandResult:
+        return self.run(executable, arguments, **kwargs)
+
 
 @pytest.mark.asyncio
 async def test_superadmin_attestation_maps_product_timeout_to_runtime_health_blocker(

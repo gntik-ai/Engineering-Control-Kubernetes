@@ -101,6 +101,11 @@ class QuotaRefreshInput:
 
 
 @dataclass
+class ConnectionsRefreshInput:
+    scope: str = "all"
+
+
+@dataclass
 class CleanupInput:
     dry_run: bool = True
     retention_policy: str = "standard"
