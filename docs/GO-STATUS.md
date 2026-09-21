@@ -1,8 +1,9 @@
-# GO Status — updated 2026-09-21 05:20 UTC (1 item remains)
+# GO Status — updated 2026-09-21 07:00 UTC (1 item remains)
 
 ## Verdict
 
-**NO-GO by exactly one item.** 46 findings tracked; 20 FIXED. F-07 (Telegram notifications) and
+**NO-GO by exactly one item.** 46 findings tracked; 21 FIXED, 3 re-scoped NOT_APPLICABLE, 5
+UNVERIFIED (all backlog, none GO-blocking). F-07 (Telegram notifications) and
 NEW-07 (ungated audit skills reachable via the production gateway) are both closed and verified.
 F-29 (SSH password auth) was reverted after causing a real lockout incident and stays paused
 pending a safety prerequisite (see `.go-status/findings.json`), not GO-blocking. NEW-15 (a real
@@ -37,6 +38,28 @@ campaign's approval naturally expires: **~2026-09-21 22:32 UTC**.
    ```
    Confirm a real draft PR appears on `gntik-ai/llmwiki`.
 2. That's it. Every other finding, decision, and hand-off from this engagement is closed.
+
+## Idle-window backlog sweep (2026-09-21, before the retry window)
+
+With ~17h to wait before NEW-16's window opens, fixed and verified the rest of the safe,
+non-blocking backlog: F-15 (env-scrub gaps), F-25 (prompt-injection wrapping in maker/checker
+prompts), F-21 (duplicate `gh` CLI on the worker), NEW-06 (installed the Temporal CLI on both
+hosts), F-23 (hermes-gateway now exits cleanly on `systemctl stop/restart`, verified with a real
+restart). Re-scoped F-20 and F-24 to NOT_APPLICABLE (neither was a real gap on inspection).
+Refreshed evidence with no code change warranted on F-08, F-14, F-16, F-17, F-19, NEW-05, F-22.
+
+**One finding (F-11) turned up something worth flagging directly**: the currently-deployed
+release traces to a git commit that was unreachable from any branch in this repository — a
+dangling worktree tip from an earlier, abandoned automated "findings closure" effort (superseded
+by decision D7 on 2026-09-17) that built a more general Run/Campaign reconciler. That reconciler
+is live in production right now and independently confirms NEW-16's diagnosis (it's stuck
+reporting "unresolved" on the same operation, for the same underlying reason). The immediate
+data-loss risk is fixed — 28 preservation branches pushed to `origin` so a future `git gc` can't
+destroy that history — but two things need a real decision, not more unilateral fixing:
+whether to formally review/merge that abandoned reconciler work, and a second instance of NEW-11's
+stacked-`ConditionPathExists`-drop-in pattern found on `hermes-gateway.service` (20+ drop-ins,
+and the unit's own header says "not reviewed for activation" despite being live). Full detail in
+`.go-status/findings.json` (F-11).
 
 ## NEW-16's actual code fix (written, tested, not deployed)
 
