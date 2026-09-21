@@ -23,6 +23,7 @@ async def serve() -> None:
         activities=[activities.execute_control_step],
         max_concurrent_workflow_tasks=50,
         max_concurrent_activities=8,
+        build_id=settings.build_id,
     )
     await worker.run()
 

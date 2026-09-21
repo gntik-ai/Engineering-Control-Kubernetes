@@ -26,6 +26,7 @@ async def serve() -> None:
         workflows=[],
         activities=[activities.execute_control_step],
         max_concurrent_activities=spec.max_concurrent_activities,
+        build_id=settings.build_id,
     )
     heartbeat = WorkerHeartbeatPublisher(settings, f"{spec.kind}-runner")
     heartbeat_task = asyncio.create_task(heartbeat.serve())

@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     synthetic_mode: bool = False
     worker_kind: WorkerKind = "controller"
+    build_id: str | None = None
     notification_sink_url: str | None = None
     notification_token_file: Path | None = None
     notification_poll_seconds: int = Field(default=10, ge=2, le=300)

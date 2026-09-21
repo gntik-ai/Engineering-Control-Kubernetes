@@ -109,6 +109,28 @@ role entry in `worker_registry.py`, a new systemd unit or template instance, a n
 home, and a fresh `claude`/`codex` OAuth login for that identity (see below). Treat as a real
 code + ops change, not a config-only one.
 
+## Worker Build ID (F-11 (a))
+
+`Settings.build_id` (env `ENGINEERING_BUILD_ID`) is wired into both `Worker(...)` constructions
+(`workflows/worker.py`, `workflows/role_worker.py`) but is `None`/unset by default -- passing
+`build_id=None` to `Worker()` is a no-op, so this ships with zero behavior change until an
+operator opts in. It does **not** enable `use_worker_versioning` or Temporal's task-routing-based
+Worker Deployments feature -- it only tags each worker process with an identifier Temporal
+records and reports, closing the "zero Build ID configuration anywhere" half of F-11.
+
+To enable it on a deploy: set `ENGINEERING_BUILD_ID=<git commit hash of the deployed release>`
+(matching this repo's existing convention of naming release directories by commit hash) in the
+`EnvironmentFile=` stack for `engineering-temporal-worker.service` (controller) and each
+`engineering-worker@{codex,claude,browser,scan,delivery}.service` / `engineering-release-worker.service`
+(worker host), then restart those units. Not done automatically by this change -- it touches live
+systemd config on both hosts, so it's a deliberate operator step, not something applied here.
+
+Adopting full Worker Deployments versioning (per-workflow `VersioningBehavior`, registering and
+promoting deployment versions on each deploy via `temporal worker deployment set-current-version`)
+is a materially bigger decision -- it changes how in-flight workflow task routing works across a
+deploy, not just observability -- and was deliberately left for a separate decision rather than
+adopted silently here.
+
 ## Rotating an engine login
 
 ```
