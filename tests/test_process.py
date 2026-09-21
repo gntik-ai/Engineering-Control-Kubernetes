@@ -40,6 +40,11 @@ def test_subscription_environment_removes_api_paid_credentials(
         "MODEL_GATEWAY",
         "MODEL_ROUTER",
         "AWS_ACCESS_KEY_ID",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
     }
     for key in forbidden:
         monkeypatch.setenv(key, "fake")
@@ -56,6 +61,11 @@ def test_subscription_environment_rejects_every_forbidden_override() -> None:
         "LLM_BASE_URL",
         "MODEL_GATEWAY",
         "MODEL_ROUTER",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
     ):
         with pytest.raises(ValueError, match="forbidden"):
             subscription_only_environment("claude", {key: "fake"})
