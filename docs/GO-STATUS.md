@@ -180,10 +180,21 @@ now done.
   local Temporal dev server (via the `temporal` CLI already on PATH, no network needed) and
   `Replayer`, covering all 8 `workflow.patched()` call sites across `FinalClosureWorkflow` and
   `ExistingGitHubBacklogLoopWorkflow`, including the NEW-16 failure-recording path. F-11 is now
-  closed FIXED, flagged `needs_user_decision` for five things that are policy calls rather than
-  code gaps: Build ID versioning, a release retention policy, `api/service.py`'s unexplained
-  drift, a formal gateway-unit sign-off, and whether the wider 205-entry
-  `HERMES-FINDINGS-CLOSURE-20260901` cleanup is worth a dedicated pass. None of these block GO.
+  closed FIXED, flagged `needs_user_decision` for five follow-up items — two of which are already
+  resolved:
+  - **api/service.py's drift — fully explained, not open.** Traced it precisely with
+    `git log -S` / `git blame`: it was a documented NEW-12 hotfix (commit `50405bc4`, from earlier
+    in this same engagement) applied live to production and backported to git 24 minutes later.
+    That commit is an ancestor of tonight's deployed release; the live system has zero drift here.
+  - **Release retention policy — added.** `scripts/retention-releases.sh` keeps the 15
+    most-recently-modified release directories plus whichever is live, and refuses to delete
+    anything not git-reachable (the same safety property that caught the original data-loss risk).
+    Dry-run by default; verified working against the live host. Still your call whether to wire it
+    into cron for unattended runs or just run it manually.
+  - **Still genuinely open, policy calls not code gaps:** (a) whether to adopt worker Build ID
+    versioning, (d) a formal sign-off retracting `hermes-gateway.service`'s "not reviewed for
+    activation" status, (e) whether the wider 205-entry `HERMES-FINDINGS-CLOSURE-20260901` cleanup
+    is worth a dedicated pass. None of these block GO.
 
 Ruff, mypy, and the full test suite (766 tests) pass clean on this branch.
 
