@@ -163,13 +163,13 @@ def parser() -> argparse.ArgumentParser:
                 default="source-pr",
             )
     r3_candidate = commands.add_parser("r3-candidate")
-    r3_candidate.add_argument("project", choices=("musematic",))
-    r3_candidate.add_argument("surface", choices=("source",))
-    r3_candidate.add_argument("issue_number", type=int, choices=(1119,))
+    r3_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    r3_candidate.add_argument("surface", choices=("source", "deployment"))
+    r3_candidate.add_argument("issue_number", type=int)
     r3_approve = commands.add_parser("r3-approve")
-    r3_approve.add_argument("project", choices=("musematic",))
-    r3_approve.add_argument("surface", choices=("source",))
-    r3_approve.add_argument("issue_number", type=int, choices=(1119,))
+    r3_approve.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    r3_approve.add_argument("surface", choices=("source", "deployment"))
+    r3_approve.add_argument("issue_number", type=int)
     r3_approve.add_argument("binding")
     r3_approve.add_argument("confirmation_phrase")
     commands.add_parser("findings").add_argument("--limit", type=int, default=50)
@@ -241,6 +241,12 @@ def parser() -> argparse.ArgumentParser:
     backlog_approve.add_argument("approval_binding")
     backlog_approve.add_argument(
         "typed_confirmation", choices=("APPROVE_EXISTING_GITHUB_BACKLOG_LOOP",)
+    )
+    backlog_release_ownership = commands.add_parser("backlog-release-ownership")
+    backlog_release_ownership.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    backlog_release_ownership.add_argument("campaign_id")
+    backlog_release_ownership.add_argument(
+        "typed_confirmation", choices=("RELEASE_GITHUB_WRITE_POLICY_OWNERSHIP",)
     )
     backlog_start = commands.add_parser("backlog-start")
     backlog_start.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
@@ -586,6 +592,15 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             {
                 "project": arguments.project,
                 "approval_binding": arguments.approval_binding,
+                "typed_confirmation": arguments.typed_confirmation,
+            },
+        )
+    if command == "backlog-release-ownership":
+        return client.request(
+            "POST",
+            f"/v1/backlogs/{arguments.campaign_id}/release-ownership",
+            {
+                "project": arguments.project,
                 "typed_confirmation": arguments.typed_confirmation,
             },
         )

@@ -194,6 +194,70 @@ def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+def _r3_delivery_briefing(manifest: ProjectManifest, surface: str) -> dict[str, Any]:
+    """Build the project-specific fields of an R3 approval briefing from its manifest.
+
+    Grounded in each project's real deployment strategy rather than one hardcoded
+    (originally musematic-only) template: argocd's verification/rollback steps match
+    musematic's actual ArgoCD sync semantics (proven -- this route has real approval
+    history under exactly this content); helm's match falcone's actual
+    FalconeReleaseAdapter.verify()/rollback() checks (deployed-status + immutable-digest
+    presence; helm rollback with an exact-manifest-restoration check); repo-local-manifest
+    (llmwiki-staging) has no production counterpart and no real R3 approval history yet,
+    so its checklist is deliberately generic and should get a first real dry run before
+    being trusted the way musematic's has been.
+    """
+    repository = (
+        manifest.repositories.source if surface == "source" else manifest.repositories.deployment
+    ).full_name
+    workflow = next(
+        (item for item in manifest.deployment.build_workflows if item.repository == repository),
+        manifest.deployment.build_workflows[0],
+    )
+    build_workflow = f"{workflow.repository}/.github/workflows/{workflow.workflow}"
+    build_contract_state = (
+        "READY" if workflow.enabled else (workflow.blocker or "CANDIDATE_BUILD_CONTRACT_MISSING")
+    )
+    strategy = manifest.deployment.strategy
+    if strategy == "argocd":
+        return {
+            "build_workflow": build_workflow,
+            "build_contract_state": build_contract_state,
+            "delivery_adapter": f"argocd:{manifest.deployment.argocd_application}",
+            "verification": [
+                "Argo-Synced-and-Healthy",
+                "identity-endpoint-200",
+                "negative-tenant-controls",
+                "final-provenance",
+            ],
+            "rollback": "revert-protected-GitOps-change-and-reconcile",
+        }
+    if strategy == "helm":
+        return {
+            "build_workflow": build_workflow,
+            "build_contract_state": build_contract_state,
+            "delivery_adapter": f"helm:{manifest.deployment.helm_release}",
+            "verification": [
+                "helm-release-deployed-with-approved-image-digests",
+                "identity-endpoint-200",
+                "negative-tenant-controls",
+                "final-provenance",
+            ],
+            "rollback": "helm-rollback-to-prior-revision-and-verify-exact-manifest-restored",
+        }
+    return {
+        "build_workflow": build_workflow,
+        "build_contract_state": build_contract_state,
+        "delivery_adapter": f"repo-local-manifest:{manifest.deployment.adapter}",
+        "verification": [
+            "staging-manifest-applied",
+            "identity-endpoint-200",
+            "negative-tenant-controls",
+        ],
+        "rollback": "revert-repo-local-manifest-and-reapply-staging-bootstrap",
+    }
+
+
 class OperationsRepository:
     """Durable operation store. It never reads service or provider credentials."""
 
@@ -257,8 +321,21 @@ class OperationsRepository:
         issue_number: int,
         create: bool = True,
     ) -> dict[str, Any]:
-        if (project, surface, issue_number) != ("musematic", "source", 1119):
-            raise ValueError("R3 approval route is bound to musematic source issue 1119")
+        if project not in {"falcone", "musematic", "llmwiki"}:
+            raise ValueError("R3 approval project is not allowlisted")
+        if surface not in {"source", "deployment"}:
+            raise ValueError("R3 approval surface is not allowlisted")
+        if issue_number < 1:
+            raise ValueError("R3 approval issue number is invalid")
+        try:
+            manifest = self._load_project_manifest(project)
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError) as error:
+            raise ValueError("R3 approval project contract is unconfigured or invalid") from error
+        repositories = manifest.repositories
+        expected_repository = (
+            repositories.source if surface == "source" else repositories.deployment
+        ).full_name
+        briefing = _r3_delivery_briefing(manifest, surface)
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
             issue = session.scalar(
@@ -278,7 +355,7 @@ class OperationsRepository:
             )
             if issue is None or issue.calculated_risk != "R3":
                 raise ValueError("current backlog issue is not an approval-bound R3 issue")
-            if issue.repository != "gntik-ai/musematic":
+            if issue.repository != expected_repository:
                 raise ValueError("R3 approval issue repository binding changed")
             campaign = session.get(GitHubBacklogCampaign, issue.backlog_campaign_id)
             if campaign is None:
@@ -310,20 +387,11 @@ class OperationsRepository:
                     "ci-inspect",
                     "protected-merge-after-gates",
                 ],
-                "build_workflow": "gntik-ai/musematic/.github/workflows/deploy.yml",
-                "build_contract_state": "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
                 "environment": "staging",
-                "delivery_adapter": "argocd:musematic-platform",
-                "verification": [
-                    "Argo-Synced-and-Healthy",
-                    "identity-endpoint-200",
-                    "negative-tenant-controls",
-                    "final-provenance",
-                ],
-                "rollback": "revert-protected-GitOps-change-and-reconcile",
                 "implementation_correction_limit": 5,
                 "deployment_correction_limit": 3,
                 "production": False,
+                **briefing,
             }
             existing_rows = session.scalars(
                 select(ActionCandidate)
@@ -1003,32 +1071,44 @@ class OperationsRepository:
             binding,
         )
 
-    def _full_delivery_blockers(self, project: str) -> list[str]:
-        blockers: list[str] = []
+    def _load_project_manifest(self, project: str) -> ProjectManifest:
+        """Load and validate one project's contract from project_config_root.
+
+        Raises ValueError (with the project contract unconfigured/invalid distinction
+        collapsed) on any missing, symlinked, oversized, or otherwise unsafe manifest --
+        callers that need a fine-grained blocker code should catch OSError/ValueError/
+        yaml.YAMLError separately, as _full_delivery_blockers does below.
+        """
         root = self.project_config_root
         if root is None:
-            return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED"]
-
+            raise ValueError("project contract root is not configured")
         path = root / f"{project}.yaml"
+        if root.is_symlink() or path.is_symlink():
+            raise ValueError("project contract cannot be a symlink")
+        resolved_root = root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        metadata = resolved_path.stat()
+        if (
+            resolved_path.parent != resolved_root
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & 0o022
+            or metadata.st_size > 512 * 1024
+        ):
+            raise ValueError("project contract metadata is unsafe")
+        raw = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
+        manifest = ProjectManifest.model_validate(raw)
+        if manifest.project != project:
+            raise ValueError("project contract identity mismatch")
+        return manifest
+
+    def _full_delivery_blockers(self, project: str) -> list[str]:
+        blockers: list[str] = []
         try:
-            if root.is_symlink() or path.is_symlink():
-                raise ValueError("project contract cannot be a symlink")
-            resolved_root = root.resolve(strict=True)
-            resolved_path = path.resolve(strict=True)
-            metadata = resolved_path.stat()
-            if (
-                resolved_path.parent != resolved_root
-                or not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_mode & 0o022
-                or metadata.st_size > 512 * 1024
-            ):
-                raise ValueError("project contract metadata is unsafe")
-            raw = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
-            manifest = ProjectManifest.model_validate(raw)
-            if manifest.project != project:
-                raise ValueError("project contract identity mismatch")
+            manifest = self._load_project_manifest(project)
             policy = DeliveryControlPolicy.model_validate(manifest.delivery_control)
         except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+            if self.project_config_root is None:
+                return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED"]
             return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_INVALID"]
 
         if not policy.candidate_build.enabled:

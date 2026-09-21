@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -26,6 +27,7 @@ from engineering_control.operations.repository import (
     _global_inventory_approval_current,
 )
 
+PROJECT_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config" / "projects"
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 GLOBAL_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 FALCONE_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -196,7 +198,13 @@ async def test_global_campaign_is_sequential_retries_blocked_and_adopts_exact_r3
     tmp_path: Path,
 ) -> None:
     database_url = f"sqlite+pysqlite:///{tmp_path / 'global.db'}"
-    operations = OperationsRepository(database_url)
+    config_root = tmp_path / "projects.d"
+    config_root.mkdir()
+    for source in PROJECT_CONFIG_ROOT.glob("*.yaml"):
+        destination = config_root / source.name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o640)
+    operations = OperationsRepository(database_url, project_config_root=config_root)
     Base.metadata.create_all(operations.engine)
     with operations.sessions.begin() as session:
         session.add_all(

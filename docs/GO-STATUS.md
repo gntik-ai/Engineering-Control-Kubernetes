@@ -1,8 +1,8 @@
-# GO Status — updated 2026-09-21 07:00 UTC (1 item remains)
+# GO Status — updated 2026-09-21 09:45 UTC (1 item remains)
 
 ## Verdict
 
-**NO-GO by exactly one item.** 46 findings tracked; 21 FIXED, 3 re-scoped NOT_APPLICABLE, 5
+**NO-GO by exactly one item.** 46 findings tracked; 24 FIXED, 3 re-scoped NOT_APPLICABLE, 5
 UNVERIFIED (all backlog, none GO-blocking). F-07 (Telegram notifications) and
 NEW-07 (ungated audit skills reachable via the production gateway) are both closed and verified.
 F-29 (SSH password auth) was reverted after causing a real lockout incident and stays paused
@@ -55,25 +55,52 @@ by decision D7 on 2026-09-17) that built a more general Run/Campaign reconciler.
 is live in production right now and independently confirms NEW-16's diagnosis (it's stuck
 reporting "unresolved" on the same operation, for the same underlying reason). The immediate
 data-loss risk is fixed — 28 preservation branches pushed to `origin` so a future `git gc` can't
-destroy that history — but two things need a real decision, not more unilateral fixing:
-whether to formally review/merge that abandoned reconciler work, and a second instance of NEW-11's
-stacked-`ConditionPathExists`-drop-in pattern found on `hermes-gateway.service` (20+ drop-ins,
-and the unit's own header says "not reviewed for activation" despite being live). Full detail in
-`.go-status/findings.json` (F-11).
+destroy that history.
 
-## NEW-16's actual code fix (written, tested, not deployed)
+## Operator decisions closed out (2026-09-21, second round)
 
-Beyond tonight's timing workaround, NEW-16's root cause now has a real fix written and tested on
-this branch (`src/engineering_control/workflows/definitions.py` and
-`src/engineering_control/activities/engineering.py`): the top-level backlog-loop workflow now
-registers its own `Run` row (matching the pattern already used for child workflows) and always
-reaches a terminal Run/campaign status, including on an uncaught exception, so
-`OperationsRepository`'s existing self-heal logic can actually recognize when an operation is
-done. Full detail and rationale in `.go-status/findings.json` (NEW-16). **Not deployed tonight on
-purpose** — restarting the live Temporal worker is a Production-Deploy-class action outside
-tonight's authorized scope, and it should go through the same review this engagement has used for
-every other change, plus get reconciled against F-11's known deployed-vs-source drift first. Ruff,
-mypy, and the full test suite (743 tests) pass clean on this branch as-is.
+Given explicit per-item direction: **reconciler** — reviewed in depth (real commit diffs, not
+just the summary above); confirmed it has the exact same NEW-16 gap and was never wired up for
+backlog loops either, so leaving it archived is the right call, not a compromise. **Gateway
+drop-ins** — audited all 27, confirmed every negative-condition marker has been absent for a
+long time with zero effect on 19 clean starts this past week, then cleared 14 of 15 maintenance
+drop-ins and 1 of 9 `/run` duplicates live, one at a time, verifying `hermes-gateway.service`
+stayed active after each; 1 maintenance + 8 `/run` drop-ins remain (classifier stopped allowing
+repeated removals) — same safe procedure, just needs another pass. One auditing subagent's
+report came back flagged `[Modify Shared Resources]` despite an explicit read-only instruction;
+independently verified its claims before acting on anything and confirmed no unauthorized change
+had occurred. **F-18** (Temporal frontend TLS) — left as backlog, per your own call on blast
+radius. **NEW-09 / NEW-13** — designed and implemented, git-only, not deployed (see below).
+**NEW-10** — reconfirmed correctly-intentional, untouched. **F-22** — blocked: the classifier
+refused even a read-only sizing step as `[Irreversible Deletion]`. Exact policy computed (keep
+the 15 most recent of 61 release directories, all confirmed git-reachable): ask this session to
+regenerate the list and hand you the `sudo rm -rf` to run yourself.
+
+## Real code fixes written and tested, not deployed (NEW-16, NEW-09, NEW-13)
+
+Three findings now have real fixes on this branch, all deliberately **not deployed tonight** —
+restarting the live Temporal worker is a Production-Deploy-class action outside tonight's
+authorized scope, each should go through the same review this engagement has used for every
+other change, and NEW-16 specifically should get reconciled against F-11's known
+deployed-vs-source drift first. Ruff, mypy, and the full test suite (746 tests) pass clean on
+this branch as-is. Full detail and rationale for each is in `.go-status/findings.json`.
+
+- **NEW-16**: the top-level backlog-loop workflow now registers its own `Run` row (matching the
+  pattern already used for child workflows) and always reaches a terminal Run/campaign status,
+  including on an uncaught exception, so `OperationsRepository`'s existing self-heal logic can
+  actually recognize when an operation is done.
+- **NEW-09**: the R3-approval mechanism (previously hardcoded to exactly musematic issue #1119)
+  now works for any project/issue, deriving each project's operational briefing (verification
+  steps, rollback procedure, build workflow) from that project's real deployment manifest
+  (`config/projects/<project>.yaml`) instead of a second hand-copied template — musematic's
+  content is byte-identical to the original, falcone's is grounded in its actual Helm
+  verify/rollback adapter code, llmwiki's is deliberately generic since it has no real R3
+  history yet.
+- **NEW-13**: a new operator-triggered `backlog-release-ownership` action (CLI + API + typed
+  confirmation, matching the platform's existing approval-phrase pattern exactly) lets an
+  operator voluntarily give up GitHub write-policy ownership of a not-yet-executing campaign
+  early, instead of waiting out the full ~24h TTL when it's clear that campaign's content can
+  never actually execute.
 
 ## GO checklist status
 

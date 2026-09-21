@@ -161,6 +161,11 @@ class BacklogApprovalRequest(APIModel):
     typed_confirmation: Literal["APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"]
 
 
+class BacklogOwnershipReleaseRequest(APIModel):
+    project: Literal["falcone", "musematic", "llmwiki"]
+    typed_confirmation: Literal["RELEASE_GITHUB_WRITE_POLICY_OWNERSHIP"]
+
+
 class ExistingBacklogLoopStart(APIModel):
     project: Literal["falcone", "musematic", "llmwiki"]
     backlog_campaign_id: UUID
@@ -215,11 +220,13 @@ class AutonomousBacklogStart(APIModel):
 
 
 class R3IssueApprovalRequest(APIModel):
-    project: Literal["musematic"]
-    surface: Literal["source"]
-    issue_number: Literal[1119]
+    project: Literal["falcone", "musematic", "llmwiki"]
+    surface: Literal["source", "deployment"]
+    issue_number: int = Field(ge=1)
     binding: str = Field(pattern=r"^[a-f0-9]{64}$")
-    confirmation_phrase: str = Field(pattern=r"^APPROVE_R3_MUSEMATIC_1119_[A-F0-9]{16}$")
+    confirmation_phrase: str = Field(
+        pattern=r"^APPROVE_R3_(FALCONE|MUSEMATIC|LLMWIKI)_[0-9]+_[A-F0-9]{16}$"
+    )
 
 
 class LoopPlanDispatch(APIModel):

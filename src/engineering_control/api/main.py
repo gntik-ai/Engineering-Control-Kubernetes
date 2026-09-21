@@ -21,6 +21,7 @@ from engineering_control.api.schemas import (
     BacklogDeliveryApprovalRequest,
     BacklogImportAccepted,
     BacklogIssueAction,
+    BacklogOwnershipReleaseRequest,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
@@ -504,9 +505,9 @@ def create_app(
 
     @app.get("/v1/r3-issues/candidate")
     async def r3_issue_candidate_get(
-        project: str = Query(pattern=r"^musematic$"),
-        surface: str = Query(pattern=r"^source$"),
-        issue_number: int = Query(ge=1119, le=1119),
+        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        surface: str = Query(pattern=r"^(source|deployment)$"),
+        issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
         repository: OperationsRepository = operations_dependency,
     ) -> dict[str, Any]:
@@ -517,9 +518,9 @@ def create_app(
 
     @app.post("/v1/r3-issues/candidate", status_code=201)
     async def r3_issue_candidate_create(
-        project: str = Query(pattern=r"^musematic$"),
-        surface: str = Query(pattern=r"^source$"),
-        issue_number: int = Query(ge=1119, le=1119),
+        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        surface: str = Query(pattern=r"^(source|deployment)$"),
+        issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
         repository: OperationsRepository = operations_dependency,
     ) -> dict[str, Any]:
@@ -771,6 +772,23 @@ def create_app(
                 campaign_id,
                 body.project,
                 body.approval_binding,
+                approval_actor(subject),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/backlogs/{campaign_id}/release-ownership")
+    async def backlog_release_ownership(
+        campaign_id: UUID,
+        body: BacklogOwnershipReleaseRequest,
+        subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.release_backlog_ownership(
+                campaign_id,
+                body.project,
+                body.typed_confirmation,
                 approval_actor(subject),
             )
         except ValueError as error:

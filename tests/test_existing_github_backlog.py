@@ -19,6 +19,7 @@ from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_PROJECT_PAIRS,
+    BACKLOG_RELEASE_OWNERSHIP_PHRASE,
     BacklogApprovalBinding,
     BacklogFinalClosureEvidence,
     BacklogIssueType,
@@ -419,6 +420,152 @@ async def test_telegram_approval_queues_only_one_typed_root_policy_request(tmp_p
     ]
     assert (request_root / "activate.json").stat().st_mode & 0o777 == 0o600
     assert "token" not in request and "command" not in request
+
+
+def _plain_campaign(
+    campaign_id: UUID, project: str, source_repository: str, deployment_repository: str
+) -> GitHubBacklogCampaign:
+    return GitHubBacklogCampaign(
+        id=campaign_id,
+        project=project,
+        source_repository=source_repository,
+        deployment_repository=deployment_repository,
+        imported_at=NOW,
+        issue_query="state:open",
+        import_filter="bugs-and-docs",
+        source_default_branch="main",
+        deployment_default_branch="main",
+        source_head_at_import="a" * 40,
+        deployment_head_at_import="b" * 40,
+        issue_count=1,
+        eligible_count=1,
+        deferred_count=0,
+        duplicate_count=0,
+        stale_count=0,
+        already_fixed_count=0,
+        existing_pr_count=0,
+        blocked_count=0,
+        dependency_graph_hash="c" * 64,
+        plan_hash="d" * 64,
+        approval_binding=None,
+        approval_json={},
+        maximum_risk=None,
+        maximum_items=1,
+        maximum_concurrency=1,
+        delivery_mode=None,
+        include_enhancements=False,
+        status="PLANNED",
+        workflow_id=f"backlog-import-{project}-{campaign_id}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_ownership_frees_the_active_owner_slot_early(tmp_path) -> None:
+    request_root = tmp_path / "policy-requests"
+    request_root.mkdir(mode=0o700)
+    repository = SQLMetadataRepository(
+        f"sqlite:///{tmp_path / 'metadata.sqlite'}",
+        github_policy_request_root=request_root,
+    )
+    Base.metadata.create_all(repository.engine)
+    owner_id = UUID("11111111-1111-4111-8111-111111111111")
+    inventory_id = UUID("22222222-2222-4222-8222-222222222222")
+    fresh_id = UUID("33333333-3333-4333-8333-333333333333")
+    with repository.sessions.begin() as session:
+        session.add(
+            _plain_campaign(owner_id, "falcone", "gntik-ai/falcone", "gntik-ai/falcone-charts")
+        )
+
+    owner_candidate = await repository.prepare_backlog_approval(
+        owner_id,
+        BacklogApprovalCandidateRequest(
+            project="falcone", delivery_mode="full-delivery", maximum_risk="R2", maximum_items=1
+        ),
+    )
+    owner_approved = await repository.approve_backlog_campaign(
+        owner_id, "falcone", owner_candidate["approval_binding"], "telegram:42"
+    )
+    assert owner_approved["status"] == "APPROVED_POLICY_PENDING"
+
+    # Simulate the root reconciler promoting the queued owner (matching the established
+    # pattern in test_global_inventory_approval_reuses_the_active_shared_policy below --
+    # nothing in this test process actually consumes activate.json).
+    (request_root / "activate.json").unlink()
+    with repository.sessions.begin() as session:
+        owner = session.get(GitHubBacklogCampaign, owner_id)
+        assert owner is not None
+        owner.status = "APPROVED"
+        owner.approval_json = {
+            key: value for key, value in owner.approval_json.items() if key != "policy_role"
+        }
+
+    with repository.sessions.begin() as session:
+        session.add(
+            _plain_campaign(
+                inventory_id, "musematic", "gntik-ai/musematic", "gntik-ai/musematic-deploy"
+            )
+        )
+    inventory_candidate = await repository.prepare_backlog_approval(
+        inventory_id,
+        BacklogApprovalCandidateRequest(
+            project="musematic", delivery_mode="full-delivery", maximum_risk="R2", maximum_items=1
+        ),
+    )
+    inventory_approved = await repository.approve_backlog_campaign(
+        inventory_id, "musematic", inventory_candidate["approval_binding"], "telegram:42"
+    )
+    assert inventory_approved["status"] == "APPROVED_INVENTORY"
+
+    # Wrong actor and wrong phrase are both rejected before anything changes.
+    with pytest.raises(ValueError, match="reauthenticated operator"):
+        await repository.release_backlog_ownership(
+            owner_id, "falcone", BACKLOG_RELEASE_OWNERSHIP_PHRASE, "forged:actor"
+        )
+    with pytest.raises(ValueError, match="exact typed confirmation"):
+        await repository.release_backlog_ownership(
+            owner_id, "falcone", "WRONG_PHRASE", "telegram:42"
+        )
+    # A campaign that only holds "inventory" role has nothing to release.
+    with pytest.raises(ValueError, match="does not currently hold ownership"):
+        await repository.release_backlog_ownership(
+            inventory_id, "musematic", BACKLOG_RELEASE_OWNERSHIP_PHRASE, "telegram:42"
+        )
+
+    released = await repository.release_backlog_ownership(
+        owner_id, "falcone", BACKLOG_RELEASE_OWNERSHIP_PHRASE, "telegram:42"
+    )
+    assert released == {
+        "status": "CANCELLED",
+        "backlog_campaign_id": str(owner_id),
+        "policy_activation": "OWNERSHIP_RELEASED",
+    }
+    with repository.sessions() as session:
+        cancelled = session.get(GitHubBacklogCampaign, owner_id)
+        assert cancelled.status == "CANCELLED"
+        assert cancelled.approval_json["released_by"] == "telegram:42"
+
+    # Releasing again fails closed -- it's already terminal, not pending/approved.
+    with pytest.raises(ValueError, match="only a not-yet-executing owner campaign"):
+        await repository.release_backlog_ownership(
+            owner_id, "falcone", BACKLOG_RELEASE_OWNERSHIP_PHRASE, "telegram:42"
+        )
+
+    # A brand-new campaign now becomes owner immediately, without waiting on any TTL.
+    with repository.sessions.begin() as session:
+        session.add(
+            _plain_campaign(fresh_id, "falcone", "gntik-ai/falcone", "gntik-ai/falcone-charts")
+        )
+    fresh_candidate = await repository.prepare_backlog_approval(
+        fresh_id,
+        BacklogApprovalCandidateRequest(
+            project="falcone", delivery_mode="full-delivery", maximum_risk="R2", maximum_items=1
+        ),
+    )
+    fresh_approved = await repository.approve_backlog_campaign(
+        fresh_id, "falcone", fresh_candidate["approval_binding"], "telegram:42"
+    )
+    assert fresh_approved["status"] == "APPROVED_POLICY_PENDING"
+    assert fresh_approved["policy_activation"] == "QUEUED_ROOT_RECONCILER"
 
 
 @pytest.mark.asyncio

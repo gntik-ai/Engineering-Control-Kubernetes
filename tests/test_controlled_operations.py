@@ -515,6 +515,158 @@ def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
     ]
 
 
+def _seed_r3_issue(
+    repository: OperationsRepository,
+    *,
+    campaign_id: UUID,
+    project: str,
+    source_repository: str,
+    deployment_repository: str,
+    issue_number: int,
+) -> None:
+    now = datetime.now(UTC)
+    with repository.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=campaign_id,
+                project=project,
+                source_repository=source_repository,
+                deployment_repository=deployment_repository,
+                imported_at=now,
+                issue_query="is:issue is:open",
+                import_filter="bugs-and-docs",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=1,
+                eligible_count=0,
+                deferred_count=1,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                approval_binding=None,
+                approval_json={},
+                maximum_risk=None,
+                maximum_items=1,
+                maximum_concurrency=1,
+                delivery_mode=None,
+                include_enhancements=False,
+                status="PLANNED",
+                workflow_id=f"backlog-import-r3-{project}",
+            )
+        )
+        session.add(
+            BacklogIssueRecord(
+                backlog_campaign_id=campaign_id,
+                repository=source_repository,
+                issue_number=issue_number,
+                issue_url_reference=f"https://github.com/{source_repository}/issues/{issue_number}",
+                title="Bounded synthetic R3 issue",
+                state="OPEN",
+                labels_json=["bug"],
+                milestone=None,
+                issue_type="PRODUCT_BUG",
+                openspec_kind=None,
+                severity="critical",
+                calculated_risk="R3",
+                component="api",
+                source_or_deployment_owner="source",
+                documentation_levels_json=[],
+                dependencies_json=[],
+                blocking_issues_json=[],
+                issues_blocked_json=[],
+                linked_prs_json=[],
+                linked_branches_json=[],
+                linked_commits_json=[],
+                duplicate_candidates_json=[],
+                current_source_reproduction="REPRODUCED_CURRENT_SOURCE",
+                current_runtime_reproduction="NOT_REQUIRED",
+                current_runtime_required=False,
+                reproduction_mode="SOURCE_ONLY",
+                candidate_status="READY",
+                eligibility_status="DEFERRED",
+                eligibility_reason="R3_REQUIRES_OPERATOR",
+                planned_wave="W1",
+                planned_order=1,
+                finding_id=None,
+                change_set_id=None,
+                delivery_status="NOT_STARTED",
+                final_closure_status="OPEN",
+                documentation_impact="DOCUMENTATION_NOT_REQUIRED_WITH_EVIDENCE",
+                body_sha256="e" * 64,
+                github_updated_at=now,
+                github_snapshot_json={},
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_r3_issue_candidate_is_generalized_across_all_three_projects(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_r3_issue(
+        repository,
+        campaign_id=UUID("44444444-4444-4444-8444-444444444444"),
+        project="falcone",
+        source_repository="gntik-ai/falcone",
+        deployment_repository="gntik-ai/falcone-charts",
+        issue_number=953,
+    )
+    _seed_r3_issue(
+        repository,
+        campaign_id=UUID("55555555-5555-4555-8555-555555555555"),
+        project="musematic",
+        source_repository="gntik-ai/musematic",
+        deployment_repository="gntik-ai/musematic-deploy",
+        issue_number=1119,
+    )
+    _seed_r3_issue(
+        repository,
+        campaign_id=UUID("66666666-6666-4666-8666-666666666666"),
+        project="llmwiki",
+        source_repository="gntik-ai/llmwiki",
+        deployment_repository="gntik-ai/llmwiki",
+        issue_number=7,
+    )
+
+    falcone = await repository.r3_issue_candidate("falcone", "source", 953)
+    assert falcone["candidate"]["delivery_adapter"].startswith("helm:")
+    assert "helm-release-deployed-with-approved-image-digests" in (
+        falcone["candidate"]["verification"]
+    )
+    assert falcone["candidate"]["rollback"] == (
+        "helm-rollback-to-prior-revision-and-verify-exact-manifest-restored"
+    )
+    assert falcone["confirmation_phrase"].startswith("APPROVE_R3_FALCONE_953_")
+
+    musematic = await repository.r3_issue_candidate("musematic", "source", 1119)
+    assert musematic["candidate"]["delivery_adapter"] == "argocd:musematic-platform"
+    assert "Argo-Synced-and-Healthy" in musematic["candidate"]["verification"]
+    assert musematic["candidate"]["rollback"] == "revert-protected-GitOps-change-and-reconcile"
+    assert musematic["confirmation_phrase"].startswith("APPROVE_R3_MUSEMATIC_1119_")
+
+    llmwiki = await repository.r3_issue_candidate("llmwiki", "source", 7)
+    assert llmwiki["candidate"]["delivery_adapter"].startswith("repo-local-manifest:")
+    assert "staging-manifest-applied" in llmwiki["candidate"]["verification"]
+    assert llmwiki["confirmation_phrase"].startswith("APPROVE_R3_LLMWIKI_7_")
+
+
+def test_r3_issue_candidate_rejects_unknown_project_and_fails_closed_without_manifest(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="not allowlisted"):
+        OperationsRepository._r3_issue_candidate(Mock(), "not-a-real-project", "source", 1)
+    unconfigured = OperationsRepository(f"sqlite+pysqlite:///{tmp_path / 'unconfigured.db'}")
+    with pytest.raises(ValueError, match="unconfigured or invalid"):
+        unconfigured._r3_issue_candidate("falcone", "source", 1)
+
+
 def test_audit_publication_is_opt_in_and_full_audit_requires_phrase() -> None:
     command = AuditStartCommand(project="musematic", preset="full-e2e", environment="staging")
     assert command.publish_findings is False

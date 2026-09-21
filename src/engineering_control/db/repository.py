@@ -43,6 +43,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
+    BACKLOG_RELEASE_OWNERSHIP_PHRASE,
     approval_binding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
@@ -108,6 +109,9 @@ class MetadataRepository(Protocol):
     ) -> dict[str, Any]: ...
     async def approve_backlog_campaign(
         self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]: ...
+    async def release_backlog_ownership(
+        self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
     ) -> dict[str, Any]: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
     async def list_findings(self, limit: int) -> list[dict[str, Any]]: ...
@@ -765,6 +769,55 @@ class SQLMetadataRepository:
             self._write_github_policy_request(request)
         return result
 
+    async def release_backlog_ownership(
+        self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._release_backlog_ownership, campaign_id, project, typed_confirmation, actor
+        )
+
+    def _release_backlog_ownership(
+        self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
+    ) -> dict[str, Any]:
+        """Let an operator voluntarily give up GitHub write-policy ownership early.
+
+        NEW-13: ownership otherwise only ever changes hands via a ~24h TTL expiry, so a
+        campaign whose content can never actually execute (e.g. R3-only) blocks every
+        other campaign for its full window. This cancels the CURRENT owner (only while
+        it hasn't started executing yet -- a RUNNING/PAUSED campaign needs an explicit
+        cancel, not a casual ownership release), which removes it from the active-owner
+        set computed in _approve_backlog_campaign. It does not retroactively promote any
+        other campaign -- the next fresh backlog-approve simply finds no active owner.
+        """
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("backlog ownership release requires a reauthenticated operator")
+        if typed_confirmation != BACKLOG_RELEASE_OWNERSHIP_PHRASE:
+            raise ValueError("backlog ownership release requires its exact typed confirmation")
+        with self.sessions.begin() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
+            campaign = session.get(GitHubBacklogCampaign, campaign_id)
+            if campaign is None or campaign.project != project:
+                raise ValueError("backlog campaign does not exist")
+            if campaign.approval_json.get("policy_role") not in {None, "owner"}:
+                raise ValueError("backlog campaign does not currently hold ownership")
+            if campaign.status not in {"APPROVED_POLICY_PENDING", "APPROVED"}:
+                raise ValueError(
+                    "only a not-yet-executing owner campaign's ownership can be released "
+                    "-- cancel a running campaign instead"
+                )
+            campaign.status = "CANCELLED"
+            campaign.approval_json = {
+                **campaign.approval_json,
+                "released_by": actor,
+                "released_at": datetime.now(UTC).isoformat(),
+            }
+        return {
+            "status": "CANCELLED",
+            "backlog_campaign_id": str(campaign_id),
+            "policy_activation": "OWNERSHIP_RELEASED",
+        }
+
     def _write_github_policy_request(self, request: dict[str, Any]) -> None:
         root = self.github_policy_request_root
         metadata = root.stat()
@@ -1416,6 +1469,11 @@ class EmptyMetadataRepository:
 
     async def approve_backlog_campaign(
         self, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        raise ValueError("backlog metadata store is unavailable")
+
+    async def release_backlog_ownership(
+        self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
     ) -> dict[str, Any]:
         raise ValueError("backlog metadata store is unavailable")
 
