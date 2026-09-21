@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+import engineering_control.activities.delivery as delivery_module
 from engineering_control.activities.delivery import DeliveryActivityHandler
 from engineering_control.adapters.command import CommandResult
 from engineering_control.config import Settings
@@ -350,3 +351,47 @@ async def test_finding_publication_rejects_unsafe_write_validation_target(
     )
     assert result["status"] == "BLOCKED_BY_POLICY"
     assert result["reason_code"] == "POLICY_INVALID"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "expected_method"),
+    [
+        ("finding.dedupe", "_dedupe_finding"),
+        ("enhancement.github_dedupe", "_dedupe_enhancement"),
+        ("reconcile.inspect_ci", "_inspect_ci"),
+        ("final.inspect_artifact", "_inspect_final_artifact"),
+    ],
+)
+async def test_delivery_dispatch_runs_blocking_github_cli_steps_off_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    step: str,
+    expected_method: str,
+) -> None:
+    """F-08: these steps all end up calling GhCliBroker methods, which block on a real
+    gh/git subprocess for up to their configured timeout. Confirm handle() schedules the
+    actual work via asyncio.to_thread rather than running it inline on the event loop --
+    a real functional test of each method's business logic already exists elsewhere;
+    this one specifically locks in the dispatch wiring. (Steps that also require a
+    configured GitHub write policy -- final.merge_source/deployment, final.comment_issue,
+    final.close_issue, enhancement/finding.publish -- use the exact same
+    `await asyncio.to_thread(self._method, payload)` pattern and are covered by their own
+    existing functional tests elsewhere in this file.)
+    """
+    handler = DeliveryActivityHandler(
+        Settings(project_config_root=tmp_path / "projects.d", run_root=tmp_path / "runs"),
+        FakePublicationRunner("main", {}),  # type: ignore[arg-type]
+    )
+    calls: list[str] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(getattr(func, "__name__", str(func)))
+        return {"status": "OK"}
+
+    monkeypatch.setattr(delivery_module.asyncio, "to_thread", fake_to_thread)
+
+    result = await handler.handle(step, {"status": "PENDING"})
+
+    assert calls == [expected_method]
+    assert result == {"status": "OK"}

@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from temporalio.exceptions import ApplicationError
 
+import engineering_control.activities.scan as scan_module
 from engineering_control.activities.retention import cleanup_authorization_sha256
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandResult
@@ -406,3 +407,38 @@ async def test_cleanup_protects_dirty_and_executes_only_controller_authorization
     )
     assert result["removed_lease_ids"] == [str(lease_id)]
     assert manager.cleaned == [str(path)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "expected_method"),
+    [
+        ("project.snapshot_pair", "_snapshot_pair"),
+        ("runtime.deterministic_checks", "_runtime_deterministic_checks"),
+        ("identity.observer_attest", "_observer_attestation"),
+        ("reconcile.apply_promotion", "_apply_promotion"),
+        ("delivery.deterministic_prechecks", "_delivery_prechecks"),
+        ("delivery.validate_changeset", "_validate_changeset"),
+    ],
+)
+async def test_scan_dispatch_runs_blocking_kubectl_and_scanner_steps_off_the_event_loop(
+    step: str, expected_method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-08: these steps all end up calling kubectl (via KubernetesObserver), git (via
+    the promotion runner), or gitleaks/trivy/semgrep/syft (via DeterministicScanner) --
+    all blocking subprocess calls through SafeCommandRunner. Confirm handle() schedules
+    the actual work via asyncio.to_thread rather than running it inline on the event loop.
+    """
+    handler = ScanActivityHandler(Settings())  # type: ignore[arg-type]
+    calls: list[str] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(getattr(func, "__name__", str(func)))
+        return {"status": "OK"}
+
+    monkeypatch.setattr(scan_module.asyncio, "to_thread", fake_to_thread)
+
+    result = await handler.handle(step, {"status": "PENDING"})
+
+    assert calls == [expected_method]
+    assert result == {"status": "OK"}
