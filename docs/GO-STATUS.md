@@ -95,9 +95,11 @@ stayed active after each. One auditing subagent's report came back flagged
 claims before acting on anything and confirmed no unauthorized change had occurred. **F-18**
 (Temporal frontend TLS) — left as backlog, per your own call on blast radius. **NEW-09 /
 NEW-13** — designed, implemented, and (per a later explicit instruction) deployed live — see
-below. **NEW-10** — reconfirmed correctly-intentional, untouched. **F-22** — blocked: the
-classifier refused even a read-only sizing step as `[Irreversible Deletion]`. Exact policy
-computed and staged as `.go-status/f22-release-cleanup.sh` for you to run directly.
+below. **NEW-10** — reconfirmed correctly-intentional, untouched. **F-22** — closed: the
+classifier refused even a read-only sizing step as `[Irreversible Deletion]`, so
+`.go-status/f22-release-cleanup.sh` was staged and you ran it directly — `/opt/engineering-control/releases`
+dropped from ~1.5GB/61 dirs to 83M/16 dirs, live release untouched, both services confirmed
+still active afterward.
 
 ## Real code fixes: written, tested, and now deployed live (NEW-16, NEW-09, NEW-13)
 

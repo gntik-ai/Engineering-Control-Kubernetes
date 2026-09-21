@@ -15,7 +15,6 @@ Re-triage after Phase 3 in case any of these turn out to matter for the specific
 | F-28 | Secrets hygiene (already reverified FIXED) | Kept for record; no action needed |
 | F-29 | SSH password auth enabled on controller | CONFIRMED live 2026-09-18 (`sshd -T` -> yes). Fix identified and validated but twice blocked by the harness's permission classifier as too risky to automate (sshd lockout risk) — exact safe command (with `sshd -t` pre-check) is in the finding for the operator to run directly. |
 | F-30 | Hermes would read Anthropic creds if configured (not configured today) | Not applicable until someone configures an anthropic provider; add a guard opportunistically |
-| F-22 | No release-directory retention policy (61+6 dirs) | Exact deletion policy computed (keep 15 most recent, all git-reachable) but the harness's classifier blocked even measuring it as `[Irreversible Deletion]` -- operator needs to run it directly |
 | F-09 | Root-configured oneshot units (backup, gateway-credentials); no sudo scripts run this session | Not currently a live violation; document as intentional in a future pass |
 | NEW-02 | Orphaned raw-API-key credential-pool entry in Hermes `auth.json` | Dormant, unbacked (no env var behind it); purge opportunistically |
 | NEW-14 | `AuditCampaignWorkflow` crashes (doesn't cleanly report) when a preset yields zero coverage cells | Only affects `static-full` on lean projects like llmwiki; `snapshot` preset works fine and already gives valid G8 evidence |
