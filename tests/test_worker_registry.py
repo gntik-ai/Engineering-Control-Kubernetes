@@ -16,8 +16,10 @@ from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
     GITHUB_TASK_QUEUE,
     ROLE_WORKER_REGISTRY,
+    WORKER_DEPLOYMENT_NAME,
     provider_task_queue,
     role_worker_spec,
+    worker_deployment_kwargs,
 )
 
 ROOT = Path(__file__).parents[1]
@@ -54,6 +56,26 @@ def test_role_worker_registry_is_complete_and_github_is_controller_only() -> Non
     assert ROLE_WORKER_REGISTRY["github"].task_queue == "engineering-github"
     assert all(
         spec.host == "worker" for kind, spec in ROLE_WORKER_REGISTRY.items() if kind != "github"
+    )
+
+
+def test_worker_deployment_kwargs_is_a_noop_when_build_id_unset() -> None:
+    assert worker_deployment_kwargs(None) == {}
+    assert worker_deployment_kwargs("") == {}
+
+
+def test_worker_deployment_kwargs_enables_auto_upgrade_versioning_when_set() -> None:
+    from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
+    from temporalio.worker import WorkerDeploymentConfig
+
+    kwargs = worker_deployment_kwargs("abc123")
+    assert set(kwargs) == {"deployment_config"}
+    config = kwargs["deployment_config"]
+    assert isinstance(config, WorkerDeploymentConfig)
+    assert config.use_worker_versioning is True
+    assert config.default_versioning_behavior == VersioningBehavior.AUTO_UPGRADE
+    assert config.version == WorkerDeploymentVersion(
+        deployment_name=WORKER_DEPLOYMENT_NAME, build_id="abc123"
     )
 
 

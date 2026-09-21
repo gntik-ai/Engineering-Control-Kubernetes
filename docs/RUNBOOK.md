@@ -109,27 +109,51 @@ role entry in `worker_registry.py`, a new systemd unit or template instance, a n
 home, and a fresh `claude`/`codex` OAuth login for that identity (see below). Treat as a real
 code + ops change, not a config-only one.
 
-## Worker Build ID (F-11 (a))
+## Worker Build ID + Deployments versioning (F-11 (a))
 
 `Settings.build_id` (env `ENGINEERING_BUILD_ID`) is wired into both `Worker(...)` constructions
-(`workflows/worker.py`, `workflows/role_worker.py`) but is `None`/unset by default -- passing
-`build_id=None` to `Worker()` is a no-op, so this ships with zero behavior change until an
-operator opts in. It does **not** enable `use_worker_versioning` or Temporal's task-routing-based
-Worker Deployments feature -- it only tags each worker process with an identifier Temporal
-records and reports, closing the "zero Build ID configuration anywhere" half of F-11.
+via `worker_deployment_kwargs()` in `workflows/worker_registry.py`. Unset (`None`, the default),
+it's a total no-op -- `worker_deployment_kwargs(None) == {}` -- so this ships with zero behavior
+change until an operator opts in.
 
-To enable it on a deploy: set `ENGINEERING_BUILD_ID=<git commit hash of the deployed release>`
-(matching this repo's existing convention of naming release directories by commit hash) in the
-`EnvironmentFile=` stack for `engineering-temporal-worker.service` (controller) and each
-`engineering-worker@{codex,claude,browser,scan,delivery}.service` / `engineering-release-worker.service`
-(worker host), then restart those units. Not done automatically by this change -- it touches live
-systemd config on both hosts, so it's a deliberate operator step, not something applied here.
+When `ENGINEERING_BUILD_ID` is set, it enables Temporal's **Worker Deployments** feature
+(`WorkerDeploymentConfig`, `use_worker_versioning=True`) with `default_versioning_behavior =
+AUTO_UPGRADE` for all 24 workflows (no per-workflow override needed) -- matching this codebase's
+existing `workflow.patched()`-based replay-safety model, where in-flight executions are expected
+to pick up new worker code rather than stay pinned to the build they started on. All worker
+processes share one deployment identity, `WORKER_DEPLOYMENT_NAME = "engineering-control"`
+(`worker_registry.py`), since they're always built and deployed together from the same release.
 
-Adopting full Worker Deployments versioning (per-workflow `VersioningBehavior`, registering and
-promoting deployment versions on each deploy via `temporal worker deployment set-current-version`)
-is a materially bigger decision -- it changes how in-flight workflow task routing works across a
-deploy, not just observability -- and was deliberately left for a separate decision rather than
-adopted silently here.
+**Temporal itself flags this as an experimental feature** (`temporal worker deployment --help`
+prints a caution banner) -- expect flags/behavior to potentially change on a future
+temporalio/temporal-cli upgrade; re-verify against a real server before relying on it after one.
+
+**Critical: setting the env var and restarting is not enough on its own.** Temporal does not
+route new workflow executions to a newly-versioned worker until its version is explicitly
+promoted -- this is deliberate (safe rollout), not a bug, but it means skipping the activation
+step below leaves the service up, healthy, and polling while silently starting zero new workflow
+executions.
+
+To enable and activate on a deploy:
+
+1. Set `ENGINEERING_BUILD_ID=<git commit hash of the deployed release>` (matching this repo's
+   existing convention of naming release directories by commit hash) in the `EnvironmentFile=`
+   stack for `engineering-temporal-worker.service` (controller) and each
+   `engineering-worker@{codex,claude,browser,scan,delivery}.service` /
+   `engineering-release-worker.service` (worker host).
+2. Restart those units. Give them a few seconds to connect and start polling -- Temporal needs to
+   have seen at least one poll from the new build before it can be set current.
+3. Run `scripts/activate-worker-deployment.sh <git-commit-hash>` (from the controller, where
+   Temporal is reachable at `127.0.0.1:7233`) to promote that build to current. It prints the
+   deployment's state before and after, and fails loudly (non-zero exit) if promotion didn't
+   succeed -- don't consider the deploy done until it prints "Done."
+
+None of this is done automatically by this change -- it touches live systemd config on two hosts
+and a real Temporal server call, so it's a deliberate operator/deploy-script step each time.
+
+Verified end-to-end against a real (local, offline) Temporal dev server before being adopted
+here: a versioned worker started, received zero traffic until promoted, then correctly received
+and completed a workflow immediately after `scripts/activate-worker-deployment.sh` ran.
 
 ## Rotating an engine login
 
