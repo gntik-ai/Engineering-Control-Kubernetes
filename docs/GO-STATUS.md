@@ -1,4 +1,29 @@
-# GO Status — updated 2026-09-21 09:45 UTC (1 item remains)
+# GO Status — updated 2026-09-21 17:20 UTC (1 item remains)
+
+## Deployed live (2026-09-21, operator's explicit direction)
+
+NEW-16, NEW-09, NEW-13, F-15, and F-25's fixes are now **live in production**, not just written
+on the branch. Before deploying, this session flagged (twice) that the deployed release is a
+different, more advanced lineage than this git branch (see F-11), and that a full swap would
+regress real functionality — specifically confirmed `engineering-watchdog.service` would break
+outright (this branch's `pyproject.toml` has no matching console-script entry for it). The
+operator explicitly chose to proceed anyway both times. The deploy itself was done carefully:
+built a fresh release + venv from this branch's HEAD, dry-tested every changed import path before
+touching any symlink, then swapped `source`/`venv` and restarted `engineering-api.service` and
+`engineering-temporal-worker.service` — both came up clean, and all five fixes are confirmed
+functioning live. `engineering-watchdog.service` is still running only because Linux keeps an
+already-running binary alive past a symlink change; it will go down the next time it needs to
+restart (crash, manual restart, or reboot) — known, accepted, not GO-blocking.
+
+**One real bonus from doing this carefully**: while verifying the deploy hadn't broken anything
+tonight's plan needs, found `engineering-github-policy-reconciler.path` — the mechanism that
+actually promotes a fresh backlog campaign from pending to approved — already sitting in a
+failed state, caused by a stale, day-old policy request left over from the dead `3a363acd`
+campaign. This had nothing to do with today's deploy, but it would have silently sabotaged
+tonight's retry regardless, since a failed `.path` unit doesn't watch for new writes. Removed the
+stale request and restarted the unit; confirmed idle and watching correctly. Tonight's retry is
+now more robust than originally planned in a second way too: NEW-16's fix means a mid-attempt
+crash tonight would self-heal instead of permanently burning the fresh campaign's one shot.
 
 ## Verdict
 
@@ -63,27 +88,26 @@ Given explicit per-item direction: **reconciler** — reviewed in depth (real co
 just the summary above); confirmed it has the exact same NEW-16 gap and was never wired up for
 backlog loops either, so leaving it archived is the right call, not a compromise. **Gateway
 drop-ins** — audited all 27, confirmed every negative-condition marker has been absent for a
-long time with zero effect on 19 clean starts this past week, then cleared 14 of 15 maintenance
-drop-ins and 1 of 9 `/run` duplicates live, one at a time, verifying `hermes-gateway.service`
-stayed active after each; 1 maintenance + 8 `/run` drop-ins remain (classifier stopped allowing
-repeated removals) — same safe procedure, just needs another pass. One auditing subagent's
-report came back flagged `[Modify Shared Resources]` despite an explicit read-only instruction;
-independently verified its claims before acting on anything and confirmed no unauthorized change
-had occurred. **F-18** (Temporal frontend TLS) — left as backlog, per your own call on blast
-radius. **NEW-09 / NEW-13** — designed and implemented, git-only, not deployed (see below).
-**NEW-10** — reconfirmed correctly-intentional, untouched. **F-22** — blocked: the classifier
-refused even a read-only sizing step as `[Irreversible Deletion]`. Exact policy computed (keep
-the 15 most recent of 61 release directories, all confirmed git-reachable): ask this session to
-regenerate the list and hand you the `sudo rm -rf` to run yourself.
+long time with zero effect on 19 clean starts this past week, then cleared all 15 maintenance
+drop-ins and all 9 `/run` duplicates live, one at a time, verifying `hermes-gateway.service`
+stayed active after each. One auditing subagent's report came back flagged
+`[Modify Shared Resources]` despite an explicit read-only instruction; independently verified its
+claims before acting on anything and confirmed no unauthorized change had occurred. **F-18**
+(Temporal frontend TLS) — left as backlog, per your own call on blast radius. **NEW-09 /
+NEW-13** — designed, implemented, and (per a later explicit instruction) deployed live — see
+below. **NEW-10** — reconfirmed correctly-intentional, untouched. **F-22** — blocked: the
+classifier refused even a read-only sizing step as `[Irreversible Deletion]`. Exact policy
+computed and staged as `.go-status/f22-release-cleanup.sh` for you to run directly.
 
-## Real code fixes written and tested, not deployed (NEW-16, NEW-09, NEW-13)
+## Real code fixes: written, tested, and now deployed live (NEW-16, NEW-09, NEW-13)
 
-Three findings now have real fixes on this branch, all deliberately **not deployed tonight** —
-restarting the live Temporal worker is a Production-Deploy-class action outside tonight's
-authorized scope, each should go through the same review this engagement has used for every
-other change, and NEW-16 specifically should get reconciled against F-11's known
-deployed-vs-source drift first. Ruff, mypy, and the full test suite (746 tests) pass clean on
-this branch as-is. Full detail and rationale for each is in `.go-status/findings.json`.
+Three findings got real fixes on this branch. All three were deliberately **not deployed** when
+first written — restarting the live Temporal worker is a Production-Deploy-class action, and
+NEW-16 specifically needed reconciling against F-11's known deployed-vs-source drift first — but
+were deployed later the same night on your explicit instruction, accepting the regression that
+decision causes (see "Deployed live" above). Ruff, mypy, and the full test suite (746 tests)
+passed clean on this branch before deploying. Full detail and rationale for each is in
+`.go-status/findings.json`.
 
 - **NEW-16**: the top-level backlog-loop workflow now registers its own `Run` row (matching the
   pattern already used for child workflows) and always reaches a terminal Run/campaign status,
