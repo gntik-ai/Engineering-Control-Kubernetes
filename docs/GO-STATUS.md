@@ -1,4 +1,4 @@
-# GO Status — updated 2026-09-21 17:20 UTC (1 item remains)
+# GO Status — updated 2026-09-21 20:30 UTC (1 item remains)
 
 ## Deployed live (2026-09-21, operator's explicit direction)
 
@@ -27,7 +27,7 @@ crash tonight would self-heal instead of permanently burning the fresh campaign'
 
 ## Verdict
 
-**NO-GO by exactly one item.** 46 findings tracked; 26 FIXED, 3 re-scoped NOT_APPLICABLE, 5
+**NO-GO by exactly one item.** 46 findings tracked; 32 FIXED, 3 re-scoped NOT_APPLICABLE, 2
 UNVERIFIED (all backlog, none GO-blocking). F-07 (Telegram notifications) and
 NEW-07 (ungated audit skills reachable via the production gateway) are both closed and verified.
 F-29 (SSH password auth) was reverted after causing a real lockout incident and stays paused
@@ -142,6 +142,37 @@ own `integrations/hermes-engineering-control/hook/handler.py`, plus fixed a stal
 claiming `full-delivery` was still fail-closed. Bonus fix in the same file: `/loop r3-candidate`
 and `/loop approve-r3` had their own separate hardcoded `musematic`/`1119` check that NEW-09's
 earlier API/CLI generalization had missed — fixed to match.
+
+## Six more findings closed (written, tested, not deployed)
+
+Per your instruction to resolve F-08, F-11, F-14, F-16, NEW-02, NEW-05, and NEW-14. Six are done;
+F-11 (replay tests, the wider abandoned-effort audit, api/service.py drift characterization) is
+large and was correctly not rushed — still in progress.
+
+- **NEW-02**: turned out to already be fixed on 2026-09-18 (the dormant credential-pool entries
+  were already purged) — the ledger just never got updated. Retroactively closed.
+- **NEW-14**: traced the real crash path — a leaner project's plan can legitimately return an
+  explicitly empty domains/personas/lenses list, which the coverage-persist step correctly
+  rejects as inconsistent (`total=0`). Added a clean `BLOCKED`/`NO_APPLICABLE_COVERAGE_CELLS`
+  result before that call instead of letting it crash.
+- **F-08**: fixed all 55 event-loop-blocking call sites across 12 files. `SafeCommandRunner` got
+  `run_async()`/`run_yaml_summary_async()` wrappers; sites already inside an async function use
+  them directly, sites behind a sync helper (the majority — every lower-level adapter class is
+  plain sync by design) get wrapped in `asyncio.to_thread(...)` at the async dispatch boundary
+  instead of cascading async/await through entire call graphs.
+- **F-14**: stripped the full agent prompt (up to 200K characters) from the provider activity's
+  echoed results, after verifying no downstream consumer reads it back out of that echo — the
+  single largest, safely-provable piece of the workflow-history-accretion claim.
+- **F-16**: consolidated 13 independently hardcoded agent effort literals into
+  `resolve_agent_effort()`, matching the convention those literals already implicitly followed
+  (verified against every site before migrating it) — deliberately did not build a larger
+  execution-profile system nothing asked for.
+- **NEW-05**: added `ConnectionsRefreshWorkflow` mirroring `QuotaRefreshWorkflow`'s exact pattern
+  — a new Temporal Schedule (every 15 minutes) driving the same bounded connection-health check
+  `recheck-connections` already performs on demand, so the snapshot stops decaying to `DEGRADED`
+  between missions. No new checking logic invented.
+
+Ruff, mypy, and the full test suite (763 tests) pass clean on this branch.
 
 ## GO checklist status
 
