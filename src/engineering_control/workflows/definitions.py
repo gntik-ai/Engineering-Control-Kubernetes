@@ -1821,9 +1821,54 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         after_current_controls = workflow.patched("existing-backlog-after-current-controls-v1")
         final_closure_enabled = workflow.patched("existing-backlog-final-closure-v1")
         global_child_blocker_return = workflow.patched("global-backlog-child-blocker-return-v1")
+        register_run = workflow.patched("existing-backlog-register-run-v1")
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
             return context
+        if register_run:
+            await self._step(
+                "backlog.register_run",
+                {**asdict(request), "workflow_id": workflow.info().workflow_id},
+            )
+        try:
+            return await self._run_backlog_loop(
+                request,
+                context,
+                register_child_runs=register_child_runs,
+                sequential_source_pr=sequential_source_pr,
+                after_current_controls=after_current_controls,
+                final_closure_enabled=final_closure_enabled,
+                global_child_blocker_return=global_child_blocker_return,
+                register_run=register_run,
+            )
+        except Exception:
+            # Without this, an uncaught exception (e.g. a non-retryable
+            # ApplicationError from an activity or child workflow) leaves the
+            # campaign stuck at status RUNNING forever with no Run row to
+            # reconcile against -- see NEW-16.
+            if register_run:
+                await self._step(
+                    "backlog.record_loop_state",
+                    {
+                        **asdict(request),
+                        "workflow_id": workflow.info().workflow_id,
+                        "loop_status": "FAILED",
+                    },
+                )
+            raise
+
+    async def _run_backlog_loop(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        context: dict[str, Any],
+        *,
+        register_child_runs: bool,
+        sequential_source_pr: bool,
+        after_current_controls: bool,
+        final_closure_enabled: bool,
+        global_child_blocker_return: bool,
+        register_run: bool,
+    ) -> dict[str, Any]:
         raw_items = context.get("items")
         if not isinstance(raw_items, list):
             raise TypeError("existing backlog selection must be a list")
@@ -1834,10 +1879,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             continue_to_next_issue = False
             while True:
                 if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "CANCELLED"},
-                    )
+                    cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                    if register_run:
+                        cancel_state["workflow_id"] = workflow.info().workflow_id
+                    await self._step("backlog.record_loop_state", cancel_state)
                     return {"status": "CANCELLED", "results": results}
                 gate = await self._step(
                     "backlog.revalidate_gate",
@@ -1948,10 +1993,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                 )
                 if self._cancelled:
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "CANCELLED"},
-                    )
+                    cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                    if register_run:
+                        cancel_state["workflow_id"] = workflow.info().workflow_id
+                    await self._step("backlog.record_loop_state", cancel_state)
                     return {"status": "CANCELLED", "results": results}
                 if self._skip_reason is not None:
                     skip_value = self._skip_reason
@@ -2187,9 +2232,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             )
             if boundary is not None:
                 return boundary
-        await self._step(
-            "backlog.record_loop_state", {**asdict(request), "loop_status": "COMPLETE"}
-        )
+        complete_state = {**asdict(request), "loop_status": "COMPLETE"}
+        if register_run:
+            complete_state["workflow_id"] = workflow.info().workflow_id
+        await self._step("backlog.record_loop_state", complete_state)
         return {"status": "COMPLETE", "results": results}
 
     async def _execute_full_delivery(

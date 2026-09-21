@@ -135,6 +135,7 @@ class EngineeringActivityHandler:
             "backlog.revalidate_gate",
             "backlog.record_loop_state",
             "backlog.register_child_run",
+            "backlog.register_run",
             "global_backlog.register",
             "global_backlog.select_next",
             "global_backlog.record_result",
@@ -271,6 +272,8 @@ class EngineeringActivityHandler:
             return self._record_backlog_loop_state(payload)
         if step == "backlog.register_child_run":
             return self._register_backlog_child_run(payload)
+        if step == "backlog.register_run":
+            return self._register_backlog_run(payload)
         if step == "global_backlog.register":
             return self._register_global_backlog(payload)
         if step == "global_backlog.select_next":
@@ -1893,13 +1896,24 @@ class EngineeringActivityHandler:
     def _record_backlog_loop_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
         status = str(payload.get("loop_status", "PAUSED"))
-        if status not in {"PAUSED", "CANCELLED", "COMPLETE", "RUNNING", "STOPPED"}:
+        if status not in {"PAUSED", "CANCELLED", "COMPLETE", "RUNNING", "STOPPED", "FAILED"}:
             raise ValueError("backlog loop status is not allowlisted")
+        run_workflow_id = payload.get("workflow_id")
         deactivation: dict[str, Any] | None = None
         with self.sessions.begin() as session:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
+            if isinstance(run_workflow_id, str) and run_workflow_id:
+                # NEW-16: the top-level loop run must reach a terminal Run.status
+                # here (whichever branch below returns) so OperationsRepository's
+                # self-heal can ever recognize this operation as finished. Without
+                # this, an operation record keyed on this workflow stays STARTED
+                # forever and permanently blocks every future attempt.
+                run = session.scalar(select(db.Run).where(db.Run.workflow_id == run_workflow_id))
+                if run is not None:
+                    run.status = status
+                    run.finished_at = datetime.now(UTC)
             raw_global_id = payload.get("global_campaign_id")
             linked_global_ids = {
                 candidate.id
@@ -1958,6 +1972,38 @@ class EngineeringActivityHandler:
         if deactivation is not None:
             self._write_policy_request(deactivation)
         return self._envelope("backlog.record_loop_state", payload, status)
+
+    def _register_backlog_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["backlog_campaign_id"]))
+        workflow_id = str(payload.get("workflow_id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", workflow_id):
+            raise ValueError("backlog run workflow identity is invalid")
+        with self.sessions.begin() as session:
+            campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
+            if campaign is None:
+                raise ValueError("backlog campaign disappeared")
+            existing = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id))
+            if existing is not None:
+                return self._envelope(
+                    "backlog.register_run",
+                    {**payload, "run_id": str(existing.id)},
+                    "REGISTERED",
+                )
+            run = db.Run(
+                campaign_id=None,
+                workflow_id=workflow_id,
+                run_type="existing-backlog-loop",
+                status="RUNNING",
+                project=campaign.project,
+                started_at=datetime.now(UTC),
+            )
+            session.add(run)
+            session.flush()
+            return self._envelope(
+                "backlog.register_run",
+                {**payload, "run_id": str(run.id)},
+                "REGISTERED",
+            )
 
     def _register_backlog_child_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         child_kind = str(payload.get("child_kind", ""))

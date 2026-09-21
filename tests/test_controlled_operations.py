@@ -1380,6 +1380,11 @@ async def test_global_child_returns_blocker_without_waiting_or_completing_issue(
 
     instance._step = step  # type: ignore[method-assign]
     monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="synthetic-global-blocker", task_queue="engineering"),
+    )
 
     result = await instance.run(
         ExistingGitHubBacklogLoopInput(
