@@ -528,7 +528,8 @@ the exception handler *and* every early-return stop branch, not just crashes. Ad
 mistake). Added a real Temporal replay regression test
 (`test_issue_delivery_workflow_releases_leases_when_a_later_step_crashes`) confirming
 `delivery.release_leases` gets scheduled before the workflow re-raises, plus two unit tests for the
-activity handler itself. Filed as NEW-20. 778 tests, ruff/mypy clean. **Not deployed yet.**
+activity handler itself. Filed as NEW-20. 778 tests, ruff/mypy clean.
+**Deployed 2026-09-22 (commit `2dee6f2`), both hosts, verified active with zero restarts.**
 
 Tonight's specific stale lease (`musematic:general`) was deliberately **not** corrected directly in
 the database, unlike NEW-16's `defef39e` precedent — it isn't blocking further progress. It
@@ -538,11 +539,10 @@ namespaces and are unaffected right now.
 ---
 
 **Status**: G7/NEW-16 remains the sole GO-blocking item. Tonight's retries found and fixed seven
-real bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19, NEW-20) — six deployed and confirmed working on
-both hosts, NEW-20 git-only pending deploy. The pipeline's dispatch, ownership, materialization,
-and real agent verification stages have all now been proven working end to end, and issue 1 of the
-latest attempt passed verification and reached real delivery for the first time ever before hitting
-NEW-20. Once NEW-20 is deployed, the next retry — against `llmwiki` or `falcone` rather than the
-still-lease-blocked `musematic:general` — is the first ever with a real chance of clearing
-delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing an
-actual PR.
+real bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19, NEW-20) — all deployed and confirmed working on
+both hosts. The pipeline's dispatch, ownership, materialization, and real agent verification stages
+have all now been proven working end to end, and issue 1 of the latest attempt passed verification
+and reached real delivery for the first time ever before hitting NEW-20. The next retry — against
+`llmwiki` or `falcone` rather than the still-lease-blocked `musematic:general` (self-heals
+~`19:46Z`) — is the first ever with a real chance of clearing delivery's remaining prechecks
+(gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
