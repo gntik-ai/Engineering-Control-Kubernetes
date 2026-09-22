@@ -73,8 +73,14 @@ from engineering_control.operations.models import (
     parse_command,
 )
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.workflows.schedule_intervals import QUOTA_REFRESH_INTERVAL
 
 _ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNNING"})
+# NEW-16, 2026-09-22: this must stay comfortably above QUOTA_REFRESH_INTERVAL, not an
+# independent literal -- a hardcoded 300s (5 min) here against a schedule that only
+# refreshes every 30 min made solve_backlog/solve_issue's preflight fail ~83% of the
+# time. The buffer absorbs schedule jitter and the refresh workflow's own run time.
+_PROVIDER_HEALTH_STALE_AFTER = QUOTA_REFRESH_INTERVAL + timedelta(minutes=10)
 _CAMPAIGN_EXPORT_COLLECTIONS = ("root_blockers", "findings", "runs", "artifacts")
 _TERMINAL_WORKFLOW_STATES = frozenset(
     {
@@ -1135,8 +1141,8 @@ class OperationsRepository:
             if snapshot is None:
                 blockers.append(f"{provider.upper()}_HEALTH_NOT_REPORTED")
                 continue
-            age = (datetime.now(UTC) - _utc(snapshot.captured_at)).total_seconds()
-            if age > 300:
+            age = datetime.now(UTC) - _utc(snapshot.captured_at)
+            if age > _PROVIDER_HEALTH_STALE_AFTER:
                 blockers.append(f"{provider.upper()}_HEALTH_STALE")
             if snapshot.cli_present is False:
                 blockers.append(f"{provider.upper()}_CLI_NOT_INSTALLED")

@@ -294,11 +294,27 @@ steps — confirmed it fails without the fix and passes with it, closing this en
 going forward. 769 tests, ruff/mypy clean. **Not deployed** — the live release still has this bug
 and will fail identically on the next attempt until it ships.
 
+## NEW-17: CLAUDE_HEALTH_STALE fixed properly (2026-09-22)
+
+Filed as its own finding and fixed, not just worked around. Root cause: `QuotaRefreshWorkflow`'s
+30-minute schedule (`scheduler.py`) and `_provider_blockers()`'s 5-minute staleness threshold
+(`operations/repository.py`) were independently hardcoded in two different modules and never
+checked against each other.
+
+Fixed the relationship, not just the number: added `workflows/schedule_intervals.py` as the
+single source of truth for `QUOTA_REFRESH_INTERVAL` (30 min) and `CONNECTIONS_REFRESH_INTERVAL`
+(15 min). `scheduler.py` now references it instead of an inline literal; `operations/repository.py`
+derives its staleness threshold as `QUOTA_REFRESH_INTERVAL` plus a 10-minute buffer instead of an
+independent number, so the two can't silently drift apart again. Updated the one existing test
+that asserted staleness at a 10-minute age (no longer stale under the corrected ~40-minute
+threshold) to 45 minutes, and added a new test that checks the actual configured schedule interval
+has real margin under the actual configured threshold — not just that the constants are related by
+construction, in case a future edit changes one without the other. 770 tests, ruff/mypy clean.
+**Not deployed** — same deploy-review gate as NEW-16's fix applies.
+
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item, now understood far more precisely. It was
-never actually functional, in git or in production, until this pass fixed it — and it still isn't
-deployed. Next retry needs: this fix deployed, a fresh campaign, and either good timing or another
-`temporal schedule trigger` for quota freshness. The `CLAUDE_HEALTH_STALE` scheduling mismatch
-(30-min refresh vs. 5-min staleness threshold) is a separate, real bug worth its own fix, not yet
-filed as its own numbered finding.
+**Status**: G7/NEW-16 remains the sole GO-blocking item, now understood far more precisely. Both
+bugs that blocked tonight's retry — NEW-16's non-functional fix and NEW-17's scheduling mismatch —
+are fixed in git with regression tests, but neither is deployed. Next retry needs both fixes
+shipped plus a fresh campaign (`defef39e` is burned).

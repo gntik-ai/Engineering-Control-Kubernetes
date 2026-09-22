@@ -455,7 +455,9 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
     with repository.sessions.begin() as session:
         snapshots = session.scalars(select(QuotaSnapshot)).all()
         for snapshot in snapshots:
-            snapshot.captured_at = datetime.now(UTC) - timedelta(minutes=10)
+            # Must exceed QUOTA_REFRESH_INTERVAL (30 min) + its staleness buffer,
+            # not an arbitrary short age -- see NEW-16 (2026-09-22).
+            snapshot.captured_at = datetime.now(UTC) - timedelta(minutes=45)
     stale = await repository.candidate(_solve_issue(), SESSION_A)
     assert stale.capability.status == "BLOCKED"
     assert {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"} <= set(stale.capability.blockers)

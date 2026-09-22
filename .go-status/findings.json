@@ -645,6 +645,21 @@
     "needs_user_decision": true
   },
   {
+    "id": "NEW-17",
+    "title": "solve_backlog/solve_issue preflight fails ~83% of the time: 5-min provider-health staleness threshold vs. a 30-min refresh schedule",
+    "area": "operations",
+    "severity": "major",
+    "blocks_go": false,
+    "claimed_status": "Not previously identified -- discovered live 2026-09-22 while continuing the NEW-16 retry after fixing its actual code-dispatch bug.",
+    "claimed_source": "Discovered live 2026-09-22 mid-retry: engineering-ctl backlog-start returned safe_error 'operation preflight changed: CLAUDE_HEALTH_STALE' on a campaign whose approval-candidate/approve steps had both just succeeded cleanly.",
+    "real_status": "FIXED",
+    "evidence": "operations/repository.py's _provider_blockers() flagged {PROVIDER}_HEALTH_STALE whenever the most recent QuotaSnapshot was more than 300 seconds (5 minutes) old. The only thing that writes a QuotaSnapshot is QuotaRefreshWorkflow, scheduled every 30 minutes (scheduler.py). Confirmed live via `temporal schedule list`: last run 21 minutes ago, next in 8 -- meaning this preflight check would only pass in a ~5-minute window out of every 30, i.e. it failed roughly 83% of the time by design, for every solve_backlog/solve_issue attempt system-wide, the whole time this schedule has existed. Worked around live via `temporal schedule trigger --schedule-id engineering-quota-refresh` (a standard, safe Temporal operation) to unblock tonight's specific retry. FIXED properly (git-only): added workflows/schedule_intervals.py as the single source of truth for both QUOTA_REFRESH_INTERVAL (30 min) and CONNECTIONS_REFRESH_INTERVAL (15 min) -- scheduler.py now references it instead of an inline literal, and operations/repository.py derives its staleness threshold (_PROVIDER_HEALTH_STALE_AFTER) as QUOTA_REFRESH_INTERVAL plus a 10-minute buffer instead of an independent hardcoded number, so the two can never silently drift apart again. Updated the one existing test that asserted staleness at a 10-minute age (test_candidate_fails_closed_for_stale_provider_and_r3) to use 45 minutes, since 10 minutes is no longer stale under the corrected threshold. Added a new test, test_quota_refresh_schedule_stays_well_under_the_provider_health_staleness_threshold in test_scheduler.py, that checks the actual configured schedule interval has real margin under the actual configured threshold -- not just that the two constants are related by construction, in case a future edit changes one without the other. 770 tests, ruff/mypy clean.",
+    "root_cause": "QuotaRefreshWorkflow's 30-minute schedule interval (scheduler.py) and _provider_blockers()'s 5-minute staleness threshold (operations/repository.py) were each hardcoded independently in two different modules with no shared reference, and were never verified against each other -- the staleness threshold looks like it was chosen assuming a much more frequent refresh (or an on-demand refresh path, which quota checks never got, unlike connections' recheck-connections).",
+    "proposed_fix": "DONE: threshold now derived from the schedule interval via a shared constant, with a regression test on the actual configured relationship. Not deployed yet, same as the rest of tonight's fixes -- needs the same deploy review as NEW-16's dispatch fix before it takes effect live. Optional further improvement, not done here: add an on-demand quota-refresh CLI action mirroring recheck-connections, so an operator doesn't need `temporal schedule trigger` as a manual escape hatch.",
+    "irreversible": false,
+    "needs_user_decision": false
+  },
+  {
     "id": "NEW-15",
     "title": "_serialize_backlog_issue never includes body_sha256, crashing the first-ever real ExistingGitHubBacklogLoopWorkflow delivery attempt with KeyError",
     "area": "temporal",
