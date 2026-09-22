@@ -81,11 +81,17 @@ echo "=== 2/7: build release on controller (this host) ==="
 build_release controller
 
 echo ""
-echo "=== 3/7: copy archive to worker host and build release there ==="
-scp "$ARCHIVE" worker:"$ARCHIVE"
-ssh -t worker "bash -s" <<REMOTE_BUILD
+echo "=== 3/7: copy archive + build script to worker host and build release there ==="
+# Written to a local file and scp'd over (rather than piped into `ssh -t` via a
+# heredoc) because piping a heredoc as stdin into `ssh -t` leaves sudo with no
+# real controlling terminal to prompt on -- ssh even warns "Pseudo-terminal
+# will not be allocated because stdin is not a terminal" and sudo then fails
+# with "a terminal is required to authenticate". Running the script as a real
+# file over an allocated pty avoids that entirely.
+REMOTE_SCRIPT="/tmp/engineering-control-remote-build-$HASH.sh"
+cat > "$REMOTE_SCRIPT" <<REMOTE_BUILD
+#!/usr/bin/env bash
 set -euo pipefail
-HASH="$HASH"
 RELEASE_DIR="$RELEASE_DIR"
 VENV_DIR="$VENV_DIR"
 ARCHIVE="$ARCHIVE"
@@ -106,6 +112,9 @@ import engineering_control.activities.delivery
 print('[worker] imports OK')
 "
 REMOTE_BUILD
+scp "$ARCHIVE" "$REMOTE_SCRIPT" worker:/tmp/
+ssh -t worker "bash /tmp/$(basename "$REMOTE_SCRIPT")"
+rm -f "$REMOTE_SCRIPT"
 
 echo ""
 echo "=== 4/7: swap symlinks on controller ==="
