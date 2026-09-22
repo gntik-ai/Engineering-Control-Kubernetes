@@ -490,15 +490,15 @@ messages on failure previously discarded `stderr` entirely, unlike `command.py`'
 `CommandFailure` — this cost real debugging time today. All four now include the return code and a
 stderr tail. Added `test_semgrep_scan_uses_a_fixed_config_compatible_with_installed_semgrep` and
 `test_semgrep_failure_message_includes_stderr`. Filed as NEW-19. 775 tests, ruff/mypy clean.
-**Not deployed yet.**
+**Deployed 2026-09-22 (commit `6ff4712`), both hosts, verified active with zero restarts.**
 
 ---
 
 **Status**: G7/NEW-16 remains the sole GO-blocking item. Tonight's retries found and fixed six real
-bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19) — the pipeline's dispatch, ownership, materialization,
-and real agent verification stages have all now been proven working end to end, and issue 1 of the
-latest attempt passed verification for the first time ever before hitting NEW-19. NEW-19 is likely
-the actual root blocker that made every prior attempt at an actual PR impossible, since it gated
-every delivery unconditionally. It needs deploying before the next retry can find out whether
-delivery clears its remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) — territory
-no attempt has ever reached before.
+bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19) — all deployed and confirmed working on both hosts.
+The pipeline's dispatch, ownership, materialization, and real agent verification stages have all
+now been proven working end to end, and issue 1 of the latest attempt passed verification for the
+first time ever before hitting NEW-19. NEW-19 is likely the actual root blocker that made every
+prior attempt at an actual PR impossible, since it gated every delivery unconditionally. With it
+now deployed, the next retry is the first ever with a real chance of clearing delivery's remaining
+prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
