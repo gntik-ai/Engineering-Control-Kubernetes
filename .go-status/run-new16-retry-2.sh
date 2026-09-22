@@ -12,16 +12,27 @@
 # Always imports a brand-new campaign -- defef39e, 3a363acd, and c405b4d7
 # have all permanently used their one solve_backlog attempt (see NEW-16).
 #
-# Usage: ./run-new16-retry-2.sh
+# Usage: ./run-new16-retry-2.sh [project]
+#   project: falcone, musematic, or llmwiki (default: llmwiki)
 set -euo pipefail
 
 CTL=/opt/engineering-control/venv/bin/engineering-ctl
-PROJECT=llmwiki
+PROJECT="${1:-llmwiki}"
 IMPORT_FILTER=all
 DELIVERY_MODE=source-pr
 MAXIMUM_RISK=R1
 PLAN_POLL_TIMEOUT_SECONDS=300
 PLAN_POLL_INTERVAL_SECONDS=10
+
+case "$PROJECT" in
+  falcone) SOURCE_REPO="gntik-ai/falcone" ;;
+  musematic) SOURCE_REPO="gntik-ai/musematic" ;;
+  llmwiki) SOURCE_REPO="gntik-ai/llmwiki" ;;
+  *)
+    echo "Unknown project: $PROJECT (expected falcone, musematic, or llmwiki)" >&2
+    exit 1
+    ;;
+esac
 
 echo "== 1/5 backlog-import =="
 import_result=$("$CTL" backlog-import "$PROJECT" "$IMPORT_FILTER" --max-items 5)
@@ -111,8 +122,8 @@ fi
 echo "== waiting a bit, then checking the workflow and for a PR =="
 sleep 15
 "$CTL" backlog-status "$workflow_id" | jq .
-echo "Checking gntik-ai/llmwiki for a real draft PR (may need more time to appear)..."
-gh pr list --repo gntik-ai/llmwiki --state open --json number,title,url,createdAt --limit 10
+echo "Checking $SOURCE_REPO for a real draft PR (may need more time to appear)..."
+gh pr list --repo "$SOURCE_REPO" --state open --json number,title,url,createdAt --limit 10
 
 echo
 echo "Started. Campaign $campaign_id / workflow $workflow_id."
