@@ -201,6 +201,7 @@ class ControlActivities:
         "backlog.revalidate_gate",
         "backlog.record_loop_state",
         "backlog.register_child_run",
+        "backlog.register_run",
         "global_backlog.register",
         "global_backlog.select_next",
         "global_backlog.record_result",

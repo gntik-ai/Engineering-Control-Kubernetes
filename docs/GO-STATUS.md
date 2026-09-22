@@ -208,7 +208,7 @@ Ruff, mypy, and the full test suite (766 tests) pass clean on this branch.
 | G4 | Hermes unit active, CLI-backed, skills load | **PASS** |
 | G5 | Telegram + dashboard can trigger/show missions | **PASS** (Telegram confirmed end-to-end; dashboard wired, not visually re-checked) |
 | G6 | Fail-closed gates consciously set | **PASS** (Temporal control plane fully gated; NEW-07's parallel path now also gated) |
-| G7 | Issue-resolution loop completes end to end | **PENDING** — retry attempt 1 (2026-09-21T22:34 UTC) failed at step 3/5 (backlog-approval-candidate, 409 Conflict) before ever reaching NEW-16's fix; needs root-causing, not just more waiting (see NEW-16 in findings.json) |
+| G7 | Issue-resolution loop completes end to end | **PENDING** — NEW-16's fix was never actually functional (missing activity-dispatch entry), now fixed in git with a regression test but not deployed; a second real bug (CLAUDE_HEALTH_STALE) also found and worked around live; see NEW-16 in findings.json |
 | G8 | Audit mission completes end to end | **PASS** |
 | G9 | Security baseline | **PASS, one paused item** (F-29 reverted after incident, needs an SSH key prerequisite before retry) |
 | G10 | Restart resilience | **PARTIAL** (app-level proven; core infra restart not tested, real blast radius) |
@@ -255,7 +255,50 @@ Two unconfirmed hypotheses, in order of likelihood:
 `engineering-ctl connections all` yourself to see which of the two it is, then either patch the
 script to wait for plan-ready, or clear the actual blocking owner.
 
+## Continued investigation (2026-09-22) — the real root cause
+
+The operator ran those diagnostics and shared the output, and the investigation continued live
+rather than stopping. Corrected an error on my part first: `backlog-status` takes a Temporal
+**workflow_id**, not the campaign UUID I originally gave — that mistake caused two spurious 500s
+(a real, separate bug in `get_workflow()`'s missing not-found handling, but triggered by bad
+input, not a live outage). With the right IDs: the plan workflow had by then reached `COMPLETED`,
+confirming hypothesis 1 (the script's race) was correct.
+
+Resumed the same campaign from step 3 (`.go-status/run-new16-retry-resume.sh`). Steps 3–4
+(approval-candidate, approve) succeeded cleanly. **Step 5 (backlog-start) hit a second, unrelated,
+real bug**: `CLAUDE_HEALTH_STALE`. `operations/repository.py`'s `_provider_blockers()` requires a
+`QuotaSnapshot` under 5 minutes old, but `QuotaRefreshWorkflow` — the only thing that writes
+one — is scheduled every **30 minutes** (`temporal schedule list` confirmed: last run 21 minutes
+ago, next in 8). This preflight fails roughly **83% of the time by design**. Worked around it live
+via `temporal schedule trigger --schedule-id engineering-quota-refresh` (a standard, safe Temporal
+operation) to force a fresh snapshot, then retried immediately.
+
+**That retry then failed instantly — and revealed the actual headline finding.**
+`ExistingGitHubBacklogLoopWorkflow`'s second activity call, `backlog.register_run` — the exact
+step NEW-16's own fix added — is not in `ControlActivities._allowed_steps`, in **either the
+deployed release or this git repo's HEAD**. Every fresh execution fails immediately with a
+non-retryable `ApplicationError: unknown or invalid control step`. Every existing test mocked the
+activity dispatcher and never caught this; tonight was the first genuine end-to-end exercise of
+NEW-16's fix since it was written. Confirmed the consequence directly: retrying `backlog-start`
+against the same campaign returned the exact same stale cached `STARTED` operation instead of a
+fresh attempt — **NEW-16's original bug, reproduced exactly**, because the workflow crashes before
+the try/except that would have recorded a `Run` row ever runs. Campaign
+`defef39e-b0ae-4a36-8863-dd59f08e960c` is now permanently burned, joining `3a363acd` and
+`c405b4d7`.
+
+**Fixed immediately (git-only)**: added `"backlog.register_run"` to `_allowed_steps`
+(`activities/core.py`), plus a new regression test
+(`test_every_literal_step_a_workflow_calls_is_a_registered_activity`) that AST-parses every
+literal step name any workflow calls and checks it against the real dispatcher's registered
+steps — confirmed it fails without the fix and passes with it, closing this entire class of bug
+going forward. 769 tests, ruff/mypy clean. **Not deployed** — the live release still has this bug
+and will fail identically on the next attempt until it ships.
+
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item. Not resolved by waiting alone this time —
-needs the root-cause check above before the next attempt.
+**Status**: G7/NEW-16 remains the sole GO-blocking item, now understood far more precisely. It was
+never actually functional, in git or in production, until this pass fixed it — and it still isn't
+deployed. Next retry needs: this fix deployed, a fresh campaign, and either good timing or another
+`temporal schedule trigger` for quota freshness. The `CLAUDE_HEALTH_STALE` scheduling mismatch
+(30-min refresh vs. 5-min staleness threshold) is a separate, real bug worth its own fix, not yet
+filed as its own numbered finding.
