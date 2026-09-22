@@ -555,8 +555,9 @@ fix; the harness correctly blocked an attempt to run the doc's own verification 
 `8fedc69d`'s issue 2 failing earlier tonight with `PROVIDER_EXIT_NONZERO` (`provider=claude`) —
 unconfirmed, but the same root cause would fit.
 
-**Next step**: the operator checks/refreshes `claude-runner`'s auth
-(`ssh worker 'sudo -u claude-runner -H env -i HOME=/var/lib/engineering-control/identities/claude-runner
-PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/claude auth status'`), then retries. Once that's
-resolved, the next attempt is still the first ever with a real chance of clearing delivery's
-remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
+**Confirmed**: the operator ran the verification command themselves — `claude auth status` on the
+worker returned `{"loggedIn": false, "authMethod": "none"}`. `claude-runner` is logged out
+entirely, not just stale. This needs an interactive `claude auth login` (or equivalent) run as
+`claude-runner` on the worker host — an operator-only credential action. Once that's restored, the
+next attempt is still the first ever with a real chance of clearing delivery's remaining prechecks
+(gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
