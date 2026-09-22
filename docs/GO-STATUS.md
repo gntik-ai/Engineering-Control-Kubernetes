@@ -573,6 +573,35 @@ by running `claude auth login` on their own machine's normal terminal (worked im
 pty issues) and manually placing the resulting credential file into `claude-runner`'s identity
 directory on the worker. Confirmed fixed: `claude auth status` now shows `loggedIn: true`,
 `email: support@gntik.ai`, `subscriptionType: max`. `musematic:general`'s stale lease has also now
-naturally expired. No blockers remain — the next attempt is still the first ever with a real chance
-of clearing delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and
-landing an actual PR.
+naturally expired.
+
+## The global concurrency slot (2026-09-22)
+
+With claude-runner fixed, retrying `musematic` fresh hit a *new* `409 Conflict` on
+`backlog-approve` — but every per-project check (campaign status, approval binding, active-owner
+query) came back clean on code-reading. Wrote a small read-only script to call the same endpoint
+directly and print the response body the CLI's own error handling discards: `"another backlog
+campaign policy activation is pending"`.
+
+Root cause: `TypedCommandBus`/`_approve_backlog_campaign`'s ownership queries (`db/repository.py`)
+have **no project filter at all** — `maximum_concurrency: 1` is enforced *globally* across all
+three projects through a single shared "root reconciler," by design (it shows up identically in
+every project's approval candidate). `llmwiki`'s earlier campaign (`cd217170`) was still sitting at
+`APPROVED_POLICY_PENDING` from its `CLAUDE_AUTH_NOT_READY` failure — correctly left untouched by
+that failure (nothing destructive happened, safe to retry), but by the same design this also
+correctly blocks every *other* project's approval until it resolves one way or another. **Not a
+bug** — resolved by simply retrying `backlog-start` on that same already-approved campaign
+(`.go-status/resume-llmwiki-cd217170.sh`) now that auth was fixed.
+
+That resume ran real work: issue `#7`'s documentation-gap finding was reproduced successfully
+twice at the clean source SHA, with both positive and negative controls passing — but it ended
+`BLOCKED` (`CURRENT_REVALIDATION_BLOCKED`) because the verification sandbox's `gh` CLI has no
+authentication, so the agent couldn't independently confirm the GitHub issue's own state/duplicate
+status. This reads as intentional fail-closed design, the same philosophy behind every other
+`CURRENT_REVALIDATION_BLOCKED` outcome tonight — not a crash, not a bug — but it's worth knowing
+this may make `llmwiki`'s one eligible issue permanently unresolvable via this exact path unless
+that sandbox is deliberately given `gh` read access.
+
+`musematic`'s global concurrency slot is now free. No blockers remain — the next attempt is still
+the first ever with a real chance of clearing delivery's remaining prechecks
+(gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
