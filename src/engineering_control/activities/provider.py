@@ -469,14 +469,30 @@ class ProviderActivityHandler:
             open_questions=self._string_list(self._find_value(payload, "open_questions", [])),
         )
 
+    _PROMPT_REDACTED = "[redacted by F-14 -- see docs/GO-STATUS.md for the history-bloat fix]"
+
     @classmethod
     def _without_prompt(cls, value: Any, key: str) -> Any:
-        """Return a copy of value with key's nested "prompt" field removed, if present."""
+        """Return a copy of value with key's nested "prompt" field redacted to a
+        short placeholder, if present.
+
+        Deliberately REPLACES rather than removes the key (found live in
+        production, 2026-09-22): metadata.py's _agent_request() re-validates
+        this exact payload shape via AgentRequest.model_validate() when
+        persisting the agent result (agent.persist_result), and prompt is a
+        required, non-empty field on that model (min_length=1) -- fully
+        dropping the key broke that reconstruction with a pydantic
+        ValidationError on the very next real delivery attempt. The
+        placeholder satisfies validation without storing the up-to-200K-char
+        prompt content in Temporal history; nothing downstream reads
+        request.prompt's actual value (only presence/type is required).
+        """
         if not isinstance(value, dict):
             return value
         if key in value and isinstance(value[key], dict):
             trimmed = dict(value[key])
-            trimmed.pop("prompt", None)
+            if "prompt" in trimmed:
+                trimmed["prompt"] = cls._PROMPT_REDACTED
             return {**value, key: trimmed}
         return {inner_key: cls._without_prompt(inner, key) for inner_key, inner in value.items()}
 

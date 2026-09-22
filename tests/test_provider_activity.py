@@ -146,10 +146,22 @@ async def test_provider_activity_does_not_echo_prompt_text_back_into_its_result(
     )
 
     assert result["status"] == "SUCCESS"
-    assert "prompt" not in result["maker_request"]
+    # Redacted to a short placeholder, not removed entirely (regression test,
+    # 2026-09-22): metadata.py's _agent_request() re-validates this exact
+    # payload shape via AgentRequest.model_validate() when persisting the
+    # agent result, and prompt is a required field on that model -- fully
+    # dropping the key broke that reconstruction on the very next real
+    # delivery attempt in production.
+    assert result["maker_request"]["prompt"] != original_prompt
+    assert len(result["maker_request"]["prompt"]) < 200
     # every other field survives the trim untouched
     assert result["maker_request"]["role"] == "implementer"
     assert result["maker_request"]["working_directory"] == str(worktree)
+
+    # The redacted payload must still satisfy AgentRequest's own validation --
+    # this is exactly the reconstruction metadata.py's _agent_request() does
+    # when persisting the agent result, and it crashed on this in production.
+    AgentRequest.model_validate(result["maker_request"])
 
 
 @pytest.mark.asyncio

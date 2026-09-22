@@ -397,9 +397,34 @@ Worth flagging: this is the **second confirmed instance** of a fix that only eve
 in-place hotfix and was silently lost on redeploy (NEW-12 was the first). A dedicated audit of
 other "confirmed fixed live" findings in this ledger for the same gap may be worth doing.
 
+## Retry #4 (2026-09-22): the furthest ever — 9 minutes of real work, a fourth bug
+
+Deployed NEW-16's and NEW-15's fixes to both hosts, confirmed present on disk, then pushed
+`go-status/2026-09-17` to `origin` for the first time in this entire engagement (126 commits — it
+had only ever existed locally). Ran the retry again against a brand-new campaign.
+
+**`backlog-start`'s workflow ran for over 9 minutes doing genuine real work** — the furthest any
+attempt has ever gotten in this whole engagement, well past dispatch, past ownership, and past
+issue materialization. It then failed with a pydantic `ValidationError: 'prompt Field required'`.
+
+**Root cause**: F-14's own fix from earlier tonight. `_without_prompt` (in `provider.py`) fully
+removes the `prompt` key from every echoed agent-request payload to cut Temporal history bloat.
+But `metadata.py`'s `_agent_request()` re-validates that *exact* payload shape via
+`AgentRequest.model_validate()` when persisting the `agent.persist_result` step, and
+`AgentRequest.prompt` is a required, non-empty field with no default. The original F-14
+verification traced one consumer (`_persist_handoff`) and missed this second, independent one in a
+different file.
+
+**Re-fixed**: `_without_prompt` now redacts the prompt value to a short placeholder string instead
+of deleting the key — satisfies the model's validation (confirmed nothing downstream reads the
+actual value, only its presence/type) while still achieving the original goal of not storing
+up-to-200K-char prompt content in history. Updated the existing F-14 test to call
+`AgentRequest.model_validate()` directly on the echoed payload — the exact reconstruction that
+crashed in production — confirmed it fails with the same error without the fix, passes with it.
+772 tests, ruff/mypy clean. **Not deployed yet.**
+
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item. Ownership is currently free. Three real
-bugs found tonight (NEW-16's dispatch entry — deployed; NEW-16's `register_run`-in-try — git-only;
-NEW-15's `body_sha256` — git-only) need the last two deployed together before the next retry has a
-real shot at reaching a PR.
+**Status**: G7/NEW-16 remains the sole GO-blocking item. Ownership is currently free. NEW-16's and
+NEW-15's fixes are confirmed deployed and working — the retry got past both this time. Only F-14's
+newest fix remains to ship before the next attempt can get past the first native agent invocation.
