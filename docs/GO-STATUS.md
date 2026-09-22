@@ -602,6 +602,36 @@ status. This reads as intentional fail-closed design, the same philosophy behind
 this may make `llmwiki`'s one eligible issue permanently unresolvable via this exact path unless
 that sandbox is deliberately given `gh` read access.
 
-`musematic`'s global concurrency slot is now free. No blockers remain — the next attempt is still
-the first ever with a real chance of clearing delivery's remaining prechecks
-(gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
+`musematic`'s global concurrency slot is now free.
+
+## NEW-20's own fix had a missing-dispatch-entry bug too (2026-09-22)
+
+Retried `musematic` fresh (campaign `70a97e9b`) now that the global slot was free. It ran real work
+for 15 minutes, then **FAILED** the whole workflow with a non-retryable error:
+`delivery.release_leases has no configured production activity handler`.
+
+NEW-20's own fix — deployed hours earlier the same night — was itself incomplete. Turns out
+`ControlActivities.execute_control_step` gates a step through **three** independent allowlists, not
+two: `_allowed_steps`, `_worker_steps[worker_kind]`, and — for the controller worker kind — a chain
+of `if step in self.<handler>.supported_steps` checks that pick which handler *object* actually
+implements it. NEW-20 added `delivery.release_leases` to the first two (and even verified it via
+`steps_for_worker('controller')`) but never to `MetadataActivityHandler.supported_steps` in
+`metadata.py` — the exact same missing-dispatch-entry mistake as NEW-16's original bug, in a third
+gate this session didn't know existed, despite explicitly trying not to repeat it.
+
+Worse: every regression test written for this step bypassed this exact gate. The Temporal replay
+test scripts `execute_control_step` as a bare Python function; the `MetadataActivityHandler` unit
+tests call the handler directly. Neither could have caught it.
+
+**Fixed**: added `delivery.release_leases` to `MetadataActivityHandler.supported_steps`, and added
+`test_delivery_release_leases_is_wired_to_a_production_handler`
+(`tests/test_activity_fail_closed.py`) — the first test for this step that goes through the real
+`execute_control_step` dispatch path instead of a scripted stand-in. Confirmed it fails with the
+exact same production error without the fix, passes with it. 779 tests, ruff/mypy clean.
+**Not deployed yet.**
+
+---
+
+**Status**: no blockers remain except deploying this fix — the next attempt is still the first ever
+with a real chance of clearing delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform,
+merge policy) and landing an actual PR.

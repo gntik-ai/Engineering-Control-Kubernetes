@@ -356,6 +356,7 @@ class MetadataActivityHandler:
             "delivery.load_confirmed_finding",
             "delivery.ensure_issue",
             "delivery.acquire_leases",
+            "delivery.release_leases",
             "delivery.route_providers",
             "delivery.persist_worktree_leases",
             "delivery.prepare_spec",
