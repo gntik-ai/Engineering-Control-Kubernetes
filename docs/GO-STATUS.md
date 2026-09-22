@@ -365,10 +365,41 @@ passes with it. 771 tests, ruff/mypy clean. **Not deployed yet.**
 operator approves a direct correction. Forcing it through unofficial means was deliberately not
 attempted; ownership exclusivity is a legitimate concurrency control, not a bug to route around.
 
+## Retry #3 (2026-09-22): ownership corrected, a third real bug found and fixed
+
+Per your choice, corrected `defef39e`'s stuck row directly rather than waiting out its TTL —
+`.go-status/correct-defef39e-stuck-running.py` set its status to `FAILED` (the same terminal value
+the fixed exception handler would have set) using the app's own model/session pattern, not raw
+SQL. Ownership freed immediately: the next fresh campaign's `backlog-approve` correctly became the
+sole owner (`APPROVED_POLICY_PENDING`, not queued).
+
+**`backlog-start` then ran for real** — not an instant crash, not an instant clean block. It got
+further than any attempt this entire engagement: past dispatch, past ownership, into actual issue
+revalidation and materialization. It then hit a genuine `KeyError: 'body_sha256'` in
+`_materialize_backlog_candidate` — and confirmed the campaign correctly resolved to `status=FAILED`
+afterward rather than getting stuck, proving the already-deployed exception handling works
+correctly for failures inside the main loop.
+
+**Root cause of the KeyError**: NEW-15's original fix (2026-09-20/21) was never actually committed
+to this repository. `git log --all -S` finds it on exactly one commit (`6f20d1d`), on a completely
+different, unmerged abandoned-worktree lineage — not an ancestor of this branch. The release that
+was live *before* tonight's deploy doesn't have it either. It only ever existed as a live, in-place
+hotfix applied directly to a running venv's site-packages — the same pattern as NEW-12's hotfix —
+and tonight's clean redeploy had no way to know about a fix that was never in git, so it silently
+came back the moment a real delivery attempt exercised this code path again.
+
+**Re-fixed, this time actually in git**: re-added `"body_sha256": issue.body_sha256,` to
+`_serialize_backlog_issue`, plus a regression test that constructs a real `BacklogIssueRecord` and
+confirms it fails with the exact same `KeyError` without the fix, passes with it. 772 tests,
+ruff/mypy clean. **Not deployed yet.**
+
+Worth flagging: this is the **second confirmed instance** of a fix that only ever lived as an
+in-place hotfix and was silently lost on redeploy (NEW-12 was the first). A dedicated audit of
+other "confirmed fixed live" findings in this ledger for the same gap may be worth doing.
+
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item. The core dispatch fix is proven working
-live. A second, independent bug (a campaign that crashes on `register_run` gets permanently stuck
-at `RUNNING` with no recovery path) is found and fixed in git, not yet deployed. The specific
-campaign blocking ownership right now needs either its TTL to expire (`~2026-09-23T04:47Z`) or an
-explicit operator decision to correct it directly.
+**Status**: G7/NEW-16 remains the sole GO-blocking item. Ownership is currently free. Three real
+bugs found tonight (NEW-16's dispatch entry — deployed; NEW-16's `register_run`-in-try — git-only;
+NEW-15's `body_sha256` — git-only) need the last two deployed together before the next retry has a
+real shot at reaching a PR.

@@ -115,6 +115,70 @@ def test_import_snapshot_requires_the_exact_authoritative_pair() -> None:
         )
 
 
+def test_serialize_backlog_issue_includes_body_sha256() -> None:
+    """Regression test for a real production incident, twice: NEW-15
+    (2026-09-20/21) found _serialize_backlog_issue omitted body_sha256,
+    crashing _materialize_backlog_candidate's `item["body_sha256"]` read with
+    KeyError on the first genuine delivery attempt. That fix was only ever
+    applied as a live hotfix directly to a running venv's site-packages copy
+    -- never committed here, and not even present in the release source tree
+    it was hotfixed on top of (confirmed by inspecting that release directly).
+    A later clean redeploy (2026-09-22, unrelated to this finding) silently
+    reverted it, and the exact same KeyError recurred on the next real
+    delivery attempt. Fixed again here, this time actually in git, with this
+    test so a future redeploy can't silently lose it a second time.
+    """
+    record = BacklogIssueRecord(
+        backlog_campaign_id=UUID(int=0),
+        repository="gntik-ai/llmwiki",
+        issue_number=7,
+        issue_url_reference="https://github.com/gntik-ai/llmwiki/issues/7",
+        title="Bounded issue 7",
+        state="OPEN",
+        labels_json=["bug"],
+        milestone=None,
+        issue_type="PRODUCT_BUG",
+        openspec_kind=None,
+        severity="MEDIUM",
+        calculated_risk="R1",
+        component="runtime",
+        source_or_deployment_owner="source",
+        documentation_levels_json=[],
+        dependencies_json=[],
+        blocking_issues_json=[],
+        issues_blocked_json=[],
+        linked_prs_json=[],
+        linked_branches_json=[],
+        linked_commits_json=[],
+        duplicate_candidates_json=[],
+        current_source_reproduction="REPRODUCED_CURRENT_SOURCE",
+        current_runtime_reproduction="REPRODUCED_CURRENT_RUNTIME",
+        current_runtime_required=True,
+        reproduction_mode="RUNTIME_REQUIRED",
+        candidate_status="READY",
+        eligibility_status="READY",
+        eligibility_reason="CURRENT_REVALIDATION_PASS",
+        planned_wave="W0",
+        planned_order=1,
+        finding_id=None,
+        change_set_id=None,
+        delivery_status="NOT_STARTED",
+        final_closure_status="OPEN",
+        documentation_impact="DOCUMENTATION_REQUIRED",
+        body_sha256="c" * 64,
+        github_updated_at=NOW,
+        github_snapshot_json={},
+    )
+
+    serialized = EngineeringActivityHandler._serialize_backlog_issue(record)
+
+    assert serialized["body_sha256"] == "c" * 64
+    # This is the exact read that crashed with KeyError in production twice --
+    # assert it directly, not just that the key exists.
+    item = serialized
+    assert item["body_sha256"]
+
+
 def test_classifier_separates_bugs_docs_enhancements_and_product_decisions() -> None:
     bug = classify_issue(
         issue(10), (), project="falcone", import_filter="bugs-and-docs", evaluated_at=NOW

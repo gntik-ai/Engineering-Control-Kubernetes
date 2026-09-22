@@ -2163,6 +2163,7 @@ class EngineeringActivityHandler:
             "final_closure_status": issue.final_closure_status,
             "documentation_impact": issue.documentation_impact,
             "github_updated_at": issue.github_updated_at.isoformat(),
+            "body_sha256": issue.body_sha256,
         }
 
     def _backlog_campaign_envelope(
