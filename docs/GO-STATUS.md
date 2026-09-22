@@ -557,7 +557,22 @@ unconfirmed, but the same root cause would fit.
 
 **Confirmed**: the operator ran the verification command themselves — `claude auth status` on the
 worker returned `{"loggedIn": false, "authMethod": "none"}`. `claude-runner` is logged out
-entirely, not just stale. This needs an interactive `claude auth login` (or equivalent) run as
-`claude-runner` on the worker host — an operator-only credential action. Once that's restored, the
-next attempt is still the first ever with a real chance of clearing delivery's remaining prechecks
-(gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
+entirely, not just stale.
+
+**Resolved**: `claude auth login` run interactively over `ssh -t worker` + `sudo -u claude-runner`
+never accepted any keyboard input at all — not even plain typing, only paste. Ruled out paste
+corruption specifically (typing failed identically) and confirmed the pty/ssh channel itself was
+fine (`Ctrl+C` still delivered `SIGINT` and closed the connection, which happens at the kernel tty
+layer independent of whether the app is reading stdin) — so the `claude` CLI's own interactive
+input handling simply never engages in this specific remote-pty-through-sudo environment. Tried
+`TERM=$TERM`, `TERM=xterm-256color`, and dropping `env -i` entirely; none fixed it. **This remains
+an open, unresolved environment quirk** — not GO-blocking, but worth a real investigation later
+(candidate causes not yet ruled out: how `sudo -u`'s re-exec affects Node's TTY/raw-mode detection,
+or something specific to this CLI build's OAuth-flow implementation). The operator worked around it
+by running `claude auth login` on their own machine's normal terminal (worked immediately, no
+pty issues) and manually placing the resulting credential file into `claude-runner`'s identity
+directory on the worker. Confirmed fixed: `claude auth status` now shows `loggedIn: true`,
+`email: support@gntik.ai`, `subscriptionType: max`. `musematic:general`'s stale lease has also now
+naturally expired. No blockers remain — the next attempt is still the first ever with a real chance
+of clearing delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and
+landing an actual PR.
