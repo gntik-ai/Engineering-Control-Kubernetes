@@ -628,10 +628,10 @@ tests call the handler directly. Neither could have caught it.
 (`tests/test_activity_fail_closed.py`) — the first test for this step that goes through the real
 `execute_control_step` dispatch path instead of a scripted stand-in. Confirmed it fails with the
 exact same production error without the fix, passes with it. 779 tests, ruff/mypy clean.
-**Not deployed yet.**
+**Deployed 2026-09-22 (commit `2fcb9a8`), both hosts, verified active with zero restarts.**
 
 ---
 
-**Status**: no blockers remain except deploying this fix — the next attempt is still the first ever
-with a real chance of clearing delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform,
-merge policy) and landing an actual PR.
+**Status**: no blockers remain — the next attempt is still the first ever with a real chance of
+clearing delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing
+an actual PR.
