@@ -1728,11 +1728,26 @@ class EngineeringActivityHandler:
                 session.add(campaign)
             coverage = session.get(db.CoverageCell, coverage_id)
             if coverage is None:
+                # NEW-16 follow-up, 2026-09-22: uq_coverage_cell is keyed on
+                # (campaign_id, repository_surface, domain, persona, flow, lens,
+                # environment) -- NOT this row's own primary key. persona/flow/
+                # lens/environment are fixed literals for every backlog issue
+                # (see below), so domain is the only column with enough
+                # variability to distinguish issues -- but plain
+                # record.component collides the moment two issues in the same
+                # campaign share a component, hit live in production on the
+                # first campaign that ever attempted more than one issue.
+                # Suffixing the issue reference guarantees a unique domain per
+                # issue while keeping the component prefix for readability;
+                # truncated so the issue suffix always survives even if
+                # component (up to 200 chars) alone would have exceeded 120.
+                domain_suffix = f":{issue_key}"
+                domain = (record.component[: 120 - len(domain_suffix)] + domain_suffix)[:120]
                 coverage = db.CoverageCell(
                     id=coverage_id,
                     campaign_id=campaign_id,
                     repository_surface=record.source_or_deployment_owner,
-                    domain=record.component[:120],
+                    domain=domain,
                     persona="existing-github-issue",
                     flow="current-state-revalidation",
                     lens="correctness",

@@ -425,6 +425,40 @@ crashed in production — confirmed it fails with the same error without the fix
 
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item. Ownership is currently free. NEW-16's and
-NEW-15's fixes are confirmed deployed and working — the retry got past both this time. Only F-14's
-newest fix remains to ship before the next attempt can get past the first native agent invocation.
+## Retries #5 and #6 (2026-09-22): the pipeline works end-to-end; a fifth bug found
+
+Deployed F-14's fix, then retried `llmwiki` again. It **reached a clean `COMPLETE` result with
+zero crashes** — traced precisely: a genuine child `FindingVerificationWorkflow` ran (real
+agent-based reproduction verification) and came back with `status: BLOCKED`, so the system
+correctly, safely declined to deliver an unverified fix. This is the platform's fail-closed design
+working exactly as intended, not a defect — **the full pipeline (dispatch, ownership,
+materialization, real agent verification, clean completion) now works end to end for the first
+time in this entire engagement.**
+
+Tried `falcone` (0 eligible issues right now — structural, not a bug) and `musematic` (1 eligible
+issue, same fail-closed outcome as `llmwiki`). Noticed `run-new16-retry-2.sh` hardcoded
+`--max-items 1`, which meant `continue_after_blocked_issue`'s built-in "move to the next eligible
+issue" behavior never got a chance to run. Parameterized the script by project and by max-items,
+then retried `musematic` fresh with `--max-items 4` (its full eligible count).
+
+**Issue 1 correctly hit `CURRENT_REVALIDATION_BLOCKED` and the loop correctly continued to issue
+2** — confirming `continue_after_blocked_issue` genuinely works. Issue 2's materialization then
+crashed with a **fifth real bug**: `coverage_cells`' `uq_coverage_cell` unique constraint collided
+because both issues classified into the same `component` (`"general"`), and `domain` — the only
+column with per-issue variability — wasn't actually issue-specific. This could only ever manifest
+once a campaign attempted more than one issue, which had never happened before tonight (every
+prior attempt used `--max-items 1`).
+
+**Fixed**: `domain` is now suffixed with the issue reference, guaranteeing uniqueness per issue
+while keeping the component prefix for readability. Added a regression test that seeds two
+same-component issues and confirms both materialize without collision — confirmed it fails with
+the exact same `IntegrityError` without the fix, passes with it. Filed as NEW-18. 773 tests,
+ruff/mypy clean. **Not deployed yet.**
+
+---
+
+**Status**: G7/NEW-16 remains the sole GO-blocking item, but the underlying pipeline is now proven
+working end to end. Getting an actual PR is now a search-for-a-verifiable-issue problem, not a
+code-defect problem — three issues across two projects have all correctly, safely failed real
+agent verification so far. NEW-18's fix needs deploying before a multi-issue campaign can get past
+its second issue.

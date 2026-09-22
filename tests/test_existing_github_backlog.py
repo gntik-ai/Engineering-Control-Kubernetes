@@ -14,7 +14,7 @@ from engineering_control.activities.engineering import EngineeringActivityHandle
 from engineering_control.api.schemas import BacklogApprovalCandidateRequest
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import BacklogIssueRecord, GitHubBacklogCampaign
+from engineering_control.db.models import BacklogIssueRecord, CoverageCell, GitHubBacklogCampaign
 from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
@@ -177,6 +177,144 @@ def test_serialize_backlog_issue_includes_body_sha256() -> None:
     # assert it directly, not just that the key exists.
     item = serialized
     assert item["body_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_materialize_backlog_candidate_handles_two_issues_sharing_a_component(
+    tmp_path,
+) -> None:
+    """Regression test for a real production incident (2026-09-22, NEW-16
+    follow-up): the first campaign that ever attempted more than one backlog
+    issue (musematic, once --max-items was raised past 1) crashed with
+    'duplicate key value violates unique constraint "uq_coverage_cell"'.
+
+    Root cause: uq_coverage_cell is keyed on (campaign_id, repository_surface,
+    domain, persona, flow, lens, environment) -- not each CoverageCell row's
+    own primary key. persona/flow/lens/environment are fixed literals for
+    every backlog issue, and domain was plain `record.component`, so two
+    issues sharing a component collided on that unique constraint even though
+    their own coverage_id (primary key) correctly differed.
+
+    Fixed by suffixing domain with the issue reference. This test seeds two
+    BacklogIssueRecords in the same campaign with the SAME component and
+    confirms both materialize without a constraint violation, and that they
+    get distinct domains.
+    """
+    credentials = tmp_path / "credentials"
+    credentials.mkdir()
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'coverage-cell.sqlite'}",
+        project_config_root=ROOT / "config/projects",
+        persona_config_root=ROOT / "config/personas",
+        flow_config_root=ROOT / "config/flows",
+        credential_root=credentials,
+    )
+    handler = EngineeringActivityHandler(settings)
+    Base.metadata.create_all(handler.engine)
+
+    campaign_id = UUID("33333333-3333-4333-8333-333333333333")
+    with handler.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=campaign_id,
+                project="musematic",
+                source_repository="gntik-ai/musematic",
+                deployment_repository="gntik-ai/musematic-deploy",
+                imported_at=NOW,
+                issue_query="is:issue is:open",
+                import_filter="all",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=2,
+                eligible_count=2,
+                deferred_count=0,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                approval_binding=None,
+                approval_json={},
+                maximum_risk="R1",
+                maximum_items=2,
+                maximum_concurrency=1,
+                delivery_mode="source-pr",
+                include_enhancements=False,
+                status="RUNNING",
+                workflow_id="backlog-loop-musematic-test",
+            )
+        )
+        for number in (1, 2):
+            session.add(
+                BacklogIssueRecord(
+                    backlog_campaign_id=campaign_id,
+                    repository="gntik-ai/musematic",
+                    issue_number=number,
+                    issue_url_reference=f"https://github.com/gntik-ai/musematic/issues/{number}",
+                    title=f"Bounded issue {number}",
+                    state="OPEN",
+                    labels_json=["bug"],
+                    milestone=None,
+                    issue_type="PRODUCT_BUG",
+                    openspec_kind=None,
+                    severity="MEDIUM",
+                    calculated_risk="R1",
+                    component="general",  # same component for both -- this is the collision
+                    source_or_deployment_owner="source",
+                    documentation_levels_json=[],
+                    dependencies_json=[],
+                    blocking_issues_json=[],
+                    issues_blocked_json=[],
+                    linked_prs_json=[],
+                    linked_branches_json=[],
+                    linked_commits_json=[],
+                    duplicate_candidates_json=[],
+                    current_source_reproduction="REPRODUCED_CURRENT_SOURCE",
+                    current_runtime_reproduction="REPRODUCED_CURRENT_RUNTIME",
+                    current_runtime_required=False,
+                    reproduction_mode="SOURCE_ONLY",
+                    candidate_status="READY",
+                    eligibility_status="READY",
+                    eligibility_reason="CURRENT_REVALIDATION_PASS",
+                    planned_wave="W0",
+                    planned_order=number,
+                    finding_id=None,
+                    change_set_id=None,
+                    delivery_status="NOT_STARTED",
+                    final_closure_status="OPEN",
+                    documentation_impact="DOCUMENTATION_REQUIRED",
+                    body_sha256=(str(number) * 64),
+                    github_updated_at=NOW,
+                    github_snapshot_json={},
+                )
+            )
+
+    for number in (1, 2):
+        result = await handler.handle(
+            "backlog.materialize_candidate",
+            {
+                "backlog_campaign_id": str(campaign_id),
+                "project": "musematic",
+                "item": {
+                    "repository": "gntik-ai/musematic",
+                    "issue_number": number,
+                    "body_sha256": str(number) * 64,
+                },
+            },
+        )
+        assert result["status"] == "CANDIDATE_MATERIALIZED"
+
+    with handler.sessions() as session:
+        cells = session.scalars(
+            select(CoverageCell).where(CoverageCell.campaign_id == campaign_id)
+        ).all()
+    assert len(cells) == 2
+    assert len({cell.domain for cell in cells}) == 2
+    assert all(cell.domain.startswith("general:") for cell in cells)
 
 
 def test_classifier_separates_bugs_docs_enhancements_and_product_decisions() -> None:
