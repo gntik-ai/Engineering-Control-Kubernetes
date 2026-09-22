@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 from temporalio import activity
 from temporalio.client import WorkflowFailureError
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -63,6 +64,27 @@ def _scripted_execute_control_step(script: dict[str, dict[str, Any]]) -> Any:
     @activity.defn(name="execute_control_step")
     async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
         step = request["step"]
+        if step not in script:
+            raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
+        return script[step]
+
+    return execute_control_step
+
+
+def _scripted_execute_control_step_with_failure(
+    script: dict[str, dict[str, Any]], *, fails_on: str
+) -> Any:
+    """Like _scripted_execute_control_step, but one named step raises a
+    non-retryable ApplicationError instead of returning -- reproducing
+    exactly the shape of failure a missing ControlActivities._allowed_steps
+    entry produces in production (NEW-16, 2026-09-22).
+    """
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        if step == fails_on:
+            raise ApplicationError("unknown or invalid control step", non_retryable=True)
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
         return script[step]
@@ -174,4 +196,52 @@ async def test_existing_backlog_loop_workflow_replays_cleanly_through_failure_pa
     )
     history, result = await _run_to_history(ExistingGitHubBacklogLoopWorkflow, run_arg, activity_fn)
     assert result is None  # the workflow is expected to fail (uncaught TypeError)
+    await Replayer(workflows=[ExistingGitHubBacklogLoopWorkflow]).replay_workflow(history)
+
+
+async def test_existing_backlog_loop_workflow_records_failure_when_register_run_itself_fails() -> (
+    None
+):
+    """Regression test for a real production incident (2026-09-22): the first
+    time this workflow's backlog.register_run call was ever genuinely
+    exercised, it failed with a non-retryable ApplicationError (a missing
+    ControlActivities._allowed_steps entry) -- and because that call sat
+    outside the workflow's try/except, backlog.record_loop_state never ran,
+    campaign.status stayed stuck at RUNNING (set moments earlier inside
+    backlog.load_execution), and the campaign permanently blocked GitHub
+    write-policy ownership for every other campaign until its ~24h approval
+    TTL expired, with no exposed way to release it early.
+
+    Fixed by moving the register_run call inside the try block. This test
+    scripts register_run itself to fail (not a later step) and asserts
+    record_loop_state still gets called with loop_status=FAILED before the
+    workflow re-raises.
+    """
+    activity_fn = _scripted_execute_control_step_with_failure(
+        {
+            "backlog.load_execution": {"status": "READY", "items": []},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+        },
+        fails_on="backlog.register_run",
+    )
+    run_arg = ExistingGitHubBacklogLoopInput(
+        project="falcone",
+        backlog_campaign_id="camp-1",
+        maximum_risk="low",
+        delivery_mode="source-pr",
+    )
+    history, result = await _run_to_history(ExistingGitHubBacklogLoopWorkflow, run_arg, activity_fn)
+    assert result is None  # the workflow is expected to fail (register_run's ApplicationError)
+
+    # Confirm record_loop_state actually ran (with loop_status=FAILED) before
+    # the workflow failed -- i.e. this isn't just "the workflow failed", it's
+    # specifically "the workflow failed AND still recorded that fact".
+    recorded_payloads = [
+        event.activity_task_scheduled_event_attributes.input.payloads[0].data
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert any(b"record_loop_state" in payload for payload in recorded_payloads)
+    assert any(b"FAILED" in payload for payload in recorded_payloads)
+
     await Replayer(workflows=[ExistingGitHubBacklogLoopWorkflow]).replay_workflow(history)

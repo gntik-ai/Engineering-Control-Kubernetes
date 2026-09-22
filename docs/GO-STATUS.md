@@ -332,10 +332,43 @@ instead). Third attempt succeeded end to end: both hosts now on commit
 and NEW-17's fixes confirmed present in the deployed source, and `temporal schedule list` confirms
 `engineering-connections-refresh` is registered for the first time ever — NEW-05 is finally live.
 
+## Retry #2 (2026-09-22): the dispatch fix works, but a second bug surfaced
+
+Ran `.go-status/run-new16-retry-2.sh` (waits for `backlog-plan`'s workflow to reach `COMPLETED`,
+proactively refreshes quota before `backlog-start`) against a brand-new campaign
+(`b651450b-54d5-43a3-8c55-f593ba498e51`). **`backlog-start`'s workflow completed cleanly for the
+first time ever in this whole saga — no crash.** That confirms the deployed dispatch fix genuinely
+works.
+
+It then hit a real, separate, independent bug: the new campaign got queued as `APPROVED_INVENTORY`
+behind `defef39e-b0ae-4a36-8863-dd59f08e960c`, which still holds active GitHub write-policy
+ownership. Confirmed precisely (a direct `GET /v1/backlogs/{id}` read, reusing the CLI's own
+`APIClient`/token-loading code): `defef39e` is genuinely `status=RUNNING`, its ~24h TTL hasn't
+expired (`~2026-09-23T04:47Z`), and neither `3a363acd` nor `c405b4d7` are blocking anything (both
+already correctly `EXPIRED`). None of the three could be released through the exposed action —
+`backlog-release-ownership` only works pre-execution, and `backlog-cancel` signals a *live*
+workflow, but `defef39e`'s execution already terminated.
+
+Root cause: `activities/engineering.py`'s `_load_backlog_execution` flips `campaign.status` to
+`RUNNING` the moment execution begins, but the workflow's try/except only wrapped
+`backlog.register_run`'s *caller* side onward — the `register_run` call itself sat outside it. When
+it failed (`defef39e`'s actual crash, the missing dispatch-allowlist entry), the cleanup that
+resets `campaign.status` never ran. This is exactly the second half of NEW-16's original two-part
+diagnosis, now reproduced live and fixed for real — not just described.
+
+**Fixed (git-only)**: moved `register_run`'s call inside the try block. Added a regression test
+that scripts `register_run` to fail and inspects the real recorded Temporal history to confirm
+`record_loop_state` actually ran with `loop_status=FAILED` — confirmed it fails without the fix,
+passes with it. 771 tests, ruff/mypy clean. **Not deployed yet.**
+
+`defef39e` itself is not retroactively fixed by this — it stays stuck until its TTL expires or an
+operator approves a direct correction. Forcing it through unofficial means was deliberately not
+attempted; ownership exclusivity is a legitimate concurrency control, not a bug to route around.
+
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item, but both bugs that blocked every attempt —
-NEW-16's non-functional fix and NEW-17's scheduling mismatch — are now fixed **and deployed** to
-both hosts, confirmed via read-only checks. What's left is simply attempting the retry sequence
-again against a fresh campaign (`defef39e`/`3a363acd`/`c405b4d7` are all burned) — no known code
-blockers remain.
+**Status**: G7/NEW-16 remains the sole GO-blocking item. The core dispatch fix is proven working
+live. A second, independent bug (a campaign that crashes on `register_run` gets permanently stuck
+at `RUNNING` with no recovery path) is found and fixed in git, not yet deployed. The specific
+campaign blocking ownership right now needs either its TTL to expire (`~2026-09-23T04:47Z`) or an
+explicit operator decision to correct it directly.

@@ -1851,12 +1851,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
             return context
-        if register_run:
-            await self._step(
-                "backlog.register_run",
-                {**asdict(request), "workflow_id": workflow.info().workflow_id},
-            )
         try:
+            if register_run:
+                await self._step(
+                    "backlog.register_run",
+                    {**asdict(request), "workflow_id": workflow.info().workflow_id},
+                )
             return await self._run_backlog_loop(
                 request,
                 context,
@@ -1871,7 +1871,19 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             # Without this, an uncaught exception (e.g. a non-retryable
             # ApplicationError from an activity or child workflow) leaves the
             # campaign stuck at status RUNNING forever with no Run row to
-            # reconcile against -- see NEW-16.
+            # reconcile against -- see NEW-16. Deliberately covers
+            # backlog.register_run's own call too (NEW-16 follow-up,
+            # 2026-09-22): backlog.load_execution already flips campaign.status
+            # to RUNNING before this point, so if register_run itself fails
+            # (as it did in production the first time this whole path was ever
+            # exercised for real -- a missing dispatch-allowlist entry),
+            # nothing else will ever reset that status, and the campaign
+            # blocks GitHub write-policy ownership for every other campaign
+            # until its ~24h approval TTL expires, with no exposed way to
+            # release it early. record_loop_state handles a still-missing Run
+            # row gracefully (skips updating it) and unconditionally resets
+            # campaign.status regardless, so this is safe even though
+            # register_run hasn't necessarily succeeded.
             if register_run:
                 await self._step(
                     "backlog.record_loop_state",
