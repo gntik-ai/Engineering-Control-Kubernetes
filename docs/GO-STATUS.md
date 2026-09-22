@@ -208,7 +208,7 @@ Ruff, mypy, and the full test suite (766 tests) pass clean on this branch.
 | G4 | Hermes unit active, CLI-backed, skills load | **PASS** |
 | G5 | Telegram + dashboard can trigger/show missions | **PASS** (Telegram confirmed end-to-end; dashboard wired, not visually re-checked) |
 | G6 | Fail-closed gates consciously set | **PASS** (Temporal control plane fully gated; NEW-07's parallel path now also gated) |
-| G7 | Issue-resolution loop completes end to end | **PENDING** — NEW-16's fix was never actually functional (missing activity-dispatch entry), now fixed in git with a regression test but not deployed; a second real bug (CLAUDE_HEALTH_STALE) also found and worked around live; see NEW-16 in findings.json |
+| G7 | Issue-resolution loop completes end to end | **PENDING** — both blocking bugs (NEW-16's missing activity-dispatch entry, NEW-17's scheduling mismatch) fixed and deployed to both hosts 2026-09-22; needs one more retry attempt against a fresh campaign to actually confirm a PR |
 | G8 | Audit mission completes end to end | **PASS** |
 | G9 | Security baseline | **PASS, one paused item** (F-29 reverted after incident, needs an SSH key prerequisite before retry) |
 | G10 | Restart resilience | **PARTIAL** (app-level proven; core infra restart not tested, real blast radius) |
@@ -310,11 +310,32 @@ that asserted staleness at a 10-minute age (no longer stale under the corrected 
 threshold) to 45 minutes, and added a new test that checks the actual configured schedule interval
 has real margin under the actual configured threshold — not just that the constants are related by
 construction, in case a future edit changes one without the other. 770 tests, ruff/mypy clean.
-**Not deployed** — same deploy-review gate as NEW-16's fix applies.
+
+## Deployed everything (2026-09-22)
+
+Per operator direction ("deploy everything... check and deploy everything"). Auditing what needed
+deploying surfaced a major discovery: **the worker host had never been touched by the earlier
+917b394 deploy at all** — it was still running commit `2b678d9`, confirmed not even an ancestor of
+this branch. It's the same abandoned findings-closure lineage F-11 already reviewed on the
+controller's old deploy; none of its 33 unique files are role-worker activity code, so bringing the
+worker host onto this branch for the first time was expected to be safe.
+
+`.go-status/deploy-2026-09-22.sh` deploys one release to both hosts, gated behind the full local
+test/ruff/mypy suite, with dry-tested imports on both hosts before any symlink is touched. Two real
+deploy-tooling bugs turned up along the way (the first time in this engagement a venv was built
+from scratch via `requirements.lock` rather than copied from an existing one): a missing `fastapi`
+pin in `requirements.lock` (its own transitive deps were all correctly pinned, just not itself),
+and a broken `ssh -t` + heredoc pattern that left `sudo` with no real controlling terminal on the
+worker host (fixed by writing the remote commands to a real script file and `scp`'ing it over
+instead). Third attempt succeeded end to end: both hosts now on commit
+`f402e269529f2a600be16b36200e0245f2a90371`, all services active with zero restarts, both NEW-16's
+and NEW-17's fixes confirmed present in the deployed source, and `temporal schedule list` confirms
+`engineering-connections-refresh` is registered for the first time ever — NEW-05 is finally live.
 
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item, now understood far more precisely. Both
-bugs that blocked tonight's retry — NEW-16's non-functional fix and NEW-17's scheduling mismatch —
-are fixed in git with regression tests, but neither is deployed. Next retry needs both fixes
-shipped plus a fresh campaign (`defef39e` is burned).
+**Status**: G7/NEW-16 remains the sole GO-blocking item, but both bugs that blocked every attempt —
+NEW-16's non-functional fix and NEW-17's scheduling mismatch — are now fixed **and deployed** to
+both hosts, confirmed via read-only checks. What's left is simply attempting the retry sequence
+again against a fresh campaign (`defef39e`/`3a363acd`/`c405b4d7` are all burned) — no known code
+blockers remain.
