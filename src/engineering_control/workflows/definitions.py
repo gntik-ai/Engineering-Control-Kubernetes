@@ -850,10 +850,29 @@ class FindingVerificationWorkflow(ControlledWorkflow):
                 reproduced = await self._step("finding.record_terminal", reproduced)
                 return {"status": reproduced.get("status", "FAILED"), "context": reproduced}
             attempts.append(reproduced)
-        controls = await self._step(
-            "finding.controls",
-            {"finding": candidate, "snapshot": fresh, "attempts": attempts},
-        )
+        try:
+            controls = await self._step(
+                "finding.controls",
+                {"finding": candidate, "snapshot": fresh, "attempts": attempts},
+            )
+        except Exception:
+            # NEW-21, 2026-09-22: _evaluate_controls treats every other "can't
+            # confirm" case (environment invalid, not reproduced, flaky) as a
+            # graceful disposition -- but a verification attempt whose evidence
+            # isn't anchored to the fresh snapshot's own hash raises a bare
+            # ValueError instead, and this workflow (like IssueDeliveryWorkflow
+            # before NEW-20) had no try/except at all, so that one case crashed
+            # the entire parent campaign instead of just blocking this one
+            # issue. Deliberately NOT weakening _evaluate_controls' own
+            # anti-staleness check (it's a legitimate integrity gate); this
+            # just makes its failure read like every other blocked verification
+            # -- continue_after_blocked_issue already knows how to move on from
+            # exactly this outcome.
+            blocked = await self._step(
+                "finding.record_terminal",
+                {"finding": candidate, "status": "BLOCKED", "blocker": "VERIFICATION_INTEGRITY"},
+            )
+            return {"status": "BLOCKED", "context": blocked}
         duplicate = await self._step(
             "finding.dedupe",
             {"finding": candidate, "attempts": attempts, "controls": controls},

@@ -34,17 +34,20 @@ from engineering_control.workflows.definitions import (
     ConnectionsRefreshWorkflow,
     ExistingGitHubBacklogLoopWorkflow,
     FinalClosureWorkflow,
+    FindingVerificationWorkflow,
     IssueDeliveryWorkflow,
 )
 from engineering_control.workflows.inputs import (
     ConnectionsRefreshInput,
     ExistingGitHubBacklogLoopInput,
     FinalClosureInput,
+    FindingVerificationInput,
     IssueDeliveryInput,
 )
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
     GITHUB_TASK_QUEUE,
+    ROLE_TASK_QUEUES,
 )
 
 _TEMPORAL_CLI = shutil.which("temporal")
@@ -97,8 +100,10 @@ def _scripted_execute_control_step_with_failure(
 async def _run_to_history(workflow_cls: type, run_arg: Any, activity_fn: Any) -> Any:
     # FinalClosureWorkflow's GitHub-write steps (final.merge_source,
     # final.inspect_artifact, ...) dispatch to GITHUB_TASK_QUEUE rather than
-    # the default CONTROL_TASK_QUEUE (see ControlledWorkflow._activity_queue),
-    # so both queues need a worker regardless of which workflow is under test.
+    # the default CONTROL_TASK_QUEUE, and FindingVerificationWorkflow's
+    # finding.reproduce routes to a provider queue (claude/codex) -- see
+    # ControlledWorkflow._activity_queue -- so every role queue needs a
+    # worker regardless of which workflow is under test.
     async with await WorkflowEnvironment.start_local(
         dev_server_existing_path=_TEMPORAL_CLI
     ) as env:
@@ -112,6 +117,24 @@ async def _run_to_history(workflow_cls: type, run_arg: Any, activity_fn: Any) ->
             Worker(
                 env.client,
                 task_queue=GITHUB_TASK_QUEUE,
+                workflows=[workflow_cls],
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=ROLE_TASK_QUEUES["claude"],
+                workflows=[workflow_cls],
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=ROLE_TASK_QUEUES["codex"],
+                workflows=[workflow_cls],
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=ROLE_TASK_QUEUES["scan"],
                 workflows=[workflow_cls],
                 activities=[activity_fn],
             ),
@@ -286,3 +309,51 @@ async def test_issue_delivery_workflow_releases_leases_when_a_later_step_crashes
     assert any(b"release_leases" in payload for payload in recorded_payloads)
 
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_finding_verification_workflow_blocks_gracefully_when_controls_crash() -> None:
+    """Regression test for a real production incident (2026-09-22, NEW-21): the
+    first time a musematic finding reached finding.controls after two
+    successful reproduction attempts, _evaluate_controls raised a bare
+    ValueError ("verification attempt is not bound to fresh snapshot
+    evidence") -- its own legitimate anti-staleness integrity check, wrapped
+    as a non-retryable ApplicationError. FindingVerificationWorkflow (like
+    IssueDeliveryWorkflow before NEW-20) had no try/except at all, so this
+    crashed the entire parent ExistingGitHubBacklogLoopWorkflow instead of
+    just blocking this one issue -- exactly the outcome
+    continue_after_blocked_issue exists to avoid.
+
+    Fixed by catching finding.controls' failure and recording a graceful
+    BLOCKED terminal state instead -- deliberately NOT weakening
+    _evaluate_controls' own integrity check, just making its failure read
+    like every other blocked verification. This test scripts finding.controls
+    to fail and asserts finding.record_terminal still gets called and the
+    workflow returns BLOCKED instead of crashing.
+    """
+    activity_fn = _scripted_execute_control_step_with_failure(
+        {
+            "finding.load_candidate": {"status": "CANDIDATE_LOADED", "finding_id": "finding-1"},
+            "finding.fresh_snapshot": {"snapshot_evidence_sha256": "a" * 64},
+            "finding.prepare_verifier": {"status": "PREPARED"},
+            "agent.record_start": {"status": "STARTED"},
+            "finding.reproduce": {"status": "SUCCESS"},
+            "agent.persist_result": {
+                "status": "SUCCESS",
+                "agent_result": {"structured_result": {"evidence": []}},
+            },
+            "finding.record_terminal": {"status": "BLOCKED"},
+        },
+        fails_on="finding.controls",
+    )
+    run_arg = FindingVerificationInput(finding_id="finding-1", project="musematic")
+    history, result = await _run_to_history(FindingVerificationWorkflow, run_arg, activity_fn)
+    assert result == {"status": "BLOCKED", "context": {"status": "BLOCKED"}}
+
+    recorded_payloads = [
+        event.activity_task_scheduled_event_attributes.input.payloads[0].data
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert any(b"record_terminal" in payload for payload in recorded_payloads)
+
+    await Replayer(workflows=[FindingVerificationWorkflow]).replay_workflow(history)

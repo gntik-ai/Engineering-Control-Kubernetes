@@ -630,8 +630,44 @@ tests call the handler directly. Neither could have caught it.
 exact same production error without the fix, passes with it. 779 tests, ruff/mypy clean.
 **Deployed 2026-09-22 (commit `2fcb9a8`), both hosts, verified active with zero restarts.**
 
+## NEW-21: the third missing-try/except crash tonight (2026-09-22)
+
+Retried `musematic` fresh (campaign `2182cdcd`) now that NEW-20's follow-up fix was deployed. It ran
+real work for ~6 minutes, then **FAILED** again — this time inside `FindingVerificationWorkflow`,
+not `IssueDeliveryWorkflow`: `verification attempt is not bound to fresh snapshot evidence`.
+
+`_evaluate_controls` (`activities/metadata.py`) requires each of the two independent reproduction
+attempts to include an evidence item whose hash matches the fresh snapshot's own hash — a
+legitimate anti-staleness integrity check, preventing an agent's `reproduced: true` claim from
+being trusted unless it's provably tied to the current source state. Every *other* "can't confirm"
+outcome this function computes (invalid environment, not reproduced, flaky) returns a graceful
+disposition string; only this one case raised a bare `ValueError`. `FindingVerificationWorkflow.run()`
+had no `try`/`except` at all — the exact same shape as `IssueDeliveryWorkflow` before NEW-20 — so
+this one issue's failure crashed the entire parent campaign instead of just blocking it. This is the
+**third** time tonight a child workflow's missing exception handling turned one blocked issue into a
+full campaign crash (after NEW-16 and NEW-20).
+
+**Fixed**: wrapped the `finding.controls` call in `try`/`except`; on failure it now records a
+graceful `BLOCKED` terminal state via `finding.record_terminal` (the same call other graceful-stop
+branches in this workflow already make) and returns `{status: BLOCKED}` — which
+`_backlog_revalidate_gate` already turns into `blocker=CURRENT_REVALIDATION_BLOCKED`, identical to
+every other "verification couldn't confirm" outcome tonight. Deliberately did **not** weaken
+`_evaluate_controls`' own integrity check — it's legitimate, and whether the underlying evidence
+mismatch was a genuine agent-behavior issue or an orchestration bug wasn't fully root-caused
+tonight.
+
+Added `test_finding_verification_workflow_blocks_gracefully_when_controls_crash`
+(`tests/test_workflow_replay.py`) — confirmed it fails with the exact same uncaught error without
+the fix, passes with it. While writing it, also found and fixed a real gap in the *shared* replay
+test harness itself: `_run_to_history` only ever started workers on the control and GitHub task
+queues, but `finding.reproduce` (provider-routed) and `finding.fresh_snapshot` (scan-routed)
+dispatch to the claude/codex/scan role queues — those activities silently never ran, which looked
+exactly like a hang until traced with a standalone debug script. Added those role-queue workers to
+the shared harness so future workflow tests don't hit the same silent stall. 780 tests, ruff/mypy
+clean. **Not deployed yet.**
+
 ---
 
-**Status**: no blockers remain — the next attempt is still the first ever with a real chance of
-clearing delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing
-an actual PR.
+**Status**: no blockers remain except deploying this fix — the next attempt is still the first ever
+with a real chance of clearing delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform,
+merge policy) and landing an actual PR.
