@@ -456,10 +456,49 @@ the exact same `IntegrityError` without the fix, passes with it. Filed as NEW-18
 ruff/mypy clean. **Deployed 2026-09-22 (commit `207288a`), both hosts, verified active with zero
 restarts.**
 
+## NEW-19: the likely real reason G7 never landed a PR (2026-09-22)
+
+Retried `musematic` fresh (campaign `5e307f4c`, `--max-items 4`) right after deploying NEW-18's
+fix. Ownership acquisition was clean — no lingering lock from the earlier crashed campaign,
+confirming the `register_run`-in-`try` fix genuinely releases ownership on failure. The workflow
+then ran for **13 real minutes**, and **issue 1 passed real agent verification for the first time
+in this entire engagement** — every previous attempt had stopped earlier, either blocked in
+verification or crashed on an earlier bug. It then crashed the whole workflow with an uncaught
+child-workflow failure: `Semgrep execution failed`, from `_delivery_prechecks`.
+
+Reproduced directly on the worker host, in the exact restricted environment
+`SafeCommandRunner` uses (`PATH`/`LANG`/`LC_ALL`/`NO_COLOR` only, no `HOME`):
+
+- `--no-suppress-errors` is not a real flag on the installed/pinned semgrep version (`1.174.0`,
+  confirmed via `scripts/install-scanners.sh` and `semgrep --version` on the worker) — it fails
+  immediately with `unknown option '--no-suppress-errors'`.
+- Removing just that flag surfaces a second, deeper failure: `--config auto` itself is
+  incompatible with `--metrics=off` on this semgrep version (`Cannot create auto config when
+  metrics are off`) — and this codebase always sets `--metrics=off`.
+
+Since `_delivery_prechecks` gates **every** delivery for **every** issue in **every** campaign,
+this single bug was sufficient to make G7 unreachable regardless of any other fix made tonight —
+and it was never caught before because no earlier attempt ever got a real fix candidate past
+verification far enough to reach it.
+
+**Fixed**: switched semgrep's config from `auto` to `p/ci` (a fixed, general-purpose registry
+ruleset, confirmed compatible with `--metrics=off` by running it directly on the worker host —
+exit 0, valid JSON output), and removed the invalid flag. Checked gitleaks/trivy/syft/kubeconform's
+own flags against their installed versions (`8.30.0`/`0.74.0`/`1.51.0`) — all valid, only semgrep
+was broken. Also fixed a real diagnosability gap while in this code: all four scanners' error
+messages on failure previously discarded `stderr` entirely, unlike `command.py`'s own
+`CommandFailure` — this cost real debugging time today. All four now include the return code and a
+stderr tail. Added `test_semgrep_scan_uses_a_fixed_config_compatible_with_installed_semgrep` and
+`test_semgrep_failure_message_includes_stderr`. Filed as NEW-19. 775 tests, ruff/mypy clean.
+**Not deployed yet.**
+
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item, but the underlying pipeline is now proven
-working end to end. Getting an actual PR is now a search-for-a-verifiable-issue problem, not a
-code-defect problem — three issues across two projects have all correctly, safely failed real
-agent verification so far. NEW-18's fix is deployed; the next multi-issue retry should be able to
-get past a campaign's second issue.
+**Status**: G7/NEW-16 remains the sole GO-blocking item. Tonight's retries found and fixed six real
+bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19) — the pipeline's dispatch, ownership, materialization,
+and real agent verification stages have all now been proven working end to end, and issue 1 of the
+latest attempt passed verification for the first time ever before hitting NEW-19. NEW-19 is likely
+the actual root blocker that made every prior attempt at an actual PR impossible, since it gated
+every delivery unconditionally. It needs deploying before the next retry can find out whether
+delivery clears its remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) — territory
+no attempt has ever reached before.
