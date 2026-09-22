@@ -453,12 +453,13 @@ prior attempt used `--max-items 1`).
 while keeping the component prefix for readability. Added a regression test that seeds two
 same-component issues and confirms both materialize without collision — confirmed it fails with
 the exact same `IntegrityError` without the fix, passes with it. Filed as NEW-18. 773 tests,
-ruff/mypy clean. **Not deployed yet.**
+ruff/mypy clean. **Deployed 2026-09-22 (commit `207288a`), both hosts, verified active with zero
+restarts.**
 
 ---
 
 **Status**: G7/NEW-16 remains the sole GO-blocking item, but the underlying pipeline is now proven
 working end to end. Getting an actual PR is now a search-for-a-verifiable-issue problem, not a
 code-defect problem — three issues across two projects have all correctly, safely failed real
-agent verification so far. NEW-18's fix needs deploying before a multi-issue campaign can get past
-its second issue.
+agent verification so far. NEW-18's fix is deployed; the next multi-issue retry should be able to
+get past a campaign's second issue.
