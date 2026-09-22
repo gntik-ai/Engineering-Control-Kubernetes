@@ -492,13 +492,57 @@ stderr tail. Added `test_semgrep_scan_uses_a_fixed_config_compatible_with_instal
 `test_semgrep_failure_message_includes_stderr`. Filed as NEW-19. 775 tests, ruff/mypy clean.
 **Deployed 2026-09-22 (commit `6ff4712`), both hosts, verified active with zero restarts.**
 
+## NEW-20: the lease that never let go (2026-09-22)
+
+Retried `musematic` fresh (campaign `8fedc69d`, `--max-items 4`) right after deploying NEW-19's
+fix. No crash this time — the campaign ran all 4 issues and `COMPLETED` cleanly. But issue 1
+(`#1025`) came back `BLOCKED` with `COMPONENT_LEASE_CONFLICT` on `musematic:general`, before its
+`IssueDeliveryWorkflow` even got as far as verification.
+
+Traced it to the *previous* run — the one NEW-19's semgrep bug crashed. That run had already
+gotten past `delivery.acquire_leases` (acquiring a 4-hour implementation lease on
+`musematic:general`) before crashing at `_delivery_prechecks`. Reading `activities/metadata.py`
+confirmed `ComponentLeaseManager.release()` is called from exactly two places: `_persist_publication`'s
+success branch and its explicit `GITHUB_PUBLICATION_FAILED` branch. Nowhere else. And
+`IssueDeliveryWorkflow.run()` (`workflows/definitions.py`) had **no `try`/`except` at all** around
+its flat step loop — so that crash, or any uncaught exception between `delivery.acquire_leases` and
+`delivery.persist_publication`, skipped lease release entirely, leaving it held for its full 4-hour
+TTL. The timing lined up exactly: the earlier run acquired the lease around `15:46Z`; this retry
+hit the conflict at `17:03Z`.
+
+Re-reading the same control flow surfaced a second, related concern: every *graceful* stop before
+`delivery.persist_publication` (`RATE_LIMITED`, `BLOCKED`, `FAILED`, `TIMED_OUT`, `CANCELLED`,
+`REQUEST_CHANGES`, `DRY_RUN`) has the identical gap — including `REQUEST_CHANGES`, which the
+correction-retry loop (`ExistingGitHubBacklogLoopWorkflow`'s `sequential_source_pr` path) treats as
+"retry this issue with a fresh `run_id`" up to `correction_limit + 1` times. If attempt N returns
+`REQUEST_CHANGES` while still holding the lease, attempt N+1 would hit `COMPONENT_LEASE_CONFLICT`
+instead of actually retrying, silently truncating the correction loop after one cycle. Not yet
+directly observed (no attempt has reached `delivery.invoke_checker` yet), but the code path is
+identical, so the same fix covers it.
+
+**Fixed**: wrapped `IssueDeliveryWorkflow.run()`'s step loop in `try`/`except` — the exact pattern
+NEW-16's `ExistingGitHubBacklogLoopWorkflow` fix already established — and added a new
+`delivery.release_leases` activity step (idempotent no-op if the run holds nothing), called from
+the exception handler *and* every early-return stop branch, not just crashes. Added to
+`ControlActivities._allowed_steps` (deliberately not repeating NEW-16's original missing-dispatch-entry
+mistake). Added a real Temporal replay regression test
+(`test_issue_delivery_workflow_releases_leases_when_a_later_step_crashes`) confirming
+`delivery.release_leases` gets scheduled before the workflow re-raises, plus two unit tests for the
+activity handler itself. Filed as NEW-20. 778 tests, ruff/mypy clean. **Not deployed yet.**
+
+Tonight's specific stale lease (`musematic:general`) was deliberately **not** corrected directly in
+the database, unlike NEW-16's `defef39e` precedent — it isn't blocking further progress. It
+self-heals by around `19:46Z`, and `falcone`/`llmwiki` target entirely different component-key
+namespaces and are unaffected right now.
+
 ---
 
-**Status**: G7/NEW-16 remains the sole GO-blocking item. Tonight's retries found and fixed six real
-bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19) — all deployed and confirmed working on both hosts.
-The pipeline's dispatch, ownership, materialization, and real agent verification stages have all
-now been proven working end to end, and issue 1 of the latest attempt passed verification for the
-first time ever before hitting NEW-19. NEW-19 is likely the actual root blocker that made every
-prior attempt at an actual PR impossible, since it gated every delivery unconditionally. With it
-now deployed, the next retry is the first ever with a real chance of clearing delivery's remaining
-prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
+**Status**: G7/NEW-16 remains the sole GO-blocking item. Tonight's retries found and fixed seven
+real bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19, NEW-20) — six deployed and confirmed working on
+both hosts, NEW-20 git-only pending deploy. The pipeline's dispatch, ownership, materialization,
+and real agent verification stages have all now been proven working end to end, and issue 1 of the
+latest attempt passed verification and reached real delivery for the first time ever before hitting
+NEW-20. Once NEW-20 is deployed, the next retry — against `llmwiki` or `falcone` rather than the
+still-lease-blocked `musematic:general` — is the first ever with a real chance of clearing
+delivery's remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing an
+actual PR.

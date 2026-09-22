@@ -34,11 +34,13 @@ from engineering_control.workflows.definitions import (
     ConnectionsRefreshWorkflow,
     ExistingGitHubBacklogLoopWorkflow,
     FinalClosureWorkflow,
+    IssueDeliveryWorkflow,
 )
 from engineering_control.workflows.inputs import (
     ConnectionsRefreshInput,
     ExistingGitHubBacklogLoopInput,
     FinalClosureInput,
+    IssueDeliveryInput,
 )
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
@@ -245,3 +247,42 @@ async def test_existing_backlog_loop_workflow_records_failure_when_register_run_
     assert any(b"FAILED" in payload for payload in recorded_payloads)
 
     await Replayer(workflows=[ExistingGitHubBacklogLoopWorkflow]).replay_workflow(history)
+
+
+async def test_issue_delivery_workflow_releases_leases_when_a_later_step_crashes() -> None:
+    """Regression test for a real production incident (2026-09-22, NEW-20): the
+    first time a delivery ever got past delivery.acquire_leases (NEW-19's
+    semgrep bug crashed a later step, delivery.deterministic_prechecks --
+    itself now fixed), the crash propagated uncaught out of
+    IssueDeliveryWorkflow's flat step loop with no try/except at all, so the
+    component-implementation lease acquired moments earlier was never
+    released. It then blocked the very next retry's attempt at the same issue
+    for the rest of the lease's 4h TTL.
+
+    Fixed by wrapping the step loop in try/except and calling the new
+    delivery.release_leases step on any uncaught failure (idempotent: a no-op
+    if nothing was ever acquired). This test scripts the step right after
+    acquire_leases to fail and asserts delivery.release_leases still gets
+    called before the workflow re-raises.
+    """
+    activity_fn = _scripted_execute_control_step_with_failure(
+        {
+            "delivery.load_confirmed_finding": {"status": "OK", "run_id": "run-1"},
+            "delivery.ensure_issue": {"status": "OK", "run_id": "run-1"},
+            "delivery.acquire_leases": {"status": "LEASES_ACQUIRED", "run_id": "run-1"},
+            "delivery.release_leases": {"status": "LEASES_RELEASED", "run_id": "run-1"},
+        },
+        fails_on="delivery.route_providers",
+    )
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+    history, result = await _run_to_history(IssueDeliveryWorkflow, run_arg, activity_fn)
+    assert result is None  # the workflow is expected to fail (the scripted crash)
+
+    recorded_payloads = [
+        event.activity_task_scheduled_event_attributes.input.payloads[0].data
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert any(b"release_leases" in payload for payload in recorded_payloads)
+
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)

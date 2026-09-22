@@ -249,6 +249,84 @@ async def test_publication_persists_both_prs_and_releases_implementation_leases(
 
 
 @pytest.mark.asyncio
+async def test_release_delivery_leases_releases_leases_held_by_the_run(tmp_path: Path) -> None:
+    """NEW-20, 2026-09-22: delivery.release_leases is the cleanup step
+    IssueDeliveryWorkflow now calls from its except handler when a later step
+    (e.g. NEW-19's semgrep crash) leaves an implementation lease dangling for
+    its full 4h TTL. Confirms it actually releases whatever the run holds.
+    """
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'release.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    run_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="musematic",
+                risk_class="R1",
+                state="IMPLEMENTING",
+                version=1,
+                source_repository="musematic",
+                source_branch=None,
+                source_base_sha="a" * 40,
+                source_head_sha=None,
+                source_pr_url=None,
+                deployment_repository="musematic-deploy",
+                deployment_branch=None,
+                deployment_base_sha="c" * 40,
+                deployment_head_sha=None,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id="delivery-test-crash",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project="musematic",
+            )
+        )
+        session.add(
+            ComponentLease(
+                component_key="musematic:general",
+                owner_run_id=run_id,
+                mode="implementation",
+                expires_at=datetime.now(UTC) + timedelta(hours=4),
+                released_at=None,
+            )
+        )
+
+    result = await handler.handle("delivery.release_leases", {"run_id": str(run_id)})
+
+    assert result["status"] == "LEASES_RELEASED"
+    with handler.sessions() as session:
+        lease = session.scalar(select(ComponentLease))
+        assert lease is not None and lease.released_at is not None
+
+
+@pytest.mark.asyncio
+async def test_release_delivery_leases_is_a_noop_without_a_run_id(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'release_noop.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+
+    result = await handler.handle("delivery.release_leases", {})
+
+    assert result["status"] == "NO_RUN_TO_RELEASE_LEASES_FOR"
+
+
+@pytest.mark.asyncio
 async def test_source_pr_persists_with_deployment_bound_but_deferred(tmp_path: Path) -> None:
     handler = MetadataActivityHandler(
         Settings(database_url=f"sqlite:///{tmp_path / 'deferred.sqlite'}")

@@ -474,6 +474,8 @@ class MetadataActivityHandler:
                         "status": "BLOCKED",
                         "blocker": "COMPONENT_LEASE_CONFLICT",
                     }
+            if step == "delivery.release_leases":
+                return await asyncio.to_thread(self._release_delivery_leases, payload)
             if step == "delivery.route_providers":
                 return await asyncio.to_thread(self._route_delivery, payload)
             if step == "delivery.persist_worktree_leases":
@@ -2533,6 +2535,26 @@ class MetadataActivityHandler:
             "component_key": component,
             "component_lease_id": str(lease.id),
         }
+
+    def _release_delivery_leases(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-20, 2026-09-22: best-effort cleanup called from IssueDeliveryWorkflow's
+        exception handler. Every OTHER release of an implementation lease is wired into
+        _persist_publication's own success/failure branches, so a crash anywhere between
+        delivery.acquire_leases and delivery.persist_publication (deterministic_prechecks,
+        the maker/checker agent steps, etc.) left the lease held for its full 4h TTL,
+        blocking every other delivery attempt at the same component -- reproduced live
+        when NEW-19's (now-fixed) semgrep crash did exactly this and blocked the very next
+        retry's attempt at the same issue. Idempotent: releasing a run with no held leases
+        is a no-op.
+        """
+        raw_run_id = payload.get("run_id")
+        if not raw_run_id:
+            return {**payload, "status": "NO_RUN_TO_RELEASE_LEASES_FOR"}
+        with self.sessions.begin() as session:
+            run = session.get(Run, UUID(str(raw_run_id)))
+            if run is not None:
+                self._release_implementation_leases(session, run)
+        return {**payload, "status": "LEASES_RELEASED"}
 
     def _route_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
         risk = RiskClass(str(payload["risk_class"]))

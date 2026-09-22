@@ -895,39 +895,66 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             "delivery.publish",
             "delivery.persist_publication",
         )
-        for step in ordered_steps:
-            if not await self._checkpoint(step.upper().replace(".", "_")):
-                return {"status": "CANCELLED", "context": context}
-            step_payload = {**context, "delivery_request": asdict(request)}
-            if step in {
-                "delivery.invoke_spec",
-                "delivery.invoke_maker",
-                "delivery.invoke_deployment_maker",
-                "delivery.invoke_checker",
-            }:
-                context = await self._agent_step(step, step_payload, timeout_minutes=120)
-            else:
-                if step == "delivery.publish":
-                    context = await self._github_write_step(step, step_payload, timeout_minutes=30)
+        try:
+            for step in ordered_steps:
+                if not await self._checkpoint(step.upper().replace(".", "_")):
+                    await self._release_delivery_leases_best_effort(context)
+                    return {"status": "CANCELLED", "context": context}
+                step_payload = {**context, "delivery_request": asdict(request)}
+                if step in {
+                    "delivery.invoke_spec",
+                    "delivery.invoke_maker",
+                    "delivery.invoke_deployment_maker",
+                    "delivery.invoke_checker",
+                }:
+                    context = await self._agent_step(step, step_payload, timeout_minutes=120)
                 else:
-                    context = await self._step(step, step_payload, timeout_minutes=30)
-            if (
-                context.get("status")
-                in {
-                    "RATE_LIMITED",
-                    "BLOCKED",
-                    "FAILED",
-                    "TIMED_OUT",
-                    "CANCELLED",
-                    "REQUEST_CHANGES",
-                    "DRY_RUN",
-                }
-                and step != "delivery.publish"
-            ):
-                if step == "delivery.prepare_publication":
-                    context = await self._step("delivery.persist_handoff", context)
-                return {"status": context["status"], "context": context}
-        return {"status": context.get("status", "SOURCE_PR"), "context": context}
+                    if step == "delivery.publish":
+                        context = await self._github_write_step(
+                            step, step_payload, timeout_minutes=30
+                        )
+                    else:
+                        context = await self._step(step, step_payload, timeout_minutes=30)
+                if (
+                    context.get("status")
+                    in {
+                        "RATE_LIMITED",
+                        "BLOCKED",
+                        "FAILED",
+                        "TIMED_OUT",
+                        "CANCELLED",
+                        "REQUEST_CHANGES",
+                        "DRY_RUN",
+                    }
+                    and step != "delivery.publish"
+                ):
+                    if step == "delivery.prepare_publication":
+                        context = await self._step("delivery.persist_handoff", context)
+                    # NEW-20, 2026-09-22: every OTHER stop here (anything before
+                    # delivery.persist_publication, whose own two branches already
+                    # release) previously left this run's component-implementation
+                    # lease held for its full 4h TTL, blocking every other delivery
+                    # attempt at the same component -- including this same issue's
+                    # own next correction-retry attempt, which mints a fresh run_id
+                    # per attempt. Idempotent no-op if nothing was ever acquired.
+                    await self._release_delivery_leases_best_effort(context)
+                    return {"status": context["status"], "context": context}
+            return {"status": context.get("status", "SOURCE_PR"), "context": context}
+        except Exception:
+            # NEW-20, 2026-09-22: an uncaught exception anywhere in this pipeline
+            # (e.g. NEW-19's semgrep crash) skipped delivery.persist_publication
+            # entirely, so nothing ever released this run's lease -- reproduced
+            # live when exactly that crash blocked the very next retry's attempt
+            # at the same issue for the rest of the lease's 4h TTL.
+            await self._release_delivery_leases_best_effort(context)
+            raise
+
+    async def _release_delivery_leases_best_effort(self, context: dict[str, Any]) -> None:
+        # Discards the activity's own response payload deliberately: it returns
+        # {**context, "status": "LEASES_RELEASED"|"NO_RUN_TO_RELEASE_LEASES_FOR"},
+        # and merging that back would silently clobber context["status"] (e.g.
+        # "BLOCKED"/"REQUEST_CHANGES") that callers and result records depend on.
+        await self._step("delivery.release_leases", context)
 
 
 @workflow.defn(name="DeliveryReconciliationWorkflow")
