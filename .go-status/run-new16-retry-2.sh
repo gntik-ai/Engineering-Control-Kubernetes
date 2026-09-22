@@ -12,12 +12,20 @@
 # Always imports a brand-new campaign -- defef39e, 3a363acd, and c405b4d7
 # have all permanently used their one solve_backlog attempt (see NEW-16).
 #
-# Usage: ./run-new16-retry-2.sh [project]
+# Usage: ./run-new16-retry-2.sh [project] [max-items]
 #   project: falcone, musematic, or llmwiki (default: llmwiki)
+#   max-items: how many eligible issues to let the campaign attempt in
+#     sequence (default: 1). Each attempted issue that fails reproduction
+#     verification is CURRENT_REVALIDATION_BLOCKED but -- since
+#     continue_after_blocked_issue defaults true -- the loop moves on to the
+#     next one instead of stopping, so a higher value gives a real shot at
+#     landing on an issue that actually passes verification and produces a
+#     PR. Only matters if the campaign has more than 1 eligible issue.
 set -euo pipefail
 
 CTL=/opt/engineering-control/venv/bin/engineering-ctl
 PROJECT="${1:-llmwiki}"
+MAXIMUM_ITEMS="${2:-1}"
 IMPORT_FILTER=all
 DELIVERY_MODE=source-pr
 MAXIMUM_RISK=R1
@@ -91,7 +99,7 @@ while true; do
 done
 
 echo "== 3/5 backlog-approval-candidate =="
-candidate_result=$("$CTL" backlog-approval-candidate "$PROJECT" "$campaign_id" "$DELIVERY_MODE" "$MAXIMUM_RISK" --max-items 1)
+candidate_result=$("$CTL" backlog-approval-candidate "$PROJECT" "$campaign_id" "$DELIVERY_MODE" "$MAXIMUM_RISK" --max-items "$MAXIMUM_ITEMS")
 echo "$candidate_result" | jq .
 approval_binding=$(echo "$candidate_result" | jq -r .approval_binding)
 if [[ -z "$approval_binding" || "$approval_binding" == "null" ]]; then
@@ -108,7 +116,7 @@ temporal schedule trigger --address 127.0.0.1:7233 --namespace engineering-contr
 sleep 8
 
 echo "== 5/5 backlog-start =="
-start_result=$("$CTL" backlog-start "$PROJECT" "$campaign_id" "$MAXIMUM_RISK" "$DELIVERY_MODE" --max-items 1)
+start_result=$("$CTL" backlog-start "$PROJECT" "$campaign_id" "$MAXIMUM_RISK" "$DELIVERY_MODE" --max-items "$MAXIMUM_ITEMS")
 echo "$start_result" | jq .
 status=$(echo "$start_result" | jq -r .status)
 workflow_id=$(echo "$start_result" | jq -r .workflow_id)
