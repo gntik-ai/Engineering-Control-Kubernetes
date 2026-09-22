@@ -542,7 +542,21 @@ namespaces and are unaffected right now.
 real bugs (NEW-16 ×2, NEW-15, F-14, NEW-18, NEW-19, NEW-20) — all deployed and confirmed working on
 both hosts. The pipeline's dispatch, ownership, materialization, and real agent verification stages
 have all now been proven working end to end, and issue 1 of the latest attempt passed verification
-and reached real delivery for the first time ever before hitting NEW-20. The next retry — against
-`llmwiki` or `falcone` rather than the still-lease-blocked `musematic:general` (self-heals
-~`19:46Z`) — is the first ever with a real chance of clearing delivery's remaining prechecks
-(gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
+and reached real delivery for the first time ever before hitting NEW-20.
+
+The very next retry, against `llmwiki`, hit something new that is **not a code bug**:
+`backlog-start` itself returned `BLOCKED` with `safe_error: "operation preflight changed:
+CLAUDE_AUTH_NOT_READY"`, before any workflow even started. Per `docs/CLAUDE.md`, this is a
+documented, expected failure mode — the `claude-runner` identity is independently
+subscription-authenticated, and if that lapses, a marker file gets created and "other platform work
+continues" while Claude-specific work is gated. This needs an operator check/refresh, not a code
+fix; the harness correctly blocked an attempt to run the doc's own verification command myself
+(`[Credential Exploration]`), and that wasn't worked around. It may also explain musematic campaign
+`8fedc69d`'s issue 2 failing earlier tonight with `PROVIDER_EXIT_NONZERO` (`provider=claude`) —
+unconfirmed, but the same root cause would fit.
+
+**Next step**: the operator checks/refreshes `claude-runner`'s auth
+(`ssh worker 'sudo -u claude-runner -H env -i HOME=/var/lib/engineering-control/identities/claude-runner
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/claude auth status'`), then retries. Once that's
+resolved, the next attempt is still the first ever with a real chance of clearing delivery's
+remaining prechecks (gitleaks/trivy/syft/kubeconform, merge policy) and landing an actual PR.
