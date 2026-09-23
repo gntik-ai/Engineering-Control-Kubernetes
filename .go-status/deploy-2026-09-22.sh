@@ -126,6 +126,42 @@ echo "=== 5/7: swap symlinks on worker ==="
 ssh -t worker "sudo ln -sfn '$RELEASE_DIR/source' /opt/engineering-control/source && sudo ln -sfn '$VENV_DIR' /opt/engineering-control/venv"
 
 echo ""
+echo "=== 5b/7: project contracts (projects.d) on both hosts ==="
+# Both hosts read their OWN /etc/engineering-control/projects.d; a contract updated
+# on only one host silently disables features on the other (e.g. the toolchain
+# step on the worker). Show each host's diff against this release and ask before
+# installing, so live-only operator edits are never overwritten silently.
+for host in controller worker; do
+  for contract in config/projects/*.yaml; do
+    name=$(basename "$contract")
+    live="/etc/engineering-control/projects.d/$name"
+    if [[ "$host" == controller ]]; then
+      diff_out=$(sudo diff "$live" "$contract" 2>&1 || true)
+    else
+      scp -q "$contract" "worker:/tmp/engineering-contract-$name"
+      diff_out=$(ssh -t worker "sudo diff '$live' '/tmp/engineering-contract-$name'" 2>&1 | tr -d '\r' || true)
+    fi
+    if [[ -z "$diff_out" ]]; then
+      [[ "$host" == worker ]] && ssh worker "rm -f '/tmp/engineering-contract-$name'"
+      continue
+    fi
+    echo "--- $host: $live differs from this release ---"
+    echo "$diff_out"
+    read -r -p "Install the release copy of $name on $host? [y/N] " answer
+    if [[ "$answer" == y || "$answer" == Y ]]; then
+      if [[ "$host" == controller ]]; then
+        sudo cp "$contract" "$live"
+      else
+        ssh -t worker "sudo cp '/tmp/engineering-contract-$name' '$live'"
+      fi
+      echo "installed on $host"
+    else
+      echo "left unchanged on $host"
+    fi
+    [[ "$host" == worker ]] && ssh worker "rm -f '/tmp/engineering-contract-$name'"
+  done
+done
+
 echo "=== 6/7: restart services ==="
 echo "-- controller: engineering-api, engineering-temporal-worker --"
 sudo systemctl restart engineering-api.service engineering-temporal-worker.service
