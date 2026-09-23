@@ -22,6 +22,11 @@
 #   .go-status/deploy-2026-09-22.sh
 set -euo pipefail
 
+if [[ "$(id -un)" != hermes ]]; then
+  echo "Run this as the hermes user (no sudo); it calls sudo itself where needed." >&2
+  exit 1
+fi
+
 REPO_ROOT="/home/hermes/engineering/engineering-control"
 RELEASES_ROOT="/opt/engineering-control/releases"
 VENVS_ROOT="/opt/engineering-control/venvs"
