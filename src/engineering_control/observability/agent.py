@@ -132,6 +132,8 @@ class TranscriptNormalizer:
     ) -> list[NormalizedTranscriptLine]:
         now = datetime.now(UTC)
         event_type = str(event.get("type", "provider.event"))[:120]
+        if provider == "claude" and event_type == "user":
+            return self._claude_tool_errors(event, now)
         if event_type in {"user", "prompt", "input", "thinking", "reasoning"}:
             return []
         if event_type == "provider.stderr":
@@ -199,6 +201,31 @@ class TranscriptNormalizer:
         if event_type in {"error", "failed"} or event_type.endswith("failed"):
             return self._line("stderr", self._error_text(event, event_type), now)
         return []
+
+    def _claude_tool_errors(
+        self, event: dict[str, Any], now: datetime
+    ) -> list[NormalizedTranscriptLine]:
+        """NEW-34: Claude returns tool results (including structured-output schema
+        rejections) inside "user" events, which were dropped wholesale, so no
+        rejection reason was ever visible. Keep only failed results, briefly."""
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        lines: list[NormalizedTranscriptLine] = []
+        for block in content if isinstance(content, list) else []:
+            if not (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("is_error") is True
+            ):
+                continue
+            detail = block.get("content")
+            if isinstance(detail, list):
+                detail = " ".join(
+                    str(part.get("text", "")) for part in detail if isinstance(part, dict)
+                )
+            text = " ".join(str(detail or "").split())[:300]
+            lines.extend(self._line("tool", f"Tool result: failed: {text}", now))
+        return lines
 
     def _line(
         self, stream: TranscriptStream, value: Any, created_at: datetime

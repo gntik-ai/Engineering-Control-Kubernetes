@@ -2726,6 +2726,16 @@ class MetadataActivityHandler:
             "Produce a bounded provider-neutral OpenSpec for exactly one confirmed GitHub issue. "
             "Do not modify files and do not propose deployment execution. The source and "
             "deployment repositories belong to one ChangeSet.\n\n"
+            # NEW-34: every live spec run needed all 5 structured-output attempts (two
+            # #1026 runs exhausted them) because these limits were never stated.
+            "Output contract (validated strictly; any violation is rejected): return exactly "
+            "these keys and no others -- decision (READY or BLOCKED), title, problem, scope, "
+            "non_scope, acceptance_criteria, implementation_constraints, test_plan, "
+            "risk_notes, open_questions. title is at most 300 characters and problem at most "
+            "20000. Every list except open_questions needs at least one entry, even when "
+            "BLOCKED. Each list holds at most 100 entries of at most 4000 characters each; "
+            "keep entries concise and split long points into several entries. "
+            "open_questions may be empty.\n\n"
             f"Issue: {payload['issue_url']}\nFingerprint: {payload['fingerprint']}\n"
             f"Risk class: {payload['risk_class']}\n"
             f"Source SHA: {payload['source_base_sha']}\n"

@@ -544,3 +544,38 @@ async def test_worktree_leases_are_kept_once_a_pull_request_exists(tmp_path: Pat
     with handler.sessions() as session:
         leases = session.scalars(select(WorktreeLease)).all()
     assert leases and all(lease.released_at is None for lease in leases)
+
+
+def test_spec_prompt_states_the_output_contract_the_schema_enforces(tmp_path: Path) -> None:
+    # NEW-34: every live spec run needed all 5 structured-output attempts and two
+    # musematic #1026 runs exhausted them: the prompt never stated the schema's limits.
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'spec.sqlite'}")
+    )
+    prepared = handler._prepare_spec(
+        {
+            "spec_provider": "claude",
+            "change_set_id": str(uuid4()),
+            "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-attempt-1"},
+            "expected_behavior": "benchmark exists",
+            "actual_behavior": "no benchmark",
+            "minimal_reproduction": ["inspect tests/e2e/performance"],
+            "issue_url": "https://github.com/gntik-ai/musematic/issues/1026",
+            "fingerprint": "f" * 64,
+            "risk_class": "R1",
+            "source_base_sha": "a" * 40,
+            "deployment_base_sha": "b" * 40,
+            "deployment_worktree": "/srv/engineering/worktrees/musematic-deploy/x",
+            "source_worktree": "/srv/engineering/worktrees/musematic/x",
+            "project": "musematic",
+        }
+    )
+    prompt = prepared["spec_request"]["prompt"]
+    schema = MetadataActivityHandler._spec_output_schema()
+
+    assert "no others" in prompt
+    for key in schema["required"]:
+        assert key in prompt
+    assert f"at most {schema['properties']['title']['maxLength']} characters" in prompt
+    item_limit = schema["properties"]["scope"]["items"]["maxLength"]
+    assert f"at most {item_limit} characters each" in prompt

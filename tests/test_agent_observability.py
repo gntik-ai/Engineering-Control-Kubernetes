@@ -544,3 +544,32 @@ async def test_worker_identity_mismatch_fails_closed(tmp_path: Path) -> None:
     execution_id = _register(repository, provider="claude", role="checker")
     with pytest.raises(ValueError, match="identity"):
         await repository.start("codex-runner", execution_id, _start("claude", "checker"))
+
+
+def test_claude_failed_tool_results_keep_a_short_reason() -> None:
+    # NEW-34: structured-output schema rejections arrive as tool_result blocks inside
+    # Claude "user" events, which were dropped, so a spec run that exhausted its 5
+    # structured-output attempts left no trace of why.
+    normalizer = TranscriptNormalizer()
+    rejected = {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "is_error": True,
+                    "content": [
+                        {"type": "text", "text": "title: must NOT have more than 300 characters"}
+                    ],
+                },
+                {"type": "tool_result", "is_error": False, "content": "file contents stay out"},
+            ]
+        },
+    }
+
+    lines = normalizer.normalize("claude", rejected)
+
+    assert [(line.stream, line.text) for line in lines] == [
+        ("tool", "Tool result: failed: title: must NOT have more than 300 characters")
+    ]
+    assert normalizer.normalize("claude", {"type": "user", "message": {"content": "prompt"}}) == []
