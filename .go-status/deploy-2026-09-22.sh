@@ -144,7 +144,10 @@ for host in controller worker; do
       diff_out=$(sudo diff "$live" "$contract" 2>&1 || true)
     else
       scp -q "$contract" "worker:/tmp/engineering-contract-$name"
-      diff_out=$(ssh -t worker "sudo diff '$live' '/tmp/engineering-contract-$name'" 2>&1 | tr -d '\r' || true)
+      # sudo must prompt on the real terminal, so compare on the worker with a
+      # visible prompt and capture only the diff text (via a file, never $(ssh -t ...)).
+      ssh -t worker "sudo diff '$live' '/tmp/engineering-contract-$name' > '/tmp/engineering-contract-$name.diff' 2>&1" || true
+      diff_out=$(ssh worker "cat '/tmp/engineering-contract-$name.diff'; rm -f '/tmp/engineering-contract-$name.diff'")
     fi
     if [[ -z "$diff_out" ]]; then
       [[ "$host" == worker ]] && ssh worker "rm -f '/tmp/engineering-contract-$name'"
