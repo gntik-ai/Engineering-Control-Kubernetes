@@ -2872,7 +2872,20 @@ class MetadataActivityHandler:
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
             "repository tests, then create one local commit on the assigned branch. Preserve all "
             "existing safety gates.\n"
-            f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
+            # NEW-41: a deployment maker blocked a finished source change because the
+            # OpenSpec needed no deployment change and the deploy repo already contained
+            # credential-like findings -- neither is a blocker under platform policy.
+            + (
+                "If the OpenSpec requires no change in this repository, make no commit and "
+                "return decision COMPLETE with an empty changed_files list. Findings that "
+                "already exist in the repository (secrets, vulnerabilities, lint) are tracked "
+                "by the platform baseline and are not a reason to block; block only for "
+                "problems your change would introduce. Never read or output credential "
+                "values.\n"
+                if deployment
+                else ""
+            )
+            + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"

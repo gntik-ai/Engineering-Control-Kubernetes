@@ -628,3 +628,30 @@ def test_correction_attempt_maker_sees_the_previous_checker_findings(tmp_path: P
     assert "upload cap runs after the body is spooled" in prompt
     assert "five substantive issues" in prompt
     assert "Independent checker findings" not in first_attempt
+
+
+def test_deployment_maker_may_complete_without_changes_and_ignores_baseline(
+    tmp_path: Path,
+) -> None:
+    # NEW-41: musematic #993's deployment maker blocked a finished, committed source
+    # change because no deployment change was needed and the deploy repository already
+    # held credential-like findings (baseline, not introduced by the change).
+    handler, allocation = _lease_fixture(tmp_path)
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "risk_class": "R1",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "import"},
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+
+    deployment = handler._prepare_maker(payload, deployment=True)
+    source = handler._prepare_maker(payload, deployment=False)
+
+    prompt = deployment["deployment_maker_request"]["prompt"]
+    assert "return decision COMPLETE with an empty changed_files list" in prompt
+    assert "tracked by the platform baseline" in prompt
+    assert "empty changed_files" not in source["maker_request"]["prompt"]
