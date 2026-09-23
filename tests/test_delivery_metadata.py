@@ -579,3 +579,6 @@ def test_spec_prompt_states_the_output_contract_the_schema_enforces(tmp_path: Pa
     assert f"at most {schema['properties']['title']['maxLength']} characters" in prompt
     item_limit = schema["properties"]["scope"]["items"]["maxLength"]
     assert f"at most {item_limit} characters each" in prompt
+    # The live failure was unparseable 17-26 KB JSON, not a schema limit.
+    assert "well under 8000 characters" in prompt
+    assert "must be valid JSON" in prompt and "never raw newlines" in prompt

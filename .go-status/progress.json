@@ -225,6 +225,12 @@
    "started": "2026-09-23T09:55:00Z",
    "status": "complete",
    "notes": "Operator deployed a80607e (NEW-34); the paused #1026 loop ae4214cc survived the worker restarts (still AWAITING_OPERATOR). engineering-ctl backlog-retry was refused: 'operation preflight changed: WORKFLOW_IS_NOT_RETRYABLE'. NEW-33b (gap in my own NEW-33 fix): the retry/resume preflight reads the loop Run's status, but the operator pause recorded PAUSED only on the campaign (no workflow_id), so the Run stayed RUNNING and the pause could never be retried through the typed command bus; record_loop_state also stamped finished_at for any status. FIXED: the operator-pause and resume records carry the loop workflow_id (Run reads PAUSED while waiting, RUNNING after retry/skip); finished_at only for terminal statuses. Replay test asserts the PAUSED record carries workflow_id; unit test PAUSED->RUNNING->STOPPED (both fail without). 807 tests. The live loop paused before the fix -> one-off .go-status/mark-paused-loop-run-new33b.py records its pause via the deployed step (refuses unless campaign PAUSED and Run RUNNING). Git-only."
+  },
+  {
+   "phase": "3-new34-real-cause-unparseable-json",
+   "started": "2026-09-23T10:05:00Z",
+   "status": "complete",
+   "notes": "Operator deployed 543ce25 and ran the NEW-33b one-off (loop run PAUSED). backlog-retry ACCEPTED -> loop RESUMED -> NEW-33/NEW-33b CONFIRMED LIVE end to end; retry delivery ...-issue-1-retry-1-attempt-1 reclaimed leases (NEW-32 again), PRECHECKS_PASS, spec FAILED again (error_max_structured_output_retries); loop paused again at AWAITING_OPERATOR. NEW-34's stored-rejection half worked: diagnostic shows the REAL cause -- all 5 StructuredOutput calls were 'input that could not be parsed as JSON' (17-26 KB each, decision READY, substantive spec); not a schema-limit problem (my NEW-34 prompt-limits hypothesis was wrong). #1025's earlier success on attempt 5 was the same failure mode, luckier. One unrelated benign rejection: agent passed unsupported head_limit to Glob. FIX (NEW-34 part 2): spec prompt adds a size budget (whole output well under 8000 chars, problem <1500, <=12 entries/list, entries <600) and shared _STRUCTURED_OUTPUT_JSON_RULES (escape quotes/backslashes, \\n not raw newlines, no code fences/multi-line code, no trailing commas, cite code by path:line), also added to maker and checker prompts (same StructuredOutput exposure). Schema unchanged. 807 tests. Git-only."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
@@ -254,5 +260,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD. 2) Operator runs mark-paused-loop-run-new33b.py. 3) engineering-ctl backlog-retry backlog-loop-musematic-44e4bfd3-133c-490e-84e9-b00e28390c5c-ae4214cc-2026-4896-a330-b1daf7d8d252 musematic 1026. 4) Follow spec (NEW-34 contract) -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator deploys HEAD (activities-only change; paused loop survives). 2) backlog-retry the paused #1026 loop (Run already PAUSED via NEW-33b). 3) Follow spec -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }

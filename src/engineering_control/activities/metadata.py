@@ -302,6 +302,16 @@ class RuntimeTargetRecord(BaseModel):
         return self
 
 
+# NEW-34: agents return results through a StructuredOutput tool call; a live #1026 spec
+# run had all 5 attempts rejected as unparseable JSON (17-26 KB, code-heavy text).
+_STRUCTURED_OUTPUT_JSON_RULES = (
+    'The StructuredOutput input must be valid JSON: escape every double quote as \\" '
+    "and every backslash as \\\\ inside strings, write line breaks as \\n (never raw "
+    "newlines), no code fences or multi-line code, no trailing commas. Refer to code by "
+    "path and line instead of quoting it."
+)
+
+
 def _untrusted_block(label: str, content: str) -> str:
     """Fence externally-sourced issue content so embedded prompt-injection reads as data."""
     return (
@@ -2735,7 +2745,13 @@ class MetadataActivityHandler:
             "20000. Every list except open_questions needs at least one entry, even when "
             "BLOCKED. Each list holds at most 100 entries of at most 4000 characters each; "
             "keep entries concise and split long points into several entries. "
-            "open_questions may be empty.\n\n"
+            "open_questions may be empty.\n"
+            # NEW-34 evidence: all 5 attempts of a live #1026 spec run were rejected as
+            # unparseable JSON (17-26 KB each); the size, not the content, broke it.
+            "Size and JSON validity: this is a plan for the implementer, not the "
+            "implementation. Keep the whole output well under 8000 characters: problem "
+            "under 1500 characters, at most 12 entries per list, each entry under 600 "
+            f"characters. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nFingerprint: {payload['fingerprint']}\n"
             f"Risk class: {payload['risk_class']}\n"
             f"Source SHA: {payload['source_base_sha']}\n"
@@ -2817,7 +2833,8 @@ class MetadataActivityHandler:
             f"Implement only the {target} repository portion of one bounded ChangeSet. "
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
             "repository tests, then create one local commit on the assigned branch. Preserve all "
-            "existing safety gates.\n\n"
+            "existing safety gates.\n"
+            f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"
@@ -2870,7 +2887,8 @@ class MetadataActivityHandler:
         prompt = (
             "Independently review both bounded worktrees for one ChangeSet. Do not modify files. "
             "Validate the OpenSpec, source and deployment diffs, tests, immutable image policy, "
-            "and risk gates. Request changes on any uncertainty.\n\n"
+            "and risk gates. Request changes on any uncertainty.\n"
+            f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"

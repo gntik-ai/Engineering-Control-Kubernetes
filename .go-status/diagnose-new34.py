@@ -57,7 +57,8 @@ with Session(engine) as session:
         select(AgentExecution)
         .where(AgentExecution.workflow_id.contains(MARKER))
         .where(AgentExecution.role == "maker")
-        .order_by(AgentExecution.started_at)
+        .order_by(AgentExecution.started_at.desc())
+        .limit(1)
     ).all()
     for execution in executions:
         print(f"== {execution.workflow_id[-60:]} status={execution.status} "
@@ -100,6 +101,8 @@ with Session(engine) as session:
                 for key in tally:
                     if line.strip() == key:
                         tally[key] += 1
+                if line.strip().startswith("Tool result: failed:"):
+                    print(f"  [rejection] {line.strip()[:400]}")
                 if chunk.stream in {"assistant", "stderr"} and keywords.search(line) and shown < 15:
                     shown += 1
                     print(f"  [{chunk.stream}] {line.strip()[:300]}")
