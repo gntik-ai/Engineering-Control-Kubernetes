@@ -2,7 +2,7 @@
  "mission": "GO status remediation for engineering-control",
  "branch": "go-status/2026-09-17",
  "started": "2026-09-17",
- "phase": "3-new33-live-new34-spec-output-contract",
+ "phase": "3-spec-passes-maker-blocked-codex-model",
  "phase_history": [
   {
    "phase": "0-discovery",
@@ -237,11 +237,17 @@
    "started": "2026-09-23T10:25:00Z",
    "status": "complete",
    "notes": "Operator deployed 859eed5 (NEW-34 part 2). backlog-retry of the paused #1026 loop returned STARTED but the loop stayed AWAITING_OPERATOR: history shows only ONE retry signal ever (09:58:40); both new commands returned the old retry operation 16d2b319 (created 09:58:39). NEW-35: TypedCommandBus.submit recorded every accepted WorkflowControlCommand (retry/skip/resume/pause/...) as STARTED bound to the target loop's workflow_id; the loop is long-lived (Run PAUSED/RUNNING, non-terminal), so _active_operation kept returning that op and every later control of the same action for the loop was deduplicated onto it -- a paused loop could be retried exactly once. FIXED: delivered control signals finish COMPLETED (workflow_id kept) with an operation.completed event. Updated the existing control test (asserted STARTED) and added a two-retries regression test (fails without). 808 tests. One-off .go-status/complete-delivered-retry-op-new35.py completes op 16d2b319 via OperationsRepository.finish (refuses unless it is a STARTED retry for that loop). Git-only."
+  },
+  {
+   "phase": "3-spec-passes-maker-blocked-codex-model",
+   "started": "2026-09-23T10:28:00Z",
+   "status": "complete",
+   "notes": "Operator deployed e6a8594 (NEW-35) and ran the one-off (op 16d2b319 STARTED->COMPLETED). backlog-retry: operation COMPLETED, second retry signal delivered 10:29:04, loop RESUMED -- NEW-35 CONFIRMED LIVE. Delivery ...-issue-1-retry-2-attempt-1: PRECHECKS_PASS, invoke_spec SUCCESS, create_openspec OPENSPEC_READY -- NEW-34 (size budget + JSON rules) CONFIRMED LIVE, first READY spec for #1026 and the furthest any delivery has reached. Source maker routed to Codex, then invoke_maker FAILED: Codex 400 invalid_request_error \"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.\" NEW-36 (environment, not platform code): the control plane passes no --model to Codex (adapters/codex/client.py only adds --model if request.model, never set), so the CLI uses its own default/config in the codex-runner identity on the worker; Codex verifier runs with the same runner succeeded ~07:40 today, so the default model changed since (CLI update or config). Per AGENTS.md no automatic provider substitution/auth change -- operator must inspect the worker (codex --version, codex-runner config.toml model) and pick a model the ChatGPT plan supports, or decide routing. Loop paused at AWAITING_OPERATOR (retry works now)."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
  "remaining_blockers": [
-  "NEW-33b git-only. After deploy: run the one-off, then backlog-retry the paused #1026 loop."
+  "NEW-36: Codex default model gpt-5.4 unsupported for the ChatGPT account on the worker's codex-runner -- operator decision."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -266,5 +272,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD and runs complete-delivered-retry-op-new35.py. 2) backlog-retry the paused #1026 loop. 3) Follow spec (NEW-34 size/JSON rules) -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator inspects worker codex CLI version/config and sets a supported model (or decides maker routing). 2) backlog-retry the paused #1026 loop. 3) Follow maker -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }
