@@ -219,11 +219,17 @@
    "started": "2026-09-23T09:10:00Z",
    "status": "complete",
    "notes": "Operator deployed e523da2 and ran the NEW-33 one-off: 44e4bfd3 PAUSED -> STOPPED, loop Run STOPPED; policy reconciler disabled the policy (09:11:18 success). issue-start musematic source 1026 started a real new loop (ae4214cc) on the re-approved campaign. NEW-32 CONFIRMED LIVE (persist_worktree_leases reclaimed the released leases; PRECHECKS_PASS). NEW-33 CONFIRMED LIVE: delivery failed and the loop stayed alive at phase AWAITING_OPERATOR:gntik-ai/musematic#1026:FAILED (still paused, awaiting retry/skip/cancel). NEW-31 CONFIRMED LIVE: reason now visible -- 'claude result error_max_structured_output_retries: Failed to provide valid structured output after 5 attempts'. Read-only diagnostic (.go-status/diagnose-new34.py, run 3x by operator; spec runs are stored as role=maker): ALL THREE spec runs, including #1025's successful one, used 5 StructuredOutput attempts -- the spec agent almost always violates the output contract and #1025 passed on its last try; #1026's agent was writing a substantive spec (not an empty BLOCKED one). The transcript normalizer drops Claude 'user' events, so the schema rejection messages were never stored. NEW-34 FIX: spec prompt now states the exact contract (10 keys, no others; title<=300, problem<=20000; lists 1-100 entries of <=4000 chars, open_questions may be empty); transcript keeps failed tool results as 'Tool result: failed: <redacted excerpt <=300>' (successful results, which can hold file contents, still dropped). 2 tests (fail without). 806 tests. Git-only."
+  },
+  {
+   "phase": "3-new33b-paused-loop-run-status",
+   "started": "2026-09-23T09:55:00Z",
+   "status": "complete",
+   "notes": "Operator deployed a80607e (NEW-34); the paused #1026 loop ae4214cc survived the worker restarts (still AWAITING_OPERATOR). engineering-ctl backlog-retry was refused: 'operation preflight changed: WORKFLOW_IS_NOT_RETRYABLE'. NEW-33b (gap in my own NEW-33 fix): the retry/resume preflight reads the loop Run's status, but the operator pause recorded PAUSED only on the campaign (no workflow_id), so the Run stayed RUNNING and the pause could never be retried through the typed command bus; record_loop_state also stamped finished_at for any status. FIXED: the operator-pause and resume records carry the loop workflow_id (Run reads PAUSED while waiting, RUNNING after retry/skip); finished_at only for terminal statuses. Replay test asserts the PAUSED record carries workflow_id; unit test PAUSED->RUNNING->STOPPED (both fail without). 807 tests. The live loop paused before the fix -> one-off .go-status/mark-paused-loop-run-new33b.py records its pause via the deployed step (refuses unless campaign PAUSED and Run RUNNING). Git-only."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
  "remaining_blockers": [
-  "NEW-34 git-only. After deploy: backlog-retry the paused loop ae4214cc for gntik-ai/musematic#1026 (NEW-33 retry path)."
+  "NEW-33b git-only. After deploy: run the one-off, then backlog-retry the paused #1026 loop."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -248,5 +254,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD (worker restart; the paused loop survives). 2) engineering-ctl backlog-retry <ae4214cc loop> gntik-ai/musematic 1026. 3) Follow spec -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO. If the spec still fails, the transcript now shows the schema rejection."
+ "next_action_on_resume": "1) Operator deploys HEAD. 2) Operator runs mark-paused-loop-run-new33b.py. 3) engineering-ctl backlog-retry backlog-loop-musematic-44e4bfd3-133c-490e-84e9-b00e28390c5c-ae4214cc-2026-4896-a330-b1daf7d8d252 musematic 1026. 4) Follow spec (NEW-34 contract) -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }

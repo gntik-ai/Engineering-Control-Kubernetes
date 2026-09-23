@@ -2205,12 +2205,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     pause_blocker = "CORRECTION_LIMIT_EXHAUSTED"
                 if pause_blocker is None:
                     break
-                await self._step(
-                    "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": pause_blocker},
-                )
+                paused_state = {
+                    **asdict(request),
+                    "loop_status": "PAUSED",
+                    "blocker": pause_blocker,
+                }
+                if operator_pause and register_run:
+                    # NEW-33b: the loop Run must read PAUSED, or the retry/resume
+                    # preflight (which reads Run.status) refuses the operator's signal.
+                    paused_state["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", paused_state)
                 if not operator_pause:
                     return {"status": "PAUSED", "results": results}
+                resumed_state = {**asdict(request), "loop_status": "RUNNING"}
+                if register_run:
+                    resumed_state["workflow_id"] = workflow.info().workflow_id
                 outcome, skipped = await self._await_delivery_operator(
                     request, item, pause_blocker, register_run=register_run
                 )
@@ -2218,14 +2227,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     return {"status": "CANCELLED", "results": results}
                 if outcome == "RETRY":
                     delivery_round += 1
-                    await self._step(
-                        "backlog.record_loop_state", {**asdict(request), "loop_status": "RUNNING"}
-                    )
+                    await self._step("backlog.record_loop_state", resumed_state)
                     continue
                 results.append(skipped)
-                await self._step(
-                    "backlog.record_loop_state", {**asdict(request), "loop_status": "RUNNING"}
-                )
+                await self._step("backlog.record_loop_state", resumed_state)
                 advance_to_next_issue = True
                 break
             if advance_to_next_issue:

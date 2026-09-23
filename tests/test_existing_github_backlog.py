@@ -1151,3 +1151,86 @@ def test_final_issue_closure_fails_closed() -> None:
         deployed_change=False,
     )
     assert evaluate_final_closure(evidence) == "BLOCKED_BY_FINAL_CLOSURE_GATE"
+
+
+def test_a_paused_loop_run_reads_paused_until_it_really_finishes(tmp_path: Path) -> None:
+    # NEW-33b: the retry/resume preflight reads the loop Run's status; a paused loop
+    # left it RUNNING, so engineering-ctl backlog-retry was refused
+    # (WORKFLOW_IS_NOT_RETRYABLE). A pause must not stamp finished_at either.
+    from engineering_control.db.models import Run
+
+    state_root = tmp_path / "state"
+    (state_root / "github-policy-requests").mkdir(parents=True, mode=0o700)
+    handler = EngineeringActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'paused-run.sqlite'}",
+            state_root=state_root,
+            project_config_root=ROOT / "config/projects",
+            persona_config_root=ROOT / "config/personas",
+            flow_config_root=ROOT / "config/flows",
+            credential_root=tmp_path / "credentials",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign_id = UUID("44444444-4444-4444-8444-444444444444")
+    workflow_id = "backlog-loop-musematic-paused-run"
+    with handler.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=campaign_id,
+                project="musematic",
+                source_repository="gntik-ai/musematic",
+                deployment_repository="gntik-ai/musematic-deploy",
+                imported_at=NOW,
+                issue_query="state:open",
+                import_filter="all",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=1,
+                eligible_count=1,
+                deferred_count=0,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                approval_binding="e" * 64,
+                approval_json={"approval": {"approved_by": "dashboard:reauthenticated"}},
+                maximum_risk="R2",
+                maximum_items=1,
+                maximum_concurrency=1,
+                delivery_mode="source-pr",
+                include_enhancements=False,
+                status="RUNNING",
+                workflow_id=workflow_id,
+            )
+        )
+        session.add(
+            Run(
+                workflow_id=workflow_id,
+                run_type="existing-github-backlog-loop",
+                status="RUNNING",
+                project="musematic",
+            )
+        )
+
+    def record(status: str) -> tuple[str, object]:
+        handler._record_backlog_loop_state(
+            {
+                "backlog_campaign_id": str(campaign_id),
+                "loop_status": status,
+                "workflow_id": workflow_id,
+            }
+        )
+        with handler.sessions() as session:
+            run = session.query(Run).filter(Run.workflow_id == workflow_id).one()
+            return run.status, run.finished_at
+
+    assert record("PAUSED") == ("PAUSED", None)
+    assert record("RUNNING") == ("RUNNING", None)
+    status, finished_at = record("STOPPED")
+    assert status == "STOPPED" and finished_at is not None

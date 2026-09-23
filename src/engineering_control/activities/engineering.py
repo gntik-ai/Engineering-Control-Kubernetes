@@ -1911,7 +1911,12 @@ class EngineeringActivityHandler:
                 run = session.scalar(select(db.Run).where(db.Run.workflow_id == run_workflow_id))
                 if run is not None:
                     run.status = status
-                    run.finished_at = datetime.now(UTC)
+                    # NEW-33b: a paused loop is still alive; only terminal states finish it.
+                    run.finished_at = (
+                        datetime.now(UTC)
+                        if status in {"CANCELLED", "COMPLETE", "STOPPED", "FAILED"}
+                        else None
+                    )
             raw_global_id = payload.get("global_campaign_id")
             linked_global_ids = {
                 candidate.id

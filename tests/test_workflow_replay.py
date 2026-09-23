@@ -19,6 +19,7 @@ code. `Replayer.replay_workflow` raises on any non-determinism.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import uuid
 from datetime import timedelta
@@ -514,6 +515,20 @@ async def test_blocked_delivery_pauses_until_the_operator_retries_then_cancels()
     )
 
     assert result["status"] == "CANCELLED"
+    # NEW-33b: the retry preflight reads the loop Run's status, so the pause must be
+    # recorded against this workflow (otherwise engineering-ctl backlog-retry is refused).
+    loop_states = [
+        json.loads(event.activity_task_scheduled_event_attributes.input.payloads[0].data)
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    paused = [
+        state["payload"]
+        for state in loop_states
+        if state.get("step") == "backlog.record_loop_state"
+        and state["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused and all(state.get("workflow_id") for state in paused)
     assert [child.rsplit("-issue-", 1)[1] for child in children] == [
         "1-attempt-1",
         "1-retry-1-attempt-1",
