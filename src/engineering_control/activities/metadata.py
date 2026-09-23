@@ -2876,6 +2876,18 @@ class MetadataActivityHandler:
             # OpenSpec needed no deployment change and the deploy repo already contained
             # credential-like findings -- neither is a blocker under platform policy.
             + (
+                # NEW-42 (operator rule 2026-09-23): every project is deployed to staging
+                # with a NEW image built from the source change and published to GitHub
+                # Packages (ghcr.io/gntik-ai/...); the platform's promotion step pins that
+                # exact version after the build. It cannot exist at this stage.
+                "Image versions are not your concern: after the source change is built, the "
+                "new image is published to GitHub Packages and the platform's promotion step "
+                "pins that exact version in this repository before the staging deployment. "
+                "Never pin, change or require an image tag or digest, and do not block because "
+                "none exists yet. Make only deployment changes the OpenSpec explicitly requires "
+                "that need no new image; record any other deployment concern (for example "
+                "where optional configuration should live) in open_questions for the release "
+                "review instead of blocking. "
                 "If the OpenSpec requires no change in this repository, make no commit and "
                 "return decision COMPLETE with an empty changed_files list. Findings that "
                 "already exist in the repository (secrets, vulnerabilities, lint) are tracked "

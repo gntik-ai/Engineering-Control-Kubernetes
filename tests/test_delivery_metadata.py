@@ -654,4 +654,7 @@ def test_deployment_maker_may_complete_without_changes_and_ignores_baseline(
     prompt = deployment["deployment_maker_request"]["prompt"]
     assert "return decision COMPLETE with an empty changed_files list" in prompt
     assert "tracked by the platform baseline" in prompt
+    # NEW-42: the image version comes from the build + promotion, never from the maker.
+    assert "Never pin, change or require an image tag or digest" in prompt
+    assert "GitHub Packages" in prompt
     assert "empty changed_files" not in source["maker_request"]["prompt"]
