@@ -1994,11 +1994,29 @@ class MetadataActivityHandler:
             f"finding-verifier:{workflow_id}:{finding['finding_id']}:"
             f"{snapshot['source_sha']}:{ordinal}",
         )
+        anchor = str(snapshot["snapshot_evidence_sha256"])
+        revalidation = finding.get("flow") == "current-state-revalidation"
         prompt = (
             "Independently verify one candidate finding from a fresh immutable snapshot. "
             "Do not modify files. Reproduce only the supplied minimal steps, establish a "
             "positive and a negative control, and reject environment failures. Do not file an "
             "issue.\n\n"
+            # _evaluate_controls rejects any attempt whose evidence lacks this exact
+            # hash, so the requirement must be stated rather than left implicit.
+            "Evidence binding (mandatory): the evidence list MUST include one item with "
+            f'kind "fresh_snapshot" and sha256 exactly "{anchor}". Copy it verbatim; do not '
+            "recompute, pad or substitute a git SHA. An attempt without it is discarded.\n"
+            # Duplicate search runs as a separate control-plane step after verification.
+            "Deduplication is performed separately by the control plane. No GitHub issue "
+            "index is supplied; its absence is not an environment failure and must not set "
+            "environment_valid to false.\n"
+            + (
+                "This candidate is an existing GitHub issue being revalidated against current "
+                "source; its own issue is expected to exist and is not a duplicate.\n"
+                if revalidation
+                else ""
+            )
+            + "\n"
             f"Finding fingerprint: {finding['fingerprint']}\n"
             f"Expected: {finding['expected_behavior']}\n"
             f"Actual: {finding['actual_behavior']}\n"
@@ -2007,7 +2025,7 @@ class MetadataActivityHandler:
             f"Source SHA: {snapshot['source_sha']}\n"
             f"Deployment SHA: {snapshot['deployment_sha']}\n"
             f"Deployment worktree: {snapshot['deployment_worktree']}\n"
-            f"Fresh snapshot evidence SHA256: {snapshot['snapshot_evidence_sha256']}\n"
+            f"Fresh snapshot evidence SHA256: {anchor}\n"
             f"Independent reproduction ordinal: {ordinal}\n"
         )
         request = AgentRequest(

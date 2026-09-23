@@ -2094,3 +2094,92 @@ async def test_cleanup_protects_all_resources_owned_by_rate_limited_run(tmp_path
     assert discovered["cleanup_candidates"] == []
     assert discovered["component_lease_cleanup_candidates"] == []
     assert discovered["file_cleanup_candidates"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow", ["repository-static", "current-state-revalidation"])
+async def test_verifier_prompt_states_the_evidence_binding_controls_enforce(
+    tmp_path: Path, flow: str
+) -> None:
+    # NEW-22: live verifiers reproduced findings correctly but omitted the snapshot
+    # hash (or padded a git SHA to 64 chars), because the prompt never said
+    # _evaluate_controls requires it; one attempt also failed closed looking for a
+    # GitHub issue index the control plane never supplies.
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'finding.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    cell = audit_cell()
+    await handler.handle(
+        "campaign.persist_coverage",
+        {"campaign_id": str(campaign.id), "cells": [cell], "total": 1},
+    )
+    await handler.handle(
+        "campaign.persist_cell_result",
+        {
+            "campaign_id": str(campaign.id),
+            "cell": cell,
+            "deterministic_evidence_sha256": "d" * 64,
+            "agent_result": {
+                "provider": "claude",
+                "run_id": str(uuid4()),
+                "structured_result": {
+                    "summary": "bounded mismatch",
+                    "decision": "FAIL",
+                    "evidence": [{"kind": "source", "reference": "gw", "sha256": "d" * 64}],
+                    "open_questions": [],
+                    "finding": {
+                        "severity": "medium",
+                        "confidence": 0.9,
+                        "expected_behavior": "request follows the declared contract",
+                        "actual_behavior": "request diverges from the declared contract",
+                        "minimal_reproduction": ["inspect the bounded fixture"],
+                        "affected_component": "gateway",
+                        "security_impact": None,
+                        "data_impact": None,
+                        "recommended_action": "independently reproduce before filing",
+                    },
+                },
+            },
+        },
+    )
+    with handler.sessions() as session:
+        finding = session.scalar(select(Finding))
+    assert finding is not None
+    workflow_id = f"finding-verify-{finding.id}-{uuid4()}"
+    loaded = await handler.handle(
+        "finding.load_candidate",
+        {
+            "finding_id": str(finding.id),
+            "project": "falcone",
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    loaded = {**loaded, "flow": flow}
+    anchor = "a5f81bf64f588d77c051d1213c7fe814c339eb58bb36be3c94f7570ad9643558"
+    snapshot = {
+        **loaded,
+        "source_sha": "a" * 40,
+        "deployment_sha": "b" * 40,
+        "source_worktree": str(tmp_path / "fresh-source"),
+        "deployment_worktree": str(tmp_path / "fresh-deployment"),
+        "snapshot_evidence_sha256": anchor,
+    }
+    prepared = await handler.handle(
+        "finding.prepare_verifier",
+        {
+            "finding": loaded,
+            "snapshot": snapshot,
+            "ordinal": 1,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    prompt = prepared["verifier_request"]["prompt"]
+
+    assert f'kind "fresh_snapshot" and sha256 exactly "{anchor}"' in prompt
+    assert "No GitHub issue index is supplied" in prompt
+    assert "must not set environment_valid to false" in prompt
+    assert ("its own issue is expected to exist" in prompt) is (
+        flow == "current-state-revalidation"
+    )
