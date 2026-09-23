@@ -2127,13 +2127,37 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if boundary is not None:
                     return boundary
                 continue
-            delivery: dict[str, Any]
-            if sequential_source_pr:
-                delivery = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
-                for attempt in range(1, request.correction_limit + 2):
-                    delivery_workflow_id = (
-                        f"{workflow.info().workflow_id}-issue-{ordinal}-attempt-{attempt}"
-                    )
+            delivery: dict[str, Any] = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
+            # NEW-33: a blocked delivery used to record PAUSED and then end the workflow,
+            # leaving a PAUSED campaign no signal could reach (resume/retry/skip target
+            # this workflow), still owning the GitHub write policy. Now it really waits.
+            operator_pause = workflow.patched("existing-backlog-delivery-operator-pause-v1")
+            delivery_round = 0
+            advance_to_next_issue = False
+            while True:
+                issue_prefix = f"{workflow.info().workflow_id}-issue-{ordinal}"
+                if delivery_round:
+                    issue_prefix = f"{issue_prefix}-retry-{delivery_round}"
+                if sequential_source_pr:
+                    delivery = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
+                    for attempt in range(1, request.correction_limit + 2):
+                        delivery_workflow_id = f"{issue_prefix}-attempt-{attempt}"
+                        if register_child_runs:
+                            await self._step(
+                                "backlog.register_child_run",
+                                {
+                                    **asdict(request),
+                                    "child_kind": "issue-delivery",
+                                    "child_workflow_id": delivery_workflow_id,
+                                    "finding_id": str(gate["finding_id"]),
+                                },
+                            )
+                        delivery = await self._issue_delivery(gate, delivery_workflow_id)
+                        results.append({**delivery, "attempt": attempt})
+                        if delivery.get("status") != "REQUEST_CHANGES":
+                            break
+                else:
+                    delivery_workflow_id = issue_prefix
                     if register_child_runs:
                         await self._step(
                             "backlog.register_child_run",
@@ -2145,74 +2169,75 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             },
                         )
                     delivery = await self._issue_delivery(gate, delivery_workflow_id)
-                    results.append({**delivery, "attempt": attempt})
-                    if delivery.get("status") != "REQUEST_CHANGES":
+                    results.append(delivery)
+                pause_blocker: str | None = None
+                if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
+                    blocker = str(delivery.get("blocker") or delivery.get("status"))
+                    if global_child_blocker_return and request.global_campaign_id is not None:
+                        await self._step(
+                            "backlog.record_loop_state",
+                            {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                        )
+                        return {"status": "BLOCKED", "blocker": blocker, "results": results}
+                    if (
+                        sequential_source_pr
+                        and request.continue_after_blocked_issue
+                        and not self._requires_operator_pause(blocker)
+                    ):
+                        advance_to_next_issue = True
                         break
-            else:
-                delivery_workflow_id = f"{workflow.info().workflow_id}-issue-{ordinal}"
-                if register_child_runs:
-                    await self._step(
-                        "backlog.register_child_run",
-                        {
-                            **asdict(request),
-                            "child_kind": "issue-delivery",
-                            "child_workflow_id": delivery_workflow_id,
-                            "finding_id": str(gate["finding_id"]),
-                        },
-                    )
-                delivery = await self._issue_delivery(gate, delivery_workflow_id)
-                results.append(delivery)
-            if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
-                blocker = str(delivery.get("blocker") or delivery.get("status"))
-                if global_child_blocker_return and request.global_campaign_id is not None:
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
-                    )
-                    return {"status": "BLOCKED", "blocker": blocker, "results": results}
-                if (
-                    sequential_source_pr
-                    and request.continue_after_blocked_issue
-                    and not self._requires_operator_pause(blocker)
-                ):
-                    boundary = await self._after_issue_boundary(
-                        request,
-                        results,
-                        enabled=after_current_controls,
-                        has_more=ordinal < len(raw_items),
-                    )
-                    if boundary is not None:
-                        return boundary
-                    continue
-                await self._step(
-                    "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
-                )
-                return {"status": "PAUSED", "results": results}
-            if sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
-                if global_child_blocker_return and request.global_campaign_id is not None:
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {
-                            **asdict(request),
-                            "loop_status": "PAUSED",
+                    pause_blocker = blocker
+                elif sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
+                    if global_child_blocker_return and request.global_campaign_id is not None:
+                        await self._step(
+                            "backlog.record_loop_state",
+                            {
+                                **asdict(request),
+                                "loop_status": "PAUSED",
+                                "blocker": "CORRECTION_LIMIT_EXHAUSTED",
+                            },
+                        )
+                        return {
+                            "status": "BLOCKED",
                             "blocker": "CORRECTION_LIMIT_EXHAUSTED",
-                        },
-                    )
-                    return {
-                        "status": "BLOCKED",
-                        "blocker": "CORRECTION_LIMIT_EXHAUSTED",
-                        "results": results,
-                    }
+                            "results": results,
+                        }
+                    pause_blocker = "CORRECTION_LIMIT_EXHAUSTED"
+                if pause_blocker is None:
+                    break
                 await self._step(
                     "backlog.record_loop_state",
-                    {
-                        **asdict(request),
-                        "loop_status": "PAUSED",
-                        "blocker": "CORRECTION_LIMIT_EXHAUSTED",
-                    },
+                    {**asdict(request), "loop_status": "PAUSED", "blocker": pause_blocker},
                 )
-                return {"status": "PAUSED", "results": results}
+                if not operator_pause:
+                    return {"status": "PAUSED", "results": results}
+                outcome, skipped = await self._await_delivery_operator(
+                    request, item, pause_blocker, register_run=register_run
+                )
+                if outcome == "CANCELLED":
+                    return {"status": "CANCELLED", "results": results}
+                if outcome == "RETRY":
+                    delivery_round += 1
+                    await self._step(
+                        "backlog.record_loop_state", {**asdict(request), "loop_status": "RUNNING"}
+                    )
+                    continue
+                results.append(skipped)
+                await self._step(
+                    "backlog.record_loop_state", {**asdict(request), "loop_status": "RUNNING"}
+                )
+                advance_to_next_issue = True
+                break
+            if advance_to_next_issue:
+                boundary = await self._after_issue_boundary(
+                    request,
+                    results,
+                    enabled=after_current_controls,
+                    has_more=ordinal < len(raw_items),
+                )
+                if boundary is not None:
+                    return boundary
+                continue
             if request.delivery_mode == "source-pr":
                 if sequential_source_pr:
                     boundary = await self._after_issue_boundary(
@@ -2488,6 +2513,52 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             {**asdict(request), "loop_status": "CANCELLED"},
         )
         return {"status": "CANCELLED", "results": results}
+
+    async def _await_delivery_operator(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        blocker: str,
+        *,
+        register_run: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """Hold a blocked delivery until the operator cancels, skips or retries it."""
+        issue_ref = f"{item['repository']}#{item['issue_number']}"
+        self._phase = f"AWAITING_OPERATOR:{issue_ref}:{blocker}"
+        self._skip_reason = None
+        self._retry_step = None
+        while True:
+            await workflow.wait_condition(
+                lambda: (
+                    self._cancelled or self._skip_reason is not None or self._retry_step is not None
+                )
+            )
+            if self._cancelled:
+                cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                if register_run:
+                    cancel_state["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", cancel_state)
+                return "CANCELLED", {}
+            if self._skip_reason is not None:
+                reference, separator, reason = self._skip_reason.rpartition("|")
+                self._skip_reason = None
+                if not separator or reference != issue_ref:
+                    continue
+                self._phase = f"RESUMED:{issue_ref}"
+                skipped = await self._step(
+                    "backlog.record_skip",
+                    {
+                        **asdict(request),
+                        "repository": item["repository"],
+                        "issue_number": item["issue_number"],
+                        "reason_code": reason,
+                    },
+                )
+                return "SKIPPED", skipped
+            retry_ref, self._retry_step = self._retry_step, None
+            if retry_ref == issue_ref:
+                self._phase = f"RESUMED:{issue_ref}"
+                return "RETRY", {}
 
     @staticmethod
     async def _issue_delivery(gate: dict[str, Any], delivery_workflow_id: str) -> dict[str, Any]:

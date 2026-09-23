@@ -2,7 +2,7 @@
  "mission": "GO status remediation for engineering-control",
  "branch": "go-status/2026-09-17",
  "started": "2026-09-17",
- "phase": "3-delivery-reaches-spec-issue-selection-new31",
+ "phase": "3-new32-deployed-new33-operator-pause",
  "phase_history": [
   {
    "phase": "0-discovery",
@@ -207,11 +207,17 @@
    "started": "2026-09-23T08:30:00Z",
    "status": "complete",
    "notes": "Operator deployed cf09911 (NEW-31). Targeted #1026 via engineering-ctl issue-start musematic source 1026 (reuses campaign 44e4bfd3 where #1026 is READY, skipping re-verification): solve_issue approved + started. Delivery FAILED at delivery.persist_worktree_leases: 'active worktree lease conflicts with this delivery run'. NEW-32: (1) delivery.release_leases (NEW-20) only released component leases -- the 8h worktree leases of any delivery that stopped before publication (BLOCKED/FAILED/REQUEST_CHANGES, including correction attempts of the same delivery) stayed active, blocking every retry of the ChangeSet; (2) worktree lease ids are fixed (uuid5 changeset+repository) so, once released or expired, a new run's insert would collide on the primary key. FIXED: release_leases also releases the run's worktree leases while the ChangeSet has no PR; persist_worktree_leases reclaims a released/expired lease row for the new run; an active lease of another run still conflicts. 3 tests (reclaim fails without the fix). 802 tests. Stale leases of run 62ce2ee5 (ChangeSet ab89c22e, active until ~16:07Z) need a one-off release after deploy: .go-status/release-stale-worktree-leases-new32.py (runs the deployed release step for that run only). Git-only."
+  },
+  {
+   "phase": "3-new32-deployed-new33-operator-pause",
+   "started": "2026-09-23T08:45:00Z",
+   "status": "complete",
+   "notes": "Operator deployed 0b73071 and ran the NEW-32 one-off: released both stale worktree leases of run 62ce2ee5 (before: 2, LEASES_RELEASED, after: none). issue-start musematic source 1026 then returned the OLD operation aa3df818 (workflow 25a0d010, STARTED) without starting anything. NEW-33 root cause: that single-issue solve_issue (continue_after_blocked_issue=False) had its delivery fail; the loop recorded loop_status PAUSED and then RETURNED, so the Temporal workflow closed while campaign 44e4bfd3 stayed PAUSED -- unresumable (resume/retry/skip are signals to the closed workflow; backlog-start does not accept PAUSED), still counted as an active policy owner (active owners include PAUSED; no disable request ever written), and its operation stayed active, so every later solve_issue for #1026 was deduplicated onto it. Operator chose 'real pause': delivery-blocked and correction-exhausted branches now record PAUSED and WAIT for cancel (CANCELLED, policy disabled), skip (record_skip, next issue) or retry (re-run delivery with fresh child ids ...-issue-N-retry-K-attempt-M), behind workflow.patched('existing-backlog-delivery-operator-pause-v1'); global-child returns unchanged; phase shows AWAITING_OPERATOR then RESUMED. 2 Temporal signal tests (retry->cancel, skip->complete) with replay; both fail on the old code ('loop ended instead of pausing'). 804 tests. One-off .go-status/stop-orphaned-paused-campaign-new33.py ends 44e4bfd3 via the deployed backlog.record_loop_state (STOPPED + loop workflow id; refuses unless PAUSED). Git-only."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
  "remaining_blockers": [
-  "NEW-32 git-only; after deploy, run the one-off release for run 62ce2ee5, then issue-start musematic source 1026 again."
+  "NEW-33 git-only; after deploy run the one-off to stop 44e4bfd3, then the reconciler disables the policy; then issue-start #1026 needs an approvable campaign (44e4bfd3 will be STOPPED) -> fresh import likely required."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -236,5 +242,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD. 2) Operator runs .go-status/release-stale-worktree-leases-new32.py. 3) engineering-ctl issue-start musematic source 1026. 4) Follow spec -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator deploys HEAD. 2) Operator runs stop-orphaned-paused-campaign-new33.py. 3) Start #1026 (fresh campaign if issue-start refuses STOPPED 44e4bfd3). 4) If blocked, the loop now pauses: backlog-retry / backlog-skip / backlog-cancel. 5) spec -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }

@@ -18,6 +18,7 @@ code. `Replayer.replay_workflow` raises on any non-determinism.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import uuid
 from datetime import timedelta
@@ -106,9 +107,7 @@ async def _run_to_history(
     # finding.reproduce routes to a provider queue (claude/codex) -- see
     # ControlledWorkflow._activity_queue -- so every role queue needs a
     # worker regardless of which workflow is under test.
-    async with await WorkflowEnvironment.start_local(
-        dev_server_existing_path=_TEMPORAL_CLI
-    ) as env:
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
         async with (
             Worker(
                 env.client,
@@ -158,9 +157,7 @@ async def _run_to_history(
 
 async def test_connections_refresh_workflow_replays_cleanly() -> None:
     """Baseline: a workflow with zero patches replays against its own history."""
-    activity_fn = _scripted_execute_control_step(
-        {"connections.refresh": {"status": "COMPLETE"}}
-    )
+    activity_fn = _scripted_execute_control_step({"connections.refresh": {"status": "COMPLETE"}})
     history, result = await _run_to_history(
         ConnectionsRefreshWorkflow, ConnectionsRefreshInput(scope="all"), activity_fn
     )
@@ -410,6 +407,131 @@ async def test_existing_backlog_loop_continues_when_a_delivery_child_crashes() -
         result["results"]
     )
 
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
+    ).replay_workflow(history)
+
+
+async def _run_with_signals(
+    run_arg: Any, activity_fn: Any, signals: list[tuple[str, Any]]
+) -> tuple[Any, Any, list[str]]:
+    """Run the backlog loop, and each time it pauses for the operator send the next
+    signal. Returns history, result and the delivery child workflow ids started."""
+    workflows = [ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        async with (
+            Worker(
+                env.client,
+                task_queue=CONTROL_TASK_QUEUE,
+                workflows=workflows,
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=GITHUB_TASK_QUEUE,
+                workflows=workflows,
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=ROLE_TASK_QUEUES["scan"],
+                workflows=workflows,
+                activities=[activity_fn],
+            ),
+        ):
+            handle = await env.client.start_workflow(
+                ExistingGitHubBacklogLoopWorkflow.run,
+                run_arg,
+                id=f"replay-test-pause-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=2),
+            )
+            for name, argument in signals:
+                for _ in range(200):
+                    state = await handle.query("status")
+                    if str(state.get("phase", "")).startswith("AWAITING_OPERATOR"):
+                        break
+                    description = await handle.describe()
+                    assert (
+                        description.status is not None and description.status.name == "RUNNING"
+                    ), "the loop ended instead of pausing for the operator"
+                    await asyncio.sleep(0.1)
+                await handle.signal(name, argument)
+                await asyncio.sleep(0.5)
+            result = await handle.result()
+            history = await handle.fetch_history()
+    children = [
+        event.start_child_workflow_execution_initiated_event_attributes.workflow_id
+        for event in history.events
+        if event.HasField("start_child_workflow_execution_initiated_event_attributes")
+    ]
+    return history, result, children
+
+
+def _paused_delivery_script() -> Any:
+    return _scripted_execute_control_step_with_failure(
+        {
+            "backlog.load_execution": {
+                "status": "READY",
+                "items": [{"repository": "gntik-ai/musematic", "issue_number": 1026}],
+            },
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.revalidate_gate": {
+                "status": "READY",
+                "finding_id": "finding-1",
+                "risk_class": "R1",
+            },
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "delivery.release_leases": {"status": "LEASES_RELEASED"},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+            "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
+        },
+        fails_on="delivery.load_confirmed_finding",
+    )
+
+
+def _single_issue_input() -> ExistingGitHubBacklogLoopInput:
+    return ExistingGitHubBacklogLoopInput(
+        project="musematic",
+        backlog_campaign_id="camp-1",
+        maximum_risk="R1",
+        delivery_mode="source-pr",
+        continue_after_blocked_issue=False,
+    )
+
+
+async def test_blocked_delivery_pauses_until_the_operator_retries_then_cancels() -> None:
+    """Regression test for a real production incident (2026-09-23, NEW-33): a
+    single-issue solve_issue for musematic #1026 had its delivery fail; the loop
+    recorded PAUSED and then ENDED, so campaign 44e4bfd3 stayed PAUSED with no
+    workflow any resume/retry/skip signal could reach, still owning the GitHub
+    write policy and blocking every later solve_issue for that issue.
+    """
+    history, result, children = await _run_with_signals(
+        _single_issue_input(),
+        _paused_delivery_script(),
+        [("retry", "gntik-ai/musematic#1026"), ("cancel", None)],
+    )
+
+    assert result["status"] == "CANCELLED"
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-retry-1-attempt-1",
+    ]
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
+    ).replay_workflow(history)
+
+
+async def test_blocked_delivery_skip_moves_on_and_completes() -> None:
+    history, result, _ = await _run_with_signals(
+        _single_issue_input(),
+        _paused_delivery_script(),
+        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert {"status": "SKIPPED", "reason_code": "OPERATOR"} in result["results"]
     await Replayer(
         workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
     ).replay_workflow(history)
