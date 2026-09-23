@@ -442,3 +442,172 @@ async def test_scan_dispatch_runs_blocking_kubectl_and_scanner_steps_off_the_eve
 
     assert calls == [expected_method]
     assert result == {"status": "OK"}
+
+
+class BaselineScanner:
+    """Scanner double: each repository's findings for the current phase (pre/post)."""
+
+    def __init__(self) -> None:
+        self.findings: dict[str, dict[str, Any]] = {}
+
+    def _for(self, worktree: Path) -> dict[str, Any]:
+        return self.findings.get(worktree.name, {})
+
+    def secret_scan(self, worktree: Path, output: Path) -> dict[str, Any]:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "gitleaks.json").write_text("[]\n", encoding="utf-8")
+        found = [
+            {"RuleID": rule, "File": f"{worktree}/{path}", "StartLine": line}
+            for rule, path, line in self._for(worktree).get("secrets", [])
+        ]
+        return {"status": "FINDINGS" if found else "PASS", "findings": found}
+
+    def vulnerability_scan(self, worktree: Path, output: Path) -> dict[str, Any]:
+        vulnerabilities = [
+            {
+                "VulnerabilityID": cve,
+                "PkgName": package,
+                "InstalledVersion": "1.0",
+                "Severity": "HIGH",
+            }
+            for cve, package in self._for(worktree).get("vulnerabilities", [])
+        ]
+        return {"Results": [{"Target": "requirements.txt", "Vulnerabilities": vulnerabilities}]}
+
+    def semgrep(self, worktree: Path, output: Path) -> dict[str, Any]:
+        return {
+            "results": [
+                {"check_id": rule, "path": f"{worktree}/{path}", "start": {"line": line}}
+                for rule, path, line in self._for(worktree).get("semgrep", [])
+            ]
+        }
+
+    def sbom(self, worktree: Path, output: Path) -> dict[str, Any]:
+        return {}
+
+
+class ChangeManager:
+    def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
+        return (
+            {"changed_file_count": 1, "changed_paths": ["app/service.py"]},
+            "--- a/app/service.py\n+++ b/app/service.py\n+fixed = True\n",
+        )
+
+    def grant_delivery_read(self, repository: str, path: Path) -> None:
+        pass
+
+    def grant_release_read(self, repository: str, path: Path) -> None:
+        pass
+
+
+class ReceiptPublisher:
+    def publish(self, path: Path, **_: Any) -> dict[str, Any]:
+        return {"id": str(uuid4()), "filename": path.name}
+
+
+def _baseline_handler(
+    tmp_path: Path,
+) -> tuple[ScanActivityHandler, BaselineScanner, dict[str, Any]]:
+    worktrees = tmp_path / "worktrees"
+    for name in ("source", "deployment"):
+        (worktrees / name).mkdir(parents=True)
+    scanner = BaselineScanner()
+    handler = ScanActivityHandler(
+        Settings(evidence_root=tmp_path / "evidence", worktree_root=worktrees),
+        ChangeManager(),  # type: ignore[arg-type]
+        scanner=scanner,  # type: ignore[arg-type]
+        publisher=ReceiptPublisher(),  # type: ignore[arg-type]
+    )
+    maker = {"structured_result": {"tests": [{"status": "PASS"}]}}
+    payload = {
+        "project": "musematic",
+        "change_set_id": str(uuid4()),
+        "source_worktree": str(worktrees / "source"),
+        "deployment_worktree": str(worktrees / "deployment"),
+        "source_repository": "musematic",
+        "deployment_repository": "musematic-deploy",
+        "source_base_sha": "a" * 40,
+        "deployment_base_sha": "b" * 40,
+        "agent_result": {"structured_result": {"decision": "PASS"}},
+        "source_maker_result": maker,
+        "deployment_maker_result": maker,
+    }
+    return handler, scanner, payload
+
+
+EXISTING = {
+    "secrets": [("generic-api-key", "tests/fixtures/sample.env", 3)],
+    "semgrep": [("python.lang.security.audit.eval", "app/service.py", 10)],
+    "vulnerabilities": [("CVE-2024-0001", "requests")],
+}
+
+
+def test_prechecks_record_existing_findings_as_baseline_instead_of_blocking(
+    tmp_path: Path,
+) -> None:
+    # NEW-28: musematic's unmodified repo (156 semgrep findings, 363 HIGH/CRITICAL vulns,
+    # gitleaks findings) blocked every delivery at prechecks, before any change existed.
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+
+    prechecks = handler._delivery_prechecks(payload)
+
+    assert prechecks["status"] == "PRECHECKS_PASS"
+    assert prechecks["blocker"] is None
+    assert prechecks["prechecks"]["source"]["semgrep_findings"] == 1
+
+
+def test_postchecks_pass_when_the_change_only_shifts_existing_findings(tmp_path: Path) -> None:
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+    handler._delivery_prechecks(payload)
+    shifted = {
+        "secrets": [("generic-api-key", "tests/fixtures/sample.env", 9)],
+        "semgrep": [("python.lang.security.audit.eval", "app/service.py", 14)],
+        "vulnerabilities": EXISTING["vulnerabilities"],
+    }
+    scanner.findings = {"source": shifted, "deployment": EXISTING}
+
+    validated = handler._validate_changeset(payload)
+
+    assert validated["status"] == "LOCAL_VALIDATION_PASS"
+    source = validated["change_evidence"]["source"]
+    assert source["introduced_findings"] == {"secrets": 0, "semgrep": 0, "vulnerabilities": 0}
+    assert source["diff_withheld"] is False
+
+
+@pytest.mark.parametrize(
+    ("category", "added", "withheld"),
+    [
+        ("semgrep", ("python.lang.security.audit.eval", "app/service.py", 30), False),
+        ("secrets", ("aws-access-token", "app/service.py", 2), True),
+        ("vulnerabilities", ("CVE-2025-9999", "urllib3"), False),
+    ],
+)
+def test_postchecks_block_findings_the_change_introduces(
+    tmp_path: Path, category: str, added: tuple[Any, ...], withheld: bool
+) -> None:
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+    handler._delivery_prechecks(payload)
+    changed = {key: list(value) for key, value in EXISTING.items()}
+    changed[category].append(added)
+    scanner.findings = {"source": changed, "deployment": EXISTING}
+
+    validated = handler._validate_changeset(payload)
+
+    assert validated["status"] == "BLOCKED"
+    assert validated["blocker"] == "CHANGESET_VALIDATION_FINDINGS"
+    source = validated["change_evidence"]["source"]
+    assert source["introduced_findings"][category] == 1
+    assert source["diff_withheld"] is withheld
+
+
+def test_postchecks_fail_closed_to_absolute_gate_without_a_baseline(tmp_path: Path) -> None:
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+
+    validated = handler._validate_changeset(payload)
+
+    assert validated["status"] == "BLOCKED"
+    assert validated["change_evidence"]["source"]["diff_withheld"] is True

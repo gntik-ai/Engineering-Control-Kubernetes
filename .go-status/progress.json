@@ -2,7 +2,7 @@
  "mission": "GO status remediation for engineering-control",
  "branch": "go-status/2026-09-17",
  "started": "2026-09-17",
- "phase": "3-new22-verified-first-delivery-new23-new24-found",
+ "phase": "3-first-clean-delivery-prechecks-new28-baseline-gating",
  "phase_history": [
   {
    "phase": "0-discovery",
@@ -183,12 +183,17 @@
    "started": "2026-09-23T05:40:00Z",
    "status": "in_progress",
    "notes": "Deployed 034680d. Retry campaign 8034e576: reconciler moved it to APPROVED in 5s (05:41:02 GITHUB_BACKLOG_POLICY_RECONCILIATION_PASS) -- first time the GitHub write policy was ever enabled (enabled: true, musematic + musematic-deploy). NEW-25 (code, fixed git-only): reconciler unit runs UMask=0077 so install_policy's os.open(...,0o640) created the policy as 0o600 -- root cause of the original 600 file; every later reconciler run then failed 'canonical GitHub policy metadata is unsafe' and the GitHub worker (production requires 0o640) would return POLICY_UNREADABLE, blocking the PR write. Fix: explicit os.fchmod(0o640); regression test under umask 077 (0o600 without, 0o640 with). Operator chmod 640'd the live file mid-run. NEW-26 (design, NOT fixed): CLI backlog-start sends the solve_backlog command, and operations/service.py SolveBacklogCommand/SolveIssueCommand re-prepare + re-approve (writing a fresh enable activate.json) and immediately start; the loop flips the campaign to RUNNING within ms, so the reconciler always rejects that request ('campaign state is invalid') -- the real cause of every earlier reconciler failure and of the write policy never being enabled. This run only got the policy because the script's explicit approve + new APPROVED wait came first. Stale enable request for 8034e576 (05:41:15) left in place; .path unit failed again. NEW-26 FIXED (operator chose 'wait for activation'): TypedCommandBus._await_policy_activation -- after approve returns APPROVED_POLICY_PENDING, solve_backlog/solve_issue poll the campaign (<=60s) until the reconciler promotes it to APPROVED/APPROVED_INVENTORY, else the operation is BLOCKED with a clear safe_error and nothing starts. Two tests (fail without, pass with). 787 tests. Git-only, not deployed. Delivery for #1025 (8034e576) again FAILED at prechecks with 422 despite NEW-23 deployed; NEW-24 CONFIRMED LIVE (loop continued to #1026 instead of crashing). Read-only diagnostic (.go-status/diagnose-new23.py) run by operator: evidence binding OK (run 9d40f169, ChangeSet 6f281a39); worker runs new scan code and all 4 on-disk source reports pass the NEW redactor. NEW-27 ROOT CAUSE: engineering-evidence-ingest.service had been running since 2026-09-16 23:17 -- the deploy script never restarts it, so the server-side check still used the old non-idempotent redactor (semgrep.json matched lines like 'password: [REDACTED]' re-matched -> 422). Same gap: engineering-github-worker.service (the PR-writing, policy-enforcing worker) running since 2026-09-17 07:50; also stale but off the delivery path: dashboard (09-17), notifier (09-17), acceptance-worker (09-16). All their console scripts exist in the current venv except engineering-watchdog (known F-11 casualty). Deploy script now restarts + verifies engineering-evidence-ingest and engineering-github-worker."
+  },
+  {
+   "phase": "3-first-clean-delivery-prechecks-new28-baseline-gating",
+   "started": "2026-09-23T06:06:00Z",
+   "status": "complete",
+   "notes": "Operator deployed 029787b (ingest + GitHub worker restarted 06:06:15 onto current release; reconciler processed 8034e576's disable and wrote the policy 0640 -- NEW-25 confirmed live). Fresh campaign 51bdd717: reconciler APPROVED in 5s; backlog-start (solve_backlog) re-approved and WAITED for activation, reconciler Result=success, no stale request left -- NEW-26 confirmed live. #1025 CONFIRMED; delivery ran deterministic_prechecks to completion with every evidence upload ACCEPTED (NEW-23 + NEW-27 confirmed live), then BLOCKED DETERMINISTIC_PRECHECK_FINDINGS on the UNMODIFIED repo: source secret FINDINGS, 156 semgrep, 363 HIGH/CRITICAL; deployment secret FINDINGS, 3 semgrep, 1 HIGH. #1026 CONFIRMED, same block. Loop stopped cleanly via backlog-stop-after-current (operator-approved) to stop spending Codex verification runs. NEW-28 (design, operator chose baseline+delta): prechecks now record line-independent finding identities with multiplicity (gitleaks RuleID+file; semgrep check_id+path; trivy HIGH/CRITICAL vuln/misconfig/secret identities) to evidence/scan/<changeset>/prechecks/baseline.json and never block on them; validate_changeset blocks on any finding the change INTRODUCES vs that baseline (fail-closed to the old absolute gate if no baseline), and withholds the diff only when the change introduces a secret finding. 7 tests (5 fail without the fix). 793 tests, ruff/mypy clean. NOT YET DEPLOYED. SECURITY OBSERVATION for the operator: gitleaks reports existing secret findings in both musematic and musematic-deploy (not inspected -- reports are redacted); worth a human triage independent of GO."
   }
  ],
- "gate": "NEW-22 verified live; first-ever delivery reached deterministic_prechecks. NEW-23 (precheck evidence 422: unredacted scanner reports + non-idempotent redactor) and NEW-24 (loop crashes on failed delivery child) fixed git-only, not deployed. Policy reconciler restored; retry script now waits for APPROVED so the write policy actually gets enabled.",
+ "gate": "Every delivery-path fix through NEW-27 confirmed live. First delivery ran prechecks cleanly and was blocked only by pre-existing repo findings; NEW-28 baseline+delta gate fixed git-only.",
  "remaining_blockers": [
-  "Deploy HEAD (NEW-25, NEW-26, NEW-27 deploy-script restarts) -- restarts the stale ingest + GitHub worker.",
-  "Stale enable activate.json for 8034e576 + failed .path unit need clearing so the end-of-campaign disable is processed."
+  "NEW-28 git-only, not deployed; then retry musematic and follow delivery through spec, maker, checker, validate_changeset, publish (PR)."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -213,5 +218,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator: deploy HEAD (script now restarts ingest + GitHub worker), clear stale activate.json, reset/restart the .path unit. 2) Loop 8034e576 continues on new code; if #1026 delivers, watch prechecks -> maker/checker -> postchecks -> PR. 3) Otherwise fresh retry (script). 4) PR + policy gates clear -> GATE 3 GO. 5) Decide on restarting dashboard/notifier/acceptance-worker onto the current release."
+ "next_action_on_resume": "1) Operator deploys HEAD. 2) Retry musematic --max-items 2 (1025/1026 confirm reliably). 3) Follow delivery: prepare/invoke spec, create_openspec, maker, deployment maker, checker, validate_changeset, publish -> PR. 4) PR + merge policy -> GATE 3 GO. 5) Human triage of pre-existing gitleaks findings in musematic repos."
 }

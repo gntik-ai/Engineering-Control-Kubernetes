@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import tempfile
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1256,7 +1257,7 @@ class ScanActivityHandler:
         change_set_id = UUID(str(payload["change_set_id"]))
         evidence_root = self.settings.evidence_root / "scan" / str(change_set_id) / "prechecks"
         summaries: dict[str, Any] = {}
-        blocked = False
+        baseline: dict[str, dict[str, dict[str, int]]] = {}
         for name, path_value in (
             ("source", payload["source_worktree"]),
             ("deployment", payload["deployment_worktree"]),
@@ -1272,8 +1273,10 @@ class ScanActivityHandler:
             self.scanner.sbom(worktree, output)
             semgrep_findings = len(semgrep.get("results", []))
             severe_vulnerabilities = self._severe_vulnerability_count(trivy)
-            if secret.get("status") == "FINDINGS" or semgrep_findings or severe_vulnerabilities:
-                blocked = True
+            # NEW-28: pre-existing findings are the baseline, not a blocker -- otherwise
+            # no real repository can ever receive a change. validate_changeset blocks on
+            # any finding the change introduces relative to this baseline.
+            baseline[name] = self._finding_counts(worktree, secret, trivy, semgrep)
             artifacts = self._publish_reports(
                 payload,
                 sorted(report for report in output.iterdir() if report.is_file()),
@@ -1285,10 +1288,13 @@ class ScanActivityHandler:
                 "high_or_critical_vulnerabilities": severe_vulnerabilities,
                 "artifacts": artifacts,
             }
+        self._atomic_text(
+            self._baseline_path(change_set_id), json.dumps(baseline, indent=2, sort_keys=True)
+        )
         return {
             **payload,
-            "status": "BLOCKED" if blocked else "PRECHECKS_PASS",
-            "blocker": "DETERMINISTIC_PRECHECK_FINDINGS" if blocked else None,
+            "status": "PRECHECKS_PASS",
+            "blocker": None,
             "prechecks": summaries,
         }
 
@@ -1318,6 +1324,7 @@ class ScanActivityHandler:
         change_set_id = UUID(str(payload["change_set_id"]))
         evidence_root = self.settings.evidence_root / "scan" / str(change_set_id) / "changes"
         evidence_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        baseline = self._load_baseline(change_set_id)
         changes: dict[str, Any] = {}
         blocked = False
         for name, path_key, base_key in (
@@ -1337,14 +1344,19 @@ class ScanActivityHandler:
             self.scanner.sbom(worktree, output)
             semgrep_findings = len(semgrep.get("results", []))
             severe = self._severe_vulnerability_count(trivy)
-            if secret.get("status") == "FINDINGS" or semgrep_findings or severe:
+            introduced = self._introduced_findings(
+                baseline.get(name) if baseline is not None else None,
+                self._finding_counts(worktree, secret, trivy, semgrep),
+            )
+            if any(introduced.values()):
                 blocked = True
+            secrets_introduced = bool(introduced["secrets"])
             artifacts = self._publish_reports(
                 payload,
                 sorted(report for report in output.iterdir() if report.is_file()),
                 filename_prefix=f"postchecks-{name}",
             )
-            if secret.get("status") == "FINDINGS":
+            if secrets_introduced:
                 artifacts.append(
                     {
                         "status": "WITHHELD_SECRET_FINDINGS",
@@ -1368,8 +1380,9 @@ class ScanActivityHandler:
                     changed_paths=summary["changed_paths"],
                     diff=diff,
                 ),
-                "diff_path": (None if secret.get("status") == "FINDINGS" else str(diff_path)),
-                "diff_withheld": secret.get("status") == "FINDINGS",
+                "diff_path": (None if secrets_introduced else str(diff_path)),
+                "diff_withheld": secrets_introduced,
+                "introduced_findings": introduced,
                 "diff_redacted_sha256": hashlib.sha256(safe_diff.encode()).hexdigest(),
                 "secret_status": secret.get("status"),
                 "semgrep_findings": semgrep_findings,
@@ -1454,6 +1467,84 @@ class ScanActivityHandler:
             json.dumps(classifier, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         return classifier
+
+    def _baseline_path(self, change_set_id: UUID) -> Path:
+        prechecks = self.settings.evidence_root / "scan" / str(change_set_id) / "prechecks"
+        return prechecks / "baseline.json"
+
+    def _load_baseline(self, change_set_id: UUID) -> dict[str, Any] | None:
+        path = self._baseline_path(change_set_id)
+        if not path.is_file():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+
+    @classmethod
+    def _finding_counts(
+        cls,
+        worktree: Path,
+        secret: dict[str, Any],
+        trivy: dict[str, Any],
+        semgrep: dict[str, Any],
+    ) -> dict[str, dict[str, int]]:
+        """Line-independent finding identities with multiplicity, so edits that only shift
+        lines match the baseline while a second occurrence of the same rule still counts."""
+        root = f"{worktree.resolve()}/"
+
+        def relative(value: Any) -> str:
+            text = str(value or "")
+            return text[len(root) :] if text.startswith(root) else text
+
+        def key(*parts: Any) -> str:
+            return json.dumps([str(part or "") for part in parts])
+
+        counts: dict[str, Counter[str]] = {
+            "secrets": Counter(),
+            "semgrep": Counter(),
+            "vulnerabilities": Counter(),
+        }
+        for finding in secret.get("findings") or []:
+            if isinstance(finding, dict):
+                counts["secrets"][key(finding.get("RuleID"), relative(finding.get("File")))] += 1
+        for finding in semgrep.get("results") or []:
+            if isinstance(finding, dict):
+                counts["semgrep"][
+                    key(finding.get("check_id"), relative(finding.get("path")))
+                ] += 1
+        for result in trivy.get("Results") or []:
+            if not isinstance(result, dict):
+                continue
+            target = relative(result.get("Target"))
+            for category, fields in (
+                ("Vulnerabilities", ("VulnerabilityID", "PkgName", "InstalledVersion")),
+                ("Misconfigurations", ("ID", "AVDID")),
+                ("Secrets", ("RuleID",)),
+            ):
+                for finding in result.get(category) or []:
+                    if isinstance(finding, dict) and str(
+                        finding.get("Severity", "")
+                    ).upper() in {"HIGH", "CRITICAL"}:
+                        identity = key(
+                            category, target, *(finding.get(field) for field in fields)
+                        )
+                        counts["vulnerabilities"][identity] += 1
+        return {name: dict(counter) for name, counter in counts.items()}
+
+    @staticmethod
+    def _introduced_findings(
+        baseline: dict[str, Any] | None, current: dict[str, dict[str, int]]
+    ) -> dict[str, int]:
+        # No recorded baseline (e.g. prechecks from an older release): fail closed and
+        # treat every current finding as introduced, i.e. the previous absolute gate.
+        introduced: dict[str, int] = {}
+        for category, findings in current.items():
+            before = baseline.get(category) if isinstance(baseline, dict) else None
+            before = before if isinstance(before, dict) else {}
+            introduced[category] = sum(
+                max(0, count - int(before.get(identity, 0)))
+                for identity, count in findings.items()
+            )
+        return introduced
 
     @staticmethod
     def _severe_vulnerability_count(report: dict[str, Any]) -> int:
