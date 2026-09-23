@@ -132,6 +132,11 @@ sudo systemctl restart engineering-api.service engineering-temporal-worker.servi
 sleep 3
 echo "-- controller: engineering-scheduler (re-registers schedules, e.g. NEW-05's connections-refresh) --"
 sudo systemctl restart engineering-scheduler.service
+# NEW-27: these two sit on the delivery path but were never restarted by this script,
+# so they kept running 2026-09-16/17 code from memory (the ingest service's old
+# non-idempotent redactor kept 422-ing precheck evidence after NEW-23 was deployed).
+echo "-- controller: engineering-evidence-ingest, engineering-github-worker --"
+sudo systemctl restart engineering-evidence-ingest.service engineering-github-worker.service
 echo "-- worker: all 5 role workers + release worker --"
 ssh -t worker "sudo systemctl restart engineering-worker@codex.service engineering-worker@claude.service engineering-worker@browser.service engineering-worker@scan.service engineering-worker@delivery.service engineering-release-worker.service"
 
@@ -139,7 +144,7 @@ echo ""
 echo "=== 7/7: verify ==="
 sleep 3
 echo "-- controller --"
-systemctl is-active engineering-api.service engineering-temporal-worker.service engineering-scheduler.service
+systemctl is-active engineering-api.service engineering-temporal-worker.service engineering-scheduler.service engineering-evidence-ingest.service engineering-github-worker.service
 systemctl show engineering-api.service engineering-temporal-worker.service --property=NRestarts,ActiveState
 echo "-- worker --"
 ssh worker "systemctl is-active engineering-worker@codex.service engineering-worker@claude.service engineering-worker@browser.service engineering-worker@scan.service engineering-worker@delivery.service engineering-release-worker.service"
