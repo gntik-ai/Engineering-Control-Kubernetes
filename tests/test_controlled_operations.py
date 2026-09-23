@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import func, select
@@ -500,11 +501,9 @@ def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
-    assert set(repository._full_delivery_blockers("musematic")) == {
-        "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
-        "MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED",
-        "MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC",
-    }
+    # musematic now delivers through the post-merge staging GitOps flow, so the
+    # pre-merge candidate/promotion/staging-releaser blockers no longer apply.
+    assert repository._full_delivery_blockers("musematic") == []
     assert set(repository._full_delivery_blockers("llmwiki")) == {
         "LLMWIKI_CANDIDATE_BUILD_DISABLED",
         "LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED",
@@ -516,6 +515,45 @@ def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
     )
     assert unconfigured._full_delivery_blockers("falcone") == [
         "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED",
+    ]
+
+
+def _set_staging_flow(repository: OperationsRepository, **changes: object) -> None:
+    root = repository.project_config_root
+    assert root is not None
+    path = root / "musematic.yaml"
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value["delivery_control"]["staging_flow"].update(changes)
+    path.write_text(yaml.safe_dump(value), encoding="utf-8")
+
+
+def test_staging_flow_admission_replaces_pre_merge_blockers_and_is_validated(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _set_staging_flow(repository, enabled=False)
+    assert set(repository._full_delivery_blockers("musematic")) == {
+        "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
+        "MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED",
+        "MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC",
+    }
+
+    _set_staging_flow(
+        repository,
+        enabled=True,
+        argo_application="other-app",
+        namespaces=["musematic-platform", "kube-flannel"],
+        image_repositories=["ghcr.io/gntik-ai/other/image"],
+    )
+    assert set(repository._full_delivery_blockers("musematic")) == {
+        "STAGING_FLOW_ARGO_APPLICATION_MISMATCH",
+        "STAGING_FLOW_NAMESPACE_OUTSIDE_PROJECT",
+        "STAGING_FLOW_IMAGE_REPOSITORY_OUTSIDE_PROJECT",
+    }
+
+    _set_staging_flow(repository, argo_application="musematic-platform", unknown_field=True)
+    assert repository._full_delivery_blockers("musematic") == [
+        "FULL_DELIVERY_PROJECT_CONTRACT_INVALID"
     ]
 
 

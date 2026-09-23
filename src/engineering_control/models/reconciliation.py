@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import UUID
@@ -98,10 +99,92 @@ class ImmutablePromotionPolicy(ReconciliationModel):
         return self
 
 
+_KUBERNETES_NAME = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+_WORKFLOW_REFERENCE = r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,159}$"
+
+
+class ReleaseTagPolicy(ReconciliationModel):
+    """Optional semver release tag that triggers a tag-driven image build."""
+
+    enabled: bool = False
+    prefix: str = Field(default="v", pattern=r"^[A-Za-z]{0,8}$")
+    bump: Literal["patch"] = "patch"
+
+
+class StagingFlowPolicy(ReconciliationModel):
+    """Post-merge staging GitOps delivery (Argo CD + argocd-image-updater)."""
+
+    enabled: bool = False
+    kind: Literal["argocd-image-updater"] = "argocd-image-updater"
+    argo_application: str = Field(pattern=_KUBERNETES_NAME)
+    argo_namespace: str = Field(default="argocd", pattern=_KUBERNETES_NAME)
+    namespaces: tuple[str, ...] = Field(min_length=1, max_length=10)
+    source_ci_workflow: str = Field(pattern=_WORKFLOW_REFERENCE)
+    main_ci_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
+    image_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
+    release_tag: ReleaseTagPolicy = Field(default_factory=ReleaseTagPolicy)
+    deploy_repository: str = Field(
+        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
+    )
+    deploy_values_file: str = Field(pattern=r"^[A-Za-z0-9._/-]{1,240}\.ya?ml$")
+    deploy_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
+    image_repositories: tuple[str, ...] = Field(min_length=1, max_length=20)
+    tag_prefix: str = Field(default="sha-", pattern=r"^[A-Za-z0-9._-]{0,20}$")
+    tag_length: int = Field(default=7, ge=7, le=40)
+    chart_source_repository: str | None = Field(
+        default=None,
+        pattern=r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)\.git$",
+    )
+    pin_chart_to_merge: bool = False
+    external_secrets_namespace: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
+    external_secrets_deployment: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
+
+    @field_validator("namespaces")
+    @classmethod
+    def kubernetes_namespaces(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("staging flow namespaces must be unique")
+        for value in values:
+            if not re.fullmatch(_KUBERNETES_NAME, value) or value in {
+                "kube-system",
+                "kube-public",
+                "default",
+            }:
+                raise ValueError("staging flow namespaces must be bounded project namespaces")
+        return values
+
+    @field_validator("deploy_values_file")
+    @classmethod
+    def relative_values_file(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("deploy values file must be a bounded repository-relative path")
+        return value
+
+    @field_validator("image_repositories")
+    @classmethod
+    def first_party_images(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("staging flow image repositories must be unique")
+        for value in values:
+            if not re.fullmatch(r"ghcr\.io/gntik-ai/[a-z0-9._/-]{1,160}", value):
+                raise ValueError("staging flow image repositories must be first-party GHCR images")
+        return values
+
+    @model_validator(mode="after")
+    def coherent_staging_flow(self) -> StagingFlowPolicy:
+        if self.pin_chart_to_merge and self.chart_source_repository is None:
+            raise ValueError("pinning the chart to the merge requires chart_source_repository")
+        if self.release_tag.enabled and self.image_workflow is None:
+            raise ValueError("a release tag requires the image_workflow it triggers")
+        return self
+
+
 class DeliveryControlPolicy(ReconciliationModel):
     source_ci_workflow: str = Field(min_length=1, max_length=160)
     candidate_build: CandidateBuildPolicy
     immutable_promotion: ImmutablePromotionPolicy
+    staging_flow: StagingFlowPolicy | None = None
 
 
 class CIReconciliationPlan(ReconciliationModel):

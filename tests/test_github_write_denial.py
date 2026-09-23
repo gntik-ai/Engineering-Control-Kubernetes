@@ -15,6 +15,8 @@ from engineering_control.activities.delivery import DeliveryActivityHandler
 from engineering_control.config import Settings
 from engineering_control.policy.github_write import (
     GITHUB_ACTIVITY_STEPS,
+    GITOPS_READ_ONLY_GITHUB_STEPS,
+    GITOPS_WRITE_CAPABLE_GITHUB_STEPS,
     READ_ONLY_GITHUB_STEPS,
     WRITE_CAPABLE_GITHUB_STEPS,
     GitHubWritePolicyDenial,
@@ -39,10 +41,13 @@ class NoCommandRunner:
 
 
 def test_github_activity_classification_is_complete_and_disjoint() -> None:
-    assert len(GITHUB_ACTIVITY_STEPS) == 16
+    assert len(GITHUB_ACTIVITY_STEPS) == 23
     assert len(READ_ONLY_GITHUB_STEPS) == 8
     assert len(WRITE_CAPABLE_GITHUB_STEPS) == 8
+    assert len(GITOPS_READ_ONLY_GITHUB_STEPS) == 3
+    assert len(GITOPS_WRITE_CAPABLE_GITHUB_STEPS) == 4
     assert READ_ONLY_GITHUB_STEPS.isdisjoint(WRITE_CAPABLE_GITHUB_STEPS)
+    assert GITOPS_READ_ONLY_GITHUB_STEPS.isdisjoint(GITOPS_WRITE_CAPABLE_GITHUB_STEPS)
     assert GITHUB_ACTIVITY_STEPS == ControlActivities.steps_for_worker("github")
 
 

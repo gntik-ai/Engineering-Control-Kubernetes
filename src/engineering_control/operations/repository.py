@@ -1117,6 +1117,11 @@ class OperationsRepository:
                 return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED"]
             return [*blockers, "FULL_DELIVERY_PROJECT_CONTRACT_INVALID"]
 
+        if policy.staging_flow is not None and policy.staging_flow.enabled:
+            # Post-merge staging GitOps flow: the pre-merge candidate build,
+            # immutable promotion and scoped staging-releaser gates do not apply;
+            # the flow's own contract is cross-checked against the project instead.
+            return list(dict.fromkeys(manifest.staging_flow_blockers()))
         if not policy.candidate_build.enabled:
             blockers.append(
                 policy.candidate_build.blocker or "FULL_DELIVERY_CANDIDATE_BUILD_DISABLED"

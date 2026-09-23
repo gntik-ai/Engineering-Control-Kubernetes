@@ -26,7 +26,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
@@ -38,6 +38,7 @@ from engineering_control.workflows.definitions import (
     FinalClosureWorkflow,
     FindingVerificationWorkflow,
     IssueDeliveryWorkflow,
+    StagingGitOpsDeliveryWorkflow,
 )
 from engineering_control.workflows.inputs import (
     ConnectionsRefreshInput,
@@ -45,6 +46,7 @@ from engineering_control.workflows.inputs import (
     FinalClosureInput,
     FindingVerificationInput,
     IssueDeliveryInput,
+    StagingGitOpsDeliveryInput,
 )
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
@@ -550,3 +552,267 @@ async def test_blocked_delivery_skip_moves_on_and_completes() -> None:
     await Replayer(
         workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
     ).replay_workflow(history)
+
+
+# -- post-merge staging GitOps flow -----------------------------------------------------
+
+_GITOPS_PLAN = {
+    "change_set_id": "00000000-0000-0000-0000-000000000007",
+    "project": "musematic",
+    "risk_class": "R1",
+    "source_repository": "gntik-ai/musematic",
+    "source_pr_number": 77,
+    "source_pr_url": "https://github.com/gntik-ai/musematic/pull/77",
+    "source_head_sha": "a" * 40,
+    "source_base_branch": "main",
+    "deployment_repository": "gntik-ai/musematic-deploy",
+    "deployment_pr_number": None,
+    "deployment_pr_url": None,
+    "deployment_head_sha": None,
+    "deployment_base_branch": "main",
+    "issue_repository": "gntik-ai/musematic",
+    "issue_number": 1026,
+}
+
+
+def _gitops_script(**overrides: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    script: dict[str, dict[str, Any]] = {
+        "gitops.prepare": {
+            "status": "READY",
+            "plan": _GITOPS_PLAN,
+            "staging_flow": {
+                "argo_application": "musematic-platform",
+                "main_ci_workflow": None,
+                "image_workflow": "deploy.yml",
+                "release_tag_enabled": True,
+                "pin_chart_to_merge": True,
+            },
+        },
+        "gitops.pr_checks": {"status": "CHECKS_PASSED"},
+        "gitops.merge": {"status": "MERGED", "target": "source", "merge_sha": "d" * 40},
+        "gitops.release_tag": {"status": "TAG_READY", "release_tag": "v0.0.11"},
+        "gitops.workflow_run": {"status": "RUN_SUCCEEDED"},
+        "gitops.environment_check": {"status": "HEALTHY", "diagnosis": {}},
+        "gitops.image_pin": {
+            "status": "PINNED",
+            "image_tag": "sha-ddddddd",
+            "pinned_repositories": ["ghcr.io/gntik-ai/musematic/web"],
+        },
+        "gitops.trigger_sync": {
+            "status": "SYNC_TRIGGERED",
+            "previous_operation_started_at": "",
+            "chart_pin": {"changed": True},
+        },
+        "gitops.sync_status": {"status": "SYNCED", "argo_revision": "d" * 40},
+        "gitops.verify_workloads": {"status": "VERIFIED"},
+        "gitops.close_issue": {"status": "ISSUE_CLOSED"},
+        "gitops.persist_result": {"status": "PERSISTED"},
+    }
+    script.update(overrides)
+    return script
+
+
+def _gitops_input() -> StagingGitOpsDeliveryInput:
+    return StagingGitOpsDeliveryInput(
+        change_set_id=_GITOPS_PLAN["change_set_id"],
+        project="musematic",
+        issue_repository="gntik-ai/musematic",
+        issue_number=1026,
+    )
+
+
+def _scheduled_steps(history: Any) -> list[dict[str, Any]]:
+    return [
+        json.loads(event.activity_task_scheduled_event_attributes.input.payloads[0].data)
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+
+
+async def test_staging_gitops_workflow_happy_path_replays_cleanly() -> None:
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(_gitops_script()),
+    )
+
+    assert result is not None and result["status"] == "STAGING_VERIFIED"
+    assert result["evidence"]["merge_sha"] == "d" * 40
+    assert result["evidence"]["release_tag"] == "v0.0.11"
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert steps == [
+        "gitops.prepare",
+        "gitops.pr_checks",
+        "gitops.merge",
+        "gitops.release_tag",
+        "gitops.workflow_run",
+        "gitops.environment_check",
+        "gitops.image_pin",
+        "gitops.trigger_sync",
+        "gitops.sync_status",
+        "gitops.verify_workloads",
+        "gitops.close_issue",
+        "gitops.persist_result",
+    ]
+    persisted = _scheduled_steps(history)[-1]["payload"]
+    assert persisted["outcome"] == "STAGING_VERIFIED"
+    assert persisted["image_tag"] == "sha-ddddddd"
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_staging_gitops_workflow_failed_checks_block_before_merge() -> None:
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _gitops_script(
+                **{"gitops.pr_checks": {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_FAILED"}}
+            )
+        ),
+    )
+
+    assert result is not None
+    assert (result["status"], result["blocker"]) == ("BLOCKED", "SOURCE_PR_CI_FAILED")
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert steps == ["gitops.prepare", "gitops.pr_checks", "gitops.persist_result"]
+    assert _scheduled_steps(history)[-1]["payload"]["outcome"] == "BLOCKED"
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+@workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
+class _PublishedIssueDeliveryStub:
+    """Stands in for IssueDeliveryWorkflow: the source PR has been published."""
+
+    @workflow.run
+    async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
+        return {"status": "SOURCE_PR", "context": {"change_set_id": _GITOPS_PLAN["change_set_id"]}}
+
+
+def _full_delivery_loop_script(
+    **gitops_overrides: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    return {
+        "backlog.load_execution": {
+            "status": "READY",
+            "items": [{"repository": "gntik-ai/musematic", "issue_number": 1026}],
+        },
+        "backlog.register_run": {"status": "REGISTERED"},
+        "backlog.revalidate_gate": {
+            "status": "READY",
+            "finding_id": "finding-1",
+            "risk_class": "R1",
+        },
+        "backlog.register_child_run": {"status": "REGISTERED"},
+        "backlog.record_loop_state": {"status": "RECORDED"},
+        "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
+        "gitops.flow_for_project": {"status": "ENABLED", "enabled": True},
+        **_gitops_script(**gitops_overrides),
+    }
+
+
+_LOOP_WORKFLOWS = [
+    ExistingGitHubBacklogLoopWorkflow,
+    _PublishedIssueDeliveryStub,
+    StagingGitOpsDeliveryWorkflow,
+]
+
+
+async def _run_loop(
+    script: dict[str, dict[str, Any]], signals: list[tuple[str, Any]]
+) -> tuple[Any, Any, list[str]]:
+    activity_fn = _scripted_execute_control_step(script)
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        async with (
+            Worker(
+                env.client,
+                task_queue=CONTROL_TASK_QUEUE,
+                workflows=_LOOP_WORKFLOWS,
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=GITHUB_TASK_QUEUE,
+                workflows=_LOOP_WORKFLOWS,
+                activities=[activity_fn],
+            ),
+        ):
+            handle = await env.client.start_workflow(
+                ExistingGitHubBacklogLoopWorkflow.run,
+                ExistingGitHubBacklogLoopInput(
+                    project="musematic",
+                    backlog_campaign_id="camp-1",
+                    maximum_risk="R2",
+                    delivery_mode="full-delivery",
+                    continue_after_blocked_issue=False,
+                ),
+                id=f"replay-test-gitops-loop-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=2),
+            )
+            for name, argument in signals:
+                for _ in range(200):
+                    state = await handle.query("status")
+                    if str(state.get("phase", "")).startswith("AWAITING_OPERATOR"):
+                        break
+                    await asyncio.sleep(0.1)
+                await handle.signal(name, argument)
+                await asyncio.sleep(0.5)
+            result = await handle.result()
+            history = await handle.fetch_history()
+    children = [
+        event.start_child_workflow_execution_initiated_event_attributes.workflow_id
+        for event in history.events
+        if event.HasField("start_child_workflow_execution_initiated_event_attributes")
+    ]
+    return history, result, children
+
+
+async def test_full_delivery_loop_runs_the_staging_gitops_child_when_enabled() -> None:
+    history, result, children = await _run_loop(_full_delivery_loop_script(), [])
+
+    assert result["status"] == "COMPLETE"
+    assert any(
+        item.get("stage") == "staging-gitops" and item.get("status") == "STAGING_VERIFIED"
+        for item in result["results"]
+    )
+    # The pre-merge candidate pipeline is never started when the flow is enabled.
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+    ]
+    registered = [
+        request["payload"]["child_kind"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.register_child_run"
+    ]
+    assert registered == ["issue-delivery", "staging-gitops"]
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+async def test_blocked_staging_gitops_pauses_retries_only_the_child_then_skips() -> None:
+    history, result, children = await _run_loop(
+        _full_delivery_loop_script(
+            **{"gitops.prepare": {"status": "BLOCKED", "blocker": "ENVIRONMENT_UNHEALTHY"}}
+        ),
+        [
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert {"status": "SKIPPED", "reason_code": "OPERATOR"} in result["results"]
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+        "1-staging-gitops-retry-1",
+    ]
+    paused = [
+        request["payload"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert [state["blocker"] for state in paused] == ["ENVIRONMENT_UNHEALTHY"] * 2
+    assert all(state.get("workflow_id") for state in paused)
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)

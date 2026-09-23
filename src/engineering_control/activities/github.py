@@ -19,12 +19,15 @@ from engineering_control.engineering.backlog import (
     GitHubRepositoryBacklogSnapshot,
 )
 
+from .gitops import GitOpsGitHubHandler
+
 
 class GitHubActivityHandler:
     """Run only typed gh broker activities under the authenticated broker identity."""
 
-    supported_steps = frozenset(
-        {"llmwiki.bootstrap.plan", "github.refresh_mirrors", "backlog.github_import"}
+    supported_steps = (
+        frozenset({"llmwiki.bootstrap.plan", "github.refresh_mirrors", "backlog.github_import"})
+        | GitOpsGitHubHandler.supported_steps
     )
 
     def __init__(self, settings: Settings) -> None:
@@ -37,11 +40,15 @@ class GitHubActivityHandler:
             maximum_json_bytes=16_000_000,
         )
         self.git = SafeCommandRunner({"git": settings.git_executable})
+        # Post-merge staging GitOps steps share this worker's typed dispatch surface.
+        self.gitops = GitOpsGitHubHandler(settings)
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         # F-08: every branch here does blocking gh/git subprocess work through sync
         # broker/runner methods; run each off the event loop in a worker thread rather
         # than converting the whole synchronous call graph to async/await.
+        if step in GitOpsGitHubHandler.supported_steps:
+            return await self.gitops.handle(step, payload)
         if step == "backlog.github_import":
             return await asyncio.to_thread(self._import_backlog, payload)
         if step == "github.refresh_mirrors":

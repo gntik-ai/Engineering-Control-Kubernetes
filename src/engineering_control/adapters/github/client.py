@@ -21,6 +21,9 @@ ALLOWED_REPOSITORIES = frozenset(
 )
 READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'-]{1,500}$")
+STAGING_GITOPS_MARKER = re.compile(
+    r"<!-- engineering-control-staging-gitops:[a-z-]{1,40}:[a-f0-9-]{36}(?::[a-z0-9-]{1,40})? -->"
+)
 
 
 class GhCliAuthError(RuntimeError):
@@ -593,6 +596,192 @@ class GhCliBroker:
             )
             issue = self.view_issue(repository, number)
         if issue.get("state") != "CLOSED" or not issue.get("closedAt"):
+            raise GhCliPolicyError("issue closure was not confirmed")
+        return {
+            "status": "CLOSED",
+            "issue_url": issue.get("url"),
+            "closed_at": issue.get("closedAt"),
+        }
+
+    def mark_pull_request_ready(
+        self,
+        *,
+        repository: str,
+        number: int,
+        expected_head_sha: str,
+        change_binding: str,
+    ) -> dict[str, Any]:
+        """Take a draft PR out of draft only while it still points at the bound head."""
+        repository = self._write(repository, change_binding)
+        if number < 1 or not re.fullmatch(r"[a-f0-9]{40}", expected_head_sha):
+            raise GhCliPolicyError("ready-for-review binding is invalid")
+        current = self.view_pull_request(repository, number)
+        if current.get("headRefOid") != expected_head_sha:
+            raise GhCliPolicyError("pull request head changed before ready-for-review")
+        if current.get("state") == "MERGED":
+            return current
+        if current.get("state") != "OPEN":
+            raise GhCliPolicyError("pull request is not open")
+        if current.get("isDraft") is not False:
+            self._run(["pr", "ready", str(number), "--repo", repository])
+            current = self.view_pull_request(repository, number)
+        if current.get("headRefOid") != expected_head_sha:
+            raise GhCliPolicyError("pull request head changed during ready-for-review")
+        return current
+
+    def list_tag_refs(self, repository: str, prefix: str) -> list[dict[str, str]]:
+        """Return bounded tag refs under refs/tags/<prefix> as {ref, sha, type}."""
+        repository = self._batch(repository)
+        if not re.fullmatch(r"[A-Za-z]{0,8}", prefix):
+            raise GhCliPolicyError("tag prefix is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/git/matching-refs/tags/{prefix}",
+                "--paginate",
+                "--jq",
+                ".[] | {ref: .ref, sha: .object.sha, type: .object.type}",
+            ]
+        ).stdout
+        lines = [line for line in raw.splitlines() if line.strip()]
+        if len(lines) > 5000:
+            raise GhCliPolicyError("tag listing is unbounded")
+        refs: list[dict[str, str]] = []
+        for line in lines:
+            value = self._json(line, "tag ref")
+            if not isinstance(value, dict):
+                raise GhCliPolicyError("tag ref is not an object")
+            refs.append({key: str(value.get(key) or "") for key in ("ref", "sha", "type")})
+        return refs
+
+    def create_tag_ref(
+        self, *, repository: str, tag: str, sha: str, change_binding: str
+    ) -> dict[str, str]:
+        """Create one lightweight tag ref at an exact commit (never moves a tag)."""
+        repository = self._write(repository, change_binding)
+        if not re.fullmatch(r"[A-Za-z]{0,8}[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", tag):
+            raise GhCliPolicyError("release tag is not a bounded semantic version")
+        if not re.fullmatch(r"[a-f0-9]{40}", sha):
+            raise GhCliPolicyError("release tag target is not an exact commit")
+        value = self._json(
+            self._run(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"repos/{repository}/git/refs",
+                    "-f",
+                    f"ref=refs/tags/{tag}",
+                    "-f",
+                    f"sha={sha}",
+                    "--jq",
+                    "{ref: .ref, sha: .object.sha}",
+                ]
+            ).stdout,
+            "created tag ref",
+        )
+        if (
+            not isinstance(value, dict)
+            or value.get("ref") != f"refs/tags/{tag}"
+            or value.get("sha") != sha
+        ):
+            raise GhCliPolicyError("created tag ref does not match its binding")
+        return {"ref": f"refs/tags/{tag}", "sha": sha}
+
+    def repository_file_text(self, repository: str, path: str, ref: str) -> str:
+        """Read one bounded repository file at a branch; never returned to callers verbatim."""
+        repository = self._batch(repository)
+        if not re.fullmatch(r"[A-Za-z0-9._/-]{1,240}", path) or ".." in path.split("/"):
+            raise GhCliPolicyError("repository file path is invalid")
+        ref = self._value(ref, "repository file ref", maximum=120)
+        raw = self._run(
+            [
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repository}/contents/{path}",
+                "-f",
+                f"ref={ref}",
+                "-H",
+                "Accept: application/vnd.github.raw",
+            ]
+        ).stdout
+        if len(raw.encode()) > self.maximum_json_bytes:
+            raise GhCliPolicyError("repository file exceeded its bounded size")
+        return raw
+
+    def comment_marked_issue(
+        self,
+        *,
+        repository: str,
+        number: int,
+        body_file: Path,
+        marker: str,
+        change_binding: str,
+        require_open: bool = True,
+    ) -> dict[str, Any]:
+        """Comment once per staging-GitOps marker; an existing marker comment is reused."""
+        repository = self._write(repository, change_binding)
+        if number < 1 or not STAGING_GITOPS_MARKER.fullmatch(marker):
+            raise GhCliPolicyError("staging issue comment binding is invalid")
+        bounded_body = self._bounded_file(body_file)
+        if bounded_body.stat().st_size > 12_000:
+            raise GhCliPolicyError("issue comment body exceeded the bounded size")
+        try:
+            body = bounded_body.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise GhCliPolicyError("issue comment body is unreadable") from error
+        if body.count(marker) != 1:
+            raise GhCliPolicyError("issue comment body is missing its exact binding marker")
+        issue = self.view_issue(repository, number)
+        matches = [
+            comment
+            for comment in issue["comments"]
+            if isinstance(comment, dict) and marker in str(comment.get("body") or "")
+        ]
+        if matches:
+            return {"status": "COMMENT_PRESENT", "comment_url": matches[0].get("url")}
+        if require_open and issue.get("state") != "OPEN":
+            raise GhCliPolicyError("issue closed before staging evidence publication")
+        url = self._run(
+            [
+                "issue",
+                "comment",
+                str(number),
+                "--repo",
+                repository,
+                "--body-file",
+                str(bounded_body),
+            ]
+        ).stdout.strip()
+        if not re.fullmatch(r"https://github\.com/[^\s]+#issuecomment-[1-9][0-9]*", url):
+            raise GhCliPolicyError("issue comment returned an invalid URL")
+        return {"status": "COMMENTED", "comment_url": url}
+
+    def close_marked_issue(
+        self,
+        *,
+        repository: str,
+        number: int,
+        marker: str,
+        change_binding: str,
+    ) -> dict[str, Any]:
+        """Close an issue only after its staging-GitOps evidence comment exists."""
+        repository = self._write(repository, change_binding)
+        if number < 1 or not STAGING_GITOPS_MARKER.fullmatch(marker):
+            raise GhCliPolicyError("staging issue closure binding is invalid")
+        issue = self.view_issue(repository, number)
+        if not any(
+            isinstance(comment, dict) and marker in str(comment.get("body") or "")
+            for comment in issue["comments"]
+        ):
+            raise GhCliPolicyError("issue closure requires its staging evidence comment")
+        if issue.get("state") == "OPEN":
+            self._run(
+                ["issue", "close", str(number), "--repo", repository, "--reason", "completed"]
+            )
+            issue = self.view_issue(repository, number)
+        if issue.get("state") != "CLOSED":
             raise GhCliPolicyError("issue closure was not confirmed")
         return {
             "status": "CLOSED",

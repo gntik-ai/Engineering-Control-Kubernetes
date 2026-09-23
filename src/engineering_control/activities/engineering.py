@@ -2017,6 +2017,7 @@ class EngineeringActivityHandler:
             "delivery-reconciliation",
             "staging-deployment",
             "runtime-verification",
+            "staging-gitops",
         }
         if child_kind not in allowed:
             raise ValueError("backlog child run kind is not allowlisted")

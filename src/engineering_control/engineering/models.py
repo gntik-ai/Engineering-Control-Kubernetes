@@ -6,6 +6,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
+from engineering_control.models.reconciliation import StagingFlowPolicy
+
 Slug = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,119}$")]
 GitSHA = Annotated[str, Field(pattern=r"^[a-f0-9]{40}$")]
 Digest = Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
@@ -162,6 +164,45 @@ class ProjectManifest(EngineeringModel):
     deployment_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
     dependencies: dict[str, object] = Field(default_factory=dict)
     classification: dict[str, bool] = Field(default_factory=dict)
+
+    @field_validator("delivery_control")
+    @classmethod
+    def typed_staging_flow(cls, value: dict[str, object]) -> dict[str, object]:
+        raw = value.get("staging_flow")
+        if raw is not None:
+            StagingFlowPolicy.model_validate(raw)
+        return value
+
+    def staging_flow(self) -> StagingFlowPolicy | None:
+        """Return the typed post-merge staging GitOps flow, or None when absent."""
+        raw = self.delivery_control.get("staging_flow")
+        return StagingFlowPolicy.model_validate(raw) if raw is not None else None
+
+    def staging_flow_blockers(self) -> list[str]:
+        """Cross-check an enabled staging flow against the rest of this contract."""
+        flow = self.staging_flow()
+        if flow is None or not flow.enabled:
+            return ["STAGING_FLOW_DISABLED"]
+        blockers: list[str] = []
+        deployment = self.deployment
+        if deployment.strategy != "argocd":
+            blockers.append("STAGING_FLOW_REQUIRES_ARGOCD_STRATEGY")
+        if deployment.argocd_application != flow.argo_application:
+            blockers.append("STAGING_FLOW_ARGO_APPLICATION_MISMATCH")
+        if flow.deploy_repository != self.repositories.deployment.full_name:
+            blockers.append("STAGING_FLOW_DEPLOY_REPOSITORY_MISMATCH")
+        if not set(flow.namespaces) <= set(deployment.namespaces):
+            blockers.append("STAGING_FLOW_NAMESPACE_OUTSIDE_PROJECT")
+        if not set(flow.image_repositories) <= set(deployment.image_repositories.values()):
+            blockers.append("STAGING_FLOW_IMAGE_REPOSITORY_OUTSIDE_PROJECT")
+        if flow.chart_source_repository is not None and flow.chart_source_repository not in {
+            str(self.repositories.source.url),
+            str(self.repositories.deployment.url),
+        }:
+            blockers.append("STAGING_FLOW_CHART_REPOSITORY_OUTSIDE_PROJECT")
+        if flow.main_ci_workflow is None and flow.image_workflow is None:
+            blockers.append("STAGING_FLOW_IMAGE_BUILD_WORKFLOW_MISSING")
+        return blockers
 
     @field_validator("source_test_commands", "deployment_test_commands")
     @classmethod

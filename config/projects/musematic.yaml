@@ -97,3 +97,33 @@ delivery_control:
       sandbox-manager: images.sandboxManager.digest
       simulation-controller: images.simulationController.digest
     blocker: MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED
+  staging_flow:
+    enabled: true
+    kind: argocd-image-updater
+    argo_application: musematic-platform
+    argo_namespace: argocd
+    namespaces: [musematic-platform, platform-data]
+    source_ci_workflow: CI
+    # main CI is intentionally unset: it does not publish images (deploy.yml does).
+    main_ci_workflow: null
+    image_workflow: deploy.yml
+    release_tag:
+      enabled: true
+      prefix: v
+      bump: patch
+    deploy_repository: gntik-ai/musematic-deploy
+    deploy_values_file: apps/musematic-platform/values.override.yaml
+    deploy_branch: main
+    image_repositories:
+      - ghcr.io/gntik-ai/musematic/control-plane
+      - ghcr.io/gntik-ai/musematic/runtime-controller
+      - ghcr.io/gntik-ai/musematic/reasoning-engine
+      - ghcr.io/gntik-ai/musematic/simulation-controller
+      - ghcr.io/gntik-ai/musematic/sandbox-manager
+      - ghcr.io/gntik-ai/musematic/web
+    tag_prefix: sha-
+    tag_length: 7
+    chart_source_repository: https://github.com/gntik-ai/musematic.git
+    pin_chart_to_merge: true
+    external_secrets_namespace: external-secrets
+    external_secrets_deployment: external-secrets

@@ -17,6 +17,7 @@ from .connections import ConnectionsActivityHandler
 from .delivery import DeliveryActivityHandler
 from .engineering import EngineeringActivityHandler
 from .github import GitHubActivityHandler
+from .gitops import GITOPS_GITHUB_STEPS, GitOpsControllerHandler
 from .metadata import MetadataActivityHandler
 from .preview_cleanup import PreviewCleanupActivityHandler
 from .provider import ProviderActivityHandler
@@ -219,6 +220,23 @@ class ControlActivities:
         "observability.invoke_codex_checker",
         "observability.finalize",
         "observability.cleanup_workspace",
+        # Post-merge staging GitOps flow: controller (DB + kubectl) steps ...
+        "gitops.flow_for_project",
+        "gitops.prepare",
+        "gitops.environment_check",
+        "gitops.remediate",
+        "gitops.trigger_sync",
+        "gitops.sync_status",
+        "gitops.verify_workloads",
+        "gitops.persist_result",
+        # ... and GitHub-worker steps (GitOpsGitHubHandler via GitHubActivityHandler).
+        "gitops.pr_checks",
+        "gitops.merge",
+        "gitops.release_tag",
+        "gitops.workflow_run",
+        "gitops.image_pin",
+        "gitops.environment_issue",
+        "gitops.close_issue",
     }
     _mutation_steps = {
         "preview.deploy",
@@ -310,7 +328,8 @@ class ControlActivities:
             "observability.invoke_claude_maker",
             "observability.invoke_codex_checker",
             "observability.cleanup_workspace",
-        },
+        }
+        - GITOPS_GITHUB_STEPS,
         "scan": {
             "project.snapshot",
             "project.snapshot_pair",
@@ -396,6 +415,7 @@ class ControlActivities:
             "enhancement.publish",
             "enhancement.github_dedupe",
             "finding.publish",
+            *GITOPS_GITHUB_STEPS,
         },
         "release": {
             "preview.preflight",
@@ -461,6 +481,9 @@ class ControlActivities:
         )
         self.connections_handler = (
             ConnectionsActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
+        self.gitops_handler = (
+            GitOpsControllerHandler(settings) if self.worker_kind == "controller" else None
         )
 
     @activity.defn(name="execute_control_step")
@@ -539,6 +562,8 @@ class ControlActivities:
             return await self.connections_handler.handle(step, safe_payload)
         if self.provider_handler is not None:
             return await self.provider_handler.handle(step, safe_payload)
+        if self.gitops_handler is not None and step in self.gitops_handler.supported_steps:
+            return await self.gitops_handler.handle(step, safe_payload)
         if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:
             return await self.metadata_handler.handle(step, safe_payload)
         if (

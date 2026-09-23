@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     claude_executable: Path = Path("/usr/local/bin/claude")
     helm_executable: Path = Path("/usr/local/bin/helm")
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")
+    staging_kubeconfig_path: Path = Path("/etc/engineering-control/credentials/staging/kubeconfig")
     argocd_executable: Path = Path("/usr/local/bin/argocd")
     release_credential_root: Path = Path("/etc/engineering-control/env/release")
     observer_credential_root: Path = Path("/etc/engineering-control/credentials")
