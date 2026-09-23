@@ -57,8 +57,7 @@ with Session(engine) as session:
         select(AgentExecution)
         .where(AgentExecution.workflow_id.contains(MARKER))
         .where(AgentExecution.role == "maker")
-        .order_by(AgentExecution.started_at.desc())
-        .limit(1)
+        .where(AgentExecution.workflow_id.endswith("-issue-1-retry-3-attempt-1"))
     ).all()
     for execution in executions:
         print(f"== {execution.workflow_id[-60:]} status={execution.status} "
