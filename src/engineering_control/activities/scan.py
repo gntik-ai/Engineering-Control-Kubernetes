@@ -1508,8 +1508,24 @@ class ScanActivityHandler:
             UUID(str(payload["change_set_id"])) if payload.get("change_set_id") else None
         )
         receipts: list[dict[str, Any]] = []
+        redactor = SecretRedactor()
         for report in reports:
-            content_type = "application/json" if report.suffix == ".json" else "text/plain"
+            # Scanner output (trivy "Secrets", semgrep matched lines, SBOM fields) is not
+            # pre-redacted; the ingest service rejects any evidence it would still redact.
+            text = report.read_text(encoding="utf-8", errors="replace")
+            content_type = "text/plain"
+            if report.suffix == ".json":
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    safe = str(redactor.redact_text(text).value)
+                else:
+                    content_type = "application/json"
+                    safe = json.dumps(redactor.redact(parsed).value, indent=2, sort_keys=True)
+            else:
+                safe = str(redactor.redact_text(text).value)
+            if safe != text:
+                self._atomic_text(report, safe)
             receipt = self.publisher.publish(
                 report,
                 project=project,

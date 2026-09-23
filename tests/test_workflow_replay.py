@@ -97,7 +97,9 @@ def _scripted_execute_control_step_with_failure(
     return execute_control_step
 
 
-async def _run_to_history(workflow_cls: type, run_arg: Any, activity_fn: Any) -> Any:
+async def _run_to_history(
+    workflow_cls: type, run_arg: Any, activity_fn: Any, *, child_workflows: tuple[type, ...] = ()
+) -> Any:
     # FinalClosureWorkflow's GitHub-write steps (final.merge_source,
     # final.inspect_artifact, ...) dispatch to GITHUB_TASK_QUEUE rather than
     # the default CONTROL_TASK_QUEUE, and FindingVerificationWorkflow's
@@ -111,31 +113,31 @@ async def _run_to_history(workflow_cls: type, run_arg: Any, activity_fn: Any) ->
             Worker(
                 env.client,
                 task_queue=CONTROL_TASK_QUEUE,
-                workflows=[workflow_cls],
+                workflows=[workflow_cls, *child_workflows],
                 activities=[activity_fn],
             ),
             Worker(
                 env.client,
                 task_queue=GITHUB_TASK_QUEUE,
-                workflows=[workflow_cls],
+                workflows=[workflow_cls, *child_workflows],
                 activities=[activity_fn],
             ),
             Worker(
                 env.client,
                 task_queue=ROLE_TASK_QUEUES["claude"],
-                workflows=[workflow_cls],
+                workflows=[workflow_cls, *child_workflows],
                 activities=[activity_fn],
             ),
             Worker(
                 env.client,
                 task_queue=ROLE_TASK_QUEUES["codex"],
-                workflows=[workflow_cls],
+                workflows=[workflow_cls, *child_workflows],
                 activities=[activity_fn],
             ),
             Worker(
                 env.client,
                 task_queue=ROLE_TASK_QUEUES["scan"],
-                workflows=[workflow_cls],
+                workflows=[workflow_cls, *child_workflows],
                 activities=[activity_fn],
             ),
         ):
@@ -357,3 +359,57 @@ async def test_finding_verification_workflow_blocks_gracefully_when_controls_cra
     assert any(b"record_terminal" in payload for payload in recorded_payloads)
 
     await Replayer(workflows=[FindingVerificationWorkflow]).replay_workflow(history)
+
+
+async def test_existing_backlog_loop_continues_when_a_delivery_child_crashes() -> None:
+    """Regression test for a real production incident (2026-09-23, NEW-24): the
+    first delivery ever started (musematic #1025, campaign 11e90233) failed in
+    delivery.deterministic_prechecks (NEW-23's evidence-ingest 422). The
+    IssueDeliveryWorkflow child released its leases and re-raised, and the
+    ChildWorkflowError propagated uncaught out of the backlog loop -- the fourth
+    instance of the NEW-16/NEW-20/NEW-21 gap -- failing the whole campaign
+    instead of blocking one issue.
+
+    Fixed by converting the child failure into the loop's existing FAILED
+    delivery result (blocker DELIVERY_CHILD_WORKFLOW_FAILED), so
+    continue_after_blocked_issue applies. This test makes the delivery child
+    crash and asserts the loop finishes with that blocker recorded.
+    """
+    activity_fn = _scripted_execute_control_step_with_failure(
+        {
+            "backlog.load_execution": {
+                "status": "READY",
+                "items": [{"repository": "gntik-ai/musematic", "issue_number": 1025}],
+            },
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.revalidate_gate": {
+                "status": "READY",
+                "finding_id": "finding-1",
+                "risk_class": "R1",
+            },
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "delivery.release_leases": {"status": "LEASES_RELEASED"},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+        },
+        fails_on="delivery.load_confirmed_finding",
+    )
+    run_arg = ExistingGitHubBacklogLoopInput(
+        project="musematic",
+        backlog_campaign_id="camp-1",
+        maximum_risk="R1",
+        delivery_mode="source-pr",
+    )
+    history, result = await _run_to_history(
+        ExistingGitHubBacklogLoopWorkflow,
+        run_arg,
+        activity_fn,
+        child_workflows=(IssueDeliveryWorkflow,),
+    )
+    assert result is not None, "the backlog loop crashed on a failed delivery child"
+    assert {"status": "FAILED", "blocker": "DELIVERY_CHILD_WORKFLOW_FAILED", "attempt": 1} in (
+        result["results"]
+    )
+
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
+    ).replay_workflow(history)

@@ -111,6 +111,32 @@ echo "approval_binding=$approval_binding"
 echo "== 4/5 backlog-approve =="
 "$CTL" backlog-approve "$PROJECT" "$campaign_id" "$approval_binding" APPROVE_EXISTING_GITHUB_BACKLOG_LOOP | jq .
 
+echo "== waiting for the policy reconciler to move the campaign to APPROVED =="
+# backlog-start also accepts APPROVED_POLICY_PENDING and flips it to RUNNING,
+# after which the reconciler rejects the request ("campaign state is invalid")
+# and the GitHub write policy is never enabled -- so never start before this.
+campaign_status() {
+  /opt/engineering-control/venv/bin/python -c "
+from engineering_control.cli import APIClient, parser
+a = parser().parse_args(['campaigns'])
+print(APIClient(a.api_url, a.token_file).request('GET', '/v1/backlogs/$1').get('status'))"
+}
+elapsed=0
+while true; do
+  cstatus=$(campaign_status "$campaign_id")
+  echo "  campaign status: $cstatus (${elapsed}s elapsed)"
+  if [[ "$cstatus" == "APPROVED" || "$cstatus" == "APPROVED_INVENTORY" ]]; then
+    break
+  fi
+  if (( elapsed >= 60 )); then
+    echo "Campaign still $cstatus after 60s: engineering-github-policy-reconciler did not" >&2
+    echo "process activate.json. Check: systemctl is-failed engineering-github-policy-reconciler.service" >&2
+    exit 1
+  fi
+  sleep 5
+  elapsed=$((elapsed + 5))
+done
+
 echo "== proactively refreshing quota snapshot before backlog-start (fix for NEW-17 / CLAUDE_HEALTH_STALE) =="
 temporal schedule trigger --address 127.0.0.1:7233 --namespace engineering-control --schedule-id engineering-quota-refresh
 sleep 8

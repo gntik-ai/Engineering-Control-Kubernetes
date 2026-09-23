@@ -290,3 +290,77 @@ def test_publisher_rejects_public_ingest_origin(tmp_path: Path) -> None:
         assert "public" in str(error)
     else:
         raise AssertionError("public evidence origin was accepted")
+
+
+def test_scan_reports_pass_the_real_ingest_redaction_check(tmp_path: Path) -> None:
+    # NEW-23: delivery prechecks uploaded raw scanner reports asserting REDACTED, and the
+    # ingest service's central re-redaction answered 422, failing the first live delivery.
+    # Also covers redaction idempotency: already-redacted "password: [REDACTED]" text
+    # used to be re-matched and rejected even after correct pre-redaction.
+    from engineering_control.activities.scan import ScanActivityHandler
+
+    workflow_id = "backlog-loop-falcone-prechecks"
+    campaign_id = uuid4()
+    repository = FakeEvidenceRepository(workflow_id, uuid4(), campaign_id)
+    evidence_root = tmp_path / "evidence"
+    reports = evidence_root / "scan" / "prechecks"
+    reports.mkdir(parents=True)
+    trivy = reports / "trivy.json"
+    trivy.write_text(
+        json.dumps(
+            {
+                "Results": [
+                    {
+                        "Class": "secret",
+                        "Secrets": [{"RuleID": "generic", "Match": "password: hunter2"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    semgrep = reports / "semgrep.txt"
+    semgrep.write_text("config.yaml:3\n  password: hunter2  # fixture\n", encoding="utf-8")
+    already = reports / "already-redacted.txt"
+    already.write_text("password: [REDACTED]\nCookie: [REDACTED]\n", encoding="utf-8")
+    token_file = tmp_path / "evidence.token"
+    token_file.write_text("e" * 48, encoding="utf-8")
+    os.chmod(token_file, 0o640)
+    app = create_evidence_ingest_app(
+        settings=Settings(evidence_root=tmp_path / "stored"),
+        repository=repository,  # type: ignore[arg-type]
+        tokens={"scan-runner": "e" * 48},
+    )
+
+    with TestClient(app) as client:
+
+        def forward(request: httpx.Request) -> httpx.Response:
+            response = client.post(
+                "/v1/evidence", headers=dict(request.headers), content=request.content
+            )
+            return httpx.Response(response.status_code, content=response.content)
+
+        settings = Settings(
+            evidence_root=evidence_root,
+            evidence_ingest_url="http://10.10.0.2:8750/v1/evidence",
+            evidence_ingest_token_file=token_file,
+        )
+        handler = ScanActivityHandler(
+            settings,
+            publisher=EvidencePublisher(settings, evidence_root, httpx.MockTransport(forward)),
+        )
+        receipts = handler._publish_reports(
+            {
+                "project": "falcone",
+                "campaign_id": str(campaign_id),
+                "orchestration": {"workflow_id": workflow_id},
+            },
+            [already, semgrep, trivy],
+            filename_prefix="prechecks-source",
+        )
+
+    assert len(receipts) == 3
+    assert len(repository.persisted) == 3
+    stored = "".join(path.read_text() for path in (tmp_path / "stored").rglob("*.*"))
+    assert "hunter2" not in stored
+    assert "# fixture" in stored

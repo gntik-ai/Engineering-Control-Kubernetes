@@ -2144,17 +2144,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                 "finding_id": str(gate["finding_id"]),
                             },
                         )
-                    delivery = await workflow.execute_child_workflow(
-                        "IssueDeliveryWorkflow",
-                        IssueDeliveryInput(
-                            finding_id=str(gate["finding_id"]),
-                            risk_class=str(gate["risk_class"]),
-                            dry_run=False,
-                        ),
-                        id=delivery_workflow_id,
-                        task_queue=workflow.info().task_queue,
-                        execution_timeout=timedelta(hours=12),
-                    )
+                    delivery = await self._issue_delivery(gate, delivery_workflow_id)
                     results.append({**delivery, "attempt": attempt})
                     if delivery.get("status") != "REQUEST_CHANGES":
                         break
@@ -2170,17 +2160,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             "finding_id": str(gate["finding_id"]),
                         },
                     )
-                delivery = await workflow.execute_child_workflow(
-                    "IssueDeliveryWorkflow",
-                    IssueDeliveryInput(
-                        finding_id=str(gate["finding_id"]),
-                        risk_class=str(gate["risk_class"]),
-                        dry_run=False,
-                    ),
-                    id=delivery_workflow_id,
-                    task_queue=workflow.info().task_queue,
-                    execution_timeout=timedelta(hours=12),
-                )
+                delivery = await self._issue_delivery(gate, delivery_workflow_id)
                 results.append(delivery)
             if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
                 blocker = str(delivery.get("blocker") or delivery.get("status"))
@@ -2508,6 +2488,26 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             {**asdict(request), "loop_status": "CANCELLED"},
         )
         return {"status": "CANCELLED", "results": results}
+
+    @staticmethod
+    async def _issue_delivery(gate: dict[str, Any], delivery_workflow_id: str) -> dict[str, Any]:
+        # A failed delivery child (e.g. NEW-23's evidence 422) must block its one issue
+        # through the normal FAILED path below, not crash the whole backlog loop.
+        try:
+            result: dict[str, Any] = await workflow.execute_child_workflow(
+                "IssueDeliveryWorkflow",
+                IssueDeliveryInput(
+                    finding_id=str(gate["finding_id"]),
+                    risk_class=str(gate["risk_class"]),
+                    dry_run=False,
+                ),
+                id=delivery_workflow_id,
+                task_queue=workflow.info().task_queue,
+                execution_timeout=timedelta(hours=12),
+            )
+        except ChildWorkflowError:
+            return {"status": "FAILED", "blocker": "DELIVERY_CHILD_WORKFLOW_FAILED"}
+        return result
 
     @staticmethod
     def _requires_operator_pause(blocker: str) -> bool:
