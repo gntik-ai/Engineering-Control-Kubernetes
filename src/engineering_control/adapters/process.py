@@ -59,6 +59,12 @@ def subscription_only_environment(
         env.pop(key, None)
     env["ENGINEERING_PROVIDER"] = provider
     env["NO_COLOR"] = "1"
+    # NEW-45: makers/checkers run the project's tests in shared worktrees. pytest
+    # creates .pytest_cache through a 0700 temp directory, so the scan worker's next
+    # `git clean` of that worktree failed with "Permission denied". No cache, no
+    # bytecode: nothing an agent's test run leaves behind is unremovable.
+    env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     if overrides:
         disallowed = forbidden.intersection(overrides)
         if disallowed:

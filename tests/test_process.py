@@ -156,3 +156,11 @@ async def test_jsonl_process_accepts_bounded_result_larger_than_asyncio_default_
 
     assert result.exit_code == 0
     assert result.events == ({"type": "result", "value": value},)
+
+
+def test_agent_environment_leaves_no_unremovable_test_caches() -> None:
+    """NEW-45: pytest's 0700 .pytest_cache blocked the scan worker's worktree clean."""
+    for provider in ("codex", "claude"):
+        environment = subscription_only_environment(provider)
+        assert environment["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+        assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
