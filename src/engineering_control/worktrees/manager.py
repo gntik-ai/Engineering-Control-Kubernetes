@@ -227,6 +227,13 @@ class GitWorktreeManager:
                     f"got {actual}"
                 )
             metadata = self._ensure_metadata_mirror(repository, change_set_id, mirror)
+            # NEW-40: a maker could implement and stage a change yet fail to commit
+            # ("Git has no configured author identity"). Give the ChangeSet's repository
+            # the same identity the platform uses for its own commits.
+            self._run(["git", "config", "user.name", "Engineering Control"], metadata)
+            self._run(
+                ["git", "config", "user.email", "engineering-control@local.invalid"], metadata
+            )
             repo_slug = self._slug(repository)
             target = self.worktree_root / repo_slug / str(change_set_id)
             branch = f"agent/{self._slug(project)}/{self._slug(issue)}/{str(change_set_id)}"

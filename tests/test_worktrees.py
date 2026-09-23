@@ -1,4 +1,5 @@
 import hashlib
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -406,3 +407,33 @@ def test_manager_keeps_access_to_what_the_maker_creates(tmp_path: Path) -> None:
         acls = [command for command in commands if command[-1] == str(path)]
         assert any(f"u:{me}:rwX" in argument for command in acls for argument in command)
         assert any(f"d:u:{me}:rwx" in argument for command in acls for argument in command)
+
+
+def test_allocated_worktree_has_a_commit_identity(tmp_path: Path) -> None:
+    # NEW-40: musematic #993's corrected implementation was staged but the maker could
+    # not commit it -- "Git has no configured author identity".
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    allocation = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="993",
+        change_set_id=uuid4(),
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    (allocation.path / "feature.txt").write_text("x\n", encoding="utf-8")
+    git(["add", "feature.txt"], allocation.path)
+    subprocess.run(  # noqa: S603 - fixed executable and test-controlled arguments
+        [GIT, "commit", "-q", "-m", "maker"],
+        cwd=allocation.path,
+        check=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path / "empty-home")},
+    )
+    assert git(["log", "-1", "--format=%an <%ae>"], allocation.path) == (
+        "Engineering Control <engineering-control@local.invalid>"
+    )
