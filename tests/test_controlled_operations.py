@@ -2003,3 +2003,72 @@ def test_operator_pause_classification_is_fail_closed_for_high_impact_blockers()
     assert required("SECRET_LIFECYCLE_UNRESOLVED")
     assert required("EXTERNAL_REVISION_DRIFT")
     assert not required("INDEPENDENT_TEST_FAILURE")
+
+
+@pytest.mark.asyncio
+async def test_solve_waits_for_the_policy_reconciler_before_starting(tmp_path: Path) -> None:
+    # NEW-26: solve_backlog/solve_issue approved and started in one call; the loop moved
+    # the campaign to RUNNING within milliseconds, so the root reconciler rejected the
+    # queued request ("campaign state is invalid") and the write policy stayed disabled.
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    order: list[str] = []
+    control = Mock()
+
+    async def start(_: object) -> OperationAccepted:
+        order.append("start")
+        return OperationAccepted(workflow_id="backlog-loop-synthetic", run_id="run-1")
+
+    async def campaign(_: object) -> dict[str, str]:
+        order.append("poll")
+        return {"status": "APPROVED" if order.count("poll") >= 2 else "APPROVED_POLICY_PENDING"}
+
+    control.start_existing_backlog_loop = AsyncMock(side_effect=start)
+    metadata = Mock()
+    metadata.prepare_backlog_approval = AsyncMock(return_value={"approval_binding": "f" * 64})
+    metadata.approve_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING"}
+    )
+    metadata.get_backlog_campaign = AsyncMock(side_effect=campaign)
+    bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
+    bus.policy_activation_poll_seconds = 0
+
+    view = await bus.submit(
+        _solve_issue(),
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("cli", 1),
+    )
+
+    assert view.workflow_id == "backlog-loop-synthetic"
+    assert order == ["poll", "poll", "start"]
+
+
+@pytest.mark.asyncio
+async def test_solve_blocks_instead_of_starting_without_an_active_write_policy(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    control = Mock()
+    control.start_existing_backlog_loop = AsyncMock()
+    metadata = Mock()
+    metadata.prepare_backlog_approval = AsyncMock(return_value={"approval_binding": "f" * 64})
+    metadata.approve_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING"}
+    )
+    metadata.get_backlog_campaign = AsyncMock(return_value={"status": "APPROVED_POLICY_PENDING"})
+    bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
+    bus.policy_activation_timeout_seconds = 0
+    bus.policy_activation_poll_seconds = 0
+
+    view = await bus.submit(
+        _solve_issue(),
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("cli", 1),
+    )
+
+    assert view.status == "BLOCKED"
+    assert "policy activation did not complete" in str(view.safe_error)
+    control.start_existing_backlog_loop.assert_not_awaited()

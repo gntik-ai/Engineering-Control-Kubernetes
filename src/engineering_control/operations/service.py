@@ -148,6 +148,31 @@ class TypedCommandBus:
                     workflow_id=accepted.workflow_id,
                 )
 
+    policy_activation_timeout_seconds = 60.0
+    policy_activation_poll_seconds = 2.0
+
+    async def _await_policy_activation(self, campaign_id: UUID, approval: dict[str, Any]) -> None:
+        # Starting moves the campaign to RUNNING at once, after which the root policy
+        # reconciler rejects the queued request and the GitHub write policy is never
+        # enabled (NEW-26). Start only once the reconciler has promoted the campaign.
+        if approval.get("status") != "APPROVED_POLICY_PENDING":
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.policy_activation_timeout_seconds
+        while True:
+            campaign = await self.metadata.get_backlog_campaign(campaign_id)
+            if campaign is not None and campaign.get("status") in {
+                "APPROVED",
+                "APPROVED_INVENTORY",
+            }:
+                return
+            if loop.time() >= deadline:
+                raise ValueError(
+                    "GitHub write policy activation did not complete; check "
+                    "engineering-github-policy-reconciler before starting"
+                )
+            await asyncio.sleep(self.policy_activation_poll_seconds)
+
     async def _execute(
         self,
         command: Command,
@@ -169,12 +194,13 @@ class TypedCommandBus:
                     maximum_items=1,
                 ),
             )
-            await self.metadata.approve_backlog_campaign(
+            approval = await self.metadata.approve_backlog_campaign(
                 command.backlog_campaign_id,
                 command.project.value,
                 str(candidate["approval_binding"]),
                 self._approval_actor(operator_class),
             )
+            await self._await_policy_activation(command.backlog_campaign_id, approval)
             return await self.control.start_existing_backlog_loop(
                 ExistingBacklogLoopStart(
                     project=command.project.value,
@@ -198,12 +224,13 @@ class TypedCommandBus:
                     maximum_items=command.maximum_items,
                 ),
             )
-            await self.metadata.approve_backlog_campaign(
+            approval = await self.metadata.approve_backlog_campaign(
                 command.backlog_campaign_id,
                 command.project,
                 str(candidate["approval_binding"]),
                 self._approval_actor(operator_class),
             )
+            await self._await_policy_activation(command.backlog_campaign_id, approval)
             return await self.control.start_existing_backlog_loop(
                 ExistingBacklogLoopStart(
                     project=command.project,
