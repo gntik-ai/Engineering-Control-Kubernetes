@@ -891,3 +891,94 @@ async def test_pre_toolchain_issue_delivery_history_replays_without_the_new_step
     assert steps[prechecks + 1] == "delivery.prepare_spec"
     assert not any(event.HasField("marker_recorded_event_attributes") for event in history.events)
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+_REFRESHED_BODY = "Issue body\n\n## Operator decisions\n\n- JSON only; 5 MB; 20/hour"
+
+
+async def test_issue_delivery_refreshes_an_existing_issue_body_and_replays() -> None:
+    """NEW-44: decisions added to an existing issue after backlog import reach the
+    spec/maker, because delivery re-reads the body right after ensure_issue."""
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "existing-github-issue",
+            "issue_repository": "gntik-ai/musematic",
+            "issue_number": 993,
+            "actual_behavior": "Issue body",
+        },
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_REFRESHED",
+            "body_excerpt": _REFRESHED_BODY,
+            "body_sha256": "0" * 64,
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "BLOCKED"
+    requests = _scheduled_steps(history)
+    steps = [request["step"] for request in requests]
+    ensure = steps.index("delivery.ensure_issue")
+    assert steps[ensure + 1 : ensure + 3] == [
+        "delivery.refresh_issue_body",
+        "delivery.acquire_leases",
+    ]
+    refresh = requests[ensure + 1]["payload"]
+    assert refresh == {"issue_repository": "gntik-ai/musematic", "issue_number": 993}
+    assert requests[ensure + 2]["payload"]["actual_behavior"] == _REFRESHED_BODY
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_issue_delivery_keeps_the_imported_body_when_the_refresh_fails() -> None:
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "existing-github-issue",
+            "issue_repository": "gntik-ai/musematic",
+            "issue_number": 993,
+            "actual_behavior": "Issue body",
+        },
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_UNAVAILABLE",
+            "reason": "CommandFailure",
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, _ = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    requests = _scheduled_steps(history)
+    leases = next(r for r in requests if r["step"] == "delivery.acquire_leases")
+    assert leases["payload"]["actual_behavior"] == "Issue body"
+    assert leases["payload"]["status"] == "ISSUE_READY"
+
+
+async def test_issue_delivery_does_not_refresh_findings_without_an_existing_issue() -> None:
+    """Hermes-discovered findings own their body; only imported backlog issues refresh."""
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "api-consumer",
+            "issue_repository": "gntik-ai/musematic",
+            "issue_number": 12,
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, _ = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert "delivery.refresh_issue_body" not in _scheduled_step_names(history)

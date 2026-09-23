@@ -21,6 +21,7 @@ READ_ONLY_GITHUB_STEPS = frozenset(
         "finding.dedupe",
         "github.refresh_mirrors",
         "backlog.github_import",
+        "delivery.refresh_issue_body",
         "llmwiki.bootstrap.plan",
         "reconcile.inspect_ci",
         "final.inspect_artifact",

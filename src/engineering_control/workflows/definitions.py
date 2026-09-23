@@ -278,7 +278,11 @@ class ControlledWorkflow:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.plan":
             return GITHUB_TASK_QUEUE
-        if step in {"github.refresh_mirrors", "backlog.github_import"}:
+        if step in {
+            "github.refresh_mirrors",
+            "backlog.github_import",
+            "delivery.refresh_issue_body",
+        }:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.execute":
             return task_queue_for("release")
@@ -958,6 +962,8 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                         context = await self._step(step, step_payload, timeout_minutes=90)
                     else:
                         context = await self._step(step, step_payload, timeout_minutes=30)
+                if step == "delivery.ensure_issue" and context.get("status") == "ISSUE_READY":
+                    context = await self._refresh_issue_body(context)
                 if (
                     context.get("status")
                     in {
@@ -991,6 +997,30 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             # at the same issue for the rest of the lease's 4h TTL.
             await self._release_delivery_leases_best_effort(context)
             raise
+
+    async def _refresh_issue_body(self, context: dict[str, Any]) -> dict[str, Any]:
+        # NEW-44: the Finding copied an existing backlog issue's body once at import,
+        # so decisions the operator later adds to the issue never reached the
+        # spec/maker. Re-read it here; only actual_behavior is taken from the result,
+        # and any failure keeps the imported copy. Histories recorded before this
+        # step existed carry no marker and replay without it.
+        if context.get("persona") != "existing-github-issue" or not context.get("issue_number"):
+            return context
+        if not workflow.patched("delivery-refresh-issue-body-v1"):
+            return context
+        refreshed = await self._step(
+            "delivery.refresh_issue_body",
+            {
+                "issue_repository": context.get("issue_repository"),
+                "issue_number": context.get("issue_number"),
+            },
+        )
+        body = refreshed.get("body_excerpt")
+        if refreshed.get("status") != "ISSUE_BODY_REFRESHED" or not isinstance(body, str):
+            return context
+        if not body:
+            return context
+        return {**context, "actual_behavior": body}
 
     def _prepare_toolchain_patched(self) -> bool:
         return workflow.patched("delivery-prepare-toolchain-v1")

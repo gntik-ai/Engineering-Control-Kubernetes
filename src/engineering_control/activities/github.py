@@ -7,8 +7,12 @@ from typing import Any, Literal, cast
 
 from temporalio.exceptions import ApplicationError
 
-from engineering_control.adapters.command import SafeCommandRunner
-from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker
+from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
+from engineering_control.adapters.github.client import (
+    GhCliAuthError,
+    GhCliBroker,
+    GhCliPolicyError,
+)
 from engineering_control.adapters.llmwiki import LLMWikiBootstrapPlanner
 from engineering_control.config import Settings
 from engineering_control.engineering.backlog import (
@@ -18,15 +22,27 @@ from engineering_control.engineering.backlog import (
     GitHubPullRequestSnapshot,
     GitHubRepositoryBacklogSnapshot,
 )
+from engineering_control.security.redaction import SecretRedactor
 
 from .gitops import GitOpsGitHubHandler
+
+# The backlog import keeps 4000 chars; operator decisions are usually appended at the
+# end of the body, so the refresh keeps more (Finding.actual_behavior allows 20000).
+ISSUE_BODY_REFRESH_LIMIT = 8000
 
 
 class GitHubActivityHandler:
     """Run only typed gh broker activities under the authenticated broker identity."""
 
     supported_steps = (
-        frozenset({"llmwiki.bootstrap.plan", "github.refresh_mirrors", "backlog.github_import"})
+        frozenset(
+            {
+                "llmwiki.bootstrap.plan",
+                "github.refresh_mirrors",
+                "backlog.github_import",
+                "delivery.refresh_issue_body",
+            }
+        )
         | GitOpsGitHubHandler.supported_steps
     )
 
@@ -53,6 +69,8 @@ class GitHubActivityHandler:
             return await asyncio.to_thread(self._import_backlog, payload)
         if step == "github.refresh_mirrors":
             return await asyncio.to_thread(self._refresh_mirrors, payload)
+        if step == "delivery.refresh_issue_body":
+            return await asyncio.to_thread(self._refresh_issue_body, payload)
         if step != "llmwiki.bootstrap.plan":
             raise ApplicationError("unsupported GitHub broker activity", non_retryable=True)
         if payload.get("project") != "llmwiki" or payload.get("environment") != "staging":
@@ -62,6 +80,32 @@ class GitHubActivityHandler:
                 non_retryable=True,
             )
         return await asyncio.to_thread(self._plan_llmwiki_bootstrap, payload)
+
+    def _refresh_issue_body(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-44: re-read an existing backlog issue's body at delivery start.
+
+        The Finding copies the body once at backlog import, so decisions an operator
+        adds to the issue later never reached the spec/maker. Read-only; any failure
+        leaves the imported copy in place.
+        """
+        repository = str(payload.get("issue_repository") or "")
+        number = payload.get("issue_number")
+        if not repository or not isinstance(number, int):
+            return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": "ISSUE_BINDING_MISSING"}
+        try:
+            value = self.broker.view_issue_body(repository, number)
+        except (GhCliAuthError, GhCliPolicyError, CommandFailure, OSError, ValueError) as error:
+            return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": type(error).__name__}
+        body = str(SecretRedactor().redact_text(str(value["body"])).value).strip()
+        if not body:
+            return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": "ISSUE_BODY_EMPTY"}
+        excerpt = body[:ISSUE_BODY_REFRESH_LIMIT]
+        return {
+            "status": "ISSUE_BODY_REFRESHED",
+            "body_excerpt": excerpt,
+            "body_sha256": hashlib.sha256(excerpt.encode()).hexdigest(),
+            "issue_state": str(value.get("state") or "")[:20],
+        }
 
     def _refresh_mirrors(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = payload.get("project")

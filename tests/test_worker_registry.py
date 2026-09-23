@@ -30,6 +30,7 @@ GITHUB_STEPS = frozenset(
         "llmwiki.bootstrap.plan",
         "github.refresh_mirrors",
         "backlog.github_import",
+        "delivery.refresh_issue_body",
         "finding.dedupe",
         "delivery.publish",
         "reconcile.inspect_ci",

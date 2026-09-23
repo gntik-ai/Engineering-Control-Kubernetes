@@ -245,6 +245,21 @@ class GhCliBroker:
             raise GhCliPolicyError("issue comments response is unbounded")
         return value
 
+    def view_issue_body(self, repository: str, number: int) -> dict[str, Any]:
+        """Read one issue's current state and body (read-only)."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("issue number is invalid")
+        value = self._json(
+            self._run(
+                ["issue", "view", str(number), "--repo", repository, "--json", "number,state,body"]
+            ).stdout,
+            "issue",
+        )
+        if not isinstance(value, dict) or not isinstance(value.get("body"), str):
+            raise GhCliPolicyError("issue body response is invalid")
+        return value
+
     def list_workflow_runs(
         self,
         repository: str,
