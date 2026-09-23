@@ -641,8 +641,9 @@ async def test_r3_issue_candidate_is_generalized_across_all_three_projects(
 
     falcone = await repository.r3_issue_candidate("falcone", "source", 953)
     assert falcone["candidate"]["delivery_adapter"].startswith("helm:")
-    assert "helm-release-deployed-with-approved-image-digests" in (
-        falcone["candidate"]["verification"]
+    assert (
+        "helm-release-deployed-with-approved-image-digests"
+        in (falcone["candidate"]["verification"])
     )
     assert falcone["candidate"]["rollback"] == (
         "helm-rollback-to-prior-revision-and-verify-exact-manifest-restored"
@@ -1241,7 +1242,8 @@ async def test_state_dependent_workflow_controls_use_only_typed_signals(
             operator_class="engineering-ctl:hermes",
             idempotency_key=_idempotency_fixture("control", ordinal),
         )
-        assert result.status == "STARTED"
+        # NEW-35: a delivered control signal is complete; it started no workflow.
+        assert result.status == "COMPLETED"
         assert result.workflow_id == workflow_id
     assert control.signal.await_count == 7
     signals = [call.args for call in control.signal.await_args_list]
@@ -2072,3 +2074,52 @@ async def test_solve_blocks_instead_of_starting_without_an_active_write_policy(
     assert view.status == "BLOCKED"
     assert "policy activation did not complete" in str(view.safe_error)
     control.start_existing_backlog_loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_paused_loop_can_be_retried_more_than_once(tmp_path: Path) -> None:
+    # NEW-35: the first backlog-retry of the paused musematic #1026 loop stayed STARTED
+    # against that long-lived loop, so the second retry was deduplicated onto it and
+    # no signal was sent.
+    repository = _repository(tmp_path)
+    with repository.sessions.begin() as session:
+        session.add(
+            Run(
+                campaign_id=None,
+                change_set_id=None,
+                workflow_id="backlog-loop-musematic-paused",
+                run_type="existing-github-backlog-loop",
+                status="PAUSED",
+                project="musematic",
+                worker="controller",
+                started_at=datetime.now(UTC),
+                finished_at=None,
+                error_code=None,
+                summary=None,
+            )
+        )
+    control = Mock()
+    control.signal = AsyncMock(return_value=None)
+    bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
+    command = WorkflowControlCommand(
+        action="retry",
+        workflow_id="backlog-loop-musematic-paused",
+        repository="musematic",
+        issue_number=1026,
+    )
+
+    first = await bus.submit(
+        command,
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("retry", 1),
+    )
+    second = await bus.submit(
+        command,
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("retry", 2),
+    )
+
+    assert first.operation_id != second.operation_id
+    assert control.signal.await_count == 2

@@ -133,6 +133,23 @@ class TypedCommandBus:
                     level="INFO",
                     message="Typed operation completed without starting a workflow",
                 )
+            elif isinstance(command, WorkflowControlCommand):
+                # NEW-35: a control only signals an existing workflow. Leaving it STARTED
+                # bound to that long-lived loop made it "active" forever, so every later
+                # retry/skip/resume of the same loop was deduplicated onto it unsent.
+                await self.operations.finish(
+                    operation_id,
+                    status="COMPLETED",
+                    workflow_id=accepted.workflow_id,
+                    run_id=accepted.run_id,
+                )
+                await self.operations.record_dispatch_event(
+                    operation_id,
+                    event_type="operation.completed",
+                    level="INFO",
+                    message="Typed workflow control signal delivered",
+                    workflow_id=accepted.workflow_id,
+                )
             else:
                 await self.operations.finish(
                     operation_id,

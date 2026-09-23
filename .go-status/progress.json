@@ -231,6 +231,12 @@
    "started": "2026-09-23T10:05:00Z",
    "status": "complete",
    "notes": "Operator deployed 543ce25 and ran the NEW-33b one-off (loop run PAUSED). backlog-retry ACCEPTED -> loop RESUMED -> NEW-33/NEW-33b CONFIRMED LIVE end to end; retry delivery ...-issue-1-retry-1-attempt-1 reclaimed leases (NEW-32 again), PRECHECKS_PASS, spec FAILED again (error_max_structured_output_retries); loop paused again at AWAITING_OPERATOR. NEW-34's stored-rejection half worked: diagnostic shows the REAL cause -- all 5 StructuredOutput calls were 'input that could not be parsed as JSON' (17-26 KB each, decision READY, substantive spec); not a schema-limit problem (my NEW-34 prompt-limits hypothesis was wrong). #1025's earlier success on attempt 5 was the same failure mode, luckier. One unrelated benign rejection: agent passed unsupported head_limit to Glob. FIX (NEW-34 part 2): spec prompt adds a size budget (whole output well under 8000 chars, problem <1500, <=12 entries/list, entries <600) and shared _STRUCTURED_OUTPUT_JSON_RULES (escape quotes/backslashes, \\n not raw newlines, no code fences/multi-line code, no trailing commas, cite code by path:line), also added to maker and checker prompts (same StructuredOutput exposure). Schema unchanged. 807 tests. Git-only."
+  },
+  {
+   "phase": "3-new35-control-ops-never-complete",
+   "started": "2026-09-23T10:25:00Z",
+   "status": "complete",
+   "notes": "Operator deployed 859eed5 (NEW-34 part 2). backlog-retry of the paused #1026 loop returned STARTED but the loop stayed AWAITING_OPERATOR: history shows only ONE retry signal ever (09:58:40); both new commands returned the old retry operation 16d2b319 (created 09:58:39). NEW-35: TypedCommandBus.submit recorded every accepted WorkflowControlCommand (retry/skip/resume/pause/...) as STARTED bound to the target loop's workflow_id; the loop is long-lived (Run PAUSED/RUNNING, non-terminal), so _active_operation kept returning that op and every later control of the same action for the loop was deduplicated onto it -- a paused loop could be retried exactly once. FIXED: delivered control signals finish COMPLETED (workflow_id kept) with an operation.completed event. Updated the existing control test (asserted STARTED) and added a two-retries regression test (fails without). 808 tests. One-off .go-status/complete-delivered-retry-op-new35.py completes op 16d2b319 via OperationsRepository.finish (refuses unless it is a STARTED retry for that loop). Git-only."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
@@ -260,5 +266,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD (activities-only change; paused loop survives). 2) backlog-retry the paused #1026 loop (Run already PAUSED via NEW-33b). 3) Follow spec -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator deploys HEAD and runs complete-delivered-retry-op-new35.py. 2) backlog-retry the paused #1026 loop. 3) Follow spec (NEW-34 size/JSON rules) -> maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }
