@@ -294,3 +294,76 @@ def test_release_read_is_limited_to_exact_deployment_worktree(tmp_path: Path) ->
         manager.grant_release_read("falcone", allocation.path)
     with pytest.raises(WorktreeError, match="exact deployment worktree"):
         manager.grant_release_read("falcone-charts", tmp_path)
+
+
+def test_retry_archives_and_resets_a_stopped_attempts_worktree(tmp_path: Path) -> None:
+    # NEW-38: musematic #1026's Codex maker left 9 uncommitted files; every later retry
+    # then failed at allocation ("existing worktree is dirty and will not be reused").
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    change_set_id = uuid4()
+    request = {
+        "repository": "falcone",
+        "project": "falcone",
+        "issue": "1026",
+        "change_set_id": change_set_id,
+        "base_ref": "refs/heads/main",
+        "expected_base_sha": sha,
+    }
+    first = manager.allocate(**request)
+    git(
+        [
+            "-c",
+            "user.name=m",
+            "-c",
+            "user.email=m@invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "maker commit",
+        ],
+        first.path,
+    )
+    ahead = git(["rev-parse", "HEAD"], first.path)
+    (first.path / "README.md").write_text("maker edit\n", encoding="utf-8")
+    (first.path / "new_benchmark.py").write_text("print('x')\n", encoding="utf-8")
+
+    second = manager.allocate(**request)
+
+    assert second.path == first.path
+    assert git(["rev-parse", "HEAD"], second.path) == sha
+    assert git(["status", "--porcelain=v1"], second.path) == ""
+    archived = git(
+        ["for-each-ref", "--format=%(refname)", f"refs/archive/{change_set_id}"], second.path
+    ).splitlines()
+    head_ref = next(ref for ref in archived if ref.endswith("-head"))
+    work_ref = next(ref for ref in archived if ref.endswith("-worktree"))
+    assert git(["rev-parse", head_ref], second.path) == ahead
+    assert "maker edit" in git(["show", f"{work_ref}:README.md"], second.path)
+    assert "print('x')" in git(["show", f"{work_ref}^3:new_benchmark.py"], second.path)
+
+
+def test_retry_still_refuses_a_worktree_on_another_branch(tmp_path: Path) -> None:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    request = {
+        "repository": "falcone",
+        "project": "falcone",
+        "issue": "1026",
+        "change_set_id": uuid4(),
+        "base_ref": "refs/heads/main",
+        "expected_base_sha": sha,
+    }
+    first = manager.allocate(**request)
+    git(["checkout", "-q", "-b", "somewhere-else"], first.path)
+
+    with pytest.raises(WorktreeError, match="does not match the ChangeSet allocation"):
+        manager.allocate(**request)

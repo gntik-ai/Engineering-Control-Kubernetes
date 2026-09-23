@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -231,14 +232,16 @@ class GitWorktreeManager:
             if target.exists():
                 actual_head = self._run(["git", "rev-parse", "HEAD"], target)
                 actual_branch = self._run(["git", "branch", "--show-current"], target)
-                if actual_head != expected_base_sha or actual_branch != branch:
+                if actual_branch != branch:
                     raise WorktreeError(
                         f"existing worktree does not match the ChangeSet allocation: {target}"
                     )
-                if self.is_dirty(target):
-                    raise WorktreeError(
-                        f"existing worktree is dirty and will not be reused: {target}"
-                    )
+                if actual_head != expected_base_sha or self.is_dirty(target):
+                    # NEW-38: a stopped attempt's maker left work behind, so no retry or
+                    # correction of this ChangeSet could ever start. The exclusive
+                    # implementation component lease is held before allocation, so no other
+                    # delivery can be using this worktree: archive it, then start clean.
+                    self._archive_and_reset(target, expected_base_sha, change_set_id)
                 return WorktreeAllocation(repository, target, branch, actual, change_set_id)
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
             self._run(
@@ -467,6 +470,37 @@ class GitWorktreeManager:
     ) -> None:
         reader_acl = ",".join(f"u:{identity}:r-X" for identity in identities)
         self._run(["setfacl", "--recursive", "--modify", reader_acl, str(target)], cwd)
+
+    def _archive_and_reset(self, target: Path, base_sha: str, change_set_id: UUID) -> None:
+        """Keep a stopped attempt's work under refs/archive/<changeset>/ in the ChangeSet's
+        git metadata, then reset the worktree to its base."""
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        prefix = f"refs/archive/{change_set_id}/{stamp}"
+        head = self._run(["git", "rev-parse", "HEAD"], target)
+        if head != base_sha:
+            self._run(["git", "update-ref", f"{prefix}-head", head], target)
+        if self.is_dirty(target):
+            self._run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=engineering-control",
+                    "-c",
+                    "user.email=engineering-control@localhost",
+                    "stash",
+                    "push",
+                    "--include-untracked",
+                    "--message",
+                    f"archived stopped delivery attempt {stamp}",
+                ],
+                target,
+            )
+            stash = self._run(["git", "rev-parse", "refs/stash"], target)
+            self._run(["git", "update-ref", f"{prefix}-worktree", stash], target)
+        self._run(["git", "reset", "--hard", base_sha], target)
+        self._run(["git", "clean", "-ffdx"], target)
+        if self.is_dirty(target) or self._run(["git", "rev-parse", "HEAD"], target) != base_sha:
+            raise WorktreeError(f"could not reset the archived worktree to its base: {target}")
 
     def is_dirty(self, path: Path) -> bool:
         return bool(self._run(["git", "status", "--porcelain=v1"], path))

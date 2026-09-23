@@ -255,12 +255,17 @@
    "started": "2026-09-23T10:50:00Z",
    "status": "complete",
    "notes": "Operator deployed abd19a1 (NEW-36 model pin). retry-3: spec failed again (error_max_structured_output_retries). Diagnostic on retry-3: every StructuredOutput call was 'could not be parsed as JSON' even at ~3 KB -- so not size; an intermittent character-level JSON defect (spec succeeded on retry-2 and retry-4 with the same prompt). retry-4: spec SUCCESS, OPENSPEC_READY; source maker on Codex with pinned gpt-5.6-terra RAN (NEW-36 CONFIRMED LIVE): implemented the Judge ON/OFF latency benchmark -- 9 changed files, 4 tests PASS / 2 SKIPPED -- but returned BLOCKED: 'The local commit cannot be created because this worktree's Git metadata is read-only: Git cannot create its index.lock under /srv/engineering/cache/scan/worktree-git/...'; delivery BLOCKED SOURCE_MAKER_DID_NOT_COMPLETE, loop paused AWAITING_OPERATOR:...:BLOCKED. NEW-37: _grant_access already gives the maker rwX ACLs on the worktree's metadata repo, but Codex --sandbox workspace-write only permits writes under the working directory and a linked worktree's gitdir/commondir live outside it. FIX: for writable Codex requests the adapter reads the worktree .git file (gitdir) and gitdir/commondir and passes both as --add-dir (only paths outside the worktree). Test with a real git linked worktree: writable gets both dirs, read-only none (writable fails without). 812 tests. Git-only. Open item: spec step still intermittently emits unparseable JSON -- consider reusing an already-produced OpenSpec on retries."
+  },
+  {
+   "phase": "3-new38-archive-reset-leftover-worktree",
+   "started": "2026-09-23T11:25:00Z",
+   "status": "complete",
+   "notes": "Operator deployed 86ab552 (NEW-37). backlog-retry delivered; retry-5 delivery failed within seconds at delivery.allocate_worktrees: 'existing worktree is dirty and will not be reused' (retry-4's Codex maker left its 9 uncommitted files); loop paused AWAITING_OPERATOR:...:DELIVERY_CHILD_WORKFLOW_FAILED (NEW-24/33 behaving). NEW-38: allocation refused any reused worktree that was dirty or whose HEAD had moved past the base, so no retry -- nor any checker-requested correction after a maker commit -- could ever start. Operator chose 'archive, then reset': allocate now (branch still must match, else refused) archives a HEAD-ahead commit to refs/archive/<changeset>/<stamp>-head and uncommitted+untracked work via git stash to refs/archive/<changeset>/<stamp>-worktree in the ChangeSet's own git metadata, then reset --hard base + clean -ffdx and verifies clean. Safe because the exclusive implementation component lease is acquired before allocation. Tests: archive+reset (fails without) and branch-mismatch still refused. 814 tests. Git-only."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
  "remaining_blockers": [
-  "NEW-37 git-only; then backlog-retry the paused #1026 loop.",
-  "Spec StructuredOutput intermittently unparseable (~50%)."
+  "NEW-38 git-only; then backlog-retry the paused #1026 loop."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -285,5 +290,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD. 2) backlog-retry the paused #1026 loop. 3) Follow maker commit -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator deploys HEAD. 2) backlog-retry the paused #1026 loop (spec is ~50% flaky -- retry again if only the spec fails). 3) Follow maker commit -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }
