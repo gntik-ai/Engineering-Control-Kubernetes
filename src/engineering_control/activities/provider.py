@@ -94,6 +94,7 @@ class ProviderActivityHandler:
             return CodexCLIAdapter(
                 executable=str(self.settings.codex_executable),
                 temp_root=str(self.settings.temporary_root / self.provider.value),
+                default_model=self.settings.codex_model,
             )
         return ClaudeCLIAdapter(executable=str(self.settings.claude_executable))
 

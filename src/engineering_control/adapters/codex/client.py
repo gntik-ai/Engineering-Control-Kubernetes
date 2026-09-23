@@ -23,9 +23,15 @@ from engineering_control.security.redaction import SecretRedactor
 class CodexCLIAdapter:
     provider = Provider.CODEX
 
-    def __init__(self, executable: str = "codex", temp_root: str | None = None) -> None:
+    def __init__(
+        self,
+        executable: str = "codex",
+        temp_root: str | None = None,
+        default_model: str | None = None,
+    ) -> None:
         self.executable = executable
         self.temp_root = temp_root
+        self.default_model = default_model
 
     async def authenticated(self) -> bool:
         import asyncio
@@ -77,8 +83,9 @@ class CodexCLIAdapter:
             ]
             if request.skip_git_repository_check:
                 command.append("--skip-git-repo-check")
-            if request.model:
-                command.extend(("--model", request.model))
+            model = request.model or self.default_model
+            if model:
+                command.extend(("--model", model))
             if request.effort:
                 command.extend(("--config", f'model_reasoning_effort="{request.effort}"'))
             command.append("-")

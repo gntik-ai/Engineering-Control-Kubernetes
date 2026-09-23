@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     runtime_target_root: Path = Path("/etc/engineering-control/runtime")
     temporary_root: Path = Path("/srv/engineering/tmp")
     codex_executable: Path = Path("/usr/local/bin/codex")
+    # NEW-36: pin the Codex model instead of inheriting the CLI default, which changed
+    # under us (codex-cli 0.149.0 defaulted to gpt-5.4, refused for the ChatGPT account).
+    # Operator choice 2026-09-23; override with ENGINEERING_CODEX_MODEL.
+    codex_model: str | None = "gpt-5.6-terra"
     claude_executable: Path = Path("/usr/local/bin/claude")
     helm_executable: Path = Path("/usr/local/bin/helm")
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")

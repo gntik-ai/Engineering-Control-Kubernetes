@@ -243,11 +243,17 @@
    "started": "2026-09-23T10:28:00Z",
    "status": "complete",
    "notes": "Operator deployed e6a8594 (NEW-35) and ran the one-off (op 16d2b319 STARTED->COMPLETED). backlog-retry: operation COMPLETED, second retry signal delivered 10:29:04, loop RESUMED -- NEW-35 CONFIRMED LIVE. Delivery ...-issue-1-retry-2-attempt-1: PRECHECKS_PASS, invoke_spec SUCCESS, create_openspec OPENSPEC_READY -- NEW-34 (size budget + JSON rules) CONFIRMED LIVE, first READY spec for #1026 and the furthest any delivery has reached. Source maker routed to Codex, then invoke_maker FAILED: Codex 400 invalid_request_error \"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.\" NEW-36 (environment, not platform code): the control plane passes no --model to Codex (adapters/codex/client.py only adds --model if request.model, never set), so the CLI uses its own default/config in the codex-runner identity on the worker; Codex verifier runs with the same runner succeeded ~07:40 today, so the default model changed since (CLI update or config). Per AGENTS.md no automatic provider substitution/auth change -- operator must inspect the worker (codex --version, codex-runner config.toml model) and pick a model the ChatGPT plan supports, or decide routing. Loop paused at AWAITING_OPERATOR (retry works now)."
+  },
+  {
+   "phase": "3-new36-pin-codex-model",
+   "started": "2026-09-23T10:45:00Z",
+   "status": "complete",
+   "notes": "Operator inspected the worker: codex-cli 0.149.0 (/usr/local/bin/codex -> /opt/engineering-cli/node_modules/.bin/codex, symlink dated 2026-08-27), no config.toml under the codex-runner identity -- so the CLI's built-in default gpt-5.4 applied (CODEX_HOME is deliberately stripped). Operator decision: pin Codex to 'gpt 5.5 terra'; the account's cached Codex model list has no gpt-5.5-terra (has gpt-5.5, gpt-5.6-terra/sol/luna, ...), operator confirmed gpt-5.6-terra. FIX: Settings.codex_model (default 'gpt-5.6-terra', override ENGINEERING_CODEX_MODEL); CodexCLIAdapter(default_model=...) passes --model unless the request names one; provider worker wires it. Test covers default pin and explicit request model (fails without). 810 tests. Git-only."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
  "remaining_blockers": [
-  "NEW-36: Codex default model gpt-5.4 unsupported for the ChatGPT account on the worker's codex-runner -- operator decision."
+  "NEW-36 fix git-only; after deploy, backlog-retry the paused #1026 loop."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -272,5 +278,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator inspects worker codex CLI version/config and sets a supported model (or decides maker routing). 2) backlog-retry the paused #1026 loop. 3) Follow maker -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator deploys HEAD. 2) backlog-retry the paused #1026 loop (NEW-35 makes repeat retries work). 3) Follow maker -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }
