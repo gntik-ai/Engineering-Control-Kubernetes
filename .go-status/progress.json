@@ -2,7 +2,7 @@
  "mission": "GO status remediation for engineering-control",
  "branch": "go-status/2026-09-17",
  "started": "2026-09-17",
- "phase": "3-maker-implements-new37-commit-sandbox",
+ "phase": "3-platform-end-to-end-to-maker-switch-to-993",
  "phase_history": [
   {
    "phase": "0-discovery",
@@ -267,11 +267,17 @@
    "started": "2026-09-23T11:45:00Z",
    "status": "complete",
    "notes": "Operator deployed eb3dd45 (NEW-38). Retry-6: allocate_worktrees FAILED -- the NEW-38 archive (git stash, run by the scan worker as scan-runner) hit 'Permission denied' on openspec/changes/governance-latency-benchmark/, a directory the Codex maker (codex-runner) created. NEW-38b (gap in my NEW-38): worktree and metadata ACLs (incl. inherited defaults) granted only maker+checker, not the managing identity, so the scan worker could not read what the maker wrote -- would also have hit later diff/publish of maker commits. FIX: _grant_access adds u:<manager>:rwX and d:u:<manager>:rwx (manager = effective user, scan-runner in production) to worktree and metadata ACLs. Test (fails without). 815 tests. Existing ChangeSet ab89c22e worktrees/metadata predate the fix -> one-off root setfacl for scan-runner. Git-only."
+  },
+  {
+   "phase": "3-platform-end-to-end-to-maker-switch-to-993",
+   "started": "2026-09-23T11:50:00Z",
+   "status": "in_progress",
+   "notes": "Operator deployed 71818f4 (NEW-38b) and granted scan-runner ACLs on ChangeSet ab89c22e (all 4 paths). Retry-7: allocate_worktrees archived+reset the leftover worktree (NEW-38/38b CONFIRMED LIVE), PRECHECKS_PASS, spec SUCCESS first try, source maker on Codex (gpt-5.6-terra) ran and returned decision BLOCKED with no changes -- a correct product finding: no execution-to-governance signal path produces verdicts for the seeded executor, and injecting synthetic verdicts is prohibited by the spec (matches #1026's own 'Blocked by: representative agents E5.2/E8.13'; retry-4's maker had implemented it anyway, likely via the now-forbidden injection). Platform verdict: every stage now works end to end (policy, verification, prechecks, spec, maker in a clean worktree on the pinned model); the remaining gap is issue selection. Operator: cancelled the #1026 loop (backlog-cancel -> campaign 44e4bfd3 CANCELLED, reconciler disabled policy 11:56:14) and chose #993 [E8.1] Import ingestion (delta added, no stated blocker, R1; the dependency #1025 waits on). issue-start musematic source 993 STARTED loop backlog-loop-musematic-94a83947-...-95367660 (campaign 94a83947; revalidation first). Other dependency-free candidates: #992, #1017, #1022."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
  "remaining_blockers": [
-  "NEW-38 git-only; then backlog-retry the paused #1026 loop."
+  "No PR yet: #993 delivery in progress."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -296,5 +302,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD and runs the one-off setfacl for ChangeSet ab89c22e. 2) backlog-retry the paused #1026 loop. 3) Follow archive/reset -> spec -> maker commit -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "Follow #993: revalidation -> prechecks -> spec -> maker commit -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO. If blocked on product grounds, next candidates #992/#1017."
 }
