@@ -2486,6 +2486,14 @@ class MetadataActivityHandler:
             issue = session.scalar(select(Issue).where(Issue.finding_id == finding.id))
             if issue is not None and issue.repository != issue_repository:
                 raise ValueError("bound issue repository does not match finding classification")
+            if issue is not None:
+                # NEW-29: only finding publication bound the ChangeSet to its issue; a
+                # revalidated existing backlog issue left issue_id unset and
+                # delivery.create_openspec then refused the ChangeSet.
+                if change_set.issue_id is None:
+                    change_set.issue_id = issue.id
+                elif change_set.issue_id != issue.id:
+                    raise ValueError("ChangeSet is already bound to a different GitHub issue")
             return {
                 **payload,
                 "status": "CONFIRMED_LOADED",

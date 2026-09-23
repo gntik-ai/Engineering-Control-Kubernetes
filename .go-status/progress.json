@@ -2,7 +2,7 @@
  "mission": "GO status remediation for engineering-control",
  "branch": "go-status/2026-09-17",
  "started": "2026-09-17",
- "phase": "3-first-clean-delivery-prechecks-new28-baseline-gating",
+ "phase": "3-first-delivery-past-prechecks-new29-new30",
  "phase_history": [
   {
    "phase": "0-discovery",
@@ -189,11 +189,17 @@
    "started": "2026-09-23T06:06:00Z",
    "status": "complete",
    "notes": "Operator deployed 029787b (ingest + GitHub worker restarted 06:06:15 onto current release; reconciler processed 8034e576's disable and wrote the policy 0640 -- NEW-25 confirmed live). Fresh campaign 51bdd717: reconciler APPROVED in 5s; backlog-start (solve_backlog) re-approved and WAITED for activation, reconciler Result=success, no stale request left -- NEW-26 confirmed live. #1025 CONFIRMED; delivery ran deterministic_prechecks to completion with every evidence upload ACCEPTED (NEW-23 + NEW-27 confirmed live), then BLOCKED DETERMINISTIC_PRECHECK_FINDINGS on the UNMODIFIED repo: source secret FINDINGS, 156 semgrep, 363 HIGH/CRITICAL; deployment secret FINDINGS, 3 semgrep, 1 HIGH. #1026 CONFIRMED, same block. Loop stopped cleanly via backlog-stop-after-current (operator-approved) to stop spending Codex verification runs. NEW-28 (design, operator chose baseline+delta): prechecks now record line-independent finding identities with multiplicity (gitleaks RuleID+file; semgrep check_id+path; trivy HIGH/CRITICAL vuln/misconfig/secret identities) to evidence/scan/<changeset>/prechecks/baseline.json and never block on them; validate_changeset blocks on any finding the change INTRODUCES vs that baseline (fail-closed to the old absolute gate if no baseline), and withholds the diff only when the change introduces a secret finding. 7 tests (5 fail without the fix). 793 tests, ruff/mypy clean. NOT YET DEPLOYED. SECURITY OBSERVATION for the operator: gitleaks reports existing secret findings in both musematic and musematic-deploy (not inspected -- reports are redacted); worth a human triage independent of GO."
+  },
+  {
+   "phase": "3-first-delivery-past-prechecks-new29-new30",
+   "started": "2026-09-23T06:40:00Z",
+   "status": "complete",
+   "notes": "Operator deployed 0cf73a3 (NEW-28). Campaign 56c609e8 (--max-items 2): #1025 CONFIRMED; delivery PRECHECKS_PASS (NEW-28 confirmed live -- first delivery ever past prechecks), prepare_spec SPEC_READY, invoke_spec SUCCESS (spec architect decision READY), then FAILED at delivery.create_openspec: 'OpenSpec requires a ChangeSet with a GitHub issue'. NEW-29: the backlog flow links the existing Issue row to the finding (engineering.py backlog-existing-issue) but ChangeSet.issue_id was only ever bound by the finding-publication path (metadata.py), so revalidated backlog issues never had one. FIXED in load_confirmed_finding: bind the finding's Issue to the ChangeSet (fail closed if bound to a different issue); regression test runs load_confirmed_finding -> create_openspec (fails without with the exact production error). NEW-30: backlog-stop-after-current returned BLOCKED 'unsupported control signal' -- TemporalControlService.signal's allowlist lacked pause_after_current/stop_after_current although the workflow defines both and the command bus/CLI/Telegram offer them; neither control has ever worked. CORRECTION: the earlier 'stopped cleanly after #1026' on 51bdd717 was NOT the stop signal -- that loop ended because #1027/#1028 block immediately (CURRENT_RUNTIME_REVALIDATION_REQUIRED). FIXED allowlist + tests. 797 tests. Both git-only."
   }
  ],
- "gate": "Every delivery-path fix through NEW-27 confirmed live. First delivery ran prechecks cleanly and was blocked only by pre-existing repo findings; NEW-28 baseline+delta gate fixed git-only.",
+ "gate": "Delivery now passes prechecks and the spec agent. NEW-29 (ChangeSet not bound to backlog issue -> create_openspec refused) and NEW-30 (after-current controls refused) fixed git-only.",
  "remaining_blockers": [
-  "NEW-28 git-only, not deployed; then retry musematic and follow delivery through spec, maker, checker, validate_changeset, publish (PR)."
+  "NEW-29/NEW-30 git-only, not deployed; then retry and follow delivery through create_openspec, makers, checker, validate_changeset, publish."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -218,5 +224,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD. 2) Retry musematic --max-items 2 (1025/1026 confirm reliably). 3) Follow delivery: prepare/invoke spec, create_openspec, maker, deployment maker, checker, validate_changeset, publish -> PR. 4) PR + merge policy -> GATE 3 GO. 5) Human triage of pre-existing gitleaks findings in musematic repos."
+ "next_action_on_resume": "1) Operator deploys HEAD. 2) Retry musematic --max-items 2. 3) Follow delivery past create_openspec -> maker -> deployment maker -> checker -> validate_changeset (baseline delta) -> publish -> PR. 4) PR + merge policy -> GATE 3 GO."
 }

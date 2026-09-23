@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from jsonschema.validators import Draft202012Validator
@@ -27,10 +27,12 @@ from engineering_control.db.models import (
     Finding,
     FindingVerification,
     Incident,
+    Issue,
     QuotaSnapshot,
     Run,
     WorktreeLease,
 )
+from engineering_control.models.enums import Project
 from engineering_control.policy.approvals import ApprovalService
 
 
@@ -2183,3 +2185,104 @@ async def test_verifier_prompt_states_the_evidence_binding_controls_enforce(
     assert ("its own issue is expected to exist" in prompt) is (
         flow == "current-state-revalidation"
     )
+
+
+@pytest.mark.asyncio
+async def test_existing_backlog_issue_is_bound_to_the_changeset_for_openspec(
+    tmp_path: Path,
+) -> None:
+    # NEW-29: the first delivery past prechecks (musematic #1025) failed at
+    # delivery.create_openspec with "OpenSpec requires a ChangeSet with a GitHub issue":
+    # the revalidated backlog issue was linked to the finding but never to the ChangeSet,
+    # which only the finding-publication path did.
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'delivery.sqlite'}",
+            worktree_root=tmp_path / "worktrees",
+            state_root=tmp_path / "state",
+            project_config_root=Path(__file__).parents[1] / "config/projects",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    coverage = CoverageCell(
+        id=uuid4(),
+        campaign_id=campaign.id,
+        domain="gateway",
+        persona="tenant-admin",
+        lens="correctness",
+        environment="snapshot",
+        status="CONFIRMED_FINDING",
+        blocker=None,
+        exclusion_approval_id=None,
+        evidence_json=[{"sha256": "c" * 64}],
+        result_json={"provider": "claude"},
+    )
+    finding = Finding(
+        id=uuid4(),
+        campaign_id=campaign.id,
+        coverage_cell_id=coverage.id,
+        fingerprint="f" * 64,
+        project="falcone",
+        domain="gateway",
+        persona="tenant-admin",
+        severity="medium",
+        confidence=0.9,
+        risk_class="R1",
+        disposition="CONFIRMED",
+        expected_behavior="bounded contract",
+        actual_behavior="bounded mismatch",
+        evidence_json=[{"sha256": "c" * 64}],
+        minimal_reproduction=["inspect the bounded contract"],
+        affected_source_sha="a" * 40,
+        affected_deployment_sha="b" * 40,
+        affected_image_digest=None,
+        affected_component="gateway",
+        impact_json={},
+        recommended_action="implement the bounded fix",
+    )
+    source_issue_repository, _ = handler._project_issue_repositories(Project.FALCONE)
+    issue = Issue(
+        id=uuid4(),
+        finding_id=finding.id,
+        repository=source_issue_repository,
+        number=1025,
+        url=f"https://github.com/{source_issue_repository}/issues/1025",
+        state="OPEN",
+        openspec_change=None,
+    )
+    workflow_id = f"backlog-loop-falcone-issue-1-attempt-1-{finding.id}"
+    run = Run(
+        id=uuid4(),
+        campaign_id=None,
+        change_set_id=None,
+        workflow_id=workflow_id,
+        run_type="issue-delivery",
+        status="QUEUED",
+        project="falcone",
+    )
+    with handler.sessions.begin() as session:
+        session.add_all([coverage, finding, issue, run])
+
+    loaded = await handler.handle(
+        "delivery.load_confirmed_finding",
+        {
+            "finding_id": str(finding.id),
+            "risk_class": "R1",
+            "dry_run": False,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    spec = await handler.handle(
+        "delivery.create_openspec",
+        {
+            **loaded,
+            "agent_result": {"structured_result": {"decision": "READY", "title": "fix"}},
+        },
+    )
+
+    assert loaded["issue_number"] == 1025
+    assert spec["status"] == "OPENSPEC_READY"
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, UUID(loaded["change_set_id"]))
+        assert change_set is not None and change_set.issue_id == issue.id
