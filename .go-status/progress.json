@@ -283,13 +283,21 @@
   {
    "phase": "3-full-delivery-contracts-missing",
    "started": "2026-09-23T14:48:00Z",
-   "status": "awaiting_operator",
+   "status": "complete",
    "notes": "Operator deployed 57b7f47 (NEW-42). Cancelled the paused source-pr #993 loop (campaign 94a83947 CANCELLED, policy disabled 14:49:07). engineering-ctl issue-start --delivery-mode full-delivery musematic source 993 -> BLOCKED preflight MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING. Full delivery is deliberately disabled in every project contract (config/projects/*.yaml): musematic -- candidate_build (no exact-SHA Release workflow publishing ghcr digests + engineering-artifacts.json), immutable_promotion (MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED: chart pins tags, no images.*.digest), staging_policy (MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC: only Argo target musematic-platform is production; cf. issue #1119); falcone -- candidate_build missing, immutable_promotion READY, staging releaser/values missing; llmwiki -- CI lacks immutable image publication, promotion/staging await first staging bootstrap approval. These are product-repo CI, chart and cluster/staging-environment prerequisites plus operator approvals, not engineering-control code bugs. Under the operator rule (GO = change running in staging from a freshly built GitHub Packages image) GO is blocked on these contracts. The source-pr delivery core is one retry from a first PR (last round: committed, reviewed code; NEW-41/42 fix the deployment-maker blocks)."
+  },
+  {
+   "phase": "4-staging-deploy-model-and-musematic-env-diagnosis",
+   "started": "2026-09-23T15:10:00Z",
+   "status": "in_progress",
+   "notes": "Operator briefing: single k3s cluster 178.104.182.200:6443 is STAGING/dev (free to modify); every deploying flow must check the project namespaces, open a GitHub issue in the project's source repo, fix, then deploy. Decisions: Hermes triggers Argo sync via API after health check (auto-sync off); keep argocd-image-updater, Hermes verifies deployed tag == sha-<merged commit>; Hermes merges its own PRs after checker + CI pass; add falcone to Argo; create gntik-ai/llmwiki-charts, namespace llmwiki, under Argo; Hermes may fix env itself; use operator admin kubeconfig. (Argo admin password given in chat -- NOT stored anywhere; recommend rotation.) musematic env diagnosis (read-only, Argo API via kubectl port-forward): E1 Argo app musematic-platform has Helm parameter override controlPlane.image.tag=sha-663c061 (parameters beat the Image Updater-written values file); control plane manually running sha-825d600 (== musematic-deploy pin) -> 4 Deployments OutOfSync, a sync would DOWNGRADE; app health 'Degraded' stale since 2026-08-13 while all workload pods are Running/Ready. E2 argocd-image-updater-controller scaled to 0 replicas. E3 musematic CI on main failing since 2026-08-11 (Secret scan, Localization vendor sync, Detect changed paths, CI gate) -> no new sha- images; logs expired, rerun refused (run >30d). E4 argocd.musematic.ai serves argocd-server's self-signed cert (ingress TLS passthrough) although argocd-tls Certificate is Ready. E5 chart source pinned to musematic commit 663c0611. No argocd CLI installed; Argo reachable via kubectl port-forward."
   }
  ],
  "gate": "Pipeline works through committed, independently reviewed code. GO (operator rule) = full-delivery: source PR -> new image built to GitHub Packages -> promotion pins exact version -> staging deployment.",
  "remaining_blockers": [
-  "Full-delivery contracts (build->GitHub Packages, digest promotion, staging target) missing for musematic/falcone/llmwiki -- operator decisions + product-repo/cluster work."
+  "musematic env: E1 param override, E2 image updater at 0, E3 CI failing on main (blocks image build after merge), E4 Argo TLS, E5 pinned chart.",
+  "Hermes code: namespace-health gate + issue + fix loop; Argo API sync + tag verification; merge-after-checker+CI; contracts reclassified as staging.",
+  "falcone -> Argo + sha- images; llmwiki chart repo + CI + namespace + Argo."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
