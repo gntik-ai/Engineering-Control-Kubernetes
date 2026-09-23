@@ -63,8 +63,34 @@ deployment:
     credential_ref: file:/etc/engineering-control/credentials/musematic/staging-releaser.kubeconfig
     blocker: MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC
 source_test_commands:
-  - [make, test]
+  # The Makefile has no `test` target; run the control-plane unit suite directly.
+  - [apps/control-plane/.venv/bin/pytest, --import-mode=importlib, --rootdir=apps/control-plane, --ignore=apps/control-plane/tests/integration, --ignore=apps/control-plane/tests/e2e, -q, apps/control-plane/tests]
   - [corepack, pnpm, --dir, apps/web, test]
+toolchain:
+  # Prepared by the scan worker (delivery.prepare_toolchain) in the source worktree
+  # before the maker runs; makers and the checker have no network.
+  enabled: true
+  prepare:
+    - cwd: apps/control-plane
+      argv: [uv, sync, --frozen, --extra, dev, --python, "{python312}"]
+      timeout_seconds: 1200
+    - cwd: "."
+      argv: [pnpm, install, --frozen-lockfile]
+      timeout_seconds: 1200
+  test_commands:
+    - cwd: apps/control-plane
+      argv: [.venv/bin/pytest, --import-mode=importlib, --ignore=tests/integration, --ignore=tests/e2e, -q]
+      description: control-plane unit tests
+    - cwd: apps/control-plane
+      argv: [.venv/bin/mypy, src/platform]
+      description: control-plane type check
+    - cwd: apps/web
+      argv: [pnpm, exec, vitest, run]
+      description: web unit tests
+    - cwd: apps/web
+      argv: [pnpm, exec, tsc, --noEmit]
+      description: web type check
+  cleanup_paths_ignored_only: true
 deployment_test_commands:
   - [python3, scripts/verify_argocd_release_drift.py, --help]
   - [python3, -m, pytest, tests/gitops_release_guard]

@@ -78,6 +78,36 @@ async def test_delivery_release_leases_is_wired_to_a_production_handler(
     assert result["status"] == "NO_RUN_TO_RELEASE_LEASES_FOR"
 
 
+@pytest.mark.asyncio
+async def test_delivery_prepare_toolchain_is_wired_to_the_scan_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delivery.prepare_toolchain must pass both allowlist gates on the scan worker only,
+    route to the scan queue, and reach ScanActivityHandler through execute_control_step."""
+    from pathlib import Path
+
+    from engineering_control.workflows.definitions import IssueDeliveryWorkflow
+    from engineering_control.workflows.worker_registry import task_queue_for
+
+    step = "delivery.prepare_toolchain"
+    assert step in ControlActivities._worker_steps["scan"]
+    for worker in ("controller", "codex", "claude", "browser", "delivery", "release"):
+        assert step not in ControlActivities._worker_steps[worker]
+    assert IssueDeliveryWorkflow._activity_queue(step, {}) == task_queue_for("scan")
+
+    monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
+    projects = Path(__file__).resolve().parents[1] / "config" / "projects"  # noqa: ASYNC240
+    activities = ControlActivities(
+        Settings(synthetic_mode=False, project_config_root=projects), "scan"
+    )
+
+    result = await activities.execute_control_step(
+        {"step": step, "payload": {"project": "falcone", "source_worktree": "/nonexistent"}}
+    )
+
+    assert result["status"] == "TOOLCHAIN_SKIPPED"
+
+
 def test_provider_telemetry_persistence_is_controller_only() -> None:
     for step in ("agent.record_start", "agent.persist_result"):
         assert step in ControlActivities._worker_steps["controller"]

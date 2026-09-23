@@ -427,11 +427,14 @@ async def test_source_pr_persists_with_deployment_bound_but_deferred(tmp_path: P
         assert run is not None and run.status == "SUCCESS"
 
 
-def _lease_fixture(tmp_path: Path) -> tuple[MetadataActivityHandler, dict[str, str]]:
+def _lease_fixture(
+    tmp_path: Path, **settings: object
+) -> tuple[MetadataActivityHandler, dict[str, str]]:
     handler = MetadataActivityHandler(
         Settings(
             database_url=f"sqlite:///{tmp_path / 'worktree-lease.sqlite'}",
             worktree_root=tmp_path / "worktrees",
+            **settings,  # type: ignore[arg-type]
         )
     )
     Base.metadata.create_all(handler.engine)
@@ -658,3 +661,49 @@ def test_deployment_maker_may_complete_without_changes_and_ignores_baseline(
     assert "Never pin, change or require an image tag or digest" in prompt
     assert "GitHub Packages" in prompt
     assert "empty changed_files" not in source["maker_request"]["prompt"]
+
+
+@pytest.mark.parametrize(("project_config", "prepared"), [("config/projects", True), (None, False)])
+def test_makers_and_checker_are_told_to_run_the_prepared_toolchain_tests(
+    tmp_path: Path, project_config: str | None, prepared: bool
+) -> None:
+    # Makers run offline in the worktree; without the prepared toolchain and the exact
+    # commands, the checker kept rejecting for "missing test evidence".
+    root = Path(__file__).resolve().parents[1]
+    overrides = (
+        {"project_config_root": root / project_config}
+        if project_config
+        else {"project_config_root": tmp_path / "missing"}
+    )
+    handler, allocation = _lease_fixture(tmp_path, **overrides)
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "risk_class": "R1",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "import"},
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+        "source_maker_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+
+    source = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    deployment = handler._prepare_maker(payload, deployment=True)["deployment_maker_request"][
+        "prompt"
+    ]
+    checker = handler._prepare_checker(payload)["checker_request"]["prompt"]
+
+    for prompt in (source, deployment, checker):
+        assert "must be valid JSON" in prompt  # _STRUCTURED_OUTPUT_JSON_RULES intact
+    assert ("Toolchain prepared in the source worktree" in source) is prepared
+    assert ("Toolchain prepared" in checker) is prepared
+    assert "Toolchain prepared" not in deployment  # the deployment worktree has none
+    if prepared:
+        assert "`.venv/bin/pytest --import-mode=importlib" in source
+        assert "`pnpm exec vitest run`" in source and "in `apps/web`" in source
+        assert "tests[] entry with its real status" in source
+        assert "do not install anything (no network)" in source
+        assert 'evidence[] entry with kind "test"' in checker
+        assert "`.venv/bin/mypy src/platform`" in checker

@@ -239,6 +239,7 @@ class ControlledWorkflow:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "delivery.prepare_toolchain",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
@@ -904,6 +905,13 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
         context = await self._step("delivery.load_confirmed_finding", asdict(request))
+        # Makers and the checker have no network, so the scan worker installs the project
+        # toolchain in the source worktree first -- after the prechecks, so the NEW-28
+        # finding baseline never contains toolchain directories. Histories recorded
+        # before this step existed carry no marker and replay without it.
+        toolchain_steps: tuple[str, ...] = (
+            ("delivery.prepare_toolchain",) if self._prepare_toolchain_patched() else ()
+        )
         ordered_steps = (
             "delivery.ensure_issue",
             "delivery.acquire_leases",
@@ -911,6 +919,7 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             "delivery.allocate_worktrees",
             "delivery.persist_worktree_leases",
             "delivery.deterministic_prechecks",
+            *toolchain_steps,
             "delivery.prepare_spec",
             "delivery.invoke_spec",
             "delivery.create_openspec",
@@ -943,6 +952,10 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                         context = await self._github_write_step(
                             step, step_payload, timeout_minutes=30
                         )
+                    elif step == "delivery.prepare_toolchain":
+                        # Up to 10 bounded installs of <= 3600 s each; the handler
+                        # heartbeats while they run.
+                        context = await self._step(step, step_payload, timeout_minutes=90)
                     else:
                         context = await self._step(step, step_payload, timeout_minutes=30)
                 if (
@@ -978,6 +991,9 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             # at the same issue for the rest of the lease's 4h TTL.
             await self._release_delivery_leases_best_effort(context)
             raise
+
+    def _prepare_toolchain_patched(self) -> bool:
+        return workflow.patched("delivery-prepare-toolchain-v1")
 
     async def _release_delivery_leases_best_effort(self, context: dict[str, Any]) -> None:
         # Discards the activity's own response payload deliberately: it returns

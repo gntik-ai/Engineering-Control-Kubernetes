@@ -6,15 +6,19 @@ import json
 import os
 import re
 import stat
+import subprocess
 import tempfile
+import time
 from collections import Counter
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from uuid import UUID
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.retention import cleanup_authorization_sha256
@@ -23,7 +27,13 @@ from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
 from engineering_control.engineering.configuration import EngineeringCatalog
-from engineering_control.engineering.models import ProjectPairSnapshot
+from engineering_control.engineering.models import ProjectPairSnapshot, ToolchainPolicy
+from engineering_control.engineering.toolchain import (
+    enabled_toolchain,
+    load_toolchain_policy,
+    prepare_executables,
+    render_argv,
+)
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
@@ -35,6 +45,10 @@ from engineering_control.worktrees.manager import (
     WorktreeAllocation,
     WorktreeError,
 )
+
+_T = TypeVar("_T")
+_TOOLCHAIN_STDERR_TAIL = 2000
+_TOOLCHAIN_HEARTBEAT_SECONDS = 30.0
 
 
 class WorktreeAllocationRequest(BaseModel):
@@ -120,6 +134,7 @@ class ScanActivityHandler:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "delivery.prepare_toolchain",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
@@ -143,6 +158,8 @@ class ScanActivityHandler:
         publisher: EvidencePublisher | None = None,
         observer_runner: SafeCommandRunner | None = None,
         promotion_runner: SafeCommandRunner | None = None,
+        toolchain_runner: SafeCommandRunner | None = None,
+        git_runner: SafeCommandRunner | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager or GitWorktreeManager(
@@ -169,6 +186,9 @@ class ScanActivityHandler:
         self.promotion_runner = promotion_runner or SafeCommandRunner(
             {"git": settings.git_executable, "helm": settings.helm_executable}
         )
+        # delivery.prepare_toolchain: only the allowlisted installers, never a shell.
+        self.toolchain_runner = toolchain_runner or SafeCommandRunner(prepare_executables(settings))
+        self.git_runner = git_runner or SafeCommandRunner({"git": settings.git_executable})
         self.catalog = EngineeringCatalog(
             project_root=settings.project_config_root,
             persona_root=settings.persona_config_root,
@@ -200,6 +220,10 @@ class ScanActivityHandler:
                 return await asyncio.to_thread(self._allocate, payload)
             if step == "delivery.deterministic_prechecks":
                 return await asyncio.to_thread(self._delivery_prechecks, payload)
+            if step == "delivery.prepare_toolchain":
+                return await self._with_heartbeat(
+                    asyncio.to_thread(self._prepare_toolchain, payload)
+                )
             if step == "runtime.deterministic_checks":
                 return await asyncio.to_thread(self._runtime_deterministic_checks, payload)
             if step == "identity.observer_attest":
@@ -1298,6 +1322,230 @@ class ScanActivityHandler:
             "prechecks": summaries,
         }
 
+    @staticmethod
+    async def _with_heartbeat(work: Awaitable[_T]) -> _T:
+        """Keep a long blocking step alive against the workflow's 2-minute heartbeat timeout."""
+        task = asyncio.ensure_future(work)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_TOOLCHAIN_HEARTBEAT_SECONDS)
+                if done:
+                    return task.result()
+                try:
+                    activity.heartbeat({"phase": "toolchain_prepare"})
+                except RuntimeError:
+                    pass  # not running inside an activity (unit tests)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+
+    def _bounded_worktree(self, value: object) -> Path:
+        worktree = Path(str(value)).resolve()
+        root = self.settings.worktree_root.resolve()
+        if worktree == root or not worktree.is_dir() or not worktree.is_relative_to(root):
+            raise ValueError("toolchain worktree escaped its bounded root")
+        return worktree
+
+    def _git(self, worktree: Path, arguments: list[str], *, timeout_seconds: int = 300) -> str:
+        return self.git_runner.run(
+            "git",
+            ["-c", f"safe.directory={worktree}", *arguments],
+            cwd=worktree,
+            timeout_seconds=timeout_seconds,
+            environment={
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+            },
+        ).stdout
+
+    def _git_status(self, worktree: Path, *, ignored: bool) -> dict[str, str]:
+        """Map each porcelain path to its XY code ('??' untracked, '!!' ignored)."""
+        arguments = ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]
+        if ignored:
+            arguments.append("--ignored=traditional")
+        tokens = self._git(worktree, arguments).split("\0")
+        entries: dict[str, str] = {}
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            index += 1
+            if len(token) < 4:
+                continue
+            code, path = token[:2], token[3:]
+            entries[path] = code
+            if code[0] in {"R", "C"}:
+                index += 1  # -z rename/copy records carry the original path next
+        return entries
+
+    def _toolchain_environment(self) -> dict[str, str]:
+        """Network-enabled installer environment: private caches, no credentials."""
+        root = self.settings.toolchain_cache_root
+        directories = {
+            name: root / name for name in ("uv", "pnpm-store", "pnpm-cache", "home", "xdg-cache")
+        }
+        for directory in (root, *directories.values()):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+            if directory.stat().st_uid == os.getuid():
+                directory.chmod(0o750)
+        store = str(directories["pnpm-store"])
+        cache = str(directories["pnpm-cache"])
+        return {
+            "CI": "true",
+            # HOME is a private empty directory so no ~/.npmrc, ~/.netrc or uv/pnpm user
+            # configuration (and no credential in them) is ever read.
+            "HOME": str(directories["home"]),
+            "XDG_CACHE_HOME": str(directories["xdg-cache"]),
+            "UV_PYTHON_DOWNLOADS": "never",
+            "UV_CACHE_DIR": str(directories["uv"]),
+            "UV_NO_PROGRESS": "1",
+            # Copy, never hardlink: makers can write to the worktree, and a hardlinked
+            # file would let them modify the shared cache for every later ChangeSet.
+            "UV_LINK_MODE": "copy",
+            "npm_config_store_dir": store,
+            "pnpm_config_store_dir": store,
+            "npm_config_cache_dir": cache,
+            "pnpm_config_cache_dir": cache,
+            "npm_config_package_import_method": "copy",
+            "pnpm_config_package_import_method": "copy",
+            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+        }
+
+    @staticmethod
+    def _toolchain_blocked(
+        payload: dict[str, Any], blocker: str, detail: str, commands: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        safe = str(SecretRedactor().redact_text(detail).value)[-_TOOLCHAIN_STDERR_TAIL:]
+        return {
+            **payload,
+            "status": "BLOCKED",
+            "blocker": blocker,
+            "toolchain_preparation": {
+                "status": "BLOCKED",
+                "blocker": blocker,
+                "detail": safe,
+                "commands": commands,
+            },
+        }
+
+    def _prepare_toolchain(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Install the project's dependencies in the source worktree before the maker.
+
+        Runs after delivery.deterministic_prechecks so the NEW-28 baseline never contains
+        toolchain directories, and fails closed unless everything created is git-ignored.
+        """
+        try:
+            policy = load_toolchain_policy(
+                self.settings.project_config_root, str(payload["project"])
+            )
+        except (OSError, ValueError) as error:
+            return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
+        if policy is None or not policy.enabled:
+            return {
+                **payload,
+                "status": "TOOLCHAIN_SKIPPED",
+                "blocker": None,
+                "toolchain_preparation": {"status": "TOOLCHAIN_SKIPPED"},
+            }
+        worktree = self._bounded_worktree(payload["source_worktree"])
+        environment = self._toolchain_environment()
+        before = self._git_status(worktree, ignored=True)
+        commands: list[dict[str, Any]] = []
+        for command in policy.prepare:
+            cwd = (worktree / command.cwd).resolve()
+            if not cwd.is_relative_to(worktree) or not cwd.is_dir():
+                return self._toolchain_blocked(
+                    payload,
+                    "TOOLCHAIN_PREPARE_FAILED",
+                    f"prepare cwd {command.cwd!r} is not a directory inside the worktree",
+                    commands,
+                )
+            argv = render_argv(command.argv, self.settings)
+            record: dict[str, Any] = {"cwd": command.cwd, "argv": argv}
+            started = time.monotonic()
+            try:
+                result = self.toolchain_runner.run(
+                    argv[0],
+                    argv[1:],
+                    cwd=cwd,
+                    timeout_seconds=command.timeout_seconds,
+                    environment=environment,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                commands.append({**record, "status": "TIMED_OUT"})
+                return self._toolchain_blocked(
+                    payload,
+                    "TOOLCHAIN_PREPARE_FAILED",
+                    f"{argv[0]} timed out after {command.timeout_seconds}s",
+                    commands,
+                )
+            except (OSError, ValueError) as error:
+                commands.append({**record, "status": "NOT_STARTED"})
+                return self._toolchain_blocked(
+                    payload, "TOOLCHAIN_PREPARE_FAILED", f"{argv[0]}: {error}", commands
+                )
+            record["duration_seconds"] = round(time.monotonic() - started, 1)
+            record["return_code"] = result.return_code
+            if result.return_code:
+                commands.append({**record, "status": "FAILED"})
+                # pnpm reports errors on stdout; uv on stderr. Both are already redacted.
+                return self._toolchain_blocked(
+                    payload,
+                    "TOOLCHAIN_PREPARE_FAILED",
+                    result.stderr.strip() or result.stdout,
+                    commands,
+                )
+            commands.append({**record, "status": "PASS"})
+        after = self._git_status(worktree, ignored=True)
+        created = {path: code for path, code in after.items() if before.get(path) != code}
+        not_ignored = sorted(path for path, code in created.items() if code == "??")
+        tracked = sorted(path for path, code in created.items() if code not in {"??", "!!"})
+        if not_ignored:
+            return self._toolchain_blocked(
+                payload,
+                "TOOLCHAIN_ARTIFACTS_NOT_IGNORED",
+                "untracked paths that are not git-ignored: " + ", ".join(not_ignored[:50]),
+                commands,
+            )
+        if tracked:
+            return self._toolchain_blocked(
+                payload,
+                "TOOLCHAIN_MODIFIED_TRACKED_FILES",
+                "prepare commands modified tracked files: " + ", ".join(tracked[:50]),
+                commands,
+            )
+        return {
+            **payload,
+            "status": "TOOLCHAIN_READY",
+            "blocker": None,
+            "toolchain_preparation": {
+                "status": "TOOLCHAIN_READY",
+                "commands": commands,
+                "ignored_paths_created": sorted(
+                    path for path, code in created.items() if code == "!!"
+                )[:100],
+                "test_commands": [item.model_dump() for item in policy.test_commands],
+            },
+        }
+
+    def _toolchain_cleanup_policy(self, project: str) -> ToolchainPolicy | None:
+        try:
+            policy = enabled_toolchain(self.settings.project_config_root, project)
+        except (OSError, ValueError):
+            # Without a readable contract nothing is removed; the NEW-28 delta gate then
+            # sees any toolchain directories and blocks, which is the fail-closed outcome.
+            return None
+        return policy if policy is not None and policy.cleanup_paths_ignored_only else None
+
+    def _clean_ignored_toolchain_artifacts(self, value: object) -> None:
+        """Remove only git-ignored files (.venv, node_modules) so scanners never see them."""
+        worktree = self._bounded_worktree(value)
+        before = self._git_status(worktree, ignored=False)
+        self._git(worktree, ["clean", "-ffdX", "--quiet"], timeout_seconds=900)
+        if self._git_status(worktree, ignored=False) != before:
+            raise ValueError("toolchain cleanup changed tracked or non-ignored worktree files")
+
     def _validate_changeset(self, payload: dict[str, Any]) -> dict[str, Any]:
         checker = payload.get("agent_result")
         if not isinstance(checker, dict) or not isinstance(checker.get("structured_result"), dict):
@@ -1327,11 +1575,17 @@ class ScanActivityHandler:
         baseline = self._load_baseline(change_set_id)
         changes: dict[str, Any] = {}
         blocked = False
+        toolchain = self._toolchain_cleanup_policy(str(payload.get("project", "")))
         for name, path_key, base_key in (
             ("source", "source_worktree", "source_base_sha"),
             ("deployment", "deployment_worktree", "deployment_base_sha"),
         ):
             worktree = Path(str(payload[path_key]))
+            if toolchain is not None:
+                # The prepared .venv/node_modules are git-ignored and absent from the
+                # prechecks baseline; scanning them would flag thousands of "introduced"
+                # findings. git clean -X never touches tracked or non-ignored files.
+                self._clean_ignored_toolchain_artifacts(worktree)
             summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
             if name == "source" and summary["changed_file_count"] == 0:
                 blocked = True

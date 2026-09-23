@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     observer_credential_root: Path = Path("/etc/engineering-control/credentials")
     node_executable: Path = Path("/usr/local/bin/node")
     pnpm_executable: Path = Path("/opt/engineering-browser/node_modules/.bin/pnpm")
+    # Delivery toolchain preparation (scan worker, delivery.prepare_toolchain). The
+    # browser worker's pnpm above is a different, pinned consumer-suite install.
+    uv_executable: Path = Path("/usr/local/bin/uv")
+    toolchain_pnpm_executable: Path = Path("/usr/local/bin/pnpm")
+    python312_executable: Path = Path("/usr/local/bin/python3.12")
+    toolchain_cache_root: Path = Path("/srv/engineering/cache/toolchain")
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")

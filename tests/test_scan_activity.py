@@ -419,6 +419,7 @@ async def test_cleanup_protects_dirty_and_executes_only_controller_authorization
         ("reconcile.apply_promotion", "_apply_promotion"),
         ("delivery.deterministic_prechecks", "_delivery_prechecks"),
         ("delivery.validate_changeset", "_validate_changeset"),
+        ("delivery.prepare_toolchain", "_prepare_toolchain"),
     ],
 )
 async def test_scan_dispatch_runs_blocking_kubectl_and_scanner_steps_off_the_event_loop(

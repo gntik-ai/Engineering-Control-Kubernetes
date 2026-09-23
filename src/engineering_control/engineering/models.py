@@ -153,6 +153,101 @@ class DeploymentManifest(EngineeringModel):
         return self
 
 
+TOOLCHAIN_PREPARE_EXECUTABLES = frozenset({"uv", "pnpm"})
+TOOLCHAIN_PLACEHOLDERS = frozenset({"{python312}"})
+TOOLCHAIN_TOTAL_TIMEOUT = 80 * 60
+_FORBIDDEN_TOOLCHAIN_COMMANDS = frozenset(
+    {"sh", "bash", "zsh", "fish", "dash", "env", "sudo", "ssh", "curl", "wget", "kubectl"}
+)
+
+
+def _repository_relative_cwd(value: str) -> str:
+    if (
+        not value
+        or value.startswith(("/", "~"))
+        or "\\" in value
+        or any(character in value for character in ("\x00", "\n", "\r"))
+    ):
+        raise ValueError("toolchain cwd must be a repository-relative path")
+    parts = value.split("/")
+    if any(part == ".." for part in parts) or (value != "." and any(p in {"", "."} for p in parts)):
+        raise ValueError("toolchain cwd must be a normalized repository-relative path")
+    return value
+
+
+def _bounded_arguments(argv: list[str]) -> list[str]:
+    for argument in argv:
+        if not argument or len(argument) > 500:
+            raise ValueError("toolchain arguments must be non-empty bounded values")
+        if any(character in argument for character in ("\x00", "\n", "\r")):
+            raise ValueError("toolchain arguments must be single-line values")
+        remainder = argument
+        for placeholder in TOOLCHAIN_PLACEHOLDERS:
+            remainder = remainder.replace(placeholder, "")
+        if "{" in remainder or "}" in remainder:
+            raise ValueError("toolchain arguments support only the {python312} placeholder")
+    return argv
+
+
+class ToolchainPrepareCommand(EngineeringModel):
+    """One platform-executed dependency installation command (scan worker, network)."""
+
+    cwd: str = Field(min_length=1, max_length=200)
+    argv: list[str] = Field(min_length=1, max_length=30)
+    timeout_seconds: int = Field(default=1200, ge=10, le=3600)
+
+    @field_validator("cwd")
+    @classmethod
+    def repository_relative(cls, value: str) -> str:
+        return _repository_relative_cwd(value)
+
+    @field_validator("argv")
+    @classmethod
+    def allowlisted_executable(cls, argv: list[str]) -> list[str]:
+        if argv[0] not in TOOLCHAIN_PREPARE_EXECUTABLES:
+            raise ValueError(
+                "toolchain prepare executable must be one of "
+                + ", ".join(sorted(TOOLCHAIN_PREPARE_EXECUTABLES))
+            )
+        return _bounded_arguments(argv)
+
+
+class ToolchainTestCommand(EngineeringModel):
+    """A command makers and the checker run themselves; never executed by the platform."""
+
+    cwd: str = Field(min_length=1, max_length=200)
+    argv: list[str] = Field(min_length=1, max_length=30)
+    description: str = Field(min_length=1, max_length=200)
+
+    @field_validator("cwd")
+    @classmethod
+    def repository_relative(cls, value: str) -> str:
+        return _repository_relative_cwd(value)
+
+    @field_validator("argv")
+    @classmethod
+    def fixed_command(cls, argv: list[str]) -> list[str]:
+        if argv[0] in _FORBIDDEN_TOOLCHAIN_COMMANDS or argv[0].startswith("/"):
+            raise ValueError("toolchain test commands must use fixed non-shell executables")
+        return _bounded_arguments(argv)
+
+
+class ToolchainPolicy(EngineeringModel):
+    enabled: bool = False
+    prepare: list[ToolchainPrepareCommand] = Field(default_factory=list, max_length=10)
+    test_commands: list[ToolchainTestCommand] = Field(default_factory=list, max_length=20)
+    cleanup_paths_ignored_only: bool = True
+
+    @model_validator(mode="after")
+    def enabled_requires_prepare(self) -> ToolchainPolicy:
+        if self.enabled and not self.prepare:
+            raise ValueError("an enabled toolchain requires at least one prepare command")
+        if sum(command.timeout_seconds for command in self.prepare) > TOOLCHAIN_TOTAL_TIMEOUT:
+            # IssueDeliveryWorkflow gives delivery.prepare_toolchain 90 minutes in total.
+            raise ValueError("toolchain prepare timeouts exceed the step's bounded budget")
+        return self
+
+
 class ProjectManifest(EngineeringModel):
     schema_version: Literal[1]
     project: Literal["falcone", "musematic", "llmwiki"]
@@ -164,6 +259,7 @@ class ProjectManifest(EngineeringModel):
     deployment_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
     dependencies: dict[str, object] = Field(default_factory=dict)
     classification: dict[str, bool] = Field(default_factory=dict)
+    toolchain: ToolchainPolicy | None = None
 
     @field_validator("delivery_control")
     @classmethod

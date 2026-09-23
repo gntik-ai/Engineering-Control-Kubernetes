@@ -62,6 +62,10 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.engineering.github import FindingPublication
 from engineering_control.engineering.models import ProjectManifest
+from engineering_control.engineering.toolchain import (
+    enabled_toolchain,
+    toolchain_test_command_lines,
+)
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
 from engineering_control.models.core import AgentRequest, AgentResult, resolve_agent_effort
 from engineering_control.models.core import ChangeSet as ChangeSetModel
@@ -2897,6 +2901,11 @@ class MetadataActivityHandler:
                 if deployment
                 else ""
             )
+            + (
+                self._toolchain_prompt(payload, role="maker")
+                if not deployment or payload["source_worktree"] == payload["deployment_worktree"]
+                else ""
+            )
             + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
             f"Source worktree: {payload['source_worktree']}\n"
@@ -2926,6 +2935,32 @@ class MetadataActivityHandler:
             response["source_maker_result"] = prior
         return response
 
+    def _toolchain_prompt(self, payload: dict[str, Any], *, role: str) -> str:
+        """Tell makers/the checker which prepared test commands to run (source worktree)."""
+        try:
+            policy = enabled_toolchain(self.settings.project_config_root, str(payload["project"]))
+        except (OSError, ValueError):
+            return ""  # advisory only: the checker still demands real test evidence
+        if policy is None or not policy.test_commands:
+            return ""
+        if role == "maker":
+            instruction = (
+                "Run these before committing, and report each as a tests[] entry with its "
+                "real status (PASS, FAIL, or SKIPPED with the reason in the summary)"
+            )
+        else:
+            # The checker schema has no tests[]; its evidence[] carries the same facts.
+            instruction = (
+                "Run these to verify the change, and report each as an evidence[] entry with "
+                'kind "test", the command and its real result (PASS or FAIL) as reference, '
+                "and the sha256 of the command output"
+            )
+        return (
+            "Toolchain prepared in the source worktree (dependencies are already installed). "
+            f"{instruction}; do not install anything (no network):\n"
+            + "".join(f"{line}\n" for line in toolchain_test_command_lines(policy))
+        )
+
     def _prepare_checker(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider = Provider(str(payload["checker_provider"]))
         change_set_id = UUID(str(payload["change_set_id"]))
@@ -2951,7 +2986,8 @@ class MetadataActivityHandler:
             "Independently review both bounded worktrees for one ChangeSet. Do not modify files. "
             "Validate the OpenSpec, source and deployment diffs, tests, immutable image policy, "
             "and risk gates. Request changes on any uncertainty.\n"
-            f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
+            + self._toolchain_prompt(payload, role="checker")
+            + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
             f"Source worktree: {payload['source_worktree']}\n"
             f"Deployment worktree: {payload['deployment_worktree']}\n\n"

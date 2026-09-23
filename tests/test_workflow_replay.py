@@ -816,3 +816,78 @@ async def test_blocked_staging_gitops_pauses_retries_only_the_child_then_skips()
     assert [state["blocker"] for state in paused] == ["ENVIRONMENT_UNHEALTHY"] * 2
     assert all(state.get("workflow_id") for state in paused)
     await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+_DELIVERY_TO_SPEC_SCRIPT: dict[str, dict[str, Any]] = {
+    "delivery.load_confirmed_finding": {"status": "OK", "run_id": "run-1"},
+    "delivery.ensure_issue": {"status": "OK", "run_id": "run-1"},
+    "delivery.acquire_leases": {"status": "LEASES_ACQUIRED", "run_id": "run-1"},
+    "delivery.route_providers": {"status": "ROUTED", "run_id": "run-1"},
+    "delivery.allocate_worktrees": {"status": "WORKTREES_ALLOCATED", "run_id": "run-1"},
+    "delivery.persist_worktree_leases": {"status": "WORKTREE_LEASES_PERSISTED"},
+    "delivery.deterministic_prechecks": {"status": "PRECHECKS_PASS", "run_id": "run-1"},
+    "delivery.prepare_toolchain": {"status": "TOOLCHAIN_READY", "run_id": "run-1"},
+    "delivery.prepare_spec": {"status": "BLOCKED", "blocker": "SPEC_STOP", "run_id": "run-1"},
+    "delivery.release_leases": {"status": "LEASES_RELEASED", "run_id": "run-1"},
+}
+
+
+def _scheduled_step_names(history: Any) -> list[str]:
+    return [
+        json.loads(event.activity_task_scheduled_event_attributes.input.payloads[0].data)["step"]
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+
+
+@workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
+class _PreToolchainIssueDeliveryWorkflow(IssueDeliveryWorkflow):
+    """IssueDeliveryWorkflow exactly as it ran before delivery-prepare-toolchain-v1."""
+
+    @workflow.run
+    async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
+        return await super().run(request)
+
+    def _prepare_toolchain_patched(self) -> bool:
+        return False
+
+
+async def test_issue_delivery_prepares_the_toolchain_after_prechecks_and_replays() -> None:
+    activity_fn = _scripted_execute_control_step(_DELIVERY_TO_SPEC_SCRIPT)
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(IssueDeliveryWorkflow, run_arg, activity_fn)
+
+    assert result is not None and result["status"] == "BLOCKED"
+    steps = _scheduled_step_names(history)
+    prechecks = steps.index("delivery.deterministic_prechecks")
+    assert steps[prechecks + 1 : prechecks + 3] == [
+        "delivery.prepare_toolchain",
+        "delivery.prepare_spec",
+    ]
+    markers = [
+        event.marker_recorded_event_attributes.SerializeToString()
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+    ]
+    assert any(b"delivery-prepare-toolchain-v1" in marker for marker in markers)
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_pre_toolchain_issue_delivery_history_replays_without_the_new_step() -> None:
+    """A delivery recorded before the patch (no marker) must replay unchanged against the
+    current code, i.e. without scheduling delivery.prepare_toolchain."""
+    activity_fn = _scripted_execute_control_step(_DELIVERY_TO_SPEC_SCRIPT)
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        _PreToolchainIssueDeliveryWorkflow, run_arg, activity_fn
+    )
+
+    assert result is not None and result["status"] == "BLOCKED"
+    steps = _scheduled_step_names(history)
+    assert "delivery.prepare_toolchain" not in steps
+    prechecks = steps.index("delivery.deterministic_prechecks")
+    assert steps[prechecks + 1] == "delivery.prepare_spec"
+    assert not any(event.HasField("marker_recorded_event_attributes") for event in history.events)
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
