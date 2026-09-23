@@ -261,6 +261,12 @@
    "started": "2026-09-23T11:25:00Z",
    "status": "complete",
    "notes": "Operator deployed 86ab552 (NEW-37). backlog-retry delivered; retry-5 delivery failed within seconds at delivery.allocate_worktrees: 'existing worktree is dirty and will not be reused' (retry-4's Codex maker left its 9 uncommitted files); loop paused AWAITING_OPERATOR:...:DELIVERY_CHILD_WORKFLOW_FAILED (NEW-24/33 behaving). NEW-38: allocation refused any reused worktree that was dirty or whose HEAD had moved past the base, so no retry -- nor any checker-requested correction after a maker commit -- could ever start. Operator chose 'archive, then reset': allocate now (branch still must match, else refused) archives a HEAD-ahead commit to refs/archive/<changeset>/<stamp>-head and uncommitted+untracked work via git stash to refs/archive/<changeset>/<stamp>-worktree in the ChangeSet's own git metadata, then reset --hard base + clean -ffdx and verifies clean. Safe because the exclusive implementation component lease is acquired before allocation. Tests: archive+reset (fails without) and branch-mismatch still refused. 814 tests. Git-only."
+  },
+  {
+   "phase": "3-new38b-manager-acl",
+   "started": "2026-09-23T11:45:00Z",
+   "status": "complete",
+   "notes": "Operator deployed eb3dd45 (NEW-38). Retry-6: allocate_worktrees FAILED -- the NEW-38 archive (git stash, run by the scan worker as scan-runner) hit 'Permission denied' on openspec/changes/governance-latency-benchmark/, a directory the Codex maker (codex-runner) created. NEW-38b (gap in my NEW-38): worktree and metadata ACLs (incl. inherited defaults) granted only maker+checker, not the managing identity, so the scan worker could not read what the maker wrote -- would also have hit later diff/publish of maker commits. FIX: _grant_access adds u:<manager>:rwX and d:u:<manager>:rwx (manager = effective user, scan-runner in production) to worktree and metadata ACLs. Test (fails without). 815 tests. Existing ChangeSet ab89c22e worktrees/metadata predate the fix -> one-off root setfacl for scan-runner. Git-only."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
@@ -290,5 +296,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD. 2) backlog-retry the paused #1026 loop (spec is ~50% flaky -- retry again if only the spec fails). 3) Follow maker commit -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator deploys HEAD and runs the one-off setfacl for ChangeSet ab89c22e. 2) backlog-retry the paused #1026 loop. 3) Follow archive/reset -> spec -> maker commit -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }

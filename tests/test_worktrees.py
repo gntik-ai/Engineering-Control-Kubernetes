@@ -367,3 +367,42 @@ def test_retry_still_refuses_a_worktree_on_another_branch(tmp_path: Path) -> Non
 
     with pytest.raises(WorktreeError, match="does not match the ChangeSet allocation"):
         manager.allocate(**request)
+
+
+def test_manager_keeps_access_to_what_the_maker_creates(tmp_path: Path) -> None:
+    # NEW-38b: archiving a stopped attempt failed with "Permission denied" on
+    # openspec/changes/... -- directories the Codex maker created were unreadable to
+    # the scan worker that manages the worktree.
+    import os
+    import pwd
+
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "musematic" / str(uuid4())
+    target.mkdir(parents=True)
+    metadata_root = tmp_path / "cache" / "scan" / "worktree-git"
+    metadata = metadata_root / "musematic" / f"{target.name}.git"
+    metadata.mkdir(parents=True)
+    canonical = tmp_path / "mirrors" / "musematic.git"
+    canonical.mkdir(parents=True)
+    manager = GitWorktreeManager(
+        mirror_root=tmp_path / "mirrors",
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+    )
+    commands: list[list[str]] = []
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        commands.append(args)
+        return ""
+
+    manager._run = record  # type: ignore[method-assign]
+    manager._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+
+    me = pwd.getpwuid(os.geteuid()).pw_name
+    for path in (target, metadata):
+        acls = [command for command in commands if command[-1] == str(path)]
+        assert any(f"u:{me}:rwX" in argument for command in acls for argument in command)
+        assert any(f"d:u:{me}:rwx" in argument for command in acls for argument in command)

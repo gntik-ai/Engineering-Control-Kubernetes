@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import re
 import subprocess
 from dataclasses import dataclass
@@ -330,8 +331,19 @@ class GitWorktreeManager:
         resolved_target = target.resolve()
         if not resolved_target.is_relative_to(resolved_root) or resolved_target == resolved_root:
             raise WorktreeError("refusing to grant access outside a bounded worktree")
-        access_acl = f"u:{access.maker_identity}:rwX,u:{access.checker_identity}:r-X,m::rwX"
-        default_acl = f"d:u:{access.maker_identity}:rwx,d:u:{access.checker_identity}:r-x,d:m::rwx"
+        # NEW-38b: the manager's own identity (the scan worker) must keep access to files
+        # the maker creates, or it cannot archive/reset (or later diff) that worktree.
+        manager = pwd.getpwuid(os.geteuid()).pw_name
+        manager_acl = f"u:{manager}:rwX,"
+        manager_default_acl = f"d:u:{manager}:rwx,"
+        access_acl = (
+            f"{manager_acl}u:{access.maker_identity}:rwX,"
+            f"u:{access.checker_identity}:r-X,m::rwX"
+        )
+        default_acl = (
+            f"{manager_default_acl}d:u:{access.maker_identity}:rwx,"
+            f"d:u:{access.checker_identity}:r-x,d:m::rwx"
+        )
         traverse_acl = f"u:{access.maker_identity}:--x,u:{access.checker_identity}:--x"
         self._run(
             ["setfacl", "--modify", traverse_acl, str(resolved_target.parent)],
@@ -343,10 +355,8 @@ class GitWorktreeManager:
 
         identities = (access.maker_identity, access.checker_identity)
         self._grant_metadata_traverse(metadata, identities)
-        metadata_acl = f"u:{access.maker_identity}:rwX,u:{access.checker_identity}:r-X,m::rwX"
-        metadata_default_acl = (
-            f"d:u:{access.maker_identity}:rwx,d:u:{access.checker_identity}:r-x,d:m::rwx"
-        )
+        metadata_acl = access_acl
+        metadata_default_acl = default_acl
         self._run(["setfacl", "--recursive", "--modify", metadata_acl, str(metadata)], metadata)
         for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
             self._run(["setfacl", "--modify", metadata_default_acl, str(directory)], metadata)
