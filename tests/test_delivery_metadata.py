@@ -582,3 +582,49 @@ def test_spec_prompt_states_the_output_contract_the_schema_enforces(tmp_path: Pa
     # The live failure was unparseable 17-26 KB JSON, not a schema limit.
     assert "well under 8000 characters" in prompt
     assert "must be valid JSON" in prompt and "never raw newlines" in prompt
+
+
+def test_correction_attempt_maker_sees_the_previous_checker_findings(tmp_path: Path) -> None:
+    # NEW-39: the first real checker review (musematic #993) requested changes for a
+    # genuine upload-size DoS gap, but correction attempts restart from the base with
+    # a prompt holding only the OpenSpec -- the maker never learned what to fix.
+    from engineering_control.db.models import AgentInvocation
+
+    handler, allocation = _lease_fixture(tmp_path)
+    change_set_id = allocation["change_set_id"]
+    previous = _delivery_run(handler, change_set_id)
+    with handler.sessions.begin() as session:
+        session.add(
+            AgentInvocation(
+                id=uuid4(),
+                run_id=UUID(previous),
+                provider="claude",
+                role="code-reviewer",
+                model_class="judge",
+                status="SUCCESS",
+                structured_result={
+                    "decision": "REQUEST_CHANGES",
+                    "findings": ["MAJOR - upload cap runs after the body is spooled"],
+                    "summary": "five substantive issues",
+                },
+                started_at=datetime.now(UTC),
+            )
+        )
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-attempt-2"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "risk_class": "R1",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "import"},
+    }
+
+    prompt = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    first_attempt = handler._prepare_maker(
+        {**payload, "change_set_id": str(uuid4())}, deployment=False
+    )["maker_request"]["prompt"]
+
+    assert "upload cap runs after the body is spooled" in prompt
+    assert "five substantive issues" in prompt
+    assert "Independent checker findings" not in first_attempt

@@ -271,8 +271,14 @@
   {
    "phase": "3-platform-end-to-end-to-maker-switch-to-993",
    "started": "2026-09-23T11:50:00Z",
-   "status": "in_progress",
+   "status": "complete",
    "notes": "Operator deployed 71818f4 (NEW-38b) and granted scan-runner ACLs on ChangeSet ab89c22e (all 4 paths). Retry-7: allocate_worktrees archived+reset the leftover worktree (NEW-38/38b CONFIRMED LIVE), PRECHECKS_PASS, spec SUCCESS first try, source maker on Codex (gpt-5.6-terra) ran and returned decision BLOCKED with no changes -- a correct product finding: no execution-to-governance signal path produces verdicts for the seeded executor, and injecting synthetic verdicts is prohibited by the spec (matches #1026's own 'Blocked by: representative agents E5.2/E8.13'; retry-4's maker had implemented it anyway, likely via the now-forbidden injection). Platform verdict: every stage now works end to end (policy, verification, prechecks, spec, maker in a clean worktree on the pinned model); the remaining gap is issue selection. Operator: cancelled the #1026 loop (backlog-cancel -> campaign 44e4bfd3 CANCELLED, reconciler disabled policy 11:56:14) and chose #993 [E8.1] Import ingestion (delta added, no stated blocker, R1; the dependency #1025 waits on). issue-start musematic source 993 STARTED loop backlog-loop-musematic-94a83947-...-95367660 (campaign 94a83947; revalidation first). Other dependency-free candidates: #992, #1017, #1022."
+  },
+  {
+   "phase": "3-993-first-commit-and-real-review-new39",
+   "started": "2026-09-23T12:05:00Z",
+   "status": "in_progress",
+   "notes": "#993 (campaign 94a83947, loop ...-95367660): verification CONFIRMED; PRECHECKS_PASS; spec SUCCESS first try; source maker (Codex gpt-5.6-terra) decision COMPLETE and COMMITTED b030627f (7 files: migration 142 workflow_import_artifacts with RLS, import_service.py, router.py, unit tests, web page + hook, OpenSpec delta) -- NEW-37 CONFIRMED LIVE, first committed implementation of the engagement; deployment maker completed; independent checker (Claude, code-reviewer) returned REQUEST_CHANGES with substantive, correct findings (MAJOR: upload size cap runs only after FastAPI spools the multipart body and DebugCaptureMiddleware buffers every body, so the pre-read DoS control is ineffective; five issues total); validate_changeset REQUEST_CHANGES INDEPENDENT_CHECKER_DID_NOT_PASS -> correction attempt 2 started. NEW-39: correction attempts restart from the base (NEW-38) with a maker prompt holding only the OpenSpec -- the checker's findings never reached the next maker (blind reruns up to 5x). FIX: _prepare_maker looks up the ChangeSet's latest code-reviewer invocation from an earlier attempt and, if REQUEST_CHANGES, adds its findings + summary (bounded 20 items / 12000 chars) to the maker prompt as must-fix items. Test (fails without). 816 tests. Git-only; attempt 2 was in its spec step at commit time."
   }
  ],
  "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
@@ -302,5 +308,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "Follow #993: revalidation -> prechecks -> spec -> maker commit -> deployment maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO. If blocked on product grounds, next candidates #992/#1017."
+ "next_action_on_resume": "1) Operator deploys HEAD (attempt 2's maker picks up NEW-39 if not started; otherwise the next attempt does). 2) Follow correction attempts -> checker PASS -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }

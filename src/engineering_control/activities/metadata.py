@@ -2806,6 +2806,35 @@ class MetadataActivityHandler:
             "openspec_document": structured,
         }
 
+    def _prior_checker_findings(self, change_set_id: UUID, workflow_id: str) -> list[str]:
+        """Findings of the latest checker that requested changes on an earlier attempt."""
+        with self.sessions() as session:
+            row = session.execute(
+                select(AgentInvocation.structured_result)
+                .join(Run, AgentInvocation.run_id == Run.id)
+                .where(
+                    Run.change_set_id == change_set_id,
+                    Run.workflow_id != workflow_id,
+                    AgentInvocation.role == "code-reviewer",
+                )
+                .order_by(AgentInvocation.started_at.desc())
+                .limit(1)
+            ).first()
+        structured = row[0] if row is not None and isinstance(row[0], dict) else {}
+        if structured.get("decision") != "REQUEST_CHANGES":
+            return []
+        items = [str(item) for item in structured.get("findings") or []][:20]
+        if structured.get("summary"):
+            items.append(f"Checker summary: {structured['summary']}")
+        bounded: list[str] = []
+        budget = 12000
+        for item in items:
+            if budget <= 0:
+                break
+            bounded.append(item[:budget])
+            budget -= len(item)
+        return bounded
+
     def _prepare_maker(self, payload: dict[str, Any], *, deployment: bool) -> dict[str, Any]:
         provider = Provider(str(payload["maker_provider"]))
         change_set_id = UUID(str(payload["change_set_id"]))
@@ -2829,6 +2858,15 @@ class MetadataActivityHandler:
             f"OpenSpec: {json.dumps(payload['openspec_document'], sort_keys=True)}\n"
             f"Prior source maker result: {json.dumps(prior, sort_keys=True, default=str)}\n"
         )
+        correction = self._prior_checker_findings(change_set_id, workflow_id)
+        if correction:
+            # NEW-39: correction attempts restart from the base (NEW-38) and previously
+            # never saw why the independent checker requested changes.
+            derived_content += (
+                "Independent checker findings on the previous attempt of this ChangeSet "
+                "(the worktree was reset to base; address every finding):\n"
+                + "".join(f"- {item}\n" for item in correction)
+            )
         prompt = (
             f"Implement only the {target} repository portion of one bounded ChangeSet. "
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
