@@ -743,3 +743,25 @@ def test_owner_expiry_also_expires_orphaned_inventory_approvals(tmp_path: Path) 
     with Session(engine) as session:
         assert session.get(GitHubBacklogCampaign, owner_id).status == "EXPIRED"
         assert session.get(GitHubBacklogCampaign, inventory_id).status == "EXPIRED"
+
+
+def test_install_policy_is_0640_under_the_units_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NEW-25: the reconciler unit runs with UMask=0077, which turned os.open's 0o640 into
+    # 0o600. Its own validate_current_policy and the GitHub worker then rejected the policy
+    # it had just installed, failing every later run and blocking PR writes.
+    import stat
+
+    monkeypatch.setattr(os, "chown", lambda *args, **kwargs: None)
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("enabled: false\nsafe_repositories: []\n", encoding="utf-8")
+
+    previous = os.umask(0o077)
+    try:
+        SCRIPT["install_policy"](policy, tmp_path / "backups", os.getgid(), enabled=True)
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(policy.stat().st_mode) == 0o640
+    assert "enabled: true" in policy.read_text(encoding="utf-8")

@@ -414,6 +414,9 @@ def install_policy(path: Path, backup_root: Path, group_id: int, *, enabled: boo
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(content)
             stream.flush()
+            # The unit runs with UMask=0077, which silently turned os.open's 0o640 into
+            # 0o600; validate_current_policy and the GitHub worker both require 0o640.
+            os.fchmod(stream.fileno(), 0o640)
             os.fsync(stream.fileno())
         os.chown(temporary, 0, group_id)
         os.replace(temporary, path)
