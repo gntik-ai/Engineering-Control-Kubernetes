@@ -140,6 +140,15 @@ class ClaudeCLIAdapter:
                 result_text = event.get("result")
                 if isinstance(result_text, str):
                     summary = str(SecretRedactor().redact_text(result_text).value)
+                elif event.get("is_error") or event.get("subtype") not in {None, "success"}:
+                    # NEW-31: error results (max turns, structured-output retries, ...)
+                    # carry no "result" text, so the reason was lost and only an
+                    # unrelated stderr warning reached the run summary.
+                    errors = event.get("errors")
+                    detail = f"claude result {event.get('subtype') or 'error'}"
+                    if isinstance(errors, list) and errors:
+                        detail += ": " + "; ".join(str(error) for error in errors)[:2000]
+                    summary = str(SecretRedactor().redact_text(detail).value)
         return structured, summary, session_id
 
     @staticmethod

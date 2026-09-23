@@ -107,3 +107,36 @@ def test_claude_usage_ignores_malformed_or_redacted_counters() -> None:
     assert usage.input_tokens is None
     assert usage.output_tokens is None
     assert usage.cached_input_tokens is None
+
+
+def test_error_result_reason_reaches_the_run_summary() -> None:
+    # NEW-31: a live spec run (musematic #1026) exited 1 after 10 minutes; the error
+    # result event had no "result" text, so the summary showed only an unrelated stderr
+    # warning and the real reason was lost.
+    structured, summary, session_id = ClaudeCLIAdapter._final(
+        (
+            {"type": "system", "session_id": "s-1"},
+            {
+                "type": "result",
+                "subtype": "error_max_structured_output_retries",
+                "is_error": True,
+                "errors": ["structured output did not match the schema"],
+                "session_id": "s-1",
+            },
+        )
+    )
+
+    assert structured == {}
+    assert session_id == "s-1"
+    assert summary == (
+        "claude result error_max_structured_output_retries: "
+        "structured output did not match the schema"
+    )
+
+
+def test_successful_result_text_is_still_the_summary() -> None:
+    _, summary, _ = ClaudeCLIAdapter._final(
+        ({"type": "result", "subtype": "success", "result": "done"},)
+    )
+
+    assert summary == "done"

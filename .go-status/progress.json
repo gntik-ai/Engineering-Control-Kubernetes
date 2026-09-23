@@ -2,7 +2,7 @@
  "mission": "GO status remediation for engineering-control",
  "branch": "go-status/2026-09-17",
  "started": "2026-09-17",
- "phase": "3-first-delivery-past-prechecks-new29-new30",
+ "phase": "3-delivery-reaches-spec-issue-selection-new31",
  "phase_history": [
   {
    "phase": "0-discovery",
@@ -195,11 +195,17 @@
    "started": "2026-09-23T06:40:00Z",
    "status": "complete",
    "notes": "Operator deployed 0cf73a3 (NEW-28). Campaign 56c609e8 (--max-items 2): #1025 CONFIRMED; delivery PRECHECKS_PASS (NEW-28 confirmed live -- first delivery ever past prechecks), prepare_spec SPEC_READY, invoke_spec SUCCESS (spec architect decision READY), then FAILED at delivery.create_openspec: 'OpenSpec requires a ChangeSet with a GitHub issue'. NEW-29: the backlog flow links the existing Issue row to the finding (engineering.py backlog-existing-issue) but ChangeSet.issue_id was only ever bound by the finding-publication path (metadata.py), so revalidated backlog issues never had one. FIXED in load_confirmed_finding: bind the finding's Issue to the ChangeSet (fail closed if bound to a different issue); regression test runs load_confirmed_finding -> create_openspec (fails without with the exact production error). NEW-30: backlog-stop-after-current returned BLOCKED 'unsupported control signal' -- TemporalControlService.signal's allowlist lacked pause_after_current/stop_after_current although the workflow defines both and the command bus/CLI/Telegram offer them; neither control has ever worked. CORRECTION: the earlier 'stopped cleanly after #1026' on 51bdd717 was NOT the stop signal -- that loop ended because #1027/#1028 block immediately (CURRENT_RUNTIME_REVALIDATION_REQUIRED). FIXED allowlist + tests. 797 tests. Both git-only."
+  },
+  {
+   "phase": "3-delivery-reaches-spec-issue-selection-new31",
+   "started": "2026-09-23T07:35:00Z",
+   "status": "complete",
+   "notes": "Operator deployed bbc6150. NEW-30 CONFIRMED LIVE (stop_after_current returned STARTED, signal present in loop history). Campaign 44e4bfd3 (--max-items 2): #1025 delivery PRECHECKS_PASS -> spec -> create_openspec ran (NEW-29 confirmed: no ChangeSet error) and returned BLOCKED SPEC_ARCHITECT_BLOCKED -- a legitimate agent judgment, not a platform bug: #1025's body says 'Blocked by: E8.1' (the import feature it hardens is not on main) and its 'delta: modified' base change exists only on unmerged branch claude/issues-openspec-milestone-rnxqcp. Prior run's spec agent said READY for the same issue (agent inconsistency; BLOCKED is the defensible call). #1026 (E9.1, delta: added, soft dep 'representative agents available E5.2/E8.13') delivery PRECHECKS_PASS, then invoke_spec FAILED PROVIDER_EXIT_NONZERO (claude, 10m31s, 45k output tokens, empty structured result); the run summary held only an unrelated stderr warning (Claude correctly ignoring the repo's untrusted .claude/settings.local.json). NEW-31 (diagnostic): ClaudeCLIAdapter._final discarded the error result event's subtype/errors; now surfaced in the summary. Tests (fail without). 799 tests. Git-only. Loop COMPLETED cleanly. Remaining GO gap is now issue selection + one unexplained Claude spec exit."
   }
  ],
- "gate": "Delivery now passes prechecks and the spec agent. NEW-29 (ChangeSet not bound to backlog issue -> create_openspec refused) and NEW-30 (after-current controls refused) fixed git-only.",
+ "gate": "Delivery pipeline runs cleanly through prechecks, spec and create_openspec. #1025 legitimately blocked on dependency E8.1; #1026 spec run failed once with an unexplained Claude exit (NEW-31 diagnostic fix, git-only).",
  "remaining_blockers": [
-  "NEW-29/NEW-30 git-only, not deployed; then retry and follow delivery through create_openspec, makers, checker, validate_changeset, publish."
+  "No PR yet: need an issue whose dependencies are met and a spec run that completes. NEW-31 git-only."
  ],
  "pending_operator_actions": [
   "Deploy NEW-21's fix, then retry llmwiki/falcone/musematic until one clears delivery prechecks end to end and produces an actual PR",
@@ -224,5 +230,5 @@
  },
  "findings_file": ".go-status/findings.json",
  "last_action": "Policy enabled for the first time; found + fixed NEW-25 (umask); diagnosed NEW-26 (solve_backlog re-approves then races the reconciler). Watching 8034e576.",
- "next_action_on_resume": "1) Operator deploys HEAD. 2) Retry musematic --max-items 2. 3) Follow delivery past create_openspec -> maker -> deployment maker -> checker -> validate_changeset (baseline delta) -> publish -> PR. 4) PR + merge policy -> GATE 3 GO."
+ "next_action_on_resume": "1) Operator deploys HEAD (NEW-31). 2) Retry #1026 alone via engineering-ctl issue-start musematic source 1026 (avoids re-running #1025), or pick a dependency-free issue. 3) If spec READY: follow maker -> checker -> validate_changeset -> publish -> PR -> GATE 3 GO."
 }
