@@ -2581,6 +2581,21 @@ class MetadataActivityHandler:
             run = session.get(Run, UUID(str(raw_run_id)))
             if run is not None:
                 self._release_implementation_leases(session, run)
+                # NEW-32: worktree leases (8h) were never released on these stop
+                # paths, so every retry or correction attempt of the same ChangeSet
+                # conflicted. Once a PR exists the lease stays for the release path.
+                change_set = (
+                    session.get(ChangeSet, run.change_set_id) if run.change_set_id else None
+                )
+                if change_set is None or change_set.source_pr_url is None:
+                    now = datetime.now(UTC)
+                    for lease in session.scalars(
+                        select(WorktreeLease).where(
+                            WorktreeLease.owner_run_id == run.id,
+                            WorktreeLease.released_at.is_(None),
+                        )
+                    ).all():
+                        lease.released_at = now
         return {**payload, "status": "LEASES_RELEASED"}
 
     def _route_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2642,11 +2657,31 @@ class MetadataActivityHandler:
         )
         expires_at = datetime.now(UTC) + timedelta(hours=8)
         lease_ids: list[str] = []
+        now = datetime.now(UTC)
         with self.sessions.begin() as session:
             for repository, worktree_path, branch, base_sha in records:
                 expected_path = expected_root / repository / str(change_set_id)
                 if PurePosixPath(worktree_path) != expected_path:
                     raise ValueError("worktree lease path does not match its ChangeSet allocation")
+                identity = uuid5(NAMESPACE_URL, f"worktree-lease:{change_set_id}:{repository}")
+                prior = session.get(WorktreeLease, identity)
+                prior_expires = prior.expires_at if prior is not None else None
+                if prior_expires is not None and prior_expires.tzinfo is None:
+                    prior_expires = prior_expires.replace(tzinfo=UTC)
+                if prior is not None and (
+                    prior.released_at is not None
+                    or (prior_expires is not None and prior_expires <= now)
+                ):
+                    # NEW-32: the lease id is fixed per ChangeSet+repository, so a new
+                    # run must reclaim a released or expired row, not insert a duplicate.
+                    prior.owner_run_id = owner_run_id
+                    prior.worktree_path = worktree_path
+                    prior.branch = branch
+                    prior.base_sha = base_sha
+                    prior.expires_at = expires_at
+                    prior.released_at = None
+                    lease_ids.append(str(identity))
+                    continue
                 existing = session.scalar(
                     select(WorktreeLease).where(
                         WorktreeLease.change_set_id == change_set_id,
@@ -2664,7 +2699,6 @@ class MetadataActivityHandler:
                         raise ValueError("active worktree lease conflicts with this delivery run")
                     lease_ids.append(str(existing.id))
                     continue
-                identity = uuid5(NAMESPACE_URL, f"worktree-lease:{change_set_id}:{repository}")
                 lease = WorktreeLease(
                     id=identity,
                     change_set_id=change_set_id,

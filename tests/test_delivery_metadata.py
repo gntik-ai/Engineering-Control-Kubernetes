@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -12,7 +12,7 @@ from sqlalchemy import select
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import ChangeSet, ComponentLease, Run
+from engineering_control.db.models import ChangeSet, ComponentLease, Run, WorktreeLease
 
 
 def release_impact(
@@ -425,3 +425,122 @@ async def test_source_pr_persists_with_deployment_bound_but_deferred(tmp_path: P
         assert change_set.deployment_head_sha == deployment_head
         assert change_set.deployment_pr_url is None
         assert run is not None and run.status == "SUCCESS"
+
+
+def _lease_fixture(tmp_path: Path) -> tuple[MetadataActivityHandler, dict[str, str]]:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'worktree-lease.sqlite'}",
+            worktree_root=tmp_path / "worktrees",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    change_set_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="musematic",
+                risk_class="R1",
+                state="IMPLEMENTING",
+                version=1,
+                source_repository="musematic",
+                source_branch=None,
+                source_base_sha="a" * 40,
+                source_head_sha=None,
+                source_pr_url=None,
+                deployment_repository="musematic-deploy",
+                deployment_branch=None,
+                deployment_base_sha="c" * 40,
+                deployment_head_sha=None,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+            )
+        )
+    root = tmp_path / "worktrees"
+    allocation = {
+        "change_set_id": str(change_set_id),
+        "source_repository": "musematic",
+        "source_worktree": str(root / "musematic" / str(change_set_id)),
+        "source_branch": f"agent/musematic/1026/{change_set_id}",
+        "source_base_sha": "a" * 40,
+        "deployment_repository": "musematic-deploy",
+        "deployment_worktree": str(root / "musematic-deploy" / str(change_set_id)),
+        "deployment_branch": f"agent/musematic-deploy/1026/{change_set_id}",
+        "deployment_base_sha": "c" * 40,
+    }
+    return handler, allocation
+
+
+def _delivery_run(handler: MetadataActivityHandler, change_set_id: str) -> str:
+    run_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=UUID(change_set_id),
+                workflow_id=f"delivery-{run_id}",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project="musematic",
+            )
+        )
+    return str(run_id)
+
+
+@pytest.mark.asyncio
+async def test_a_retry_reclaims_worktree_leases_released_by_a_stopped_delivery(
+    tmp_path: Path,
+) -> None:
+    # NEW-32: musematic #1026's first delivery stopped at the spec step and kept its 8h
+    # worktree leases, so the retry failed with "active worktree lease conflicts with
+    # this delivery run"; after a release, the fixed lease id also collided on insert.
+    handler, allocation = _lease_fixture(tmp_path)
+    first = _delivery_run(handler, allocation["change_set_id"])
+    second = _delivery_run(handler, allocation["change_set_id"])
+    await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": first})
+
+    released = await handler.handle("delivery.release_leases", {"run_id": first})
+    retried = await handler.handle(
+        "delivery.persist_worktree_leases", {**allocation, "run_id": second}
+    )
+
+    assert released["status"] == "LEASES_RELEASED"
+    assert retried["status"] == "WORKTREE_LEASES_PERSISTED"
+    with handler.sessions() as session:
+        leases = session.scalars(select(WorktreeLease)).all()
+    assert len(leases) == 2
+    assert all(str(lease.owner_run_id) == second and lease.released_at is None for lease in leases)
+
+
+@pytest.mark.asyncio
+async def test_an_active_worktree_lease_of_another_run_still_conflicts(tmp_path: Path) -> None:
+    handler, allocation = _lease_fixture(tmp_path)
+    first = _delivery_run(handler, allocation["change_set_id"])
+    second = _delivery_run(handler, allocation["change_set_id"])
+    await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": first})
+
+    with pytest.raises(Exception) as caught:
+        await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": second})
+    assert "active worktree lease conflicts" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
+async def test_worktree_leases_are_kept_once_a_pull_request_exists(tmp_path: Path) -> None:
+    handler, allocation = _lease_fixture(tmp_path)
+    run = _delivery_run(handler, allocation["change_set_id"])
+    await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": run})
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.source_pr_url = "https://github.com/gntik-ai/musematic/pull/1"
+
+    await handler.handle("delivery.release_leases", {"run_id": run})
+
+    with handler.sessions() as session:
+        leases = session.scalars(select(WorktreeLease)).all()
+    assert leases and all(lease.released_at is None for lease in leases)
