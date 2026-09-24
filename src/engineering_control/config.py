@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     uv_executable: Path = Path("/usr/local/bin/uv")
     toolchain_pnpm_executable: Path = Path("/usr/local/bin/pnpm")
     python312_executable: Path = Path("/usr/local/bin/python3.12")
+    # NEW-49: contract test commands are wrapped in coreutils timeout (NEW-46).
+    timeout_executable: Path = Path("/usr/bin/timeout")
     # Must sit under the scan worker unit's ReadWritePaths (/srv/engineering/cache/%i).
     toolchain_cache_root: Path = Path("/srv/engineering/cache/scan/toolchain")
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")

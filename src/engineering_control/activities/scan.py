@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -27,10 +30,15 @@ from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
 from engineering_control.engineering.configuration import EngineeringCatalog
-from engineering_control.engineering.models import ProjectPairSnapshot, ToolchainPolicy
+from engineering_control.engineering.models import (
+    ProjectPairSnapshot,
+    ToolchainPolicy,
+    ToolchainTestCommand,
+)
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
     load_toolchain_policy,
+    match_toolchain_test_command,
     prepare_executables,
     render_argv,
 )
@@ -49,6 +57,9 @@ from engineering_control.worktrees.manager import (
 _T = TypeVar("_T")
 _TOOLCHAIN_STDERR_TAIL = 2000
 _TOOLCHAIN_HEARTBEAT_SECONDS = 30.0
+_BASELINE_TEST_TIMEOUT_SECONDS = 1200
+_BASELINE_OUTPUT_TAIL = 500
+_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class WorktreeAllocationRequest(BaseModel):
@@ -160,6 +171,7 @@ class ScanActivityHandler:
         promotion_runner: SafeCommandRunner | None = None,
         toolchain_runner: SafeCommandRunner | None = None,
         git_runner: SafeCommandRunner | None = None,
+        baseline_runner: SafeCommandRunner | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager or GitWorktreeManager(
@@ -189,6 +201,8 @@ class ScanActivityHandler:
         # delivery.prepare_toolchain: only the allowlisted installers, never a shell.
         self.toolchain_runner = toolchain_runner or SafeCommandRunner(prepare_executables(settings))
         self.git_runner = git_runner or SafeCommandRunner({"git": settings.git_executable})
+        # NEW-49: None builds a per-command allowlist (see _baseline_executables).
+        self.baseline_runner = baseline_runner
         self.catalog = EngineeringCatalog(
             project_root=settings.project_config_root,
             persona_root=settings.persona_config_root,
@@ -235,7 +249,11 @@ class ScanActivityHandler:
             if step == "reconcile.apply_promotion":
                 return await asyncio.to_thread(self._apply_promotion, payload)
             if step == "delivery.validate_changeset":
-                return await asyncio.to_thread(self._validate_changeset, payload)
+                # NEW-49: may run the maker-test baseline (prepare + tests) at the base commit.
+                return await self._with_heartbeat(
+                    asyncio.to_thread(self._validate_changeset, payload),
+                    phase="changeset_validation",
+                )
             if step == "observability.prepare_workspace":
                 return await asyncio.to_thread(self._prepare_observability_workspace, payload)
             if step == "observability.cleanup_workspace":
@@ -1323,7 +1341,7 @@ class ScanActivityHandler:
         }
 
     @staticmethod
-    async def _with_heartbeat(work: Awaitable[_T]) -> _T:
+    async def _with_heartbeat(work: Awaitable[_T], phase: str = "toolchain_prepare") -> _T:
         """Keep a long blocking step alive against the workflow's 2-minute heartbeat timeout."""
         task = asyncio.ensure_future(work)
         try:
@@ -1332,7 +1350,7 @@ class ScanActivityHandler:
                 if done:
                     return task.result()
                 try:
-                    activity.heartbeat({"phase": "toolchain_prepare"})
+                    activity.heartbeat({"phase": phase})
                 except RuntimeError:
                     pass  # not running inside an activity (unit tests)
         except asyncio.CancelledError:
@@ -1546,6 +1564,220 @@ class ScanActivityHandler:
         if self._git_status(worktree, ignored=False) != before:
             raise ValueError("toolchain cleanup changed tracked or non-ignored worktree files")
 
+    def _preexisting_test_failures(
+        self, payload: dict[str, Any], failed_commands: list[str]
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """NEW-49: evidence that every failing maker command also fails at the base commit.
+
+        Returns (None, None) when a FAIL is not eligible (no contract, a non-contract
+        command, or the command passes at the base) and (None, error) when the baseline
+        could not be established; both keep MAKER_TEST_FAILURE.
+        """
+        project = str(payload.get("project", ""))
+        try:
+            policy = enabled_toolchain(self.settings.project_config_root, project)
+        except (OSError, ValueError):
+            return None, None
+        if policy is None:
+            return None, None
+        source = Path(str(payload.get("source_worktree", "")))
+        commands: list[ToolchainTestCommand] = []
+        for reported in failed_commands:
+            command = match_toolchain_test_command(policy, reported, self.settings, worktree=source)
+            if command is None:
+                return None, None
+            if command not in commands:
+                commands.append(command)
+        base_sha = str(payload.get("source_base_sha", ""))
+        try:
+            results = self._baseline_test_results(
+                project, str(payload["source_repository"]), base_sha, policy, commands
+            )
+        except (
+            CommandFailure,
+            KeyError,
+            OSError,
+            ValueError,
+            WorktreeError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            detail = f"{type(error).__name__}: {error}"
+            return None, str(SecretRedactor().redact_text(detail).value)[-_TOOLCHAIN_STDERR_TAIL:]
+        evidence: list[dict[str, Any]] = []
+        for command, result in zip(commands, results, strict=True):
+            if result["exit_code"] == 0:
+                return None, None  # the change introduced this failure
+            evidence.append(
+                {
+                    "command": f"cd {command.cwd} && {shlex.join(result['argv'])}",
+                    "base_sha": base_sha,
+                    "base_exit_code": result["exit_code"],
+                    "base_output_tail": result["output_tail"],
+                }
+            )
+        return evidence, None
+
+    @staticmethod
+    def _baseline_key(cwd: str, argv: list[str]) -> str:
+        return json.dumps({"argv": argv, "cwd": cwd}, sort_keys=True)
+
+    @staticmethod
+    def _cached_baseline_results(path: Path) -> dict[str, dict[str, Any]]:
+        if not path.is_file():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}  # a torn or foreign file is recomputed, never trusted
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            key: value
+            for key, value in raw.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("exit_code"), int)
+            and isinstance(value.get("argv"), list)
+        }
+
+    def _baseline_test_results(
+        self,
+        project: str,
+        repository: str,
+        base_sha: str,
+        policy: ToolchainPolicy,
+        commands: list[ToolchainTestCommand],
+    ) -> list[dict[str, Any]]:
+        """Run the contract commands at the base once per (project, base, argv), then cache."""
+        if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
+            raise ValueError("the maker test baseline requires the source base commit")
+        root = self.settings.toolchain_cache_root / "baselines" / Project(project).value / base_sha
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        results_path = root / "results.json"
+        keys = [
+            self._baseline_key(command.cwd, render_argv(command.argv, self.settings))
+            for command in commands
+        ]
+        with (root / ".lock").open("a") as lock:
+            # Concurrent ChangeSets on the same base wait for one checkout and one run.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            cached = self._cached_baseline_results(results_path)
+            if any(key not in cached for key in keys):
+                worktree = self._baseline_worktree(root, repository, base_sha, policy)
+                environment = {
+                    **self._toolchain_environment(),
+                    "PATH": f"{self.settings.toolchain_pnpm_executable.parent}:{_DEFAULT_PATH}",
+                    # As for the agents (NEW-48), so mypy runs as it did for the maker.
+                    "MYPY_CACHE_DIR": "/dev/null",
+                }
+                for command, key in zip(commands, keys, strict=True):
+                    if key not in cached:
+                        cached[key] = self._run_baseline_test(worktree, command, environment)
+                        self._atomic_text(
+                            results_path, json.dumps(cached, indent=2, sort_keys=True)
+                        )
+            return [cached[key] for key in keys]
+
+    def _baseline_worktree(
+        self, root: Path, repository: str, base_sha: str, policy: ToolchainPolicy
+    ) -> Path:
+        """A detached, toolchain-prepared checkout of base_sha owned by the scan worker."""
+        worktree = root / "worktree"
+        prepared = root / "prepared"
+        if prepared.is_file() and worktree.is_dir() and not worktree.is_symlink():
+            if self._git(worktree, ["rev-parse", "HEAD"]).strip() == base_sha:
+                return worktree
+        prepared.unlink(missing_ok=True)
+        if worktree.is_symlink():
+            raise ValueError("baseline worktree must not be a symlink")
+        if worktree.exists():
+            shutil.rmtree(worktree)  # a partial checkout or prepare from an earlier attempt
+        mirror = self.manager.verify_mirror(repository)
+        # --shared: objects are read from the canonical mirror, which is never written.
+        self.git_runner.run(
+            "git",
+            [
+                "-c",
+                f"safe.directory={mirror}",
+                "clone",
+                "--shared",
+                "--no-checkout",
+                "--quiet",
+                str(mirror),
+                str(worktree),
+            ],
+            cwd=root,
+            timeout_seconds=900,
+            environment={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+        self._git(worktree, ["checkout", "--detach", "--quiet", base_sha], timeout_seconds=900)
+        if self._git(worktree, ["rev-parse", "HEAD"]).strip() != base_sha:
+            raise ValueError("baseline checkout does not match the source base commit")
+        environment = self._toolchain_environment()
+        resolved_root = worktree.resolve()
+        for command in policy.prepare:
+            cwd = (worktree / command.cwd).resolve()
+            if not cwd.is_relative_to(resolved_root) or not cwd.is_dir():
+                raise ValueError(f"baseline prepare cwd {command.cwd!r} is not in the checkout")
+            argv = render_argv(command.argv, self.settings)
+            result = self.toolchain_runner.run(
+                argv[0],
+                argv[1:],
+                cwd=cwd,
+                timeout_seconds=command.timeout_seconds,
+                environment=environment,
+                check=False,
+            )
+            if result.return_code:
+                raise ValueError(
+                    f"baseline prepare {argv[0]} failed with {result.return_code}: "
+                    + (result.stderr.strip() or result.stdout)[-_TOOLCHAIN_STDERR_TAIL:]
+                )
+        prepared.write_text(f"{base_sha}\n", encoding="utf-8")
+        return worktree
+
+    def _baseline_executables(self, root: Path, cwd: Path, executable: str) -> dict[str, Path]:
+        """Contract test commands may run the installers, timeout, or a checkout-local tool."""
+        executables = {
+            **prepare_executables(self.settings),
+            "timeout": self.settings.timeout_executable,
+        }
+        if "/" in executable:
+            # normpath, not resolve: .venv/bin entries may be symlinks to the interpreter.
+            local = Path(os.path.normpath(cwd / executable))
+            if not local.is_relative_to(root) or not local.is_file():
+                raise ValueError(f"baseline test executable {executable!r} is not in the checkout")
+            executables[executable] = local
+        return executables
+
+    def _run_baseline_test(
+        self, worktree: Path, command: ToolchainTestCommand, environment: dict[str, str]
+    ) -> dict[str, Any]:
+        root = worktree.resolve()
+        cwd = (worktree / command.cwd).resolve()
+        if not cwd.is_relative_to(root) or not cwd.is_dir():
+            raise ValueError(f"baseline test cwd {command.cwd!r} is not in the checkout")
+        argv = render_argv(command.argv, self.settings)
+        runner = self.baseline_runner or SafeCommandRunner(
+            self._baseline_executables(root, cwd, argv[0])
+        )
+        # argv is normally timeout-wrapped (NEW-46); this bound also covers unwrapped ones.
+        result = runner.run(
+            argv[0],
+            argv[1:],
+            cwd=cwd,
+            timeout_seconds=_BASELINE_TEST_TIMEOUT_SECONDS,
+            environment=environment,
+            check=False,
+        )
+        # Only the exit code and a short tail of the (already redacted) output are kept.
+        output = str(SecretRedactor().redact_text(f"{result.stdout}\n{result.stderr}").value)
+        return {
+            "cwd": command.cwd,
+            "argv": argv,
+            "exit_code": result.return_code,
+            "output_tail": output.strip()[-_BASELINE_OUTPUT_TAIL:],
+        }
+
     def _validate_changeset(self, payload: dict[str, Any]) -> dict[str, Any]:
         checker = payload.get("agent_result")
         if not isinstance(checker, dict) or not isinstance(checker.get("structured_result"), dict):
@@ -1556,19 +1788,37 @@ class ScanActivityHandler:
                 "status": "REQUEST_CHANGES",
                 "blocker": "INDEPENDENT_CHECKER_DID_NOT_PASS",
             }
+        failed_commands: list[str] = []
         for key in ("source_maker_result", "deployment_maker_result"):
             maker = payload.get(key)
             if not isinstance(maker, dict) or not isinstance(maker.get("structured_result"), dict):
+                if failed_commands:
+                    return {**payload, "status": "BLOCKED", "blocker": "MAKER_TEST_FAILURE"}
                 raise ValueError(f"ChangeSet validation requires {key}")
             tests = maker["structured_result"].get("tests")
-            if not isinstance(tests, list) or any(
-                isinstance(test, dict) and test.get("status") == "FAIL" for test in tests
-            ):
-                return {
+            if not isinstance(tests, list):
+                return {**payload, "status": "BLOCKED", "blocker": "MAKER_TEST_FAILURE"}
+            failed_commands.extend(
+                str(test.get("command", ""))
+                for test in tests
+                if isinstance(test, dict) and test.get("status") == "FAIL"
+            )
+        if failed_commands:
+            # NEW-49: the independent checker PASSed (above). A maker FAIL still blocks
+            # unless every failing command is a contract test command that the scan
+            # worker also sees fail at the source BASE commit (a pre-existing failure,
+            # e.g. #993's mypy error in an untouched file). Anything else fails closed.
+            preexisting, baseline_error = self._preexisting_test_failures(payload, failed_commands)
+            if preexisting is None:
+                maker_blocked: dict[str, Any] = {
                     **payload,
                     "status": "BLOCKED",
                     "blocker": "MAKER_TEST_FAILURE",
                 }
+                if baseline_error is not None:
+                    maker_blocked["baseline_error"] = baseline_error
+                return maker_blocked
+            payload = {**payload, "preexisting_test_failures": preexisting}
         change_set_id = UUID(str(payload["change_set_id"]))
         evidence_root = self.settings.evidence_root / "scan" / str(change_set_id) / "changes"
         evidence_root.mkdir(parents=True, exist_ok=True, mode=0o750)

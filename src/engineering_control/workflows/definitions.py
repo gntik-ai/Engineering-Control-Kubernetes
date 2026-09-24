@@ -960,6 +960,11 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                         # Up to 10 bounded installs of <= 3600 s each; the handler
                         # heartbeats while they run.
                         context = await self._step(step, step_payload, timeout_minutes=90)
+                    elif step == "delivery.validate_changeset":
+                        # NEW-49: may prepare a base-commit checkout (<= 80 min contract
+                        # budget) and rerun failing test commands there; heartbeats. An
+                        # activity timeout is not part of replay, so no patch marker.
+                        context = await self._step(step, step_payload, timeout_minutes=120)
                     else:
                         context = await self._step(step, step_payload, timeout_minutes=30)
                 if step == "delivery.ensure_issue" and context.get("status") == "ISSUE_READY":
