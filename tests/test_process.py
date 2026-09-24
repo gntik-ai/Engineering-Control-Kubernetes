@@ -164,3 +164,4 @@ def test_agent_environment_leaves_no_unremovable_test_caches() -> None:
         environment = subscription_only_environment(provider)
         assert environment["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
         assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+        assert environment["MYPY_CACHE_DIR"] == "/dev/null"

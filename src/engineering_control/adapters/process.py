@@ -65,6 +65,9 @@ def subscription_only_environment(
     # bytecode: nothing an agent's test run leaves behind is unremovable.
     env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # NEW-48: a worktree .mypy_cache written by the maker is not writable by the
+    # checker (another runner uid). /dev/null is mypy's documented "no cache".
+    env["MYPY_CACHE_DIR"] = "/dev/null"
     if overrides:
         disallowed = forbidden.intersection(overrides)
         if disallowed:
