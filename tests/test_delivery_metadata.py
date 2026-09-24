@@ -702,7 +702,7 @@ def test_makers_and_checker_are_told_to_run_the_prepared_toolchain_tests(
     assert "Toolchain prepared" not in deployment  # the deployment worktree has none
     if prepared:
         assert "`timeout --kill-after=30 900 .venv/bin/pytest --import-mode=importlib" in source
-        assert "`timeout --kill-after=30 900 pnpm exec vitest run`" in source
+        assert "`timeout --kill-after=30 900 pnpm exec vitest run --maxWorkers=2`" in source
         assert "in `apps/web`" in source
         assert "tests[] entry with its real status" in source
         assert "do not install anything (no network)" in source

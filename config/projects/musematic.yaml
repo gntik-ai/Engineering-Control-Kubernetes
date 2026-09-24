@@ -87,7 +87,8 @@ toolchain:
       argv: [timeout, --kill-after=30, "900", .venv/bin/mypy, src/platform]
       description: control-plane type check
     - cwd: apps/web
-      argv: [timeout, --kill-after=30, "900", pnpm, exec, vitest, run]
+      # NEW-47: bounded workers keep vitest inside the agent worker's memory cap.
+      argv: [timeout, --kill-after=30, "900", pnpm, exec, vitest, run, --maxWorkers=2]
       description: web unit tests
     - cwd: apps/web
       # --incremental false: a tsbuildinfo written by the maker is not writable by the checker.
