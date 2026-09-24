@@ -79,16 +79,19 @@ toolchain:
       timeout_seconds: 1200
   test_commands:
     - cwd: apps/control-plane
-      argv: [.venv/bin/pytest, --import-mode=importlib, --ignore=tests/integration, --ignore=tests/e2e, -q]
-      description: control-plane unit tests
+      # NEW-46: in the maker's no-network sandbox this suite has hung for 75+ min
+      # (the checker finishes it in ~5 min); a hard timeout keeps the maker's budget.
+      argv: [timeout, --kill-after=30, "900", .venv/bin/pytest, --import-mode=importlib, --ignore=tests/integration, --ignore=tests/e2e, -q]
+      description: control-plane unit tests (exit 124 = timed out after 15 min; report it, do not rerun the full suite)
     - cwd: apps/control-plane
-      argv: [.venv/bin/mypy, src/platform]
+      argv: [timeout, --kill-after=30, "900", .venv/bin/mypy, src/platform]
       description: control-plane type check
     - cwd: apps/web
-      argv: [pnpm, exec, vitest, run]
+      argv: [timeout, --kill-after=30, "900", pnpm, exec, vitest, run]
       description: web unit tests
     - cwd: apps/web
-      argv: [pnpm, exec, tsc, --noEmit]
+      # --incremental false: a tsbuildinfo written by the maker is not writable by the checker.
+      argv: [timeout, --kill-after=30, "900", pnpm, exec, tsc, --noEmit, --incremental, "false"]
       description: web type check
   cleanup_paths_ignored_only: true
 deployment_test_commands:

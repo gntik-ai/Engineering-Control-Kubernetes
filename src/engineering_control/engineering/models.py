@@ -161,6 +161,16 @@ _FORBIDDEN_TOOLCHAIN_COMMANDS = frozenset(
 )
 
 
+def _unwrapped_timeout_command(argv: list[str]) -> str:
+    """NEW-46: `timeout [--opt...] DURATION CMD ...` is checked as CMD."""
+    if argv[0] != "timeout":
+        return argv[0]
+    rest = [value for value in argv[1:] if not value.startswith("-")]
+    if len(rest) < 2:
+        raise ValueError("timeout must wrap a command")
+    return rest[1]
+
+
 def _repository_relative_cwd(value: str) -> str:
     if (
         not value
@@ -227,7 +237,8 @@ class ToolchainTestCommand(EngineeringModel):
     @field_validator("argv")
     @classmethod
     def fixed_command(cls, argv: list[str]) -> list[str]:
-        if argv[0] in _FORBIDDEN_TOOLCHAIN_COMMANDS or argv[0].startswith("/"):
+        command = _unwrapped_timeout_command(argv)
+        if command in _FORBIDDEN_TOOLCHAIN_COMMANDS or command.startswith("/"):
             raise ValueError("toolchain test commands must use fixed non-shell executables")
         return _bounded_arguments(argv)
 

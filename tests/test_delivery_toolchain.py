@@ -17,7 +17,11 @@ from pydantic import ValidationError
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandResult
 from engineering_control.config import Settings
-from engineering_control.engineering.models import ProjectManifest, ToolchainPolicy
+from engineering_control.engineering.models import (
+    ProjectManifest,
+    ToolchainPolicy,
+    ToolchainTestCommand,
+)
 from engineering_control.engineering.toolchain import load_toolchain_policy, render_argv
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -169,7 +173,12 @@ def test_prepare_installs_in_the_source_worktree_with_private_offline_caches(
     summary = result["toolchain_preparation"]
     assert summary["ignored_paths_created"] == ["apps/control-plane/.venv/", "node_modules/"]
     assert [item["status"] for item in summary["commands"]] == ["PASS", "PASS"]
-    assert summary["test_commands"][0]["argv"][0] == ".venv/bin/pytest"
+    assert summary["test_commands"][0]["argv"][:4] == [
+        "timeout",
+        "--kill-after=30",
+        "900",
+        ".venv/bin/pytest",
+    ]
     uv, pnpm = runner.calls
     assert uv["cwd"] == repo / "apps" / "control-plane"
     assert uv["arguments"][-2:] == ["--python", "/opt/python/bin/python3.12"]
@@ -363,3 +372,25 @@ def test_postchecks_do_not_clean_when_the_toolchain_is_disabled(tmp_path: Path) 
 
     assert scanner.seen == {str(repo): True}
     assert (repo / "node_modules" / "a.js").exists()
+
+
+@pytest.mark.parametrize(
+    ("argv", "allowed"),
+    [
+        (["timeout", "--kill-after=30", "900", ".venv/bin/pytest", "-q"], True),
+        (["timeout", "900", "pnpm", "exec", "vitest", "run"], True),
+        (["timeout", "--kill-after=30", "900", "bash", "-c", "true"], False),
+        (["timeout", "900", "/usr/bin/pytest"], False),
+        (["timeout", "900"], False),
+    ],
+)
+def test_timeout_wrapped_test_commands_check_the_wrapped_command(
+    argv: list[str], allowed: bool
+) -> None:
+    """NEW-46: a `timeout` wrapper must not hide a shell or absolute executable."""
+    command = {"cwd": ".", "argv": argv, "description": "tests"}
+    if allowed:
+        assert ToolchainTestCommand.model_validate(command).argv == argv
+    else:
+        with pytest.raises(ValidationError):
+            ToolchainTestCommand.model_validate(command)
