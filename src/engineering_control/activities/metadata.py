@@ -2863,19 +2863,41 @@ class MetadataActivityHandler:
             f"Prior source maker result: {json.dumps(prior, sort_keys=True, default=str)}\n"
         )
         correction = self._prior_checker_findings(change_set_id, workflow_id)
+        # NEW-52: the allocation kept the previous attempt's commits (they descend from
+        # the base), so the maker builds on them instead of re-implementing.
+        resumed = payload.get(f"{target}_resumed_from_sha")
+        resumed_from = resumed if isinstance(resumed, str) and self._is_git_sha(resumed) else None
         if correction:
             # NEW-39: correction attempts restart from the base (NEW-38) and previously
             # never saw why the independent checker requested changes.
             derived_content += (
-                "Independent checker findings on the previous attempt of this ChangeSet "
-                "(the worktree was reset to base; address every finding):\n"
-                + "".join(f"- {item}\n" for item in correction)
-            )
+                (
+                    "Independent checker findings on the previous attempt of this ChangeSet "
+                    f"(the worktree still contains that attempt's commits, HEAD {resumed_from}; "
+                    "fix every finding on top of that work):\n"
+                )
+                if resumed_from
+                else (
+                    "Independent checker findings on the previous attempt of this ChangeSet "
+                    "(the worktree was reset to base; address every finding):\n"
+                )
+            ) + "".join(f"- {item}\n" for item in correction)
+        resume_instruction = (
+            f"This {target} worktree already contains the previous attempt's committed work "
+            f"for this ChangeSet (HEAD {resumed_from}, on top of base "
+            f"{payload.get(f'{target}_base_sha')}). Do not re-implement or revert it: review "
+            "it, fix the remaining problems (including any checker findings listed below) on "
+            "top of it, and record your changes as an additional local commit on the "
+            "assigned branch.\n"
+            if resumed_from
+            else ""
+        )
         prompt = (
             f"Implement only the {target} repository portion of one bounded ChangeSet. "
             "Do not deploy, merge, push, read credentials, or alter unrelated files. Run bounded "
             "repository tests, then create one local commit on the assigned branch. Preserve all "
             "existing safety gates.\n"
+            + resume_instruction
             # NEW-41: a deployment maker blocked a finished source change because the
             # OpenSpec needed no deployment change and the deploy repo already contained
             # credential-like findings -- neither is a blocker under platform policy.
@@ -2935,6 +2957,22 @@ class MetadataActivityHandler:
             response["source_maker_result"] = prior
         return response
 
+    def _checker_range_prompt(self, payload: dict[str, Any]) -> str:
+        """NEW-52: a resumed ChangeSet spans several commits; review all of base..HEAD."""
+        ranges = [
+            f"{target} worktree: git diff {base}..HEAD"
+            for target in ("source", "deployment")
+            if isinstance(base := payload.get(f"{target}_base_sha"), str)
+            and self._is_git_sha(base)
+        ]
+        if not ranges:
+            return ""
+        return (
+            "Review the complete change relative to the base commit, which may span several "
+            "commits and earlier attempts (" + "; ".join(ranges) + "), not only the last "
+            "commit.\n"
+        )
+
     def _toolchain_prompt(self, payload: dict[str, Any], *, role: str) -> str:
         """Tell makers/the checker which prepared test commands to run (source worktree)."""
         try:
@@ -2986,6 +3024,7 @@ class MetadataActivityHandler:
             "Independently review both bounded worktrees for one ChangeSet. Do not modify files. "
             "Validate the OpenSpec, source and deployment diffs, tests, immutable image policy, "
             "and risk gates. Request changes on any uncertainty.\n"
+            + self._checker_range_prompt(payload)
             + self._toolchain_prompt(payload, role="checker")
             + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"

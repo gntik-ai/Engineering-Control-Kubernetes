@@ -612,3 +612,147 @@ def test_postchecks_fail_closed_to_absolute_gate_without_a_baseline(tmp_path: Pa
 
     assert validated["status"] == "BLOCKED"
     assert validated["change_evidence"]["source"]["diff_withheld"] is True
+
+
+class ResumingManager:
+    """NEW-52 allocation double: the source worktree resumes, the deployment does not."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.resume_flags: list[bool] = []
+
+    def allocate(self, **kwargs: Any) -> WorktreeAllocation:
+        self.resume_flags.append(kwargs["resume_prior_commits"])
+        repository = kwargs["repository"]
+        return WorktreeAllocation(
+            repository=repository,
+            path=self.root / repository,
+            branch=f"agent/{repository}",
+            base_sha=kwargs["expected_base_sha"],
+            change_set_id=kwargs["change_set_id"],
+            resumed_from_sha="d" * 40 if repository == "musematic" else None,
+        )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_allocation_threads_the_resume_setting_and_resumed_head(
+    tmp_path: Path, enabled: bool
+) -> None:
+    manager = ResumingManager(tmp_path)
+    handler = ScanActivityHandler(
+        Settings(delivery_resume_prior_commits=enabled),
+        manager,  # type: ignore[arg-type]
+    )
+    request = {
+        "change_set_id": str(uuid4()),
+        "project": "musematic",
+        "issue": "993",
+        "source_repository": "musematic",
+        "source_base_sha": "a" * 40,
+        "deployment_repository": "musematic-deploy",
+        "deployment_base_sha": "b" * 40,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+
+    allocated = handler._allocate({"allocation_request": request})
+
+    assert manager.resume_flags == [enabled, enabled]
+    assert allocated["status"] == "WORKTREES_ALLOCATED"
+    assert allocated["source_resumed_from_sha"] == "d" * 40
+    assert allocated["deployment_resumed_from_sha"] is None
+
+
+class BaseMirrorManager(ChangeManager):
+    def __init__(self, mirror: Path) -> None:
+        self.mirror = mirror
+
+    def verify_mirror(self, repository: str) -> Path:
+        assert repository == "musematic"
+        return self.mirror
+
+
+class RecordingBaselineScanner(BaselineScanner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scanned: list[tuple[Path, list[str]]] = []
+
+    def secret_scan(self, worktree: Path, output: Path) -> dict[str, Any]:
+        files = sorted(item.name for item in worktree.iterdir())
+        self.scanned.append((worktree, files))
+        return super().secret_scan(worktree, output)
+
+
+def test_resumed_worktree_prechecks_baseline_is_taken_at_the_base(tmp_path: Path) -> None:
+    # NEW-52: a resumed worktree already holds the previous attempt's commits. Its own
+    # findings must not become the NEW-28 baseline, or postchecks would miss them.
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    assert git is not None
+    mirror = tmp_path / "mirrors" / "musematic"
+    mirror.mkdir(parents=True)
+    (mirror / "README.md").write_text("base\n", encoding="utf-8")
+
+    def run(*arguments: str) -> str:
+        return subprocess.run(  # noqa: S603 - fixed Git executable in the test harness
+            [git, *arguments], cwd=mirror, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    run("init", "-q")
+    run("add", ".")
+    run("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "base")
+    base = run("rev-parse", "HEAD")
+
+    worktrees = tmp_path / "worktrees"
+    for name in ("source", "deployment"):
+        (worktrees / name).mkdir(parents=True)
+    (worktrees / "source" / "resumed_feature.py").write_text("eval(x)\n", encoding="utf-8")
+    scanner = RecordingBaselineScanner()
+    handler = ScanActivityHandler(
+        Settings(
+            evidence_root=tmp_path / "evidence",
+            worktree_root=worktrees,
+            toolchain_cache_root=tmp_path / "toolchain",
+        ),
+        BaseMirrorManager(mirror),  # type: ignore[arg-type]
+        scanner=scanner,  # type: ignore[arg-type]
+        publisher=ReceiptPublisher(),  # type: ignore[arg-type]
+    )
+    maker = {"structured_result": {"tests": [{"status": "PASS"}]}}
+    payload = {
+        "project": "musematic",
+        "change_set_id": str(uuid4()),
+        "source_worktree": str(worktrees / "source"),
+        "deployment_worktree": str(worktrees / "deployment"),
+        "source_repository": "musematic",
+        "deployment_repository": "musematic-deploy",
+        "source_base_sha": base,
+        "deployment_base_sha": "b" * 40,
+        "source_resumed_from_sha": "d" * 40,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "PASS"}},
+        "source_maker_result": maker,
+        "deployment_maker_result": maker,
+    }
+    introduced = ("python.lang.security.audit.eval", "resumed_feature.py", 1)
+    resumed = {**EXISTING, "semgrep": [*EXISTING["semgrep"], introduced]}
+    # The resumed worktree already carries the previous attempt's finding; the base
+    # checkout ("source-base") only has the pre-existing ones.
+    scanner.findings = {"source": resumed, "source-base": EXISTING, "deployment": EXISTING}
+
+    prechecks = handler._delivery_prechecks(payload)
+
+    assert prechecks["status"] == "PRECHECKS_PASS"
+    base_scan = next(item for item in scanner.scanned if item[0].name == "source-base")
+    assert base_scan[1] == ["README.md"]  # the base tree, without the resumed commit
+    assert not base_scan[0].exists()  # the scratch checkout is removed afterwards
+    assert (worktrees / "deployment").resolve() in [item[0] for item in scanner.scanned]
+
+    validated = handler._validate_changeset(payload)
+
+    assert validated["status"] == "BLOCKED"
+    assert validated["blocker"] == "CHANGESET_VALIDATION_FINDINGS"
+    assert validated["change_evidence"]["source"]["introduced_findings"]["semgrep"] == 1
+    assert validated["change_evidence"]["deployment"]["introduced_findings"]["semgrep"] == 0

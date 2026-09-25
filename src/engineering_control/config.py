@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     timeout_executable: Path = Path("/usr/bin/timeout")
     # Must sit under the scan worker unit's ReadWritePaths (/srv/engineering/cache/%i).
     toolchain_cache_root: Path = Path("/srv/engineering/cache/scan/toolchain")
+    # NEW-52: a retry/correction of a ChangeSet keeps the previous attempt's commits
+    # (when they descend from the base) instead of re-implementing from the base.
+    delivery_resume_prior_commits: bool = True
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")

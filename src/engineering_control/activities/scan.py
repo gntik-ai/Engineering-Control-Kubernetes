@@ -13,7 +13,8 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
@@ -1268,6 +1269,7 @@ class ScanActivityHandler:
             base_ref=request.source_base_ref,
             expected_base_sha=request.source_base_sha,
             access=access,
+            resume_prior_commits=self.settings.delivery_resume_prior_commits,
         )
         deployment = source
         if request.source_repository == request.deployment_repository:
@@ -1285,6 +1287,7 @@ class ScanActivityHandler:
                 base_ref=request.deployment_base_ref,
                 expected_base_sha=request.deployment_base_sha,
                 access=access,
+                resume_prior_commits=self.settings.delivery_resume_prior_commits,
             )
         return {
             **payload,
@@ -1293,6 +1296,9 @@ class ScanActivityHandler:
             "source_branch": source.branch,
             "deployment_worktree": str(deployment.path),
             "deployment_branch": deployment.branch,
+            # NEW-52 (additive): the previous attempt's HEAD a worktree kept, else None.
+            "source_resumed_from_sha": source.resumed_from_sha,
+            "deployment_resumed_from_sha": deployment.resumed_from_sha,
         }
 
     def _delivery_prechecks(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1309,16 +1315,29 @@ class ScanActivityHandler:
             if not worktree.is_dir() or not worktree.is_relative_to(root):
                 raise ValueError("precheck worktree escaped its bounded root")
             output = evidence_root / name
-            secret = self.scanner.secret_scan(worktree, output)
-            trivy = self.scanner.vulnerability_scan(worktree, output)
-            semgrep = self.scanner.semgrep(worktree, output)
-            self.scanner.sbom(worktree, output)
+            resumed = payload.get(f"{name}_resumed_from_sha")
+            if isinstance(resumed, str) and resumed:
+                # NEW-52: a resumed worktree already contains the previous attempt's
+                # commits; scanning it would absorb the change's own findings into the
+                # baseline. Scan a scratch checkout of the base commit instead.
+                base_sha = str(payload[f"{name}_base_sha"])
+                output = evidence_root / f"{name}-base-{base_sha}"
+                if output.exists():
+                    shutil.rmtree(output)  # reports name the scratch checkout's path
+                with self._precheck_base_checkout(
+                    change_set_id, name, str(payload[f"{name}_repository"]), base_sha
+                ) as checkout:
+                    secret, trivy, semgrep = self._precheck_scans(checkout, output)
+                    counts = self._finding_counts(checkout, secret, trivy, semgrep)
+            else:
+                secret, trivy, semgrep = self._precheck_scans(worktree, output)
+                counts = self._finding_counts(worktree, secret, trivy, semgrep)
             semgrep_findings = len(semgrep.get("results", []))
             severe_vulnerabilities = self._severe_vulnerability_count(trivy)
             # NEW-28: pre-existing findings are the baseline, not a blocker -- otherwise
             # no real repository can ever receive a change. validate_changeset blocks on
             # any finding the change introduces relative to this baseline.
-            baseline[name] = self._finding_counts(worktree, secret, trivy, semgrep)
+            baseline[name] = counts
             artifacts = self._publish_reports(
                 payload,
                 sorted(report for report in output.iterdir() if report.is_file()),
@@ -1339,6 +1358,63 @@ class ScanActivityHandler:
             "blocker": None,
             "prechecks": summaries,
         }
+
+    def _precheck_scans(
+        self, worktree: Path, output: Path
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        secret = self.scanner.secret_scan(worktree, output)
+        trivy = self.scanner.vulnerability_scan(worktree, output)
+        semgrep = self.scanner.semgrep(worktree, output)
+        self.scanner.sbom(worktree, output)
+        return secret, trivy, semgrep
+
+    @contextmanager
+    def _precheck_base_checkout(
+        self, change_set_id: UUID, name: str, repository: str, base_sha: str
+    ) -> Iterator[Path]:
+        """NEW-52: a scratch, detached checkout of base_sha for a resumed worktree's
+        prechecks baseline, owned by the scan worker and removed after the scan."""
+        if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
+            raise ValueError("the prechecks baseline requires the exact base commit")
+        root = self.settings.toolchain_cache_root / "baselines" / "prechecks" / str(change_set_id)
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        checkout = root / f"{name}-base"
+        if checkout.is_symlink():
+            raise ValueError("prechecks baseline checkout must not be a symlink")
+        if checkout.exists():
+            shutil.rmtree(checkout)  # left behind by an interrupted attempt
+        try:
+            self._clone_detached(repository, base_sha, checkout, cwd=root)
+            # Scan only the tree, like a worktree whose .git is a pointer file.
+            shutil.rmtree(checkout / ".git")
+            yield checkout
+        finally:
+            if checkout.exists():
+                shutil.rmtree(checkout)
+
+    def _clone_detached(self, repository: str, base_sha: str, target: Path, *, cwd: Path) -> None:
+        """Check out base_sha, detached, from the canonical mirror (never written)."""
+        mirror = self.manager.verify_mirror(repository)
+        # --shared: objects are read from the canonical mirror, which is never written.
+        self.git_runner.run(
+            "git",
+            [
+                "-c",
+                f"safe.directory={mirror}",
+                "clone",
+                "--shared",
+                "--no-checkout",
+                "--quiet",
+                str(mirror),
+                str(target),
+            ],
+            cwd=cwd,
+            timeout_seconds=900,
+            environment={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+        self._git(target, ["checkout", "--detach", "--quiet", base_sha], timeout_seconds=900)
+        if self._git(target, ["rev-parse", "HEAD"]).strip() != base_sha:
+            raise ValueError("baseline checkout does not match the source base commit")
 
     @staticmethod
     async def _with_heartbeat(work: Awaitable[_T], phase: str = "toolchain_prepare") -> _T:
@@ -1691,27 +1767,7 @@ class ScanActivityHandler:
             raise ValueError("baseline worktree must not be a symlink")
         if worktree.exists():
             shutil.rmtree(worktree)  # a partial checkout or prepare from an earlier attempt
-        mirror = self.manager.verify_mirror(repository)
-        # --shared: objects are read from the canonical mirror, which is never written.
-        self.git_runner.run(
-            "git",
-            [
-                "-c",
-                f"safe.directory={mirror}",
-                "clone",
-                "--shared",
-                "--no-checkout",
-                "--quiet",
-                str(mirror),
-                str(worktree),
-            ],
-            cwd=root,
-            timeout_seconds=900,
-            environment={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
-        )
-        self._git(worktree, ["checkout", "--detach", "--quiet", base_sha], timeout_seconds=900)
-        if self._git(worktree, ["rev-parse", "HEAD"]).strip() != base_sha:
-            raise ValueError("baseline checkout does not match the source base commit")
+        self._clone_detached(repository, base_sha, worktree, cwd=root)
         environment = self._toolchain_environment()
         resolved_root = worktree.resolve()
         for command in policy.prepare:

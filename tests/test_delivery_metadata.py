@@ -633,6 +633,73 @@ def test_correction_attempt_maker_sees_the_previous_checker_findings(tmp_path: P
     assert "Independent checker findings" not in first_attempt
 
 
+def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
+    tmp_path: Path,
+) -> None:
+    # NEW-52: musematic #993 ran 11 rounds / ~60 attempts because every correction
+    # re-implemented the feature from the base. A resumed worktree keeps the previous
+    # attempt's commits and the maker must build on them.
+    from engineering_control.db.models import AgentInvocation
+
+    handler, allocation = _lease_fixture(tmp_path)
+    change_set_id = allocation["change_set_id"]
+    previous = _delivery_run(handler, change_set_id)
+    with handler.sessions.begin() as session:
+        session.add(
+            AgentInvocation(
+                id=uuid4(),
+                run_id=UUID(previous),
+                provider="claude",
+                role="code-reviewer",
+                model_class="judge",
+                status="SUCCESS",
+                structured_result={
+                    "decision": "REQUEST_CHANGES",
+                    "findings": ["BLOCKER - missing size check on resume"],
+                },
+                started_at=datetime.now(UTC),
+            )
+        )
+    resumed_head = "d" * 40
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-attempt-2"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "risk_class": "R1",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "import"},
+        "source_resumed_from_sha": resumed_head,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+        "source_maker_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+
+    resumed = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    reset = handler._prepare_maker(
+        {**payload, "source_resumed_from_sha": None}, deployment=False
+    )["maker_request"]["prompt"]
+    deployment = handler._prepare_maker(payload, deployment=True)[
+        "deployment_maker_request"
+    ]["prompt"]
+    checker = handler._prepare_checker(payload)["checker_request"]["prompt"]
+
+    assert "missing size check on resume" in resumed
+    assert f"HEAD {resumed_head}" in resumed
+    assert "Do not re-implement or revert it" in resumed
+    assert "additional local commit" in resumed
+    assert "the worktree was reset to base" not in resumed
+    # The reset (NEW-38) case keeps the NEW-39 wording.
+    assert "the worktree was reset to base; address every finding" in reset
+    assert "Do not re-implement" not in reset and resumed_head not in reset
+    # Resume is per repository: the deployment worktree was not resumed.
+    assert "Do not re-implement" not in deployment
+    # The checker reviews the full base..HEAD change, not only the latest commit.
+    assert f"git diff {'a' * 40}..HEAD" in checker
+    assert "may span several commits" in checker
+
+
 def test_deployment_maker_may_complete_without_changes_and_ignores_baseline(
     tmp_path: Path,
 ) -> None:

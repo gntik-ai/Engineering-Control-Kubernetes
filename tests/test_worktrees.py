@@ -348,6 +348,103 @@ def test_retry_archives_and_resets_a_stopped_attempts_worktree(tmp_path: Path) -
     assert "print('x')" in git(["show", f"{work_ref}^3:new_benchmark.py"], second.path)
 
 
+def _resume_fixture(tmp_path: Path) -> tuple[GitWorktreeManager, dict[str, object], Path, str]:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    request: dict[str, object] = {
+        "repository": "falcone",
+        "project": "falcone",
+        "issue": "993",
+        "change_set_id": uuid4(),
+        "base_ref": "refs/heads/main",
+        "expected_base_sha": sha,
+    }
+    first = manager.allocate(**request)  # type: ignore[arg-type]
+    (first.path / "feature.py").write_text("print('previous attempt')\n", encoding="utf-8")
+    git(["add", "feature.py"], first.path)
+    git(["commit", "-q", "-m", "previous attempt"], first.path)
+    return manager, request, first.path, sha
+
+
+def test_retry_resumes_from_the_previous_attempts_commits(tmp_path: Path) -> None:
+    # NEW-52: musematic #993 needed 11 rounds / ~60 attempts because every correction
+    # was reset to the base (NEW-38) and re-implemented the whole feature.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.path == path
+    assert second.base_sha == sha
+    assert second.resumed_from_sha == head
+    assert git(["rev-parse", "HEAD"], path) == head
+    assert (path / "feature.py").read_text(encoding="utf-8") == "print('previous attempt')\n"
+    assert git(["status", "--porcelain=v1"], path) == ""
+    change_set_id = request["change_set_id"]
+    assert git(["for-each-ref", f"refs/archive/{change_set_id}"], path) == ""
+
+
+def test_dirty_resume_archives_leftovers_then_resets_to_the_attempts_head(
+    tmp_path: Path,
+) -> None:
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    (path / "feature.py").write_text("half-finished edit\n", encoding="utf-8")
+    (path / "scratch.txt").write_text("untracked\n", encoding="utf-8")
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.resumed_from_sha == head
+    assert git(["rev-parse", "HEAD"], path) == head
+    assert git(["status", "--porcelain=v1"], path) == ""
+    assert (path / "feature.py").read_text(encoding="utf-8") == "print('previous attempt')\n"
+    assert not (path / "scratch.txt").exists()
+    archived = git(
+        ["for-each-ref", "--format=%(refname)", f"refs/archive/{request['change_set_id']}"],
+        path,
+    ).splitlines()
+    work_ref = next(ref for ref in archived if ref.endswith("-worktree"))
+    assert "half-finished edit" in git(["show", f"{work_ref}:feature.py"], path)
+    assert "untracked" in git(["show", f"{work_ref}^3:scratch.txt"], path)
+
+
+def test_resume_falls_back_to_the_base_when_head_does_not_descend_from_it(
+    tmp_path: Path,
+) -> None:
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    # Foreign history: an orphan commit that does not contain the base.
+    git(["checkout", "-q", "--orphan", "tmp-orphan"], path)
+    git(["commit", "-q", "-m", "foreign"], path)
+    foreign = git(["rev-parse", "HEAD"], path)
+    branch = f"agent/falcone/993/{request['change_set_id']}"
+    git(["checkout", "-q", "-B", branch, foreign], path)
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.resumed_from_sha is None
+    assert git(["rev-parse", "HEAD"], path) == sha
+    assert not (path / "feature.py").exists()
+
+
+def test_resume_disabled_keeps_the_new38_reset_to_base(tmp_path: Path) -> None:
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+
+    second = manager.allocate(**request, resume_prior_commits=False)  # type: ignore[arg-type]
+
+    assert second.resumed_from_sha is None
+    assert git(["rev-parse", "HEAD"], path) == sha
+    archived = git(
+        ["for-each-ref", "--format=%(objectname)", f"refs/archive/{request['change_set_id']}"],
+        path,
+    )
+    assert head in archived
+
+
 def test_retry_still_refuses_a_worktree_on_another_branch(tmp_path: Path) -> None:
     mirror_root, sha = create_mirror(tmp_path)
     manager = GitWorktreeManager(

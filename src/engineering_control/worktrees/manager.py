@@ -26,6 +26,9 @@ class WorktreeAllocation:
     branch: str
     base_sha: str
     change_set_id: UUID
+    # NEW-52: the previous attempt's committed HEAD (a descendant of base_sha) this
+    # allocation kept instead of resetting to the base; None for a fresh/reset worktree.
+    resumed_from_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,7 @@ class GitWorktreeManager:
         base_ref: str,
         expected_base_sha: str,
         access: WorktreeAccess | None = None,
+        resume_prior_commits: bool = False,
     ) -> WorktreeAllocation:
         if not re.fullmatch(r"[a-f0-9]{40}", expected_base_sha):
             raise ValueError("expected base must be a full 40-character SHA")
@@ -243,6 +247,27 @@ class GitWorktreeManager:
                 if actual_branch != branch:
                     raise WorktreeError(
                         f"existing worktree does not match the ChangeSet allocation: {target}"
+                    )
+                if (
+                    resume_prior_commits
+                    and actual_head != expected_base_sha
+                    and self._descends_from(target, expected_base_sha, actual_head)
+                ):
+                    # NEW-52: musematic #993 churned through 11 rounds because every
+                    # correction re-implemented the feature from the base. Keep the
+                    # previous attempt's commits (they descend from this base); only
+                    # uncommitted leftovers are archived and dropped.
+                    if self.is_dirty(target):
+                        self._archive_and_reset(
+                            target, expected_base_sha, change_set_id, reset_to=actual_head
+                        )
+                    return WorktreeAllocation(
+                        repository,
+                        target,
+                        branch,
+                        actual,
+                        change_set_id,
+                        resumed_from_sha=actual_head,
                     )
                 if actual_head != expected_base_sha or self.is_dirty(target):
                     # NEW-38: a stopped attempt's maker left work behind, so no retry or
@@ -488,9 +513,28 @@ class GitWorktreeManager:
         reader_acl = ",".join(f"u:{identity}:r-X" for identity in identities)
         self._run(["setfacl", "--recursive", "--modify", reader_acl, str(target)], cwd)
 
-    def _archive_and_reset(self, target: Path, base_sha: str, change_set_id: UUID) -> None:
+    def _descends_from(self, target: Path, base_sha: str, head: str) -> bool:
+        """True when head is a strict descendant of base_sha (NEW-52 resume guard)."""
+        if not re.fullmatch(r"[a-f0-9]{40}", head) or head == base_sha:
+            return False
+        try:
+            self._run(["git", "merge-base", "--is-ancestor", base_sha, head], target)
+        except WorktreeError:
+            return False  # not an ancestor (exit 1) or unknown history: reset to base
+        return True
+
+    def _archive_and_reset(
+        self,
+        target: Path,
+        base_sha: str,
+        change_set_id: UUID,
+        *,
+        reset_to: str | None = None,
+    ) -> None:
         """Keep a stopped attempt's work under refs/archive/<changeset>/ in the ChangeSet's
-        git metadata, then reset the worktree to its base."""
+        git metadata, then reset the worktree to its base (or, NEW-52, to reset_to: the
+        attempt's own committed HEAD, so only uncommitted leftovers are dropped)."""
+        destination = reset_to or base_sha
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         prefix = f"refs/archive/{change_set_id}/{stamp}"
         head = self._run(["git", "rev-parse", "HEAD"], target)
@@ -514,9 +558,12 @@ class GitWorktreeManager:
             )
             stash = self._run(["git", "rev-parse", "refs/stash"], target)
             self._run(["git", "update-ref", f"{prefix}-worktree", stash], target)
-        self._run(["git", "reset", "--hard", base_sha], target)
+        self._run(["git", "reset", "--hard", destination], target)
         self._run(["git", "clean", "-ffdx"], target)
-        if self.is_dirty(target) or self._run(["git", "rev-parse", "HEAD"], target) != base_sha:
+        if (
+            self.is_dirty(target)
+            or self._run(["git", "rev-parse", "HEAD"], target) != destination
+        ):
             raise WorktreeError(f"could not reset the archived worktree to its base: {target}")
 
     def is_dirty(self, path: Path) -> bool:
