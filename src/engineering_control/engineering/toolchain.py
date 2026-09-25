@@ -18,6 +18,9 @@ from engineering_control.engineering.models import (
 _PROJECTS = frozenset({"falcone", "musematic", "llmwiki"})
 _MAX_MANIFEST_BYTES = 512 * 1024
 _CD_PREFIX = re.compile(r"^cd\s+(?P<cwd>\S+)\s*&&\s*(?P<command>.+)$", re.DOTALL)
+# NEW-58: makers also report commands as "<cwd>: <command>" (musematic #993 retry 18),
+# which fell through as a non-contract command and skipped the NEW-49 baseline.
+_CWD_LABEL_PREFIX = re.compile(r"^(?P<cwd>[A-Za-z0-9_./-]+):\s+(?P<command>.+)$", re.DOTALL)
 
 
 def load_toolchain_policy(project_config_root: Path, project: str) -> ToolchainPolicy | None:
@@ -100,7 +103,7 @@ def match_toolchain_test_command(
     if text.startswith("(") and text.endswith(")"):
         text = text[1:-1].strip()
     cwd: str | None = None
-    prefix = _CD_PREFIX.match(text)
+    prefix = _CD_PREFIX.match(text) or _CWD_LABEL_PREFIX.match(text)
     if prefix is not None:
         cwd = _reported_cwd(prefix["cwd"], worktree)
         if cwd is None:

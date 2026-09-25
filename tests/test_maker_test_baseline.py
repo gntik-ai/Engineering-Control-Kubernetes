@@ -357,6 +357,9 @@ def test_baseline_executables_stay_inside_the_checkout(tmp_path: Path) -> None:
         (".venv/bin/mypy src/platform", None),
         (f"{MYPY_COMMAND}; true", None),
         ("cd apps/control-plane && timeout 900 .venv/bin/mypy 'src/platform", None),
+        # NEW-58: the "<cwd>: <command>" form a maker used on musematic #993.
+        (f"apps/control-plane: {MYPY_COMMAND}", MYPY),
+        (f"apps/web: {MYPY_COMMAND}", None),
     ],
 )
 def test_reported_commands_match_contract_commands_exactly(
