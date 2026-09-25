@@ -101,6 +101,10 @@ class ProviderActivityHandler:
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         if step == "quota.refresh":
             return await self._quota_snapshot(payload)
+        if step == "delivery.invoke_spec" and payload.get("status") == "SPEC_REUSED":
+            # NEW-53: delivery.prepare_spec found this ChangeSet's OpenSpec from an
+            # earlier attempt for the same issue content; nothing to invoke.
+            return dict(payload)
         request = self._request(step, payload)
         self._validate_boundary(step, request)
         # F-14: request.prompt (up to 200_000 chars) is already fully captured on `request`

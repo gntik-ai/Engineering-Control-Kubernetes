@@ -123,6 +123,9 @@ class AgentResult(StrictModel):
     finished_at: datetime
     exit_code: int | None = None
     error_code: str | None = None
+    # NEW-53: the CLI gave up on structured output, but its last candidate passed the
+    # original Draft 2020-12 output schema and was accepted by the adapter.
+    recovered_from_structured_retry: bool = False
 
 
 class ArtifactMetadata(StrictModel):

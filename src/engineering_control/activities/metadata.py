@@ -12,6 +12,7 @@ from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
+from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import IntegrityError
@@ -472,6 +473,12 @@ class MetadataActivityHandler:
                 return await asyncio.to_thread(self._persist_finding_publication, payload)
             if step == "finding.record_terminal":
                 return await asyncio.to_thread(self._record_finding_terminal, payload)
+            if step in {"agent.record_start", "agent.persist_result"} and self._spec_reused(
+                payload
+            ):
+                # NEW-53: no provider runs for a reused OpenSpec, so there is no
+                # invocation to record; the payload passes through unchanged.
+                return payload
             if step == "agent.record_start":
                 return await asyncio.to_thread(self._record_agent_start, payload)
             if step == "agent.persist_result":
@@ -496,9 +503,9 @@ class MetadataActivityHandler:
             if step == "delivery.persist_worktree_leases":
                 return await asyncio.to_thread(self._persist_worktree_leases, payload)
             if step == "delivery.prepare_spec":
-                return self._prepare_spec(payload)
+                return await asyncio.to_thread(self._prepare_spec, payload)
             if step == "delivery.create_openspec":
-                return self._create_openspec(payload)
+                return await asyncio.to_thread(self._create_openspec, payload)
             if step == "delivery.prepare_maker":
                 return self._prepare_maker(payload, deployment=False)
             if step == "delivery.prepare_deployment_maker":
@@ -2728,6 +2735,59 @@ class MetadataActivityHandler:
                 lease_ids.append(str(identity))
         return {**payload, "status": "WORKTREE_LEASES_PERSISTED", "worktree_lease_ids": lease_ids}
 
+    @staticmethod
+    def _spec_reused(payload: dict[str, Any]) -> bool:
+        return (
+            payload.get("provider_step") == "delivery.invoke_spec"
+            and payload.get("status") == "SPEC_REUSED"
+        )
+
+    @staticmethod
+    def _spec_input_sha256(payload: dict[str, Any], issue_content: str) -> str:
+        """NEW-53: binds an OpenSpec to the issue content it was generated from.
+
+        actual_behavior is refreshed from the live issue body on every attempt (NEW-44),
+        so an edited issue produces a different hash and the spec is regenerated.
+        """
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "issue_url": str(payload.get("issue_url", "")),
+                    "fingerprint": str(payload.get("fingerprint", "")),
+                    "risk_class": str(payload.get("risk_class", "")),
+                    "issue_content": issue_content,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+    def _reusable_openspec(
+        self, session: Session, change_set_id: UUID, spec_input_sha256: str
+    ) -> dict[str, Any] | None:
+        """NEW-53: the OpenSpec an earlier attempt created for this exact issue content."""
+        change_set = session.get(ChangeSet, change_set_id)
+        if change_set is None or change_set.issue_id is None:
+            return None
+        issue = session.get(Issue, change_set.issue_id)
+        stored = dict(change_set.recovery_json or {}).get("openspec")
+        if (
+            issue is None
+            or not isinstance(stored, dict)
+            or stored.get("identifier") != f"engineering/{change_set_id}"
+            or issue.openspec_change != stored.get("identifier")
+            or stored.get("spec_input_sha256") != spec_input_sha256
+        ):
+            return None
+        document = stored.get("document")
+        if (
+            not isinstance(document, dict)
+            or document.get("decision") != "READY"
+            or not Draft202012Validator(self._spec_output_schema()).is_valid(document)
+        ):
+            return None
+        return document
+
     def _prepare_spec(self, payload: dict[str, Any]) -> dict[str, Any]:
         provider = Provider(str(payload["spec_provider"]))
         change_set_id = UUID(str(payload["change_set_id"]))
@@ -2736,6 +2796,20 @@ class MetadataActivityHandler:
             f"Expected: {payload['expected_behavior']}\nActual: {payload['actual_behavior']}\n"
             f"Minimal reproduction: {json.dumps(payload['minimal_reproduction'])}\n"
         )
+        spec_input_sha256 = self._spec_input_sha256(payload, issue_content)
+        if self.settings.delivery_reuse_spec:
+            with self.sessions() as session:
+                reusable = self._reusable_openspec(session, change_set_id, spec_input_sha256)
+            if reusable is not None:
+                # NEW-53: invoke_spec, its record/persist boundary and create_openspec
+                # all short-circuit on this status, so the workflow is unchanged and the
+                # spec architect (and its structured-output failure mode) is skipped.
+                return {
+                    **payload,
+                    "status": "SPEC_REUSED",
+                    "spec_reused": True,
+                    "spec_input_sha256": spec_input_sha256,
+                }
         prompt = (
             "Produce a bounded provider-neutral OpenSpec for exactly one confirmed GitHub issue. "
             "Do not modify files and do not propose deployment execution. The source and "
@@ -2746,10 +2820,11 @@ class MetadataActivityHandler:
             "these keys and no others -- decision (READY or BLOCKED), title, problem, scope, "
             "non_scope, acceptance_criteria, implementation_constraints, test_plan, "
             "risk_notes, open_questions. title is at most 300 characters and problem at most "
-            "20000. Every list except open_questions needs at least one entry, even when "
-            "BLOCKED. Each list holds at most 100 entries of at most 4000 characters each; "
-            "keep entries concise and split long points into several entries. "
-            "open_questions may be empty.\n"
+            "20000. scope, acceptance_criteria and test_plan need at least one entry, even "
+            "when BLOCKED. Each list holds at most 100 entries of at most 4000 characters "
+            "each; keep entries concise and split long points into several entries. "
+            "non_scope, implementation_constraints, risk_notes and open_questions may be "
+            "empty.\n"
             # NEW-34 evidence: all 5 attempts of a live #1026 spec run were rejected as
             # unparseable JSON (17-26 KB each); the size, not the content, broke it.
             "Size and JSON validity: this is a plan for the implementer, not the "
@@ -2774,24 +2849,40 @@ class MetadataActivityHandler:
             output_schema=self._spec_output_schema(),
             timeout_seconds=3600,
             effort=resolve_agent_effort(ModelClass.JUDGE),
+            # NEW-53: optional pin; only meaningful for the Claude CLI.
+            model=self.settings.claude_spec_model if provider is Provider.CLAUDE else None,
             writable=False,
             change_set_id=change_set_id,
         )
         return {
             **payload,
             "status": "SPEC_READY",
+            "spec_input_sha256": spec_input_sha256,
             "spec_request": request.model_dump(mode="json"),
         }
 
     def _create_openspec(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_set_id = UUID(str(payload["change_set_id"]))
+        identifier = f"engineering/{change_set_id}"
+        if payload.get("status") == "SPEC_REUSED":
+            return self._reuse_openspec(payload, change_set_id, identifier)
         result = self._object(payload.get("agent_result"), "agent_result")
         structured = self._object(result.get("structured_result"), "structured_result")
         if structured.get("decision") == "BLOCKED":
             return {**payload, "status": "BLOCKED", "blocker": "SPEC_ARCHITECT_BLOCKED"}
         if structured.get("decision") != "READY":
             raise ValueError("spec architect returned an unknown decision")
-        change_set_id = UUID(str(payload["change_set_id"]))
-        identifier = f"engineering/{change_set_id}"
+        # NEW-53: the schema no longer forbids extra top-level keys (see
+        # _spec_output_schema); the OpenSpec document keeps exactly the contract keys.
+        known = self._spec_output_schema()["properties"]
+        structured = {key: value for key, value in structured.items() if key in known}
+        spec_input_sha256 = payload.get("spec_input_sha256")
+        orchestration = payload.get("orchestration")
+        workflow_id = (
+            str(orchestration.get("workflow_id", ""))[:240]
+            if isinstance(orchestration, dict)
+            else ""
+        )
         with self.sessions.begin() as session:
             change_set = session.get(ChangeSet, change_set_id)
             if change_set is None or change_set.issue_id is None:
@@ -2802,12 +2893,48 @@ class MetadataActivityHandler:
             issue.openspec_change = identifier
             change_set.state = "PLANNED"
             change_set.version += 1
+            if isinstance(spec_input_sha256, str) and re.fullmatch(
+                r"[a-f0-9]{64}", spec_input_sha256
+            ):
+                # NEW-53: kept for later attempts of this ChangeSet (reused only while
+                # the issue content hash is unchanged).
+                recovery = dict(change_set.recovery_json or {})
+                recovery["openspec"] = {
+                    "identifier": identifier,
+                    "spec_input_sha256": spec_input_sha256,
+                    "document": structured,
+                    "workflow_id": workflow_id,
+                    "created_at": datetime.now(UTC).isoformat(),
+                }
+                change_set.recovery_json = recovery
         return {
             **payload,
             "status": "OPENSPEC_READY",
             "spec_agent_result": result,
             "openspec_identifier": identifier,
             "openspec_document": structured,
+        }
+
+    def _reuse_openspec(
+        self, payload: dict[str, Any], change_set_id: UUID, identifier: str
+    ) -> dict[str, Any]:
+        """NEW-53: complete the spec step with the OpenSpec of an earlier attempt."""
+        spec_input_sha256 = str(payload.get("spec_input_sha256", ""))
+        with self.sessions.begin() as session:
+            document = self._reusable_openspec(session, change_set_id, spec_input_sha256)
+            change_set = session.get(ChangeSet, change_set_id)
+            if document is None or change_set is None:
+                raise ValueError("reused OpenSpec is no longer bound to this issue content")
+            change_set.state = "PLANNED"
+            change_set.version += 1
+            reused_from = dict(change_set.recovery_json or {})["openspec"].get("workflow_id")
+        return {
+            **payload,
+            "status": "OPENSPEC_READY",
+            "spec_reused": True,
+            "spec_reused_from_workflow_id": reused_from,
+            "openspec_identifier": identifier,
+            "openspec_document": document,
         }
 
     def _prior_checker_findings(self, change_set_id: UUID, workflow_id: str) -> list[str]:
@@ -3043,6 +3170,8 @@ class MetadataActivityHandler:
             output_schema=self._checker_output_schema(),
             timeout_seconds=5400,
             effort=resolve_agent_effort(ModelClass.JUDGE),
+            # NEW-53: optional pin; only meaningful for the Claude CLI.
+            model=self.settings.claude_checker_model if provider is Provider.CLAUDE else None,
             writable=False,
             change_set_id=change_set_id,
         )
@@ -8230,15 +8359,26 @@ class MetadataActivityHandler:
 
     @staticmethod
     def _spec_output_schema() -> dict[str, Any]:
+        # NEW-53 schema review (~13% of spec runs ended in
+        # error_max_structured_output_retries). The schema is flat; the length limits
+        # (title 300, problem 20000, entries 4000) are far above what the prompt asks
+        # for and the decision enum is the contract create_openspec acts on, so all
+        # stay. Relaxed, because they only forced the model to invent content or retry:
+        # - non_scope, implementation_constraints and risk_notes may be empty
+        #   (minItems 1 -> 0); a spec still needs scope, acceptance_criteria and
+        #   test_plan entries.
+        # - extra top-level keys are tolerated (additionalProperties false dropped);
+        #   delivery.create_openspec keeps only the contract keys, so the stored and
+        #   downstream OpenSpec document is unchanged.
         string_list = {
             "type": "array",
             "minItems": 1,
             "maxItems": 100,
             "items": {"type": "string", "minLength": 1, "maxLength": 4000},
         }
+        optional_string_list = {**string_list, "minItems": 0}
         return {
             "type": "object",
-            "additionalProperties": False,
             "required": [
                 "decision",
                 "title",
@@ -8256,11 +8396,11 @@ class MetadataActivityHandler:
                 "title": {"type": "string", "minLength": 1, "maxLength": 300},
                 "problem": {"type": "string", "minLength": 1, "maxLength": 20000},
                 "scope": string_list,
-                "non_scope": string_list,
+                "non_scope": optional_string_list,
                 "acceptance_criteria": string_list,
-                "implementation_constraints": string_list,
+                "implementation_constraints": optional_string_list,
                 "test_plan": string_list,
-                "risk_notes": string_list,
+                "risk_notes": optional_string_list,
                 "open_questions": {
                     "type": "array",
                     "maxItems": 100,

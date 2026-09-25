@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     # Operator choice 2026-09-23; override with ENGINEERING_CODEX_MODEL.
     codex_model: str | None = "gpt-5.6-terra"
     claude_executable: Path = Path("/usr/local/bin/claude")
+    # NEW-53: optional Claude model pins for the delivery spec architect and the
+    # independent checker (passed as --model). None keeps the CLI default.
+    claude_spec_model: str | None = None
+    claude_checker_model: str | None = None
     helm_executable: Path = Path("/usr/local/bin/helm")
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")
     staging_kubeconfig_path: Path = Path("/etc/engineering-control/credentials/staging/kubeconfig")
@@ -79,6 +83,10 @@ class Settings(BaseSettings):
     # NEW-52: a retry/correction of a ChangeSet keeps the previous attempt's commits
     # (when they descend from the base) instead of re-implementing from the base.
     delivery_resume_prior_commits: bool = True
+    # NEW-53: a retry/correction of a ChangeSet reuses the OpenSpec created by an earlier
+    # attempt when the issue content it was generated from is unchanged, instead of
+    # re-running the spec architect (whose structured output fails ~13% of runs).
+    delivery_reuse_spec: bool = True
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")

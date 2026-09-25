@@ -893,6 +893,45 @@ async def test_pre_toolchain_issue_delivery_history_replays_without_the_new_step
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 
+async def test_issue_delivery_passes_a_reused_openspec_through_unchanged_steps() -> None:
+    """NEW-53: spec reuse is an activity-level short-circuit -- the workflow schedules
+    the same steps (no patch marker) and SPEC_REUSED is not a stop status."""
+    reused = {"status": "SPEC_REUSED", "spec_reused": True, "run_id": "run-1"}
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.prepare_spec": reused,
+        "agent.record_start": reused,
+        "delivery.invoke_spec": reused,
+        "agent.persist_result": reused,
+        "delivery.create_openspec": {"status": "OPENSPEC_READY", "spec_reused": True},
+        "delivery.prepare_maker": {"status": "BLOCKED", "blocker": "MAKER_STOP"},
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "BLOCKED"
+    steps = _scheduled_step_names(history)
+    spec = steps.index("delivery.prepare_spec")
+    assert steps[spec : spec + 6] == [
+        "delivery.prepare_spec",
+        "agent.record_start",
+        "delivery.invoke_spec",
+        "agent.persist_result",
+        "delivery.create_openspec",
+        "delivery.prepare_maker",
+    ]
+    markers = [
+        event.marker_recorded_event_attributes.SerializeToString()
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+    ]
+    assert not any(b"reuse-spec" in marker for marker in markers)
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
 _REFRESHED_BODY = "Issue body\n\n## Operator decisions\n\n- JSON only; 5 MB; 20/hour"
 
 

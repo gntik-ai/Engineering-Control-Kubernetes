@@ -4,15 +4,27 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from jsonschema import Draft202012Validator
 from sqlalchemy import select
 
 from engineering_control.activities.metadata import MetadataActivityHandler
+from engineering_control.activities.provider import ProviderActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db.base import Base
-from engineering_control.db.models import ChangeSet, ComponentLease, Run, WorktreeLease
+from engineering_control.db.models import (
+    AgentInvocation,
+    ChangeSet,
+    ComponentLease,
+    Issue,
+    Run,
+    WorktreeLease,
+)
+from engineering_control.models.core import AgentResult
+from engineering_control.models.enums import Provider
 
 
 def release_impact(
@@ -555,6 +567,8 @@ def test_spec_prompt_states_the_output_contract_the_schema_enforces(tmp_path: Pa
     handler = MetadataActivityHandler(
         Settings(database_url=f"sqlite:///{tmp_path / 'spec.sqlite'}")
     )
+    # NEW-53: prepare_spec looks up a reusable OpenSpec of the ChangeSet first.
+    Base.metadata.create_all(handler.engine)
     prepared = handler._prepare_spec(
         {
             "spec_provider": "claude",
@@ -775,3 +789,174 @@ def test_makers_and_checker_are_told_to_run_the_prepared_toolchain_tests(
         assert "do not install anything (no network)" in source
         assert 'evidence[] entry with kind "test"' in checker
         assert "`timeout --kill-after=30 900 .venv/bin/mypy src/platform`" in checker
+
+
+def _spec_fixture(
+    tmp_path: Path, **settings: object
+) -> tuple[MetadataActivityHandler, dict[str, object]]:
+    """A ChangeSet bound to a GitHub issue plus a delivery.prepare_spec payload."""
+    handler, allocation = _lease_fixture(tmp_path, **settings)
+    issue_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            Issue(
+                id=issue_id,
+                finding_id=uuid4(),
+                repository="gntik-ai/musematic",
+                number=993,
+                url="https://github.com/gntik-ai/musematic/issues/993",
+                state="OPEN",
+                openspec_change=None,
+            )
+        )
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.issue_id = issue_id
+    payload: dict[str, object] = {
+        **allocation,
+        "spec_provider": "claude",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-993-attempt-1"},
+        "expected_behavior": "uploads are capped before spooling",
+        "actual_behavior": "the whole body is spooled first",
+        "minimal_reproduction": ["POST a 2 GB upload"],
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "fingerprint": "f" * 64,
+        "risk_class": "R1",
+        "project": "musematic",
+    }
+    return handler, payload
+
+
+_READY_SPEC = {
+    "decision": "READY",
+    "title": "Cap uploads before spooling",
+    "problem": "The upload body is spooled before the size cap applies.",
+    "scope": ["enforce the cap while streaming"],
+    "non_scope": [],
+    "acceptance_criteria": ["a 2 GB upload is rejected without spooling"],
+    "implementation_constraints": [],
+    "test_plan": ["unit test the streaming cap"],
+    "risk_notes": [],
+    "open_questions": [],
+}
+
+
+async def _first_attempt_creates_openspec(
+    handler: MetadataActivityHandler, payload: dict[str, object]
+) -> dict[str, Any]:
+    prepared = await handler.handle("delivery.prepare_spec", payload)
+    assert prepared["status"] == "SPEC_READY"
+    return await handler.handle(
+        "delivery.create_openspec",
+        {
+            **prepared,
+            "status": "SUCCESS",
+            "agent_result": {"structured_result": {**_READY_SPEC, "extra": "dropped"}},
+        },
+    )
+
+
+class _ExplodingClaudeAdapter:
+    provider = Provider.CLAUDE
+
+    async def authenticated(self) -> bool:
+        raise AssertionError("a reused spec must not reach the provider")
+
+    async def execute(self, *_args: object, **_kwargs: object) -> AgentResult:
+        raise AssertionError("a reused spec must not reach the provider")
+
+
+@pytest.mark.asyncio
+async def test_a_later_attempt_reuses_the_openspec_without_invoking_the_provider(
+    tmp_path: Path,
+) -> None:
+    # NEW-53: every correction/resumed attempt re-ran the spec architect, whose
+    # structured output fails ~13% of runs and burned whole attempts.
+    handler, payload = _spec_fixture(tmp_path)
+    first = await _first_attempt_creates_openspec(handler, payload)
+    assert first["status"] == "OPENSPEC_READY"
+    assert first["openspec_document"] == _READY_SPEC  # extra keys are projected away
+
+    retry = {**payload, "orchestration": {"workflow_id": "backlog-loop-993-attempt-2"}}
+    prepared = await handler.handle("delivery.prepare_spec", retry)
+    assert prepared["status"] == "SPEC_REUSED"
+    assert "spec_request" not in prepared
+
+    started = await handler.handle(
+        "agent.record_start", {**prepared, "provider_step": "delivery.invoke_spec"}
+    )
+    provider = ProviderActivityHandler(
+        Settings(worktree_root=tmp_path / "worktrees", run_root=tmp_path / "runs"),
+        "claude",
+        _ExplodingClaudeAdapter(),
+    )
+    invoked = await provider.handle("delivery.invoke_spec", started)
+    persisted = await handler.handle("agent.persist_result", invoked)
+    created = await handler.handle("delivery.create_openspec", persisted)
+
+    assert started == {**prepared, "provider_step": "delivery.invoke_spec"}
+    assert invoked["status"] == persisted["status"] == "SPEC_REUSED"
+    assert created["status"] == "OPENSPEC_READY"
+    assert created["spec_reused"] is True
+    assert created["spec_reused_from_workflow_id"] == "backlog-loop-musematic-issue-993-attempt-1"
+    assert created["openspec_document"] == _READY_SPEC
+    assert created["openspec_identifier"] == f"engineering/{payload['change_set_id']}"
+    with handler.sessions() as session:
+        assert session.scalars(select(AgentInvocation)).all() == []
+        change_set = session.get(ChangeSet, UUID(str(payload["change_set_id"])))
+        assert change_set is not None and change_set.state == "PLANNED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["issue-edited", "setting-off"])
+async def test_the_openspec_is_regenerated_when_the_issue_changed_or_reuse_is_off(
+    tmp_path: Path, reason: str
+) -> None:
+    # NEW-53 / NEW-44: actual_behavior is refreshed from the live issue body, so an
+    # edited issue must not reuse a spec generated from the old text.
+    settings = {"delivery_reuse_spec": False} if reason == "setting-off" else {}
+    handler, payload = _spec_fixture(tmp_path, **settings)
+    await _first_attempt_creates_openspec(handler, payload)
+    retry = {**payload, "orchestration": {"workflow_id": "backlog-loop-993-attempt-2"}}
+    if reason == "issue-edited":
+        retry["actual_behavior"] = "operator decision: cap at 100 MB"
+
+    prepared = await handler.handle("delivery.prepare_spec", retry)
+
+    assert prepared["status"] == "SPEC_READY"
+    assert "spec_request" in prepared
+
+
+@pytest.mark.parametrize("configured", [None, "claude-opus-4-9"])
+def test_spec_and_checker_model_pins_reach_their_claude_requests(
+    tmp_path: Path, configured: str | None
+) -> None:
+    # NEW-53: plumbing only; None keeps the CLI default.
+    handler, payload = _spec_fixture(
+        tmp_path, claude_spec_model=configured, claude_checker_model=configured
+    )
+    spec = handler._prepare_spec(payload)["spec_request"]
+    checker = handler._prepare_checker(
+        {
+            **payload,
+            "openspec_document": _READY_SPEC,
+            "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+            "source_maker_result": {"structured_result": {"decision": "COMPLETE"}},
+        }
+    )["checker_request"]
+    codex_spec = handler._prepare_spec({**payload, "spec_provider": "codex"})["spec_request"]
+
+    assert spec["model"] == configured
+    assert checker["model"] == configured
+    assert codex_spec["model"] is None
+
+
+def test_spec_schema_relaxations_keep_the_required_contract() -> None:
+    # NEW-53: empty optional lists and extra keys validate; missing core content does not.
+    validator = Draft202012Validator(MetadataActivityHandler._spec_output_schema())
+
+    assert validator.is_valid({**_READY_SPEC, "summary": "extra key"})
+    assert not validator.is_valid({**_READY_SPEC, "scope": []})
+    assert not validator.is_valid({**_READY_SPEC, "decision": "MAYBE"})
+    assert not validator.is_valid({k: v for k, v in _READY_SPEC.items() if k != "test_plan"})
