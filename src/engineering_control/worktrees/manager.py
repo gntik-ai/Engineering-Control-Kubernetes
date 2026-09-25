@@ -287,7 +287,7 @@ class GitWorktreeManager:
                 raise WorktreeError("newly allocated worktree is unexpectedly dirty")
             if access is not None:
                 try:
-                    self._grant_access(target, metadata, mirror, access)
+                    self._grant_access(target, metadata, mirror, access, repository=repository)
                 except Exception:
                     self._run(["git", "worktree", "remove", str(target)], metadata)
                     raise
@@ -358,6 +358,8 @@ class GitWorktreeManager:
         metadata: Path,
         canonical_mirror: Path,
         access: WorktreeAccess,
+        *,
+        repository: str | None = None,
     ) -> None:
         """Grant the maker write and checker read access to exactly one worktree."""
         resolved_root = self.worktree_root.resolve()
@@ -369,13 +371,22 @@ class GitWorktreeManager:
         manager = pwd.getpwuid(os.geteuid()).pw_name
         manager_acl = f"u:{manager}:rwX,"
         manager_default_acl = f"d:u:{manager}:rwx,"
+        # NEW-56: the publishing identities read the worktree after validation, but only a
+        # file's owner may add them to its ACL later, and every file the maker creates is
+        # owned by its runner (mode 660/770). Grant them read in the default ACL up front so
+        # maker-created files inherit it.
+        readers = ["delivery-runner"]
+        if repository in self._deployment_repositories:
+            readers.append("release-runner")
+        reader_acl = "".join(f"u:{reader}:r-X," for reader in readers)
+        reader_default_acl = "".join(f"d:u:{reader}:r-x," for reader in readers)
         access_acl = (
             f"{manager_acl}u:{access.maker_identity}:rwX,"
-            f"u:{access.checker_identity}:r-X,m::rwX"
+            f"u:{access.checker_identity}:r-X,{reader_acl}m::rwX"
         )
         default_acl = (
             f"{manager_default_acl}d:u:{access.maker_identity}:rwx,"
-            f"d:u:{access.checker_identity}:r-x,d:m::rwx"
+            f"d:u:{access.checker_identity}:r-x,{reader_default_acl}d:m::rwx"
         )
         traverse_acl = f"u:{access.maker_identity}:--x,u:{access.checker_identity}:--x"
         self._run(
@@ -539,6 +550,10 @@ class GitWorktreeManager:
         )
         if not result.returncode:
             return
+        # NEW-56: identities named in the ACL argument (u:<id>:... or d:u:<id>:...).
+        identities = tuple(
+            dict.fromkeys(re.findall(r"(?:^|,)(?:d:)?u:([a-z][a-z0-9-]*):", args[-2]))
+        )
         lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
         unreadable: list[str] = []
         for line in lines:
@@ -557,13 +572,45 @@ class GitWorktreeManager:
             other_ok = bool(info.st_mode & stat.S_IROTH) and (
                 not stat.S_ISDIR(info.st_mode) or bool(info.st_mode & stat.S_IXOTH)
             )
-            if info.st_uid == os.geteuid() or not other_ok:
+            if info.st_uid == os.geteuid() or not (
+                other_ok or self._acl_grants_read(path, identities, stat.S_ISDIR(info.st_mode))
+            ):
                 unreadable.append(str(path))
         if unreadable:
             raise WorktreeError(
                 "cannot grant read access to "
                 f"{len(unreadable)} path(s), e.g. {unreadable[0][-300:]}"
             )
+
+    @staticmethod
+    def _acl_grants_read(path: Path, identities: tuple[str, ...], directory: bool) -> bool:
+        """NEW-56: True when every identity has an effective read (and, for a directory,
+        traverse) entry in the path's access ACL, e.g. inherited from a default ACL."""
+        if not identities:
+            return False
+        command = ["getfacl", "--omit-header", "--absolute-names", "--", str(path)]
+        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode:
+            return False
+        effective: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if line.startswith("default:"):
+                continue
+            match = re.match(r"^user:([^:]+):([rwx-]{3})(?:\s+#effective:([rwx-]{3}))?", line)
+            if match:
+                effective[match.group(1)] = match.group(3) or match.group(2)
+        return all(
+            identity in effective
+            and effective[identity][0] == "r"
+            and (not directory or effective[identity][2] == "x")
+            for identity in identities
+        )
 
     def _descends_from(self, target: Path, base_sha: str, head: str) -> bool:
         """True when head is a strict descendant of base_sha (NEW-52 resume guard)."""

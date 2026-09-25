@@ -255,6 +255,25 @@ def test_maker_acl_covers_worktree_traversal_and_isolated_git_metadata(
         and any("u:codex-runner:r-X" in argument for argument in command)
         for command in commands
     )
+    # NEW-56: files the maker creates inherit read for the publishing identity.
+    assert any(
+        command[-1] == str(target) and any("d:u:delivery-runner:r-x" in a for a in command)
+        for command in commands
+    )
+    assert not any("release-runner" in a for command in commands for a in command)
+
+    commands.clear()
+    manager._grant_access(
+        target,
+        metadata,
+        canonical,
+        WorktreeAccess("codex-runner", "claude-runner"),
+        repository="musematic-deploy",
+    )
+    assert any(
+        command[-1] == str(target) and any("d:u:release-runner:r-x" in a for a in command)
+        for command in commands
+    )
 
 
 def test_release_read_is_limited_to_exact_deployment_worktree(tmp_path: Path) -> None:
@@ -598,3 +617,40 @@ def test_read_grant_still_fails_for_unreadable_or_other_errors(
     other = _eperm_manager(tmp_path, monkeypatch, ["setfacl: /x: No such file or directory"])
     with pytest.raises(WorktreeError, match="setfacl failed"):
         other._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+
+def test_read_grant_accepts_foreign_files_whose_acl_already_grants_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-56: maker files are 660 but inherit u:delivery-runner:r-x from the default ACL."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    owned = tree / "tasks.md"
+    owned.write_text("x", encoding="utf-8")
+    os.chmod(owned, 0o660)
+    manager = _eperm_manager(tmp_path, monkeypatch, [f"setfacl: {owned}: Operation not permitted"])
+    acl = "user::rw-\nuser:delivery-runner:r-x\t#effective:r--\ngroup::rw-\nmask::rw-\n"
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[0] == "getfacl":
+            return subprocess.CompletedProcess(args, 0, acl, "")
+        return subprocess.CompletedProcess(
+            args, 1, "", f"setfacl: {owned}: Operation not permitted\n"
+        )
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+    manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+    missing = "user::rw-\ngroup::rw-\nmask::rw-\n"
+    monkeypatch.setattr(
+        manager_module.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            0 if args[0] == "getfacl" else 1,
+            missing if args[0] == "getfacl" else "",
+            "" if args[0] == "getfacl" else f"setfacl: {owned}: Operation not permitted\n",
+        ),
+    )
+    with pytest.raises(WorktreeError, match="cannot grant read access"):
+        manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
