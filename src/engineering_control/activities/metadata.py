@@ -317,6 +317,14 @@ _STRUCTURED_OUTPUT_JSON_RULES = (
 )
 
 
+_TASKS_MD_ADVISORY = (
+    "The wording, phrasing and checkbox state of gate or test records in OpenSpec "
+    "tasks.md are advisory: run the gates yourself and judge the change on those "
+    "results. Report a tasks.md record that differs from your results as a non-blocking "
+    "finding; never request changes solely because of tasks.md gate-record wording.\n"
+)
+
+
 def _untrusted_block(label: str, content: str) -> str:
     """Fence externally-sourced issue content so embedded prompt-injection reads as data."""
     return (
@@ -3151,6 +3159,11 @@ class MetadataActivityHandler:
             "Independently review both bounded worktrees for one ChangeSet. Do not modify files. "
             "Validate the OpenSpec, source and deployment diffs, tests, immutable image policy, "
             "and risk gates. Request changes on any uncertainty.\n"
+            # NEW-57 (operator 2026-09-25): #993 was repeatedly rejected only because the
+            # gate-record wording or checkbox state in the OpenSpec tasks.md did not match
+            # the checker's own gate runs. The checker verifies gates itself; the record
+            # is documentation.
+            + _TASKS_MD_ADVISORY
             + self._checker_range_prompt(payload)
             + self._toolchain_prompt(payload, role="checker")
             + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
