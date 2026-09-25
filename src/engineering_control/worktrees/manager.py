@@ -5,6 +5,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -501,7 +502,9 @@ class GitWorktreeManager:
             resolved_target,
             *(item for item in resolved_target.rglob("*") if item.is_dir()),
         ):
-            self._run(["setfacl", "--modify", default_acl, str(directory)], resolved_target)
+            self._setfacl_readable(
+                ["setfacl", "--modify", default_acl, str(directory)], resolved_target
+            )
 
     def _grant_tree_read_access(
         self,
@@ -511,7 +514,56 @@ class GitWorktreeManager:
         cwd: Path,
     ) -> None:
         reader_acl = ",".join(f"u:{identity}:r-X" for identity in identities)
-        self._run(["setfacl", "--recursive", "--modify", reader_acl, str(target)], cwd)
+        self._setfacl_readable(["setfacl", "--recursive", "--modify", reader_acl, str(target)], cwd)
+
+    _SETFACL_EPERM = re.compile(r"^setfacl: (.+): Operation not permitted$")
+
+    def _setfacl_readable(self, args: list[str], cwd: Path) -> None:
+        """NEW-55: run a read-granting setfacl, tolerating only files it may not modify.
+
+        Files the maker creates are owned by its runner identity, and only a file's
+        owner (or root) may change its ACL, so granting delivery-runner/release-runner
+        read after validation failed with "Operation not permitted" on every maker
+        file. Such a file is accepted only when it is not ours and is already readable
+        by any identity through its "other" permission bits (directories also
+        traversable); anything else still fails closed.
+        """
+        try:
+            self._run(args, cwd)
+            return
+        except WorktreeError:
+            pass
+        # _run keeps only the last 4000 characters; re-run (idempotent) for every path.
+        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            args, cwd=cwd, check=False, text=True, capture_output=True, timeout=300
+        )
+        if not result.returncode:
+            return
+        lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+        unreadable: list[str] = []
+        for line in lines:
+            match = self._SETFACL_EPERM.match(line)
+            if match is None:
+                output = str(SecretRedactor().redact_text("\n".join(lines)).value)
+                raise WorktreeError(f"setfacl failed ({result.returncode}): {output[-4000:]}")
+            path = Path(match.group(1))
+            try:
+                info = path.lstat()
+            except OSError:
+                unreadable.append(str(path))
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            other_ok = bool(info.st_mode & stat.S_IROTH) and (
+                not stat.S_ISDIR(info.st_mode) or bool(info.st_mode & stat.S_IXOTH)
+            )
+            if info.st_uid == os.geteuid() or not other_ok:
+                unreadable.append(str(path))
+        if unreadable:
+            raise WorktreeError(
+                "cannot grant read access to "
+                f"{len(unreadable)} path(s), e.g. {unreadable[0][-300:]}"
+            )
 
     def _descends_from(self, target: Path, base_sha: str, head: str) -> bool:
         """True when head is a strict descendant of base_sha (NEW-52 resume guard)."""

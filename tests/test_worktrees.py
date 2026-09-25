@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from engineering_control.worktrees import manager as manager_module
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -534,3 +535,66 @@ def test_allocated_worktree_has_a_commit_identity(tmp_path: Path) -> None:
     assert git(["log", "-1", "--format=%an <%ae>"], allocation.path) == (
         "Engineering Control <engineering-control@local.invalid>"
     )
+
+
+def _eperm_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lines: list[str]
+) -> GitWorktreeManager:
+    """A manager whose setfacl is refused on the given lines, running as another uid."""
+    manager = GitWorktreeManager(
+        mirror_root=tmp_path / "mirrors",
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 1, "", "\n".join(lines) + "\n")
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+
+    def refused(args: list[str], cwd: Path, **kwargs: object) -> str:
+        raise WorktreeError("Git command failed (1): truncated")
+
+    manager._run = refused  # type: ignore[method-assign]
+    monkeypatch.setattr(manager_module.os, "geteuid", lambda: os.getuid() + 12345)
+    return manager
+
+
+def test_read_grant_accepts_foreign_files_that_are_already_world_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-55: maker-owned files refuse setfacl but are readable through 'other'."""
+    tree = tmp_path / "tree"
+    (tree / "dir").mkdir(parents=True)
+    os.chmod(tree / "dir", 0o755)  # noqa: S103 - the world-readable case under test
+    (tree / "dir" / "file.py").write_text("x", encoding="utf-8")
+    os.chmod(tree / "dir" / "file.py", 0o644)
+    manager = _eperm_manager(
+        tmp_path,
+        monkeypatch,
+        [
+            f"setfacl: {tree / 'dir'}: Operation not permitted",
+            f"setfacl: {tree / 'dir' / 'file.py'}: Operation not permitted",
+        ],
+    )
+
+    manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+
+def test_read_grant_still_fails_for_unreadable_or_other_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    private = tree / "private.env"
+    private.write_text("x", encoding="utf-8")
+    os.chmod(private, 0o600)
+    manager = _eperm_manager(
+        tmp_path, monkeypatch, [f"setfacl: {private}: Operation not permitted"]
+    )
+    with pytest.raises(WorktreeError, match="cannot grant read access"):
+        manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+    other = _eperm_manager(tmp_path, monkeypatch, ["setfacl: /x: No such file or directory"])
+    with pytest.raises(WorktreeError, match="setfacl failed"):
+        other._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
