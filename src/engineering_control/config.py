@@ -61,8 +61,9 @@ class Settings(BaseSettings):
     claude_executable: Path = Path("/usr/local/bin/claude")
     # NEW-53: optional Claude model pins for the delivery spec architect and the
     # independent checker (passed as --model). None keeps the CLI default.
-    claude_spec_model: str | None = None
-    claude_checker_model: str | None = None
+    # NEW-53 (operator 2026-09-25): pin Opus 5.5 for the Claude spec and checker roles.
+    claude_spec_model: str | None = "claude-opus-5-5"
+    claude_checker_model: str | None = "claude-opus-5-5"
     helm_executable: Path = Path("/usr/local/bin/helm")
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")
     staging_kubeconfig_path: Path = Path("/etc/engineering-control/credentials/staging/kubeconfig")
