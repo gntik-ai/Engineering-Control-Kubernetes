@@ -68,6 +68,7 @@ class GitWorktreeManager:
         worktree_root: Path = Path("/srv/engineering/worktrees"),
         lease_root: Path = Path("/var/lib/engineering-control/leases/worktrees"),
         metadata_root: Path | None = None,
+        publication_transport_identity: str | None = None,
     ) -> None:
         self.mirror_root = mirror_root
         self.worktree_root = worktree_root
@@ -75,6 +76,15 @@ class GitWorktreeManager:
         self.metadata_root = metadata_root or (
             worktree_root.parent / "cache" / "scan" / "worktree-git"
         )
+        # NEW-61: the controller's GitHub worker fetches the validated commits over SSH
+        # as this operator identity; it reads the ChangeSet's Git metadata (and, through
+        # its alternates, the canonical mirror) but never the worktree.
+        if publication_transport_identity is not None and (
+            not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", publication_transport_identity)
+            or publication_transport_identity in WorktreeAccess._allowed_identities
+        ):
+            raise ValueError("publication transport identity is invalid")
+        self.publication_transport_identity = publication_transport_identity
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -401,10 +411,24 @@ class GitWorktreeManager:
         self._grant_metadata_traverse(metadata, identities)
         metadata_acl = access_acl
         metadata_default_acl = default_acl
+        transport = self.publication_transport_identity
+        if transport is not None:
+            # NEW-61: objects and refs the maker commits inherit read for the transport
+            # identity, so the controller can fetch the validated branch after checking.
+            # Metadata only: the worktree ACL above is unchanged.
+            metadata_acl = access_acl.replace(",m::rwX", f",u:{transport}:r-X,m::rwX")
+            metadata_default_acl = default_acl.replace(
+                ",d:m::rwx", f",d:u:{transport}:r-x,d:m::rwx"
+            )
+            self._grant_metadata_traverse(metadata, (transport,))
         self._run(["setfacl", "--recursive", "--modify", metadata_acl, str(metadata)], metadata)
         for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
             self._run(["setfacl", "--modify", metadata_default_acl, str(directory)], metadata)
         self._grant_canonical_read(canonical_mirror, identities)
+        if transport is not None:
+            # NEW-61: the metadata repository is a --shared clone; upload-pack reads the
+            # base history through its alternates in the canonical mirror.
+            self._grant_canonical_read(canonical_mirror, (transport,))
 
     def _grant_read_access(
         self,
@@ -464,6 +488,25 @@ class GitWorktreeManager:
         self._grant_metadata_traverse(metadata, ("delivery-runner",))
         self._grant_tree_read_access(metadata, ("delivery-runner",), cwd=metadata)
         self._grant_canonical_read(mirror, ("delivery-runner",))
+        self._grant_publication_transport_read(metadata, mirror)
+
+    def _grant_publication_transport_read(self, metadata: Path, mirror: Path) -> None:
+        """NEW-61: let the controller's GitHub worker fetch the validated branch over SSH.
+
+        Only the ChangeSet's bare Git metadata repository (and the canonical mirror its
+        alternates point at) become readable; the worktree is never granted. Maker-owned
+        files must already carry the read entry from the allocation default ACL (or be
+        readable otherwise), else this fails closed like every other read grant.
+        """
+        transport = self.publication_transport_identity
+        if transport is None:
+            return
+        self._grant_metadata_traverse(metadata, (transport,))
+        self._grant_tree_read_access(metadata, (transport,), cwd=metadata)
+        default_acl = f"d:u:{transport}:r-x"
+        for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
+            self._setfacl_readable(["setfacl", "--modify", default_acl, str(directory)], metadata)
+        self._grant_canonical_read(mirror, (transport,))
 
     def _metadata_for_target(self, repository: str, target: Path) -> Path:
         try:

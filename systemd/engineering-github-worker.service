@@ -33,7 +33,12 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 ReadOnlyPaths=/home/hermes/.config/gh /home/hermes/.gitconfig /etc/engineering-control/policy/github-issue-write-validation.yaml
-InaccessiblePaths=-/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.ssh -/home/hermes/.kube -/etc/engineering-control/credentials -/etc/engineering-control/env/release
+InaccessiblePaths=-/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.kube -/etc/engineering-control/credentials -/etc/engineering-control/env/release
+# NEW-61: delivery.publish fetches the validated ChangeSet commits from the worker host
+# over SSH (read-only access to its ChangeSet Git metadata). Expose only the worker
+# alias config, its key and known_hosts, read-only; every other ~/.ssh entry stays hidden.
+TemporaryFileSystem=/home/hermes/.ssh:ro,mode=0755
+BindReadOnlyPaths=-/home/hermes/.ssh/config -/home/hermes/.ssh/hermes_worker -/home/hermes/.ssh/known_hosts
 ReadWritePaths=/var/lib/engineering-control/workers/github /srv/engineering/mirrors /srv/engineering/worktrees /srv/engineering/runs /srv/engineering/tmp
 MemoryMax=1G
 CPUQuota=100%

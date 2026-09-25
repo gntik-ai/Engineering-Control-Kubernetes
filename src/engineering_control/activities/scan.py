@@ -180,6 +180,13 @@ class ScanActivityHandler:
             worktree_root=settings.worktree_root,
             lease_root=settings.lease_root / "worktrees",
             metadata_root=settings.worktree_metadata_root,
+            # NEW-61: allocation default ACLs and the post-validation delivery grant add
+            # read on the ChangeSet Git metadata for the controller's SSH fetch.
+            publication_transport_identity=(
+                settings.publication_transport_identity
+                if settings.publication_fetch_from_worker
+                else None
+            ),
         )
         self.scanner = scanner or DeterministicScanner(
             SafeCommandRunner(

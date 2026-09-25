@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -790,8 +791,12 @@ class DeliveryActivityHandler:
     def _publish_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             promotion = PromotionPublication.model_validate(payload.get("promotion_publication"))
-            publication = RepositoryPublication.model_validate(promotion.model_dump())
-            result = self._publish(publication)
+            # NEW-61: the ChangeSet id selects the worker metadata repository; it is not a
+            # RepositoryPublication field (extra="forbid" rejected the full dump).
+            publication = RepositoryPublication.model_validate(
+                promotion.model_dump(exclude={"change_set_id"})
+            )
+            result = self._publish(publication, promotion.change_set_id)
         except GhCliAuthError:
             return {
                 **payload,
@@ -837,9 +842,116 @@ class DeliveryActivityHandler:
 
     def _publish_all(self, plan: PublicationPlan) -> list[dict[str, Any]]:
         self.broker.preflight(tuple(item.repository for item in plan.publications))
-        return [self._publish(item) for item in plan.publications]
+        return [self._publish(item, plan.change_set_id) for item in plan.publications]
 
-    def _publish(self, plan: RepositoryPublication) -> dict[str, Any]:
+    def _publish(self, plan: RepositoryPublication, change_set_id: UUID) -> dict[str, Any]:
+        if plan.branch.rsplit("/", 1)[-1] != str(change_set_id):
+            raise ValueError("publication branch does not bind its ChangeSet")
+        if self.settings.publication_fetch_from_worker:
+            # NEW-61: the worktree lives on the worker host; bring only its commits here.
+            self._push_from_worker(plan, change_set_id)
+        else:
+            self._push_from_local_worktree(plan)
+        return self._bind_pull_request(plan)
+
+    def _push_from_worker(self, plan: RepositoryPublication, change_set_id: UUID) -> None:
+        """NEW-61: fetch the exact validated branch from the worker, then push it.
+
+        The worker keeps each ChangeSet's commits in a bare Git metadata repository whose
+        path is derived only from settings, the repository slug and the ChangeSet id (as
+        GitWorktreeManager.metadata_path does), never from the payload. The branch is
+        fetched over SSH into a controller-local scratch repository and pushed only when it
+        resolves to exactly the checker-approved head.
+        """
+        self._expected_worktree(plan)  # the payload must still name the exact worktree
+        metadata = self._worker_metadata_path(plan.repository_slug, change_set_id)
+        scratch = self._publication_scratch(plan, change_set_id)
+        try:
+            repository = scratch / "repository.git"
+            self.runner.run("git", ["init", "--quiet", "--bare", str(repository)], cwd=scratch)
+            environment = self._scratch_environment(plan.repository_slug)
+            ref = f"refs/heads/{plan.branch}"
+            self.runner.run(
+                "git",
+                [
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    # The metadata repository is owned by the worker's scan identity.
+                    f"--upload-pack=git -c safe.directory={metadata} upload-pack",
+                    f"ssh://{self.settings.publication_transport_host}{metadata}",
+                    f"+{ref}:{ref}",
+                ],
+                cwd=repository,
+                timeout_seconds=900,
+                environment={
+                    **environment,
+                    "GIT_SSH_COMMAND": (
+                        "ssh -o BatchMode=yes -o ConnectTimeout=20 -o UpdateHostKeys=no"
+                    ),
+                },
+            )
+            fetched = self.runner.run(
+                "git",
+                ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+                cwd=repository,
+                environment=environment,
+            ).stdout.strip()
+            if fetched != plan.head_sha:
+                # NEW-61: fail closed; never publish anything but the validated commit.
+                raise ValueError("fetched ChangeSet branch does not match the validated commit")
+            self.runner.run(
+                "git",
+                [
+                    "push",
+                    "--porcelain",
+                    f"https://github.com/{plan.repository}.git",
+                    f"{plan.head_sha}:{ref}",
+                ],
+                cwd=repository,
+                timeout_seconds=900,
+                environment=environment,
+            )
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def _worker_metadata_path(self, repository_slug: str, change_set_id: UUID) -> Path:
+        """NEW-61: mirror GitWorktreeManager.metadata_path on the worker host."""
+        metadata = self.settings.worktree_metadata_root / repository_slug / f"{change_set_id}.git"
+        # The path is embedded in the remote upload-pack command line: keep it inert.
+        if (
+            not metadata.is_absolute()
+            or ".." in metadata.parts
+            or not re.fullmatch(r"/[A-Za-z0-9._/-]+", str(metadata))
+        ):
+            raise ValueError("worker ChangeSet Git metadata path is not bounded")
+        return metadata
+
+    def _publication_scratch(self, plan: RepositoryPublication, change_set_id: UUID) -> Path:
+        root = (self.settings.run_root / "delivery" / "publications").resolve()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        scratch = Path(
+            tempfile.mkdtemp(prefix=f"{plan.repository_slug}-{change_set_id}-", dir=root)
+        ).resolve()
+        if scratch.parent != root:
+            raise ValueError("publication scratch repository escaped its root")
+        os.chmod(scratch, 0o700)
+        return scratch
+
+    def _scratch_environment(self, repository_slug: str) -> dict[str, str]:
+        environment = {
+            "HOME": str(self.broker.authenticated_home),
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        # NEW-61: borrow objects from the controller's canonical mirror so only the
+        # ChangeSet's new commits travel over SSH (and the base need not be re-sent).
+        mirror_root = self.settings.mirror_root.resolve()
+        mirror = (self.settings.mirror_root / f"{repository_slug}.git").resolve()
+        if mirror.parent == mirror_root and (mirror / "objects").is_dir():
+            environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(mirror / "objects")
+        return environment
+
+    def _push_from_local_worktree(self, plan: RepositoryPublication) -> None:
         worktree = self._bounded_worktree(plan)
         git_arguments = ["-c", f"safe.directory={worktree}"]
         branch = self.runner.run(
@@ -873,6 +985,8 @@ class DeliveryActivityHandler:
             timeout_seconds=900,
             environment=environment,
         )
+
+    def _bind_pull_request(self, plan: RepositoryPublication) -> dict[str, Any]:
         existing = self._existing_pull_request(plan)
         if existing is None:
             body_path = self._body_file(plan)
@@ -925,10 +1039,17 @@ class DeliveryActivityHandler:
         return matches[0] if matches else None
 
     def _bounded_worktree(self, plan: RepositoryPublication) -> Path:
+        resolved = self._expected_worktree(plan)
+        if not resolved.is_dir():
+            raise ValueError("publication escaped its exact ChangeSet worktree")
+        return resolved
+
+    def _expected_worktree(self, plan: RepositoryPublication) -> Path:
+        # NEW-61: on the controller the worktree is remote, so this checks the path only.
         root = self.settings.worktree_root.resolve()
         resolved = plan.working_directory.resolve()
         expected = root / plan.repository_slug / str(plan.branch.rsplit("/", 1)[-1])
-        if not resolved.is_dir() or resolved != expected:
+        if resolved != expected:
             raise ValueError("publication escaped its exact ChangeSet worktree")
         return resolved
 

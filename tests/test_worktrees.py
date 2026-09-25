@@ -654,3 +654,87 @@ def test_read_grant_accepts_foreign_files_whose_acl_already_grants_read(
     )
     with pytest.raises(WorktreeError, match="cannot grant read access"):
         manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+
+def test_publication_transport_identity_reads_only_changeset_git_metadata(
+    tmp_path: Path,
+) -> None:
+    """NEW-61: the controller fetches validated commits over SSH as the operator.
+
+    (Not "hermes" here: the tests run as hermes, which is the manager identity.)
+    """
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "falcone" / str(uuid4())
+    target.mkdir(parents=True)
+    metadata_root = tmp_path / "cache" / "scan" / "worktree-git"
+    metadata = metadata_root / "falcone" / f"{target.name}.git"
+    (metadata / "objects").mkdir(parents=True)
+    mirror_root = tmp_path / "mirrors"
+    canonical = mirror_root / "falcone.git"
+    canonical.mkdir(parents=True)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+        publication_transport_identity="transport",
+    )
+    commands: list[list[str]] = []
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        commands.append(args)
+        return ""
+
+    manager._run = record  # type: ignore[method-assign]
+    manager._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+
+    def grants(path: Path, entry: str) -> bool:
+        return any(
+            command[0] == "setfacl" and command[-1] == str(path) and entry in command[-2]
+            for command in commands
+        )
+
+    # Allocation default ACL: what the maker commits inherits read for the transport.
+    assert grants(metadata, "u:transport:r-X")
+    assert grants(metadata, "d:u:transport:r-x")
+    assert grants(metadata / "objects", "d:u:transport:r-x")
+    assert grants(metadata.parent, "u:transport:--x")
+    assert grants(canonical, "u:transport:r-X")
+    # Never the worktree itself.
+    assert not any(
+        command[-1] in {str(target), str(target.parent)} and "u:transport:" in command[-2]
+        for command in commands
+    )
+
+    commands.clear()
+    manager.verify_mirror = lambda repository: canonical  # type: ignore[method-assign]
+    manager.grant_delivery_read("falcone", target)
+    assert grants(metadata, "u:transport:r-X")
+    assert grants(metadata / "objects", "d:u:transport:r-x")
+    assert grants(canonical, "u:transport:r-X")
+    assert grants(target, "u:delivery-runner:r-X")
+    assert not any(
+        command[-1] in {str(target), str(target.parent)} and "u:transport:" in command[-2]
+        for command in commands
+    )
+
+    commands.clear()
+    without = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+    )
+    without._run = record  # type: ignore[method-assign]
+    without._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+    assert not any("u:transport:" in argument for command in commands for argument in command)
+
+
+@pytest.mark.parametrize("identity", ["codex-runner", "claude-runner", "Hermes", "a b", ""])
+def test_publication_transport_identity_must_be_a_plain_non_model_user(identity: str) -> None:
+    with pytest.raises(ValueError, match="transport identity"):
+        GitWorktreeManager(publication_transport_identity=identity)

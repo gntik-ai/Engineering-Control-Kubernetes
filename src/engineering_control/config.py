@@ -112,6 +112,19 @@ class Settings(BaseSettings):
     application_data_mutation_enabled: bool = False
     github_issue_write_validation_file: Path = GITHUB_WRITE_POLICY_PATH
     github_registry_auth_file: Path | None = None
+    # NEW-61: ChangeSet worktrees live on the worker host while every GitHub write stays
+    # on the controller. delivery.publish fetches the exact validated branch from the
+    # worker's ChangeSet Git metadata over SSH (host alias below, resolved by the
+    # transport identity's ~/.ssh/config) into a controller-local scratch repository and
+    # pushes from there. The worker's worktree manager grants this identity read access
+    # to that metadata repository only. Disable to publish from a local worktree.
+    publication_fetch_from_worker: bool = True
+    publication_transport_host: str = Field(
+        default="worker", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
+    )
+    publication_transport_identity: str = Field(
+        default="hermes", pattern=r"^[a-z_][a-z0-9_-]{0,31}$"
+    )
     git_executable: Path = Path("/usr/bin/git")
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
     gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")

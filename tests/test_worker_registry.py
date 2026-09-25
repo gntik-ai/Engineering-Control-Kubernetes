@@ -283,6 +283,12 @@ def test_github_systemd_contract_is_hardened_and_secret_free() -> None:
     assert "/home/hermes/.claude" in unit
     assert "/home/hermes/.kube" in unit
     assert "/etc/engineering-control/env/release" in unit
+    # NEW-61: only the worker alias config, its key and known_hosts are exposed, read-only.
+    assert "TemporaryFileSystem=/home/hermes/.ssh:ro" in unit
+    assert (
+        "BindReadOnlyPaths=-/home/hermes/.ssh/config -/home/hermes/.ssh/hermes_worker "
+        "-/home/hermes/.ssh/known_hosts"
+    ) in unit
     for forbidden in ("GITHUB_TOKEN", "GH_TOKEN", "auth token", "worker-common.env"):
         assert forbidden not in unit
 
