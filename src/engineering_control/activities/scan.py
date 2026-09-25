@@ -2161,6 +2161,13 @@ class ScanActivityHandler:
         receipts: list[dict[str, Any]] = []
         redactor = SecretRedactor()
         for report in reports:
+            # NEW-54: an empty file (e.g. the deployment patch of a source-only ChangeSet,
+            # allowed since NEW-41/42) is refused by the evidence transfer ("empty or
+            # exceeds the configured size bound") and failed validate_changeset. Record it
+            # instead of uploading it.
+            if report.stat().st_size == 0:
+                receipts.append({"status": "EMPTY_NOT_UPLOADED", "filename": report.name})
+                continue
             # Scanner output (trivy "Secrets", semgrep matched lines, SBOM fields) is not
             # pre-redacted; the ingest service rejects any evidence it would still redact.
             text = report.read_text(encoding="utf-8", errors="replace")

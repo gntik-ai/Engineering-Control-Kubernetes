@@ -364,3 +364,31 @@ def test_scan_reports_pass_the_real_ingest_redaction_check(tmp_path: Path) -> No
     stored = "".join(path.read_text() for path in (tmp_path / "stored").rglob("*.*"))
     assert "hunter2" not in stored
     assert "# fixture" in stored
+
+
+def test_empty_evidence_is_recorded_not_uploaded(tmp_path: Path) -> None:
+    """NEW-54: a source-only ChangeSet's deployment patch is empty; uploading it raised
+    'evidence upload is empty or exceeds the configured size bound' in validate_changeset."""
+    from engineering_control.activities.scan import ScanActivityHandler
+
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    empty = evidence_root / "deployment.patch"
+    empty.write_text("", encoding="utf-8")
+
+    class _RefusingPublisher:
+        def upload(self, *args: object, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("an empty report must not be uploaded")
+
+    handler = ScanActivityHandler(
+        Settings(evidence_root=evidence_root),
+        publisher=_RefusingPublisher(),  # type: ignore[arg-type]
+    )
+
+    receipts = handler._publish_reports(
+        {"project": "musematic", "orchestration": {"workflow_id": "wf-1"}},
+        [empty],
+        filename_prefix="postchecks-deployment",
+    )
+
+    assert receipts == [{"status": "EMPTY_NOT_UPLOADED", "filename": "deployment.patch"}]
