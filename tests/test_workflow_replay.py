@@ -1021,3 +1021,17 @@ async def test_issue_delivery_does_not_refresh_findings_without_an_existing_issu
     )
 
     assert "delivery.refresh_issue_body" not in _scheduled_step_names(history)
+
+
+def test_backlog_loop_outcome_is_compacted_below_the_payload_limit() -> None:
+    """NEW-59: 19 retry rounds of full child contexts exceeded Temporal's 2 MB limit."""
+    from engineering_control.workflows.definitions import _compact_loop_outcome
+
+    bulky = {"status": "REQUEST_CHANGES", "attempt": 3, "context": {"x": "y" * 50_000}}
+    outcome = _compact_loop_outcome({"status": "PAUSED", "results": [bulky] * 300})
+
+    assert outcome["status"] == "PAUSED"
+    assert outcome["results_total"] == 300
+    assert len(outcome["results"]) == 200
+    assert outcome["results"][0] == {"status": "REQUEST_CHANGES", "attempt": 3}
+    assert len(json.dumps(outcome)) < 100_000

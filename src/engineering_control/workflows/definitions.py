@@ -2191,12 +2191,61 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         return None
 
 
+_LOOP_RESULT_KEYS = (
+    "status",
+    "blocker",
+    "reason_code",
+    "attempt",
+    "stage",
+    "issue_number",
+    "issue_url",
+    "source_pr_url",
+    "deployment_pr_url",
+    "merge_sha",
+    "release_tag",
+    "image_tag",
+)
+_LOOP_RESULT_LIMIT = 200
+
+
+def _compact_loop_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
+    """NEW-59: keep a bounded, scalar summary of each child result in the loop outcome."""
+    results = outcome.get("results")
+    if not isinstance(results, list):
+        return outcome
+    compact: list[dict[str, Any]] = []
+    for item in results[-_LOOP_RESULT_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        summary = {
+            key: item[key]
+            for key in _LOOP_RESULT_KEYS
+            if key in item and (item[key] is None or isinstance(item[key], (str, int, float, bool)))
+        }
+        context = item.get("context")
+        if isinstance(context, dict):
+            for key in _LOOP_RESULT_KEYS:
+                value = context.get(key)
+                if key not in summary and isinstance(value, (str, int, float, bool)):
+                    summary[key] = value
+        compact.append(summary)
+    return {**outcome, "results": compact, "results_total": len(results)}
+
+
 @workflow.defn(name="ExistingGitHubBacklogLoopWorkflow")
 class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     """Durably control imported issues; fail closed until current reproduction is proven."""
 
     @workflow.run
     async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+        # NEW-59: every child delivery's full context was accumulated in "results"; after
+        # 19 retry rounds on musematic #993 the loop's completion payload exceeded
+        # Temporal's 2 MB limit (TMPRL1103) and the loop could never finish. Only the
+        # returned value is compacted, so no command changes and replay is unaffected.
+        outcome = await self._run_loop(request)
+        return _compact_loop_outcome(outcome)
+
+    async def _run_loop(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
         if request.project not in {"falcone", "musematic", "llmwiki"}:
             raise ApplicationError(
                 "existing backlog loop project is not allowlisted",
