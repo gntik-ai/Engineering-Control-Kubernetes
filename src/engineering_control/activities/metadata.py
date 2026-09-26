@@ -317,6 +317,15 @@ _STRUCTURED_OUTPUT_JSON_RULES = (
 )
 
 
+# NEW-66: a published ChangeSet keeps its worktree leases for the release path.
+_PUBLISHED_CHANGE_SET_STATES = frozenset(
+    {
+        ChangeSetState.SOURCE_PR.value,
+        ChangeSetState.CI_VALIDATED.value,
+        ChangeSetState.SOURCE_MERGED.value,
+    }
+)
+
 # NEW-64: runs that can no longer use a worktree lease they still hold.
 _TERMINAL_RUN_STATUSES = frozenset(
     {"SUCCESS", "FAILED", "CANCELLED", "TIMED_OUT", "BLOCKED", "RATE_LIMITED"}
@@ -2621,7 +2630,14 @@ class MetadataActivityHandler:
                 change_set = (
                     session.get(ChangeSet, run.change_set_id) if run.change_set_id else None
                 )
-                if change_set is None or change_set.source_pr_url is None:
+                # NEW-66: a CI-repair re-delivery moves a published ChangeSet back to
+                # PLANNED/IMPLEMENTING; when one of its attempts stops, its correction
+                # attempt must be able to take the worktree over.
+                if (
+                    change_set is None
+                    or change_set.source_pr_url is None
+                    or change_set.state not in _PUBLISHED_CHANGE_SET_STATES
+                ):
                     now = datetime.now(UTC)
                     for lease in session.scalars(
                         select(WorktreeLease).where(
@@ -3063,7 +3079,12 @@ class MetadataActivityHandler:
                 "The published pull request for this ChangeSet failed these CI jobs, which "
                 "pass on unchanged main, so this ChangeSet caused them. Fix each one on top "
                 "of the existing commits and run the matching repository test commands (for "
-                "example web lint and the OpenAPI snapshot regeneration) before committing:\n"
+                "example web lint and the OpenAPI snapshot regeneration) before committing. "
+                # NEW-66: a stale govulncheck failure was "fixed" by narrowing its CI gate.
+                "Never change CI workflows, CI tests or security/supply-chain gates to make a "
+                "job pass, and revert any such change already on this branch; if a job fails "
+                "for reasons outside this ChangeSet (CI tooling, a run against an older main), "
+                "leave it and explain it in open_questions:\n"
             ) + "".join(f"- {name}\n" for name in ci_regressions)
         resume_instruction = (
             f"This {target} worktree already contains the previous attempt's committed work "

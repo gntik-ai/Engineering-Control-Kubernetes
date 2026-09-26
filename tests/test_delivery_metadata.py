@@ -579,12 +579,35 @@ async def test_worktree_leases_are_kept_once_a_pull_request_exists(tmp_path: Pat
         change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
         assert change_set is not None
         change_set.source_pr_url = "https://github.com/gntik-ai/musematic/pull/1"
+        change_set.state = "SOURCE_PR"
 
     await handler.handle("delivery.release_leases", {"run_id": run})
 
     with handler.sessions() as session:
         leases = session.scalars(select(WorktreeLease)).all()
     assert leases and all(lease.released_at is None for lease in leases)
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_ci_repair_attempt_releases_its_worktree_leases(tmp_path: Path) -> None:
+    # NEW-66: musematic #993's CI-repair attempt 1 got REQUEST_CHANGES; its PR existed,
+    # so the leases were kept and correction attempt 2 failed on the lease conflict.
+    handler, allocation = _lease_fixture(tmp_path)
+    first = _delivery_run(handler, allocation["change_set_id"])
+    second = _delivery_run(handler, allocation["change_set_id"])
+    await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": first})
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.source_pr_url = "https://github.com/gntik-ai/musematic/pull/1"
+        change_set.state = "PLANNED"  # the repair re-delivery is in progress
+
+    await handler.handle("delivery.release_leases", {"run_id": first})
+    corrected = await handler.handle(
+        "delivery.persist_worktree_leases", {**allocation, "run_id": second}
+    )
+
+    assert corrected["status"] == "WORKTREE_LEASES_PERSISTED"
 
 
 def test_spec_prompt_states_the_output_contract_the_schema_enforces(tmp_path: Path) -> None:
@@ -776,6 +799,7 @@ def test_ci_repair_maker_prompt_names_the_regressed_ci_jobs(tmp_path: Path) -> N
 
     assert "failed these CI jobs" in source
     assert "- Lint Frontend" in source and "- Build documentation" in source
+    assert "Never change CI workflows, CI tests or security/supply-chain gates" in source
     assert "failed these CI jobs" not in deployment
 
 
