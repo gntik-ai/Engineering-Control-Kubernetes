@@ -2056,6 +2056,16 @@ class MetadataActivityHandler:
             + (
                 "This candidate is an existing GitHub issue being revalidated against current "
                 "source; its own issue is expected to exist and is not a duplicate.\n"
+                # NEW-73: musematic #1125's verifiers confirmed the vulnerable versions in
+                # go.mod/pnpm-lock.yaml but answered reproduced=false because the issue's
+                # steps need scanners/network the sandbox does not have.
+                "This is a current-SOURCE revalidation. The sandbox has no network, GitHub, "
+                "CI, container runtime or deployed environment; their absence is not an "
+                "environment failure. When the minimal reproduction needs any of them, "
+                "reproduce the underlying condition statically from this snapshot instead "
+                "(for example the exact dependency versions pinned in manifests or lockfiles "
+                "inside an advisory's affected range, or the faulty code path) and set "
+                "reproduced from that evidence; the runtime is verified after deployment.\n"
                 if revalidation
                 else ""
             )

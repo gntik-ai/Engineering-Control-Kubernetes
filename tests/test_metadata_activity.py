@@ -2185,6 +2185,10 @@ async def test_verifier_prompt_states_the_evidence_binding_controls_enforce(
     assert ("its own issue is expected to exist" in prompt) is (
         flow == "current-state-revalidation"
     )
+    # NEW-73: revalidation verifiers judge from source when the steps need network/CI.
+    assert ("This is a current-SOURCE revalidation" in prompt) is (
+        flow == "current-state-revalidation"
+    )
 
 
 @pytest.mark.asyncio
