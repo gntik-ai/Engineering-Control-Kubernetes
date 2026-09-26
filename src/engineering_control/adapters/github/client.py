@@ -815,6 +815,51 @@ class GhCliBroker:
         branch = self._baseline_branch(branch)
         self._run(["api", "-X", "DELETE", f"repos/{repository}/git/refs/heads/{branch}"])
 
+    def commit_date(self, repository: str, ref: str) -> str:
+        """NEW-67: committer date (ISO 8601) of one branch or commit."""
+        repository = self._batch(repository)
+        ref = self._value(ref, "commit ref", maximum=120)
+        value = self._run(
+            ["api", f"repos/{repository}/commits/{ref}", "--jq", ".commit.committer.date"]
+        ).stdout.strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+            raise GhCliPolicyError("commit date is invalid")
+        return value
+
+    def last_reopened_at(self, repository: str, number: int) -> str:
+        """NEW-67: when the pull request was last reopened ('' if never)."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("pull request number is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/issues/{number}/events",
+                "--paginate",
+                "--jq",
+                '.[] | select(.event == "reopened") | .created_at',
+            ]
+        ).stdout
+        values = [line.strip() for line in raw.splitlines() if line.strip()]
+        return max(values) if values else ""
+
+    def rerun_pull_request_ci(
+        self, *, repository: str, number: int, expected_head_sha: str, change_binding: str
+    ) -> None:
+        """NEW-67: close and reopen the bound PR so pull_request CI runs on current base.
+
+        The head commit is unchanged (the ChangeSet binding stays valid); only the
+        merge ref GitHub builds for the PR moves to the current base branch.
+        """
+        repository = self._write(repository, change_binding)
+        if number < 1 or not re.fullmatch(r"[a-f0-9]{40}", expected_head_sha):
+            raise GhCliPolicyError("CI re-run binding is invalid")
+        current = self.view_pull_request(repository, number)
+        if current.get("headRefOid") != expected_head_sha or current.get("state") != "OPEN":
+            raise GhCliPolicyError("pull request changed before the CI re-run")
+        self._run(["pr", "close", str(number), "--repo", repository])
+        self._run(["pr", "reopen", str(number), "--repo", repository])
+
     @staticmethod
     def _baseline_branch(branch: str) -> str:
         if not re.fullmatch(r"hermes/ci-baseline/[a-f0-9]{12}-[a-f0-9]{8}", branch):

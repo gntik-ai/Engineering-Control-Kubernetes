@@ -1066,6 +1066,23 @@ class GitOpsGitHubHandler:
             return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CHECKS_PENDING"}
         failed = sorted(name for name, value in states.items() if value == "FAILED")
         repository = plan.source_repository
+        # NEW-67: the baseline always runs on current main; PR results from before main
+        # moved would turn fixes that landed on main into false regressions (#993's
+        # govulncheck). Re-run the PR's CI on the current base first.
+        main_date = self.broker.commit_date(repository, plan.source_base_branch)
+        if _latest_check_start(pull_request) < main_date:
+            if not create:
+                return {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_STALE"}
+            if self.broker.last_reopened_at(repository, plan.source_pr_number) >= main_date:
+                return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CI_RERUN_PENDING"}
+            self._require_baseline_write(repository)
+            self.broker.rerun_pull_request_ci(
+                repository=repository,
+                number=plan.source_pr_number,
+                expected_head_sha=plan.source_head_sha,
+                change_binding=f"changeset:{plan.change_set_id}",
+            )
+            return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CI_RERUN_STARTED"}
         changed = self.broker.pull_request_files(repository, plan.source_pr_number)
         markers = sorted(
             {
@@ -1496,6 +1513,17 @@ def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:
         if rank[value] >= rank.get(states.get(name, "PASSED"), 0):
             states[name] = value
     return states
+
+
+def _latest_check_start(pull_request: dict[str, Any]) -> str:
+    """NEW-67: ISO start time of the newest PR check ('' when none is reported)."""
+    raw_checks = pull_request.get("statusCheckRollup")
+    starts = [
+        str(raw.get("startedAt") or raw.get("createdAt") or "")
+        for raw in (raw_checks if isinstance(raw_checks, list) else [])
+        if isinstance(raw, dict)
+    ]
+    return max((value for value in starts if value), default="")
 
 
 def _check_names(value: Any) -> list[str]:

@@ -1236,10 +1236,26 @@ def test_gitops_steps_are_owned_by_exactly_one_worker() -> None:
 MAIN_SHA = "b" * 40
 
 
-def _check(name: str, conclusion: str | None) -> dict[str, Any]:
+MAIN_DATE = "2026-09-26T11:00:00Z"
+FRESH = "2026-09-26T12:00:00Z"
+
+
+def _check(name: str, conclusion: str | None, started: str = FRESH) -> dict[str, Any]:
     if conclusion is None:
-        return {"workflowName": "CI", "name": name, "status": "IN_PROGRESS", "conclusion": ""}
-    return {"workflowName": "CI", "name": name, "status": "COMPLETED", "conclusion": conclusion}
+        return {
+            "workflowName": "CI",
+            "name": name,
+            "status": "IN_PROGRESS",
+            "conclusion": "",
+            "startedAt": started,
+        }
+    return {
+        "workflowName": "CI",
+        "name": name,
+        "status": "COMPLETED",
+        "conclusion": conclusion,
+        "startedAt": started,
+    }
 
 
 class BaselineGh(FakeGh):
@@ -1252,6 +1268,7 @@ class BaselineGh(FakeGh):
         self.markers: list[tuple[str, str]] = []
         self.deleted: list[str] = []
         self.baseline_checks: list[dict[str, Any]] = []
+        self.reopened: list[str] = []
 
     def run(self, executable: str, arguments: Sequence[str], **kwargs: Any) -> CommandResult:
         args = list(arguments)
@@ -1269,7 +1286,15 @@ class BaselineGh(FakeGh):
         if args[0] == "api" and args[1].endswith("/pulls/77/files"):
             return "\n".join(self.changed)
         if args[0] == "api" and args[1].endswith("/commits/main"):
+            if ".commit.committer.date" in args:
+                return MAIN_DATE + "\n"
             return json.dumps({"sha": MAIN_SHA, "tree": "f" * 40})
+        if args[0] == "api" and args[1].endswith("/issues/77/events"):
+            return "".join(f"{value}\n" for value in self.reopened)
+        if args[:2] == ["pr", "reopen"]:
+            self.pull_requests[(args[4], int(args[2]))]["state"] = "OPEN"
+            self.reopened.append(FRESH)
+            return ""
         if args[:3] == ["api", "-X", "POST"] and "refs/heads/" in " ".join(args):
             ref = args[args.index("-f") + 1].removeprefix("ref=refs/heads/")
             sha = args[args.index("-f", args.index("-f") + 1) + 1].removeprefix("sha=")
@@ -1463,3 +1488,26 @@ def test_github_handler_creates_its_own_gh_working_directory(tmp_path: Path) -> 
     handler, _ = _github(tmp_path)
     assert handler.root == (tmp_path / "runs" / "gitops-github").resolve()
     assert handler.root.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_stale_pr_ci_is_rerun_on_current_main_before_the_baseline(tmp_path: Path) -> None:
+    # NEW-67: #1121's CI ran before main gained the govulncheck pin; comparing it with a
+    # baseline on the new main made govulncheck a false regression.
+    stale = [_check("govulncheck", "FAILURE", started="2026-09-26T07:20:20Z")]
+    handler, fake = _baseline_handler(tmp_path, ["apps/web/x.tsx"], stale)
+
+    rerun = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert rerun == {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CI_RERUN_STARTED"}
+    assert [call[:2] for call in fake.calls if call[:2] in (["pr", "close"], ["pr", "reopen"])] == [
+        ["pr", "close"],
+        ["pr", "reopen"],
+    ]
+    assert fake.branches == {}  # no baseline is opened against stale PR results
+
+    waiting = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert waiting == {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CI_RERUN_PENDING"}
+    assert len(fake.reopened) == 1
+
+    merge = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert merge == {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_STALE"}
