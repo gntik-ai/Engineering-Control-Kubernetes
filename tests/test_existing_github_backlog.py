@@ -1234,3 +1234,40 @@ def test_a_paused_loop_run_reads_paused_until_it_really_finishes(tmp_path: Path)
     assert record("RUNNING") == ("RUNNING", None)
     status, finished_at = record("STOPPED")
     assert status == "STOPPED" and finished_at is not None
+
+
+def test_runtime_required_issues_proceed_on_source_repro_in_staged_full_delivery(
+    tmp_path: Path,
+) -> None:
+    # NEW-69: nothing records a runtime reproduction, so musematic #1125 (its text says
+    # "staging") paused forever at CURRENT_RUNTIME_REVALIDATION_REQUIRED. Full delivery
+    # through an enabled staging flow proves the runtime after the deploy instead.
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'gate.sqlite'}",
+        project_config_root=ROOT / "config/projects",
+    )
+    handler = EngineeringActivityHandler(settings)
+    item = {
+        "repository": "gntik-ai/musematic",
+        "issue_number": 1125,
+        "reproduction_mode": "RUNTIME_REQUIRED",
+        "current_source_reproduction": "PENDING_CURRENT_STATE_REVALIDATION",
+        "current_runtime_reproduction": "PENDING",
+    }
+    staged = {"project": "musematic", "delivery_mode": "full-delivery", "item": item}
+
+    pending = handler._backlog_revalidate_gate(staged)
+    assert pending["blocker"] == "CURRENT_SOURCE_REVALIDATION_REQUIRED"
+
+    confirmed = {**item, "current_source_reproduction": "REPRODUCED_CURRENT_SOURCE"}
+    no_finding = handler._backlog_revalidate_gate({**staged, "item": confirmed})
+    assert no_finding["blocker"] == "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED"
+
+    source_pr = handler._backlog_revalidate_gate(
+        {**staged, "delivery_mode": "source-pr", "item": confirmed}
+    )
+    assert source_pr["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
+    unstaged = handler._backlog_revalidate_gate(
+        {**staged, "project": "falcone", "item": {**confirmed, "repository": "gntik-ai/falcone"}}
+    )
+    assert unstaged["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"

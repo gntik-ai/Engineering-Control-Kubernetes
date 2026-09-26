@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.activities.gitops import StagingFlowBlocked, enabled_staging_flow
 from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.engineering.backlog import (
@@ -1619,6 +1620,16 @@ class EngineeringActivityHandler:
             self._write_policy_request(deactivation)
         return {**payload, "status": terminal}
 
+    def _runtime_proven_after_deploy(self, payload: dict[str, Any]) -> bool:
+        """NEW-69: full delivery with an enabled staging flow verifies the runtime."""
+        if payload.get("delivery_mode") != "full-delivery":
+            return False
+        try:
+            enabled_staging_flow(self.settings.project_config_root, str(payload.get("project")))
+        except (StagingFlowBlocked, ValueError):
+            return False
+        return True
+
     def _backlog_revalidate_gate(self, payload: dict[str, Any]) -> dict[str, Any]:
         item = payload.get("item")
         if not isinstance(item, dict):
@@ -1646,7 +1657,15 @@ class EngineeringActivityHandler:
             "REPRODUCED_CURRENT_DEPLOYMENT",
             "PROVEN_ALREADY_FIXED",
         }
-        if mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"}:
+        # NEW-69 (operator decision 2026-09-26): no step records a runtime reproduction,
+        # so RUNTIME_REQUIRED issues (any text mentioning staging, login, 404, ...) could
+        # never be delivered. In full delivery through an enabled staging flow, the
+        # post-deploy verification (Argo sync + workloads on the new image) is the runtime
+        # proof; such issues proceed on the current-source revalidation.
+        runtime_gate = mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"} and not (
+            self._runtime_proven_after_deploy(payload)
+        )
+        if runtime_gate:
             reproduced = reproduced and runtime in {
                 "REPRODUCED_CURRENT_RUNTIME",
                 "REPRODUCED_CURRENT_DEPLOYMENT",
@@ -1657,7 +1676,7 @@ class EngineeringActivityHandler:
                 "status": "BLOCKED",
                 "blocker": (
                     "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
-                    if mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"}
+                    if runtime_gate
                     else "CURRENT_SOURCE_REVALIDATION_REQUIRED"
                 ),
             }
