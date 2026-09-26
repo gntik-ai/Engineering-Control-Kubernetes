@@ -25,6 +25,7 @@ from engineering_control.activities.gitops import (
     split_image,
 )
 from engineering_control.adapters.command import CommandFailure, CommandResult
+from engineering_control.adapters.github.client import GhCliPolicyError
 from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.db.base import Base
@@ -902,11 +903,23 @@ class FakeGh:
 SAFE = ("gntik-ai/musematic", "gntik-ai/musematic-deploy")
 
 
-def _github(tmp_path: Path, *, safe: tuple[str, ...] = SAFE) -> tuple[GitOpsGitHubHandler, FakeGh]:
+def _disable_baseline(projects: Path) -> Path:
+    path = projects / "musematic.yaml"
+    text = path.read_text(encoding="utf-8")
+    enabled = "    ci_baseline:\n      enabled: true\n"
+    assert enabled in text
+    path.write_text(text.replace(enabled, "    ci_baseline:\n      enabled: false\n"), "utf-8")
+    return projects
+
+
+def _github(
+    tmp_path: Path, *, safe: tuple[str, ...] = SAFE, baseline: bool = True
+) -> tuple[GitOpsGitHubHandler, FakeGh]:
     fake = FakeGh()
+    projects = _config_root(tmp_path, safe_repositories=safe)
     settings = _settings(
         tmp_path,
-        project_config_root=_config_root(tmp_path, safe_repositories=safe),
+        project_config_root=projects if baseline else _disable_baseline(projects),
         github_writes_enabled=True,
     )
     return GitOpsGitHubHandler(settings, runner=fake), fake  # type: ignore[arg-type]
@@ -933,7 +946,7 @@ def _pull_request(**changes: Any) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_pr_checks_poll_states(tmp_path: Path) -> None:
-    handler, fake = _github(tmp_path)
+    handler, fake = _github(tmp_path, baseline=False)
     fake.pull_requests[("gntik-ai/musematic", 77)] = _pull_request()
     assert (await handler.handle("gitops.pr_checks", {"plan": _plan()}))["status"] == (
         "CHECKS_PASSED"
@@ -1216,3 +1229,229 @@ def test_gitops_steps_are_owned_by_exactly_one_worker() -> None:
         assert step in controller and step not in github
     for step in GitOpsGitHubHandler.supported_steps:
         assert step in github and step not in controller
+
+
+# -- NEW-63: baseline-aware CI gate ----------------------------------------------------
+
+MAIN_SHA = "b" * 40
+
+
+def _check(name: str, conclusion: str | None) -> dict[str, Any]:
+    if conclusion is None:
+        return {"workflowName": "CI", "name": name, "status": "IN_PROGRESS", "conclusion": ""}
+    return {"workflowName": "CI", "name": name, "status": "COMPLETED", "conclusion": conclusion}
+
+
+class BaselineGh(FakeGh):
+    """FakeGh plus the branch, contents and PR calls of the CI baseline."""
+
+    def __init__(self, changed: list[str]) -> None:
+        super().__init__()
+        self.changed = changed
+        self.branches: dict[str, str] = {}
+        self.markers: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+        self.baseline_checks: list[dict[str, Any]] = []
+
+    def run(self, executable: str, arguments: Sequence[str], **kwargs: Any) -> CommandResult:
+        args = list(arguments)
+        if args[0] == "api" and "/commits/hermes/ci-baseline/" in args[1]:
+            self.calls.append(args)
+            branch = args[1].split("/commits/", 1)[1]
+            if branch not in self.branches:
+                raise CommandFailure("gh api failed: 404")
+            return CommandResult(
+                0, json.dumps({"sha": self.branches[branch], "tree": "f" * 40}), ""
+            )
+        return super().run(executable, arguments, **kwargs)
+
+    def _answer(self, args: list[str]) -> str:
+        if args[0] == "api" and args[1].endswith("/pulls/77/files"):
+            return "\n".join(self.changed)
+        if args[0] == "api" and args[1].endswith("/commits/main"):
+            return json.dumps({"sha": MAIN_SHA, "tree": "f" * 40})
+        if args[:3] == ["api", "-X", "POST"] and "refs/heads/" in " ".join(args):
+            ref = args[args.index("-f") + 1].removeprefix("ref=refs/heads/")
+            sha = args[args.index("-f", args.index("-f") + 1) + 1].removeprefix("sha=")
+            self.branches[ref] = sha
+            return json.dumps({"ref": f"refs/heads/{ref}", "sha": sha})
+        if args[:3] == ["api", "-X", "PUT"]:
+            path = args[3].split("/contents/", 1)[1]
+            branch = next(v for v in args if v.startswith("branch=")).removeprefix("branch=")
+            self.markers.append((branch, path))
+            return "c" * 40
+        if args[:3] == ["api", "-X", "DELETE"]:
+            branch = args[3].split("/git/refs/heads/", 1)[1]
+            self.branches.pop(branch, None)
+            self.deleted.append(branch)
+            return ""
+        if args[:2] == ["pr", "list"]:
+            head = args[args.index("--head") + 1]
+            return json.dumps(
+                [pull for pull in self.pull_requests.values() if pull["headRefName"] == head]
+            )
+        if args[:2] == ["pr", "create"]:
+            head = args[args.index("--head") + 1]
+            self.pull_requests[("gntik-ai/musematic", 900)] = {
+                "number": 900,
+                "url": "https://github.com/gntik-ai/musematic/pull/900",
+                "state": "OPEN",
+                "isDraft": True,
+                "headRefName": head,
+                "headRefOid": self.branches[head],
+                "baseRefName": "main",
+                "mergeStateStatus": "UNSTABLE",
+                "statusCheckRollup": [],
+            }
+            return "https://github.com/gntik-ai/musematic/pull/900\n"
+        if args[:2] == ["pr", "close"]:
+            self.pull_requests[(args[4], int(args[2]))]["state"] = "CLOSED"
+            return ""
+        if args[:2] == ["pr", "ready"]:
+            # Failing non-required checks keep the PR UNSTABLE after ready-for-review.
+            self.pull_requests[(args[4], int(args[2]))]["isDraft"] = False
+            return ""
+        return super()._answer(args)
+
+    def finish_baseline(self, checks: list[dict[str, Any]]) -> None:
+        self.pull_requests[("gntik-ai/musematic", 900)]["statusCheckRollup"] = checks
+
+
+def _baseline_handler(
+    tmp_path: Path, changed: list[str], pr_checks: list[dict[str, Any]]
+) -> tuple[GitOpsGitHubHandler, BaselineGh]:
+    fake = BaselineGh(changed)
+    settings = _settings(
+        tmp_path,
+        project_config_root=_config_root(tmp_path, safe_repositories=SAFE),
+        github_writes_enabled=True,
+    )
+    fake.pull_requests[("gntik-ai/musematic", 77)] = _pull_request(
+        statusCheckRollup=pr_checks, mergeStateStatus="UNSTABLE"
+    )
+    return GitOpsGitHubHandler(settings, runner=fake), fake  # type: ignore[arg-type]
+
+
+PR_FAILURES = [
+    _check("Lint Frontend", "FAILURE"),
+    _check("Type-check Python", "FAILURE"),
+    _check("Test Python", "SUCCESS"),
+    _check("CI gate", "FAILURE"),
+]
+
+
+@pytest.mark.asyncio
+async def test_baseline_gate_passes_when_every_failure_also_fails_on_main(tmp_path: Path) -> None:
+    changed = ["apps/web/components/Panel.tsx", "apps/control-plane/src/platform/x.py"]
+    handler, fake = _baseline_handler(tmp_path, changed, PR_FAILURES)
+
+    started = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert started == {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_STARTED"}
+    [branch] = fake.branches
+    assert branch.startswith(f"hermes/ci-baseline/{MAIN_SHA[:12]}-")
+    assert fake.branches[branch] == MAIN_SHA
+    assert sorted(path for _, path in fake.markers) == [
+        "apps/control-plane/tests/hermes_ci_baseline_marker.py",
+        "apps/web/.hermes-ci-baseline",
+    ]
+
+    fake.finish_baseline([_check("Lint Frontend", None)])
+    pending = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert pending == {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_PENDING"}
+
+    fake.finish_baseline(
+        [
+            _check("Lint Frontend", "FAILURE"),
+            _check("Type-check Python", "FAILURE"),
+            _check("Test Python", "SUCCESS"),
+            _check("CI gate", "FAILURE"),
+        ]
+    )
+    passed = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert passed["status"] == "CHECKS_PASSED"
+    assert passed["ci_baseline"]["preexisting_failures"] == [
+        "CI gate",
+        "Lint Frontend",
+        "Type-check Python",
+    ]
+    assert fake.pull_requests[("gntik-ai/musematic", 900)]["state"] == "CLOSED"
+    assert fake.deleted == [branch]
+
+    # The UNSTABLE source PR merges only because the recorded baseline still covers it.
+    merged = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert merged["status"] == "MERGED"
+
+
+@pytest.mark.asyncio
+async def test_baseline_gate_blocks_failures_that_pass_on_main(tmp_path: Path) -> None:
+    handler, fake = _baseline_handler(tmp_path, ["apps/web/app/page.tsx"], PR_FAILURES)
+    await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    fake.finish_baseline(
+        [
+            _check("Lint Frontend", "SUCCESS"),
+            _check("Type-check Python", "FAILURE"),
+            _check("CI gate", "FAILURE"),
+        ]
+    )
+
+    blocked = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
+    assert blocked["failed_checks"] == ["Lint Frontend"]
+    assert blocked["preexisting_checks"] == ["CI gate", "Type-check Python"]
+    merge = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert merge == {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_REGRESSION"}
+    assert not any(call[:2] == ["pr", "merge"] for call in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_baseline_gate_waits_for_pending_pr_checks_and_skips_unmapped_paths(
+    tmp_path: Path,
+) -> None:
+    handler, fake = _baseline_handler(
+        tmp_path, ["apps/web/x.tsx"], [*PR_FAILURES, _check("Build documentation", None)]
+    )
+    pending = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    assert pending == {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CHECKS_PENDING"}
+    assert fake.branches == {}
+
+    other, other_fake = _baseline_handler(
+        tmp_path / "other", [".github/workflows/ci.yml"], PR_FAILURES
+    )
+    blocked = await other.handle("gitops.pr_checks", {"plan": _plan()})
+    assert blocked["blocker"] == "SOURCE_PR_CI_FAILED"
+    assert blocked["reason"] == "CI_BASELINE_NOT_APPLICABLE"
+    assert other_fake.branches == {}
+
+
+@pytest.mark.asyncio
+async def test_baseline_gate_restarts_a_half_created_baseline_branch(tmp_path: Path) -> None:
+    handler, fake = _baseline_handler(tmp_path, ["apps/web/x.tsx"], PR_FAILURES)
+    await handler.handle("gitops.pr_checks", {"plan": _plan()})
+    [branch] = fake.branches
+    del fake.pull_requests[("gntik-ai/musematic", 900)]  # the PR step never happened
+    fake.markers.clear()
+
+    again = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+
+    assert again["reason"] == "CI_BASELINE_STARTED"
+    assert fake.deleted == [branch] and branch in fake.branches
+    assert fake.markers == [(branch, "apps/web/.hermes-ci-baseline")]
+
+
+def test_broker_refuses_baseline_writes_outside_the_baseline_prefix(tmp_path: Path) -> None:
+    handler, _ = _baseline_handler(tmp_path, [], PR_FAILURES)
+    broker = handler.broker
+    binding = f"changeset:{UUID(int=7)}"
+    with pytest.raises(GhCliPolicyError):
+        broker.delete_baseline_branch(
+            repository="gntik-ai/musematic", branch="main", change_binding=binding
+        )
+    with pytest.raises(GhCliPolicyError):
+        broker.put_baseline_marker(
+            repository="gntik-ai/musematic",
+            branch="hermes/ci-baseline/bbbbbbbbbbbb-12345678",
+            path=".github/workflows/ci.yml",
+            change_binding=binding,
+        )

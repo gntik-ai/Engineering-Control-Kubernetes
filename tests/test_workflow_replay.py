@@ -679,6 +679,51 @@ async def test_staging_gitops_workflow_failed_checks_block_before_merge() -> Non
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
 
 
+async def test_staging_gitops_workflow_records_the_ci_baseline_verdict() -> None:
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _gitops_script(
+                **{
+                    "gitops.pr_checks": {
+                        "status": "BLOCKED",
+                        "blocker": "SOURCE_PR_CI_REGRESSION",
+                        "failed_checks": ["Lint Frontend"],
+                        "preexisting_checks": ["CI gate"],
+                    }
+                }
+            )
+        ),
+    )
+
+    assert result is not None and result["blocker"] == "SOURCE_PR_CI_REGRESSION"
+    persisted = _scheduled_steps(history)[-1]["payload"]
+    assert persisted["ci_regressions"] == ["Lint Frontend"]
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+    passed, _ = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _gitops_script(
+                **{
+                    "gitops.pr_checks": {
+                        "status": "CHECKS_PASSED",
+                        "ci_baseline": {
+                            "pr": "https://github.com/gntik-ai/musematic/pull/900",
+                            "preexisting_failures": ["CI gate"],
+                        },
+                    }
+                }
+            )
+        ),
+    )
+    recorded = _scheduled_steps(passed)[-1]["payload"]
+    assert recorded["ci_preexisting_failures"] == ["CI gate"]
+    assert recorded["ci_baseline_pr"].endswith("/pull/900")
+
+
 @workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
 class _PublishedIssueDeliveryStub:
     """Stands in for IssueDeliveryWorkflow: the source PR has been published."""
@@ -815,6 +860,48 @@ async def test_blocked_staging_gitops_pauses_retries_only_the_child_then_skips()
     ]
     assert [state["blocker"] for state in paused] == ["ENVIRONMENT_UNHEALTHY"] * 2
     assert all(state.get("workflow_id") for state in paused)
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+async def test_ci_regression_redelivers_twice_then_waits_for_the_operator() -> None:
+    # NEW-64: the baseline gate (NEW-63) attributes PR CI failures to the ChangeSet, so
+    # the loop re-runs the issue delivery (same ChangeSet, same PR) before a fresh GitOps
+    # child -- at most twice automatically, then it pauses for the operator.
+    regression = {
+        "status": "BLOCKED",
+        "blocker": "SOURCE_PR_CI_REGRESSION",
+        "failed_checks": ["Lint Frontend"],
+        "preexisting_checks": ["CI gate"],
+        "baseline_pr": "https://github.com/gntik-ai/musematic/pull/900",
+    }
+    history, result, children = await _run_loop(
+        _full_delivery_loop_script(**{"gitops.pr_checks": regression}),
+        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+        "1-ci-repair-1-attempt-1",
+        "1-staging-gitops-retry-1",
+        "1-ci-repair-2-attempt-1",
+        "1-staging-gitops-retry-2",
+    ]
+    steps = _scheduled_steps(history)
+    paused = [
+        request["payload"]["blocker"]
+        for request in steps
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == ["SOURCE_PR_CI_REGRESSION"]
+    registered = [
+        request["payload"]["child_kind"]
+        for request in steps
+        if request["step"] == "backlog.register_child_run"
+    ]
+    assert registered.count("issue-delivery") == 3
     await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
 
 

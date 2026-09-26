@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pwd
@@ -20,6 +21,11 @@ ALLOWED_REPOSITORIES = frozenset(
     }
 )
 READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
+# NEW-63: the only content Hermes writes to a CI baseline branch.
+BASELINE_MARKER_CONTENT = (
+    "# Hermes CI baseline marker: makes path-filtered CI jobs run on unchanged main.\n"
+    "# Lives only on hermes/ci-baseline/* branches; never merged.\n"
+)
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'-]{1,500}$")
 STAGING_GITOPS_MARKER = re.compile(
     r"<!-- engineering-control-staging-gitops:[a-z-]{1,40}:[a-f0-9-]{36}(?::[a-z0-9-]{1,40})? -->"
@@ -474,8 +480,12 @@ class GhCliBroker:
         expected_head_sha: str,
         expected_base_branch: str,
         change_binding: str,
+        allow_unstable: bool = False,
     ) -> dict[str, Any]:
+        """Merge the bound head. ``allow_unstable`` (NEW-63) is passed only after the CI
+        baseline gate attributed every failing non-required check to unchanged main."""
         repository = self._write(repository, change_binding)
+        accepted_states = {"CLEAN", "UNSTABLE"} if allow_unstable else {"CLEAN"}
         expected_base_branch = self._value(
             expected_base_branch, "protected merge base branch", maximum=120
         )
@@ -491,7 +501,7 @@ class GhCliBroker:
             if (
                 current.get("state") != "OPEN"
                 or current.get("isDraft") is not False
-                or current.get("mergeStateStatus") != "CLEAN"
+                or current.get("mergeStateStatus") not in accepted_states
             ):
                 raise GhCliPolicyError("protected merge preconditions are not satisfied")
             self._run(
@@ -702,6 +712,114 @@ class GhCliBroker:
         ):
             raise GhCliPolicyError("created tag ref does not match its binding")
         return {"ref": f"refs/tags/{tag}", "sha": sha}
+
+    # -- NEW-63: CI baseline pull requests (only ever on hermes/ci-baseline/* branches) --
+
+    def pull_request_files(self, repository: str, number: int) -> list[str]:
+        """Return the bounded list of paths changed by one pull request."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("pull request number is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/pulls/{number}/files",
+                "--paginate",
+                "--jq",
+                ".[].filename",
+            ]
+        ).stdout
+        paths = [line for line in raw.splitlines() if line.strip()]
+        if len(paths) > 3000:
+            raise GhCliPolicyError("pull request file listing is unbounded")
+        return paths
+
+    def create_baseline_branch(
+        self, *, repository: str, branch: str, sha: str, change_binding: str
+    ) -> None:
+        """Create one CI baseline branch at an exact commit (never moves an existing ref)."""
+        repository = self._write(repository, change_binding)
+        branch = self._baseline_branch(branch)
+        if not re.fullmatch(r"[a-f0-9]{40}", sha):
+            raise GhCliPolicyError("baseline branch target is not an exact commit")
+        value = self._json(
+            self._run(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"repos/{repository}/git/refs",
+                    "-f",
+                    f"ref=refs/heads/{branch}",
+                    "-f",
+                    f"sha={sha}",
+                    "--jq",
+                    "{ref: .ref, sha: .object.sha}",
+                ]
+            ).stdout,
+            "created baseline branch",
+        )
+        if (
+            not isinstance(value, dict)
+            or value.get("ref") != f"refs/heads/{branch}"
+            or value.get("sha") != sha
+        ):
+            raise GhCliPolicyError("created baseline branch does not match its binding")
+
+    def put_baseline_marker(
+        self, *, repository: str, branch: str, path: str, change_binding: str
+    ) -> None:
+        """Commit one fixed marker file to a CI baseline branch (contents API)."""
+        repository = self._write(repository, change_binding)
+        branch = self._baseline_branch(branch)
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._/-]{1,240}", path)
+            or ".." in path.split("/")
+            or path.startswith((".github/", "/"))
+        ):
+            raise GhCliPolicyError("baseline marker path is invalid")
+        content = base64.b64encode(BASELINE_MARKER_CONTENT.encode()).decode()
+        self._run(
+            [
+                "api",
+                "-X",
+                "PUT",
+                f"repos/{repository}/contents/{path}",
+                "-f",
+                "message=ci: Hermes CI baseline marker (never merged)",
+                "-f",
+                f"content={content}",
+                "-f",
+                f"branch={branch}",
+                "--jq",
+                ".commit.sha",
+            ]
+        )
+
+    def close_baseline_pull_request(
+        self, *, repository: str, number: int, change_binding: str
+    ) -> None:
+        """Close a CI baseline PR and delete its branch; refuses any other PR."""
+        repository = self._write(repository, change_binding)
+        current = self.view_pull_request(repository, number)
+        branch = self._baseline_branch(str(current.get("headRefName") or ""))
+        if current.get("state") == "OPEN":
+            self._run(["pr", "close", str(number), "--repo", repository])
+        self.delete_baseline_branch(
+            repository=repository, branch=branch, change_binding=change_binding
+        )
+
+    def delete_baseline_branch(self, *, repository: str, branch: str, change_binding: str) -> None:
+        """Delete one CI baseline branch; refuses every other branch."""
+        repository = self._write(repository, change_binding)
+        branch = self._baseline_branch(branch)
+        self._run(["api", "-X", "DELETE", f"repos/{repository}/git/refs/heads/{branch}"])
+
+    @staticmethod
+    def _baseline_branch(branch: str) -> str:
+        if not re.fullmatch(r"hermes/ci-baseline/[a-f0-9]{12}-[a-f0-9]{8}", branch):
+            raise GhCliPolicyError("only Hermes CI baseline branches may be written")
+        return branch
 
     def repository_file_text(self, repository: str, path: str, ref: str) -> str:
         """Read one bounded repository file at a branch; never returned to callers verbatim."""

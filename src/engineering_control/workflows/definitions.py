@@ -2017,7 +2017,15 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         )
         if checks.get("status") == "TIMED_OUT":
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_TIMEOUT"}
+        # NEW-63: keep the baseline gate's verdict (job names only) for the ChangeSet record;
+        # a CI-repair re-delivery hands the regressions to the maker (NEW-64).
+        baseline = checks.get("ci_baseline")
+        if isinstance(baseline, dict):
+            evidence["ci_baseline_pr"] = baseline.get("pr")
+            evidence["ci_preexisting_failures"] = baseline.get("preexisting_failures") or []
         if checks.get("status") != "CHECKS_PASSED":
+            if checks.get("blocker") == "SOURCE_PR_CI_REGRESSION":
+                evidence["ci_regressions"] = checks.get("failed_checks") or []
             return self._blocked(checks, "SOURCE_PR_CI_FAILED")
 
         # 2. Ready + merge (source first, then the deployment PR when one exists).
@@ -2648,6 +2656,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         register_child_runs=register_child_runs,
                         register_run=register_run,
                         global_child_blocker_return=global_child_blocker_return,
+                        gate=gate,
                     )
                     if staged == "CANCELLED":
                         return {"status": "CANCELLED", "results": results}
@@ -2887,11 +2896,15 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         register_child_runs: bool,
         register_run: bool,
         global_child_blocker_return: bool,
+        gate: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         """Run the post-merge staging GitOps child; hold for the operator when it blocks.
 
         Returns ("DONE"|"SKIPPED"|"CANCELLED"|"BLOCKED", blocker). A retry re-runs
         only the GitOps child (under a fresh child id); skip moves to the next issue.
+        NEW-64: when the CI baseline gate attributes PR CI failures to the ChangeSet
+        (SOURCE_PR_CI_REGRESSION), the issue delivery re-runs on the same ChangeSet
+        (resuming its commits, updating the same PR) before a fresh GitOps child.
         """
         delivery_context = delivery.get("context")
         change_set_id = (
@@ -2901,8 +2914,27 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         )
         workflow_root = workflow.info().workflow_id
         gitops_round = 0
+        repair_round = 0
+        repair_pending = False
         while True:
-            if change_set_id:
+            staged: dict[str, Any] | None = None
+            if repair_pending and gate is not None:
+                repair_round += 1
+                repaired = await self._ci_repair_delivery(
+                    request=request,
+                    gate=gate,
+                    ordinal=ordinal,
+                    repair_round=repair_round,
+                    results=results,
+                    register_child_runs=register_child_runs,
+                )
+                if repaired.get("status") == "SOURCE_PR":
+                    repair_pending = False
+                    gitops_round += 1
+                else:
+                    reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
+                    staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
+            if staged is None and change_set_id:
                 child_id = f"{workflow_root}-issue-{ordinal}-staging-gitops"
                 if gitops_round:
                     child_id = f"{child_id}-retry-{gitops_round}"
@@ -2918,7 +2950,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         },
                     )
                 try:
-                    staged: dict[str, Any] = await workflow.execute_child_workflow(
+                    staged = await workflow.execute_child_workflow(
                         "StagingGitOpsDeliveryWorkflow",
                         StagingGitOpsDeliveryInput(
                             change_set_id=change_set_id,
@@ -2934,12 +2966,20 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                 except ChildWorkflowError:
                     staged = {"status": "FAILED", "blocker": "STAGING_GITOPS_CHILD_WORKFLOW_FAILED"}
-            else:
+            elif staged is None:
                 staged = {"status": "BLOCKED", "blocker": "CHANGE_SET_BINDING_MISSING"}
             results.append({**staged, "stage": "staging-gitops"})
             if staged.get("status") == "STAGING_VERIFIED":
                 return "DONE", ""
             blocker = str(staged.get("blocker") or staged.get("status") or "STAGING_GITOPS_FAILED")
+            if (
+                blocker == "SOURCE_PR_CI_REGRESSION"
+                and gate is not None
+                and repair_round < self._CI_REPAIR_ROUNDS
+                and workflow.patched("existing-backlog-gitops-ci-repair-v1")
+            ):
+                repair_pending = True
+                continue
             paused_state = {**asdict(request), "loop_status": "PAUSED", "blocker": blocker}
             if register_run:
                 paused_state["workflow_id"] = workflow_root
@@ -2956,10 +2996,50 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 resumed_state["workflow_id"] = workflow_root
             await self._step("backlog.record_loop_state", resumed_state)
             if outcome == "RETRY":
-                gitops_round += 1
+                if gate is not None and (
+                    blocker == "SOURCE_PR_CI_REGRESSION" or blocker.startswith("CI_REPAIR_")
+                ):
+                    # NEW-64: the operator's retry repeats the CI repair, not only GitOps.
+                    repair_pending = True
+                else:
+                    gitops_round += 1
                 continue
             results.append(skipped)
             return "SKIPPED", blocker
+
+    # NEW-64: automatic CI-repair re-deliveries before the loop waits for the operator.
+    _CI_REPAIR_ROUNDS = 2
+
+    async def _ci_repair_delivery(
+        self,
+        *,
+        request: ExistingGitHubBacklogLoopInput,
+        gate: dict[str, Any],
+        ordinal: int,
+        repair_round: int,
+        results: list[dict[str, Any]],
+        register_child_runs: bool,
+    ) -> dict[str, Any]:
+        """Re-run the issue delivery for the published ChangeSet (maker resumes its commits)."""
+        prefix = f"{workflow.info().workflow_id}-issue-{ordinal}-ci-repair-{repair_round}"
+        delivery: dict[str, Any] = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
+        for attempt in range(1, request.correction_limit + 2):
+            child_id = f"{prefix}-attempt-{attempt}"
+            if register_child_runs:
+                await self._step(
+                    "backlog.register_child_run",
+                    {
+                        **asdict(request),
+                        "child_kind": "issue-delivery",
+                        "child_workflow_id": child_id,
+                        "finding_id": str(gate["finding_id"]),
+                    },
+                )
+            delivery = await self._issue_delivery(gate, child_id)
+            results.append({**delivery, "attempt": attempt, "stage": "ci-repair"})
+            if delivery.get("status") != "REQUEST_CHANGES":
+                break
+        return delivery
 
     async def _after_issue_boundary(
         self,

@@ -317,6 +317,11 @@ _STRUCTURED_OUTPUT_JSON_RULES = (
 )
 
 
+# NEW-64: runs that can no longer use a worktree lease they still hold.
+_TERMINAL_RUN_STATUSES = frozenset(
+    {"SUCCESS", "FAILED", "CANCELLED", "TIMED_OUT", "BLOCKED", "RATE_LIMITED"}
+)
+
 _TASKS_MD_ADVISORY = (
     "The wording, phrasing and checkbox state of gate or test records in OpenSpec "
     "tasks.md are advisory: run the gates yourself and judge the change on those "
@@ -2719,6 +2724,25 @@ class MetadataActivityHandler:
                     )
                 )
                 if existing is not None:
+                    previous_owner = (
+                        session.get(Run, existing.owner_run_id)
+                        if existing.owner_run_id != owner_run_id
+                        else None
+                    )
+                    if (
+                        previous_owner is not None
+                        and previous_owner.status in _TERMINAL_RUN_STATUSES
+                        and existing.worktree_path == worktree_path
+                        and existing.branch == branch
+                    ):
+                        # NEW-64: a published ChangeSet keeps its worktree lease for the
+                        # release path (NEW-32). A CI-repair re-delivery of the same
+                        # ChangeSet and branch takes it over from the finished run.
+                        existing.owner_run_id = owner_run_id
+                        existing.base_sha = base_sha
+                        existing.expires_at = expires_at
+                        lease_ids.append(str(existing.id))
+                        continue
                     if (
                         existing.owner_run_id != owner_run_id
                         or existing.worktree_path != worktree_path
@@ -2945,6 +2969,20 @@ class MetadataActivityHandler:
             "openspec_document": document,
         }
 
+    def _ci_regressions(self, change_set_id: UUID) -> list[str]:
+        """NEW-64: PR CI jobs the staging baseline gate attributed to this ChangeSet."""
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            record = dict((change_set.recovery_json or {}) if change_set else {}).get(
+                "staging_gitops"
+            )
+        if not isinstance(record, dict) or record.get("blocker") != "SOURCE_PR_CI_REGRESSION":
+            return []
+        names = record.get("ci_regressions")
+        if not isinstance(names, list):
+            return []
+        return [str(name)[:200] for name in names if isinstance(name, str)][:20]
+
     def _prior_checker_findings(self, change_set_id: UUID, workflow_id: str) -> list[str]:
         """Findings of the latest checker that requested changes on an earlier attempt."""
         with self.sessions() as session:
@@ -3017,6 +3055,16 @@ class MetadataActivityHandler:
                     "(the worktree was reset to base; address every finding):\n"
                 )
             ) + "".join(f"- {item}\n" for item in correction)
+        # NEW-64: a CI-repair re-delivery names the PR CI jobs the baseline gate attributed
+        # to this ChangeSet (they pass on unchanged main).
+        ci_regressions = [] if deployment else self._ci_regressions(change_set_id)
+        if ci_regressions:
+            derived_content += (
+                "The published pull request for this ChangeSet failed these CI jobs, which "
+                "pass on unchanged main, so this ChangeSet caused them. Fix each one on top "
+                "of the existing commits and run the matching repository test commands (for "
+                "example web lint and the OpenAPI snapshot regeneration) before committing:\n"
+            ) + "".join(f"- {name}\n" for name in ci_regressions)
         resume_instruction = (
             f"This {target} worktree already contains the previous attempt's committed work "
             f"for this ChangeSet (HEAD {resumed_from}, on top of base "

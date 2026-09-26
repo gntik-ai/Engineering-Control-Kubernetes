@@ -147,7 +147,12 @@ def test_musematic_manifest_declares_a_valid_toolchain_and_real_test_command() -
     assert [command.argv[0] for command in policy.prepare] == ["uv", "pnpm"]
     rendered = render_argv(policy.prepare[0].argv, Settings())
     assert rendered[-2:] == ["--python", "/usr/local/bin/python3.12"]
-    assert {command.cwd for command in policy.test_commands} == {"apps/control-plane", "apps/web"}
+    # NEW-64: the OpenAPI snapshot regeneration runs from the repository root.
+    assert {command.cwd for command in policy.test_commands} == {
+        "apps/control-plane",
+        "apps/web",
+        ".",
+    }
     manifest = ProjectManifest.model_validate(
         yaml.safe_load((PROJECTS / "musematic.yaml").read_text())
     )

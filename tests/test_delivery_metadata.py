@@ -545,6 +545,32 @@ async def test_an_active_worktree_lease_of_another_run_still_conflicts(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_a_ci_repair_run_takes_over_the_published_runs_worktree_leases(
+    tmp_path: Path,
+) -> None:
+    # NEW-64: a published ChangeSet keeps its worktree leases (NEW-32); the CI-repair
+    # re-delivery of the same ChangeSet takes them over once the previous run finished.
+    handler, allocation = _lease_fixture(tmp_path)
+    first = _delivery_run(handler, allocation["change_set_id"])
+    second = _delivery_run(handler, allocation["change_set_id"])
+    await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": first})
+    with handler.sessions.begin() as session:
+        previous = session.get(Run, UUID(first))
+        assert previous is not None
+        previous.status = "SUCCESS"
+
+    repaired = await handler.handle(
+        "delivery.persist_worktree_leases", {**allocation, "run_id": second}
+    )
+
+    assert repaired["status"] == "WORKTREE_LEASES_PERSISTED"
+    with handler.sessions() as session:
+        leases = session.scalars(select(WorktreeLease)).all()
+    assert len(leases) == 2
+    assert all(str(lease.owner_run_id) == second and lease.released_at is None for lease in leases)
+
+
+@pytest.mark.asyncio
 async def test_worktree_leases_are_kept_once_a_pull_request_exists(tmp_path: Path) -> None:
     handler, allocation = _lease_fixture(tmp_path)
     run = _delivery_run(handler, allocation["change_set_id"])
@@ -700,6 +726,7 @@ def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
     checker = handler._prepare_checker(payload)["checker_request"]["prompt"]
 
     assert "missing size check on resume" in resumed
+    assert "failed these CI jobs" not in resumed
     assert f"HEAD {resumed_head}" in resumed
     assert "Do not re-implement or revert it" in resumed
     assert "additional local commit" in resumed
@@ -712,6 +739,44 @@ def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
     # The checker reviews the full base..HEAD change, not only the latest commit.
     assert f"git diff {'a' * 40}..HEAD" in checker
     assert "may span several commits" in checker
+
+
+def test_ci_repair_maker_prompt_names_the_regressed_ci_jobs(tmp_path: Path) -> None:
+    # NEW-64: the CI baseline gate recorded which PR CI jobs the ChangeSet broke; the
+    # re-delivery's source maker must see them (the deployment maker does not).
+    handler, allocation = _lease_fixture(tmp_path)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.recovery_json = {
+            "staging_gitops": {
+                "status": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_REGRESSION",
+                "ci_regressions": ["Lint Frontend", "Build documentation"],
+            }
+        }
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-ci-repair-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "risk_class": "R1",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "import"},
+        "source_resumed_from_sha": "d" * 40,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+
+    source = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    deployment = handler._prepare_maker(payload, deployment=True)["deployment_maker_request"][
+        "prompt"
+    ]
+
+    assert "failed these CI jobs" in source
+    assert "- Lint Frontend" in source and "- Build documentation" in source
+    assert "failed these CI jobs" not in deployment
 
 
 def test_deployment_maker_may_complete_without_changes_and_ignores_baseline(

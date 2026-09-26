@@ -19,6 +19,7 @@ every call instead of trusting the workflow payload.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -37,7 +38,11 @@ from sqlalchemy.orm import sessionmaker
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
-from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker
+from engineering_control.adapters.github.client import (
+    GhCliAuthError,
+    GhCliBroker,
+    GhCliPolicyError,
+)
 from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.engineering.models import ProjectManifest
@@ -461,6 +466,15 @@ class GitOpsControllerHandler:
             "chart_pin": payload.get("chart_pin"),
             "environment_issue_number": payload.get("environment_issue_number"),
             "remediation_rounds": payload.get("remediation_rounds", 0),
+            # NEW-63/64: CI job names only (the baseline gate's verdict).
+            "ci_regressions": _check_names(payload.get("ci_regressions")),
+            "ci_preexisting_failures": _check_names(payload.get("ci_preexisting_failures")),
+            "ci_baseline_pr": (
+                str(payload["ci_baseline_pr"])
+                if isinstance(payload.get("ci_baseline_pr"), str)
+                and _PR_URL.fullmatch(str(payload["ci_baseline_pr"]))
+                else None
+            ),
             "recorded_at": datetime.now(UTC).isoformat(),
         }
         orchestration = payload.get("orchestration")
@@ -1023,7 +1037,133 @@ class GitOpsGitHubHandler:
             return {"status": "CHECKS_PASSED", "already_merged": True}
         if pull_request.get("state") != "OPEN":
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_NOT_OPEN"}
-        return evaluate_pull_request_checks(pull_request, flow.source_ci_workflow)
+        result = evaluate_pull_request_checks(pull_request, flow.source_ci_workflow)
+        if result.get("blocker") == "SOURCE_PR_CI_FAILED" and flow.ci_baseline.enabled:
+            return self._baseline_gate(plan, flow, pull_request, create=True)
+        return result
+
+    # -- NEW-63: baseline-aware CI gate -----------------------------------------------------
+
+    def _baseline_gate(
+        self,
+        plan: StagingGitOpsPlan,
+        flow: StagingFlowPolicy,
+        pull_request: dict[str, Any],
+        *,
+        create: bool,
+    ) -> dict[str, Any]:
+        """Block only on PR CI jobs that do not also fail on unchanged main.
+
+        The baseline is a draft PR (hermes/ci-baseline/<main12>-<markers8>) from main plus
+        marker files that trigger the same path-filtered jobs. It is created once per main
+        commit and marker set, read once complete, then closed and its branch deleted.
+        """
+        states = _check_states(pull_request)
+        if not states or any(value == "PENDING" for value in states.values()):
+            return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CHECKS_PENDING"}
+        failed = sorted(name for name, value in states.items() if value == "FAILED")
+        repository = plan.source_repository
+        changed = self.broker.pull_request_files(repository, plan.source_pr_number)
+        markers = sorted(
+            {
+                marker.path
+                for marker in flow.ci_baseline.markers
+                if any(path.startswith(marker.scope) for path in changed)
+            }
+        )
+        if not markers:
+            return {
+                "status": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_FAILED",
+                "failed_checks": failed[:20],
+                "reason": "CI_BASELINE_NOT_APPLICABLE",
+            }
+        main = self.broker.branch_commit(repository, plan.source_base_branch)["sha"]
+        digest = hashlib.sha256("\n".join(markers).encode()).hexdigest()[:8]
+        branch = f"hermes/ci-baseline/{main[:12]}-{digest}"
+        binding = f"changeset:{plan.change_set_id}"
+        existing = self.broker.list_pull_requests(repository, head=branch, state="all")
+        if not existing:
+            if not create:
+                return {"status": "BLOCKED", "blocker": "CI_BASELINE_MISSING"}
+            self._require_baseline_write(repository)
+            self._open_baseline(plan, branch, main, markers, binding)
+            return {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_STARTED"}
+        baseline = self.broker.view_pull_request(repository, int(existing[0]["number"]))
+        baseline_states = _check_states(baseline)
+        if not baseline_states or any(value == "PENDING" for value in baseline_states.values()):
+            if baseline.get("state") != "OPEN":
+                # Closed before its checks finished: a stale record, never a verdict.
+                return {"status": "BLOCKED", "blocker": "CI_BASELINE_INCOMPLETE"}
+            return {"status": "CHECKS_PENDING", "reason": "CI_BASELINE_PENDING"}
+        if baseline.get("state") == "OPEN" and create:
+            self._require_baseline_write(repository)
+            self.broker.close_baseline_pull_request(
+                repository=repository, number=int(baseline["number"]), change_binding=binding
+            )
+        regressions = [name for name in failed if baseline_states.get(name) != "FAILED"]
+        preexisting = [name for name in failed if name not in regressions]
+        baseline_url = str(baseline.get("url") or "")
+        if regressions:
+            return {
+                "status": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_REGRESSION",
+                "failed_checks": regressions[:20],
+                "preexisting_checks": preexisting[:40],
+                "baseline_pr": baseline_url,
+            }
+        return {
+            "status": "CHECKS_PASSED",
+            "check_count": len(states),
+            "ci_baseline": {"pr": baseline_url, "preexisting_failures": preexisting[:40]},
+        }
+
+    def _require_baseline_write(self, repository: str) -> None:
+        """gitops.pr_checks is a read step; its baseline writes pass the write policy."""
+        if self.write_policy.evaluate(lambda: (repository,)) is not None:
+            raise StagingFlowBlocked("CI_BASELINE_WRITE_DENIED")
+
+    def _open_baseline(
+        self,
+        plan: StagingGitOpsPlan,
+        branch: str,
+        main: str,
+        markers: list[str],
+        binding: str,
+    ) -> None:
+        repository = plan.source_repository
+        try:
+            current = self.broker.branch_commit(repository, branch)["sha"]
+        except (CommandFailure, GhCliPolicyError):
+            current = None
+        if current is not None:
+            # A previous attempt stopped between the branch and the PR: start clean.
+            self.broker.delete_baseline_branch(
+                repository=repository, branch=branch, change_binding=binding
+            )
+        self.broker.create_baseline_branch(
+            repository=repository, branch=branch, sha=main, change_binding=binding
+        )
+        for path in markers:
+            self.broker.put_baseline_marker(
+                repository=repository, branch=branch, path=path, change_binding=binding
+            )
+        body = (
+            "Hermes CI baseline: unchanged `main` at "
+            f"`{main}` plus marker files, so the same path-filtered CI jobs run on main's "
+            f"code as on {plan.source_pr_url}. Jobs failing here too are pre-existing and "
+            "do not block that PR. **Never merge**; Hermes closes this PR and deletes its "
+            "branch once the checks finish.\n"
+        )
+        self.broker.create_pull_request(
+            repository=repository,
+            head=branch,
+            base=plan.source_base_branch,
+            title=f"Hermes CI baseline for main@{main[:12]} - do not merge",
+            body_file=self._body_file(body),
+            change_binding=binding,
+            draft=True,
+        )
 
     # -- 2. ready + merge --------------------------------------------------------------
 
@@ -1059,11 +1199,22 @@ class GitOpsGitHubHandler:
             expected_head_sha=head,
             change_binding=binding,
         )
+        allow_unstable = False
         if current.get("state") != "MERGED":
             merge_state = str(current.get("mergeStateStatus") or "UNKNOWN")
             if merge_state == "DIRTY":
                 return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_MERGE_CONFLICT"}
-            if merge_state != "CLEAN":
+            if merge_state == "UNSTABLE" and target == "source" and flow.ci_baseline.enabled:
+                # NEW-63: non-required checks failed; merge only when the baseline gate
+                # attributes every failure to unchanged main.
+                verdict = self._baseline_gate(plan, flow, current, create=False)
+                if verdict.get("status") != "CHECKS_PASSED":
+                    return {
+                        "status": "BLOCKED",
+                        "blocker": str(verdict.get("blocker") or "SOURCE_PR_CI_FAILED"),
+                    }
+                allow_unstable = True
+            elif merge_state != "CLEAN":
                 return {"status": "MERGE_PENDING", "target": target, "merge_state": merge_state}
         result = self.broker.merge_pull_request(
             repository=repository,
@@ -1071,6 +1222,7 @@ class GitOpsGitHubHandler:
             expected_head_sha=head,
             expected_base_branch=base,
             change_binding=binding,
+            allow_unstable=allow_unstable,
         )
         return {
             "status": "MERGED",
@@ -1317,6 +1469,36 @@ class GitOpsGitHubHandler:
             "comment_url": comment.get("comment_url"),
             "issue_url": closed.get("issue_url"),
         }
+
+
+def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:
+    """NEW-63: check name -> PENDING | PASSED | FAILED (the worst state wins per name)."""
+    raw_checks = pull_request.get("statusCheckRollup")
+    if not isinstance(raw_checks, list):
+        return {}
+    rank = {"PASSED": 0, "PENDING": 1, "FAILED": 2}
+    states: dict[str, str] = {}
+    for raw in raw_checks:
+        if not isinstance(raw, dict):
+            raise ValueError("GitHub PR check result is invalid")
+        name = str(raw.get("name") or raw.get("context") or "")[:200]
+        state = str(raw.get("status") or raw.get("state") or "").upper()
+        conclusion = str(raw.get("conclusion") or raw.get("state") or "").upper()
+        if state in {"QUEUED", "PENDING", "IN_PROGRESS", "REQUESTED", "WAITING"} or not conclusion:
+            value = "PENDING"
+        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+            value = "PASSED"
+        else:
+            value = "FAILED"
+        if rank[value] >= rank.get(states.get(name, "PASSED"), 0):
+            states[name] = value
+    return states
+
+
+def _check_names(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(name)[:200] for name in value if isinstance(name, str)][:40]
 
 
 def evaluate_pull_request_checks(

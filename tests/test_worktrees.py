@@ -432,6 +432,44 @@ def test_dirty_resume_archives_leftovers_then_resets_to_the_attempts_head(
     assert "untracked" in git(["show", f"{work_ref}^3:scratch.txt"], path)
 
 
+def _advance_main(tmp_path: Path) -> str:
+    source = tmp_path / "source"
+    (source / "CHANGELOG.md").write_text("main moved\n", encoding="utf-8")
+    git(["add", "CHANGELOG.md"], source)
+    git(["commit", "-q", "-m", "main moved"], source)
+    # The GitHub worker refreshes the canonical mirror in production.
+    git(
+        ["fetch", "-q", "origin", "+refs/heads/*:refs/heads/*"],
+        tmp_path / "mirrors" / "falcone.git",
+    )
+    return git(["rev-parse", "HEAD"], source)
+
+
+def test_ci_repair_resume_tolerates_main_moving_ahead(tmp_path: Path) -> None:
+    # NEW-64: a CI-repair re-delivery resumes the published branch after main moved on;
+    # it keeps the imported base (no rebase) instead of failing on a base mismatch.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    _advance_main(tmp_path)
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.base_sha == sha
+    assert second.resumed_from_sha == head
+    assert git(["rev-parse", "HEAD"], path) == head
+
+
+def test_moved_main_still_refuses_fresh_or_non_resumed_allocations(tmp_path: Path) -> None:
+    manager, request, _path, _sha = _resume_fixture(tmp_path)
+    _advance_main(tmp_path)
+
+    with pytest.raises(WorktreeError, match="base SHA mismatch"):
+        manager.allocate(**request, resume_prior_commits=False)  # type: ignore[arg-type]
+    fresh = {**request, "change_set_id": uuid4()}
+    with pytest.raises(WorktreeError, match="base SHA mismatch"):
+        manager.allocate(**fresh, resume_prior_commits=True)  # type: ignore[arg-type]
+
+
 def test_resume_falls_back_to_the_base_when_head_does_not_descend_from_it(
     tmp_path: Path,
 ) -> None:

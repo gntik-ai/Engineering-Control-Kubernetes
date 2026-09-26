@@ -111,6 +111,40 @@ class ReleaseTagPolicy(ReconciliationModel):
     bump: Literal["patch"] = "patch"
 
 
+class CiBaselineMarker(ReconciliationModel):
+    """NEW-63: a marker file that makes one CI path group run on a baseline branch."""
+
+    # The group is included when the delivered PR changes any path starting with scope.
+    scope: str = Field(pattern=r"^[A-Za-z0-9._/-]{1,200}$")
+    path: str = Field(pattern=r"^[A-Za-z0-9._/-]{1,240}$")
+
+    @field_validator("path")
+    @classmethod
+    def bounded_marker_path(cls, value: str) -> str:
+        parts = PurePosixPath(value).parts
+        if value.startswith("/") or ".." in parts or (parts and parts[0] == ".github"):
+            raise ValueError("CI baseline markers must be repository-relative, outside .github")
+        return value
+
+
+class CiBaselinePolicy(ReconciliationModel):
+    """NEW-63: PR CI jobs that also fail on unchanged main are pre-existing, not blockers.
+
+    Hermes opens a draft PR from main plus marker files (hermes/ci-baseline/*) so the same
+    path-filtered jobs run on main's code, then blocks only on jobs that fail in the
+    delivered PR but not on that baseline.
+    """
+
+    enabled: bool = False
+    markers: tuple[CiBaselineMarker, ...] = Field(default=(), max_length=30)
+
+    @model_validator(mode="after")
+    def enabled_requires_markers(self) -> CiBaselinePolicy:
+        if self.enabled and not self.markers:
+            raise ValueError("an enabled CI baseline requires at least one marker")
+        return self
+
+
 class StagingFlowPolicy(ReconciliationModel):
     """Post-merge staging GitOps delivery (Argo CD + argocd-image-updater)."""
 
@@ -139,6 +173,7 @@ class StagingFlowPolicy(ReconciliationModel):
     # NEW-62: R3 ChangeSets (e.g. database migrations) are never merged unless the project
     # opts in; the operator allows it only for staging-only clusters.
     allow_r3_merge: bool = False
+    ci_baseline: CiBaselinePolicy = Field(default_factory=CiBaselinePolicy)
     external_secrets_namespace: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
     external_secrets_deployment: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
 

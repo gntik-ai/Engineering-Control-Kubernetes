@@ -236,11 +236,17 @@ class GitWorktreeManager:
             self.fetch(repository)
             fetched_ref = self._fetched_ref(base_ref, mirror)
             actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
-            if actual != expected_base_sha:
-                raise WorktreeError(
-                    f"base SHA mismatch for {repository}: expected {expected_base_sha}, "
-                    f"got {actual}"
-                )
+            mismatch = WorktreeError(
+                f"base SHA mismatch for {repository}: expected {expected_base_sha}, got {actual}"
+            )
+            # NEW-64: a CI-repair re-delivery resumes an already published branch; main may
+            # have moved ahead (fast-forward) since import. Only that resume may proceed,
+            # and it stays bound to the imported base (never rebased onto the new main).
+            base_moved = actual != expected_base_sha
+            if base_moved and not (
+                resume_prior_commits and self._descends_from(mirror, expected_base_sha, actual)
+            ):
+                raise mismatch
             metadata = self._ensure_metadata_mirror(repository, change_set_id, mirror)
             # NEW-40: a maker could implement and stage a change yet fail to commit
             # ("Git has no configured author identity"). Give the ChangeSet's repository
@@ -276,10 +282,12 @@ class GitWorktreeManager:
                         repository,
                         target,
                         branch,
-                        actual,
+                        expected_base_sha,
                         change_set_id,
                         resumed_from_sha=actual_head,
                     )
+                if base_moved:
+                    raise mismatch
                 if actual_head != expected_base_sha or self.is_dirty(target):
                     # NEW-38: a stopped attempt's maker left work behind, so no retry or
                     # correction of this ChangeSet could ever start. The exclusive
@@ -287,6 +295,8 @@ class GitWorktreeManager:
                     # delivery can be using this worktree: archive it, then start clean.
                     self._archive_and_reset(target, expected_base_sha, change_set_id)
                 return WorktreeAllocation(repository, target, branch, actual, change_set_id)
+            if base_moved:
+                raise mismatch
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
             self._run(
                 ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha],
