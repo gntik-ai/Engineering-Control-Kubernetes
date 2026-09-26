@@ -2349,6 +2349,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if not isinstance(item, dict):
                 raise TypeError("existing backlog issue must be an object")
             continue_to_next_issue = False
+            revalidation_round = 0
             while True:
                 if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
                     cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
@@ -2387,6 +2388,13 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         f"{workflow.info().workflow_id}-issue-{ordinal}-"
                         f"revalidate-{item['issue_number']}"
                     )
+                    if revalidation_round:
+                        # NEW-74: a retried revalidation reused the child id and its run
+                        # registration refused the new binding, failing the loop.
+                        verification_workflow_id = (
+                            f"{verification_workflow_id}-r{revalidation_round}"
+                        )
+                    revalidation_round += 1
                     if register_child_runs:
                         await self._step(
                             "backlog.register_child_run",

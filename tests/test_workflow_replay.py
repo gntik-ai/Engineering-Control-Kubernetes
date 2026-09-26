@@ -875,12 +875,19 @@ async def test_a_failed_revalidation_child_pauses_the_loop_instead_of_failing_it
     )
     history, result, children = await _run_loop(
         script,
-        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+        [
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
         workflows=[*_LOOP_WORKFLOWS, _FailingVerificationStub],
     )
 
     assert result["status"] == "COMPLETE"
-    assert [child.rsplit("-issue-", 1)[1] for child in children] == ["1-revalidate-1026"]
+    # NEW-74: the retried revalidation runs under a fresh child id.
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-revalidate-1026",
+        "1-revalidate-1026-r1",
+    ]
     steps = _scheduled_steps(history)
     names = [request["step"] for request in steps]
     assert names.index("github.refresh_mirrors") < names.index("backlog.revalidate_gate")
@@ -891,7 +898,7 @@ async def test_a_failed_revalidation_child_pauses_the_loop_instead_of_failing_it
         if request["step"] == "backlog.record_loop_state"
         and request["payload"].get("loop_status") == "PAUSED"
     ]
-    assert [state["blocker"] for state in paused] == ["CURRENT_REVALIDATION_CHILD_FAILED"]
+    assert [state["blocker"] for state in paused] == ["CURRENT_REVALIDATION_CHILD_FAILED"] * 2
     assert all(state.get("workflow_id") for state in paused)
     await Replayer(workflows=[*_LOOP_WORKFLOWS, _FailingVerificationStub]).replay_workflow(history)
 
