@@ -155,5 +155,8 @@ delivery_control:
     tag_length: 7
     chart_source_repository: https://github.com/gntik-ai/musematic.git
     pin_chart_to_merge: true
+    # NEW-62 (operator decision 2026-09-26): the cluster is staging-only, so Hermes merges
+    # R3 ChangeSets (e.g. database migrations) once the checker and PR CI pass.
+    allow_r3_merge: true
     external_secrets_namespace: external-secrets
     external_secrets_deployment: external-secrets

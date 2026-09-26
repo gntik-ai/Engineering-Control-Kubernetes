@@ -399,7 +399,7 @@ class GitOpsControllerHandler:
                 ChangeSetState.SOURCE_MERGED.value,
             }:
                 raise StagingFlowBlocked("CHANGE_SET_STATE_NOT_DELIVERABLE")
-            if change_set.risk_class == "R3":
+            if change_set.risk_class == "R3" and not flow.allow_r3_merge:
                 raise StagingFlowBlocked("R3_MERGE_REQUIRES_APPROVAL")
             source_url = str(change_set.source_pr_url or "")
             source = _PR_URL.fullmatch(source_url)
@@ -1028,8 +1028,8 @@ class GitOpsGitHubHandler:
     # -- 2. ready + merge --------------------------------------------------------------
 
     def _merge(self, payload: dict[str, Any]) -> dict[str, Any]:
-        plan, _ = self._context(payload)
-        if plan.risk_class == "R3":
+        plan, flow = self._context(payload)
+        if plan.risk_class == "R3" and not flow.allow_r3_merge:
             return {"status": "BLOCKED", "blocker": "R3_MERGE_REQUIRES_APPROVAL"}
         target = str(payload.get("target"))
         if target == "source":

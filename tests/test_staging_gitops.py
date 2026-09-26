@@ -69,6 +69,14 @@ def _config_root(tmp_path: Path, *, safe_repositories: tuple[str, ...] = ()) -> 
     return projects
 
 
+def _disallow_r3(projects: Path) -> Path:
+    path = projects / "musematic.yaml"
+    text = path.read_text(encoding="utf-8")
+    assert "    allow_r3_merge: true\n" in text
+    path.write_text(text.replace("    allow_r3_merge: true\n", ""), encoding="utf-8")
+    return projects
+
+
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
     projects = overrides.pop("project_config_root", None) or _config_root(tmp_path)
     kubeconfig = tmp_path / "staging.kubeconfig"
@@ -501,9 +509,10 @@ async def test_prepare_binds_the_published_change_set(tmp_path: Path) -> None:
     assert prepared["staging_flow"]["release_tag_enabled"] is True
     assert prepared["staging_flow"]["main_ci_workflow"] is None
 
+    # NEW-62: musematic opts in to R3 merges (staging-only cluster).
     r3 = _seed_change_set(handler, risk="R3")
-    blocked = await handler.handle("gitops.prepare", {**request, "change_set_id": str(r3)})
-    assert blocked == {"status": "BLOCKED", "blocker": "R3_MERGE_REQUIRES_APPROVAL"}
+    allowed = await handler.handle("gitops.prepare", {**request, "change_set_id": str(r3)})
+    assert allowed["status"] == "READY" and allowed["plan"]["risk_class"] == "R3"
     outside = await handler.handle(
         "gitops.prepare", {**request, "issue_repository": "gntik-ai/falcone"}
     )
@@ -953,8 +962,45 @@ async def test_merge_marks_ready_then_merges_the_exact_head(tmp_path: Path) -> N
     again = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert again["status"] == "MERGED" and fake.mutations == []
 
+
+@pytest.mark.asyncio
+async def test_r3_merge_is_blocked_unless_the_project_opts_in(tmp_path: Path) -> None:
+    handler, fake = _github(tmp_path)
+    fake.pull_requests[("gntik-ai/musematic", 77)] = _pull_request()
     r3 = await handler.handle("gitops.merge", {"plan": _plan(risk_class="R3"), "target": "source"})
-    assert r3 == {"status": "BLOCKED", "blocker": "R3_MERGE_REQUIRES_APPROVAL"}
+    assert r3["status"] == "MERGED"
+
+    strict_root = tmp_path / "strict"
+    strict_root.mkdir()
+    strict = GitOpsGitHubHandler(
+        _settings(
+            strict_root,
+            project_config_root=_disallow_r3(_config_root(strict_root, safe_repositories=SAFE)),
+            github_writes_enabled=True,
+        ),
+        runner=FakeGh(),  # type: ignore[arg-type]
+    )
+    blocked = await strict.handle(
+        "gitops.merge", {"plan": _plan(risk_class="R3"), "target": "source"}
+    )
+    assert blocked == {"status": "BLOCKED", "blocker": "R3_MERGE_REQUIRES_APPROVAL"}
+
+    controller = _controller(
+        strict_root / "controller",
+        FakeKubectl(),
+        project_config_root=_disallow_r3(_config_root(strict_root / "controller")),
+    )
+    change_set_id = _seed_change_set(controller, risk="R3")
+    prepared = await controller.handle(
+        "gitops.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "project": "musematic",
+            "issue_repository": "gntik-ai/musematic",
+            "issue_number": 1026,
+        },
+    )
+    assert prepared == {"status": "BLOCKED", "blocker": "R3_MERGE_REQUIRES_APPROVAL"}
 
 
 @pytest.mark.asyncio

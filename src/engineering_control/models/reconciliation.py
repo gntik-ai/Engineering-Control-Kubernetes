@@ -136,6 +136,9 @@ class StagingFlowPolicy(ReconciliationModel):
         pattern=r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)\.git$",
     )
     pin_chart_to_merge: bool = False
+    # NEW-62: R3 ChangeSets (e.g. database migrations) are never merged unless the project
+    # opts in; the operator allows it only for staging-only clusters.
+    allow_r3_merge: bool = False
     external_secrets_namespace: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
     external_secrets_deployment: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
 
