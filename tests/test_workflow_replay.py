@@ -73,6 +73,8 @@ def _scripted_execute_control_step(script: dict[str, dict[str, Any]]) -> Any:
     @activity.defn(name="execute_control_step")
     async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
         step = request["step"]
+        if step == "github.refresh_mirrors" and step not in script:
+            return {"status": "PASS"}  # NEW-71: every loop issue refreshes the mirrors
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
         return script[step]
@@ -94,6 +96,8 @@ def _scripted_execute_control_step_with_failure(
         step = request["step"]
         if step == fails_on:
             raise ApplicationError("unknown or invalid control step", non_retryable=True)
+        if step == "github.refresh_mirrors" and step not in script:
+            return {"status": "PASS"}  # NEW-71
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
         return script[step]
@@ -795,21 +799,24 @@ _LOOP_WORKFLOWS = [
 
 
 async def _run_loop(
-    script: dict[str, dict[str, Any]], signals: list[tuple[str, Any]]
+    script: dict[str, dict[str, Any]],
+    signals: list[tuple[str, Any]],
+    workflows: list[type] | None = None,
 ) -> tuple[Any, Any, list[str]]:
     activity_fn = _scripted_execute_control_step(script)
+    workflows = workflows or _LOOP_WORKFLOWS
     async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
         async with (
             Worker(
                 env.client,
                 task_queue=CONTROL_TASK_QUEUE,
-                workflows=_LOOP_WORKFLOWS,
+                workflows=workflows,
                 activities=[activity_fn],
             ),
             Worker(
                 env.client,
                 task_queue=GITHUB_TASK_QUEUE,
-                workflows=_LOOP_WORKFLOWS,
+                workflows=workflows,
                 activities=[activity_fn],
             ),
         ):
@@ -842,6 +849,51 @@ async def _run_loop(
         if event.HasField("start_child_workflow_execution_initiated_event_attributes")
     ]
     return history, result, children
+
+
+@workflow.defn(name="FindingVerificationWorkflow", sandboxed=False)
+class _FailingVerificationStub:
+    """Stands in for FindingVerificationWorkflow failing (e.g. a stale mirror)."""
+
+    @workflow.run
+    async def run(self, request: Any) -> dict[str, Any]:
+        raise ApplicationError("Git command failed (128): unknown revision", non_retryable=True)
+
+
+async def test_a_failed_revalidation_child_pauses_the_loop_instead_of_failing_it() -> None:
+    # NEW-72: musematic #1125's revalidation child failed on a stale mirror and the whole
+    # loop went FAILED. NEW-70: the pause must carry the loop's workflow id (retryable).
+    # NEW-71: every issue iteration refreshes the canonical mirrors first.
+    script = _full_delivery_loop_script(
+        **{
+            "backlog.revalidate_gate": {
+                "status": "BLOCKED",
+                "blocker": "CURRENT_SOURCE_REVALIDATION_REQUIRED",
+            },
+            "backlog.materialize_candidate": {"status": "READY", "finding_id": "finding-1"},
+        }
+    )
+    history, result, children = await _run_loop(
+        script,
+        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+        workflows=[*_LOOP_WORKFLOWS, _FailingVerificationStub],
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == ["1-revalidate-1026"]
+    steps = _scheduled_steps(history)
+    names = [request["step"] for request in steps]
+    assert names.index("github.refresh_mirrors") < names.index("backlog.revalidate_gate")
+    assert "backlog.record_revalidation" not in names
+    paused = [
+        request["payload"]
+        for request in steps
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert [state["blocker"] for state in paused] == ["CURRENT_REVALIDATION_CHILD_FAILED"]
+    assert all(state.get("workflow_id") for state in paused)
+    await Replayer(workflows=[*_LOOP_WORKFLOWS, _FailingVerificationStub]).replay_workflow(history)
 
 
 async def test_full_delivery_loop_runs_the_staging_gitops_child_when_enabled() -> None:

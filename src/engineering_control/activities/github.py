@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from temporalio.exceptions import ApplicationError
@@ -146,8 +147,38 @@ class GitHubActivityHandler:
                     "GIT_TERMINAL_PROMPT": "0",
                 },
             )
+            if self.settings.mirror_sync_to_worker:
+                self._push_mirror_to_worker(mirror)
             refreshed.append(repository)
         return {**payload, "status": "PASS", "refreshed_repositories": refreshed}
+
+    def _push_mirror_to_worker(self, mirror: Path) -> None:
+        """NEW-71: update the worker's copy of one canonical mirror (same path) over SSH.
+
+        Only origin-tracking refs and tags are pushed; the worker's own ChangeSet data
+        lives in separate metadata repositories and is never touched.
+        """
+        self.git.run(
+            "git",
+            [
+                "push",
+                "--force",
+                "--quiet",
+                # The worker mirror is owned by the worker's scan identity.
+                f"--receive-pack=git -c safe.directory={mirror} receive-pack",
+                f"ssh://{self.settings.publication_transport_host}{mirror}",
+                "+refs/remotes/origin/*:refs/remotes/origin/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            cwd=mirror,
+            environment={
+                "HOME": str(Path.home()),
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_SSH_COMMAND": (
+                    "ssh -o BatchMode=yes -o ConnectTimeout=20 -o UpdateHostKeys=no"
+                ),
+            },
+        )
 
     def _plan_llmwiki_bootstrap(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:

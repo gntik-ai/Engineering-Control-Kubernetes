@@ -125,6 +125,10 @@ class Settings(BaseSettings):
     publication_transport_identity: str = Field(
         default="hermes", pattern=r"^[a-z_][a-z0-9_-]{0,31}$"
     )
+    # NEW-71: the worker's canonical mirrors (worktree bases) are never fetched there
+    # (no GitHub credentials on the worker); github.refresh_mirrors pushes the refreshed
+    # controller mirror to the same path on the worker over the transport above.
+    mirror_sync_to_worker: bool = True
     git_executable: Path = Path("/usr/bin/git")
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
     gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")

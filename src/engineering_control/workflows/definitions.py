@@ -2356,10 +2356,22 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         cancel_state["workflow_id"] = workflow.info().workflow_id
                     await self._step("backlog.record_loop_state", cancel_state)
                     return {"status": "CANCELLED", "results": results}
-                gate = await self._step(
-                    "backlog.revalidate_gate",
-                    {**asdict(request), "item": item},
-                )
+                # NEW-71: nothing refreshed the canonical mirrors for backlog delivery, so
+                # revalidation and allocation ran against a weeks-old main (and failed once
+                # main moved). Refresh them (controller fetch + push to the worker) first.
+                mirror_blocker: str | None = None
+                if workflow.patched("existing-backlog-refresh-mirrors-v1"):
+                    try:
+                        await self._step("github.refresh_mirrors", {"project": request.project})
+                    except ActivityError:
+                        mirror_blocker = "CANONICAL_MIRROR_REFRESH_FAILED"
+                if mirror_blocker is not None:
+                    gate = {"status": "BLOCKED", "blocker": mirror_blocker}
+                else:
+                    gate = await self._step(
+                        "backlog.revalidate_gate",
+                        {**asdict(request), "item": item},
+                    )
                 if gate.get("status") == "READY":
                     break
                 blocker = str(gate.get("blocker") or gate.get("status") or "BLOCKED")
@@ -2385,25 +2397,31 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                 "finding_id": str(candidate["finding_id"]),
                             },
                         )
-                    verification = await workflow.execute_child_workflow(
-                        "FindingVerificationWorkflow",
-                        FindingVerificationInput(
-                            finding_id=str(candidate["finding_id"]),
-                            project=request.project,
-                            fresh_snapshot=True,
-                        ),
-                        id=verification_workflow_id,
-                        task_queue=workflow.info().task_queue,
-                        execution_timeout=timedelta(hours=4),
-                    )
-                    await self._step(
-                        "backlog.record_revalidation",
-                        {
-                            **asdict(request),
-                            "item": item,
-                            "verification": verification,
-                        },
-                    )
+                    try:
+                        verification = await workflow.execute_child_workflow(
+                            "FindingVerificationWorkflow",
+                            FindingVerificationInput(
+                                finding_id=str(candidate["finding_id"]),
+                                project=request.project,
+                                fresh_snapshot=True,
+                            ),
+                            id=verification_workflow_id,
+                            task_queue=workflow.info().task_queue,
+                            execution_timeout=timedelta(hours=4),
+                        )
+                    except ChildWorkflowError:
+                        # NEW-72: a failed revalidation child (e.g. a stale mirror) crashed
+                        # the whole loop; it now pauses for the operator like any blocker.
+                        verification = {"status": "CHILD_FAILED"}
+                    else:
+                        await self._step(
+                            "backlog.record_revalidation",
+                            {
+                                **asdict(request),
+                                "item": item,
+                                "verification": verification,
+                            },
+                        )
                     refreshed = await self._step("backlog.load_execution", asdict(request))
                     candidates = refreshed.get("items")
                     if isinstance(candidates, list):
@@ -2453,10 +2471,16 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 self._phase = f"AWAITING_OPERATOR:{issue_ref}:{blocker}"
                 self._skip_reason = None
                 self._retry_step = None
-                await self._step(
-                    "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
-                )
+                gate_paused: dict[str, Any] = {
+                    **asdict(request),
+                    "loop_status": "PAUSED",
+                    "blocker": blocker,
+                }
+                if register_run:
+                    # NEW-70: without the workflow id the loop Run stayed RUNNING and the
+                    # retry preflight refused the operator's signal (NEW-33b, gate path).
+                    gate_paused["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", gate_paused)
                 await workflow.wait_condition(
                     lambda: (
                         self._cancelled
