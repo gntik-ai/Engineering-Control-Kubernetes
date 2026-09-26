@@ -1102,6 +1102,14 @@ async def test_offline_maker_dependency_requests_are_resolved_then_the_maker_rer
         if request["step"] == "delivery.prepare_maker"
     ]
     assert rounds == [None, 1, 2]
+    # NEW-77: a later round never carries the previous round's provider result.
+    reruns = [
+        request["payload"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "delivery.prepare_maker"
+        and request["payload"].get("dependency_round")
+    ]
+    assert reruns and all("agent_result" not in payload for payload in reruns)
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 

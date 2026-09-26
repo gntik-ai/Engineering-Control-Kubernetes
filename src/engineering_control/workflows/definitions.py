@@ -1032,9 +1032,17 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             )
             if resolved.get("status") != "DEPENDENCIES_RESOLVED":
                 return resolved
+            # NEW-77: the previous round's provider result must not travel into the next
+            # invocation; on a provider failure agent.persist_result read it back and
+            # rejected its identity (round 1 id vs the round 2 request).
+            fresh = {
+                key: value
+                for key, value in resolved.items()
+                if key not in {"agent_result", "agent_invocation_id", "agent_invocation_status"}
+            }
             prepared = await self._step(
                 "delivery.prepare_maker",
-                {**resolved, "dependency_round": rounds, "delivery_request": delivery_request},
+                {**fresh, "dependency_round": rounds, "delivery_request": delivery_request},
                 timeout_minutes=30,
             )
             if prepared.get("status") != "SOURCE_MAKER_READY":
