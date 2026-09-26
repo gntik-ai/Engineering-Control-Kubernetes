@@ -240,6 +240,7 @@ class ControlledWorkflow:
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "delivery.prepare_toolchain",
+            "delivery.resolve_dependencies",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
@@ -969,6 +970,8 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                         context = await self._step(step, step_payload, timeout_minutes=30)
                 if step == "delivery.ensure_issue" and context.get("status") == "ISSUE_READY":
                     context = await self._refresh_issue_body(context)
+                if step == "delivery.invoke_maker":
+                    context = await self._resolve_maker_dependencies(context, request)
                 if (
                     context.get("status")
                     in {
@@ -1002,6 +1005,52 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             # at the same issue for the rest of the lease's 4h TTL.
             await self._release_delivery_leases_best_effort(context)
             raise
+
+    # NEW-75: at most this many platform dependency resolutions per delivery attempt.
+    _DEPENDENCY_ROUNDS = 2
+
+    async def _resolve_maker_dependencies(
+        self, context: dict[str, Any], request: IssueDeliveryInput
+    ) -> dict[str, Any]:
+        """NEW-75: the offline maker edited manifests and asked for lockfile resolution.
+
+        The scan worker (network) regenerates and commits the lockfiles and reinstalls
+        the toolchain; the maker is then invoked again on top of that commit.
+        """
+        rounds = 0
+        while rounds < self._DEPENDENCY_ROUNDS and self._maker_decision(context) == (
+            "DEPENDENCIES_REQUIRED"
+        ):
+            if not workflow.patched("delivery-resolve-dependencies-v1"):
+                break
+            rounds += 1
+            delivery_request = asdict(request)
+            resolved = await self._step(
+                "delivery.resolve_dependencies",
+                {**context, "delivery_request": delivery_request},
+                timeout_minutes=120,
+            )
+            if resolved.get("status") != "DEPENDENCIES_RESOLVED":
+                return resolved
+            prepared = await self._step(
+                "delivery.prepare_maker",
+                {**resolved, "dependency_round": rounds, "delivery_request": delivery_request},
+                timeout_minutes=30,
+            )
+            if prepared.get("status") != "SOURCE_MAKER_READY":
+                return prepared
+            context = await self._agent_step(
+                "delivery.invoke_maker",
+                {**prepared, "delivery_request": delivery_request},
+                timeout_minutes=120,
+            )
+        return context
+
+    @staticmethod
+    def _maker_decision(context: dict[str, Any]) -> str:
+        agent = context.get("agent_result")
+        structured = agent.get("structured_result") if isinstance(agent, dict) else None
+        return str(structured.get("decision", "")) if isinstance(structured, dict) else ""
 
     async def _refresh_issue_body(self, context: dict[str, Any]) -> dict[str, Any]:
         # NEW-44: the Finding copied an existing backlog issue's body once at import,

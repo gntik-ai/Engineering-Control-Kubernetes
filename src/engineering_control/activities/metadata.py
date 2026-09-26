@@ -3106,6 +3106,15 @@ class MetadataActivityHandler:
                 "for reasons outside this ChangeSet (CI tooling, a run against an older main), "
                 "leave it and explain it in open_questions:\n"
             ) + "".join(f"- {name}\n" for name in ci_regressions)
+        dependency_round = 0 if deployment else int(payload.get("dependency_round") or 0)
+        resolution = payload.get("dependency_resolution_result")
+        if not deployment and dependency_round and isinstance(resolution, dict):
+            derived_content += (
+                "The platform resolved the dependency manifests you edited: "
+                f"{json.dumps(resolution.get('files') or [])} were regenerated and committed "
+                f"as {resolution.get('commit')}, and the toolchain was reinstalled. Continue "
+                "from that commit: finish the change, run the repository tests and decide.\n"
+            )
         resume_instruction = (
             f"This {target} worktree already contains the previous attempt's committed work "
             f"for this ChangeSet (HEAD {resumed_from}, on top of base "
@@ -3122,6 +3131,20 @@ class MetadataActivityHandler:
             "repository tests, then create one local commit on the assigned branch. Preserve all "
             "existing safety gates.\n"
             + resume_instruction
+            + (
+                # NEW-75: makers have no network, so they cannot regenerate lockfiles.
+                "You have no network. If the change needs added or updated dependencies, "
+                "edit only the manifests (go.mod require lines; package.json versions or the "
+                "root pnpm.overrides) and commit them; never hand-edit go.sum or "
+                "pnpm-lock.yaml. Then return decision DEPENDENCIES_REQUIRED with "
+                "dependency_resolution listing each {ecosystem: go|pnpm, directory} to "
+                "resolve (the directory holding that go.mod, or the pnpm workspace root "
+                '"."). The platform regenerates and commits the lockfiles with network, '
+                "reinstalls the toolchain and calls you again to finish and test. Otherwise "
+                "return an empty dependency_resolution list.\n"
+                if not deployment
+                else "Return an empty dependency_resolution list.\n"
+            )
             # NEW-41: a deployment maker blocked a finished source change because the
             # OpenSpec needed no deployment change and the deploy repo already contained
             # credential-like findings -- neither is a blocker under platform policy.
@@ -3159,7 +3182,12 @@ class MetadataActivityHandler:
             f"{_untrusted_block('issue-derived content', derived_content)}\n"
         )
         request = AgentRequest(
-            run_id=uuid5(NAMESPACE_URL, f"delivery-{target}-maker:{workflow_id}:{change_set_id}"),
+            run_id=uuid5(
+                NAMESPACE_URL,
+                f"delivery-{target}-maker:{workflow_id}:{change_set_id}"
+                # NEW-75: each maker round after a dependency resolution is a new call.
+                + (f":deps-{dependency_round}" if dependency_round else ""),
+            ),
             project=Project(str(payload["project"])),
             role="implementer",
             provider=provider,
@@ -8519,13 +8547,31 @@ class MetadataActivityHandler:
             "required": [
                 "decision",
                 "summary",
+                "dependency_resolution",
                 "changed_files",
                 "tests",
                 "open_questions",
             ],
             "properties": {
-                "decision": {"type": "string", "enum": ["COMPLETE", "BLOCKED"]},
+                "decision": {
+                    "type": "string",
+                    "enum": ["COMPLETE", "BLOCKED", "DEPENDENCIES_REQUIRED"],
+                },
                 "summary": {"type": "string", "minLength": 1, "maxLength": 20000},
+                # NEW-75: manifests the platform must resolve (lockfiles, with network).
+                "dependency_resolution": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ecosystem", "directory"],
+                        "properties": {
+                            "ecosystem": {"type": "string", "enum": ["go", "pnpm"]},
+                            "directory": {"type": "string", "minLength": 1, "maxLength": 200},
+                        },
+                    },
+                },
                 "changed_files": {
                     "type": "array",
                     "maxItems": 1000,

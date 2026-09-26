@@ -147,6 +147,7 @@ class ScanActivityHandler:
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
             "delivery.prepare_toolchain",
+            "delivery.resolve_dependencies",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
@@ -171,6 +172,7 @@ class ScanActivityHandler:
         observer_runner: SafeCommandRunner | None = None,
         promotion_runner: SafeCommandRunner | None = None,
         toolchain_runner: SafeCommandRunner | None = None,
+        dependency_runner: SafeCommandRunner | None = None,
         git_runner: SafeCommandRunner | None = None,
         baseline_runner: SafeCommandRunner | None = None,
     ) -> None:
@@ -208,6 +210,10 @@ class ScanActivityHandler:
         )
         # delivery.prepare_toolchain: only the allowlisted installers, never a shell.
         self.toolchain_runner = toolchain_runner or SafeCommandRunner(prepare_executables(settings))
+        # NEW-75: go + pnpm for delivery.resolve_dependencies only.
+        self.dependency_runner = dependency_runner or SafeCommandRunner(
+            {"go": settings.go_executable, "pnpm": settings.toolchain_pnpm_executable}
+        )
         self.git_runner = git_runner or SafeCommandRunner({"git": settings.git_executable})
         # NEW-49: None builds a per-command allowlist (see _baseline_executables).
         self.baseline_runner = baseline_runner
@@ -245,6 +251,10 @@ class ScanActivityHandler:
             if step == "delivery.prepare_toolchain":
                 return await self._with_heartbeat(
                     asyncio.to_thread(self._prepare_toolchain, payload)
+                )
+            if step == "delivery.resolve_dependencies":
+                return await self._with_heartbeat(
+                    asyncio.to_thread(self._resolve_dependencies, payload)
                 )
             if step == "runtime.deterministic_checks":
                 return await asyncio.to_thread(self._runtime_deterministic_checks, payload)
@@ -1510,6 +1520,148 @@ class ScanActivityHandler:
             "npm_config_package_import_method": "copy",
             "pnpm_config_package_import_method": "copy",
             "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+        }
+
+    # NEW-75: the only commands the platform runs to resolve maker-edited manifests
+    # (network; no install scripts), and the only files they may change.
+    _DEPENDENCY_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
+        "go": (("go", "mod", "tidy"),),
+        "pnpm": (("pnpm", "install", "--lockfile-only", "--ignore-scripts"),),
+    }
+    _DEPENDENCY_FILES = {"go": ("go.mod", "go.sum"), "pnpm": ("pnpm-lock.yaml",)}
+    _DEPENDENCY_MANIFEST = {"go": "go.mod", "pnpm": "package.json"}
+
+    def _resolve_dependencies(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-75: regenerate lockfiles for manifests the offline maker edited, commit them,
+        then reinstall the toolchain so the maker's next round can build and test."""
+        agent = payload.get("agent_result")
+        structured = agent.get("structured_result") if isinstance(agent, dict) else None
+        raw = structured.get("dependency_resolution") if isinstance(structured, dict) else None
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 10:
+            return self._dependency_blocked(payload, "DEPENDENCY_REQUEST_INVALID", "no requests")
+        worktree = self._bounded_worktree(payload["source_worktree"])
+        if self._git_status(worktree, ignored=False):
+            return self._dependency_blocked(
+                payload, "DEPENDENCY_WORKTREE_DIRTY", "the maker left uncommitted changes"
+            )
+        environment = self._dependency_environment()
+        allowed: set[str] = set()
+        commands: list[dict[str, Any]] = []
+        for item in raw:
+            ecosystem = str(item.get("ecosystem", "")) if isinstance(item, dict) else ""
+            directory = str(item.get("directory", "")) if isinstance(item, dict) else ""
+            if ecosystem not in self._DEPENDENCY_COMMANDS or not re.fullmatch(
+                r"\.|[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*", directory
+            ):
+                return self._dependency_blocked(
+                    payload, "DEPENDENCY_REQUEST_INVALID", f"{ecosystem!r} {directory!r}"
+                )
+            cwd = (worktree / directory).resolve()
+            manifest = cwd / self._DEPENDENCY_MANIFEST[ecosystem]
+            if not cwd.is_relative_to(worktree) or not manifest.is_file():
+                return self._dependency_blocked(
+                    payload,
+                    "DEPENDENCY_REQUEST_INVALID",
+                    f"{directory!r} has no {self._DEPENDENCY_MANIFEST[ecosystem]}",
+                )
+            prefix = "" if cwd == worktree else f"{cwd.relative_to(worktree).as_posix()}/"
+            allowed.update(prefix + name for name in self._DEPENDENCY_FILES[ecosystem])
+            for argv in self._DEPENDENCY_COMMANDS[ecosystem]:
+                record: dict[str, Any] = {"ecosystem": ecosystem, "cwd": directory, "argv": argv}
+                try:
+                    result = self.dependency_runner.run(
+                        argv[0],
+                        list(argv[1:]),
+                        cwd=cwd,
+                        timeout_seconds=1200,
+                        environment=environment,
+                        check=False,
+                    )
+                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    commands.append({**record, "status": "NOT_COMPLETED"})
+                    return self._dependency_blocked(
+                        payload, "DEPENDENCY_RESOLUTION_FAILED", f"{argv[0]}: {error}", commands
+                    )
+                if result.return_code:
+                    commands.append({**record, "status": "FAILED"})
+                    return self._dependency_blocked(
+                        payload,
+                        "DEPENDENCY_RESOLUTION_FAILED",
+                        result.stderr.strip() or result.stdout,
+                        commands,
+                    )
+                commands.append({**record, "status": "PASS"})
+        changed = sorted(self._git_status(worktree, ignored=False))
+        unexpected = [path for path in changed if path not in allowed]
+        if unexpected:
+            return self._dependency_blocked(
+                payload,
+                "DEPENDENCY_RESOLUTION_TOUCHED_OTHER_FILES",
+                ", ".join(unexpected[:50]),
+                commands,
+            )
+        commit = None
+        if changed:
+            self._git(worktree, ["add", "--", *changed])
+            self._git(
+                worktree,
+                [
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "-m",
+                    "chore(deps): regenerate lockfiles (Hermes dependency resolution)",
+                ],
+            )
+            commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
+        prepared = self._prepare_toolchain(payload)
+        if prepared.get("status") == "BLOCKED":
+            return prepared
+        return {
+            **prepared,
+            "status": "DEPENDENCIES_RESOLVED",
+            "blocker": None,
+            "dependency_resolution_result": {
+                "files": changed,
+                "commit": commit,
+                "commands": commands,
+            },
+        }
+
+    def _dependency_environment(self) -> dict[str, str]:
+        """The toolchain installer environment plus private Go caches (never GOPROXY auth)."""
+        root = self.settings.toolchain_cache_root
+        directories = {name: root / name for name in ("go-mod", "go-build", "go-path")}
+        for directory in directories.values():
+            directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        return {
+            **self._toolchain_environment(),
+            "GOMODCACHE": str(directories["go-mod"]),
+            "GOCACHE": str(directories["go-build"]),
+            "GOPATH": str(directories["go-path"]),
+            "GOTOOLCHAIN": "local",
+            "GOFLAGS": "-modcacherw",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+
+    @staticmethod
+    def _dependency_blocked(
+        payload: dict[str, Any],
+        blocker: str,
+        detail: str,
+        commands: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        safe = str(SecretRedactor().redact_text(detail).value)[-_TOOLCHAIN_STDERR_TAIL:]
+        return {
+            **payload,
+            "status": "BLOCKED",
+            "blocker": blocker,
+            "dependency_resolution_result": {
+                "status": "BLOCKED",
+                "blocker": blocker,
+                "detail": safe,
+                "commands": commands or [],
+            },
         }
 
     @staticmethod

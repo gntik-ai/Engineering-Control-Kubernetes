@@ -399,3 +399,123 @@ def test_timeout_wrapped_test_commands_check_the_wrapped_command(
     else:
         with pytest.raises(ValidationError):
             ToolchainTestCommand.model_validate(command)
+
+
+# -- NEW-75: platform dependency resolution ----------------------------------------------
+
+
+class FakeDependencyRunner:
+    """go / pnpm double: rewrites the lockfile the real command would regenerate."""
+
+    def __init__(self, writes: dict[str, str] | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.writes = writes or {"pnpm": "pnpm-lock.yaml", "go": "go.sum"}
+        self.result: CommandResult | None = None
+
+    def run(self, executable: str, arguments: Any, *, cwd: Path, **kwargs: Any) -> CommandResult:
+        self.calls.append(
+            {"executable": executable, "arguments": list(arguments), "cwd": cwd, **kwargs}
+        )
+        if self.result is not None:
+            return self.result
+        (cwd / self.writes[executable]).write_text(f"resolved by {executable}\n")
+        return CommandResult(0, "", "")
+
+
+def _dependency_setup(
+    tmp_path: Path, requests: list[dict[str, str]], runner: FakeDependencyRunner | None = None
+) -> tuple[ScanActivityHandler, FakeDependencyRunner, FakeToolchainRunner, dict[str, Any], Path]:
+    repo = _source_repo(tmp_path / "worktrees")
+    _git(repo, "config", "user.name", "Engineering Control")
+    _git(repo, "config", "user.email", "engineering-control@local.invalid")
+    (repo / "services" / "api").mkdir(parents=True)
+    (repo / "services" / "api" / "go.mod").write_text("module example.invalid/api\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "go module")
+    dependencies = runner or FakeDependencyRunner()
+    toolchain = FakeToolchainRunner()
+    settings = Settings(
+        worktree_root=tmp_path / "worktrees",
+        evidence_root=tmp_path / "evidence",
+        project_config_root=PROJECTS,
+        toolchain_cache_root=tmp_path / "cache" / "toolchain",
+        python312_executable=Path("/opt/python/bin/python3.12"),
+    )
+    handler = ScanActivityHandler(
+        settings,
+        toolchain_runner=toolchain,  # type: ignore[arg-type]
+        dependency_runner=dependencies,  # type: ignore[arg-type]
+    )
+    payload = {
+        **_payload(repo),
+        "agent_result": {
+            "structured_result": {
+                "decision": "DEPENDENCIES_REQUIRED",
+                "dependency_resolution": requests,
+            }
+        },
+    }
+    return handler, dependencies, toolchain, payload, repo
+
+
+def test_dependency_resolution_regenerates_and_commits_only_lockfiles(tmp_path: Path) -> None:
+    # NEW-75: musematic #1125's offline maker could not bump grpc/Next.js because it
+    # cannot regenerate go.sum or pnpm-lock.yaml; the scan worker (network) does it.
+    handler, dependencies, toolchain, payload, repo = _dependency_setup(
+        tmp_path,
+        [{"ecosystem": "go", "directory": "services/api"}, {"ecosystem": "pnpm", "directory": "."}],
+    )
+    base = _git(repo, "rev-parse", "HEAD").strip()
+
+    resolved = handler._resolve_dependencies(payload)
+
+    assert resolved["status"] == "DEPENDENCIES_RESOLVED"
+    result = resolved["dependency_resolution_result"]
+    assert result["files"] == ["pnpm-lock.yaml", "services/api/go.sum"]
+    assert result["commit"] == _git(repo, "rev-parse", "HEAD").strip() != base
+    assert _git(repo, "status", "--porcelain").strip() == ""
+    assert [(call["executable"], call["arguments"]) for call in dependencies.calls] == [
+        ("go", ["mod", "tidy"]),
+        ("pnpm", ["install", "--lockfile-only", "--ignore-scripts"]),
+    ]
+    go_env = dependencies.calls[0]["environment"]
+    assert go_env["GOTOOLCHAIN"] == "local" and go_env["GOMODCACHE"].startswith(str(tmp_path))
+    assert go_env["HOME"].startswith(str(tmp_path))  # never the runner's real home
+    assert toolchain.calls  # the toolchain is reinstalled for the maker's next round
+
+
+def test_dependency_resolution_rejects_other_file_changes_and_bad_requests(
+    tmp_path: Path,
+) -> None:
+    runner = FakeDependencyRunner(writes={"pnpm": "apps/control-plane/pyproject.toml"})
+    handler, _, _, payload, repo = _dependency_setup(
+        tmp_path, [{"ecosystem": "pnpm", "directory": "."}], runner
+    )
+    touched = handler._resolve_dependencies(payload)
+    assert touched["blocker"] == "DEPENDENCY_RESOLUTION_TOUCHED_OTHER_FILES"
+
+    for bad in (
+        [{"ecosystem": "cargo", "directory": "."}],
+        [{"ecosystem": "go", "directory": "../outside"}],
+        [{"ecosystem": "go", "directory": "apps/control-plane"}],  # no go.mod there
+        [],
+    ):
+        other, _, _, other_payload, _ = _dependency_setup(tmp_path / str(len(bad)) / "x", bad)
+        assert other._resolve_dependencies(other_payload)["blocker"] == "DEPENDENCY_REQUEST_INVALID"
+
+
+def test_dependency_resolution_blocks_a_dirty_worktree_and_a_failed_command(tmp_path: Path) -> None:
+    handler, _, _, payload, repo = _dependency_setup(
+        tmp_path, [{"ecosystem": "go", "directory": "services/api"}]
+    )
+    (repo / "package.json").write_text('{"dirty": true}\n')
+    assert handler._resolve_dependencies(payload)["blocker"] == "DEPENDENCY_WORKTREE_DIRTY"
+
+    failing = FakeDependencyRunner()
+    failing.result = CommandResult(1, "", "go: module lookup disabled")
+    handler, _, _, payload, _ = _dependency_setup(
+        tmp_path / "failing", [{"ecosystem": "go", "directory": "services/api"}], failing
+    )
+    blocked = handler._resolve_dependencies(payload)
+    assert blocked["blocker"] == "DEPENDENCY_RESOLUTION_FAILED"
+    assert "module lookup disabled" in blocked["dependency_resolution_result"]["detail"]

@@ -1052,6 +1052,59 @@ async def test_issue_delivery_prepares_the_toolchain_after_prechecks_and_replays
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 
+async def test_offline_maker_dependency_requests_are_resolved_then_the_maker_reruns() -> None:
+    # NEW-75: the maker edits manifests and returns DEPENDENCIES_REQUIRED; the scan
+    # worker resolves the lockfiles and the maker runs again (at most two rounds).
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.prepare_spec": {"status": "SPEC_READY", "run_id": "run-1"},
+        "agent.record_start": {"status": "STARTED", "run_id": "run-1"},
+        "delivery.invoke_spec": {"status": "SUCCESS", "run_id": "run-1"},
+        "delivery.invoke_maker": {"status": "SUCCESS", "run_id": "run-1"},
+        "agent.persist_result": {
+            "status": "SUCCESS",
+            "run_id": "run-1",
+            "agent_result": {
+                "structured_result": {
+                    "decision": "DEPENDENCIES_REQUIRED",
+                    "dependency_resolution": [{"ecosystem": "go", "directory": "services/x"}],
+                }
+            },
+        },
+        "delivery.create_openspec": {"status": "PLANNED", "run_id": "run-1"},
+        "delivery.prepare_maker": {"status": "SOURCE_MAKER_READY", "run_id": "run-1"},
+        "delivery.resolve_dependencies": {
+            "status": "DEPENDENCIES_RESOLVED",
+            "run_id": "run-1",
+            "dependency_resolution_result": {"files": ["services/x/go.sum"], "commit": "c" * 40},
+        },
+        "delivery.prepare_deployment_maker": {
+            "status": "BLOCKED",
+            "blocker": "SOURCE_MAKER_DID_NOT_COMPLETE",
+            "run_id": "run-1",
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "BLOCKED"
+    steps = _scheduled_step_names(history)
+    assert steps.count("delivery.resolve_dependencies") == 2
+    assert steps.count("delivery.invoke_maker") == 3
+    first = steps.index("delivery.resolve_dependencies")
+    assert steps[first + 1 : first + 3] == ["delivery.prepare_maker", "agent.record_start"]
+    rounds = [
+        request["payload"].get("dependency_round")
+        for request in _scheduled_steps(history)
+        if request["step"] == "delivery.prepare_maker"
+    ]
+    assert rounds == [None, 1, 2]
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
 async def test_pre_toolchain_issue_delivery_history_replays_without_the_new_step() -> None:
     """A delivery recorded before the patch (no marker) must replay unchanged against the
     current code, i.e. without scheduling delivery.prepare_toolchain."""

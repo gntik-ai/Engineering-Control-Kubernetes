@@ -1081,3 +1081,42 @@ def test_spec_schema_relaxations_keep_the_required_contract() -> None:
     assert not validator.is_valid({**_READY_SPEC, "scope": []})
     assert not validator.is_valid({**_READY_SPEC, "decision": "MAYBE"})
     assert not validator.is_valid({k: v for k, v in _READY_SPEC.items() if k != "test_plan"})
+
+
+def test_maker_prompt_and_schema_support_platform_dependency_resolution(tmp_path: Path) -> None:
+    # NEW-75: the offline maker requests lockfile resolution; each later round is a new
+    # provider invocation (a reused id would return the first round's cached result).
+    handler, allocation = _lease_fixture(tmp_path)
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/1125",
+        "risk_class": "R2",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "deps"},
+        "source_resumed_from_sha": None,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+
+    first = handler._prepare_maker(payload, deployment=False)["maker_request"]
+    second = handler._prepare_maker(
+        {
+            **payload,
+            "dependency_round": 1,
+            "dependency_resolution_result": {"files": ["go.sum"], "commit": "c" * 40},
+        },
+        deployment=False,
+    )["maker_request"]
+    deployment = handler._prepare_maker(payload, deployment=True)["deployment_maker_request"]
+
+    assert "DEPENDENCIES_REQUIRED" in first["prompt"]
+    assert "never hand-edit go.sum or pnpm-lock.yaml" in first["prompt"]
+    assert "Return an empty dependency_resolution list." in deployment["prompt"]
+    assert "regenerated and committed as " + "c" * 40 in second["prompt"]
+    assert first["run_id"] != second["run_id"]
+    schema = first["output_schema"]
+    assert "dependency_resolution" in schema["required"]
+    assert "DEPENDENCIES_REQUIRED" in schema["properties"]["decision"]["enum"]

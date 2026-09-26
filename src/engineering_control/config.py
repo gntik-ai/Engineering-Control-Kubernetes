@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     # browser worker's pnpm above is a different, pinned consumer-suite install.
     uv_executable: Path = Path("/usr/local/bin/uv")
     toolchain_pnpm_executable: Path = Path("/usr/local/bin/pnpm")
+    # NEW-75: makers are offline; delivery.resolve_dependencies (scan worker, network)
+    # regenerates go.sum / pnpm-lock.yaml after the maker edited only the manifests.
+    go_executable: Path = Path("/usr/local/go/bin/go")
     python312_executable: Path = Path("/usr/local/bin/python3.12")
     # NEW-49: contract test commands are wrapped in coreutils timeout (NEW-46).
     timeout_executable: Path = Path("/usr/bin/timeout")
