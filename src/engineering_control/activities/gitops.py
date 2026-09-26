@@ -934,7 +934,10 @@ class GitOpsGitHubHandler:
     ) -> None:
         self.settings = settings
         self.redactor = SecretRedactor()
-        self.root = (settings.run_root / "gitops").resolve()
+        # NEW-65: gh needs an existing working directory; the controller steps own
+        # run_root/gitops (engineering-control, 0700), so the GitHub worker uses its own.
+        self.root = (settings.run_root / "gitops-github").resolve()
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.broker = broker or GhCliBroker(
             runner or SafeCommandRunner({"gh": settings.github_executable}),
             self.root,

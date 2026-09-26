@@ -1455,3 +1455,11 @@ def test_broker_refuses_baseline_writes_outside_the_baseline_prefix(tmp_path: Pa
             path=".github/workflows/ci.yml",
             change_binding=binding,
         )
+
+
+def test_github_handler_creates_its_own_gh_working_directory(tmp_path: Path) -> None:
+    # NEW-65: the first gitops.pr_checks in production failed with "working directory
+    # does not exist: /srv/engineering/runs/gitops" (ValueError -> CHECKS_UNAVAILABLE).
+    handler, _ = _github(tmp_path)
+    assert handler.root == (tmp_path / "runs" / "gitops-github").resolve()
+    assert handler.root.is_dir()
