@@ -460,6 +460,12 @@ class GitOpsControllerHandler:
             "merge_sha": merge_sha,
             "deployment_merge_sha": payload.get("deployment_merge_sha"),
             "release_tag": payload.get("release_tag"),
+            # NEW-68: set when a later release containing the merge shipped the change.
+            "release_sha": (
+                str(payload["release_sha"])
+                if _SHA.fullmatch(str(payload.get("release_sha") or ""))
+                else None
+            ),
             "image_tag": payload.get("image_tag"),
             "pinned_repositories": payload.get("pinned_repositories") or [],
             "argo_revision": payload.get("argo_revision"),
@@ -1325,7 +1331,57 @@ class GitOpsGitHubHandler:
             return {"status": "RUN_SUCCEEDED", "workflow_role": role, "run": successful[0]}
         if not exact or any(str(item["status"]).lower() != "completed" for item in summary):
             return {"status": "RUN_PENDING", "workflow_role": role, "runs": summary}
+        if role == "image" and flow.release_tag.enabled:
+            later = self._later_release(plan, flow, workflow_name, merge_sha)
+            if later is not None:
+                return {**later, "workflow_role": role, "superseded_runs": summary}
         return {"status": "BLOCKED", "blocker": failure, "workflow_role": role, "runs": summary}
+
+    def _later_release(
+        self,
+        plan: StagingGitOpsPlan,
+        flow: StagingFlowPolicy,
+        workflow_name: str,
+        merge_sha: str,
+    ) -> dict[str, Any] | None:
+        """NEW-68: the merge's own release build failed (musematic v0.0.108: the release
+        supply-chain gate blocked on advisories published after v0.0.107). The change is
+        delivered by the first later release whose commit contains the merge and whose
+        image build succeeded; a later build still running is waited for."""
+        prefix = flow.release_tag.prefix
+        pattern = re.compile(rf"{re.escape(prefix)}([0-9]+)\.([0-9]+)\.([0-9]+)")
+        own = self._tag_at(plan.source_repository, prefix, merge_sha)
+        own_match = pattern.fullmatch(own) if own else None
+        floor = (
+            (int(own_match[1]), int(own_match[2]), int(own_match[3])) if own_match else None
+        )
+        candidates: list[tuple[tuple[int, int, int], str, str]] = []
+        for ref in self.broker.list_tag_refs(plan.source_repository, prefix):
+            name = ref["ref"].removeprefix("refs/tags/")
+            match = pattern.fullmatch(name)
+            if not match or ref["type"] != "commit" or ref["sha"] == merge_sha:
+                continue
+            version = (int(match[1]), int(match[2]), int(match[3]))
+            if floor is not None and version <= floor:
+                continue
+            candidates.append((version, name, ref["sha"]))
+        for _, name, sha in sorted(candidates)[:10]:
+            if not self.broker.commit_contains(
+                plan.source_repository, ancestor=merge_sha, descendant=sha
+            ):
+                continue
+            runs = [
+                run
+                for run in self.broker.list_workflow_runs(
+                    plan.source_repository, workflow_name=workflow_name, commit_sha=sha
+                )
+                if run.get("headSha") == sha
+            ]
+            if any(str(run.get("status") or "").lower() != "completed" for run in runs):
+                return {"status": "RUN_PENDING", "release_tag": name, "release_sha": sha}
+            if any(str(run.get("conclusion") or "").lower() == "success" for run in runs):
+                return {"status": "RUN_SUCCEEDED", "release_tag": name, "release_sha": sha}
+        return None
 
     # -- 5. image pin ------------------------------------------------------------------
 
@@ -1454,7 +1510,12 @@ class GitOpsGitHubHandler:
         ]
         if plan.deployment_pr_url:
             lines.append(f"- Deployment PR: {plan.deployment_pr_url}")
-        lines.append(f"- Merge SHA: `{merge_sha}`")
+        delivered = payload.get("delivered_merge_sha")
+        if isinstance(delivered, str) and _SHA.fullmatch(delivered) and delivered != merge_sha:
+            # NEW-68: shipped by a later release that contains the merge.
+            lines.append(f"- Merge SHA: `{delivered}` (released in `{merge_sha}`)")
+        else:
+            lines.append(f"- Merge SHA: `{merge_sha}`")
         if isinstance(payload.get("release_tag"), str):
             lines.append(f"- Release tag: `{payload['release_tag']}`")
         lines.append(f"- Image tag: `{image_tag}`")

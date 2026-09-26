@@ -724,6 +724,38 @@ async def test_staging_gitops_workflow_records_the_ci_baseline_verdict() -> None
     assert recorded["ci_baseline_pr"].endswith("/pull/900")
 
 
+async def test_staging_gitops_pins_and_verifies_a_later_release_that_ships_the_merge() -> None:
+    # NEW-68: gitops.workflow_run reports a later release; pin/sync/verify/close use its
+    # commit while the ChangeSet keeps its own merge SHA.
+    release_sha = "e" * 40
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _gitops_script(
+                **{
+                    "gitops.workflow_run": {
+                        "status": "RUN_SUCCEEDED",
+                        "release_tag": "v0.0.12",
+                        "release_sha": release_sha,
+                    }
+                }
+            )
+        ),
+    )
+
+    assert result is not None and result["status"] == "STAGING_VERIFIED"
+    steps = _scheduled_steps(history)
+    by_step = {request["step"]: request["payload"] for request in steps}
+    for step in ("gitops.image_pin", "gitops.verify_workloads", "gitops.close_issue"):
+        assert by_step[step]["merge_sha"] == release_sha
+        assert by_step[step]["delivered_merge_sha"] == "d" * 40
+    persisted = by_step["gitops.persist_result"]
+    assert persisted["merge_sha"] == "d" * 40 and persisted["release_sha"] == release_sha
+    assert persisted["release_tag"] == "v0.0.12"
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
 @workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
 class _PublishedIssueDeliveryStub:
     """Stands in for IssueDeliveryWorkflow: the source PR has been published."""

@@ -826,6 +826,18 @@ class GhCliBroker:
             raise GhCliPolicyError("commit date is invalid")
         return value
 
+    def commit_contains(self, repository: str, *, ancestor: str, descendant: str) -> bool:
+        """NEW-68: True when ``descendant`` is ``ancestor`` or contains it in its history."""
+        repository = self._batch(repository)
+        if not re.fullmatch(r"[a-f0-9]{40}", ancestor) or not re.fullmatch(
+            r"[a-f0-9]{40}", descendant
+        ):
+            raise GhCliPolicyError("commit comparison binding is invalid")
+        status = self._run(
+            ["api", f"repos/{repository}/compare/{ancestor}...{descendant}", "--jq", ".status"]
+        ).stdout.strip()
+        return status in {"ahead", "identical"}
+
     def last_reopened_at(self, repository: str, number: int) -> str:
         """NEW-67: when the pull request was last reopened ('' if never)."""
         repository = self._batch(repository)

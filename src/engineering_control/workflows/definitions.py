@@ -2077,6 +2077,16 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 return self._blocked(
                     run, "MAIN_CI_FAILED" if role == "main_ci" else "IMAGE_BUILD_FAILED"
                 )
+            if role == "image" and run.get("release_sha"):
+                # NEW-68: a later release containing the merge ships this change; every
+                # following step pins, syncs and verifies that release's commit.
+                evidence["release_tag"] = run.get("release_tag")
+                evidence["release_sha"] = str(run["release_sha"])
+        deployed_base = {
+            **merged_base,
+            "merge_sha": str(evidence.get("release_sha") or merge_sha),
+            "delivered_merge_sha": merge_sha,
+        }
 
         # 4. Environment gate with bounded remediation.
         gate = await self._environment_gate(base, evidence)
@@ -2086,7 +2096,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         # 5. Image pin written by argocd-image-updater (~30 minutes).
         pin = await self._poll(
             "gitops.image_pin",
-            merged_base,
+            deployed_base,
             pending=frozenset({"PIN_PENDING"}),
             attempts=30,
             interval=minute,
@@ -2101,7 +2111,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         # 6. Hermes-triggered Argo sync (~20 minutes).
         triggered = await self._poll(
             "gitops.trigger_sync",
-            merged_base,
+            deployed_base,
             pending=frozenset({"SYNC_BUSY"}),
             attempts=10,
             interval=half_minute,
@@ -2114,7 +2124,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         synced = await self._poll(
             "gitops.sync_status",
             {
-                **merged_base,
+                **deployed_base,
                 "previous_operation_started_at": triggered.get("previous_operation_started_at"),
             },
             pending=frozenset({"SYNC_PENDING"}),
@@ -2130,7 +2140,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         # 7. Verify every pinned workload runs the new tag and is fully ready.
         verified = await self._poll(
             "gitops.verify_workloads",
-            {**merged_base, "pinned_repositories": evidence["pinned_repositories"]},
+            {**deployed_base, "pinned_repositories": evidence["pinned_repositories"]},
             pending=frozenset({"VERIFICATION_PENDING"}),
             attempts=10,
             interval=half_minute,
@@ -2146,7 +2156,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         closed = await self._github_write_step(
             "gitops.close_issue",
             {
-                **merged_base,
+                **deployed_base,
                 "release_tag": evidence.get("release_tag"),
                 "pinned_repositories": evidence["pinned_repositories"],
                 "argo_revision": evidence.get("argo_revision"),

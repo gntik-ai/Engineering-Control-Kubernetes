@@ -1511,3 +1511,59 @@ async def test_stale_pr_ci_is_rerun_on_current_main_before_the_baseline(tmp_path
 
     merge = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert merge == {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_STALE"}
+
+
+RELEASE_SHA = "e" * 40
+
+
+class ReleaseGh(FakeGh):
+    """FakeGh plus the compare API used to find a later release containing a merge."""
+
+    def __init__(self, contains: bool = True) -> None:
+        super().__init__()
+        self.contains = contains
+
+    def _answer(self, args: list[str]) -> str:
+        if args[0] == "api" and "/compare/" in args[1]:
+            return "ahead\n" if self.contains else "diverged\n"
+        return super()._answer(args)
+
+
+@pytest.mark.asyncio
+async def test_a_later_release_containing_the_merge_delivers_a_failed_release(
+    tmp_path: Path,
+) -> None:
+    # NEW-68: musematic v0.0.108 (the #993 merge) was blocked by the release supply-chain
+    # gate; the change ships in the next release whose commit contains the merge.
+    fake = ReleaseGh()
+    settings = _settings(
+        tmp_path,
+        project_config_root=_config_root(tmp_path, safe_repositories=SAFE),
+        github_writes_enabled=True,
+    )
+    handler = GitOpsGitHubHandler(settings, runner=fake)  # type: ignore[arg-type]
+    fake.tags = [
+        {"ref": "refs/tags/v0.0.107", "sha": "1" * 40, "type": "commit"},
+        {"ref": "refs/tags/v0.0.108", "sha": MERGE_SHA, "type": "commit"},
+    ]
+    fake.runs = [
+        {"databaseId": 1, "headSha": MERGE_SHA, "status": "completed", "conclusion": "failure"}
+    ]
+    payload = {"plan": _plan(), "merge_sha": MERGE_SHA, "workflow_role": "image"}
+
+    blocked = await handler.handle("gitops.workflow_run", payload)
+    assert blocked["blocker"] == "IMAGE_BUILD_FAILED"  # no later release yet
+
+    fake.tags.append({"ref": "refs/tags/v0.0.109", "sha": RELEASE_SHA, "type": "commit"})
+    later = {"databaseId": 2, "headSha": RELEASE_SHA, "status": "in_progress", "conclusion": ""}
+    fake.runs.append(later)
+    pending = await handler.handle("gitops.workflow_run", payload)
+    assert pending["status"] == "RUN_PENDING" and pending["release_tag"] == "v0.0.109"
+
+    later.update(status="completed", conclusion="success")
+    shipped = await handler.handle("gitops.workflow_run", payload)
+    assert shipped["status"] == "RUN_SUCCEEDED"
+    assert (shipped["release_tag"], shipped["release_sha"]) == ("v0.0.109", RELEASE_SHA)
+
+    fake.contains = False  # a later tag that does not contain the merge never counts
+    assert (await handler.handle("gitops.workflow_run", payload))["blocker"] == "IMAGE_BUILD_FAILED"
