@@ -2745,9 +2745,19 @@ class MetadataActivityHandler:
                         if existing.owner_run_id != owner_run_id
                         else None
                     )
+                    change_set = session.get(ChangeSet, change_set_id)
+                    # NEW-66: while a published ChangeSet is being re-delivered (CI repair
+                    # moved it out of the published states) this run already holds the
+                    # exclusive implementation component lease, so no other run can still
+                    # be using the worktree even if its Run row was never finalized.
+                    repairing = (
+                        change_set is not None
+                        and change_set.source_pr_url is not None
+                        and change_set.state not in _PUBLISHED_CHANGE_SET_STATES
+                    )
                     if (
                         previous_owner is not None
-                        and previous_owner.status in _TERMINAL_RUN_STATUSES
+                        and (previous_owner.status in _TERMINAL_RUN_STATUSES or repairing)
                         and existing.worktree_path == worktree_path
                         and existing.branch == branch
                     ):

@@ -571,6 +571,35 @@ async def test_a_ci_repair_run_takes_over_the_published_runs_worktree_leases(
 
 
 @pytest.mark.asyncio
+async def test_a_ci_repair_takes_over_a_kept_lease_of_an_unfinalized_run(tmp_path: Path) -> None:
+    # NEW-66: #993's repair attempt 1 kept its lease (pre-NEW-66 rule) and its Run row
+    # stayed RUNNING; the next repair must still take the worktree over.
+    handler, allocation = _lease_fixture(tmp_path)
+    first = _delivery_run(handler, allocation["change_set_id"])
+    second = _delivery_run(handler, allocation["change_set_id"])
+    await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": first})
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.source_pr_url = "https://github.com/gntik-ai/musematic/pull/1"
+        change_set.state = "PLANNED"
+
+    taken = await handler.handle(
+        "delivery.persist_worktree_leases", {**allocation, "run_id": second}
+    )
+
+    assert taken["status"] == "WORKTREE_LEASES_PERSISTED"
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.state = "SOURCE_PR"
+    third = _delivery_run(handler, allocation["change_set_id"])
+    with pytest.raises(Exception) as caught:  # a published, active lease still conflicts
+        await handler.handle("delivery.persist_worktree_leases", {**allocation, "run_id": third})
+    assert "active worktree lease conflicts" in str(caught.value.__cause__)
+
+
+@pytest.mark.asyncio
 async def test_worktree_leases_are_kept_once_a_pull_request_exists(tmp_path: Path) -> None:
     handler, allocation = _lease_fixture(tmp_path)
     run = _delivery_run(handler, allocation["change_set_id"])
