@@ -5,6 +5,7 @@ import json
 import os
 import pwd
 import re
+import shutil
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -295,14 +296,38 @@ class GitWorktreeManager:
                     # delivery can be using this worktree: archive it, then start clean.
                     self._archive_and_reset(target, expected_base_sha, change_set_id)
                 return WorktreeAllocation(repository, target, branch, actual, change_set_id)
-            if base_moved:
+            # NEW-85: the cleanup may have removed this ChangeSet's worktree while its
+            # branch (and any archived work) stays in the metadata repository.
+            self._run(["git", "worktree", "prune"], metadata)
+            existing_head = self._branch_head(metadata, branch)
+            resumed_from: str | None = None
+            if (
+                existing_head is not None
+                and resume_prior_commits
+                and self._descends_from(metadata, expected_base_sha, existing_head)
+            ):
+                resumed_from = existing_head
+            elif base_moved:
                 raise mismatch
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
-            self._run(
-                ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha],
-                metadata,
-                timeout=900,
-            )
+            if resumed_from is not None:
+                add = ["git", "worktree", "add", str(target), branch]
+            elif existing_head is not None:
+                if existing_head != expected_base_sha:
+                    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                    self._run(
+                        [
+                            "git",
+                            "update-ref",
+                            f"refs/archive/{change_set_id}/{stamp}-head",
+                            existing_head,
+                        ],
+                        metadata,
+                    )
+                add = ["git", "worktree", "add", "-B", branch, str(target), expected_base_sha]
+            else:
+                add = ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha]
+            self._run(add, metadata, timeout=900)
             if self.is_dirty(target):
                 raise WorktreeError("newly allocated worktree is unexpectedly dirty")
             if access is not None:
@@ -311,7 +336,14 @@ class GitWorktreeManager:
                 except Exception:
                     self._run(["git", "worktree", "remove", str(target)], metadata)
                     raise
-            return WorktreeAllocation(repository, target, branch, actual, change_set_id)
+            return WorktreeAllocation(
+                repository,
+                target,
+                branch,
+                expected_base_sha if resumed_from is not None else actual,
+                change_set_id,
+                resumed_from_sha=resumed_from,
+            )
 
     def allocate_audit_snapshot(
         self,
@@ -665,6 +697,13 @@ class GitWorktreeManager:
             for identity in identities
         )
 
+    def _branch_head(self, metadata: Path, branch: str) -> str | None:
+        try:
+            head = self._run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], metadata)
+        except WorktreeError:
+            return None
+        return head if re.fullmatch(r"[a-f0-9]{40}", head) else None
+
     def _descends_from(self, target: Path, base_sha: str, head: str) -> bool:
         """True when head is a strict descendant of base_sha (NEW-52 resume guard)."""
         if not re.fullmatch(r"[a-f0-9]{40}", head) or head == base_sha:
@@ -795,7 +834,70 @@ class GitWorktreeManager:
         }
         return summary, diff
 
-    def cleanup(self, allocation: WorktreeAllocation, *, evidence_captured: bool) -> None:
+    def prune_orphan_worktrees(
+        self, *, older_than: datetime, dry_run: bool, limit: int = 200
+    ) -> dict[str, list[dict[str, str]]]:
+        """NEW-85: remove worktree directories no lease ever tracks.
+
+        Detached audit/revalidation snapshots (keyed by campaign or finding, never by a
+        ChangeSet) and directories under unknown repository slugs (old acceptance runs)
+        are removed once untouched since ``older_than``. Branch-bearing ChangeSet
+        worktrees are left to the lease-based cleanup. Nothing is followed through a
+        symlink; failures are reported, never raised.
+        """
+        root = self.worktree_root.resolve()
+        known = {self._slug(repository) for repository in self._repositories}
+        removed: list[dict[str, str]] = []
+        kept: list[dict[str, str]] = []
+        if not root.is_dir():
+            return {"removed": removed, "kept": kept}
+        for repository_dir in sorted(root.iterdir()):
+            if repository_dir.is_symlink() or not repository_dir.is_dir():
+                continue
+            for target in sorted(repository_dir.iterdir()):
+                if len(removed) >= limit:
+                    break
+                try:
+                    identity = UUID(target.name)
+                except ValueError:
+                    continue
+                if target.is_symlink() or not target.is_dir():
+                    continue
+                modified = datetime.fromtimestamp(target.stat().st_mtime, UTC)
+                if modified > older_than:
+                    continue
+                record = {
+                    "path": str(target),
+                    "modified_at": modified.isoformat(),
+                    "kind": "SNAPSHOT" if repository_dir.name in known else "UNOWNED_DIR",
+                }
+                try:
+                    if repository_dir.name in known:
+                        if self._run(["git", "branch", "--show-current"], target):
+                            continue  # a ChangeSet worktree: lease-based cleanup only
+                        metadata = self.metadata_path(repository_dir.name, identity)
+                    if dry_run:
+                        removed.append(record)
+                        continue
+                    if repository_dir.name in known:
+                        self._run(["git", "worktree", "remove", "--force", str(target)], metadata)
+                        remaining = self._run(["git", "worktree", "list", "--porcelain"], metadata)
+                        if remaining.count("worktree ") <= 1 and metadata.is_dir():
+                            shutil.rmtree(metadata)
+                    else:
+                        shutil.rmtree(target)
+                    removed.append(record)
+                except (WorktreeError, OSError) as error:
+                    kept.append({**record, "reason": str(error)[:200]})
+        return {"removed": removed, "kept": kept}
+
+    def cleanup(
+        self,
+        allocation: WorktreeAllocation,
+        *,
+        evidence_captured: bool,
+        archive_dirty: bool = False,
+    ) -> None:
         self.verify_mirror(allocation.repository)
         if not allocation.path.exists():
             return
@@ -810,11 +912,18 @@ class GitWorktreeManager:
         actual_branch = self._run(["git", "branch", "--show-current"], resolved)
         if actual_branch != allocation.branch:
             raise WorktreeError("cleanup target branch changed after authorization")
-        if self.is_dirty(allocation.path):
-            if not evidence_captured:
-                raise WorktreeError("dirty worktree is protected until evidence is captured")
-            raise WorktreeError(
-                "dirty worktree cleanup requires the abandoned-run cleanup workflow"
-            )
         metadata = self._metadata_for_target(allocation.repository, resolved)
-        self._run(["git", "worktree", "remove", str(allocation.path)], metadata)
+        if self.is_dirty(allocation.path):
+            if not archive_dirty:
+                if not evidence_captured:
+                    raise WorktreeError("dirty worktree is protected until evidence is captured")
+                raise WorktreeError(
+                    "dirty worktree cleanup requires the abandoned-run cleanup workflow"
+                )
+            # NEW-85: an abandoned attempt's uncommitted work is kept under
+            # refs/archive/<changeset>/ in its git metadata before the worktree goes.
+            head = self._run(["git", "rev-parse", "HEAD"], resolved)
+            self._archive_and_reset(
+                resolved, allocation.base_sha, allocation.change_set_id, reset_to=head
+            )
+        self._run(["git", "worktree", "remove", "--force", str(allocation.path)], metadata)

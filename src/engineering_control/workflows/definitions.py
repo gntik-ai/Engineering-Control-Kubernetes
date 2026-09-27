@@ -279,6 +279,7 @@ class ControlledWorkflow:
             "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
+            "cleanup.prune_orphan_worktrees",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
         }:
@@ -1727,6 +1728,11 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step("cleanup.inspect_codex_files", context)
             context = await self._step("cleanup.inspect_preview_namespaces", context)
             if request.dry_run:
+                if workflow.patched("cleanup-orphan-worktrees-v1"):
+                    # NEW-85: report snapshot/acceptance leftovers no lease tracks.
+                    context = await self._step(
+                        "cleanup.prune_orphan_worktrees", {**context, "dry_run": True}
+                    )
                 context = await self._step(
                     "cleanup.finalize", {**context, "terminal_status": "DRY_RUN"}
                 )
@@ -1752,6 +1758,10 @@ class CleanupWorkflow(ControlledWorkflow):
                 "cleanup.execute_preview_namespaces", {**context, "dry_run": False}
             )
             context = await self._step("cleanup.execute", {**context, "dry_run": False})
+            if workflow.patched("cleanup-orphan-worktrees-v1"):
+                context = await self._step(
+                    "cleanup.prune_orphan_worktrees", {**context, "dry_run": False}
+                )
             context = await self._step("cleanup.execute_metadata", {**context, "dry_run": False})
             context = await self._step(
                 "cleanup.finalize", {**context, "terminal_status": "COMPLETE"}

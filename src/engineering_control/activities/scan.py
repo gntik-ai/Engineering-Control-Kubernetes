@@ -15,7 +15,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import UUID
@@ -127,7 +127,9 @@ class CleanupCandidate(BaseModel):
         pattern=r"^agent/(falcone|musematic|llmwiki)/[a-zA-Z0-9._-]+/[a-f0-9-]{36}$"
     )
     base_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
-    reason: str = Field(pattern=r"^(RELEASED_RETENTION_EXPIRED|ABANDONED_LEASE_EXPIRED)$")
+    reason: str = Field(
+        pattern=r"^(RELEASED_RETENTION_EXPIRED|ABANDONED_LEASE_EXPIRED|ABANDONED_CHANGESET_STALE)$"
+    )
 
 
 class ScanActivityHandler:
@@ -152,6 +154,7 @@ class ScanActivityHandler:
             "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
+            "cleanup.prune_orphan_worktrees",
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
@@ -264,6 +267,8 @@ class ScanActivityHandler:
                 return await asyncio.to_thread(self._protect_cleanup_candidates, payload)
             if step == "cleanup.execute":
                 return await asyncio.to_thread(self._execute_cleanup, payload)
+            if step == "cleanup.prune_orphan_worktrees":
+                return await asyncio.to_thread(self._prune_orphan_worktrees, payload)
             if step == "reconcile.apply_promotion":
                 return await asyncio.to_thread(self._apply_promotion, payload)
             if step == "delivery.validate_changeset":
@@ -634,6 +639,7 @@ class ScanActivityHandler:
             raise ValueError("cleanup authorization changed after controller validation")
         removed: list[str] = []
         absent: list[str] = []
+        protected: list[dict[str, str]] = []
         for raw in raw_authorized:
             candidate = CleanupCandidate.model_validate(raw)
             allocation = WorktreeAllocation(
@@ -646,13 +652,36 @@ class ScanActivityHandler:
             if not allocation.path.exists():
                 absent.append(str(candidate.lease_id))
                 continue
-            self.manager.cleanup(allocation, evidence_captured=False)
+            try:
+                # NEW-85: abandoned attempts are archived (refs/archive/...) then removed;
+                # one protected worktree no longer fails the whole cleanup run.
+                self.manager.cleanup(
+                    allocation,
+                    evidence_captured=False,
+                    archive_dirty=candidate.reason == "ABANDONED_CHANGESET_STALE",
+                )
+            except WorktreeError as error:
+                protected.append({"lease_id": str(candidate.lease_id), "reason": str(error)[:200]})
+                continue
             removed.append(str(candidate.lease_id))
         return {
             **payload,
             "status": "CLEANUP_EXECUTED",
             "removed_lease_ids": removed,
             "already_absent_lease_ids": absent,
+            "protected_cleanup_candidates": protected,
+        }
+
+    def _prune_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-85: snapshots/acceptance leftovers no lease tracks (dry-run reports only)."""
+        dry_run = payload.get("dry_run") is not False or not self.settings.cleanup_execution_enabled
+        cutoff = datetime.now(UTC) - timedelta(days=self.settings.cleanup_retention_days)
+        result = self.manager.prune_orphan_worktrees(older_than=cutoff, dry_run=dry_run)
+        return {
+            **payload,
+            "status": "ORPHAN_WORKTREES_INSPECTED" if dry_run else "ORPHAN_WORKTREES_PRUNED",
+            "orphan_worktrees": result["removed"][:200],
+            "orphan_worktrees_kept": result["kept"][:50],
         }
 
     def _runtime_deterministic_checks(self, payload: dict[str, Any]) -> dict[str, Any]:

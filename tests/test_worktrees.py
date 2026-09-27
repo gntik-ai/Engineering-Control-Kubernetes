@@ -776,3 +776,88 @@ def test_publication_transport_identity_reads_only_changeset_git_metadata(
 def test_publication_transport_identity_must_be_a_plain_non_model_user(identity: str) -> None:
     with pytest.raises(ValueError, match="transport identity"):
         GitWorktreeManager(publication_transport_identity=identity)
+
+
+def test_abandoned_dirty_worktree_is_archived_then_removed(tmp_path: Path) -> None:
+    # NEW-85: an abandoned attempt's uncommitted work is kept under refs/archive/.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    (path / "feature.py").write_text("half-finished\n", encoding="utf-8")
+    allocation = manager_module.WorktreeAllocation(
+        "falcone",
+        path,
+        f"agent/falcone/993/{request['change_set_id']}",
+        sha,
+        request["change_set_id"],
+    )
+
+    with pytest.raises(WorktreeError, match="dirty worktree"):
+        manager.cleanup(allocation, evidence_captured=False)
+    manager.cleanup(allocation, evidence_captured=False, archive_dirty=True)
+
+    assert not path.exists()
+    metadata = manager.metadata_path("falcone", request["change_set_id"])
+    refs = git(
+        ["for-each-ref", "--format=%(refname)", f"refs/archive/{request['change_set_id']}"],
+        metadata,
+    )
+    assert any(ref.endswith("-worktree") for ref in refs.splitlines())
+    assert (
+        git(["rev-parse", f"refs/heads/agent/falcone/993/{request['change_set_id']}"], metadata)
+        == head
+    )
+
+
+def test_allocation_recreates_a_cleaned_worktree_from_its_surviving_branch(tmp_path: Path) -> None:
+    # NEW-85: cleanup removes the worktree but keeps the branch; the next delivery resumes
+    # it (NEW-52) or, without resume, archives it and starts from the base.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    metadata = manager.metadata_path("falcone", request["change_set_id"])
+    git(["worktree", "remove", "--force", str(path)], metadata)
+
+    resumed = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+    assert resumed.resumed_from_sha == head and git(["rev-parse", "HEAD"], path) == head
+
+    git(["worktree", "remove", "--force", str(path)], metadata)
+    fresh = manager.allocate(**request, resume_prior_commits=False)  # type: ignore[arg-type]
+    assert fresh.resumed_from_sha is None and git(["rev-parse", "HEAD"], path) == sha
+    archived = git(
+        ["for-each-ref", "--format=%(objectname)", f"refs/archive/{request['change_set_id']}"],
+        metadata,
+    )
+    assert head in archived.splitlines()
+
+
+def test_prune_orphan_worktrees_removes_only_old_untracked_directories(tmp_path: Path) -> None:
+    # NEW-85: 67 snapshot/acceptance directories on the worker were invisible to cleanup.
+    manager, request, changeset_path, sha = _resume_fixture(tmp_path)
+    manager._grant_read_access = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    campaign = uuid4()
+    snapshot = manager.allocate_audit_snapshot(
+        repository="falcone",
+        campaign_id=campaign,
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    unowned = tmp_path / "worktrees" / "acceptance" / str(uuid4())
+    unowned.mkdir(parents=True)
+    (unowned / "leftover.txt").write_text("x\n", encoding="utf-8")
+    recent = tmp_path / "worktrees" / "acceptance" / str(uuid4())
+    recent.mkdir()
+    old = 1_000_000_000
+    for directory in (snapshot.path, unowned, changeset_path):
+        os.utime(directory, (old, old))
+    from datetime import UTC, datetime, timedelta
+
+    cutoff = datetime.now(UTC) - timedelta(days=14)
+    dry = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=True)
+    assert {item["path"] for item in dry["removed"]} == {str(snapshot.path), str(unowned)}
+    assert snapshot.path.exists() and unowned.exists()
+
+    done = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=False)
+
+    assert {item["kind"] for item in done["removed"]} == {"SNAPSHOT", "UNOWNED_DIR"}
+    assert not snapshot.path.exists() and not unowned.exists()
+    assert not manager.metadata_path("falcone", campaign).exists()
+    assert changeset_path.exists() and recent.exists()  # lease-tracked / too recent

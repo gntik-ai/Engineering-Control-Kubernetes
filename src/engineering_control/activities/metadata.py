@@ -7694,14 +7694,24 @@ class MetadataActivityHandler:
         owner = session.get(Run, lease.owner_run_id)
         if change_set is None or owner is None:
             return None
-        if change_set.state not in {
+        terminal = change_set.state in {
             ChangeSetState.ISSUE_CLOSED.value,
             ChangeSetState.CANCELLED.value,
             ChangeSetState.SUPERSEDED.value,
             ChangeSetState.REJECTED.value,
+            # NEW-85: the staging flow ends delivered ChangeSets here, never ISSUE_CLOSED.
+            ChangeSetState.RUNTIME_VERIFIED.value,
+        }
+        # NEW-85: a published ChangeSet may still be merged/released; never auto-clean it.
+        if not terminal and change_set.state in {
+            ChangeSetState.SOURCE_PR.value,
+            ChangeSetState.CI_VALIDATED.value,
+            ChangeSetState.SOURCE_MERGED.value,
         }:
             return None
-        if self._run_retention_protected(session, owner):
+        # NEW-85: an abandoned attempt's Run was killed mid-flight and still reads RUNNING;
+        # its staleness (below) is the proof instead of the terminal-run protection.
+        if terminal and self._run_retention_protected(session, owner):
             return None
         incident = session.scalar(
             select(Incident).where(
@@ -7714,17 +7724,38 @@ class MetadataActivityHandler:
         retention_cutoff = now - timedelta(days=self.settings.cleanup_retention_days)
         released_at = self._as_utc(lease.released_at) if lease.released_at else None
         expires_at = self._as_utc(lease.expires_at)
-        owner_finished_at = self._as_utc(owner.finished_at)
+        abandonment_cutoff = now - timedelta(hours=self.settings.cleanup_expiry_grace_hours)
+        if not terminal:
+            # NEW-85: a pre-delivery attempt whose workflows were killed never finishes its
+            # Run or releases its lease. It is abandoned once the lease has expired and
+            # nothing touched the ChangeSet or any of its runs for the retention period.
+            lease_idle = (released_at is not None and released_at <= retention_cutoff) or (
+                released_at is None and expires_at <= abandonment_cutoff
+            )
+            if lease_idle and self._last_change_set_activity(session, change_set) <= (
+                retention_cutoff
+            ):
+                return "ABANDONED_CHANGESET_STALE"
+            return None
         if released_at is not None and released_at <= retention_cutoff:
             return "RELEASED_RETENTION_EXPIRED"
-        abandonment_cutoff = now - timedelta(hours=self.settings.cleanup_expiry_grace_hours)
+        owner_finished_at = self._as_utc(owner.finished_at) if owner.finished_at else None
         if (
             lease.released_at is None
             and expires_at <= abandonment_cutoff
+            and owner_finished_at is not None
             and owner_finished_at <= retention_cutoff
         ):
             return "ABANDONED_LEASE_EXPIRED"
         return None
+
+    def _last_change_set_activity(self, session: Any, change_set: ChangeSet) -> datetime:
+        latest = self._as_utc(change_set.updated_at)
+        for run in session.scalars(select(Run).where(Run.change_set_id == change_set.id)):
+            for stamp in (run.updated_at, run.finished_at, run.started_at):
+                if stamp is not None and self._as_utc(stamp) > latest:
+                    latest = self._as_utc(stamp)
+        return latest
 
     def _component_cleanup_candidates(self, session: Any, now: datetime) -> list[dict[str, Any]]:
         expiry_cutoff = now - timedelta(hours=self.settings.cleanup_expiry_grace_hours)

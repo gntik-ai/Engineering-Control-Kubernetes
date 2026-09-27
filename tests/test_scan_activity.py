@@ -146,7 +146,9 @@ class FakeCleanupManager:
     def is_dirty(self, path: Path) -> bool:
         return self.dirty
 
-    def cleanup(self, allocation: Any, *, evidence_captured: bool) -> None:
+    def cleanup(
+        self, allocation: Any, *, evidence_captured: bool, archive_dirty: bool = False
+    ) -> None:
         assert evidence_captured is False
         self.cleaned.append(str(allocation.path))
 

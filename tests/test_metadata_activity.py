@@ -2290,3 +2290,99 @@ async def test_existing_backlog_issue_is_bound_to_the_changeset_for_openspec(
     with handler.sessions() as session:
         change_set = session.get(ChangeSet, UUID(loaded["change_set_id"]))
         assert change_set is not None and change_set.issue_id == issue.id
+
+
+@pytest.mark.parametrize(
+    ("state", "run_status", "finished", "lease_released", "activity_days", "expected"),
+    [
+        # NEW-85: delivered ChangeSets end RUNTIME_VERIFIED, never ISSUE_CLOSED.
+        ("RUNTIME_VERIFIED", "SUCCESS", True, False, 20, "ABANDONED_LEASE_EXPIRED"),
+        ("RUNTIME_VERIFIED", "SUCCESS", True, True, 20, "RELEASED_RETENTION_EXPIRED"),
+        # A published ChangeSet may still be merged/released: never auto-cleaned.
+        ("SOURCE_PR", "SUCCESS", True, True, 20, None),
+        # Killed pre-GO attempts: Run never finished, lease never released.
+        ("CONFIRMED", "RUNNING", False, False, 20, "ABANDONED_CHANGESET_STALE"),
+        ("PLANNED", "RUNNING", False, False, 20, "ABANDONED_CHANGESET_STALE"),
+        # ...but not while anything touched the ChangeSet within the retention period.
+        ("CONFIRMED", "RUNNING", False, False, 3, None),
+    ],
+)
+def test_worktree_cleanup_eligibility_covers_delivered_and_abandoned_changesets(
+    tmp_path: Path,
+    state: str,
+    run_status: str,
+    finished: bool,
+    lease_released: bool,
+    activity_days: int,
+    expected: str | None,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'eligibility.sqlite'}",
+            worktree_root=tmp_path / "worktrees",
+            cleanup_retention_days=14,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    now = datetime.now(UTC)
+    old = now - timedelta(days=activity_days)
+    change_set_id, run_id, lease_id = uuid4(), uuid4(), uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="musematic",
+                risk_class="R1",
+                state=state,
+                version=1,
+                source_repository="musematic",
+                source_branch=f"agent/musematic/1/{change_set_id}",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url=None,
+                deployment_repository="musematic-deploy",
+                deployment_branch=f"agent/musematic-deploy/1/{change_set_id}",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+                created_at=old,
+                updated_at=old,
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id=f"delivery-{run_id}",
+                run_type="issue-delivery",
+                status=run_status,
+                project="musematic",
+                started_at=old,
+                finished_at=old if finished else None,
+                created_at=old,
+                updated_at=old,
+            )
+        )
+        session.add(
+            WorktreeLease(
+                id=lease_id,
+                change_set_id=change_set_id,
+                repository="musematic",
+                worktree_path=str(tmp_path / "worktrees" / "musematic" / str(change_set_id)),
+                branch=f"agent/musematic/1/{change_set_id}",
+                owner_run_id=run_id,
+                base_sha="a" * 40,
+                expires_at=old,
+                released_at=old if lease_released else None,
+            )
+        )
+
+    with handler.sessions() as session:
+        lease = session.get(WorktreeLease, lease_id)
+        assert lease is not None
+        assert handler._cleanup_lease_eligibility(session, lease, now) == expected
