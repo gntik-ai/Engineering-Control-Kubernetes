@@ -3155,6 +3155,17 @@ class MetadataActivityHandler:
                 if not deployment
                 else "Return an empty dependency_resolution list.\n"
             )
+            # NEW-78: #1125's correction maker fixed every checker finding it could, then
+            # returned BLOCKED because go test, Docker/Trivy and the OpenSpec CLI cannot run
+            # offline; those are enforced after publication.
+            + (
+                "Checks that need network access, Docker or container images, or tools "
+                "absent from this sandbox (for example go build/test, govulncheck, image "
+                "builds and scans, CLIs that are not installed) run after publication in the "
+                "project's PR CI and release gate. Record them as SKIPPED with the reason and "
+                "list them in open_questions; never return BLOCKED only because such a check "
+                "cannot run here.\n"
+            )
             # NEW-41: a deployment maker blocked a finished source change because the
             # OpenSpec needed no deployment change and the deploy repo already contained
             # credential-like findings -- neither is a blocker under platform policy.

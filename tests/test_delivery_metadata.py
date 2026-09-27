@@ -1117,6 +1117,7 @@ def test_maker_prompt_and_schema_support_platform_dependency_resolution(tmp_path
     assert "DEPENDENCIES_REQUIRED" in first["prompt"]
     assert "never hand-edit go.sum or pnpm-lock.yaml" in first["prompt"]
     assert "Return an empty dependency_resolution list." in deployment["prompt"]
+    assert "never return BLOCKED only because such a check" in first["prompt"]
     assert "regenerated and committed as " + "c" * 40 in second["prompt"]
     assert first["run_id"] != second["run_id"]
     schema = first["output_schema"]
