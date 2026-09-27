@@ -336,6 +336,16 @@ _TASKS_MD_ADVISORY = (
     "tasks.md are advisory: run the gates yourself and judge the change on those "
     "results. Report a tasks.md record that differs from your results as a non-blocking "
     "finding; never request changes solely because of tasks.md gate-record wording.\n"
+    # NEW-78: musematic #1125's checker blocked because it could not run go test,
+    # govulncheck, docker builds or Trivy image scans offline; every correction attempt
+    # would have been rejected for the same environment limit.
+    "Checks that need network access, Docker or container images, or toolchains absent "
+    "from this sandbox (for example go build/test, govulncheck, image builds and image "
+    "scans) are enforced after publication by the project's PR CI, compared against a "
+    "baseline of unchanged main, and by its release gate. Record what you could not run "
+    "as a non-blocking finding; never request changes solely because such a check could "
+    "not run here. Do request changes when the diff, manifests or lockfiles themselves "
+    "are wrong.\n"
 )
 
 

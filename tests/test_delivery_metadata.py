@@ -898,6 +898,8 @@ def test_makers_and_checker_are_told_to_run_the_prepared_toolchain_tests(
         assert "must be valid JSON" in prompt  # _STRUCTURED_OUTPUT_JSON_RULES intact
     # NEW-57: tasks.md gate-record wording never blocks on its own.
     assert "never request changes solely because of tasks.md gate-record wording" in checker
+    # NEW-78: environment-bound checks are deferred to PR CI and the release gate.
+    assert "never request changes solely because such a check could not run here" in checker
     assert "tasks.md" not in source and "tasks.md" not in deployment
     assert ("Toolchain prepared in the source worktree" in source) is prepared
     assert ("Toolchain prepared" in checker) is prepared
