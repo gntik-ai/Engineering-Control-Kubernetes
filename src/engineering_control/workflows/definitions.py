@@ -2445,9 +2445,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     "CURRENT_SOURCE_REVALIDATION_REQUIRED",
                     "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED",
                 }:
-                    candidate = await self._step(
+                    candidate = await self._loop_step(
+                        request,
+                        item,
                         "backlog.materialize_candidate",
                         {**asdict(request), "item": item},
+                        register_run=register_run,
                     )
                     verification_workflow_id = (
                         f"{workflow.info().workflow_id}-issue-{ordinal}-"
@@ -2461,7 +2464,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         )
                     revalidation_round += 1
                     if register_child_runs:
-                        await self._step(
+                        await self._loop_step(
+                            request,
+                            item,
                             "backlog.register_child_run",
                             {
                                 **asdict(request),
@@ -2469,6 +2474,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                 "child_workflow_id": verification_workflow_id,
                                 "finding_id": str(candidate["finding_id"]),
                             },
+                            register_run=register_run,
                         )
                     try:
                         verification = await workflow.execute_child_workflow(
@@ -2487,13 +2493,16 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         # the whole loop; it now pauses for the operator like any blocker.
                         verification = {"status": "CHILD_FAILED"}
                     else:
-                        await self._step(
+                        await self._loop_step(
+                            request,
+                            item,
                             "backlog.record_revalidation",
                             {
                                 **asdict(request),
                                 "item": item,
                                 "verification": verification,
                             },
+                            register_run=register_run,
                         )
                     refreshed = await self._step("backlog.load_execution", asdict(request))
                     candidates = refreshed.get("items")
@@ -2628,7 +2637,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     for attempt in range(1, request.correction_limit + 2):
                         delivery_workflow_id = f"{issue_prefix}-attempt-{attempt}"
                         if register_child_runs:
-                            await self._step(
+                            await self._loop_step(
+                                request,
+                                item,
                                 "backlog.register_child_run",
                                 {
                                     **asdict(request),
@@ -2636,6 +2647,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                     "child_workflow_id": delivery_workflow_id,
                                     "finding_id": str(gate["finding_id"]),
                                 },
+                                register_run=register_run,
                             )
                         delivery = await self._issue_delivery(gate, delivery_workflow_id)
                         results.append({**delivery, "attempt": attempt})
@@ -2644,7 +2656,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 else:
                     delivery_workflow_id = issue_prefix
                     if register_child_runs:
-                        await self._step(
+                        await self._loop_step(
+                            request,
+                            item,
                             "backlog.register_child_run",
                             {
                                 **asdict(request),
@@ -2652,6 +2666,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                 "child_workflow_id": delivery_workflow_id,
                                 "finding_id": str(gate["finding_id"]),
                             },
+                            register_run=register_run,
                         )
                     delivery = await self._issue_delivery(gate, delivery_workflow_id)
                     results.append(delivery)
@@ -3029,6 +3044,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 repair_round += 1
                 repaired = await self._ci_repair_delivery(
                     request=request,
+                    item=item,
+                    register_run=register_run,
                     gate=gate,
                     ordinal=ordinal,
                     repair_round=repair_round,
@@ -3046,7 +3063,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if gitops_round:
                     child_id = f"{child_id}-retry-{gitops_round}"
                 if register_child_runs:
-                    await self._step(
+                    await self._loop_step(
+                        request,
+                        item,
                         "backlog.register_child_run",
                         {
                             **asdict(request),
@@ -3055,6 +3074,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             "finding_id": finding_id,
                             "change_set_id": change_set_id,
                         },
+                        register_run=register_run,
                     )
                 try:
                     staged = await workflow.execute_child_workflow(
@@ -3121,6 +3141,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         self,
         *,
         request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        register_run: bool,
         gate: dict[str, Any],
         ordinal: int,
         repair_round: int,
@@ -3133,7 +3155,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         for attempt in range(1, request.correction_limit + 2):
             child_id = f"{prefix}-attempt-{attempt}"
             if register_child_runs:
-                await self._step(
+                await self._loop_step(
+                    request,
+                    item,
                     "backlog.register_child_run",
                     {
                         **asdict(request),
@@ -3141,6 +3165,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         "child_workflow_id": child_id,
                         "finding_id": str(gate["finding_id"]),
                     },
+                    register_run=register_run,
                 )
             delivery = await self._issue_delivery(gate, child_id)
             results.append({**delivery, "attempt": attempt, "stage": "ci-repair"})
@@ -3192,6 +3217,39 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             {**asdict(request), "loop_status": "CANCELLED"},
         )
         return {"status": "CANCELLED", "results": results}
+
+    async def _loop_step(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        step: str,
+        payload: dict[str, Any],
+        *,
+        register_run: bool,
+    ) -> dict[str, Any]:
+        """NEW-82: a failed loop bookkeeping activity (e.g. #1125's register_child_run
+        binding conflict) pauses the issue for the operator instead of failing the whole
+        loop; the operator's retry re-runs the step, skip/cancel end as before."""
+        while True:
+            try:
+                return await self._step(step, payload)
+            except ActivityError as error:
+                if not workflow.patched("existing-backlog-resilient-loop-steps-v1"):
+                    raise
+                blocker = "LOOP_STEP_FAILED_" + step.upper().replace(".", "_")
+                paused = {**asdict(request), "loop_status": "PAUSED", "blocker": blocker}
+                if register_run:
+                    paused["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", paused)
+                outcome, _ = await self._await_delivery_operator(
+                    request, item, blocker, register_run=register_run
+                )
+                if outcome != "RETRY":
+                    raise error
+                resumed = {**asdict(request), "loop_status": "RUNNING"}
+                if register_run:
+                    resumed["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", resumed)
 
     async def _await_delivery_operator(
         self,

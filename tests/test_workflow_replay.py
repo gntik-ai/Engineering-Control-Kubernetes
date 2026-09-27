@@ -802,8 +802,9 @@ async def _run_loop(
     script: dict[str, dict[str, Any]],
     signals: list[tuple[str, Any]],
     workflows: list[type] | None = None,
+    activity_fn: Any = None,
 ) -> tuple[Any, Any, list[str]]:
-    activity_fn = _scripted_execute_control_step(script)
+    activity_fn = activity_fn or _scripted_execute_control_step(script)
     workflows = workflows or _LOOP_WORKFLOWS
     async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
         async with (
@@ -849,6 +850,40 @@ async def _run_loop(
         if event.HasField("start_child_workflow_execution_initiated_event_attributes")
     ]
     return history, result, children
+
+
+async def test_a_failed_loop_bookkeeping_step_pauses_and_retries_instead_of_failing() -> None:
+    # NEW-82: #1125's loop went FAILED when backlog.register_child_run raised; the step
+    # now pauses the issue for the operator and the retry re-runs it.
+    script = _full_delivery_loop_script()
+    failures = {"backlog.register_child_run": 1}
+
+    @activity.defn(name="execute_control_step")
+    async def flaky(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        if failures.get(step):
+            failures[step] -= 1
+            raise ApplicationError(
+                "backlog child run idempotency binding changed", non_retryable=True
+            )
+        if step == "github.refresh_mirrors" and step not in script:
+            return {"status": "PASS"}
+        return script[step]
+
+    history, result, children = await _run_loop(
+        script, [("retry", "gntik-ai/musematic#1026")], activity_fn=flaky
+    )
+
+    assert result["status"] == "COMPLETE"
+    paused = [
+        request["payload"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert [state["blocker"] for state in paused] == ["LOOP_STEP_FAILED_BACKLOG_REGISTER_CHILD_RUN"]
+    assert all(state.get("workflow_id") for state in paused)
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
 
 
 @workflow.defn(name="FindingVerificationWorkflow", sandboxed=False)
