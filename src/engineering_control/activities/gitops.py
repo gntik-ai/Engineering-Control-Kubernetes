@@ -522,7 +522,10 @@ class GitOpsControllerHandler:
         return path
 
     def _work_root(self) -> Path:
-        root = (self.settings.run_root / "gitops").resolve()
+        # NEW-81: engineering-temporal-worker (engineering-control) may write only its
+        # state root and the evidence root; run_root/gitops raised a read-only OSError
+        # on the first production environment check (musematic #1125).
+        root = (self.settings.state_root / "gitops").resolve()
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         return root
 

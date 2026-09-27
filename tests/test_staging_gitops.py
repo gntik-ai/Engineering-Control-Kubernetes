@@ -203,6 +203,7 @@ class FakeKubectl:
         self.stores = stores or {}
         self.application = application or _application()
         self.calls: list[list[str]] = []
+        self.cwds: list[Path] = []
 
     def run(
         self,
@@ -215,6 +216,7 @@ class FakeKubectl:
         check: bool = True,
     ) -> CommandResult:
         assert executable == "kubectl"
+        self.cwds.append(cwd)
         args = list(arguments)
         assert args[0] == "--kubeconfig"
         args = args[2:]
@@ -1567,3 +1569,27 @@ async def test_a_later_release_containing_the_merge_delivers_a_failed_release(
 
     fake.contains = False  # a later tag that does not contain the merge never counts
     assert (await handler.handle("gitops.workflow_run", payload))["blocker"] == "IMAGE_BUILD_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_controller_kubectl_runs_in_the_writable_state_root(tmp_path: Path) -> None:
+    # NEW-81: the first production environment check failed with a read-only OSError:
+    # engineering-temporal-worker may write only its state root and the evidence root.
+    kubectl = FakeKubectl()
+    handler = _controller(tmp_path, kubectl)
+    change_set_id = _seed_change_set(handler)
+    prepared = await handler.handle(
+        "gitops.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "project": "musematic",
+            "issue_repository": "gntik-ai/musematic",
+            "issue_number": 1026,
+        },
+    )
+    await handler.handle("gitops.environment_check", {"plan": prepared["plan"]})
+
+    assert kubectl.cwds and all(
+        cwd == (tmp_path / "state" / "gitops").resolve() for cwd in kubectl.cwds
+    )
+    assert not (tmp_path / "runs" / "gitops").exists()
