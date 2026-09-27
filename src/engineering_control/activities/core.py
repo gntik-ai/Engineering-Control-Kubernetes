@@ -249,7 +249,9 @@ class ControlActivities:
         "staging.deploy",
         "recovery.execute",
         "cleanup.execute",
-        "cleanup.prune_orphan_worktrees",
+        # NEW-85: cleanup.prune_orphan_worktrees is not listed here: it must run in dry
+        # runs to report candidates; its handler deletes only when the payload says
+        # dry_run=False AND cleanup execution is enabled.
         "cleanup.execute_evidence_files",
         "cleanup.execute_delivery_files",
         "cleanup.execute_browser_files",

@@ -133,3 +133,11 @@ async def test_non_mutating_release_steps_reach_release_handler(
 
     assert result["status"] == "RELEASE_HANDLER_REACHED"
     assert handler.calls == [step]
+
+
+def test_orphan_worktree_prune_is_not_short_circuited_in_dry_runs() -> None:
+    # NEW-85: the dry-run cleanup must reach the scan handler so orphan candidates are
+    # reported; the handler itself refuses to delete unless dry_run=False and execution
+    # is enabled.
+    assert "cleanup.prune_orphan_worktrees" not in ControlActivities._mutation_steps
+    assert "cleanup.execute" in ControlActivities._mutation_steps
