@@ -545,3 +545,33 @@ def test_dependency_resolution_blocks_a_dirty_worktree_and_a_failed_command(tmp_
     blocked = handler._resolve_dependencies(payload)
     assert blocked["blocker"] == "DEPENDENCY_RESOLUTION_FAILED"
     assert "module lookup disabled" in blocked["dependency_resolution_result"]["detail"]
+
+
+def test_each_validated_head_is_scanned_into_its_own_report_directory(tmp_path: Path) -> None:
+    # NEW-80: scanners reuse an existing report in their output directory; keyed only by
+    # the ChangeSet, #1125's second attempt re-read the first attempt's Trivy report and
+    # kept "introducing" a CVE its new head no longer had.
+    handler, _, repo = _validation(tmp_path, "musematic")
+    outputs: list[Path] = []
+    original = handler.scanner.vulnerability_scan
+
+    def recording_scan(worktree: Path, output: Path) -> dict[str, Any]:
+        outputs.append(output)
+        return original(worktree, output)
+
+    handler.scanner.vulnerability_scan = recording_scan  # type: ignore[method-assign]
+    heads = iter(["a" * 40, "a" * 40, "b" * 40, "b" * 40])
+
+    def evidence(path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
+        return {
+            "changed_file_count": 1,
+            "changed_paths": ["app.py"],
+            "head_sha": next(heads),
+        }, "+x\n"
+
+    handler.manager.change_evidence = evidence  # type: ignore[method-assign]
+    handler._validate_changeset(_validation_payload(repo, "musematic"))
+    handler._validate_changeset(_validation_payload(repo, "musematic"))
+
+    names = [output.name for output in outputs if output.name.startswith("source")]
+    assert names == ["source-postchecks-aaaaaaaaaaaa", "source-postchecks-bbbbbbbbbbbb"]

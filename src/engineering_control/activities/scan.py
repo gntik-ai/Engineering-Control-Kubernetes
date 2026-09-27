@@ -2064,7 +2064,12 @@ class ScanActivityHandler:
                 blocked = True
             diff_path = evidence_root / f"{name}.patch"
             safe_diff = str(SecretRedactor().redact_text(diff).value)
-            output = evidence_root / f"{name}-postchecks"
+            # NEW-80: the scanners reuse an existing report in their output directory
+            # (activity retries). Keyed only by the ChangeSet, a later attempt re-read
+            # the first attempt's reports: #1125 kept "introducing" the grpc CVE its
+            # new head no longer had. Scan each head into its own directory.
+            head = str(summary.get("head_sha") or "")[:12]
+            output = evidence_root / (f"{name}-postchecks-{head}" if head else f"{name}-postchecks")
             secret = self.scanner.secret_scan(worktree, output)
             trivy = self.scanner.vulnerability_scan(worktree, output)
             semgrep = self.scanner.semgrep(worktree, output)
