@@ -840,18 +840,19 @@ class GitWorktreeManager:
         """NEW-85: remove worktree directories no lease ever tracks.
 
         Detached audit/revalidation snapshots (keyed by campaign or finding, never by a
-        ChangeSet) and directories under unknown repository slugs (old acceptance runs)
-        are removed once untouched since ``older_than``. Branch-bearing ChangeSet
-        worktrees are left to the lease-based cleanup. Nothing is followed through a
-        symlink; failures are reported, never raised.
+        ChangeSet) are removed once untouched since ``older_than``. Branch-bearing
+        ChangeSet worktrees are left to the lease-based cleanup. Only the known
+        repositories' directories are walked: the worktree root itself is root-owned and
+        traverse-only for the scan worker, so anything else under it (old acceptance
+        runs) is out of reach by design. Nothing is followed through a symlink; failures
+        are reported, never raised.
         """
         root = self.worktree_root.resolve()
-        known = {self._slug(repository) for repository in self._repositories}
         removed: list[dict[str, str]] = []
         kept: list[dict[str, str]] = []
-        if not root.is_dir():
-            return {"removed": removed, "kept": kept}
-        for repository_dir in sorted(root.iterdir()):
+        slugs = sorted({self._slug(repository) for repository in self._repositories})
+        for slug in slugs:
+            repository_dir = root / slug
             if repository_dir.is_symlink() or not repository_dir.is_dir():
                 continue
             for target in sorted(repository_dir.iterdir()):
@@ -869,23 +870,19 @@ class GitWorktreeManager:
                 record = {
                     "path": str(target),
                     "modified_at": modified.isoformat(),
-                    "kind": "SNAPSHOT" if repository_dir.name in known else "UNOWNED_DIR",
+                    "kind": "SNAPSHOT",
                 }
                 try:
-                    if repository_dir.name in known:
-                        if self._run(["git", "branch", "--show-current"], target):
-                            continue  # a ChangeSet worktree: lease-based cleanup only
-                        metadata = self.metadata_path(repository_dir.name, identity)
+                    if self._run(["git", "branch", "--show-current"], target):
+                        continue  # a ChangeSet worktree: lease-based cleanup only
+                    metadata = self.metadata_path(slug, identity)
                     if dry_run:
                         removed.append(record)
                         continue
-                    if repository_dir.name in known:
-                        self._run(["git", "worktree", "remove", "--force", str(target)], metadata)
-                        remaining = self._run(["git", "worktree", "list", "--porcelain"], metadata)
-                        if remaining.count("worktree ") <= 1 and metadata.is_dir():
-                            shutil.rmtree(metadata)
-                    else:
-                        shutil.rmtree(target)
+                    self._run(["git", "worktree", "remove", "--force", str(target)], metadata)
+                    remaining = self._run(["git", "worktree", "list", "--porcelain"], metadata)
+                    if remaining.count("worktree ") <= 1 and metadata.is_dir():
+                        shutil.rmtree(metadata)
                     removed.append(record)
                 except (WorktreeError, OSError) as error:
                     kept.append({**record, "reason": str(error)[:200]})

@@ -830,7 +830,9 @@ def test_allocation_recreates_a_cleaned_worktree_from_its_surviving_branch(tmp_p
 
 
 def test_prune_orphan_worktrees_removes_only_old_untracked_directories(tmp_path: Path) -> None:
-    # NEW-85: 67 snapshot/acceptance directories on the worker were invisible to cleanup.
+    # NEW-85: ~40 detached snapshot directories on the worker were invisible to cleanup.
+    # Unknown slugs (the root-owned acceptance/ tree) are never walked: the scan worker
+    # can only traverse the worktree root, not list it.
     manager, request, changeset_path, sha = _resume_fixture(tmp_path)
     manager._grant_read_access = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
     campaign = uuid4()
@@ -852,12 +854,12 @@ def test_prune_orphan_worktrees_removes_only_old_untracked_directories(tmp_path:
 
     cutoff = datetime.now(UTC) - timedelta(days=14)
     dry = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=True)
-    assert {item["path"] for item in dry["removed"]} == {str(snapshot.path), str(unowned)}
+    assert {item["path"] for item in dry["removed"]} == {str(snapshot.path)}
     assert snapshot.path.exists() and unowned.exists()
 
     done = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=False)
 
-    assert {item["kind"] for item in done["removed"]} == {"SNAPSHOT", "UNOWNED_DIR"}
-    assert not snapshot.path.exists() and not unowned.exists()
+    assert [item["kind"] for item in done["removed"]] == ["SNAPSHOT"]
+    assert not snapshot.path.exists() and unowned.exists()
     assert not manager.metadata_path("falcone", campaign).exists()
     assert changeset_path.exists() and recent.exists()  # lease-tracked / too recent
