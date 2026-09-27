@@ -335,18 +335,65 @@ async def test_workflow_waits_for_explicit_retry_after_policy_denial(
             }
         return {"status": "PUBLISHED"}
 
-    async def explicit_retry(predicate: Any) -> None:
+    async def explicit_retry(predicate: Any, **_kwargs: Any) -> None:
         controlled._retry_step = "finding.publish"
         assert predicate() is True
 
     monkeypatch.setattr(controlled, "_step", fake_step)
     monkeypatch.setattr(definitions.workflow, "wait_condition", explicit_retry)
+    # A history recorded before NEW-84 keeps the plain wait for the retry signal.
+    monkeypatch.setattr(definitions.workflow, "patched", lambda _name: False)
 
     result = await controlled._github_write_step("finding.publish", {})
 
     assert result["status"] == "PUBLISHED"
     assert calls == ["finding.publish", "finding.publish"]
     assert controlled._phase == "AWAITING_WRITE_POLICY"
+
+
+@pytest.mark.asyncio
+async def test_policy_denial_alerts_once_and_retries_on_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NEW-84: one operator alert, then a 5-minute re-check until the approval is back.
+    from types import SimpleNamespace
+
+    controlled = ControlledWorkflow()
+    calls: list[str] = []
+
+    async def fake_step(
+        step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
+    ) -> dict[str, Any]:
+        del timeout_minutes
+        calls.append(step)
+        if step == "notify.write_policy_required":
+            assert payload["step"] == "finding.publish"
+            return {"status": "NOTIFIED"}
+        if calls.count("finding.publish") < 3:
+            return {"status": "BLOCKED_BY_POLICY", "reason_code": "POLICY_DISABLED"}
+        return {"status": "PUBLISHED"}
+
+    waits: list[Any] = []
+
+    async def timed_out(predicate: Any, **kwargs: Any) -> None:
+        waits.append(kwargs.get("timeout"))
+        raise TimeoutError
+
+    monkeypatch.setattr(controlled, "_step", fake_step)
+    monkeypatch.setattr(definitions.workflow, "wait_condition", timed_out)
+    monkeypatch.setattr(definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(definitions.workflow, "info", lambda: SimpleNamespace(workflow_id="wf-1"))
+
+    result = await controlled._github_write_step("finding.publish", {"project": "musematic"})
+
+    assert result["status"] == "PUBLISHED"
+    assert calls == [
+        "finding.publish",
+        "notify.write_policy_required",
+        "finding.publish",
+        "finding.publish",
+    ]
+    assert all(wait is not None and wait.total_seconds() == 300 for wait in waits)
 
 
 def test_acceptance_harness_requires_exact_safe_denial_and_one_activity_start() -> None:
