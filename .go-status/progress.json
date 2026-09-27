@@ -370,6 +370,11 @@
       "id": "NEW-86",
       "status": "OPEN",
       "summary": "identity.inspect_stale reports musematic SUPERADMIN_AUTHENTICATION_FAILED in every cleanup run (seen since at least 2026-09-27 03:00 UTC)"
+    },
+    {
+      "id": "NEW-88",
+      "status": "OPEN",
+      "summary": "Watchdog sends a CHANGE Telegram message for every planned service restart (~4 per deploy); suppress for planned restarts when porting the watchdog off 2b678d9 (F-11)."
     }
   ],
   "post_go_done": [
@@ -383,6 +388,11 @@
       "id": "NEW-85",
       "date": "2026-09-27",
       "summary": "Automatic worktree cleanup live (3-day retention, execution enabled on both hosts; worker flag in worker-common.env). First run cleanup-scheduled-2026-09-27T19:27:30Z COMPLETE: 22 abandoned ChangeSet worktrees removed (uncommitted work kept under refs/archive/), 38 detached snapshots pruned, 433 agent-log + 4098 dashboard-event rows deleted by standard retention; worker disk 30G -> 39G free. acceptance/ (27 dirs) removed manually. Commits f32f2ab, a9c8c62, 51d3a36."
+    },
+    {
+      "id": "NEW-87",
+      "date": "2026-09-27",
+      "summary": "Recurring Telegram alert every 65 min came from the 2b678d9 watchdog's projection-reconciliation probe (reconciler only existed in the abandoned lineage, stale since 2026-09-21; control.env had ENGINEERING_PROJECTION_RECONCILIATION_ENABLED=true). Set it to false (backup kept) and restarted engineering-watchdog only: probe_count 17 -> 16, unhealthy 0, delivered 0. Remaining by design: ~4 watchdog CHANGE messages per deploy (unit InvocationID fingerprint), not configurable in the pinned watchdog -- fold into the F-11 watchdog port. Scripts: .go-status/telegram-alerts-diagnose.sh, telegram-alerts-fix-projection.sh."
     }
   ]
 }
