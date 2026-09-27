@@ -197,5 +197,11 @@ temporal schedule list --address 127.0.0.1:7233 --namespace engineering-control
 
 echo ""
 echo "=== Done. Deployed $HASH to both hosts. ==="
-echo "Known, accepted, unaffected-by-this-deploy issue: engineering-watchdog.service has no"
-echo "matching console-script entry on this branch and will fail on its next restart -- see F-11."
+# F-11: the watchdog has no console script on this branch; a drop-in pins it to the
+# 2b678d9 venv (which retention keeps). Warn only if that pin is missing.
+if systemctl show engineering-watchdog -p ExecStart 2>/dev/null | grep -q "/venvs/2b678d9"; then
+  echo "engineering-watchdog: pinned to the 2b678d9 venv (F-11 drop-in present)."
+else
+  echo "WARNING: engineering-watchdog is not pinned and has no console script on this branch;"
+  echo "it will fail on its next restart -- see F-11 (50-pin-venv.conf drop-in)."
+fi
