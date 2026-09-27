@@ -2048,6 +2048,8 @@ class ScanActivityHandler:
         baseline = self._load_baseline(change_set_id)
         changes: dict[str, Any] = {}
         blocked = False
+        empty_change = False
+        validation_findings: list[str] = []
         toolchain = self._toolchain_cleanup_policy(str(payload.get("project", "")))
         for name, path_key, base_key in (
             ("source", "source_worktree", "source_base_sha"),
@@ -2062,6 +2064,7 @@ class ScanActivityHandler:
             summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
             if name == "source" and summary["changed_file_count"] == 0:
                 blocked = True
+                empty_change = True
             diff_path = evidence_root / f"{name}.patch"
             safe_diff = str(SecretRedactor().redact_text(diff).value)
             # NEW-80: the scanners reuse an existing report in their output directory
@@ -2076,9 +2079,11 @@ class ScanActivityHandler:
             self.scanner.sbom(worktree, output)
             semgrep_findings = len(semgrep.get("results", []))
             severe = self._severe_vulnerability_count(trivy)
-            introduced = self._introduced_findings(
-                baseline.get(name) if baseline is not None else None,
-                self._finding_counts(worktree, secret, trivy, semgrep),
+            counts = self._finding_counts(worktree, secret, trivy, semgrep)
+            side_baseline = baseline.get(name) if baseline is not None else None
+            introduced = self._introduced_findings(side_baseline, counts)
+            validation_findings.extend(
+                f"{name}: {item}" for item in self._introduced_identities(side_baseline, counts)
             )
             if any(introduced.values()):
                 blocked = True
@@ -2134,6 +2139,16 @@ class ScanActivityHandler:
                 str(payload["deployment_repository"]),
                 Path(str(payload["deployment_worktree"])),
             )
+        if blocked and not empty_change and validation_findings and baseline is not None:
+            # NEW-76: introduced findings are the maker's to fix; name them (identities
+            # only, never secret values) so the next correction attempt can.
+            return {
+                **payload,
+                "status": "REQUEST_CHANGES",
+                "blocker": "CHANGESET_VALIDATION_FINDINGS",
+                "change_evidence": changes,
+                "validation_findings": validation_findings[:40],
+            }
         return {
             **payload,
             "status": "BLOCKED" if blocked else "LOCAL_VALIDATION_PASS",
@@ -2277,6 +2292,28 @@ class ScanActivityHandler:
                 for identity, count in findings.items()
             )
         return introduced
+
+    @staticmethod
+    def _introduced_identities(
+        baseline: dict[str, Any] | None, current: dict[str, dict[str, int]]
+    ) -> list[str]:
+        """NEW-76: readable identities of introduced findings (no secret values)."""
+        labels = {"secrets": "secret", "semgrep": "semgrep", "vulnerabilities": "trivy"}
+        identities: list[str] = []
+        for category, findings in current.items():
+            before = baseline.get(category) if isinstance(baseline, dict) else None
+            before = before if isinstance(before, dict) else {}
+            for identity, count in sorted(findings.items()):
+                if count <= int(before.get(identity, 0)):
+                    continue
+                try:
+                    parts = [str(part) for part in json.loads(identity) if part]
+                except (TypeError, ValueError):
+                    parts = [identity]
+                identities.append(f"{labels.get(category, category)} " + " | ".join(parts))
+                if len(identities) >= 20:
+                    return identities
+        return identities
 
     @staticmethod
     def _severe_vulnerability_count(report: dict[str, Any]) -> int:

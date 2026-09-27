@@ -412,6 +412,7 @@ class MetadataActivityHandler:
             "delivery.prepare_deployment_maker",
             "delivery.prepare_checker",
             "delivery.persist_handoff",
+            "delivery.record_validation_findings",
             "delivery.prepare_publication",
             "delivery.persist_publication",
             "reconcile.prepare",
@@ -546,6 +547,8 @@ class MetadataActivityHandler:
                 return self._prepare_checker(payload)
             if step == "delivery.persist_handoff":
                 return await asyncio.to_thread(self._persist_delivery_handoff, payload)
+            if step == "delivery.record_validation_findings":
+                return await asyncio.to_thread(self._record_validation_findings, payload)
             if step == "delivery.prepare_publication":
                 return self._prepare_publication(payload)
             if step == "delivery.persist_publication":
@@ -3015,6 +3018,36 @@ class MetadataActivityHandler:
             "openspec_document": document,
         }
 
+    def _record_validation_findings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-76: keep the validation's introduced findings for the next maker round."""
+        change_set_id = UUID(str(payload["change_set_id"]))
+        raw = payload.get("validation_findings")
+        findings = (
+            [str(item)[:300] for item in raw if isinstance(item, str)][:40]
+            if isinstance(raw, list)
+            else []
+        )
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                raise ValueError("validation findings have no ChangeSet")
+            recovery = dict(change_set.recovery_json or {})
+            recovery["validation_findings"] = {
+                "findings": findings,
+                "recorded_at": datetime.now(UTC).isoformat(),
+            }
+            change_set.recovery_json = recovery
+        return payload
+
+    def _validation_findings(self, change_set_id: UUID) -> list[str]:
+        with self.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            record = dict((change_set.recovery_json or {}) if change_set else {}).get(
+                "validation_findings"
+            )
+        findings = record.get("findings") if isinstance(record, dict) else None
+        return [str(item) for item in findings if isinstance(item, str)] if findings else []
+
     def _ci_regressions(self, change_set_id: UUID) -> list[str]:
         """NEW-64: PR CI jobs the staging baseline gate attributed to this ChangeSet."""
         with self.sessions.begin() as session:
@@ -3101,6 +3134,15 @@ class MetadataActivityHandler:
                     "(the worktree was reset to base; address every finding):\n"
                 )
             ) + "".join(f"- {item}\n" for item in correction)
+        # NEW-76: findings the platform validation attributed to the previous attempt.
+        validation_findings = [] if deployment else self._validation_findings(change_set_id)
+        if validation_findings:
+            derived_content += (
+                "The platform validation of the previous attempt found these NEW findings "
+                "introduced by this ChangeSet (they are absent at the base commit). Fix each "
+                "one on top of the existing commits; do not weaken scanners or add "
+                "exceptions:\n"
+            ) + "".join(f"- {item}\n" for item in validation_findings)
         # NEW-64: a CI-repair re-delivery names the PR CI jobs the baseline gate attributed
         # to this ChangeSet (they pass on unchanged main).
         ci_regressions = [] if deployment else self._ci_regressions(change_set_id)
@@ -3613,6 +3655,8 @@ class MetadataActivityHandler:
                     json.dumps(release_impacts, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest(),
             }
+            # NEW-76: a published head passed validation; earlier findings are resolved.
+            recovery.pop("validation_findings", None)
             change_set.recovery_json = recovery
             change_set.state = ChangeSetState.SOURCE_PR.value
             change_set.version += 1

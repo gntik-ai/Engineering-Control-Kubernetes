@@ -973,6 +973,14 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                 if step == "delivery.invoke_maker":
                     context = await self._resolve_maker_dependencies(context, request)
                 if (
+                    step == "delivery.validate_changeset"
+                    and context.get("status") == "REQUEST_CHANGES"
+                    and context.get("validation_findings")
+                    and workflow.patched("delivery-record-validation-findings-v1")
+                ):
+                    # NEW-76: the next correction attempt's maker is told what to fix.
+                    await self._step("delivery.record_validation_findings", context)
+                if (
                     context.get("status")
                     in {
                         "RATE_LIMITED",

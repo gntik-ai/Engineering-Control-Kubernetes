@@ -597,11 +597,14 @@ def test_postchecks_block_findings_the_change_introduces(
 
     validated = handler._validate_changeset(payload)
 
-    assert validated["status"] == "BLOCKED"
+    # NEW-76: introduced findings go back to the maker as a correction request, named.
+    assert validated["status"] == "REQUEST_CHANGES"
     assert validated["blocker"] == "CHANGESET_VALIDATION_FINDINGS"
     source = validated["change_evidence"]["source"]
     assert source["introduced_findings"][category] == 1
     assert source["diff_withheld"] is withheld
+    [finding] = validated["validation_findings"]
+    assert finding.startswith("source: ") and str(added[0]) in finding
 
 
 def test_postchecks_fail_closed_to_absolute_gate_without_a_baseline(tmp_path: Path) -> None:
@@ -752,7 +755,9 @@ def test_resumed_worktree_prechecks_baseline_is_taken_at_the_base(tmp_path: Path
 
     validated = handler._validate_changeset(payload)
 
-    assert validated["status"] == "BLOCKED"
+    # NEW-76: the maker's own finding is handed back to it by name.
+    assert validated["status"] == "REQUEST_CHANGES"
     assert validated["blocker"] == "CHANGESET_VALIDATION_FINDINGS"
+    assert any("resumed_feature.py" in item for item in validated["validation_findings"])
     assert validated["change_evidence"]["source"]["introduced_findings"]["semgrep"] == 1
     assert validated["change_evidence"]["deployment"]["introduced_findings"]["semgrep"] == 0

@@ -94,6 +94,7 @@ class ControlActivities:
         "delivery.invoke_checker",
         "delivery.validate_changeset",
         "delivery.persist_handoff",
+        "delivery.record_validation_findings",
         "delivery.prepare_publication",
         "delivery.publish",
         "delivery.persist_publication",

@@ -1123,3 +1123,36 @@ def test_maker_prompt_and_schema_support_platform_dependency_resolution(tmp_path
     schema = first["output_schema"]
     assert "dependency_resolution" in schema["required"]
     assert "DEPENDENCIES_REQUIRED" in schema["properties"]["decision"]["enum"]
+
+
+@pytest.mark.asyncio
+async def test_validation_findings_reach_the_next_maker_round(tmp_path: Path) -> None:
+    # NEW-76: #1125's validation found an introduced CVE but the maker never learned
+    # which; the finding identities are recorded and listed in the next maker prompt.
+    handler, allocation = _lease_fixture(tmp_path)
+    finding = "source: trivy Vulnerabilities | services/x/go.mod | CVE-2026-84445 | grpc | v1.83.1"
+    await handler.handle(
+        "delivery.record_validation_findings",
+        {**allocation, "validation_findings": [finding]},
+    )
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-attempt-2"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/1125",
+        "risk_class": "R2",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "deps"},
+        "source_resumed_from_sha": "d" * 40,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+
+    source = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    deployment = handler._prepare_maker(payload, deployment=True)["deployment_maker_request"][
+        "prompt"
+    ]
+
+    assert "found these NEW findings" in source and "CVE-2026-84445" in source
+    assert "CVE-2026-84445" not in deployment

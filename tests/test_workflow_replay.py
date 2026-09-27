@@ -1113,6 +1113,47 @@ async def test_offline_maker_dependency_requests_are_resolved_then_the_maker_rer
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 
+async def test_validation_findings_are_recorded_for_the_next_correction() -> None:
+    # NEW-76: a validation REQUEST_CHANGES with named findings is recorded on the
+    # ChangeSet before the attempt ends, so the next maker round sees it.
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.prepare_spec": {"status": "SPEC_READY", "run_id": "run-1"},
+        "agent.record_start": {"status": "STARTED", "run_id": "run-1"},
+        "delivery.invoke_spec": {"status": "SUCCESS", "run_id": "run-1"},
+        "delivery.invoke_maker": {"status": "SUCCESS", "run_id": "run-1"},
+        "delivery.invoke_deployment_maker": {"status": "SUCCESS", "run_id": "run-1"},
+        "delivery.invoke_checker": {"status": "SUCCESS", "run_id": "run-1"},
+        "agent.persist_result": {
+            "status": "SUCCESS",
+            "run_id": "run-1",
+            "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+        },
+        "delivery.create_openspec": {"status": "PLANNED", "run_id": "run-1"},
+        "delivery.prepare_maker": {"status": "SOURCE_MAKER_READY", "run_id": "run-1"},
+        "delivery.prepare_deployment_maker": {"status": "READY", "run_id": "run-1"},
+        "delivery.prepare_checker": {"status": "CHECKER_READY", "run_id": "run-1"},
+        "delivery.validate_changeset": {
+            "status": "REQUEST_CHANGES",
+            "blocker": "CHANGESET_VALIDATION_FINDINGS",
+            "validation_findings": ["source: trivy CVE-2026-84445"],
+            "run_id": "run-1",
+        },
+        "delivery.record_validation_findings": {"status": "RECORDED", "run_id": "run-1"},
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "REQUEST_CHANGES"
+    steps = _scheduled_step_names(history)
+    validated = steps.index("delivery.validate_changeset")
+    assert steps[validated + 1] == "delivery.record_validation_findings"
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
 async def test_pre_toolchain_issue_delivery_history_replays_without_the_new_step() -> None:
     """A delivery recorded before the patch (no marker) must replay unchanged against the
     current code, i.e. without scheduling delivery.prepare_toolchain."""
