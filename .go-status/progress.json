@@ -2,7 +2,7 @@
   "mission": "GO status remediation for engineering-control",
   "branch": "go-status/2026-09-17",
   "started": "2026-09-17",
-  "phase": "3-platform-end-to-end-to-maker-switch-to-993",
+  "phase": "GO REACHED 2026-09-27: musematic #993 delivered end to end by Hermes",
   "phase_history": [
     {
       "phase": "0-discovery",
@@ -310,6 +310,15 @@
         "NEW-64: CI-repair re-delivery (SOURCE_PR_CI_REGRESSION -> issue delivery re-runs on the same ChangeSet, max 2 automatic rounds; lease takeover from finished runs; resume tolerates main moving ahead; maker prompt lists regressed jobs; musematic maker tests add web lint + OpenAPI regeneration).",
         "musematic PR #1122 pins govulncheck v1.7.0 in ci.yml and deploy.yml (v1.8.0 needs Go 1.26); must be on main before the #993 merge commit is tagged."
       ]
+    },
+    {
+      "date": "2026-09-27",
+      "event": "GO",
+      "details": [
+        "#993: PR #1121 merged 707ba5d (baseline CI gate + 2 CI repairs), tagged v0.0.108 (release gate blocked on new advisories), shipped in v0.0.109 (NEW-68), Image Updater pinned sha-f7b0a97, Argo synced, workloads verified, issue closed 2026-09-27T13:59:14Z.",
+        "#1125 (security remediation, opened for the release gate): delivered by Hermes via NEW-75 dependency resolution; PR #1126 merged f7b0a97, v0.0.109 passed the release supply-chain gate, staging verified, closed 2026-09-27T12:56:07Z.",
+        "Fixes NEW-62..NEW-81 implemented, tested and deployed on both hosts (HEAD 4cf3503)."
+      ]
     }
   ],
   "gate": "Pipeline works through committed, independently reviewed code. GO (operator rule) = full-delivery: source PR -> new image built to GitHub Packages -> promotion pins exact version -> staging deployment.",
@@ -348,6 +357,18 @@
     "blocks_go_and_unresolved": 1
   },
   "findings_file": ".go-status/findings.json",
-  "last_action": "2026-09-26: implemented NEW-62/63/64; full suite green (984 passed).",
-  "next_action_on_resume": "After deploy: merge musematic #1122 (govulncheck pin), backlog-retry the #993 loop -> gitops pr_checks baseline -> CI repair re-delivery (lint + OpenAPI) -> merge -> tag -> deploy.yml -> Image Updater -> Argo -> verify -> close #993 = GO."
+  "last_action": "2026-09-27: GO reached (#993 closed after staging verification of sha-f7b0a97).",
+  "next_action_on_resume": "Post-GO follow-ups (see post_go_followups).",
+  "post_go_followups": [
+    "NEW-76: feed validation-introduced findings (identities) back to the maker like CI regressions.",
+    "NEW-79b: rootless Podman image build + Trivy image scan on the scan worker (needs worker disk/RAM upgrade first).",
+    "Worker capacity: 7.7 GB RAM with RAM-backed /tmp caused global OOM kills; disk 87% used. Upgrade RAM/disk or cap /tmp.",
+    "NEW-60: release leases when a loop is cancelled; stale lease cleanup.",
+    "Loop robustness: an activity failure such as backlog.register_child_run still fails the whole loop instead of pausing.",
+    "Staging GitOps: write-policy approval (24h, one owner) forces manual re-approval mid-flow; consider per-loop policy handover.",
+    "Main CI on musematic is red (mypy drift, a11y/visual, vitest, jwt helm test, expired pyjwt exception); operator chose not to open issues now.",
+    "musematic/falcone/llmwiki integration-test CI issues; falcone into Argo; llmwiki charts/Argo (Phase B list).",
+    "Rotate the sudo password, Argo admin password and Vault root token/unseal keys that appeared during the go-live work.",
+    "Cleanup: dead admission/maintenance drop-ins and placeholder files; baseline/toolchain caches; watchdog old release (F-11)."
+  ]
 }
