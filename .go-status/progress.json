@@ -365,7 +365,12 @@
     "Main CI on musematic is red (mypy drift, a11y/visual, vitest, jwt helm test, expired pyjwt exception); operator chose not to open issues now.",
     "Rotate the sudo password, Argo admin password and Vault root token/unseal keys that appeared during the go-live work.",
     "Cleanup: dead admission/maintenance drop-ins and placeholder files; baseline/toolchain caches; watchdog old release (F-11).",
-    "F-11 proper fix: port the watchdog (plus projection_health, NotificationSink, watchdog settings) onto the branch, or build a new one; operator decision pending."
+    "F-11 proper fix: port the watchdog (plus projection_health, NotificationSink, watchdog settings) onto the branch, or build a new one; operator decision pending.",
+    {
+      "id": "NEW-86",
+      "status": "OPEN",
+      "summary": "identity.inspect_stale reports musematic SUPERADMIN_AUTHENTICATION_FAILED in every cleanup run (seen since at least 2026-09-27 03:00 UTC)"
+    }
   ],
   "post_go_done": [
     "NEW-76 (63c0edb): validation-introduced findings returned to the maker by name (REQUEST_CHANGES + recorded on the ChangeSet).",
@@ -373,6 +378,11 @@
     "NEW-60 (fc3c77c): a cancelled/stopped/failed loop releases its child runs' leases.",
     "NEW-84 (c332598, 1abb4aa): write-policy blocks send one Telegram notice with the approval commands and auto-resume every 5 minutes after approval (operator decision: approval stays manual).",
     "F-11 mitigation (5603e2d): retention keeps venvs pinned by systemd units; watchdog pinned to the 2b678d9 venv via drop-in (operator applies).",
-    "Integration-test CI issues opened: musematic#1128, falcone#1025, llmwiki#8. Main-CI failure issues not opened (operator decision)."
+    "Integration-test CI issues opened: musematic#1128, falcone#1025, llmwiki#8. Main-CI failure issues not opened (operator decision).",
+    {
+      "id": "NEW-85",
+      "date": "2026-09-27",
+      "summary": "Automatic worktree cleanup live (3-day retention, execution enabled on both hosts; worker flag in worker-common.env). First run cleanup-scheduled-2026-09-27T19:27:30Z COMPLETE: 22 abandoned ChangeSet worktrees removed (uncommitted work kept under refs/archive/), 38 detached snapshots pruned, 433 agent-log + 4098 dashboard-event rows deleted by standard retention; worker disk 30G -> 39G free. acceptance/ (27 dirs) removed manually. Commits f32f2ab, a9c8c62, 51d3a36."
+    }
   ]
 }
