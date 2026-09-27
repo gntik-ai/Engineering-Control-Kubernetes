@@ -63,6 +63,9 @@ echo "Current live release: ${LIVE_HASH:-<none found>}"
 mapfile -t IN_USE < <(
   { readlink -f /opt/engineering-control/venv 2>/dev/null
     ps -eo args= 2>/dev/null
+    # F-11: a unit pinned to an older venv (the watchdog drop-in) must survive a
+    # reboot even while it is not running.
+    cat /etc/systemd/system/engineering-*.service /etc/systemd/system/engineering-*.service.d/*.conf 2>/dev/null
   } | grep -oE "$VENVS_ROOT/[0-9a-f]{40}" | sed -E "s#$VENVS_ROOT/##" | sort -u
 )
 echo "Venvs in use by the live link or a running process: ${IN_USE[*]:-<none>}"
