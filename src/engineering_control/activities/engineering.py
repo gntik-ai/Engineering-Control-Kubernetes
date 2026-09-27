@@ -134,6 +134,7 @@ class EngineeringActivityHandler:
             "backlog.record_revalidation",
             "backlog.revalidate_gate",
             "backlog.record_loop_state",
+            "notify.write_policy_required",
             "backlog.register_child_run",
             "backlog.register_run",
             "global_backlog.register",
@@ -268,6 +269,8 @@ class EngineeringActivityHandler:
             return self._backlog_revalidate_gate(payload)
         if step == "backlog.record_loop_state":
             return self._record_backlog_loop_state(payload)
+        if step == "notify.write_policy_required":
+            return self._notify_write_policy_required(payload)
         if step == "backlog.register_child_run":
             return self._register_backlog_child_run(payload)
         if step == "backlog.register_run":
@@ -1909,6 +1912,59 @@ class EngineeringActivityHandler:
             {**payload, "verification_status": status},
             "REVALIDATION_RECORDED",
         )
+
+    _CTL = "/opt/engineering-control/venv/bin/engineering-ctl"
+
+    def _notify_write_policy_required(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-84: tell the operator (Telegram, via the outbox) that a flow waits for a
+        GitHub write approval, with the exact commands; the flow resumes by itself."""
+
+        def bounded(key: str, pattern: str) -> str | None:
+            value = str(payload.get(key) or "")
+            return value if re.fullmatch(pattern, value) else None
+
+        project = bounded("project", r"falcone|musematic|llmwiki")
+        campaign = bounded("backlog_campaign_id", r"[0-9a-f-]{36}")
+        workflow_id = bounded("workflow_id", r"[A-Za-z0-9._:-]{1,300}")
+        step = bounded("step", r"[a-z_]+\.[a-z_]+")
+        reason = bounded("reason_code", r"[A-Z0-9_]{1,120}") or "POLICY_DENIED"
+        issue = bounded("issue", r"[A-Za-z0-9._/-]{1,120}#[0-9]{1,9}")
+        if project and campaign:
+            commands = [
+                f"{self._CTL} backlog-approval-candidate {project} {campaign} "
+                "full-delivery R2 --max-items 1",
+                f"{self._CTL} backlog-approve {project} {campaign} <approval_binding from the "
+                "previous output> APPROVE_EXISTING_GITHUB_BACKLOG_LOOP",
+            ]
+        else:
+            commands = [f"{self._CTL} backlog-status <loop workflow id> to find the campaign"]
+        message = (
+            f"Hermes is waiting for a GitHub write approval ({reason})"
+            + (f" for {issue}" if issue else "")
+            + f" at {step or 'a write step'}. Approve the campaign; the flow re-checks every "
+            "5 minutes and resumes by itself."
+        )
+        with self.sessions.begin() as session:
+            session.add(
+                db.NotificationOutbox(
+                    topic="telegram.engineering-write-policy-required",
+                    status="PENDING",
+                    payload_json={
+                        "message": message,
+                        "project": project,
+                        "backlog_campaign_id": campaign,
+                        "workflow_id": workflow_id,
+                        "step": step,
+                        "reason_code": reason,
+                        "commands": commands,
+                    },
+                    attempts=0,
+                    next_attempt_at=datetime.now(UTC),
+                    delivered_at=None,
+                    last_error_code=None,
+                )
+            )
+        return {"status": "NOTIFIED"}
 
     @staticmethod
     def _release_loop_child_leases(session: Any, loop_workflow_id: str) -> int:

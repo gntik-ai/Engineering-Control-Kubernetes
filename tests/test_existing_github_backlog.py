@@ -1327,3 +1327,39 @@ def test_a_cancelled_loop_releases_only_its_own_child_runs_leases(tmp_path: Path
         }
     assert leases[owners["child"]] is not None and leases[owners["staging"]] is not None
     assert leases[owners["other"]] is None  # another loop's lease is never touched
+
+
+def test_write_policy_block_queues_one_bounded_telegram_notice(tmp_path: Path) -> None:
+    # NEW-84: #993 waited silently on an expired write approval; the operator now gets a
+    # Telegram notice (outbox -> gateway engineering-alerts route) with the commands.
+    from engineering_control.db.models import NotificationOutbox
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'notice.sqlite'}",
+        project_config_root=ROOT / "config/projects",
+    )
+    handler = EngineeringActivityHandler(settings)
+    Base.metadata.create_all(handler.engine)
+    campaign = "94a83947-65f3-4f44-99fe-b1881a002983"
+
+    result = handler._notify_write_policy_required(
+        {
+            "project": "musematic",
+            "backlog_campaign_id": campaign,
+            "workflow_id": "backlog-loop-musematic-x-issue-1-staging-gitops-retry-4",
+            "step": "gitops.merge",
+            "reason_code": "POLICY_DISABLED",
+            "issue": "gntik-ai/musematic#993",
+        }
+    )
+    handler._notify_write_policy_required({"project": "musematic; rm -rf /", "step": "x"})
+
+    assert result == {"status": "NOTIFIED"}
+    with handler.sessions() as session:
+        rows = session.scalars(select(NotificationOutbox)).all()
+    first, hostile = (row.payload_json for row in rows)
+    assert rows[0].topic == "telegram.engineering-write-policy-required"
+    assert "gntik-ai/musematic#993" in first["message"] and "POLICY_DISABLED" in first["message"]
+    assert any(f"backlog-approve musematic {campaign}" in command for command in first["commands"])
+    assert hostile["project"] is None and hostile["step"] is None
+    assert "backlog-status" in hostile["commands"][0]

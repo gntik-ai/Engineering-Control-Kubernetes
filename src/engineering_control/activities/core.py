@@ -206,6 +206,7 @@ class ControlActivities:
         "backlog.record_revalidation",
         "backlog.revalidate_gate",
         "backlog.record_loop_state",
+        "notify.write_policy_required",
         "backlog.register_child_run",
         "backlog.register_run",
         "global_backlog.register",

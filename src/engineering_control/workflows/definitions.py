@@ -76,6 +76,8 @@ class ControlledWorkflow:
         self._skip_reason: str | None = None
         self._retry_step: str | None = None
         self._write_policy_reason: str | None = None
+        # NEW-84: ids a write-policy alert names (set by workflows that know them).
+        self._write_notice: dict[str, Any] = {}
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -154,8 +156,13 @@ class ControlledWorkflow:
     async def _github_write_step(
         self, step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
     ) -> dict[str, Any]:
-        """Wait durably for an explicit retry signal after a terminal policy denial."""
+        """Wait durably for an explicit retry signal after a terminal policy denial.
+
+        NEW-84: the first denial queues one Telegram alert with the approve commands, and
+        the step is then re-tried every 5 minutes so an approval alone resumes the flow.
+        """
         self._retry_step = None
+        auto_resume: bool | None = None
         while True:
             result = await self._step(step, payload, timeout_minutes=timeout_minutes)
             if result.get("status") != "BLOCKED_BY_POLICY":
@@ -163,7 +170,32 @@ class ControlledWorkflow:
                 return result
             self._phase = "AWAITING_WRITE_POLICY"
             self._write_policy_reason = str(result.get("reason_code", "POLICY_INVALID"))[:120]
-            await workflow.wait_condition(lambda: self._cancelled or self._retry_step == step)
+            if auto_resume is None:
+                auto_resume = workflow.patched("write-policy-alert-auto-resume-v1")
+                if auto_resume:
+                    await self._step(
+                        "notify.write_policy_required",
+                        {
+                            **self._write_notice,
+                            "project": self._write_notice.get("project")
+                            or payload.get("project"),
+                            "workflow_id": workflow.info().workflow_id,
+                            "step": step,
+                            "reason_code": self._write_policy_reason,
+                        },
+                    )
+            if auto_resume:
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._cancelled or self._retry_step == step,
+                        timeout=timedelta(minutes=5),
+                    )
+                except TimeoutError:
+                    continue
+            else:
+                await workflow.wait_condition(
+                    lambda: self._cancelled or self._retry_step == step
+                )
             if self._cancelled:
                 return {**result, "status": "CANCELLED", "workflow_state": "CANCELLED"}
             self._retry_step = None
@@ -2019,6 +2051,11 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 "blocker": str(prepared.get("blocker") or "STAGING_GITOPS_PREPARE_FAILED"),
             }
         base: dict[str, Any] = {"plan": prepared["plan"], "project": request.project}
+        self._write_notice = {
+            "project": request.project,
+            "backlog_campaign_id": request.backlog_campaign_id,
+            "issue": f"{request.issue_repository}#{request.issue_number}",
+        }
         flow = prepared.get("staging_flow")
         flow = flow if isinstance(flow, dict) else {}
         evidence: dict[str, Any] = {}

@@ -760,6 +760,62 @@ async def test_staging_gitops_pins_and_verifies_a_later_release_that_ships_the_m
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
 
 
+async def test_a_write_policy_block_alerts_once_and_resumes_after_approval() -> None:
+    # NEW-84: the first BLOCKED_BY_POLICY queues one operator alert; the step is re-tried
+    # (every 5 minutes, or at once on the operator's retry signal) until approved.
+    script = _gitops_script()
+    denials = {"gitops.merge": 1}
+
+    @activity.defn(name="execute_control_step")
+    async def policy(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        if step == "notify.write_policy_required":
+            return {"status": "NOTIFIED"}
+        if denials.get(step):
+            denials[step] -= 1
+            return {"status": "BLOCKED_BY_POLICY", "reason_code": "POLICY_DISABLED"}
+        return script[step]
+
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        workers = [
+            Worker(
+                env.client,
+                task_queue=queue,
+                workflows=[StagingGitOpsDeliveryWorkflow],
+                activities=[policy],
+            )
+            for queue in (CONTROL_TASK_QUEUE, GITHUB_TASK_QUEUE)
+        ]
+        async with workers[0], workers[1]:
+            handle = await env.client.start_workflow(
+                StagingGitOpsDeliveryWorkflow.run,
+                _gitops_input(),
+                id=f"replay-test-write-policy-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=2),
+            )
+            for _ in range(200):
+                state = await handle.query("status")
+                if state.get("phase") == "AWAITING_WRITE_POLICY":
+                    break
+                await asyncio.sleep(0.1)
+            await handle.signal("retry", "gitops.merge")
+            result = await handle.result()
+            history = await handle.fetch_history()
+
+    assert result["status"] == "STAGING_VERIFIED"
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert steps.count("notify.write_policy_required") == 1
+    notice = next(
+        r["payload"]
+        for r in _scheduled_steps(history)
+        if r["step"] == "notify.write_policy_required"
+    )
+    assert notice["step"] == "gitops.merge" and notice["reason_code"] == "POLICY_DISABLED"
+    assert notice["project"] == "musematic" and notice["issue"].endswith("#1026")
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
 @workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
 class _PublishedIssueDeliveryStub:
     """Stands in for IssueDeliveryWorkflow: the source PR has been published."""
