@@ -101,6 +101,11 @@ class QuotaRefreshInput:
 
 
 @dataclass
+class ConnectionsRefreshInput:
+    scope: str = "all"
+
+
+@dataclass
 class CleanupInput:
     dry_run: bool = True
     retention_policy: str = "standard"
@@ -198,3 +203,13 @@ class LLMWikiStagingBootstrapInput:
     environment: str = "staging"
     approval_binding: str | None = None
     execute: bool = False
+
+
+@dataclass
+class StagingGitOpsDeliveryInput:
+    change_set_id: str
+    project: str
+    issue_repository: str
+    issue_number: int
+    finding_id: str | None = None
+    backlog_campaign_id: str | None = None

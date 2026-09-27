@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from temporalio.exceptions import ApplicationError
 
-from engineering_control.adapters.command import SafeCommandRunner
-from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker
+from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
+from engineering_control.adapters.github.client import (
+    GhCliAuthError,
+    GhCliBroker,
+    GhCliPolicyError,
+)
 from engineering_control.adapters.llmwiki import LLMWikiBootstrapPlanner
 from engineering_control.config import Settings
 from engineering_control.engineering.backlog import (
@@ -17,13 +23,28 @@ from engineering_control.engineering.backlog import (
     GitHubPullRequestSnapshot,
     GitHubRepositoryBacklogSnapshot,
 )
+from engineering_control.security.redaction import SecretRedactor
+
+from .gitops import GitOpsGitHubHandler
+
+# The backlog import keeps 4000 chars; operator decisions are usually appended at the
+# end of the body, so the refresh keeps more (Finding.actual_behavior allows 20000).
+ISSUE_BODY_REFRESH_LIMIT = 8000
 
 
 class GitHubActivityHandler:
     """Run only typed gh broker activities under the authenticated broker identity."""
 
-    supported_steps = frozenset(
-        {"llmwiki.bootstrap.plan", "github.refresh_mirrors", "backlog.github_import"}
+    supported_steps = (
+        frozenset(
+            {
+                "llmwiki.bootstrap.plan",
+                "github.refresh_mirrors",
+                "backlog.github_import",
+                "delivery.refresh_issue_body",
+            }
+        )
+        | GitOpsGitHubHandler.supported_steps
     )
 
     def __init__(self, settings: Settings) -> None:
@@ -36,53 +57,21 @@ class GitHubActivityHandler:
             maximum_json_bytes=16_000_000,
         )
         self.git = SafeCommandRunner({"git": settings.git_executable})
+        # Post-merge staging GitOps steps share this worker's typed dispatch surface.
+        self.gitops = GitOpsGitHubHandler(settings)
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # F-08: every branch here does blocking gh/git subprocess work through sync
+        # broker/runner methods; run each off the event loop in a worker thread rather
+        # than converting the whole synchronous call graph to async/await.
+        if step in GitOpsGitHubHandler.supported_steps:
+            return await self.gitops.handle(step, payload)
         if step == "backlog.github_import":
-            return self._import_backlog(payload)
+            return await asyncio.to_thread(self._import_backlog, payload)
         if step == "github.refresh_mirrors":
-            project = payload.get("project")
-            mapping = {
-                "falcone": ("falcone", "falcone-charts"),
-                "musematic": ("musematic", "musematic-deploy"),
-                "llmwiki": ("llmwiki",),
-            }
-            repositories = mapping.get(str(project))
-            if repositories is None:
-                raise ApplicationError("mirror refresh project is invalid", non_retryable=True)
-            full_names = tuple(f"gntik-ai/{item}" for item in repositories)
-            self.broker.preflight(full_names)
-            refreshed = []
-            for slug, repository in zip(repositories, full_names, strict=True):
-                mirror = (self.settings.mirror_root / f"{slug}.git").resolve()
-                if not mirror.is_dir() or not mirror.is_relative_to(
-                    self.settings.mirror_root.resolve()
-                ):
-                    raise ApplicationError("canonical mirror is unavailable", type="NotConfigured")
-                remote = self.git.run(
-                    "git", ["remote", "get-url", "origin"], cwd=mirror
-                ).stdout.strip()
-                if remote != f"https://github.com/{repository}.git":
-                    raise ApplicationError(
-                        "canonical mirror origin changed", type="PolicyViolation"
-                    )
-                self.git.run(
-                    "git",
-                    [
-                        "fetch",
-                        "--prune",
-                        "origin",
-                        "+refs/heads/*:refs/remotes/origin/*",
-                        "+refs/tags/*:refs/tags/*",
-                    ],
-                    cwd=mirror,
-                    environment={
-                        "HOME": str(self.broker.authenticated_home),
-                        "GIT_TERMINAL_PROMPT": "0",
-                    },
-                )
-                refreshed.append(repository)
-            return {**payload, "status": "PASS", "refreshed_repositories": refreshed}
+            return await asyncio.to_thread(self._refresh_mirrors, payload)
+        if step == "delivery.refresh_issue_body":
+            return await asyncio.to_thread(self._refresh_issue_body, payload)
         if step != "llmwiki.bootstrap.plan":
             raise ApplicationError("unsupported GitHub broker activity", non_retryable=True)
         if payload.get("project") != "llmwiki" or payload.get("environment") != "staging":
@@ -91,6 +80,107 @@ class GitHubActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        return await asyncio.to_thread(self._plan_llmwiki_bootstrap, payload)
+
+    def _refresh_issue_body(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-44: re-read an existing backlog issue's body at delivery start.
+
+        The Finding copies the body once at backlog import, so decisions an operator
+        adds to the issue later never reached the spec/maker. Read-only; any failure
+        leaves the imported copy in place.
+        """
+        repository = str(payload.get("issue_repository") or "")
+        number = payload.get("issue_number")
+        if not repository or not isinstance(number, int):
+            return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": "ISSUE_BINDING_MISSING"}
+        try:
+            value = self.broker.view_issue_body(repository, number)
+        except (GhCliAuthError, GhCliPolicyError, CommandFailure, OSError, ValueError) as error:
+            return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": type(error).__name__}
+        body = str(SecretRedactor().redact_text(str(value["body"])).value).strip()
+        if not body:
+            return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": "ISSUE_BODY_EMPTY"}
+        excerpt = body[:ISSUE_BODY_REFRESH_LIMIT]
+        return {
+            "status": "ISSUE_BODY_REFRESHED",
+            "body_excerpt": excerpt,
+            "body_sha256": hashlib.sha256(excerpt.encode()).hexdigest(),
+            "issue_state": str(value.get("state") or "")[:20],
+        }
+
+    def _refresh_mirrors(self, payload: dict[str, Any]) -> dict[str, Any]:
+        project = payload.get("project")
+        mapping = {
+            "falcone": ("falcone", "falcone-charts"),
+            "musematic": ("musematic", "musematic-deploy"),
+            "llmwiki": ("llmwiki",),
+        }
+        repositories = mapping.get(str(project))
+        if repositories is None:
+            raise ApplicationError("mirror refresh project is invalid", non_retryable=True)
+        full_names = tuple(f"gntik-ai/{item}" for item in repositories)
+        self.broker.preflight(full_names)
+        refreshed = []
+        for slug, repository in zip(repositories, full_names, strict=True):
+            mirror = (self.settings.mirror_root / f"{slug}.git").resolve()
+            if not mirror.is_dir() or not mirror.is_relative_to(
+                self.settings.mirror_root.resolve()
+            ):
+                raise ApplicationError("canonical mirror is unavailable", type="NotConfigured")
+            remote = self.git.run(
+                "git", ["remote", "get-url", "origin"], cwd=mirror
+            ).stdout.strip()
+            if remote != f"https://github.com/{repository}.git":
+                raise ApplicationError("canonical mirror origin changed", type="PolicyViolation")
+            self.git.run(
+                "git",
+                [
+                    "fetch",
+                    "--prune",
+                    "origin",
+                    "+refs/heads/*:refs/remotes/origin/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+                cwd=mirror,
+                environment={
+                    "HOME": str(self.broker.authenticated_home),
+                    "GIT_TERMINAL_PROMPT": "0",
+                },
+            )
+            if self.settings.mirror_sync_to_worker:
+                self._push_mirror_to_worker(mirror)
+            refreshed.append(repository)
+        return {**payload, "status": "PASS", "refreshed_repositories": refreshed}
+
+    def _push_mirror_to_worker(self, mirror: Path) -> None:
+        """NEW-71: update the worker's copy of one canonical mirror (same path) over SSH.
+
+        Only origin-tracking refs and tags are pushed; the worker's own ChangeSet data
+        lives in separate metadata repositories and is never touched.
+        """
+        self.git.run(
+            "git",
+            [
+                "push",
+                "--force",
+                "--quiet",
+                # The worker mirror is owned by the worker's scan identity.
+                f"--receive-pack=git -c safe.directory={mirror} receive-pack",
+                f"ssh://{self.settings.publication_transport_host}{mirror}",
+                "+refs/remotes/origin/*:refs/remotes/origin/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            cwd=mirror,
+            environment={
+                "HOME": str(Path.home()),
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_SSH_COMMAND": (
+                    "ssh -o BatchMode=yes -o ConnectTimeout=20 -o UpdateHostKeys=no"
+                ),
+            },
+        )
+
+    def _plan_llmwiki_bootstrap(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             llmwiki = self.broker.branch_commit("gntik-ai/llmwiki", "master")
             falcone = self.broker.branch_commit("gntik-ai/falcone", "main")

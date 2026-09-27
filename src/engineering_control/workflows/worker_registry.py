@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
+
+from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
+from temporalio.worker import WorkerDeploymentConfig
+
+WORKER_DEPLOYMENT_NAME = "engineering-control"
 
 WorkerHost = Literal["controller", "worker"]
 WorkerKind = Literal[
@@ -106,3 +111,32 @@ def provider_task_queue(provider: str, *, default: Literal["codex", "claude"]) -
     if selected not in PROVIDER_WORKER_KINDS:
         raise ValueError("provider activity requires codex or claude")
     return ROLE_TASK_QUEUES[selected]  # type: ignore[index]
+
+
+def worker_deployment_kwargs(build_id: str | None) -> dict[str, Any]:
+    """Worker() kwargs enabling Temporal Worker Deployments versioning (F-11 (a)).
+
+    Returns {} -- no versioning, byte-identical to today's behavior -- when
+    build_id is unset. All workers share one deployment identity
+    (WORKER_DEPLOYMENT_NAME) because they are always built and deployed
+    together from the same git commit/release. AUTO_UPGRADE (rather than
+    PINNED) matches this codebase's existing workflow.patched()-based
+    replay-safety model: in-flight executions are expected to pick up new
+    worker code, not stay pinned to the build they started on indefinitely.
+
+    A new build_id's worker does not receive any new workflow executions
+    until its version is explicitly promoted, e.g. via
+    `temporal worker deployment set-current-version` -- see
+    scripts/activate-worker-deployment.sh and docs/RUNBOOK.md.
+    """
+    if not build_id:
+        return {}
+    return {
+        "deployment_config": WorkerDeploymentConfig(
+            version=WorkerDeploymentVersion(
+                deployment_name=WORKER_DEPLOYMENT_NAME, build_id=build_id
+            ),
+            use_worker_versioning=True,
+            default_versioning_behavior=VersioningBehavior.AUTO_UPGRADE,
+        ),
+    }

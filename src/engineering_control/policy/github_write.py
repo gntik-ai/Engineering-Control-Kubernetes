@@ -21,6 +21,7 @@ READ_ONLY_GITHUB_STEPS = frozenset(
         "finding.dedupe",
         "github.refresh_mirrors",
         "backlog.github_import",
+        "delivery.refresh_issue_body",
         "llmwiki.bootstrap.plan",
         "reconcile.inspect_ci",
         "final.inspect_artifact",
@@ -39,7 +40,30 @@ WRITE_CAPABLE_GITHUB_STEPS = frozenset(
         "final.close_issue",
     }
 )
-GITHUB_ACTIVITY_STEPS = READ_ONLY_GITHUB_STEPS | WRITE_CAPABLE_GITHUB_STEPS
+# Post-merge staging GitOps flow (activities/gitops.py). Kept separate from the
+# delivery handler's sets above: these are dispatched to GitOpsGitHubHandler, which
+# applies the same GitHubWritePolicyEvaluator gate before any write.
+GITOPS_READ_ONLY_GITHUB_STEPS = frozenset(
+    {
+        "gitops.pr_checks",
+        "gitops.workflow_run",
+        "gitops.image_pin",
+    }
+)
+GITOPS_WRITE_CAPABLE_GITHUB_STEPS = frozenset(
+    {
+        "gitops.merge",
+        "gitops.release_tag",
+        "gitops.environment_issue",
+        "gitops.close_issue",
+    }
+)
+GITHUB_ACTIVITY_STEPS = (
+    READ_ONLY_GITHUB_STEPS
+    | WRITE_CAPABLE_GITHUB_STEPS
+    | GITOPS_READ_ONLY_GITHUB_STEPS
+    | GITOPS_WRITE_CAPABLE_GITHUB_STEPS
+)
 WRITE_REPOSITORIES = ALLOWED_REPOSITORIES - READ_ONLY_REPOSITORIES
 
 

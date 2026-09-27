@@ -63,8 +63,84 @@ deployment:
     credential_ref: file:/etc/engineering-control/credentials/musematic/staging-releaser.kubeconfig
     blocker: MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC
 source_test_commands:
-  - [make, test]
+  # The Makefile has no `test` target; run the control-plane unit suite directly.
+  - [apps/control-plane/.venv/bin/pytest, --import-mode=importlib, --rootdir=apps/control-plane, --ignore=apps/control-plane/tests/integration, --ignore=apps/control-plane/tests/e2e, -q, apps/control-plane/tests]
   - [corepack, pnpm, --dir, apps/web, test]
+toolchain:
+  # Prepared by the scan worker (delivery.prepare_toolchain) in the source worktree
+  # before the maker runs; makers and the checker have no network.
+  enabled: true
+  prepare:
+    - cwd: apps/control-plane
+      argv: [uv, sync, --frozen, --extra, dev, --python, "{python312}"]
+      timeout_seconds: 1200
+    - cwd: "."
+      argv: [pnpm, install, --frozen-lockfile]
+      timeout_seconds: 1200
+    # NEW-79a: prefill the read-only Go module cache and the offline Trivy DB that the
+    # makers and the checker use without network.
+    - cwd: services/reasoning-engine
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/runtime-controller
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/sandbox-manager
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/simulation-controller
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/shared/secrets
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: "."
+      argv: [trivy, image, --download-db-only, --quiet]
+      timeout_seconds: 600
+  test_commands:
+    - cwd: apps/control-plane
+      # NEW-46: in the maker's no-network sandbox this suite has hung for 75+ min
+      # (the checker finishes it in ~5 min); a hard timeout keeps the maker's budget.
+      argv: [timeout, --kill-after=30, "900", .venv/bin/pytest, --import-mode=importlib, --ignore=tests/integration, --ignore=tests/e2e, -q]
+      description: control-plane unit tests (exit 124 = timed out after 15 min in the sandbox; record this test as SKIPPED with reason timeout and do NOT block on it, the independent checker runs the full suite)
+    - cwd: apps/control-plane
+      argv: [timeout, --kill-after=30, "900", .venv/bin/mypy, src/platform]
+      description: control-plane type check
+    - cwd: apps/web
+      # NEW-47: bounded workers keep vitest inside the agent worker's memory cap.
+      argv: [timeout, --kill-after=30, "900", pnpm, exec, vitest, run, --maxWorkers=2]
+      description: web unit tests
+    - cwd: apps/web
+      # --incremental false: a tsbuildinfo written by the maker is not writable by the checker.
+      argv: [timeout, --kill-after=30, "900", pnpm, exec, tsc, --noEmit, --incremental, "false"]
+      description: web type check
+    - cwd: apps/web
+      # NEW-64: PR CI "Lint Frontend" runs eslint; the maker must see lint failures too.
+      argv: [timeout, --kill-after=30, "600", pnpm, lint]
+      description: web lint (same as CI "Lint Frontend"; fix every error reported in files you changed)
+    - cwd: "."
+      # NEW-64: CI fails on OpenAPI snapshot drift when API routes change.
+      argv: [timeout, --kill-after=30, "600", apps/control-plane/.venv/bin/python, scripts/export-openapi.py]
+      description: regenerate docs/api-reference/openapi.json; if it changed, commit it (CI fails on OpenAPI drift)
+    - cwd: services/reasoning-engine
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/reasoning-engine (offline module cache; NEW-79a)
+    - cwd: services/runtime-controller
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/runtime-controller (offline module cache; NEW-79a)
+    - cwd: services/sandbox-manager
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/sandbox-manager (offline module cache; NEW-79a)
+    - cwd: services/simulation-controller
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/simulation-controller (offline module cache; NEW-79a)
+    - cwd: services/shared/secrets
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/shared/secrets (offline module cache; NEW-79a)
+    - cwd: "."
+      argv: [timeout, --kill-after=30, "900", trivy, fs, --scanners, vuln, --severity, "HIGH,CRITICAL", --skip-dirs, node_modules, --skip-dirs, .venv, "."]
+      description: offline dependency vulnerability scan (NEW-79a); main already has findings, so only findings your change introduces matter
+  cleanup_paths_ignored_only: true
 deployment_test_commands:
   - [python3, scripts/verify_argocd_release_drift.py, --help]
   - [python3, -m, pytest, tests/gitops_release_guard]
@@ -97,3 +173,62 @@ delivery_control:
       sandbox-manager: images.sandboxManager.digest
       simulation-controller: images.simulationController.digest
     blocker: MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED
+  staging_flow:
+    enabled: true
+    kind: argocd-image-updater
+    argo_application: musematic-platform
+    argo_namespace: argocd
+    namespaces: [musematic-platform, platform-data]
+    source_ci_workflow: CI
+    # main CI is intentionally unset: it does not publish images (deploy.yml does).
+    main_ci_workflow: null
+    image_workflow: deploy.yml
+    release_tag:
+      enabled: true
+      prefix: v
+      bump: patch
+    deploy_repository: gntik-ai/musematic-deploy
+    deploy_values_file: apps/musematic-platform/values.override.yaml
+    deploy_branch: main
+    image_repositories:
+      - ghcr.io/gntik-ai/musematic/control-plane
+      - ghcr.io/gntik-ai/musematic/runtime-controller
+      - ghcr.io/gntik-ai/musematic/reasoning-engine
+      - ghcr.io/gntik-ai/musematic/simulation-controller
+      - ghcr.io/gntik-ai/musematic/sandbox-manager
+      - ghcr.io/gntik-ai/musematic/web
+    tag_prefix: sha-
+    tag_length: 7
+    chart_source_repository: https://github.com/gntik-ai/musematic.git
+    pin_chart_to_merge: true
+    # NEW-62 (operator decision 2026-09-26): the cluster is staging-only, so Hermes merges
+    # R3 ChangeSets (e.g. database migrations) once the checker and PR CI pass.
+    allow_r3_merge: true
+    # NEW-63 (operator decision 2026-09-26): main's CI is red for reasons unrelated to
+    # delivered changes, so PR CI failures are compared against a baseline PR on unchanged
+    # main; only jobs failing in the PR but not on the baseline block the merge. Each
+    # marker triggers the ci.yml paths-filter group(s) for its scope.
+    ci_baseline:
+      enabled: true
+      markers:
+        - {scope: apps/control-plane/migrations/, path: apps/control-plane/migrations/.hermes-ci-baseline}
+        - {scope: apps/control-plane/, path: apps/control-plane/tests/hermes_ci_baseline_marker.py}
+        - {scope: apps/web/, path: apps/web/.hermes-ci-baseline}
+        - {scope: apps/web-status/, path: apps/web-status/.hermes-ci-baseline}
+        - {scope: package.json, path: apps/web/.hermes-ci-baseline}
+        - {scope: pnpm-lock.yaml, path: apps/web/.hermes-ci-baseline}
+        - {scope: apps/ops-cli/, path: apps/ops-cli/.hermes-ci-baseline}
+        - {scope: services/reasoning-engine/, path: services/reasoning-engine/.hermes-ci-baseline}
+        - {scope: services/runtime-controller/, path: services/runtime-controller/.hermes-ci-baseline}
+        - {scope: services/sandbox-manager/, path: services/sandbox-manager/.hermes-ci-baseline}
+        - {scope: services/simulation-controller/, path: services/simulation-controller/.hermes-ci-baseline}
+        - {scope: services/shared/, path: services/shared/secrets/.hermes-ci-baseline}
+        - {scope: deploy/helm/, path: deploy/helm/.hermes-ci-baseline}
+        - {scope: docs/, path: docs/.hermes-ci-baseline}
+        - {scope: mkdocs.yml, path: docs/.hermes-ci-baseline}
+        - {scope: terraform/, path: terraform/.hermes-ci-baseline}
+        - {scope: ci/, path: ci/hermes_ci_baseline_marker.py}
+        - {scope: tests/, path: ci/hermes_ci_baseline_marker.py}
+        - {scope: scripts/, path: ci/hermes_ci_baseline_marker.py}
+    external_secrets_namespace: external-secrets
+    external_secrets_deployment: external-secrets

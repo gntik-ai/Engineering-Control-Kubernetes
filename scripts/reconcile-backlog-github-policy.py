@@ -36,18 +36,9 @@ SAFE_REPOSITORIES = (
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
 )
-APPROVAL_REQUIRED_STATUSES = frozenset(
-    {
-        "APPROVED_POLICY_PENDING",
-        "APPROVED_INVENTORY",
-        "APPROVED",
-        "RUNNING",
-        "PAUSED",
-        "COMPLETE",
-        "STOPPED",
-        "CANCELLED",
-        "EXPIRED",
-    }
+PRE_APPROVAL_STATUSES = frozenset({"IMPORTED", "PLANNED", "AWAITING_APPROVAL"})
+UNAPPROVED_EVIDENCE_STATUSES = PRE_APPROVAL_STATUSES | frozenset(
+    {"EXPIRED", "STOPPED", "CANCELLED", "FAILED"}
 )
 REQUEST_KEYS = frozenset(
     {
@@ -60,6 +51,21 @@ REQUEST_KEYS = frozenset(
         "requested_at",
     }
 )
+
+
+def approval_audit_error(
+    *,
+    campaign_id: UUID,
+    campaign_count: int,
+    reviewed: int,
+    unapproved: int,
+    reason: str,
+) -> ValueError:
+    return ValueError(
+        "durable backlog actor audit failed "
+        f"campaign={campaign_id} campaigns={campaign_count} "
+        f"approvals={reviewed} unapproved={unapproved}: {reason}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,14 +153,21 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
         )
         if other is not None:
             raise ValueError("another backlog campaign already owns GitHub write policy")
-    nested = "binding" in campaign.approval_json or "approval" in campaign.approval_json
-    raw_binding = campaign.approval_json.get("binding")
-    raw_approval = campaign.approval_json.get("approval")
-    if nested and (not isinstance(raw_binding, dict) or not isinstance(raw_approval, dict)):
-        raise ValueError("GitHub campaign nested approval evidence is malformed")
-    binding = raw_binding if nested else campaign.approval_json
-    approval = raw_approval if nested else campaign.approval_json
-    if campaign.approval_json.get("policy_role") not in {None, "owner"}:
+    evidence = campaign.approval_json
+    if not isinstance(evidence, dict):
+        raise ValueError("GitHub campaign approval evidence is incomplete")
+    nested = "binding" in evidence or "approval" in evidence
+    raw_binding = evidence.get("binding")
+    raw_approval = evidence.get("approval")
+    if nested:
+        if not isinstance(raw_binding, dict) or not isinstance(raw_approval, dict):
+            raise ValueError("GitHub campaign nested approval evidence is malformed")
+        binding = raw_binding
+        approval = raw_approval
+    else:
+        binding = evidence
+        approval = evidence
+    if evidence.get("policy_role") not in {None, "owner"}:
         raise ValueError("GitHub campaign approval evidence is incomplete")
     try:
         exact_binding = BacklogApprovalBinding.model_validate(
@@ -242,28 +255,107 @@ def audit_approval_actors(session: Session) -> tuple[int, int, int]:
         campaign_count += 1
         evidence = campaign.approval_json
         if not isinstance(evidence, dict):
-            raise ValueError("durable backlog approval evidence is malformed")
-        nested = "approval" in evidence
+            raise approval_audit_error(
+                campaign_id=campaign.id,
+                campaign_count=campaign_count,
+                reviewed=reviewed,
+                unapproved=unapproved,
+                reason="durable backlog approval evidence is malformed",
+            )
+        nested = "binding" in evidence or "approval" in evidence
+        raw_binding = evidence.get("binding")
         raw_approval = evidence.get("approval")
         has_flat_approval = any(
             field in evidence for field in ("approved_by", "approved_at", "typed_confirmation")
         )
         if not nested and not has_flat_approval:
-            if campaign.status in APPROVAL_REQUIRED_STATUSES:
-                raise ValueError("durable backlog campaign lacks canonical approval evidence")
+            if campaign.status not in UNAPPROVED_EVIDENCE_STATUSES:
+                raise approval_audit_error(
+                    campaign_id=campaign.id,
+                    campaign_count=campaign_count,
+                    reviewed=reviewed,
+                    unapproved=unapproved,
+                    reason="durable backlog campaign lacks canonical approval evidence",
+                )
             unapproved += 1
             continue
-        if nested and not isinstance(raw_approval, dict):
-            raise ValueError("durable backlog approval evidence is malformed")
-        approval = raw_approval if nested else evidence
+        if nested:
+            if raw_approval is None and not has_flat_approval:
+                if (
+                    isinstance(raw_binding, dict)
+                    and campaign.status in UNAPPROVED_EVIDENCE_STATUSES
+                ):
+                    unapproved += 1
+                    continue
+                raise approval_audit_error(
+                    campaign_id=campaign.id,
+                    campaign_count=campaign_count,
+                    reviewed=reviewed,
+                    unapproved=unapproved,
+                    reason="durable backlog campaign lacks canonical approval evidence",
+                )
+            if not isinstance(raw_binding, dict) or not isinstance(raw_approval, dict):
+                raise approval_audit_error(
+                    campaign_id=campaign.id,
+                    campaign_count=campaign_count,
+                    reviewed=reviewed,
+                    unapproved=unapproved,
+                    reason="durable backlog approval evidence is malformed",
+                )
+            approval = raw_approval
+        else:
+            approval = evidence
         if nested and has_flat_approval:
             for field in ("approved_by", "approved_at", "typed_confirmation"):
                 if field in evidence and evidence[field] != approval.get(field):
-                    raise ValueError("durable backlog approval shapes disagree")
+                    raise approval_audit_error(
+                        campaign_id=campaign.id,
+                        campaign_count=campaign_count,
+                        reviewed=reviewed,
+                        unapproved=unapproved,
+                        reason="durable backlog approval shapes disagree",
+                    )
         actor = approval.get("approved_by")
         reviewed += 1
         if not isinstance(actor, str) or not is_reauthenticated_backlog_operator(actor):
-            raise ValueError("durable backlog approval contains a noncanonical operator actor")
+            raise approval_audit_error(
+                campaign_id=campaign.id,
+                campaign_count=campaign_count,
+                reviewed=reviewed,
+                unapproved=unapproved,
+                reason="durable backlog approval contains a noncanonical operator actor",
+            )
+        approved_at = approval.get("approved_at")
+        # GitHubBacklogCampaign stores only the campaign-ownership phrase. Issue delivery
+        # approvals use a different persistence model and are not part of this survey.
+        if approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE or not isinstance(
+            approved_at, str
+        ):
+            raise approval_audit_error(
+                campaign_id=campaign.id,
+                campaign_count=campaign_count,
+                reviewed=reviewed,
+                unapproved=unapproved,
+                reason="durable backlog approval evidence is incomplete",
+            )
+        try:
+            approved_time = datetime.fromisoformat(approved_at)
+        except ValueError:
+            raise approval_audit_error(
+                campaign_id=campaign.id,
+                campaign_count=campaign_count,
+                reviewed=reviewed,
+                unapproved=unapproved,
+                reason="durable backlog approval evidence is incomplete",
+            ) from None
+        if approved_time.tzinfo is None:
+            raise approval_audit_error(
+                campaign_id=campaign.id,
+                campaign_count=campaign_count,
+                reviewed=reviewed,
+                unapproved=unapproved,
+                reason="durable backlog approval evidence is incomplete",
+            )
     return campaign_count, reviewed, unapproved
 
 
@@ -322,6 +414,9 @@ def install_policy(path: Path, backup_root: Path, group_id: int, *, enabled: boo
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(content)
             stream.flush()
+            # The unit runs with UMask=0077, which silently turned os.open's 0o640 into
+            # 0o600; validate_current_policy and the GitHub worker both require 0o640.
+            os.fchmod(stream.fileno(), 0o640)
             os.fsync(stream.fileno())
         os.chown(temporary, 0, group_id)
         os.replace(temporary, path)
@@ -339,7 +434,7 @@ def main() -> int:
     settings = Settings()
     engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
     if args.audit_only:
-        with Session(engine) as session:
+        with Session(engine, autoflush=False) as session:
             campaigns, reviewed, unapproved = audit_approval_actors(session)
             session.rollback()
         print(

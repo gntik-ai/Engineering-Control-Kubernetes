@@ -40,6 +40,11 @@ def test_subscription_environment_removes_api_paid_credentials(
         "MODEL_GATEWAY",
         "MODEL_ROUTER",
         "AWS_ACCESS_KEY_ID",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
     }
     for key in forbidden:
         monkeypatch.setenv(key, "fake")
@@ -56,6 +61,11 @@ def test_subscription_environment_rejects_every_forbidden_override() -> None:
         "LLM_BASE_URL",
         "MODEL_GATEWAY",
         "MODEL_ROUTER",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
     ):
         with pytest.raises(ValueError, match="forbidden"):
             subscription_only_environment("claude", {key: "fake"})
@@ -146,3 +156,12 @@ async def test_jsonl_process_accepts_bounded_result_larger_than_asyncio_default_
 
     assert result.exit_code == 0
     assert result.events == ({"type": "result", "value": value},)
+
+
+def test_agent_environment_leaves_no_unremovable_test_caches() -> None:
+    """NEW-45: pytest's 0700 .pytest_cache blocked the scan worker's worktree clean."""
+    for provider in ("codex", "claude"):
+        environment = subscription_only_environment(provider)
+        assert environment["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+        assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+        assert environment["MYPY_CACHE_DIR"] == "/dev/null"

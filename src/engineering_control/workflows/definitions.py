@@ -13,6 +13,7 @@ from engineering_control.workflows.inputs import (
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
     CleanupInput,
+    ConnectionsRefreshInput,
     DeliveryReconciliationInput,
     EnhancementDeliveryInput,
     EnhancementDiscoveryInput,
@@ -31,6 +32,7 @@ from engineering_control.workflows.inputs import (
     RecoveryInput,
     RuntimeVerificationInput,
     StagingDeploymentInput,
+    StagingGitOpsDeliveryInput,
 )
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
@@ -74,6 +76,8 @@ class ControlledWorkflow:
         self._skip_reason: str | None = None
         self._retry_step: str | None = None
         self._write_policy_reason: str | None = None
+        # NEW-84: ids a write-policy alert names (set by workflows that know them).
+        self._write_notice: dict[str, Any] = {}
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -152,8 +156,13 @@ class ControlledWorkflow:
     async def _github_write_step(
         self, step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
     ) -> dict[str, Any]:
-        """Wait durably for an explicit retry signal after a terminal policy denial."""
+        """Wait durably for an explicit retry signal after a terminal policy denial.
+
+        NEW-84: the first denial queues one Telegram alert with the approve commands, and
+        the step is then re-tried every 5 minutes so an approval alone resumes the flow.
+        """
         self._retry_step = None
+        auto_resume: bool | None = None
         while True:
             result = await self._step(step, payload, timeout_minutes=timeout_minutes)
             if result.get("status") != "BLOCKED_BY_POLICY":
@@ -161,7 +170,32 @@ class ControlledWorkflow:
                 return result
             self._phase = "AWAITING_WRITE_POLICY"
             self._write_policy_reason = str(result.get("reason_code", "POLICY_INVALID"))[:120]
-            await workflow.wait_condition(lambda: self._cancelled or self._retry_step == step)
+            if auto_resume is None:
+                auto_resume = workflow.patched("write-policy-alert-auto-resume-v1")
+                if auto_resume:
+                    await self._step(
+                        "notify.write_policy_required",
+                        {
+                            **self._write_notice,
+                            "project": self._write_notice.get("project")
+                            or payload.get("project"),
+                            "workflow_id": workflow.info().workflow_id,
+                            "step": step,
+                            "reason_code": self._write_policy_reason,
+                        },
+                    )
+            if auto_resume:
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._cancelled or self._retry_step == step,
+                        timeout=timedelta(minutes=5),
+                    )
+                except TimeoutError:
+                    continue
+            else:
+                await workflow.wait_condition(
+                    lambda: self._cancelled or self._retry_step == step
+                )
             if self._cancelled:
                 return {**result, "status": "CANCELLED", "workflow_state": "CANCELLED"}
             self._retry_step = None
@@ -237,12 +271,15 @@ class ControlledWorkflow:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "delivery.prepare_toolchain",
+            "delivery.resolve_dependencies",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
+            "cleanup.prune_orphan_worktrees",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
         }:
@@ -275,7 +312,11 @@ class ControlledWorkflow:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.plan":
             return GITHUB_TASK_QUEUE
-        if step in {"github.refresh_mirrors", "backlog.github_import"}:
+        if step in {
+            "github.refresh_mirrors",
+            "backlog.github_import",
+            "delivery.refresh_issue_body",
+        }:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.execute":
             return task_queue_for("release")
@@ -317,6 +358,16 @@ class ControlledWorkflow:
                 cls._nested_value(payload, "provider", "codex"), default="codex"
             )
         if step == "delivery.publish":
+            return GITHUB_TASK_QUEUE
+        if step in {
+            "gitops.pr_checks",
+            "gitops.merge",
+            "gitops.release_tag",
+            "gitops.workflow_run",
+            "gitops.image_pin",
+            "gitops.environment_issue",
+            "gitops.close_issue",
+        }:
             return GITHUB_TASK_QUEUE
         if step in {
             "reconcile.inspect_ci",
@@ -532,6 +583,17 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     "blocker": stage_context.get("blocker", stage_context["status"]),
                     "context": stage_context,
                 }
+        if not cells:
+            # NEW-14: a leaner project's manifest can legitimately produce zero domains/
+            # personas/lenses for this preset (e.g. llmwiki under static-full, which was
+            # built with falcone's richer set in mind) -- report it as a clean, diagnosed
+            # outcome instead of calling persist_coverage with total=0, which it correctly
+            # rejects as inconsistent input and crashes the workflow.
+            return {
+                "status": "BLOCKED",
+                "campaign_id": campaign_id,
+                "blocker": "NO_APPLICABLE_COVERAGE_CELLS",
+            }
         await self._step(
             "campaign.persist_coverage",
             {"campaign_id": campaign_id, "cells": batch, "total": len(cells)},
@@ -838,10 +900,29 @@ class FindingVerificationWorkflow(ControlledWorkflow):
                 reproduced = await self._step("finding.record_terminal", reproduced)
                 return {"status": reproduced.get("status", "FAILED"), "context": reproduced}
             attempts.append(reproduced)
-        controls = await self._step(
-            "finding.controls",
-            {"finding": candidate, "snapshot": fresh, "attempts": attempts},
-        )
+        try:
+            controls = await self._step(
+                "finding.controls",
+                {"finding": candidate, "snapshot": fresh, "attempts": attempts},
+            )
+        except Exception:
+            # NEW-21, 2026-09-22: _evaluate_controls treats every other "can't
+            # confirm" case (environment invalid, not reproduced, flaky) as a
+            # graceful disposition -- but a verification attempt whose evidence
+            # isn't anchored to the fresh snapshot's own hash raises a bare
+            # ValueError instead, and this workflow (like IssueDeliveryWorkflow
+            # before NEW-20) had no try/except at all, so that one case crashed
+            # the entire parent campaign instead of just blocking this one
+            # issue. Deliberately NOT weakening _evaluate_controls' own
+            # anti-staleness check (it's a legitimate integrity gate); this
+            # just makes its failure read like every other blocked verification
+            # -- continue_after_blocked_issue already knows how to move on from
+            # exactly this outcome.
+            blocked = await self._step(
+                "finding.record_terminal",
+                {"finding": candidate, "status": "BLOCKED", "blocker": "VERIFICATION_INTEGRITY"},
+            )
+            return {"status": "BLOCKED", "context": blocked}
         duplicate = await self._step(
             "finding.dedupe",
             {"finding": candidate, "attempts": attempts, "controls": controls},
@@ -862,6 +943,13 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
         context = await self._step("delivery.load_confirmed_finding", asdict(request))
+        # Makers and the checker have no network, so the scan worker installs the project
+        # toolchain in the source worktree first -- after the prechecks, so the NEW-28
+        # finding baseline never contains toolchain directories. Histories recorded
+        # before this step existed carry no marker and replay without it.
+        toolchain_steps: tuple[str, ...] = (
+            ("delivery.prepare_toolchain",) if self._prepare_toolchain_patched() else ()
+        )
         ordered_steps = (
             "delivery.ensure_issue",
             "delivery.acquire_leases",
@@ -869,6 +957,7 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             "delivery.allocate_worktrees",
             "delivery.persist_worktree_leases",
             "delivery.deterministic_prechecks",
+            *toolchain_steps,
             "delivery.prepare_spec",
             "delivery.invoke_spec",
             "delivery.create_openspec",
@@ -883,39 +972,168 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             "delivery.publish",
             "delivery.persist_publication",
         )
-        for step in ordered_steps:
-            if not await self._checkpoint(step.upper().replace(".", "_")):
-                return {"status": "CANCELLED", "context": context}
-            step_payload = {**context, "delivery_request": asdict(request)}
-            if step in {
-                "delivery.invoke_spec",
-                "delivery.invoke_maker",
-                "delivery.invoke_deployment_maker",
-                "delivery.invoke_checker",
-            }:
-                context = await self._agent_step(step, step_payload, timeout_minutes=120)
-            else:
-                if step == "delivery.publish":
-                    context = await self._github_write_step(step, step_payload, timeout_minutes=30)
+        try:
+            for step in ordered_steps:
+                if not await self._checkpoint(step.upper().replace(".", "_")):
+                    await self._release_delivery_leases_best_effort(context)
+                    return {"status": "CANCELLED", "context": context}
+                step_payload = {**context, "delivery_request": asdict(request)}
+                if step in {
+                    "delivery.invoke_spec",
+                    "delivery.invoke_maker",
+                    "delivery.invoke_deployment_maker",
+                    "delivery.invoke_checker",
+                }:
+                    context = await self._agent_step(step, step_payload, timeout_minutes=120)
                 else:
-                    context = await self._step(step, step_payload, timeout_minutes=30)
-            if (
-                context.get("status")
-                in {
-                    "RATE_LIMITED",
-                    "BLOCKED",
-                    "FAILED",
-                    "TIMED_OUT",
-                    "CANCELLED",
-                    "REQUEST_CHANGES",
-                    "DRY_RUN",
-                }
-                and step != "delivery.publish"
-            ):
-                if step == "delivery.prepare_publication":
-                    context = await self._step("delivery.persist_handoff", context)
-                return {"status": context["status"], "context": context}
-        return {"status": context.get("status", "SOURCE_PR"), "context": context}
+                    if step == "delivery.publish":
+                        context = await self._github_write_step(
+                            step, step_payload, timeout_minutes=30
+                        )
+                    elif step == "delivery.prepare_toolchain":
+                        # Up to 10 bounded installs of <= 3600 s each; the handler
+                        # heartbeats while they run.
+                        context = await self._step(step, step_payload, timeout_minutes=90)
+                    elif step == "delivery.validate_changeset":
+                        # NEW-49: may prepare a base-commit checkout (<= 80 min contract
+                        # budget) and rerun failing test commands there; heartbeats. An
+                        # activity timeout is not part of replay, so no patch marker.
+                        context = await self._step(step, step_payload, timeout_minutes=120)
+                    else:
+                        context = await self._step(step, step_payload, timeout_minutes=30)
+                if step == "delivery.ensure_issue" and context.get("status") == "ISSUE_READY":
+                    context = await self._refresh_issue_body(context)
+                if step == "delivery.invoke_maker":
+                    context = await self._resolve_maker_dependencies(context, request)
+                if (
+                    step == "delivery.validate_changeset"
+                    and context.get("status") == "REQUEST_CHANGES"
+                    and context.get("validation_findings")
+                    and workflow.patched("delivery-record-validation-findings-v1")
+                ):
+                    # NEW-76: the next correction attempt's maker is told what to fix.
+                    await self._step("delivery.record_validation_findings", context)
+                if (
+                    context.get("status")
+                    in {
+                        "RATE_LIMITED",
+                        "BLOCKED",
+                        "FAILED",
+                        "TIMED_OUT",
+                        "CANCELLED",
+                        "REQUEST_CHANGES",
+                        "DRY_RUN",
+                    }
+                    and step != "delivery.publish"
+                ):
+                    if step == "delivery.prepare_publication":
+                        context = await self._step("delivery.persist_handoff", context)
+                    # NEW-20, 2026-09-22: every OTHER stop here (anything before
+                    # delivery.persist_publication, whose own two branches already
+                    # release) previously left this run's component-implementation
+                    # lease held for its full 4h TTL, blocking every other delivery
+                    # attempt at the same component -- including this same issue's
+                    # own next correction-retry attempt, which mints a fresh run_id
+                    # per attempt. Idempotent no-op if nothing was ever acquired.
+                    await self._release_delivery_leases_best_effort(context)
+                    return {"status": context["status"], "context": context}
+            return {"status": context.get("status", "SOURCE_PR"), "context": context}
+        except Exception:
+            # NEW-20, 2026-09-22: an uncaught exception anywhere in this pipeline
+            # (e.g. NEW-19's semgrep crash) skipped delivery.persist_publication
+            # entirely, so nothing ever released this run's lease -- reproduced
+            # live when exactly that crash blocked the very next retry's attempt
+            # at the same issue for the rest of the lease's 4h TTL.
+            await self._release_delivery_leases_best_effort(context)
+            raise
+
+    # NEW-75: at most this many platform dependency resolutions per delivery attempt.
+    _DEPENDENCY_ROUNDS = 2
+
+    async def _resolve_maker_dependencies(
+        self, context: dict[str, Any], request: IssueDeliveryInput
+    ) -> dict[str, Any]:
+        """NEW-75: the offline maker edited manifests and asked for lockfile resolution.
+
+        The scan worker (network) regenerates and commits the lockfiles and reinstalls
+        the toolchain; the maker is then invoked again on top of that commit.
+        """
+        rounds = 0
+        while rounds < self._DEPENDENCY_ROUNDS and self._maker_decision(context) == (
+            "DEPENDENCIES_REQUIRED"
+        ):
+            if not workflow.patched("delivery-resolve-dependencies-v1"):
+                break
+            rounds += 1
+            delivery_request = asdict(request)
+            resolved = await self._step(
+                "delivery.resolve_dependencies",
+                {**context, "delivery_request": delivery_request},
+                timeout_minutes=120,
+            )
+            if resolved.get("status") != "DEPENDENCIES_RESOLVED":
+                return resolved
+            # NEW-77: the previous round's provider result must not travel into the next
+            # invocation; on a provider failure agent.persist_result read it back and
+            # rejected its identity (round 1 id vs the round 2 request).
+            fresh = {
+                key: value
+                for key, value in resolved.items()
+                if key not in {"agent_result", "agent_invocation_id", "agent_invocation_status"}
+            }
+            prepared = await self._step(
+                "delivery.prepare_maker",
+                {**fresh, "dependency_round": rounds, "delivery_request": delivery_request},
+                timeout_minutes=30,
+            )
+            if prepared.get("status") != "SOURCE_MAKER_READY":
+                return prepared
+            context = await self._agent_step(
+                "delivery.invoke_maker",
+                {**prepared, "delivery_request": delivery_request},
+                timeout_minutes=120,
+            )
+        return context
+
+    @staticmethod
+    def _maker_decision(context: dict[str, Any]) -> str:
+        agent = context.get("agent_result")
+        structured = agent.get("structured_result") if isinstance(agent, dict) else None
+        return str(structured.get("decision", "")) if isinstance(structured, dict) else ""
+
+    async def _refresh_issue_body(self, context: dict[str, Any]) -> dict[str, Any]:
+        # NEW-44: the Finding copied an existing backlog issue's body once at import,
+        # so decisions the operator later adds to the issue never reached the
+        # spec/maker. Re-read it here; only actual_behavior is taken from the result,
+        # and any failure keeps the imported copy. Histories recorded before this
+        # step existed carry no marker and replay without it.
+        if context.get("persona") != "existing-github-issue" or not context.get("issue_number"):
+            return context
+        if not workflow.patched("delivery-refresh-issue-body-v1"):
+            return context
+        refreshed = await self._step(
+            "delivery.refresh_issue_body",
+            {
+                "issue_repository": context.get("issue_repository"),
+                "issue_number": context.get("issue_number"),
+            },
+        )
+        body = refreshed.get("body_excerpt")
+        if refreshed.get("status") != "ISSUE_BODY_REFRESHED" or not isinstance(body, str):
+            return context
+        if not body:
+            return context
+        return {**context, "actual_behavior": body}
+
+    def _prepare_toolchain_patched(self) -> bool:
+        return workflow.patched("delivery-prepare-toolchain-v1")
+
+    async def _release_delivery_leases_best_effort(self, context: dict[str, Any]) -> None:
+        # Discards the activity's own response payload deliberately: it returns
+        # {**context, "status": "LEASES_RELEASED"|"NO_RUN_TO_RELEASE_LEASES_FOR"},
+        # and merging that back would silently clobber context["status"] (e.g.
+        # "BLOCKED"/"REQUEST_CHANGES") that callers and result records depend on.
+        await self._step("delivery.release_leases", context)
 
 
 @workflow.defn(name="DeliveryReconciliationWorkflow")
@@ -1481,6 +1699,20 @@ class QuotaRefreshWorkflow(ControlledWorkflow):
         return {"status": "COMPLETE", "snapshots": snapshots}
 
 
+@workflow.defn(name="ConnectionsRefreshWorkflow")
+class ConnectionsRefreshWorkflow(ControlledWorkflow):
+    """NEW-05: keep the connection-health snapshot from decaying to DEGRADED between
+
+    missions by periodically re-running the same bounded read-only probes
+    `recheck-connections` already performs on demand.
+    """
+
+    @workflow.run
+    async def run(self, request: ConnectionsRefreshInput) -> dict[str, Any]:
+        result = await self._step("connections.refresh", {"scope": request.scope})
+        return {"status": "COMPLETE", "scope": request.scope, "result": result}
+
+
 @workflow.defn(name="CleanupWorkflow")
 class CleanupWorkflow(ControlledWorkflow):
     @workflow.run
@@ -1496,6 +1728,11 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step("cleanup.inspect_codex_files", context)
             context = await self._step("cleanup.inspect_preview_namespaces", context)
             if request.dry_run:
+                if workflow.patched("cleanup-orphan-worktrees-v1"):
+                    # NEW-85: report snapshot/acceptance leftovers no lease tracks.
+                    context = await self._step(
+                        "cleanup.prune_orphan_worktrees", {**context, "dry_run": True}
+                    )
                 context = await self._step(
                     "cleanup.finalize", {**context, "terminal_status": "DRY_RUN"}
                 )
@@ -1521,6 +1758,10 @@ class CleanupWorkflow(ControlledWorkflow):
                 "cleanup.execute_preview_namespaces", {**context, "dry_run": False}
             )
             context = await self._step("cleanup.execute", {**context, "dry_run": False})
+            if workflow.patched("cleanup-orphan-worktrees-v1"):
+                context = await self._step(
+                    "cleanup.prune_orphan_worktrees", {**context, "dry_run": False}
+                )
             context = await self._step("cleanup.execute_metadata", {**context, "dry_run": False})
             context = await self._step(
                 "cleanup.finalize", {**context, "terminal_status": "COMPLETE"}
@@ -1798,12 +2039,343 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
         return context
 
 
+@workflow.defn(name="StagingGitOpsDeliveryWorkflow")
+class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
+    """Post-merge staging GitOps delivery: checks, merge, build, gate, pin, sync, verify.
+
+    Every activity is short; waiting happens here with durable timers so a 90-minute
+    CI run never holds an activity slot. Fails closed with one precise blocker.
+    """
+
+    _MERGE_ROUNDS = 20
+    _REMEDIATION_ROUNDS = 3
+
+    @workflow.run
+    async def run(self, request: StagingGitOpsDeliveryInput) -> dict[str, Any]:
+        prepared = await self._step("gitops.prepare", asdict(request))
+        if prepared.get("status") == "ALREADY_VERIFIED":
+            return {"status": "STAGING_VERIFIED", "already_verified": True}
+        if prepared.get("status") != "READY" or not isinstance(prepared.get("plan"), dict):
+            return {
+                "status": "BLOCKED",
+                "blocker": str(prepared.get("blocker") or "STAGING_GITOPS_PREPARE_FAILED"),
+            }
+        base: dict[str, Any] = {"plan": prepared["plan"], "project": request.project}
+        self._write_notice = {
+            "project": request.project,
+            "backlog_campaign_id": request.backlog_campaign_id,
+            "issue": f"{request.issue_repository}#{request.issue_number}",
+        }
+        flow = prepared.get("staging_flow")
+        flow = flow if isinstance(flow, dict) else {}
+        evidence: dict[str, Any] = {}
+        outcome = await self._deliver(base, flow, evidence)
+        await self._step(
+            "gitops.persist_result",
+            {
+                **base,
+                **evidence,
+                "outcome": outcome["status"],
+                "blocker": outcome.get("blocker"),
+            },
+        )
+        return {**outcome, "evidence": evidence}
+
+    async def _poll(
+        self,
+        step: str,
+        payload: dict[str, Any],
+        *,
+        pending: frozenset[str],
+        attempts: int,
+        interval: timedelta,
+        write: bool = False,
+    ) -> dict[str, Any]:
+        """Call a short activity until it leaves ``pending``; TIMED_OUT when bounded out."""
+        result: dict[str, Any] = {}
+        for attempt in range(attempts):
+            if attempt:
+                await workflow.sleep(interval)
+            if not await self._checkpoint(step.upper().replace(".", "_")):
+                return {"status": "CANCELLED", "blocker": "CANCELLED"}
+            if write:
+                result = await self._github_write_step(step, payload)
+            else:
+                result = await self._step(step, payload)
+            if result.get("status") not in pending:
+                return result
+        return {**result, "status": "TIMED_OUT"}
+
+    @staticmethod
+    def _blocked(result: dict[str, Any], default: str) -> dict[str, Any]:
+        if result.get("status") == "CANCELLED":
+            return {"status": "CANCELLED", "blocker": "CANCELLED"}
+        return {"status": "BLOCKED", "blocker": str(result.get("blocker") or default)}
+
+    async def _deliver(
+        self, base: dict[str, Any], flow: dict[str, Any], evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        plan = base["plan"]
+        minute = timedelta(minutes=1)
+        half_minute = timedelta(seconds=30)
+
+        # 1. Source PR checks (~90 minutes).
+        checks = await self._poll(
+            "gitops.pr_checks",
+            base,
+            pending=frozenset({"CHECKS_PENDING"}),
+            attempts=90,
+            interval=minute,
+        )
+        if checks.get("status") == "TIMED_OUT":
+            return {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_TIMEOUT"}
+        # NEW-63: keep the baseline gate's verdict (job names only) for the ChangeSet record;
+        # a CI-repair re-delivery hands the regressions to the maker (NEW-64).
+        baseline = checks.get("ci_baseline")
+        if isinstance(baseline, dict):
+            evidence["ci_baseline_pr"] = baseline.get("pr")
+            evidence["ci_preexisting_failures"] = baseline.get("preexisting_failures") or []
+        if checks.get("status") != "CHECKS_PASSED":
+            if checks.get("blocker") == "SOURCE_PR_CI_REGRESSION":
+                evidence["ci_regressions"] = checks.get("failed_checks") or []
+            return self._blocked(checks, "SOURCE_PR_CI_FAILED")
+
+        # 2. Ready + merge (source first, then the deployment PR when one exists).
+        targets = ["source"]
+        if plan.get("deployment_pr_number"):
+            targets.append("deployment")
+        for target in targets:
+            merged = await self._poll(
+                "gitops.merge",
+                {**base, "target": target},
+                pending=frozenset({"MERGE_PENDING"}),
+                attempts=self._MERGE_ROUNDS,
+                interval=half_minute,
+                write=True,
+            )
+            if merged.get("status") == "TIMED_OUT":
+                return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_MERGE_BLOCKED"}
+            if merged.get("status") != "MERGED":
+                return self._blocked(merged, "PROTECTED_MERGE_FAILED")
+            key = "merge_sha" if target == "source" else "deployment_merge_sha"
+            evidence[key] = str(merged.get("merge_sha", ""))
+        merge_sha = evidence["merge_sha"]
+        merged_base = {**base, "merge_sha": merge_sha}
+
+        # 3. Release tag (optional) and the image-producing builds.
+        if flow.get("release_tag_enabled"):
+            if not await self._checkpoint("GITOPS_RELEASE_TAG"):
+                return {"status": "CANCELLED", "blocker": "CANCELLED"}
+            tagged = await self._github_write_step("gitops.release_tag", merged_base)
+            if tagged.get("status") != "TAG_READY":
+                return self._blocked(tagged, "RELEASE_TAG_FAILED")
+            evidence["release_tag"] = tagged.get("release_tag")
+        for role, configured, timeout_blocker in (
+            ("main_ci", flow.get("main_ci_workflow"), "MAIN_CI_TIMEOUT"),
+            ("image", flow.get("image_workflow"), "IMAGE_BUILD_TIMEOUT"),
+        ):
+            if not configured:
+                continue
+            run = await self._poll(
+                "gitops.workflow_run",
+                {**merged_base, "workflow_role": role},
+                pending=frozenset({"RUN_PENDING"}),
+                attempts=90,
+                interval=minute,
+            )
+            if run.get("status") == "TIMED_OUT":
+                return {"status": "BLOCKED", "blocker": timeout_blocker}
+            if run.get("status") != "RUN_SUCCEEDED":
+                return self._blocked(
+                    run, "MAIN_CI_FAILED" if role == "main_ci" else "IMAGE_BUILD_FAILED"
+                )
+            if role == "image" and run.get("release_sha"):
+                # NEW-68: a later release containing the merge ships this change; every
+                # following step pins, syncs and verifies that release's commit.
+                evidence["release_tag"] = run.get("release_tag")
+                evidence["release_sha"] = str(run["release_sha"])
+        deployed_base = {
+            **merged_base,
+            "merge_sha": str(evidence.get("release_sha") or merge_sha),
+            "delivered_merge_sha": merge_sha,
+        }
+
+        # 4. Environment gate with bounded remediation.
+        gate = await self._environment_gate(base, evidence)
+        if gate is not None:
+            return gate
+
+        # 5. Image pin written by argocd-image-updater (~30 minutes).
+        pin = await self._poll(
+            "gitops.image_pin",
+            deployed_base,
+            pending=frozenset({"PIN_PENDING"}),
+            attempts=30,
+            interval=minute,
+        )
+        if pin.get("status") == "TIMED_OUT":
+            return {"status": "BLOCKED", "blocker": "IMAGE_NOT_PINNED"}
+        if pin.get("status") != "PINNED":
+            return self._blocked(pin, "IMAGE_NOT_PINNED")
+        evidence["image_tag"] = pin.get("image_tag")
+        evidence["pinned_repositories"] = list(pin.get("pinned_repositories") or [])
+
+        # 6. Hermes-triggered Argo sync (~20 minutes).
+        triggered = await self._poll(
+            "gitops.trigger_sync",
+            deployed_base,
+            pending=frozenset({"SYNC_BUSY"}),
+            attempts=10,
+            interval=half_minute,
+        )
+        if triggered.get("status") == "TIMED_OUT":
+            return {"status": "BLOCKED", "blocker": "ARGO_OPERATION_BUSY"}
+        if triggered.get("status") != "SYNC_TRIGGERED":
+            return self._blocked(triggered, "ARGO_SYNC_FAILED")
+        evidence["chart_pin"] = triggered.get("chart_pin")
+        synced = await self._poll(
+            "gitops.sync_status",
+            {
+                **deployed_base,
+                "previous_operation_started_at": triggered.get("previous_operation_started_at"),
+            },
+            pending=frozenset({"SYNC_PENDING"}),
+            attempts=40,
+            interval=half_minute,
+        )
+        if synced.get("status") == "TIMED_OUT":
+            return {"status": "BLOCKED", "blocker": "ARGO_SYNC_TIMEOUT"}
+        if synced.get("status") != "SYNCED":
+            return self._blocked(synced, "ARGO_SYNC_FAILED")
+        evidence["argo_revision"] = synced.get("argo_revision")
+
+        # 7. Verify every pinned workload runs the new tag and is fully ready.
+        verified = await self._poll(
+            "gitops.verify_workloads",
+            {**deployed_base, "pinned_repositories": evidence["pinned_repositories"]},
+            pending=frozenset({"VERIFICATION_PENDING"}),
+            attempts=10,
+            interval=half_minute,
+        )
+        if verified.get("status") != "VERIFIED":
+            if verified.get("status") == "CANCELLED":
+                return self._blocked(verified, "CANCELLED")
+            return {"status": "BLOCKED", "blocker": "STAGING_VERIFICATION_FAILED"}
+
+        # 8. Close the delivered issue with the delivery evidence.
+        if not await self._checkpoint("GITOPS_CLOSE_ISSUE"):
+            return {"status": "CANCELLED", "blocker": "CANCELLED"}
+        closed = await self._github_write_step(
+            "gitops.close_issue",
+            {
+                **deployed_base,
+                "release_tag": evidence.get("release_tag"),
+                "pinned_repositories": evidence["pinned_repositories"],
+                "argo_revision": evidence.get("argo_revision"),
+            },
+        )
+        if closed.get("status") != "ISSUE_CLOSED":
+            return self._blocked(closed, "DELIVERED_ISSUE_CLOSE_FAILED")
+        return {"status": "STAGING_VERIFIED"}
+
+    async def _environment_gate(
+        self, base: dict[str, Any], evidence: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        check = await self._step("gitops.environment_check", base)
+        issue_number: int | None = None
+        rounds = 0
+        while check.get("status") != "HEALTHY":
+            if check.get("status") != "UNHEALTHY":
+                return self._blocked(check, "ENVIRONMENT_CHECK_FAILED")
+            if rounds >= self._REMEDIATION_ROUNDS:
+                evidence["remediation_rounds"] = rounds
+                return {"status": "BLOCKED", "blocker": "ENVIRONMENT_UNHEALTHY"}
+            rounds += 1
+            if not await self._checkpoint(f"GITOPS_REMEDIATION_{rounds}"):
+                return {"status": "CANCELLED", "blocker": "CANCELLED"}
+            issue = await self._github_write_step(
+                "gitops.environment_issue",
+                {
+                    **base,
+                    "action": "report",
+                    "round": rounds,
+                    "diagnosis": check.get("diagnosis"),
+                    "issue_number": issue_number,
+                },
+            )
+            if issue.get("status") not in {"ISSUE_OPENED", "ISSUE_COMMENTED"}:
+                return self._blocked(issue, "ENVIRONMENT_ISSUE_FAILED")
+            issue_number = int(issue["issue_number"])
+            evidence["environment_issue_number"] = issue_number
+            await self._step("gitops.remediate", {**base, "round": rounds})
+            await workflow.sleep(timedelta(minutes=2))
+            check = await self._step("gitops.environment_check", base)
+        evidence["remediation_rounds"] = rounds
+        if issue_number is not None:
+            resolved = await self._github_write_step(
+                "gitops.environment_issue",
+                {**base, "action": "resolve", "issue_number": issue_number},
+            )
+            if resolved.get("status") != "ISSUE_RESOLVED":
+                return self._blocked(resolved, "ENVIRONMENT_ISSUE_FAILED")
+        return None
+
+
+_LOOP_RESULT_KEYS = (
+    "status",
+    "blocker",
+    "reason_code",
+    "attempt",
+    "stage",
+    "issue_number",
+    "issue_url",
+    "source_pr_url",
+    "deployment_pr_url",
+    "merge_sha",
+    "release_tag",
+    "image_tag",
+)
+_LOOP_RESULT_LIMIT = 200
+
+
+def _compact_loop_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
+    """NEW-59: keep a bounded, scalar summary of each child result in the loop outcome."""
+    results = outcome.get("results")
+    if not isinstance(results, list):
+        return outcome
+    compact: list[dict[str, Any]] = []
+    for item in results[-_LOOP_RESULT_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        summary = {
+            key: item[key]
+            for key in _LOOP_RESULT_KEYS
+            if key in item and (item[key] is None or isinstance(item[key], (str, int, float, bool)))
+        }
+        context = item.get("context")
+        if isinstance(context, dict):
+            for key in _LOOP_RESULT_KEYS:
+                value = context.get(key)
+                if key not in summary and isinstance(value, (str, int, float, bool)):
+                    summary[key] = value
+        compact.append(summary)
+    return {**outcome, "results": compact, "results_total": len(results)}
+
+
 @workflow.defn(name="ExistingGitHubBacklogLoopWorkflow")
 class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     """Durably control imported issues; fail closed until current reproduction is proven."""
 
     @workflow.run
     async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+        # NEW-59: every child delivery's full context was accumulated in "results"; after
+        # 19 retry rounds on musematic #993 the loop's completion payload exceeded
+        # Temporal's 2 MB limit (TMPRL1103) and the loop could never finish. Only the
+        # returned value is compacted, so no command changes and replay is unaffected.
+        outcome = await self._run_loop(request)
+        return _compact_loop_outcome(outcome)
+
+    async def _run_loop(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
         if request.project not in {"falcone", "musematic", "llmwiki"}:
             raise ApplicationError(
                 "existing backlog loop project is not allowlisted",
@@ -1821,9 +2393,66 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         after_current_controls = workflow.patched("existing-backlog-after-current-controls-v1")
         final_closure_enabled = workflow.patched("existing-backlog-final-closure-v1")
         global_child_blocker_return = workflow.patched("global-backlog-child-blocker-return-v1")
+        register_run = workflow.patched("existing-backlog-register-run-v1")
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
             return context
+        try:
+            if register_run:
+                await self._step(
+                    "backlog.register_run",
+                    {**asdict(request), "workflow_id": workflow.info().workflow_id},
+                )
+            return await self._run_backlog_loop(
+                request,
+                context,
+                register_child_runs=register_child_runs,
+                sequential_source_pr=sequential_source_pr,
+                after_current_controls=after_current_controls,
+                final_closure_enabled=final_closure_enabled,
+                global_child_blocker_return=global_child_blocker_return,
+                register_run=register_run,
+            )
+        except Exception:
+            # Without this, an uncaught exception (e.g. a non-retryable
+            # ApplicationError from an activity or child workflow) leaves the
+            # campaign stuck at status RUNNING forever with no Run row to
+            # reconcile against -- see NEW-16. Deliberately covers
+            # backlog.register_run's own call too (NEW-16 follow-up,
+            # 2026-09-22): backlog.load_execution already flips campaign.status
+            # to RUNNING before this point, so if register_run itself fails
+            # (as it did in production the first time this whole path was ever
+            # exercised for real -- a missing dispatch-allowlist entry),
+            # nothing else will ever reset that status, and the campaign
+            # blocks GitHub write-policy ownership for every other campaign
+            # until its ~24h approval TTL expires, with no exposed way to
+            # release it early. record_loop_state handles a still-missing Run
+            # row gracefully (skips updating it) and unconditionally resets
+            # campaign.status regardless, so this is safe even though
+            # register_run hasn't necessarily succeeded.
+            if register_run:
+                await self._step(
+                    "backlog.record_loop_state",
+                    {
+                        **asdict(request),
+                        "workflow_id": workflow.info().workflow_id,
+                        "loop_status": "FAILED",
+                    },
+                )
+            raise
+
+    async def _run_backlog_loop(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        context: dict[str, Any],
+        *,
+        register_child_runs: bool,
+        sequential_source_pr: bool,
+        after_current_controls: bool,
+        final_closure_enabled: bool,
+        global_child_blocker_return: bool,
+        register_run: bool,
+    ) -> dict[str, Any]:
         raw_items = context.get("items")
         if not isinstance(raw_items, list):
             raise TypeError("existing backlog selection must be a list")
@@ -1832,17 +2461,30 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if not isinstance(item, dict):
                 raise TypeError("existing backlog issue must be an object")
             continue_to_next_issue = False
+            revalidation_round = 0
             while True:
                 if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "CANCELLED"},
-                    )
+                    cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                    if register_run:
+                        cancel_state["workflow_id"] = workflow.info().workflow_id
+                    await self._step("backlog.record_loop_state", cancel_state)
                     return {"status": "CANCELLED", "results": results}
-                gate = await self._step(
-                    "backlog.revalidate_gate",
-                    {**asdict(request), "item": item},
-                )
+                # NEW-71: nothing refreshed the canonical mirrors for backlog delivery, so
+                # revalidation and allocation ran against a weeks-old main (and failed once
+                # main moved). Refresh them (controller fetch + push to the worker) first.
+                mirror_blocker: str | None = None
+                if workflow.patched("existing-backlog-refresh-mirrors-v1"):
+                    try:
+                        await self._step("github.refresh_mirrors", {"project": request.project})
+                    except ActivityError:
+                        mirror_blocker = "CANONICAL_MIRROR_REFRESH_FAILED"
+                if mirror_blocker is not None:
+                    gate = {"status": "BLOCKED", "blocker": mirror_blocker}
+                else:
+                    gate = await self._step(
+                        "backlog.revalidate_gate",
+                        {**asdict(request), "item": item},
+                    )
                 if gate.get("status") == "READY":
                     break
                 blocker = str(gate.get("blocker") or gate.get("status") or "BLOCKED")
@@ -1850,16 +2492,28 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     "CURRENT_SOURCE_REVALIDATION_REQUIRED",
                     "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED",
                 }:
-                    candidate = await self._step(
+                    candidate = await self._loop_step(
+                        request,
+                        item,
                         "backlog.materialize_candidate",
                         {**asdict(request), "item": item},
+                        register_run=register_run,
                     )
                     verification_workflow_id = (
                         f"{workflow.info().workflow_id}-issue-{ordinal}-"
                         f"revalidate-{item['issue_number']}"
                     )
+                    if revalidation_round:
+                        # NEW-74: a retried revalidation reused the child id and its run
+                        # registration refused the new binding, failing the loop.
+                        verification_workflow_id = (
+                            f"{verification_workflow_id}-r{revalidation_round}"
+                        )
+                    revalidation_round += 1
                     if register_child_runs:
-                        await self._step(
+                        await self._loop_step(
+                            request,
+                            item,
                             "backlog.register_child_run",
                             {
                                 **asdict(request),
@@ -1867,26 +2521,36 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                 "child_workflow_id": verification_workflow_id,
                                 "finding_id": str(candidate["finding_id"]),
                             },
+                            register_run=register_run,
                         )
-                    verification = await workflow.execute_child_workflow(
-                        "FindingVerificationWorkflow",
-                        FindingVerificationInput(
-                            finding_id=str(candidate["finding_id"]),
-                            project=request.project,
-                            fresh_snapshot=True,
-                        ),
-                        id=verification_workflow_id,
-                        task_queue=workflow.info().task_queue,
-                        execution_timeout=timedelta(hours=4),
-                    )
-                    await self._step(
-                        "backlog.record_revalidation",
-                        {
-                            **asdict(request),
-                            "item": item,
-                            "verification": verification,
-                        },
-                    )
+                    try:
+                        verification = await workflow.execute_child_workflow(
+                            "FindingVerificationWorkflow",
+                            FindingVerificationInput(
+                                finding_id=str(candidate["finding_id"]),
+                                project=request.project,
+                                fresh_snapshot=True,
+                            ),
+                            id=verification_workflow_id,
+                            task_queue=workflow.info().task_queue,
+                            execution_timeout=timedelta(hours=4),
+                        )
+                    except ChildWorkflowError:
+                        # NEW-72: a failed revalidation child (e.g. a stale mirror) crashed
+                        # the whole loop; it now pauses for the operator like any blocker.
+                        verification = {"status": "CHILD_FAILED"}
+                    else:
+                        await self._loop_step(
+                            request,
+                            item,
+                            "backlog.record_revalidation",
+                            {
+                                **asdict(request),
+                                "item": item,
+                                "verification": verification,
+                            },
+                            register_run=register_run,
+                        )
                     refreshed = await self._step("backlog.load_execution", asdict(request))
                     candidates = refreshed.get("items")
                     if isinstance(candidates, list):
@@ -1936,10 +2600,16 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 self._phase = f"AWAITING_OPERATOR:{issue_ref}:{blocker}"
                 self._skip_reason = None
                 self._retry_step = None
-                await self._step(
-                    "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
-                )
+                gate_paused: dict[str, Any] = {
+                    **asdict(request),
+                    "loop_status": "PAUSED",
+                    "blocker": blocker,
+                }
+                if register_run:
+                    # NEW-70: without the workflow id the loop Run stayed RUNNING and the
+                    # retry preflight refused the operator's signal (NEW-33b, gate path).
+                    gate_paused["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", gate_paused)
                 await workflow.wait_condition(
                     lambda: (
                         self._cancelled
@@ -1948,10 +2618,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                 )
                 if self._cancelled:
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "CANCELLED"},
-                    )
+                    cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                    if register_run:
+                        cancel_state["workflow_id"] = workflow.info().workflow_id
+                    await self._step("backlog.record_loop_state", cancel_state)
                     return {"status": "CANCELLED", "results": results}
                 if self._skip_reason is not None:
                     skip_value = self._skip_reason
@@ -1998,15 +2668,44 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if boundary is not None:
                     return boundary
                 continue
-            delivery: dict[str, Any]
-            if sequential_source_pr:
-                delivery = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
-                for attempt in range(1, request.correction_limit + 2):
-                    delivery_workflow_id = (
-                        f"{workflow.info().workflow_id}-issue-{ordinal}-attempt-{attempt}"
-                    )
+            delivery: dict[str, Any] = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
+            # NEW-33: a blocked delivery used to record PAUSED and then end the workflow,
+            # leaving a PAUSED campaign no signal could reach (resume/retry/skip target
+            # this workflow), still owning the GitHub write policy. Now it really waits.
+            operator_pause = workflow.patched("existing-backlog-delivery-operator-pause-v1")
+            delivery_round = 0
+            advance_to_next_issue = False
+            while True:
+                issue_prefix = f"{workflow.info().workflow_id}-issue-{ordinal}"
+                if delivery_round:
+                    issue_prefix = f"{issue_prefix}-retry-{delivery_round}"
+                if sequential_source_pr:
+                    delivery = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
+                    for attempt in range(1, request.correction_limit + 2):
+                        delivery_workflow_id = f"{issue_prefix}-attempt-{attempt}"
+                        if register_child_runs:
+                            await self._loop_step(
+                                request,
+                                item,
+                                "backlog.register_child_run",
+                                {
+                                    **asdict(request),
+                                    "child_kind": "issue-delivery",
+                                    "child_workflow_id": delivery_workflow_id,
+                                    "finding_id": str(gate["finding_id"]),
+                                },
+                                register_run=register_run,
+                            )
+                        delivery = await self._issue_delivery(gate, delivery_workflow_id)
+                        results.append({**delivery, "attempt": attempt})
+                        if delivery.get("status") != "REQUEST_CHANGES":
+                            break
+                else:
+                    delivery_workflow_id = issue_prefix
                     if register_child_runs:
-                        await self._step(
+                        await self._loop_step(
+                            request,
+                            item,
                             "backlog.register_child_run",
                             {
                                 **asdict(request),
@@ -2014,96 +2713,83 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                                 "child_workflow_id": delivery_workflow_id,
                                 "finding_id": str(gate["finding_id"]),
                             },
+                            register_run=register_run,
                         )
-                    delivery = await workflow.execute_child_workflow(
-                        "IssueDeliveryWorkflow",
-                        IssueDeliveryInput(
-                            finding_id=str(gate["finding_id"]),
-                            risk_class=str(gate["risk_class"]),
-                            dry_run=False,
-                        ),
-                        id=delivery_workflow_id,
-                        task_queue=workflow.info().task_queue,
-                        execution_timeout=timedelta(hours=12),
-                    )
-                    results.append({**delivery, "attempt": attempt})
-                    if delivery.get("status") != "REQUEST_CHANGES":
+                    delivery = await self._issue_delivery(gate, delivery_workflow_id)
+                    results.append(delivery)
+                pause_blocker: str | None = None
+                if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
+                    blocker = str(delivery.get("blocker") or delivery.get("status"))
+                    if global_child_blocker_return and request.global_campaign_id is not None:
+                        await self._step(
+                            "backlog.record_loop_state",
+                            {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                        )
+                        return {"status": "BLOCKED", "blocker": blocker, "results": results}
+                    if (
+                        sequential_source_pr
+                        and request.continue_after_blocked_issue
+                        and not self._requires_operator_pause(blocker)
+                    ):
+                        advance_to_next_issue = True
                         break
-            else:
-                delivery_workflow_id = f"{workflow.info().workflow_id}-issue-{ordinal}"
-                if register_child_runs:
-                    await self._step(
-                        "backlog.register_child_run",
-                        {
-                            **asdict(request),
-                            "child_kind": "issue-delivery",
-                            "child_workflow_id": delivery_workflow_id,
-                            "finding_id": str(gate["finding_id"]),
-                        },
-                    )
-                delivery = await workflow.execute_child_workflow(
-                    "IssueDeliveryWorkflow",
-                    IssueDeliveryInput(
-                        finding_id=str(gate["finding_id"]),
-                        risk_class=str(gate["risk_class"]),
-                        dry_run=False,
-                    ),
-                    id=delivery_workflow_id,
-                    task_queue=workflow.info().task_queue,
-                    execution_timeout=timedelta(hours=12),
-                )
-                results.append(delivery)
-            if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
-                blocker = str(delivery.get("blocker") or delivery.get("status"))
-                if global_child_blocker_return and request.global_campaign_id is not None:
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
-                    )
-                    return {"status": "BLOCKED", "blocker": blocker, "results": results}
-                if (
-                    sequential_source_pr
-                    and request.continue_after_blocked_issue
-                    and not self._requires_operator_pause(blocker)
-                ):
-                    boundary = await self._after_issue_boundary(
-                        request,
-                        results,
-                        enabled=after_current_controls,
-                        has_more=ordinal < len(raw_items),
-                    )
-                    if boundary is not None:
-                        return boundary
-                    continue
-                await self._step(
-                    "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
-                )
-                return {"status": "PAUSED", "results": results}
-            if sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
-                if global_child_blocker_return and request.global_campaign_id is not None:
-                    await self._step(
-                        "backlog.record_loop_state",
-                        {
-                            **asdict(request),
-                            "loop_status": "PAUSED",
+                    pause_blocker = blocker
+                elif sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
+                    if global_child_blocker_return and request.global_campaign_id is not None:
+                        await self._step(
+                            "backlog.record_loop_state",
+                            {
+                                **asdict(request),
+                                "loop_status": "PAUSED",
+                                "blocker": "CORRECTION_LIMIT_EXHAUSTED",
+                            },
+                        )
+                        return {
+                            "status": "BLOCKED",
                             "blocker": "CORRECTION_LIMIT_EXHAUSTED",
-                        },
-                    )
-                    return {
-                        "status": "BLOCKED",
-                        "blocker": "CORRECTION_LIMIT_EXHAUSTED",
-                        "results": results,
-                    }
-                await self._step(
-                    "backlog.record_loop_state",
-                    {
-                        **asdict(request),
-                        "loop_status": "PAUSED",
-                        "blocker": "CORRECTION_LIMIT_EXHAUSTED",
-                    },
+                            "results": results,
+                        }
+                    pause_blocker = "CORRECTION_LIMIT_EXHAUSTED"
+                if pause_blocker is None:
+                    break
+                paused_state = {
+                    **asdict(request),
+                    "loop_status": "PAUSED",
+                    "blocker": pause_blocker,
+                }
+                if operator_pause and register_run:
+                    # NEW-33b: the loop Run must read PAUSED, or the retry/resume
+                    # preflight (which reads Run.status) refuses the operator's signal.
+                    paused_state["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", paused_state)
+                if not operator_pause:
+                    return {"status": "PAUSED", "results": results}
+                resumed_state = {**asdict(request), "loop_status": "RUNNING"}
+                if register_run:
+                    resumed_state["workflow_id"] = workflow.info().workflow_id
+                outcome, skipped = await self._await_delivery_operator(
+                    request, item, pause_blocker, register_run=register_run
                 )
-                return {"status": "PAUSED", "results": results}
+                if outcome == "CANCELLED":
+                    return {"status": "CANCELLED", "results": results}
+                if outcome == "RETRY":
+                    delivery_round += 1
+                    await self._step("backlog.record_loop_state", resumed_state)
+                    continue
+                results.append(skipped)
+                await self._step("backlog.record_loop_state", resumed_state)
+                advance_to_next_issue = True
+                break
+            if advance_to_next_issue:
+                boundary = await self._after_issue_boundary(
+                    request,
+                    results,
+                    enabled=after_current_controls,
+                    has_more=ordinal < len(raw_items),
+                )
+                if boundary is not None:
+                    return boundary
+                continue
             if request.delivery_mode == "source-pr":
                 if sequential_source_pr:
                     boundary = await self._after_issue_boundary(
@@ -2122,6 +2808,38 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     "blocker": "FULL_DELIVERY_REQUIRES_PROJECT_BUILD_AND_STAGING_GATES",
                     "results": results,
                 }
+            if workflow.patched("existing-backlog-staging-gitops-v1"):
+                flow_state = await self._step(
+                    "gitops.flow_for_project", {"project": request.project}
+                )
+                if flow_state.get("enabled") is True:
+                    # Post-merge staging GitOps flow replaces the pre-merge candidate
+                    # pipeline entirely; _execute_full_delivery is never reached.
+                    staged, staged_blocker = await self._staging_gitops_delivery(
+                        request=request,
+                        item=item,
+                        finding_id=str(gate["finding_id"]),
+                        ordinal=ordinal,
+                        delivery=delivery,
+                        results=results,
+                        register_child_runs=register_child_runs,
+                        register_run=register_run,
+                        global_child_blocker_return=global_child_blocker_return,
+                        gate=gate,
+                    )
+                    if staged == "CANCELLED":
+                        return {"status": "CANCELLED", "results": results}
+                    if staged == "BLOCKED":
+                        return {"status": "BLOCKED", "blocker": staged_blocker, "results": results}
+                    boundary = await self._after_issue_boundary(
+                        request,
+                        results,
+                        enabled=after_current_controls,
+                        has_more=ordinal < len(raw_items),
+                    )
+                    if boundary is not None:
+                        return boundary
+                    continue
             full_delivery = await self._execute_full_delivery(
                 request=request,
                 finding_id=str(gate["finding_id"]),
@@ -2187,9 +2905,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             )
             if boundary is not None:
                 return boundary
-        await self._step(
-            "backlog.record_loop_state", {**asdict(request), "loop_status": "COMPLETE"}
-        )
+        complete_state = {**asdict(request), "loop_status": "COMPLETE"}
+        if register_run:
+            complete_state["workflow_id"] = workflow.info().workflow_id
+        await self._step("backlog.record_loop_state", complete_state)
         return {"status": "COMPLETE", "results": results}
 
     async def _execute_full_delivery(
@@ -2334,6 +3053,173 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             "deployment_id": deployment_id,
         }
 
+    async def _staging_gitops_delivery(
+        self,
+        *,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        finding_id: str,
+        ordinal: int,
+        delivery: dict[str, Any],
+        results: list[dict[str, Any]],
+        register_child_runs: bool,
+        register_run: bool,
+        global_child_blocker_return: bool,
+        gate: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        """Run the post-merge staging GitOps child; hold for the operator when it blocks.
+
+        Returns ("DONE"|"SKIPPED"|"CANCELLED"|"BLOCKED", blocker). A retry re-runs
+        only the GitOps child (under a fresh child id); skip moves to the next issue.
+        NEW-64: when the CI baseline gate attributes PR CI failures to the ChangeSet
+        (SOURCE_PR_CI_REGRESSION), the issue delivery re-runs on the same ChangeSet
+        (resuming its commits, updating the same PR) before a fresh GitOps child.
+        """
+        delivery_context = delivery.get("context")
+        change_set_id = (
+            str(delivery_context.get("change_set_id", ""))
+            if isinstance(delivery_context, dict)
+            else ""
+        )
+        workflow_root = workflow.info().workflow_id
+        gitops_round = 0
+        repair_round = 0
+        repair_pending = False
+        while True:
+            staged: dict[str, Any] | None = None
+            if repair_pending and gate is not None:
+                repair_round += 1
+                repaired = await self._ci_repair_delivery(
+                    request=request,
+                    item=item,
+                    register_run=register_run,
+                    gate=gate,
+                    ordinal=ordinal,
+                    repair_round=repair_round,
+                    results=results,
+                    register_child_runs=register_child_runs,
+                )
+                if repaired.get("status") == "SOURCE_PR":
+                    repair_pending = False
+                    gitops_round += 1
+                else:
+                    reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
+                    staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
+            if staged is None and change_set_id:
+                child_id = f"{workflow_root}-issue-{ordinal}-staging-gitops"
+                if gitops_round:
+                    child_id = f"{child_id}-retry-{gitops_round}"
+                if register_child_runs:
+                    await self._loop_step(
+                        request,
+                        item,
+                        "backlog.register_child_run",
+                        {
+                            **asdict(request),
+                            "child_kind": "staging-gitops",
+                            "child_workflow_id": child_id,
+                            "finding_id": finding_id,
+                            "change_set_id": change_set_id,
+                        },
+                        register_run=register_run,
+                    )
+                try:
+                    staged = await workflow.execute_child_workflow(
+                        "StagingGitOpsDeliveryWorkflow",
+                        StagingGitOpsDeliveryInput(
+                            change_set_id=change_set_id,
+                            project=request.project,
+                            issue_repository=str(item["repository"]),
+                            issue_number=int(item["issue_number"]),
+                            finding_id=finding_id,
+                            backlog_campaign_id=request.backlog_campaign_id,
+                        ),
+                        id=child_id,
+                        task_queue=workflow.info().task_queue,
+                        execution_timeout=timedelta(hours=12),
+                    )
+                except ChildWorkflowError:
+                    staged = {"status": "FAILED", "blocker": "STAGING_GITOPS_CHILD_WORKFLOW_FAILED"}
+            elif staged is None:
+                staged = {"status": "BLOCKED", "blocker": "CHANGE_SET_BINDING_MISSING"}
+            results.append({**staged, "stage": "staging-gitops"})
+            if staged.get("status") == "STAGING_VERIFIED":
+                return "DONE", ""
+            blocker = str(staged.get("blocker") or staged.get("status") or "STAGING_GITOPS_FAILED")
+            if (
+                blocker == "SOURCE_PR_CI_REGRESSION"
+                and gate is not None
+                and repair_round < self._CI_REPAIR_ROUNDS
+                and workflow.patched("existing-backlog-gitops-ci-repair-v1")
+            ):
+                repair_pending = True
+                continue
+            paused_state = {**asdict(request), "loop_status": "PAUSED", "blocker": blocker}
+            if register_run:
+                paused_state["workflow_id"] = workflow_root
+            await self._step("backlog.record_loop_state", paused_state)
+            if global_child_blocker_return and request.global_campaign_id is not None:
+                return "BLOCKED", blocker
+            outcome, skipped = await self._await_delivery_operator(
+                request, item, blocker, register_run=register_run
+            )
+            if outcome == "CANCELLED":
+                return "CANCELLED", blocker
+            resumed_state = {**asdict(request), "loop_status": "RUNNING"}
+            if register_run:
+                resumed_state["workflow_id"] = workflow_root
+            await self._step("backlog.record_loop_state", resumed_state)
+            if outcome == "RETRY":
+                if gate is not None and (
+                    blocker == "SOURCE_PR_CI_REGRESSION" or blocker.startswith("CI_REPAIR_")
+                ):
+                    # NEW-64: the operator's retry repeats the CI repair, not only GitOps.
+                    repair_pending = True
+                else:
+                    gitops_round += 1
+                continue
+            results.append(skipped)
+            return "SKIPPED", blocker
+
+    # NEW-64: automatic CI-repair re-deliveries before the loop waits for the operator.
+    _CI_REPAIR_ROUNDS = 2
+
+    async def _ci_repair_delivery(
+        self,
+        *,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        register_run: bool,
+        gate: dict[str, Any],
+        ordinal: int,
+        repair_round: int,
+        results: list[dict[str, Any]],
+        register_child_runs: bool,
+    ) -> dict[str, Any]:
+        """Re-run the issue delivery for the published ChangeSet (maker resumes its commits)."""
+        prefix = f"{workflow.info().workflow_id}-issue-{ordinal}-ci-repair-{repair_round}"
+        delivery: dict[str, Any] = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
+        for attempt in range(1, request.correction_limit + 2):
+            child_id = f"{prefix}-attempt-{attempt}"
+            if register_child_runs:
+                await self._loop_step(
+                    request,
+                    item,
+                    "backlog.register_child_run",
+                    {
+                        **asdict(request),
+                        "child_kind": "issue-delivery",
+                        "child_workflow_id": child_id,
+                        "finding_id": str(gate["finding_id"]),
+                    },
+                    register_run=register_run,
+                )
+            delivery = await self._issue_delivery(gate, child_id)
+            results.append({**delivery, "attempt": attempt, "stage": "ci-repair"})
+            if delivery.get("status") != "REQUEST_CHANGES":
+                break
+        return delivery
+
     async def _after_issue_boundary(
         self,
         request: ExistingGitHubBacklogLoopInput,
@@ -2378,6 +3264,105 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             {**asdict(request), "loop_status": "CANCELLED"},
         )
         return {"status": "CANCELLED", "results": results}
+
+    async def _loop_step(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        step: str,
+        payload: dict[str, Any],
+        *,
+        register_run: bool,
+    ) -> dict[str, Any]:
+        """NEW-82: a failed loop bookkeeping activity (e.g. #1125's register_child_run
+        binding conflict) pauses the issue for the operator instead of failing the whole
+        loop; the operator's retry re-runs the step, skip/cancel end as before."""
+        while True:
+            try:
+                return await self._step(step, payload)
+            except ActivityError as error:
+                if not workflow.patched("existing-backlog-resilient-loop-steps-v1"):
+                    raise
+                blocker = "LOOP_STEP_FAILED_" + step.upper().replace(".", "_")
+                paused = {**asdict(request), "loop_status": "PAUSED", "blocker": blocker}
+                if register_run:
+                    paused["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", paused)
+                outcome, _ = await self._await_delivery_operator(
+                    request, item, blocker, register_run=register_run
+                )
+                if outcome != "RETRY":
+                    raise error
+                resumed = {**asdict(request), "loop_status": "RUNNING"}
+                if register_run:
+                    resumed["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", resumed)
+
+    async def _await_delivery_operator(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        blocker: str,
+        *,
+        register_run: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """Hold a blocked delivery until the operator cancels, skips or retries it."""
+        issue_ref = f"{item['repository']}#{item['issue_number']}"
+        self._phase = f"AWAITING_OPERATOR:{issue_ref}:{blocker}"
+        self._skip_reason = None
+        self._retry_step = None
+        while True:
+            await workflow.wait_condition(
+                lambda: (
+                    self._cancelled or self._skip_reason is not None or self._retry_step is not None
+                )
+            )
+            if self._cancelled:
+                cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                if register_run:
+                    cancel_state["workflow_id"] = workflow.info().workflow_id
+                await self._step("backlog.record_loop_state", cancel_state)
+                return "CANCELLED", {}
+            if self._skip_reason is not None:
+                reference, separator, reason = self._skip_reason.rpartition("|")
+                self._skip_reason = None
+                if not separator or reference != issue_ref:
+                    continue
+                self._phase = f"RESUMED:{issue_ref}"
+                skipped = await self._step(
+                    "backlog.record_skip",
+                    {
+                        **asdict(request),
+                        "repository": item["repository"],
+                        "issue_number": item["issue_number"],
+                        "reason_code": reason,
+                    },
+                )
+                return "SKIPPED", skipped
+            retry_ref, self._retry_step = self._retry_step, None
+            if retry_ref == issue_ref:
+                self._phase = f"RESUMED:{issue_ref}"
+                return "RETRY", {}
+
+    @staticmethod
+    async def _issue_delivery(gate: dict[str, Any], delivery_workflow_id: str) -> dict[str, Any]:
+        # A failed delivery child (e.g. NEW-23's evidence 422) must block its one issue
+        # through the normal FAILED path below, not crash the whole backlog loop.
+        try:
+            result: dict[str, Any] = await workflow.execute_child_workflow(
+                "IssueDeliveryWorkflow",
+                IssueDeliveryInput(
+                    finding_id=str(gate["finding_id"]),
+                    risk_class=str(gate["risk_class"]),
+                    dry_run=False,
+                ),
+                id=delivery_workflow_id,
+                task_queue=workflow.info().task_queue,
+                execution_timeout=timedelta(hours=12),
+            )
+        except ChildWorkflowError:
+            return {"status": "FAILED", "blocker": "DELIVERY_CHILD_WORKFLOW_FAILED"}
+        return result
 
     @staticmethod
     def _requires_operator_pause(blocker: str) -> bool:
@@ -2626,6 +3611,7 @@ ALL_WORKFLOWS = [
     RuntimeVerificationWorkflow,
     RecoveryWorkflow,
     QuotaRefreshWorkflow,
+    ConnectionsRefreshWorkflow,
     CleanupWorkflow,
     AcceptanceLifecycleWorkflow,
     ObservabilityAcceptanceWorkflow,
@@ -2638,4 +3624,5 @@ ALL_WORKFLOWS = [
     EnhancementDeliveryWorkflow,
     EnhancementSolutionLoopWorkflow,
     LLMWikiStagingBootstrapWorkflow,
+    StagingGitOpsDeliveryWorkflow,
 ]

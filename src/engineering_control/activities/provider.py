@@ -94,24 +94,37 @@ class ProviderActivityHandler:
             return CodexCLIAdapter(
                 executable=str(self.settings.codex_executable),
                 temp_root=str(self.settings.temporary_root / self.provider.value),
+                default_model=self.settings.codex_model,
             )
         return ClaudeCLIAdapter(executable=str(self.settings.claude_executable))
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         if step == "quota.refresh":
             return await self._quota_snapshot(payload)
+        if step == "delivery.invoke_spec" and payload.get("status") == "SPEC_REUSED":
+            # NEW-53: delivery.prepare_spec found this ChangeSet's OpenSpec from an
+            # earlier attempt for the same issue content; nothing to invoke.
+            return dict(payload)
         request = self._request(step, payload)
         self._validate_boundary(step, request)
+        # F-14: request.prompt (up to 200_000 chars) is already fully captured on `request`
+        # above -- nothing reads it back out of this activity's own echoed result (verified:
+        # instructions.py/the CLI adapters consume it from `request` during this same call;
+        # _persist_handoff receives `request` directly for the real handoff record, and only
+        # reads decisions/source_refs/diff/test_results/open_questions from the echoed
+        # payload). Dropping it from every echo below is the dominant fix for this step's
+        # contribution to Temporal history accretion.
+        echo_payload = self._without_prompt(payload, self._request_keys[step])
         try:
             request, bundle = self.instruction_pack.enrich(request, step)
         except (OSError, ValueError) as error:
             return self._blocked(
-                payload,
+                echo_payload,
                 "AGENT_PACK_INVALID",
                 detail=type(error).__name__,
             )
         runtime_payload = {
-            **payload,
+            **echo_payload,
             "instruction_bundle": {
                 "sha256": bundle.sha256,
                 "revision": bundle.revision,
@@ -460,6 +473,33 @@ class ProviderActivityHandler:
             test_results=self._object(self._find_value(payload, "test_results", {})),
             open_questions=self._string_list(self._find_value(payload, "open_questions", [])),
         )
+
+    _PROMPT_REDACTED = "[redacted by F-14 -- see docs/GO-STATUS.md for the history-bloat fix]"
+
+    @classmethod
+    def _without_prompt(cls, value: Any, key: str) -> Any:
+        """Return a copy of value with key's nested "prompt" field redacted to a
+        short placeholder, if present.
+
+        Deliberately REPLACES rather than removes the key (found live in
+        production, 2026-09-22): metadata.py's _agent_request() re-validates
+        this exact payload shape via AgentRequest.model_validate() when
+        persisting the agent result (agent.persist_result), and prompt is a
+        required, non-empty field on that model (min_length=1) -- fully
+        dropping the key broke that reconstruction with a pydantic
+        ValidationError on the very next real delivery attempt. The
+        placeholder satisfies validation without storing the up-to-200K-char
+        prompt content in Temporal history; nothing downstream reads
+        request.prompt's actual value (only presence/type is required).
+        """
+        if not isinstance(value, dict):
+            return value
+        if key in value and isinstance(value[key], dict):
+            trimmed = dict(value[key])
+            if "prompt" in trimmed:
+                trimmed["prompt"] = cls._PROMPT_REDACTED
+            return {**value, key: trimmed}
+        return {inner_key: cls._without_prompt(inner, key) for inner_key, inner in value.items()}
 
     @classmethod
     def _find_mapping(cls, value: Any, key: str) -> dict[str, Any] | None:

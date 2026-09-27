@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import func, select
@@ -54,10 +55,12 @@ from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.service import TypedCommandBus
 from engineering_control.workflows import definitions as workflow_definitions
 from engineering_control.workflows.definitions import (
+    AuditCampaignWorkflow,
     ExistingGitHubBacklogLoopWorkflow,
     MultiProjectAuditWorkflow,
 )
 from engineering_control.workflows.inputs import (
+    AuditCampaignInput,
     ExistingGitHubBacklogLoopInput,
     MultiProjectAuditInput,
 )
@@ -402,7 +405,7 @@ async def test_backlog_requires_server_phrase_and_prevents_duplicate_active_oper
     second = await repository.create_external(
         command,
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("telegram", 1),
     )
     assert second.operation_id == first.operation_id
@@ -453,7 +456,9 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
     with repository.sessions.begin() as session:
         snapshots = session.scalars(select(QuotaSnapshot)).all()
         for snapshot in snapshots:
-            snapshot.captured_at = datetime.now(UTC) - timedelta(minutes=10)
+            # Must exceed QUOTA_REFRESH_INTERVAL (30 min) + its staleness buffer,
+            # not an arbitrary short age -- see NEW-16 (2026-09-22).
+            snapshot.captured_at = datetime.now(UTC) - timedelta(minutes=45)
     stale = await repository.candidate(_solve_issue(), SESSION_A)
     assert stale.capability.status == "BLOCKED"
     assert {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"} <= set(stale.capability.blockers)
@@ -496,11 +501,9 @@ def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
-    assert set(repository._full_delivery_blockers("musematic")) == {
-        "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
-        "MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED",
-        "MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC",
-    }
+    # musematic now delivers through the post-merge staging GitOps flow, so the
+    # pre-merge candidate/promotion/staging-releaser blockers no longer apply.
+    assert repository._full_delivery_blockers("musematic") == []
     assert set(repository._full_delivery_blockers("llmwiki")) == {
         "LLMWIKI_CANDIDATE_BUILD_DISABLED",
         "LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED",
@@ -513,6 +516,237 @@ def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
     assert unconfigured._full_delivery_blockers("falcone") == [
         "FULL_DELIVERY_PROJECT_CONTRACT_NOT_CONFIGURED",
     ]
+
+
+def _set_staging_flow(repository: OperationsRepository, **changes: object) -> None:
+    root = repository.project_config_root
+    assert root is not None
+    path = root / "musematic.yaml"
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value["delivery_control"]["staging_flow"].update(changes)
+    path.write_text(yaml.safe_dump(value), encoding="utf-8")
+
+
+def test_staging_flow_admission_replaces_pre_merge_blockers_and_is_validated(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _set_staging_flow(repository, enabled=False)
+    assert set(repository._full_delivery_blockers("musematic")) == {
+        "MUSEMATIC_CANDIDATE_BUILD_CONTRACT_MISSING",
+        "MUSEMATIC_DIGEST_RENDERING_UNSUPPORTED",
+        "MUSEMATIC_DISCOVERED_TARGET_IS_PRODUCTION_DEGRADED_AND_OUT_OF_SYNC",
+    }
+
+    _set_staging_flow(
+        repository,
+        enabled=True,
+        argo_application="other-app",
+        namespaces=["musematic-platform", "kube-flannel"],
+        image_repositories=["ghcr.io/gntik-ai/other/image"],
+    )
+    assert set(repository._full_delivery_blockers("musematic")) == {
+        "STAGING_FLOW_ARGO_APPLICATION_MISMATCH",
+        "STAGING_FLOW_NAMESPACE_OUTSIDE_PROJECT",
+        "STAGING_FLOW_IMAGE_REPOSITORY_OUTSIDE_PROJECT",
+    }
+
+    _set_staging_flow(repository, argo_application="musematic-platform", unknown_field=True)
+    assert repository._full_delivery_blockers("musematic") == [
+        "FULL_DELIVERY_PROJECT_CONTRACT_INVALID"
+    ]
+
+
+def _seed_r3_issue(
+    repository: OperationsRepository,
+    *,
+    campaign_id: UUID,
+    project: str,
+    source_repository: str,
+    deployment_repository: str,
+    issue_number: int,
+) -> None:
+    now = datetime.now(UTC)
+    with repository.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=campaign_id,
+                project=project,
+                source_repository=source_repository,
+                deployment_repository=deployment_repository,
+                imported_at=now,
+                issue_query="is:issue is:open",
+                import_filter="bugs-and-docs",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=1,
+                eligible_count=0,
+                deferred_count=1,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                approval_binding=None,
+                approval_json={},
+                maximum_risk=None,
+                maximum_items=1,
+                maximum_concurrency=1,
+                delivery_mode=None,
+                include_enhancements=False,
+                status="PLANNED",
+                workflow_id=f"backlog-import-r3-{project}",
+            )
+        )
+        session.add(
+            BacklogIssueRecord(
+                backlog_campaign_id=campaign_id,
+                repository=source_repository,
+                issue_number=issue_number,
+                issue_url_reference=f"https://github.com/{source_repository}/issues/{issue_number}",
+                title="Bounded synthetic R3 issue",
+                state="OPEN",
+                labels_json=["bug"],
+                milestone=None,
+                issue_type="PRODUCT_BUG",
+                openspec_kind=None,
+                severity="critical",
+                calculated_risk="R3",
+                component="api",
+                source_or_deployment_owner="source",
+                documentation_levels_json=[],
+                dependencies_json=[],
+                blocking_issues_json=[],
+                issues_blocked_json=[],
+                linked_prs_json=[],
+                linked_branches_json=[],
+                linked_commits_json=[],
+                duplicate_candidates_json=[],
+                current_source_reproduction="REPRODUCED_CURRENT_SOURCE",
+                current_runtime_reproduction="NOT_REQUIRED",
+                current_runtime_required=False,
+                reproduction_mode="SOURCE_ONLY",
+                candidate_status="READY",
+                eligibility_status="DEFERRED",
+                eligibility_reason="R3_REQUIRES_OPERATOR",
+                planned_wave="W1",
+                planned_order=1,
+                finding_id=None,
+                change_set_id=None,
+                delivery_status="NOT_STARTED",
+                final_closure_status="OPEN",
+                documentation_impact="DOCUMENTATION_NOT_REQUIRED_WITH_EVIDENCE",
+                body_sha256="e" * 64,
+                github_updated_at=now,
+                github_snapshot_json={},
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_r3_issue_candidate_is_generalized_across_all_three_projects(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_r3_issue(
+        repository,
+        campaign_id=UUID("44444444-4444-4444-8444-444444444444"),
+        project="falcone",
+        source_repository="gntik-ai/falcone",
+        deployment_repository="gntik-ai/falcone-charts",
+        issue_number=953,
+    )
+    _seed_r3_issue(
+        repository,
+        campaign_id=UUID("55555555-5555-4555-8555-555555555555"),
+        project="musematic",
+        source_repository="gntik-ai/musematic",
+        deployment_repository="gntik-ai/musematic-deploy",
+        issue_number=1119,
+    )
+    _seed_r3_issue(
+        repository,
+        campaign_id=UUID("66666666-6666-4666-8666-666666666666"),
+        project="llmwiki",
+        source_repository="gntik-ai/llmwiki",
+        deployment_repository="gntik-ai/llmwiki",
+        issue_number=7,
+    )
+
+    falcone = await repository.r3_issue_candidate("falcone", "source", 953)
+    assert falcone["candidate"]["delivery_adapter"].startswith("helm:")
+    assert (
+        "helm-release-deployed-with-approved-image-digests"
+        in (falcone["candidate"]["verification"])
+    )
+    assert falcone["candidate"]["rollback"] == (
+        "helm-rollback-to-prior-revision-and-verify-exact-manifest-restored"
+    )
+    assert falcone["confirmation_phrase"].startswith("APPROVE_R3_FALCONE_953_")
+
+    musematic = await repository.r3_issue_candidate("musematic", "source", 1119)
+    assert musematic["candidate"]["delivery_adapter"] == "argocd:musematic-platform"
+    assert "Argo-Synced-and-Healthy" in musematic["candidate"]["verification"]
+    assert musematic["candidate"]["rollback"] == "revert-protected-GitOps-change-and-reconcile"
+    assert musematic["confirmation_phrase"].startswith("APPROVE_R3_MUSEMATIC_1119_")
+
+    llmwiki = await repository.r3_issue_candidate("llmwiki", "source", 7)
+    assert llmwiki["candidate"]["delivery_adapter"].startswith("repo-local-manifest:")
+    assert "staging-manifest-applied" in llmwiki["candidate"]["verification"]
+    assert llmwiki["confirmation_phrase"].startswith("APPROVE_R3_LLMWIKI_7_")
+
+
+def test_r3_issue_candidate_rejects_unknown_project_and_fails_closed_without_manifest(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="not allowlisted"):
+        OperationsRepository._r3_issue_candidate(Mock(), "not-a-real-project", "source", 1)
+    unconfigured = OperationsRepository(f"sqlite+pysqlite:///{tmp_path / 'unconfigured.db'}")
+    with pytest.raises(ValueError, match="unconfigured or invalid"):
+        unconfigured._r3_issue_candidate("falcone", "source", 1)
+
+
+@pytest.mark.asyncio
+async def test_audit_campaign_reports_clean_blocker_for_zero_coverage_cells() -> None:
+    """NEW-14: a leaner project's plan can legitimately yield zero domains/personas/lenses
+    for a preset built with a richer project in mind. That must surface as a diagnosed
+    BLOCKED result, not a crash from persist_coverage rejecting total=0.
+    """
+    instance = AuditCampaignWorkflow()
+    instance._checkpoint = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    persist_coverage_called = False
+
+    async def step(name: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if name == "campaign.plan":
+            return {"domains": [], "personas": ["anonymous"], "lenses": ["correctness"]}
+        if name == "project.snapshot":
+            return {"campaign_id": "11111111-1111-4111-8111-111111111111"}
+        if name == "project.persist_snapshot":
+            return {}
+        if name == "github.refresh_mirrors":
+            return {}
+        if name == "campaign.persist_coverage":
+            nonlocal persist_coverage_called
+            persist_coverage_called = True
+            return {"status": "COVERAGE_PERSISTED"}
+        return {"status": "OK"}
+
+    instance._step = step  # type: ignore[method-assign]
+
+    result = await instance.run(
+        AuditCampaignInput(project="llmwiki", preset="static-full", environment="staging")
+    )
+
+    assert result == {
+        "status": "BLOCKED",
+        "campaign_id": "11111111-1111-4111-8111-111111111111",
+        "blocker": "NO_APPLICABLE_COVERAGE_CELLS",
+    }
+    assert persist_coverage_called is False
 
 
 def test_audit_publication_is_opt_in_and_full_audit_requires_phrase() -> None:
@@ -746,7 +980,7 @@ async def test_bounded_evidence_exports_are_typed_redacted_expiring_and_cross_ch
     workflow_operation = await bus.submit(
         EvidenceExportWorkflowCommand(workflow_id=workflow_id),
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("workflow-export", 1),
     )
     assert workflow_operation.status == "COMPLETED"
@@ -935,7 +1169,7 @@ async def test_enhancement_actions_use_immutable_binding_and_typed_services(
     started = await bus.submit(
         run,
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("enhancement-run", 1),
     )
     assert started.workflow_id == "enhance-solution-synthetic"
@@ -996,7 +1230,7 @@ async def test_cli_and_telegram_share_one_command_bus_and_workflow_identity(
     telegram = await bus.submit(
         _solve_issue(),
         source_channel="telegram",
-        operator_class="telegram:allowlisted",
+        operator_class="telegram:42",
         idempotency_key=_idempotency_fixture("telegram", 2),
     )
     assert cli.operation_id == telegram.operation_id
@@ -1046,7 +1280,8 @@ async def test_state_dependent_workflow_controls_use_only_typed_signals(
             operator_class="engineering-ctl:hermes",
             idempotency_key=_idempotency_fixture("control", ordinal),
         )
-        assert result.status == "STARTED"
+        # NEW-35: a delivered control signal is complete; it started no workflow.
+        assert result.status == "COMPLETED"
         assert result.workflow_id == workflow_id
     assert control.signal.await_count == 7
     signals = [call.args for call in control.signal.await_args_list]
@@ -1380,6 +1615,11 @@ async def test_global_child_returns_blocker_without_waiting_or_completing_issue(
 
     instance._step = step  # type: ignore[method-assign]
     monkeypatch.setattr(workflow_definitions.workflow, "patched", lambda _name: True)
+    monkeypatch.setattr(
+        workflow_definitions.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id="synthetic-global-blocker", task_queue="engineering"),
+    )
 
     result = await instance.run(
         ExistingGitHubBacklogLoopInput(
@@ -1803,3 +2043,121 @@ def test_operator_pause_classification_is_fail_closed_for_high_impact_blockers()
     assert required("SECRET_LIFECYCLE_UNRESOLVED")
     assert required("EXTERNAL_REVISION_DRIFT")
     assert not required("INDEPENDENT_TEST_FAILURE")
+
+
+@pytest.mark.asyncio
+async def test_solve_waits_for_the_policy_reconciler_before_starting(tmp_path: Path) -> None:
+    # NEW-26: solve_backlog/solve_issue approved and started in one call; the loop moved
+    # the campaign to RUNNING within milliseconds, so the root reconciler rejected the
+    # queued request ("campaign state is invalid") and the write policy stayed disabled.
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    order: list[str] = []
+    control = Mock()
+
+    async def start(_: object) -> OperationAccepted:
+        order.append("start")
+        return OperationAccepted(workflow_id="backlog-loop-synthetic", run_id="run-1")
+
+    async def campaign(_: object) -> dict[str, str]:
+        order.append("poll")
+        return {"status": "APPROVED" if order.count("poll") >= 2 else "APPROVED_POLICY_PENDING"}
+
+    control.start_existing_backlog_loop = AsyncMock(side_effect=start)
+    metadata = Mock()
+    metadata.prepare_backlog_approval = AsyncMock(return_value={"approval_binding": "f" * 64})
+    metadata.approve_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING"}
+    )
+    metadata.get_backlog_campaign = AsyncMock(side_effect=campaign)
+    bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
+    bus.policy_activation_poll_seconds = 0
+
+    view = await bus.submit(
+        _solve_issue(),
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("cli", 1),
+    )
+
+    assert view.workflow_id == "backlog-loop-synthetic"
+    assert order == ["poll", "poll", "start"]
+
+
+@pytest.mark.asyncio
+async def test_solve_blocks_instead_of_starting_without_an_active_write_policy(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    control = Mock()
+    control.start_existing_backlog_loop = AsyncMock()
+    metadata = Mock()
+    metadata.prepare_backlog_approval = AsyncMock(return_value={"approval_binding": "f" * 64})
+    metadata.approve_backlog_campaign = AsyncMock(
+        return_value={"status": "APPROVED_POLICY_PENDING"}
+    )
+    metadata.get_backlog_campaign = AsyncMock(return_value={"status": "APPROVED_POLICY_PENDING"})
+    bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
+    bus.policy_activation_timeout_seconds = 0
+    bus.policy_activation_poll_seconds = 0
+
+    view = await bus.submit(
+        _solve_issue(),
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("cli", 1),
+    )
+
+    assert view.status == "BLOCKED"
+    assert "policy activation did not complete" in str(view.safe_error)
+    control.start_existing_backlog_loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_paused_loop_can_be_retried_more_than_once(tmp_path: Path) -> None:
+    # NEW-35: the first backlog-retry of the paused musematic #1026 loop stayed STARTED
+    # against that long-lived loop, so the second retry was deduplicated onto it and
+    # no signal was sent.
+    repository = _repository(tmp_path)
+    with repository.sessions.begin() as session:
+        session.add(
+            Run(
+                campaign_id=None,
+                change_set_id=None,
+                workflow_id="backlog-loop-musematic-paused",
+                run_type="existing-github-backlog-loop",
+                status="PAUSED",
+                project="musematic",
+                worker="controller",
+                started_at=datetime.now(UTC),
+                finished_at=None,
+                error_code=None,
+                summary=None,
+            )
+        )
+    control = Mock()
+    control.signal = AsyncMock(return_value=None)
+    bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
+    command = WorkflowControlCommand(
+        action="retry",
+        workflow_id="backlog-loop-musematic-paused",
+        repository="musematic",
+        issue_number=1026,
+    )
+
+    first = await bus.submit(
+        command,
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("retry", 1),
+    )
+    second = await bus.submit(
+        command,
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("retry", 2),
+    )
+
+    assert first.operation_id != second.operation_id
+    assert control.signal.await_count == 2

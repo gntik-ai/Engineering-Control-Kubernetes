@@ -86,6 +86,29 @@ class AgentRequest(StrictModel):
         return values
 
 
+def resolve_agent_effort(
+    model_class: ModelClass,
+    *,
+    writable: bool = False,
+    risk: RiskClass | None = None,
+    trivial: bool = False,
+) -> str:
+    """Map model tier, write-access, and risk to a consistent CLI effort level.
+
+    Centralizes what were 13 independently hardcoded literals across activities/
+    engineering.py and activities/metadata.py into the convention they already
+    implicitly followed (verified against every existing call site's current
+    value before migrating any of them): trivial synthetic canaries always get
+    "low" regardless of tier; code-producing (writable) work, R3-risk work, and
+    JUDGE-tier review work all get "high"; everything else gets "medium". F-16.
+    """
+    if trivial:
+        return "low"
+    if writable or risk is RiskClass.R3 or model_class is ModelClass.JUDGE:
+        return "high"
+    return "medium"
+
+
 class AgentResult(StrictModel):
     run_id: UUID
     provider: Provider
@@ -100,6 +123,9 @@ class AgentResult(StrictModel):
     finished_at: datetime
     exit_code: int | None = None
     error_code: str | None = None
+    # NEW-53: the CLI gave up on structured output, but its last candidate passed the
+    # original Draft 2020-12 output schema and was accepted by the adapter.
+    recovered_from_structured_retry: bool = False
 
 
 class ArtifactMetadata(StrictModel):

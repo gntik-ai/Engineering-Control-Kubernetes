@@ -335,7 +335,9 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
         older.imported_at = now - timedelta(days=1)
         newer = _backlog_campaign("falcone", "falcone-import-newer")
         newer.imported_at = now
-        session.add_all([older, newer])
+        other_project = _backlog_campaign("musematic", "musematic-import-same-reference")
+        other_project.imported_at = now + timedelta(hours=1)
+        session.add_all([older, newer, other_project])
         session.flush()
         older_issue = _issue(older.id, 11, "Older queued API repair", "QUEUED")
         older_issue.updated_at = now + timedelta(minutes=1)
@@ -343,11 +345,16 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
         current_issue.updated_at = now
         tied_issue = _issue(newer.id, 12, "Current tied API repair", "BLOCKED")
         tied_issue.updated_at = now
+        other_project_issue = _issue(
+            other_project.id, 11, "Musematic retained same reference", "BLOCKED"
+        )
+        other_project_issue.updated_at = now + timedelta(hours=1)
         session.add_all(
             [
                 older_issue,
                 current_issue,
                 tied_issue,
+                other_project_issue,
             ]
         )
         session.flush()
@@ -372,6 +379,9 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
     all_projects = await repository.list_backlog(
         project=None, status=None, search=None, page=1, page_size=10
     )
+    second_page = await repository.list_backlog(
+        project="falcone", status=None, search=None, page=2, page_size=1
+    )
 
     assert projected["total"] == 2
     assert [item["issue_number"] for item in projected["items"]] == expected_tied_order
@@ -381,9 +391,16 @@ async def test_backlog_projects_only_latest_campaign_row_for_each_issue(
     assert old_search["total"] == 0
     assert stale_status["total"] == 0
     assert current_status["total"] == 2
-    assert all_projects["total"] == 2
+    assert all_projects["total"] == 3
+    assert {item["project"] for item in all_projects["items"] if item["issue_number"] == 11} == {
+        "falcone",
+        "musematic",
+    }
+    assert second_page["total"] == 2
+    assert second_page["pages"] == 2
+    assert [item["issue_number"] for item in second_page["items"]] == [expected_tied_order[1]]
     with repository.sessions() as session:
-        assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 3
+        assert session.scalar(select(func.count()).select_from(BacklogIssueRecord)) == 4
 
 
 @pytest.mark.asyncio

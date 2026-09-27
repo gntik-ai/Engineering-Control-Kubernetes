@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -82,7 +83,7 @@ class BrowserActivityHandler:
             "ENGINEERING_JOURNEY_OUTPUT": str(output),
             **credentials,
         }
-        result = self.runner.run(
+        result = await self.runner.run_async(
             "node",
             [str(self.settings.browser_script)],
             cwd=self.settings.browser_script.parent,
@@ -384,7 +385,8 @@ class BrowserActivityHandler:
                     "status": "BLOCKED",
                     "blocker": "EPHEMERAL_FALCONE_SESSION_TOKEN_UNAVAILABLE",
                 }
-            results = self.consumer_suite.run(
+            results = await asyncio.to_thread(
+                self.consumer_suite.run,
                 source_worktree=worktree,
                 command_ids=("lint", "test", "smoke", "e2e", "s14", "s14-integration"),
                 falcone_access_token=token,
@@ -603,7 +605,7 @@ class BrowserActivityHandler:
                         "ENGINEERING_JOURNEY_OUTPUT": str(output),
                         **credentials,
                     }
-                    result = self.runner.run(
+                    result = await self.runner.run_async(
                         "node",
                         [str(self.settings.browser_script)],
                         cwd=self.settings.browser_script.parent,

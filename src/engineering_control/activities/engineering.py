@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.activities.gitops import StagingFlowBlocked, enabled_staging_flow
 from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.engineering.backlog import (
@@ -35,7 +36,7 @@ from engineering_control.identity.attestation import (
     observer_contract_hash,
     superadmin_contract_hash,
 )
-from engineering_control.models.core import AgentRequest
+from engineering_control.models.core import AgentRequest, resolve_agent_effort
 from engineering_control.models.enums import ModelClass, Project, Provider
 
 
@@ -128,13 +129,14 @@ class EngineeringActivityHandler:
             "backlog.record_approval",
             "backlog.record_skip",
             "backlog.record_retry",
-            "backlog.delivery_candidate",
             "backlog.load_execution",
             "backlog.materialize_candidate",
             "backlog.record_revalidation",
             "backlog.revalidate_gate",
             "backlog.record_loop_state",
+            "notify.write_policy_required",
             "backlog.register_child_run",
+            "backlog.register_run",
             "global_backlog.register",
             "global_backlog.select_next",
             "global_backlog.record_result",
@@ -257,8 +259,6 @@ class EngineeringActivityHandler:
             return self._record_backlog_skip(payload)
         if step == "backlog.record_retry":
             return self._record_backlog_retry(payload)
-        if step == "backlog.delivery_candidate":
-            return self._backlog_delivery_candidate(payload)
         if step == "backlog.load_execution":
             return self._load_backlog_execution(payload)
         if step == "backlog.materialize_candidate":
@@ -269,8 +269,12 @@ class EngineeringActivityHandler:
             return self._backlog_revalidate_gate(payload)
         if step == "backlog.record_loop_state":
             return self._record_backlog_loop_state(payload)
+        if step == "notify.write_policy_required":
+            return self._notify_write_policy_required(payload)
         if step == "backlog.register_child_run":
             return self._register_backlog_child_run(payload)
+        if step == "backlog.register_run":
+            return self._register_backlog_run(payload)
         if step == "global_backlog.register":
             return self._register_global_backlog(payload)
         if step == "global_backlog.select_next":
@@ -396,7 +400,7 @@ class EngineeringActivityHandler:
             working_directory=worktree,
             output_schema=schema,
             timeout_seconds=3600,
-            effort="medium",
+            effort=resolve_agent_effort(ModelClass.WORKER),
             writable=False,
             campaign_id=campaign_id,
         )
@@ -434,7 +438,7 @@ class EngineeringActivityHandler:
             working_directory=str(discovery["working_directory"]),
             output_schema=self._enhancement_review_schema(),
             timeout_seconds=3600,
-            effort="high",
+            effort=resolve_agent_effort(ModelClass.JUDGE),
             writable=False,
             campaign_id=campaign_id,
         )
@@ -874,7 +878,11 @@ class EngineeringActivityHandler:
         supplied = str(payload.get("approval_binding", ""))
         confirmation = str(payload.get("typed_confirmation", ""))
         actor = str(payload.get("actor", ""))
-        if confirmation != BACKLOG_APPROVAL_PHRASE or not actor.startswith("telegram:"):
+        if (
+            confirmation != BACKLOG_APPROVAL_PHRASE
+            or not actor.startswith("telegram:")
+            or not is_reauthenticated_backlog_operator(actor)
+        ):
             return {**payload, "status": "BLOCKED", "blocker": "BACKLOG_APPROVAL_INVALID"}
         with self.sessions.begin() as session:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
@@ -925,20 +933,6 @@ class EngineeringActivityHandler:
             row.eligibility_reason = "OPERATOR_RETRY_REQUESTED"
             row.delivery_status = "NOT_STARTED"
         return self._envelope("backlog.record_retry", payload, "RETRY_QUEUED")
-
-    def _backlog_delivery_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        issue = self._backlog_issue_for_update(payload)
-        return self._envelope(
-            "backlog.delivery_candidate",
-            {
-                **payload,
-                "issue": self._serialize_backlog_issue(issue),
-                "blockers": self._delivery_blockers(issue),
-            },
-            "AWAITING_STAGING_DELIVERY"
-            if not self._delivery_blockers(issue)
-            else "BLOCKED_BY_DELIVERY",
-        )
 
     def _load_backlog_execution(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
@@ -1629,6 +1623,16 @@ class EngineeringActivityHandler:
             self._write_policy_request(deactivation)
         return {**payload, "status": terminal}
 
+    def _runtime_proven_after_deploy(self, payload: dict[str, Any]) -> bool:
+        """NEW-69: full delivery with an enabled staging flow verifies the runtime."""
+        if payload.get("delivery_mode") != "full-delivery":
+            return False
+        try:
+            enabled_staging_flow(self.settings.project_config_root, str(payload.get("project")))
+        except (StagingFlowBlocked, ValueError):
+            return False
+        return True
+
     def _backlog_revalidate_gate(self, payload: dict[str, Any]) -> dict[str, Any]:
         item = payload.get("item")
         if not isinstance(item, dict):
@@ -1656,7 +1660,15 @@ class EngineeringActivityHandler:
             "REPRODUCED_CURRENT_DEPLOYMENT",
             "PROVEN_ALREADY_FIXED",
         }
-        if mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"}:
+        # NEW-69 (operator decision 2026-09-26): no step records a runtime reproduction,
+        # so RUNTIME_REQUIRED issues (any text mentioning staging, login, 404, ...) could
+        # never be delivered. In full delivery through an enabled staging flow, the
+        # post-deploy verification (Argo sync + workloads on the new image) is the runtime
+        # proof; such issues proceed on the current-source revalidation.
+        runtime_gate = mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"} and not (
+            self._runtime_proven_after_deploy(payload)
+        )
+        if runtime_gate:
             reproduced = reproduced and runtime in {
                 "REPRODUCED_CURRENT_RUNTIME",
                 "REPRODUCED_CURRENT_DEPLOYMENT",
@@ -1667,7 +1679,7 @@ class EngineeringActivityHandler:
                 "status": "BLOCKED",
                 "blocker": (
                     "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
-                    if mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"}
+                    if runtime_gate
                     else "CURRENT_SOURCE_REVALIDATION_REQUIRED"
                 ),
             }
@@ -1738,11 +1750,26 @@ class EngineeringActivityHandler:
                 session.add(campaign)
             coverage = session.get(db.CoverageCell, coverage_id)
             if coverage is None:
+                # NEW-16 follow-up, 2026-09-22: uq_coverage_cell is keyed on
+                # (campaign_id, repository_surface, domain, persona, flow, lens,
+                # environment) -- NOT this row's own primary key. persona/flow/
+                # lens/environment are fixed literals for every backlog issue
+                # (see below), so domain is the only column with enough
+                # variability to distinguish issues -- but plain
+                # record.component collides the moment two issues in the same
+                # campaign share a component, hit live in production on the
+                # first campaign that ever attempted more than one issue.
+                # Suffixing the issue reference guarantees a unique domain per
+                # issue while keeping the component prefix for readability;
+                # truncated so the issue suffix always survives even if
+                # component (up to 200 chars) alone would have exceeded 120.
+                domain_suffix = f":{issue_key}"
+                domain = (record.component[: 120 - len(domain_suffix)] + domain_suffix)[:120]
                 coverage = db.CoverageCell(
                     id=coverage_id,
                     campaign_id=campaign_id,
                     repository_surface=record.source_or_deployment_owner,
-                    domain=record.component[:120],
+                    domain=domain,
                     persona="existing-github-issue",
                     flow="current-state-revalidation",
                     lens="correctness",
@@ -1886,16 +1913,113 @@ class EngineeringActivityHandler:
             "REVALIDATION_RECORDED",
         )
 
+    _CTL = "/opt/engineering-control/venv/bin/engineering-ctl"
+
+    def _notify_write_policy_required(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-84: tell the operator (Telegram, via the outbox) that a flow waits for a
+        GitHub write approval, with the exact commands; the flow resumes by itself."""
+
+        def bounded(key: str, pattern: str) -> str | None:
+            value = str(payload.get(key) or "")
+            return value if re.fullmatch(pattern, value) else None
+
+        project = bounded("project", r"falcone|musematic|llmwiki")
+        campaign = bounded("backlog_campaign_id", r"[0-9a-f-]{36}")
+        workflow_id = bounded("workflow_id", r"[A-Za-z0-9._:-]{1,300}")
+        step = bounded("step", r"[a-z_]+\.[a-z_]+")
+        reason = bounded("reason_code", r"[A-Z0-9_]{1,120}") or "POLICY_DENIED"
+        issue = bounded("issue", r"[A-Za-z0-9._/-]{1,120}#[0-9]{1,9}")
+        if project and campaign:
+            commands = [
+                f"{self._CTL} backlog-approval-candidate {project} {campaign} "
+                "full-delivery R2 --max-items 1",
+                f"{self._CTL} backlog-approve {project} {campaign} <approval_binding from the "
+                "previous output> APPROVE_EXISTING_GITHUB_BACKLOG_LOOP",
+            ]
+        else:
+            commands = [f"{self._CTL} backlog-status <loop workflow id> to find the campaign"]
+        message = (
+            f"Hermes is waiting for a GitHub write approval ({reason})"
+            + (f" for {issue}" if issue else "")
+            + f" at {step or 'a write step'}. Approve the campaign; the flow re-checks every "
+            "5 minutes and resumes by itself."
+        )
+        with self.sessions.begin() as session:
+            session.add(
+                db.NotificationOutbox(
+                    topic="telegram.engineering-write-policy-required",
+                    status="PENDING",
+                    payload_json={
+                        "message": message,
+                        "project": project,
+                        "backlog_campaign_id": campaign,
+                        "workflow_id": workflow_id,
+                        "step": step,
+                        "reason_code": reason,
+                        "commands": commands,
+                    },
+                    attempts=0,
+                    next_attempt_at=datetime.now(UTC),
+                    delivered_at=None,
+                    last_error_code=None,
+                )
+            )
+        return {"status": "NOTIFIED"}
+
+    @staticmethod
+    def _release_loop_child_leases(session: Any, loop_workflow_id: str) -> int:
+        """Release every unreleased lease owned by one loop's child runs."""
+        child_runs = set(
+            session.scalars(
+                select(db.Run.id).where(db.Run.workflow_id.like(f"{loop_workflow_id}-issue-%"))
+            ).all()
+        )
+        if not child_runs:
+            return 0
+        now = datetime.now(UTC)
+        released = 0
+        for model in (db.ComponentLease, db.WorktreeLease):
+            for lease in session.scalars(
+                select(model).where(
+                    model.owner_run_id.in_(child_runs),
+                    model.released_at.is_(None),
+                )
+            ).all():
+                lease.released_at = now
+                released += 1
+        return released
+
     def _record_backlog_loop_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
         status = str(payload.get("loop_status", "PAUSED"))
-        if status not in {"PAUSED", "CANCELLED", "COMPLETE", "RUNNING", "STOPPED"}:
+        if status not in {"PAUSED", "CANCELLED", "COMPLETE", "RUNNING", "STOPPED", "FAILED"}:
             raise ValueError("backlog loop status is not allowlisted")
+        run_workflow_id = payload.get("workflow_id")
         deactivation: dict[str, Any] | None = None
         with self.sessions.begin() as session:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
+            if isinstance(run_workflow_id, str) and run_workflow_id:
+                # NEW-16: the top-level loop run must reach a terminal Run.status
+                # here (whichever branch below returns) so OperationsRepository's
+                # self-heal can ever recognize this operation as finished. Without
+                # this, an operation record keyed on this workflow stays STARTED
+                # forever and permanently blocks every future attempt.
+                run = session.scalar(select(db.Run).where(db.Run.workflow_id == run_workflow_id))
+                if run is not None:
+                    run.status = status
+                    # NEW-33b: a paused loop is still alive; only terminal states finish it.
+                    run.finished_at = (
+                        datetime.now(UTC)
+                        if status in {"CANCELLED", "COMPLETE", "STOPPED", "FAILED"}
+                        else None
+                    )
+                if status in {"CANCELLED", "STOPPED", "FAILED"}:
+                    # NEW-60: a cancelled loop's child runs never reach their own lease
+                    # release; the next loop for the same issue then failed with
+                    # COMPONENT_LEASE_CONFLICT / worktree lease conflicts (#993).
+                    self._release_loop_child_leases(session, run_workflow_id)
             raw_global_id = payload.get("global_campaign_id")
             linked_global_ids = {
                 candidate.id
@@ -1955,6 +2079,38 @@ class EngineeringActivityHandler:
             self._write_policy_request(deactivation)
         return self._envelope("backlog.record_loop_state", payload, status)
 
+    def _register_backlog_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = UUID(str(payload["backlog_campaign_id"]))
+        workflow_id = str(payload.get("workflow_id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", workflow_id):
+            raise ValueError("backlog run workflow identity is invalid")
+        with self.sessions.begin() as session:
+            campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
+            if campaign is None:
+                raise ValueError("backlog campaign disappeared")
+            existing = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id))
+            if existing is not None:
+                return self._envelope(
+                    "backlog.register_run",
+                    {**payload, "run_id": str(existing.id)},
+                    "REGISTERED",
+                )
+            run = db.Run(
+                campaign_id=None,
+                workflow_id=workflow_id,
+                run_type="existing-backlog-loop",
+                status="RUNNING",
+                project=campaign.project,
+                started_at=datetime.now(UTC),
+            )
+            session.add(run)
+            session.flush()
+            return self._envelope(
+                "backlog.register_run",
+                {**payload, "run_id": str(run.id)},
+                "REGISTERED",
+            )
+
     def _register_backlog_child_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         child_kind = str(payload.get("child_kind", ""))
         child_workflow_id = str(payload.get("child_workflow_id", ""))
@@ -1964,6 +2120,7 @@ class EngineeringActivityHandler:
             "delivery-reconciliation",
             "staging-deployment",
             "runtime-verification",
+            "staging-gitops",
         }
         if child_kind not in allowed:
             raise ValueError("backlog child run kind is not allowlisted")
@@ -2060,19 +2217,6 @@ class EngineeringActivityHandler:
             return row
 
     @staticmethod
-    def _delivery_blockers(issue: db.BacklogIssueRecord) -> list[str]:
-        blockers: list[str] = []
-        if issue.change_set_id is None:
-            blockers.append("CHANGE_SET_NOT_CREATED")
-        if issue.documentation_impact == "BLOCKED_BY_UNRESOLVED_DOCUMENTATION_IMPACT":
-            blockers.append("DOCUMENTATION_IMPACT_UNRESOLVED")
-        if issue.current_runtime_required and issue.current_runtime_reproduction != (
-            "REPRODUCED_CURRENT_RUNTIME"
-        ):
-            blockers.append("CURRENT_RUNTIME_REPRODUCTION_REQUIRED")
-        return blockers
-
-    @staticmethod
     def _serialize_backlog_campaign(campaign: db.GitHubBacklogCampaign) -> dict[str, Any]:
         return {
             "backlog_campaign_id": str(campaign.id),
@@ -2143,6 +2287,7 @@ class EngineeringActivityHandler:
             "final_closure_status": issue.final_closure_status,
             "documentation_impact": issue.documentation_impact,
             "github_updated_at": issue.github_updated_at.isoformat(),
+            "body_sha256": issue.body_sha256,
         }
 
     def _backlog_campaign_envelope(

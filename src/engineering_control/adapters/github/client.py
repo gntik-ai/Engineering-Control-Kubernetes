@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pwd
@@ -20,7 +21,15 @@ ALLOWED_REPOSITORIES = frozenset(
     }
 )
 READ_ONLY_REPOSITORIES: frozenset[str] = frozenset()
+# NEW-63: the only content Hermes writes to a CI baseline branch.
+BASELINE_MARKER_CONTENT = (
+    "# Hermes CI baseline marker: makes path-filtered CI jobs run on unchanged main.\n"
+    "# Lives only on hermes/ci-baseline/* branches; never merged.\n"
+)
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'-]{1,500}$")
+STAGING_GITOPS_MARKER = re.compile(
+    r"<!-- engineering-control-staging-gitops:[a-z-]{1,40}:[a-f0-9-]{36}(?::[a-z0-9-]{1,40})? -->"
+)
 
 
 class GhCliAuthError(RuntimeError):
@@ -242,6 +251,21 @@ class GhCliBroker:
             raise GhCliPolicyError("issue comments response is unbounded")
         return value
 
+    def view_issue_body(self, repository: str, number: int) -> dict[str, Any]:
+        """Read one issue's current state and body (read-only)."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("issue number is invalid")
+        value = self._json(
+            self._run(
+                ["issue", "view", str(number), "--repo", repository, "--json", "number,state,body"]
+            ).stdout,
+            "issue",
+        )
+        if not isinstance(value, dict) or not isinstance(value.get("body"), str):
+            raise GhCliPolicyError("issue body response is invalid")
+        return value
+
     def list_workflow_runs(
         self,
         repository: str,
@@ -456,8 +480,12 @@ class GhCliBroker:
         expected_head_sha: str,
         expected_base_branch: str,
         change_binding: str,
+        allow_unstable: bool = False,
     ) -> dict[str, Any]:
+        """Merge the bound head. ``allow_unstable`` (NEW-63) is passed only after the CI
+        baseline gate attributed every failing non-required check to unchanged main."""
         repository = self._write(repository, change_binding)
+        accepted_states = {"CLEAN", "UNSTABLE"} if allow_unstable else {"CLEAN"}
         expected_base_branch = self._value(
             expected_base_branch, "protected merge base branch", maximum=120
         )
@@ -473,7 +501,7 @@ class GhCliBroker:
             if (
                 current.get("state") != "OPEN"
                 or current.get("isDraft") is not False
-                or current.get("mergeStateStatus") != "CLEAN"
+                or current.get("mergeStateStatus") not in accepted_states
             ):
                 raise GhCliPolicyError("protected merge preconditions are not satisfied")
             self._run(
@@ -593,6 +621,357 @@ class GhCliBroker:
             )
             issue = self.view_issue(repository, number)
         if issue.get("state") != "CLOSED" or not issue.get("closedAt"):
+            raise GhCliPolicyError("issue closure was not confirmed")
+        return {
+            "status": "CLOSED",
+            "issue_url": issue.get("url"),
+            "closed_at": issue.get("closedAt"),
+        }
+
+    def mark_pull_request_ready(
+        self,
+        *,
+        repository: str,
+        number: int,
+        expected_head_sha: str,
+        change_binding: str,
+    ) -> dict[str, Any]:
+        """Take a draft PR out of draft only while it still points at the bound head."""
+        repository = self._write(repository, change_binding)
+        if number < 1 or not re.fullmatch(r"[a-f0-9]{40}", expected_head_sha):
+            raise GhCliPolicyError("ready-for-review binding is invalid")
+        current = self.view_pull_request(repository, number)
+        if current.get("headRefOid") != expected_head_sha:
+            raise GhCliPolicyError("pull request head changed before ready-for-review")
+        if current.get("state") == "MERGED":
+            return current
+        if current.get("state") != "OPEN":
+            raise GhCliPolicyError("pull request is not open")
+        if current.get("isDraft") is not False:
+            self._run(["pr", "ready", str(number), "--repo", repository])
+            current = self.view_pull_request(repository, number)
+        if current.get("headRefOid") != expected_head_sha:
+            raise GhCliPolicyError("pull request head changed during ready-for-review")
+        return current
+
+    def list_tag_refs(self, repository: str, prefix: str) -> list[dict[str, str]]:
+        """Return bounded tag refs under refs/tags/<prefix> as {ref, sha, type}."""
+        repository = self._batch(repository)
+        if not re.fullmatch(r"[A-Za-z]{0,8}", prefix):
+            raise GhCliPolicyError("tag prefix is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/git/matching-refs/tags/{prefix}",
+                "--paginate",
+                "--jq",
+                ".[] | {ref: .ref, sha: .object.sha, type: .object.type}",
+            ]
+        ).stdout
+        lines = [line for line in raw.splitlines() if line.strip()]
+        if len(lines) > 5000:
+            raise GhCliPolicyError("tag listing is unbounded")
+        refs: list[dict[str, str]] = []
+        for line in lines:
+            value = self._json(line, "tag ref")
+            if not isinstance(value, dict):
+                raise GhCliPolicyError("tag ref is not an object")
+            refs.append({key: str(value.get(key) or "") for key in ("ref", "sha", "type")})
+        return refs
+
+    def create_tag_ref(
+        self, *, repository: str, tag: str, sha: str, change_binding: str
+    ) -> dict[str, str]:
+        """Create one lightweight tag ref at an exact commit (never moves a tag)."""
+        repository = self._write(repository, change_binding)
+        if not re.fullmatch(r"[A-Za-z]{0,8}[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", tag):
+            raise GhCliPolicyError("release tag is not a bounded semantic version")
+        if not re.fullmatch(r"[a-f0-9]{40}", sha):
+            raise GhCliPolicyError("release tag target is not an exact commit")
+        value = self._json(
+            self._run(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"repos/{repository}/git/refs",
+                    "-f",
+                    f"ref=refs/tags/{tag}",
+                    "-f",
+                    f"sha={sha}",
+                    "--jq",
+                    "{ref: .ref, sha: .object.sha}",
+                ]
+            ).stdout,
+            "created tag ref",
+        )
+        if (
+            not isinstance(value, dict)
+            or value.get("ref") != f"refs/tags/{tag}"
+            or value.get("sha") != sha
+        ):
+            raise GhCliPolicyError("created tag ref does not match its binding")
+        return {"ref": f"refs/tags/{tag}", "sha": sha}
+
+    # -- NEW-63: CI baseline pull requests (only ever on hermes/ci-baseline/* branches) --
+
+    def pull_request_files(self, repository: str, number: int) -> list[str]:
+        """Return the bounded list of paths changed by one pull request."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("pull request number is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/pulls/{number}/files",
+                "--paginate",
+                "--jq",
+                ".[].filename",
+            ]
+        ).stdout
+        paths = [line for line in raw.splitlines() if line.strip()]
+        if len(paths) > 3000:
+            raise GhCliPolicyError("pull request file listing is unbounded")
+        return paths
+
+    def create_baseline_branch(
+        self, *, repository: str, branch: str, sha: str, change_binding: str
+    ) -> None:
+        """Create one CI baseline branch at an exact commit (never moves an existing ref)."""
+        repository = self._write(repository, change_binding)
+        branch = self._baseline_branch(branch)
+        if not re.fullmatch(r"[a-f0-9]{40}", sha):
+            raise GhCliPolicyError("baseline branch target is not an exact commit")
+        value = self._json(
+            self._run(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"repos/{repository}/git/refs",
+                    "-f",
+                    f"ref=refs/heads/{branch}",
+                    "-f",
+                    f"sha={sha}",
+                    "--jq",
+                    "{ref: .ref, sha: .object.sha}",
+                ]
+            ).stdout,
+            "created baseline branch",
+        )
+        if (
+            not isinstance(value, dict)
+            or value.get("ref") != f"refs/heads/{branch}"
+            or value.get("sha") != sha
+        ):
+            raise GhCliPolicyError("created baseline branch does not match its binding")
+
+    def put_baseline_marker(
+        self, *, repository: str, branch: str, path: str, change_binding: str
+    ) -> None:
+        """Commit one fixed marker file to a CI baseline branch (contents API)."""
+        repository = self._write(repository, change_binding)
+        branch = self._baseline_branch(branch)
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._/-]{1,240}", path)
+            or ".." in path.split("/")
+            or path.startswith((".github/", "/"))
+        ):
+            raise GhCliPolicyError("baseline marker path is invalid")
+        content = base64.b64encode(BASELINE_MARKER_CONTENT.encode()).decode()
+        self._run(
+            [
+                "api",
+                "-X",
+                "PUT",
+                f"repos/{repository}/contents/{path}",
+                "-f",
+                "message=ci: Hermes CI baseline marker (never merged)",
+                "-f",
+                f"content={content}",
+                "-f",
+                f"branch={branch}",
+                "--jq",
+                ".commit.sha",
+            ]
+        )
+
+    def close_baseline_pull_request(
+        self, *, repository: str, number: int, change_binding: str
+    ) -> None:
+        """Close a CI baseline PR and delete its branch; refuses any other PR."""
+        repository = self._write(repository, change_binding)
+        current = self.view_pull_request(repository, number)
+        branch = self._baseline_branch(str(current.get("headRefName") or ""))
+        if current.get("state") == "OPEN":
+            self._run(["pr", "close", str(number), "--repo", repository])
+        self.delete_baseline_branch(
+            repository=repository, branch=branch, change_binding=change_binding
+        )
+
+    def delete_baseline_branch(self, *, repository: str, branch: str, change_binding: str) -> None:
+        """Delete one CI baseline branch; refuses every other branch."""
+        repository = self._write(repository, change_binding)
+        branch = self._baseline_branch(branch)
+        self._run(["api", "-X", "DELETE", f"repos/{repository}/git/refs/heads/{branch}"])
+
+    def commit_date(self, repository: str, ref: str) -> str:
+        """NEW-67: committer date (ISO 8601) of one branch or commit."""
+        repository = self._batch(repository)
+        ref = self._value(ref, "commit ref", maximum=120)
+        value = self._run(
+            ["api", f"repos/{repository}/commits/{ref}", "--jq", ".commit.committer.date"]
+        ).stdout.strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+            raise GhCliPolicyError("commit date is invalid")
+        return value
+
+    def commit_contains(self, repository: str, *, ancestor: str, descendant: str) -> bool:
+        """NEW-68: True when ``descendant`` is ``ancestor`` or contains it in its history."""
+        repository = self._batch(repository)
+        if not re.fullmatch(r"[a-f0-9]{40}", ancestor) or not re.fullmatch(
+            r"[a-f0-9]{40}", descendant
+        ):
+            raise GhCliPolicyError("commit comparison binding is invalid")
+        status = self._run(
+            ["api", f"repos/{repository}/compare/{ancestor}...{descendant}", "--jq", ".status"]
+        ).stdout.strip()
+        return status in {"ahead", "identical"}
+
+    def last_reopened_at(self, repository: str, number: int) -> str:
+        """NEW-67: when the pull request was last reopened ('' if never)."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("pull request number is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/issues/{number}/events",
+                "--paginate",
+                "--jq",
+                '.[] | select(.event == "reopened") | .created_at',
+            ]
+        ).stdout
+        values = [line.strip() for line in raw.splitlines() if line.strip()]
+        return max(values) if values else ""
+
+    def rerun_pull_request_ci(
+        self, *, repository: str, number: int, expected_head_sha: str, change_binding: str
+    ) -> None:
+        """NEW-67: close and reopen the bound PR so pull_request CI runs on current base.
+
+        The head commit is unchanged (the ChangeSet binding stays valid); only the
+        merge ref GitHub builds for the PR moves to the current base branch.
+        """
+        repository = self._write(repository, change_binding)
+        if number < 1 or not re.fullmatch(r"[a-f0-9]{40}", expected_head_sha):
+            raise GhCliPolicyError("CI re-run binding is invalid")
+        current = self.view_pull_request(repository, number)
+        if current.get("headRefOid") != expected_head_sha or current.get("state") != "OPEN":
+            raise GhCliPolicyError("pull request changed before the CI re-run")
+        self._run(["pr", "close", str(number), "--repo", repository])
+        self._run(["pr", "reopen", str(number), "--repo", repository])
+
+    @staticmethod
+    def _baseline_branch(branch: str) -> str:
+        if not re.fullmatch(r"hermes/ci-baseline/[a-f0-9]{12}-[a-f0-9]{8}", branch):
+            raise GhCliPolicyError("only Hermes CI baseline branches may be written")
+        return branch
+
+    def repository_file_text(self, repository: str, path: str, ref: str) -> str:
+        """Read one bounded repository file at a branch; never returned to callers verbatim."""
+        repository = self._batch(repository)
+        if not re.fullmatch(r"[A-Za-z0-9._/-]{1,240}", path) or ".." in path.split("/"):
+            raise GhCliPolicyError("repository file path is invalid")
+        ref = self._value(ref, "repository file ref", maximum=120)
+        raw = self._run(
+            [
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repository}/contents/{path}",
+                "-f",
+                f"ref={ref}",
+                "-H",
+                "Accept: application/vnd.github.raw",
+            ]
+        ).stdout
+        if len(raw.encode()) > self.maximum_json_bytes:
+            raise GhCliPolicyError("repository file exceeded its bounded size")
+        return raw
+
+    def comment_marked_issue(
+        self,
+        *,
+        repository: str,
+        number: int,
+        body_file: Path,
+        marker: str,
+        change_binding: str,
+        require_open: bool = True,
+    ) -> dict[str, Any]:
+        """Comment once per staging-GitOps marker; an existing marker comment is reused."""
+        repository = self._write(repository, change_binding)
+        if number < 1 or not STAGING_GITOPS_MARKER.fullmatch(marker):
+            raise GhCliPolicyError("staging issue comment binding is invalid")
+        bounded_body = self._bounded_file(body_file)
+        if bounded_body.stat().st_size > 12_000:
+            raise GhCliPolicyError("issue comment body exceeded the bounded size")
+        try:
+            body = bounded_body.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise GhCliPolicyError("issue comment body is unreadable") from error
+        if body.count(marker) != 1:
+            raise GhCliPolicyError("issue comment body is missing its exact binding marker")
+        issue = self.view_issue(repository, number)
+        matches = [
+            comment
+            for comment in issue["comments"]
+            if isinstance(comment, dict) and marker in str(comment.get("body") or "")
+        ]
+        if matches:
+            return {"status": "COMMENT_PRESENT", "comment_url": matches[0].get("url")}
+        if require_open and issue.get("state") != "OPEN":
+            raise GhCliPolicyError("issue closed before staging evidence publication")
+        url = self._run(
+            [
+                "issue",
+                "comment",
+                str(number),
+                "--repo",
+                repository,
+                "--body-file",
+                str(bounded_body),
+            ]
+        ).stdout.strip()
+        if not re.fullmatch(r"https://github\.com/[^\s]+#issuecomment-[1-9][0-9]*", url):
+            raise GhCliPolicyError("issue comment returned an invalid URL")
+        return {"status": "COMMENTED", "comment_url": url}
+
+    def close_marked_issue(
+        self,
+        *,
+        repository: str,
+        number: int,
+        marker: str,
+        change_binding: str,
+    ) -> dict[str, Any]:
+        """Close an issue only after its staging-GitOps evidence comment exists."""
+        repository = self._write(repository, change_binding)
+        if number < 1 or not STAGING_GITOPS_MARKER.fullmatch(marker):
+            raise GhCliPolicyError("staging issue closure binding is invalid")
+        issue = self.view_issue(repository, number)
+        if not any(
+            isinstance(comment, dict) and marker in str(comment.get("body") or "")
+            for comment in issue["comments"]
+        ):
+            raise GhCliPolicyError("issue closure requires its staging evidence comment")
+        if issue.get("state") == "OPEN":
+            self._run(
+                ["issue", "close", str(number), "--repo", repository, "--reason", "completed"]
+            )
+            issue = self.view_issue(repository, number)
+        if issue.get("state") != "CLOSED":
             raise GhCliPolicyError("issue closure was not confirmed")
         return {
             "status": "CLOSED",

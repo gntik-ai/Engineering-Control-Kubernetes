@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import subprocess
@@ -63,6 +64,29 @@ class SafeCommandRunner:
             )
         return result
 
+    async def run_async(
+        self,
+        executable: str,
+        arguments: Sequence[str],
+        *,
+        cwd: Path,
+        timeout_seconds: int = 900,
+        environment: Mapping[str, str] | None = None,
+        check: bool = True,
+    ) -> CommandResult:
+        """F-08: run() blocks for up to timeout_seconds; call this from async activity
+        handlers instead so the Temporal worker's event loop isn't stalled for the
+        subprocess's full duration."""
+        return await asyncio.to_thread(
+            self.run,
+            executable,
+            arguments,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            environment=environment,
+            check=check,
+        )
+
     def run_yaml_summary(
         self,
         executable: str,
@@ -97,6 +121,25 @@ class SafeCommandRunner:
             stdout_sha256=hashlib.sha256(process.stdout.encode()).hexdigest(),
             document_count=len(documents),
             kinds=tuple(sorted(kinds.items())),
+        )
+
+    async def run_yaml_summary_async(
+        self,
+        executable: str,
+        arguments: Sequence[str],
+        *,
+        cwd: Path,
+        timeout_seconds: int = 900,
+        environment: Mapping[str, str] | None = None,
+    ) -> YamlCommandSummary:
+        """F-08: async counterpart to run_yaml_summary(), same reasoning as run_async()."""
+        return await asyncio.to_thread(
+            self.run_yaml_summary,
+            executable,
+            arguments,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            environment=environment,
         )
 
     def _invoke(

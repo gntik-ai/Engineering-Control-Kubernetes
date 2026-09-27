@@ -13,9 +13,11 @@ from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
 
 from .browser import BrowserActivityHandler
+from .connections import ConnectionsActivityHandler
 from .delivery import DeliveryActivityHandler
 from .engineering import EngineeringActivityHandler
 from .github import GitHubActivityHandler
+from .gitops import GITOPS_GITHUB_STEPS, GitOpsControllerHandler
 from .metadata import MetadataActivityHandler
 from .preview_cleanup import PreviewCleanupActivityHandler
 from .provider import ProviderActivityHandler
@@ -72,13 +74,17 @@ class ControlActivities:
         "agent.persist_result",
         "delivery.load_confirmed_finding",
         "delivery.ensure_issue",
+        "delivery.refresh_issue_body",
         "delivery.prepare_spec",
         "delivery.invoke_spec",
         "delivery.create_openspec",
         "delivery.acquire_leases",
+        "delivery.release_leases",
         "delivery.allocate_worktrees",
         "delivery.persist_worktree_leases",
         "delivery.deterministic_prechecks",
+        "delivery.prepare_toolchain",
+        "delivery.resolve_dependencies",
         "delivery.route_providers",
         "delivery.prepare_maker",
         "delivery.invoke_maker",
@@ -88,6 +94,7 @@ class ControlActivities:
         "delivery.invoke_checker",
         "delivery.validate_changeset",
         "delivery.persist_handoff",
+        "delivery.record_validation_findings",
         "delivery.prepare_publication",
         "delivery.publish",
         "delivery.persist_publication",
@@ -146,10 +153,12 @@ class ControlActivities:
         "recovery.record_failure",
         "quota.refresh",
         "quota.persist",
+        "connections.refresh",
         "cleanup.discover",
         "cleanup.protect_active",
         "cleanup.authorize",
         "cleanup.execute",
+        "cleanup.prune_orphan_worktrees",
         "cleanup.inspect_evidence_files",
         "cleanup.inspect_delivery_files",
         "cleanup.inspect_browser_files",
@@ -193,13 +202,14 @@ class ControlActivities:
         "backlog.record_approval",
         "backlog.record_skip",
         "backlog.record_retry",
-        "backlog.delivery_candidate",
         "backlog.load_execution",
         "backlog.materialize_candidate",
         "backlog.record_revalidation",
         "backlog.revalidate_gate",
         "backlog.record_loop_state",
+        "notify.write_policy_required",
         "backlog.register_child_run",
+        "backlog.register_run",
         "global_backlog.register",
         "global_backlog.select_next",
         "global_backlog.record_result",
@@ -216,12 +226,32 @@ class ControlActivities:
         "observability.invoke_codex_checker",
         "observability.finalize",
         "observability.cleanup_workspace",
+        # Post-merge staging GitOps flow: controller (DB + kubectl) steps ...
+        "gitops.flow_for_project",
+        "gitops.prepare",
+        "gitops.environment_check",
+        "gitops.remediate",
+        "gitops.trigger_sync",
+        "gitops.sync_status",
+        "gitops.verify_workloads",
+        "gitops.persist_result",
+        # ... and GitHub-worker steps (GitOpsGitHubHandler via GitHubActivityHandler).
+        "gitops.pr_checks",
+        "gitops.merge",
+        "gitops.release_tag",
+        "gitops.workflow_run",
+        "gitops.image_pin",
+        "gitops.environment_issue",
+        "gitops.close_issue",
     }
     _mutation_steps = {
         "preview.deploy",
         "staging.deploy",
         "recovery.execute",
         "cleanup.execute",
+        # NEW-85: cleanup.prune_orphan_worktrees is not listed here: it must run in dry
+        # runs to report candidates; its handler deletes only when the payload says
+        # dry_run=False AND cleanup execution is enabled.
         "cleanup.execute_evidence_files",
         "cleanup.execute_delivery_files",
         "cleanup.execute_browser_files",
@@ -252,12 +282,15 @@ class ControlActivities:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "delivery.prepare_toolchain",
+            "delivery.resolve_dependencies",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
+            "cleanup.prune_orphan_worktrees",
             "cleanup.inspect_delivery_files",
             "cleanup.execute_delivery_files",
             "cleanup.inspect_browser_files",
@@ -307,7 +340,8 @@ class ControlActivities:
             "observability.invoke_claude_maker",
             "observability.invoke_codex_checker",
             "observability.cleanup_workspace",
-        },
+        }
+        - GITOPS_GITHUB_STEPS,
         "scan": {
             "project.snapshot",
             "project.snapshot_pair",
@@ -319,12 +353,15 @@ class ControlActivities:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "delivery.prepare_toolchain",
+            "delivery.resolve_dependencies",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
+            "cleanup.prune_orphan_worktrees",
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
@@ -380,6 +417,7 @@ class ControlActivities:
             "llmwiki.bootstrap.plan",
             "github.refresh_mirrors",
             "backlog.github_import",
+            "delivery.refresh_issue_body",
             "finding.dedupe",
             "delivery.publish",
             "reconcile.inspect_ci",
@@ -393,6 +431,7 @@ class ControlActivities:
             "enhancement.publish",
             "enhancement.github_dedupe",
             "finding.publish",
+            *GITOPS_GITHUB_STEPS,
         },
         "release": {
             "preview.preflight",
@@ -455,6 +494,12 @@ class ControlActivities:
         )
         self.github_handler = (
             GitHubActivityHandler(settings) if self.worker_kind == "github" else None
+        )
+        self.connections_handler = (
+            ConnectionsActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
+        self.gitops_handler = (
+            GitOpsControllerHandler(settings) if self.worker_kind == "controller" else None
         )
 
     @activity.defn(name="execute_control_step")
@@ -526,8 +571,15 @@ class ControlActivities:
             return await self.preview_cleanup_handler.handle(step, safe_payload)
         if self.release_handler is not None and step in self.release_handler.supported_steps:
             return await self.release_handler.handle(step, safe_payload)
+        if (
+            self.connections_handler is not None
+            and step in self.connections_handler.supported_steps
+        ):
+            return await self.connections_handler.handle(step, safe_payload)
         if self.provider_handler is not None:
             return await self.provider_handler.handle(step, safe_payload)
+        if self.gitops_handler is not None and step in self.gitops_handler.supported_steps:
+            return await self.gitops_handler.handle(step, safe_payload)
         if self.metadata_handler is not None and step in self.metadata_handler.supported_steps:
             return await self.metadata_handler.handle(step, safe_payload)
         if (

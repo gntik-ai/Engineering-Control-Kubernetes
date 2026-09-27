@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import stat
+import subprocess
 import tempfile
-from datetime import UTC, datetime
+import time
+from collections import Counter
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from uuid import UUID
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.retention import cleanup_authorization_sha256
@@ -21,7 +31,18 @@ from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
 from engineering_control.config import Settings
 from engineering_control.engineering.configuration import EngineeringCatalog
-from engineering_control.engineering.models import ProjectPairSnapshot
+from engineering_control.engineering.models import (
+    ProjectPairSnapshot,
+    ToolchainPolicy,
+    ToolchainTestCommand,
+)
+from engineering_control.engineering.toolchain import (
+    enabled_toolchain,
+    load_toolchain_policy,
+    match_toolchain_test_command,
+    prepare_executables,
+    render_argv,
+)
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
@@ -33,6 +54,13 @@ from engineering_control.worktrees.manager import (
     WorktreeAllocation,
     WorktreeError,
 )
+
+_T = TypeVar("_T")
+_TOOLCHAIN_STDERR_TAIL = 2000
+_TOOLCHAIN_HEARTBEAT_SECONDS = 30.0
+_BASELINE_TEST_TIMEOUT_SECONDS = 1200
+_BASELINE_OUTPUT_TAIL = 500
+_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class WorktreeAllocationRequest(BaseModel):
@@ -99,7 +127,9 @@ class CleanupCandidate(BaseModel):
         pattern=r"^agent/(falcone|musematic|llmwiki)/[a-zA-Z0-9._-]+/[a-f0-9-]{36}$"
     )
     base_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
-    reason: str = Field(pattern=r"^(RELEASED_RETENTION_EXPIRED|ABANDONED_LEASE_EXPIRED)$")
+    reason: str = Field(
+        pattern=r"^(RELEASED_RETENTION_EXPIRED|ABANDONED_LEASE_EXPIRED|ABANDONED_CHANGESET_STALE)$"
+    )
 
 
 class ScanActivityHandler:
@@ -118,10 +148,13 @@ class ScanActivityHandler:
             "finding.fresh_snapshot",
             "delivery.allocate_worktrees",
             "delivery.deterministic_prechecks",
+            "delivery.prepare_toolchain",
+            "delivery.resolve_dependencies",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
             "cleanup.execute",
+            "cleanup.prune_orphan_worktrees",
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
@@ -141,6 +174,10 @@ class ScanActivityHandler:
         publisher: EvidencePublisher | None = None,
         observer_runner: SafeCommandRunner | None = None,
         promotion_runner: SafeCommandRunner | None = None,
+        toolchain_runner: SafeCommandRunner | None = None,
+        dependency_runner: SafeCommandRunner | None = None,
+        git_runner: SafeCommandRunner | None = None,
+        baseline_runner: SafeCommandRunner | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager or GitWorktreeManager(
@@ -148,6 +185,13 @@ class ScanActivityHandler:
             worktree_root=settings.worktree_root,
             lease_root=settings.lease_root / "worktrees",
             metadata_root=settings.worktree_metadata_root,
+            # NEW-61: allocation default ACLs and the post-validation delivery grant add
+            # read on the ChangeSet Git metadata for the controller's SSH fetch.
+            publication_transport_identity=(
+                settings.publication_transport_identity
+                if settings.publication_fetch_from_worker
+                else None
+            ),
         )
         self.scanner = scanner or DeterministicScanner(
             SafeCommandRunner(
@@ -167,6 +211,15 @@ class ScanActivityHandler:
         self.promotion_runner = promotion_runner or SafeCommandRunner(
             {"git": settings.git_executable, "helm": settings.helm_executable}
         )
+        # delivery.prepare_toolchain: only the allowlisted installers, never a shell.
+        self.toolchain_runner = toolchain_runner or SafeCommandRunner(prepare_executables(settings))
+        # NEW-75: go + pnpm for delivery.resolve_dependencies only.
+        self.dependency_runner = dependency_runner or SafeCommandRunner(
+            {"go": settings.go_executable, "pnpm": settings.toolchain_pnpm_executable}
+        )
+        self.git_runner = git_runner or SafeCommandRunner({"git": settings.git_executable})
+        # NEW-49: None builds a per-command allowlist (see _baseline_executables).
+        self.baseline_runner = baseline_runner
         self.catalog = EngineeringCatalog(
             project_root=settings.project_config_root,
             persona_root=settings.persona_config_root,
@@ -179,41 +232,55 @@ class ScanActivityHandler:
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             if step == "project.snapshot":
-                return self._snapshot(payload)
+                return await asyncio.to_thread(self._snapshot, payload)
             if step == "project.snapshot_pair":
-                return self._snapshot_pair(payload)
+                return await asyncio.to_thread(self._snapshot_pair, payload)
             if step in {"audit.static_source", "audit.static_deployment"}:
-                return self._static_surface(step, payload)
+                return await asyncio.to_thread(self._static_surface, step, payload)
             if step == "deployment.compare_live":
-                return self._compare_live(payload)
+                return await asyncio.to_thread(self._compare_live, payload)
             if step == "audit.kubernetes_observe":
-                return self._kubernetes_observe(payload)
+                return await asyncio.to_thread(self._kubernetes_observe, payload)
             if step == "audit.correlate_runtime":
-                return self._correlate_runtime(payload)
+                return await asyncio.to_thread(self._correlate_runtime, payload)
             if step == "audit.deterministic_cell":
-                return self._deterministic_cell(payload)
+                return await asyncio.to_thread(self._deterministic_cell, payload)
             if step == "finding.fresh_snapshot":
-                return self._fresh_finding_snapshot(payload)
+                return await asyncio.to_thread(self._fresh_finding_snapshot, payload)
             if step == "delivery.allocate_worktrees":
-                return self._allocate(payload)
+                return await asyncio.to_thread(self._allocate, payload)
             if step == "delivery.deterministic_prechecks":
-                return self._delivery_prechecks(payload)
+                return await asyncio.to_thread(self._delivery_prechecks, payload)
+            if step == "delivery.prepare_toolchain":
+                return await self._with_heartbeat(
+                    asyncio.to_thread(self._prepare_toolchain, payload)
+                )
+            if step == "delivery.resolve_dependencies":
+                return await self._with_heartbeat(
+                    asyncio.to_thread(self._resolve_dependencies, payload)
+                )
             if step == "runtime.deterministic_checks":
-                return self._runtime_deterministic_checks(payload)
+                return await asyncio.to_thread(self._runtime_deterministic_checks, payload)
             if step == "identity.observer_attest":
-                return self._observer_attestation(payload)
+                return await asyncio.to_thread(self._observer_attestation, payload)
             if step == "cleanup.protect_active":
-                return self._protect_cleanup_candidates(payload)
+                return await asyncio.to_thread(self._protect_cleanup_candidates, payload)
             if step == "cleanup.execute":
-                return self._execute_cleanup(payload)
+                return await asyncio.to_thread(self._execute_cleanup, payload)
+            if step == "cleanup.prune_orphan_worktrees":
+                return await asyncio.to_thread(self._prune_orphan_worktrees, payload)
             if step == "reconcile.apply_promotion":
-                return self._apply_promotion(payload)
+                return await asyncio.to_thread(self._apply_promotion, payload)
             if step == "delivery.validate_changeset":
-                return self._validate_changeset(payload)
+                # NEW-49: may run the maker-test baseline (prepare + tests) at the base commit.
+                return await self._with_heartbeat(
+                    asyncio.to_thread(self._validate_changeset, payload),
+                    phase="changeset_validation",
+                )
             if step == "observability.prepare_workspace":
-                return self._prepare_observability_workspace(payload)
+                return await asyncio.to_thread(self._prepare_observability_workspace, payload)
             if step == "observability.cleanup_workspace":
-                return self._cleanup_observability_workspace(payload)
+                return await asyncio.to_thread(self._cleanup_observability_workspace, payload)
         except PermissionError as error:
             raise ApplicationError(
                 "runtime observer credential violates least-privilege policy",
@@ -572,6 +639,7 @@ class ScanActivityHandler:
             raise ValueError("cleanup authorization changed after controller validation")
         removed: list[str] = []
         absent: list[str] = []
+        protected: list[dict[str, str]] = []
         for raw in raw_authorized:
             candidate = CleanupCandidate.model_validate(raw)
             allocation = WorktreeAllocation(
@@ -584,13 +652,36 @@ class ScanActivityHandler:
             if not allocation.path.exists():
                 absent.append(str(candidate.lease_id))
                 continue
-            self.manager.cleanup(allocation, evidence_captured=False)
+            try:
+                # NEW-85: abandoned attempts are archived (refs/archive/...) then removed;
+                # one protected worktree no longer fails the whole cleanup run.
+                self.manager.cleanup(
+                    allocation,
+                    evidence_captured=False,
+                    archive_dirty=candidate.reason == "ABANDONED_CHANGESET_STALE",
+                )
+            except WorktreeError as error:
+                protected.append({"lease_id": str(candidate.lease_id), "reason": str(error)[:200]})
+                continue
             removed.append(str(candidate.lease_id))
         return {
             **payload,
             "status": "CLEANUP_EXECUTED",
             "removed_lease_ids": removed,
             "already_absent_lease_ids": absent,
+            "protected_cleanup_candidates": protected,
+        }
+
+    def _prune_orphan_worktrees(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-85: snapshots/acceptance leftovers no lease tracks (dry-run reports only)."""
+        dry_run = payload.get("dry_run") is not False or not self.settings.cleanup_execution_enabled
+        cutoff = datetime.now(UTC) - timedelta(days=self.settings.cleanup_retention_days)
+        result = self.manager.prune_orphan_worktrees(older_than=cutoff, dry_run=dry_run)
+        return {
+            **payload,
+            "status": "ORPHAN_WORKTREES_INSPECTED" if dry_run else "ORPHAN_WORKTREES_PRUNED",
+            "orphan_worktrees": result["removed"][:200],
+            "orphan_worktrees_kept": result["kept"][:50],
         }
 
     def _runtime_deterministic_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1224,6 +1315,7 @@ class ScanActivityHandler:
             base_ref=request.source_base_ref,
             expected_base_sha=request.source_base_sha,
             access=access,
+            resume_prior_commits=self.settings.delivery_resume_prior_commits,
         )
         deployment = source
         if request.source_repository == request.deployment_repository:
@@ -1241,6 +1333,7 @@ class ScanActivityHandler:
                 base_ref=request.deployment_base_ref,
                 expected_base_sha=request.deployment_base_sha,
                 access=access,
+                resume_prior_commits=self.settings.delivery_resume_prior_commits,
             )
         return {
             **payload,
@@ -1249,13 +1342,16 @@ class ScanActivityHandler:
             "source_branch": source.branch,
             "deployment_worktree": str(deployment.path),
             "deployment_branch": deployment.branch,
+            # NEW-52 (additive): the previous attempt's HEAD a worktree kept, else None.
+            "source_resumed_from_sha": source.resumed_from_sha,
+            "deployment_resumed_from_sha": deployment.resumed_from_sha,
         }
 
     def _delivery_prechecks(self, payload: dict[str, Any]) -> dict[str, Any]:
         change_set_id = UUID(str(payload["change_set_id"]))
         evidence_root = self.settings.evidence_root / "scan" / str(change_set_id) / "prechecks"
         summaries: dict[str, Any] = {}
-        blocked = False
+        baseline: dict[str, dict[str, dict[str, int]]] = {}
         for name, path_value in (
             ("source", payload["source_worktree"]),
             ("deployment", payload["deployment_worktree"]),
@@ -1265,14 +1361,29 @@ class ScanActivityHandler:
             if not worktree.is_dir() or not worktree.is_relative_to(root):
                 raise ValueError("precheck worktree escaped its bounded root")
             output = evidence_root / name
-            secret = self.scanner.secret_scan(worktree, output)
-            trivy = self.scanner.vulnerability_scan(worktree, output)
-            semgrep = self.scanner.semgrep(worktree, output)
-            self.scanner.sbom(worktree, output)
+            resumed = payload.get(f"{name}_resumed_from_sha")
+            if isinstance(resumed, str) and resumed:
+                # NEW-52: a resumed worktree already contains the previous attempt's
+                # commits; scanning it would absorb the change's own findings into the
+                # baseline. Scan a scratch checkout of the base commit instead.
+                base_sha = str(payload[f"{name}_base_sha"])
+                output = evidence_root / f"{name}-base-{base_sha}"
+                if output.exists():
+                    shutil.rmtree(output)  # reports name the scratch checkout's path
+                with self._precheck_base_checkout(
+                    change_set_id, name, str(payload[f"{name}_repository"]), base_sha
+                ) as checkout:
+                    secret, trivy, semgrep = self._precheck_scans(checkout, output)
+                    counts = self._finding_counts(checkout, secret, trivy, semgrep)
+            else:
+                secret, trivy, semgrep = self._precheck_scans(worktree, output)
+                counts = self._finding_counts(worktree, secret, trivy, semgrep)
             semgrep_findings = len(semgrep.get("results", []))
             severe_vulnerabilities = self._severe_vulnerability_count(trivy)
-            if secret.get("status") == "FINDINGS" or semgrep_findings or severe_vulnerabilities:
-                blocked = True
+            # NEW-28: pre-existing findings are the baseline, not a blocker -- otherwise
+            # no real repository can ever receive a change. validate_changeset blocks on
+            # any finding the change introduces relative to this baseline.
+            baseline[name] = counts
             artifacts = self._publish_reports(
                 payload,
                 sorted(report for report in output.iterdir() if report.is_file()),
@@ -1284,11 +1395,639 @@ class ScanActivityHandler:
                 "high_or_critical_vulnerabilities": severe_vulnerabilities,
                 "artifacts": artifacts,
             }
+        self._atomic_text(
+            self._baseline_path(change_set_id), json.dumps(baseline, indent=2, sort_keys=True)
+        )
         return {
             **payload,
-            "status": "BLOCKED" if blocked else "PRECHECKS_PASS",
-            "blocker": "DETERMINISTIC_PRECHECK_FINDINGS" if blocked else None,
+            "status": "PRECHECKS_PASS",
+            "blocker": None,
             "prechecks": summaries,
+        }
+
+    def _precheck_scans(
+        self, worktree: Path, output: Path
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        secret = self.scanner.secret_scan(worktree, output)
+        trivy = self.scanner.vulnerability_scan(worktree, output)
+        semgrep = self.scanner.semgrep(worktree, output)
+        self.scanner.sbom(worktree, output)
+        return secret, trivy, semgrep
+
+    @contextmanager
+    def _precheck_base_checkout(
+        self, change_set_id: UUID, name: str, repository: str, base_sha: str
+    ) -> Iterator[Path]:
+        """NEW-52: a scratch, detached checkout of base_sha for a resumed worktree's
+        prechecks baseline, owned by the scan worker and removed after the scan."""
+        if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
+            raise ValueError("the prechecks baseline requires the exact base commit")
+        root = self.settings.toolchain_cache_root / "baselines" / "prechecks" / str(change_set_id)
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        checkout = root / f"{name}-base"
+        if checkout.is_symlink():
+            raise ValueError("prechecks baseline checkout must not be a symlink")
+        if checkout.exists():
+            shutil.rmtree(checkout)  # left behind by an interrupted attempt
+        try:
+            self._clone_detached(repository, base_sha, checkout, cwd=root)
+            # Scan only the tree, like a worktree whose .git is a pointer file.
+            shutil.rmtree(checkout / ".git")
+            yield checkout
+        finally:
+            if checkout.exists():
+                shutil.rmtree(checkout)
+
+    def _clone_detached(self, repository: str, base_sha: str, target: Path, *, cwd: Path) -> None:
+        """Check out base_sha, detached, from the canonical mirror (never written)."""
+        mirror = self.manager.verify_mirror(repository)
+        # --shared: objects are read from the canonical mirror, which is never written.
+        self.git_runner.run(
+            "git",
+            [
+                "-c",
+                f"safe.directory={mirror}",
+                "clone",
+                "--shared",
+                "--no-checkout",
+                "--quiet",
+                str(mirror),
+                str(target),
+            ],
+            cwd=cwd,
+            timeout_seconds=900,
+            environment={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+        self._git(target, ["checkout", "--detach", "--quiet", base_sha], timeout_seconds=900)
+        if self._git(target, ["rev-parse", "HEAD"]).strip() != base_sha:
+            raise ValueError("baseline checkout does not match the source base commit")
+
+    @staticmethod
+    async def _with_heartbeat(work: Awaitable[_T], phase: str = "toolchain_prepare") -> _T:
+        """Keep a long blocking step alive against the workflow's 2-minute heartbeat timeout."""
+        task = asyncio.ensure_future(work)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_TOOLCHAIN_HEARTBEAT_SECONDS)
+                if done:
+                    return task.result()
+                try:
+                    activity.heartbeat({"phase": phase})
+                except RuntimeError:
+                    pass  # not running inside an activity (unit tests)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+
+    def _bounded_worktree(self, value: object) -> Path:
+        worktree = Path(str(value)).resolve()
+        root = self.settings.worktree_root.resolve()
+        if worktree == root or not worktree.is_dir() or not worktree.is_relative_to(root):
+            raise ValueError("toolchain worktree escaped its bounded root")
+        return worktree
+
+    def _git(self, worktree: Path, arguments: list[str], *, timeout_seconds: int = 300) -> str:
+        return self.git_runner.run(
+            "git",
+            ["-c", f"safe.directory={worktree}", *arguments],
+            cwd=worktree,
+            timeout_seconds=timeout_seconds,
+            environment={
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+            },
+        ).stdout
+
+    def _git_status(self, worktree: Path, *, ignored: bool) -> dict[str, str]:
+        """Map each porcelain path to its XY code ('??' untracked, '!!' ignored)."""
+        arguments = ["status", "--porcelain=v1", "-z", "--untracked-files=normal"]
+        if ignored:
+            arguments.append("--ignored=traditional")
+        tokens = self._git(worktree, arguments).split("\0")
+        entries: dict[str, str] = {}
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            index += 1
+            if len(token) < 4:
+                continue
+            code, path = token[:2], token[3:]
+            entries[path] = code
+            if code[0] in {"R", "C"}:
+                index += 1  # -z rename/copy records carry the original path next
+        return entries
+
+    def _toolchain_environment(self) -> dict[str, str]:
+        """Network-enabled installer environment: private caches, no credentials."""
+        root = self.settings.toolchain_cache_root
+        directories = {
+            name: root / name
+            for name in (
+                "uv",
+                "pnpm-store",
+                "pnpm-cache",
+                "home",
+                "xdg-cache",
+                # NEW-75/79a: Go modules and the Trivy DB, read-only for makers/checkers.
+                "go-mod",
+                "go-build",
+                "go-path",
+                "trivy",
+            )
+        }
+        for directory in (root, *directories.values()):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+            if directory.stat().st_uid == os.getuid():
+                directory.chmod(0o750)
+        store = str(directories["pnpm-store"])
+        cache = str(directories["pnpm-cache"])
+        return {
+            "CI": "true",
+            # HOME is a private empty directory so no ~/.npmrc, ~/.netrc or uv/pnpm user
+            # configuration (and no credential in them) is ever read.
+            "HOME": str(directories["home"]),
+            "XDG_CACHE_HOME": str(directories["xdg-cache"]),
+            "UV_PYTHON_DOWNLOADS": "never",
+            "UV_CACHE_DIR": str(directories["uv"]),
+            "UV_NO_PROGRESS": "1",
+            # Copy, never hardlink: makers can write to the worktree, and a hardlinked
+            # file would let them modify the shared cache for every later ChangeSet.
+            "UV_LINK_MODE": "copy",
+            "npm_config_store_dir": store,
+            "pnpm_config_store_dir": store,
+            "npm_config_cache_dir": cache,
+            "pnpm_config_cache_dir": cache,
+            "npm_config_package_import_method": "copy",
+            "pnpm_config_package_import_method": "copy",
+            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+            "GOMODCACHE": str(directories["go-mod"]),
+            "GOCACHE": str(directories["go-build"]),
+            "GOPATH": str(directories["go-path"]),
+            "GOTOOLCHAIN": "local",
+            "GOTELEMETRY": "off",
+            "GOFLAGS": "-modcacherw",
+            "TRIVY_CACHE_DIR": str(directories["trivy"]),
+            "TRIVY_NO_PROGRESS": "true",
+        }
+
+    # NEW-75: the only commands the platform runs to resolve maker-edited manifests
+    # (network; no install scripts), and the only files they may change.
+    _DEPENDENCY_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
+        "go": (("go", "mod", "tidy"),),
+        "pnpm": (("pnpm", "install", "--lockfile-only", "--ignore-scripts"),),
+    }
+    _DEPENDENCY_FILES = {"go": ("go.mod", "go.sum"), "pnpm": ("pnpm-lock.yaml",)}
+    _DEPENDENCY_MANIFEST = {"go": "go.mod", "pnpm": "package.json"}
+
+    def _resolve_dependencies(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-75: regenerate lockfiles for manifests the offline maker edited, commit them,
+        then reinstall the toolchain so the maker's next round can build and test."""
+        agent = payload.get("agent_result")
+        structured = agent.get("structured_result") if isinstance(agent, dict) else None
+        raw = structured.get("dependency_resolution") if isinstance(structured, dict) else None
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 10:
+            return self._dependency_blocked(payload, "DEPENDENCY_REQUEST_INVALID", "no requests")
+        worktree = self._bounded_worktree(payload["source_worktree"])
+        if self._git_status(worktree, ignored=False):
+            return self._dependency_blocked(
+                payload, "DEPENDENCY_WORKTREE_DIRTY", "the maker left uncommitted changes"
+            )
+        environment = self._dependency_environment()
+        allowed: set[str] = set()
+        commands: list[dict[str, Any]] = []
+        for item in raw:
+            ecosystem = str(item.get("ecosystem", "")) if isinstance(item, dict) else ""
+            directory = str(item.get("directory", "")) if isinstance(item, dict) else ""
+            if ecosystem not in self._DEPENDENCY_COMMANDS or not re.fullmatch(
+                r"\.|[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*", directory
+            ):
+                return self._dependency_blocked(
+                    payload, "DEPENDENCY_REQUEST_INVALID", f"{ecosystem!r} {directory!r}"
+                )
+            cwd = (worktree / directory).resolve()
+            manifest = cwd / self._DEPENDENCY_MANIFEST[ecosystem]
+            if not cwd.is_relative_to(worktree) or not manifest.is_file():
+                return self._dependency_blocked(
+                    payload,
+                    "DEPENDENCY_REQUEST_INVALID",
+                    f"{directory!r} has no {self._DEPENDENCY_MANIFEST[ecosystem]}",
+                )
+            prefix = "" if cwd == worktree else f"{cwd.relative_to(worktree).as_posix()}/"
+            allowed.update(prefix + name for name in self._DEPENDENCY_FILES[ecosystem])
+            for argv in self._DEPENDENCY_COMMANDS[ecosystem]:
+                record: dict[str, Any] = {"ecosystem": ecosystem, "cwd": directory, "argv": argv}
+                try:
+                    result = self.dependency_runner.run(
+                        argv[0],
+                        list(argv[1:]),
+                        cwd=cwd,
+                        timeout_seconds=1200,
+                        environment=environment,
+                        check=False,
+                    )
+                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    commands.append({**record, "status": "NOT_COMPLETED"})
+                    return self._dependency_blocked(
+                        payload, "DEPENDENCY_RESOLUTION_FAILED", f"{argv[0]}: {error}", commands
+                    )
+                if result.return_code:
+                    commands.append({**record, "status": "FAILED"})
+                    return self._dependency_blocked(
+                        payload,
+                        "DEPENDENCY_RESOLUTION_FAILED",
+                        result.stderr.strip() or result.stdout,
+                        commands,
+                    )
+                commands.append({**record, "status": "PASS"})
+        changed = sorted(self._git_status(worktree, ignored=False))
+        unexpected = [path for path in changed if path not in allowed]
+        if unexpected:
+            return self._dependency_blocked(
+                payload,
+                "DEPENDENCY_RESOLUTION_TOUCHED_OTHER_FILES",
+                ", ".join(unexpected[:50]),
+                commands,
+            )
+        commit = None
+        if changed:
+            self._git(worktree, ["add", "--", *changed])
+            self._git(
+                worktree,
+                [
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "-m",
+                    "chore(deps): regenerate lockfiles (Hermes dependency resolution)",
+                ],
+            )
+            commit = self._git(worktree, ["rev-parse", "HEAD"]).strip()
+        prepared = self._prepare_toolchain(payload)
+        if prepared.get("status") == "BLOCKED":
+            return prepared
+        return {
+            **prepared,
+            "status": "DEPENDENCIES_RESOLVED",
+            "blocker": None,
+            "dependency_resolution_result": {
+                "files": changed,
+                "commit": commit,
+                "commands": commands,
+            },
+        }
+
+    def _dependency_environment(self) -> dict[str, str]:
+        """The toolchain installer environment plus private Go caches (never GOPROXY auth)."""
+        return {**self._toolchain_environment(), "GIT_TERMINAL_PROMPT": "0"}
+
+    @staticmethod
+    def _dependency_blocked(
+        payload: dict[str, Any],
+        blocker: str,
+        detail: str,
+        commands: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        safe = str(SecretRedactor().redact_text(detail).value)[-_TOOLCHAIN_STDERR_TAIL:]
+        return {
+            **payload,
+            "status": "BLOCKED",
+            "blocker": blocker,
+            "dependency_resolution_result": {
+                "status": "BLOCKED",
+                "blocker": blocker,
+                "detail": safe,
+                "commands": commands or [],
+            },
+        }
+
+    @staticmethod
+    def _toolchain_blocked(
+        payload: dict[str, Any], blocker: str, detail: str, commands: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        safe = str(SecretRedactor().redact_text(detail).value)[-_TOOLCHAIN_STDERR_TAIL:]
+        return {
+            **payload,
+            "status": "BLOCKED",
+            "blocker": blocker,
+            "toolchain_preparation": {
+                "status": "BLOCKED",
+                "blocker": blocker,
+                "detail": safe,
+                "commands": commands,
+            },
+        }
+
+    def _prepare_toolchain(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Install the project's dependencies in the source worktree before the maker.
+
+        Runs after delivery.deterministic_prechecks so the NEW-28 baseline never contains
+        toolchain directories, and fails closed unless everything created is git-ignored.
+        """
+        try:
+            policy = load_toolchain_policy(
+                self.settings.project_config_root, str(payload["project"])
+            )
+        except (OSError, ValueError) as error:
+            return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
+        if policy is None or not policy.enabled:
+            return {
+                **payload,
+                "status": "TOOLCHAIN_SKIPPED",
+                "blocker": None,
+                "toolchain_preparation": {"status": "TOOLCHAIN_SKIPPED"},
+            }
+        worktree = self._bounded_worktree(payload["source_worktree"])
+        environment = self._toolchain_environment()
+        before = self._git_status(worktree, ignored=True)
+        commands: list[dict[str, Any]] = []
+        for command in policy.prepare:
+            cwd = (worktree / command.cwd).resolve()
+            if not cwd.is_relative_to(worktree) or not cwd.is_dir():
+                return self._toolchain_blocked(
+                    payload,
+                    "TOOLCHAIN_PREPARE_FAILED",
+                    f"prepare cwd {command.cwd!r} is not a directory inside the worktree",
+                    commands,
+                )
+            argv = render_argv(command.argv, self.settings)
+            record: dict[str, Any] = {"cwd": command.cwd, "argv": argv}
+            started = time.monotonic()
+            try:
+                result = self.toolchain_runner.run(
+                    argv[0],
+                    argv[1:],
+                    cwd=cwd,
+                    timeout_seconds=command.timeout_seconds,
+                    environment=environment,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                commands.append({**record, "status": "TIMED_OUT"})
+                return self._toolchain_blocked(
+                    payload,
+                    "TOOLCHAIN_PREPARE_FAILED",
+                    f"{argv[0]} timed out after {command.timeout_seconds}s",
+                    commands,
+                )
+            except (OSError, ValueError) as error:
+                commands.append({**record, "status": "NOT_STARTED"})
+                return self._toolchain_blocked(
+                    payload, "TOOLCHAIN_PREPARE_FAILED", f"{argv[0]}: {error}", commands
+                )
+            record["duration_seconds"] = round(time.monotonic() - started, 1)
+            record["return_code"] = result.return_code
+            if result.return_code:
+                commands.append({**record, "status": "FAILED"})
+                # pnpm reports errors on stdout; uv on stderr. Both are already redacted.
+                return self._toolchain_blocked(
+                    payload,
+                    "TOOLCHAIN_PREPARE_FAILED",
+                    result.stderr.strip() or result.stdout,
+                    commands,
+                )
+            commands.append({**record, "status": "PASS"})
+        after = self._git_status(worktree, ignored=True)
+        created = {path: code for path, code in after.items() if before.get(path) != code}
+        not_ignored = sorted(path for path, code in created.items() if code == "??")
+        tracked = sorted(path for path, code in created.items() if code not in {"??", "!!"})
+        if not_ignored:
+            return self._toolchain_blocked(
+                payload,
+                "TOOLCHAIN_ARTIFACTS_NOT_IGNORED",
+                "untracked paths that are not git-ignored: " + ", ".join(not_ignored[:50]),
+                commands,
+            )
+        if tracked:
+            return self._toolchain_blocked(
+                payload,
+                "TOOLCHAIN_MODIFIED_TRACKED_FILES",
+                "prepare commands modified tracked files: " + ", ".join(tracked[:50]),
+                commands,
+            )
+        return {
+            **payload,
+            "status": "TOOLCHAIN_READY",
+            "blocker": None,
+            "toolchain_preparation": {
+                "status": "TOOLCHAIN_READY",
+                "commands": commands,
+                "ignored_paths_created": sorted(
+                    path for path, code in created.items() if code == "!!"
+                )[:100],
+                "test_commands": [item.model_dump() for item in policy.test_commands],
+            },
+        }
+
+    def _toolchain_cleanup_policy(self, project: str) -> ToolchainPolicy | None:
+        try:
+            policy = enabled_toolchain(self.settings.project_config_root, project)
+        except (OSError, ValueError):
+            # Without a readable contract nothing is removed; the NEW-28 delta gate then
+            # sees any toolchain directories and blocks, which is the fail-closed outcome.
+            return None
+        return policy if policy is not None and policy.cleanup_paths_ignored_only else None
+
+    def _clean_ignored_toolchain_artifacts(self, value: object) -> None:
+        """Remove only git-ignored files (.venv, node_modules) so scanners never see them."""
+        worktree = self._bounded_worktree(value)
+        before = self._git_status(worktree, ignored=False)
+        self._git(worktree, ["clean", "-ffdX", "--quiet"], timeout_seconds=900)
+        if self._git_status(worktree, ignored=False) != before:
+            raise ValueError("toolchain cleanup changed tracked or non-ignored worktree files")
+
+    def _preexisting_test_failures(
+        self, payload: dict[str, Any], failed_commands: list[str]
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """NEW-49: evidence that every failing maker command also fails at the base commit.
+
+        Returns (None, None) when a FAIL is not eligible (no contract, a non-contract
+        command, or the command passes at the base) and (None, error) when the baseline
+        could not be established; both keep MAKER_TEST_FAILURE.
+        """
+        project = str(payload.get("project", ""))
+        try:
+            policy = enabled_toolchain(self.settings.project_config_root, project)
+        except (OSError, ValueError):
+            return None, None
+        if policy is None:
+            return None, None
+        source = Path(str(payload.get("source_worktree", "")))
+        commands: list[ToolchainTestCommand] = []
+        for reported in failed_commands:
+            command = match_toolchain_test_command(policy, reported, self.settings, worktree=source)
+            if command is None:
+                return None, None
+            if command not in commands:
+                commands.append(command)
+        base_sha = str(payload.get("source_base_sha", ""))
+        try:
+            results = self._baseline_test_results(
+                project, str(payload["source_repository"]), base_sha, policy, commands
+            )
+        except (
+            CommandFailure,
+            KeyError,
+            OSError,
+            ValueError,
+            WorktreeError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            detail = f"{type(error).__name__}: {error}"
+            return None, str(SecretRedactor().redact_text(detail).value)[-_TOOLCHAIN_STDERR_TAIL:]
+        evidence: list[dict[str, Any]] = []
+        for command, result in zip(commands, results, strict=True):
+            if result["exit_code"] == 0:
+                return None, None  # the change introduced this failure
+            evidence.append(
+                {
+                    "command": f"cd {command.cwd} && {shlex.join(result['argv'])}",
+                    "base_sha": base_sha,
+                    "base_exit_code": result["exit_code"],
+                    "base_output_tail": result["output_tail"],
+                }
+            )
+        return evidence, None
+
+    @staticmethod
+    def _baseline_key(cwd: str, argv: list[str]) -> str:
+        return json.dumps({"argv": argv, "cwd": cwd}, sort_keys=True)
+
+    @staticmethod
+    def _cached_baseline_results(path: Path) -> dict[str, dict[str, Any]]:
+        if not path.is_file():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}  # a torn or foreign file is recomputed, never trusted
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            key: value
+            for key, value in raw.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("exit_code"), int)
+            and isinstance(value.get("argv"), list)
+        }
+
+    def _baseline_test_results(
+        self,
+        project: str,
+        repository: str,
+        base_sha: str,
+        policy: ToolchainPolicy,
+        commands: list[ToolchainTestCommand],
+    ) -> list[dict[str, Any]]:
+        """Run the contract commands at the base once per (project, base, argv), then cache."""
+        if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
+            raise ValueError("the maker test baseline requires the source base commit")
+        root = self.settings.toolchain_cache_root / "baselines" / Project(project).value / base_sha
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        results_path = root / "results.json"
+        keys = [
+            self._baseline_key(command.cwd, render_argv(command.argv, self.settings))
+            for command in commands
+        ]
+        with (root / ".lock").open("a") as lock:
+            # Concurrent ChangeSets on the same base wait for one checkout and one run.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            cached = self._cached_baseline_results(results_path)
+            if any(key not in cached for key in keys):
+                worktree = self._baseline_worktree(root, repository, base_sha, policy)
+                environment = {
+                    **self._toolchain_environment(),
+                    "PATH": f"{self.settings.toolchain_pnpm_executable.parent}:{_DEFAULT_PATH}",
+                    # As for the agents (NEW-48), so mypy runs as it did for the maker.
+                    "MYPY_CACHE_DIR": "/dev/null",
+                }
+                for command, key in zip(commands, keys, strict=True):
+                    if key not in cached:
+                        cached[key] = self._run_baseline_test(worktree, command, environment)
+                        self._atomic_text(
+                            results_path, json.dumps(cached, indent=2, sort_keys=True)
+                        )
+            return [cached[key] for key in keys]
+
+    def _baseline_worktree(
+        self, root: Path, repository: str, base_sha: str, policy: ToolchainPolicy
+    ) -> Path:
+        """A detached, toolchain-prepared checkout of base_sha owned by the scan worker."""
+        worktree = root / "worktree"
+        prepared = root / "prepared"
+        if prepared.is_file() and worktree.is_dir() and not worktree.is_symlink():
+            if self._git(worktree, ["rev-parse", "HEAD"]).strip() == base_sha:
+                return worktree
+        prepared.unlink(missing_ok=True)
+        if worktree.is_symlink():
+            raise ValueError("baseline worktree must not be a symlink")
+        if worktree.exists():
+            shutil.rmtree(worktree)  # a partial checkout or prepare from an earlier attempt
+        self._clone_detached(repository, base_sha, worktree, cwd=root)
+        environment = self._toolchain_environment()
+        resolved_root = worktree.resolve()
+        for command in policy.prepare:
+            cwd = (worktree / command.cwd).resolve()
+            if not cwd.is_relative_to(resolved_root) or not cwd.is_dir():
+                raise ValueError(f"baseline prepare cwd {command.cwd!r} is not in the checkout")
+            argv = render_argv(command.argv, self.settings)
+            result = self.toolchain_runner.run(
+                argv[0],
+                argv[1:],
+                cwd=cwd,
+                timeout_seconds=command.timeout_seconds,
+                environment=environment,
+                check=False,
+            )
+            if result.return_code:
+                raise ValueError(
+                    f"baseline prepare {argv[0]} failed with {result.return_code}: "
+                    + (result.stderr.strip() or result.stdout)[-_TOOLCHAIN_STDERR_TAIL:]
+                )
+        prepared.write_text(f"{base_sha}\n", encoding="utf-8")
+        return worktree
+
+    def _baseline_executables(self, root: Path, cwd: Path, executable: str) -> dict[str, Path]:
+        """Contract test commands may run the installers, timeout, or a checkout-local tool."""
+        executables = {
+            **prepare_executables(self.settings),
+            "timeout": self.settings.timeout_executable,
+        }
+        if "/" in executable:
+            # normpath, not resolve: .venv/bin entries may be symlinks to the interpreter.
+            local = Path(os.path.normpath(cwd / executable))
+            if not local.is_relative_to(root) or not local.is_file():
+                raise ValueError(f"baseline test executable {executable!r} is not in the checkout")
+            executables[executable] = local
+        return executables
+
+    def _run_baseline_test(
+        self, worktree: Path, command: ToolchainTestCommand, environment: dict[str, str]
+    ) -> dict[str, Any]:
+        root = worktree.resolve()
+        cwd = (worktree / command.cwd).resolve()
+        if not cwd.is_relative_to(root) or not cwd.is_dir():
+            raise ValueError(f"baseline test cwd {command.cwd!r} is not in the checkout")
+        argv = render_argv(command.argv, self.settings)
+        runner = self.baseline_runner or SafeCommandRunner(
+            self._baseline_executables(root, cwd, argv[0])
+        )
+        # argv is normally timeout-wrapped (NEW-46); this bound also covers unwrapped ones.
+        result = runner.run(
+            argv[0],
+            argv[1:],
+            cwd=cwd,
+            timeout_seconds=_BASELINE_TEST_TIMEOUT_SECONDS,
+            environment=environment,
+            check=False,
+        )
+        # Only the exit code and a short tail of the (already redacted) output are kept.
+        output = str(SecretRedactor().redact_text(f"{result.stdout}\n{result.stderr}").value)
+        return {
+            "cwd": command.cwd,
+            "argv": argv,
+            "exit_code": result.return_code,
+            "output_tail": output.strip()[-_BASELINE_OUTPUT_TAIL:],
         }
 
     def _validate_changeset(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1301,49 +2040,89 @@ class ScanActivityHandler:
                 "status": "REQUEST_CHANGES",
                 "blocker": "INDEPENDENT_CHECKER_DID_NOT_PASS",
             }
+        failed_commands: list[str] = []
         for key in ("source_maker_result", "deployment_maker_result"):
             maker = payload.get(key)
             if not isinstance(maker, dict) or not isinstance(maker.get("structured_result"), dict):
+                if failed_commands:
+                    return {**payload, "status": "BLOCKED", "blocker": "MAKER_TEST_FAILURE"}
                 raise ValueError(f"ChangeSet validation requires {key}")
             tests = maker["structured_result"].get("tests")
-            if not isinstance(tests, list) or any(
-                isinstance(test, dict) and test.get("status") == "FAIL" for test in tests
-            ):
-                return {
+            if not isinstance(tests, list):
+                return {**payload, "status": "BLOCKED", "blocker": "MAKER_TEST_FAILURE"}
+            failed_commands.extend(
+                str(test.get("command", ""))
+                for test in tests
+                if isinstance(test, dict) and test.get("status") == "FAIL"
+            )
+        if failed_commands:
+            # NEW-49: the independent checker PASSed (above). A maker FAIL still blocks
+            # unless every failing command is a contract test command that the scan
+            # worker also sees fail at the source BASE commit (a pre-existing failure,
+            # e.g. #993's mypy error in an untouched file). Anything else fails closed.
+            preexisting, baseline_error = self._preexisting_test_failures(payload, failed_commands)
+            if preexisting is None:
+                maker_blocked: dict[str, Any] = {
                     **payload,
                     "status": "BLOCKED",
                     "blocker": "MAKER_TEST_FAILURE",
                 }
+                if baseline_error is not None:
+                    maker_blocked["baseline_error"] = baseline_error
+                return maker_blocked
+            payload = {**payload, "preexisting_test_failures": preexisting}
         change_set_id = UUID(str(payload["change_set_id"]))
         evidence_root = self.settings.evidence_root / "scan" / str(change_set_id) / "changes"
         evidence_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        baseline = self._load_baseline(change_set_id)
         changes: dict[str, Any] = {}
         blocked = False
+        empty_change = False
+        validation_findings: list[str] = []
+        toolchain = self._toolchain_cleanup_policy(str(payload.get("project", "")))
         for name, path_key, base_key in (
             ("source", "source_worktree", "source_base_sha"),
             ("deployment", "deployment_worktree", "deployment_base_sha"),
         ):
             worktree = Path(str(payload[path_key]))
+            if toolchain is not None:
+                # The prepared .venv/node_modules are git-ignored and absent from the
+                # prechecks baseline; scanning them would flag thousands of "introduced"
+                # findings. git clean -X never touches tracked or non-ignored files.
+                self._clean_ignored_toolchain_artifacts(worktree)
             summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
             if name == "source" and summary["changed_file_count"] == 0:
                 blocked = True
+                empty_change = True
             diff_path = evidence_root / f"{name}.patch"
             safe_diff = str(SecretRedactor().redact_text(diff).value)
-            output = evidence_root / f"{name}-postchecks"
+            # NEW-80: the scanners reuse an existing report in their output directory
+            # (activity retries). Keyed only by the ChangeSet, a later attempt re-read
+            # the first attempt's reports: #1125 kept "introducing" the grpc CVE its
+            # new head no longer had. Scan each head into its own directory.
+            head = str(summary.get("head_sha") or "")[:12]
+            output = evidence_root / (f"{name}-postchecks-{head}" if head else f"{name}-postchecks")
             secret = self.scanner.secret_scan(worktree, output)
             trivy = self.scanner.vulnerability_scan(worktree, output)
             semgrep = self.scanner.semgrep(worktree, output)
             self.scanner.sbom(worktree, output)
             semgrep_findings = len(semgrep.get("results", []))
             severe = self._severe_vulnerability_count(trivy)
-            if secret.get("status") == "FINDINGS" or semgrep_findings or severe:
+            counts = self._finding_counts(worktree, secret, trivy, semgrep)
+            side_baseline = baseline.get(name) if baseline is not None else None
+            introduced = self._introduced_findings(side_baseline, counts)
+            validation_findings.extend(
+                f"{name}: {item}" for item in self._introduced_identities(side_baseline, counts)
+            )
+            if any(introduced.values()):
                 blocked = True
+            secrets_introduced = bool(introduced["secrets"])
             artifacts = self._publish_reports(
                 payload,
                 sorted(report for report in output.iterdir() if report.is_file()),
                 filename_prefix=f"postchecks-{name}",
             )
-            if secret.get("status") == "FINDINGS":
+            if secrets_introduced:
                 artifacts.append(
                     {
                         "status": "WITHHELD_SECRET_FINDINGS",
@@ -1367,8 +2146,9 @@ class ScanActivityHandler:
                     changed_paths=summary["changed_paths"],
                     diff=diff,
                 ),
-                "diff_path": (None if secret.get("status") == "FINDINGS" else str(diff_path)),
-                "diff_withheld": secret.get("status") == "FINDINGS",
+                "diff_path": (None if secrets_introduced else str(diff_path)),
+                "diff_withheld": secrets_introduced,
+                "introduced_findings": introduced,
                 "diff_redacted_sha256": hashlib.sha256(safe_diff.encode()).hexdigest(),
                 "secret_status": secret.get("status"),
                 "semgrep_findings": semgrep_findings,
@@ -1388,6 +2168,16 @@ class ScanActivityHandler:
                 str(payload["deployment_repository"]),
                 Path(str(payload["deployment_worktree"])),
             )
+        if blocked and not empty_change and validation_findings and baseline is not None:
+            # NEW-76: introduced findings are the maker's to fix; name them (identities
+            # only, never secret values) so the next correction attempt can.
+            return {
+                **payload,
+                "status": "REQUEST_CHANGES",
+                "blocker": "CHANGESET_VALIDATION_FINDINGS",
+                "change_evidence": changes,
+                "validation_findings": validation_findings[:40],
+            }
         return {
             **payload,
             "status": "BLOCKED" if blocked else "LOCAL_VALIDATION_PASS",
@@ -1454,6 +2244,106 @@ class ScanActivityHandler:
         ).hexdigest()
         return classifier
 
+    def _baseline_path(self, change_set_id: UUID) -> Path:
+        prechecks = self.settings.evidence_root / "scan" / str(change_set_id) / "prechecks"
+        return prechecks / "baseline.json"
+
+    def _load_baseline(self, change_set_id: UUID) -> dict[str, Any] | None:
+        path = self._baseline_path(change_set_id)
+        if not path.is_file():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+
+    @classmethod
+    def _finding_counts(
+        cls,
+        worktree: Path,
+        secret: dict[str, Any],
+        trivy: dict[str, Any],
+        semgrep: dict[str, Any],
+    ) -> dict[str, dict[str, int]]:
+        """Line-independent finding identities with multiplicity, so edits that only shift
+        lines match the baseline while a second occurrence of the same rule still counts."""
+        root = f"{worktree.resolve()}/"
+
+        def relative(value: Any) -> str:
+            text = str(value or "")
+            return text[len(root) :] if text.startswith(root) else text
+
+        def key(*parts: Any) -> str:
+            return json.dumps([str(part or "") for part in parts])
+
+        counts: dict[str, Counter[str]] = {
+            "secrets": Counter(),
+            "semgrep": Counter(),
+            "vulnerabilities": Counter(),
+        }
+        for finding in secret.get("findings") or []:
+            if isinstance(finding, dict):
+                counts["secrets"][key(finding.get("RuleID"), relative(finding.get("File")))] += 1
+        for finding in semgrep.get("results") or []:
+            if isinstance(finding, dict):
+                counts["semgrep"][
+                    key(finding.get("check_id"), relative(finding.get("path")))
+                ] += 1
+        for result in trivy.get("Results") or []:
+            if not isinstance(result, dict):
+                continue
+            target = relative(result.get("Target"))
+            for category, fields in (
+                ("Vulnerabilities", ("VulnerabilityID", "PkgName", "InstalledVersion")),
+                ("Misconfigurations", ("ID", "AVDID")),
+                ("Secrets", ("RuleID",)),
+            ):
+                for finding in result.get(category) or []:
+                    if isinstance(finding, dict) and str(
+                        finding.get("Severity", "")
+                    ).upper() in {"HIGH", "CRITICAL"}:
+                        identity = key(
+                            category, target, *(finding.get(field) for field in fields)
+                        )
+                        counts["vulnerabilities"][identity] += 1
+        return {name: dict(counter) for name, counter in counts.items()}
+
+    @staticmethod
+    def _introduced_findings(
+        baseline: dict[str, Any] | None, current: dict[str, dict[str, int]]
+    ) -> dict[str, int]:
+        # No recorded baseline (e.g. prechecks from an older release): fail closed and
+        # treat every current finding as introduced, i.e. the previous absolute gate.
+        introduced: dict[str, int] = {}
+        for category, findings in current.items():
+            before = baseline.get(category) if isinstance(baseline, dict) else None
+            before = before if isinstance(before, dict) else {}
+            introduced[category] = sum(
+                max(0, count - int(before.get(identity, 0)))
+                for identity, count in findings.items()
+            )
+        return introduced
+
+    @staticmethod
+    def _introduced_identities(
+        baseline: dict[str, Any] | None, current: dict[str, dict[str, int]]
+    ) -> list[str]:
+        """NEW-76: readable identities of introduced findings (no secret values)."""
+        labels = {"secrets": "secret", "semgrep": "semgrep", "vulnerabilities": "trivy"}
+        identities: list[str] = []
+        for category, findings in current.items():
+            before = baseline.get(category) if isinstance(baseline, dict) else None
+            before = before if isinstance(before, dict) else {}
+            for identity, count in sorted(findings.items()):
+                if count <= int(before.get(identity, 0)):
+                    continue
+                try:
+                    parts = [str(part) for part in json.loads(identity) if part]
+                except (TypeError, ValueError):
+                    parts = [identity]
+                identities.append(f"{labels.get(category, category)} " + " | ".join(parts))
+                if len(identities) >= 20:
+                    return identities
+        return identities
+
     @staticmethod
     def _severe_vulnerability_count(report: dict[str, Any]) -> int:
         count = 0
@@ -1507,8 +2397,31 @@ class ScanActivityHandler:
             UUID(str(payload["change_set_id"])) if payload.get("change_set_id") else None
         )
         receipts: list[dict[str, Any]] = []
+        redactor = SecretRedactor()
         for report in reports:
-            content_type = "application/json" if report.suffix == ".json" else "text/plain"
+            # NEW-54: an empty file (e.g. the deployment patch of a source-only ChangeSet,
+            # allowed since NEW-41/42) is refused by the evidence transfer ("empty or
+            # exceeds the configured size bound") and failed validate_changeset. Record it
+            # instead of uploading it.
+            if report.stat().st_size == 0:
+                receipts.append({"status": "EMPTY_NOT_UPLOADED", "filename": report.name})
+                continue
+            # Scanner output (trivy "Secrets", semgrep matched lines, SBOM fields) is not
+            # pre-redacted; the ingest service rejects any evidence it would still redact.
+            text = report.read_text(encoding="utf-8", errors="replace")
+            content_type = "text/plain"
+            if report.suffix == ".json":
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    safe = str(redactor.redact_text(text).value)
+                else:
+                    content_type = "application/json"
+                    safe = json.dumps(redactor.redact(parsed).value, indent=2, sort_keys=True)
+            else:
+                safe = str(redactor.redact_text(text).value)
+            if safe != text:
+                self._atomic_text(report, safe)
             receipt = self.publisher.publish(
                 report,
                 project=project,

@@ -118,6 +118,53 @@ async def test_provider_activity_executes_only_in_bounded_worktree(
 
 
 @pytest.mark.asyncio
+async def test_provider_activity_does_not_echo_prompt_text_back_into_its_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-14: the rendered prompt (up to 200_000 chars) must not be echoed back into the
+    activity's own result -- nothing reads it from there, and it dominates Temporal
+    history-accretion cost for every maker/checker/agent invocation."""
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.activity.heartbeat", lambda _: None
+    )
+    worktree_root = tmp_path / "worktrees"
+    worktree = worktree_root / "falcone" / "change-set"
+    worktree.mkdir(parents=True)
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
+        "codex",
+        FakeAdapter(),
+        FakeInstructionPack(),
+    )
+    original_prompt = "make one bounded synthetic change" * 100
+
+    result = await handler.handle(
+        "delivery.invoke_maker",
+        {"maker_request": request_for(worktree).model_dump(mode="json") | {
+            "prompt": original_prompt
+        }},
+    )
+
+    assert result["status"] == "SUCCESS"
+    # Redacted to a short placeholder, not removed entirely (regression test,
+    # 2026-09-22): metadata.py's _agent_request() re-validates this exact
+    # payload shape via AgentRequest.model_validate() when persisting the
+    # agent result, and prompt is a required field on that model -- fully
+    # dropping the key broke that reconstruction on the very next real
+    # delivery attempt in production.
+    assert result["maker_request"]["prompt"] != original_prompt
+    assert len(result["maker_request"]["prompt"]) < 200
+    # every other field survives the trim untouched
+    assert result["maker_request"]["role"] == "implementer"
+    assert result["maker_request"]["working_directory"] == str(worktree)
+
+    # The redacted payload must still satisfy AgentRequest's own validation --
+    # this is exactly the reconstruction metadata.py's _agent_request() does
+    # when persisting the agent result, and it crashed on this in production.
+    AgentRequest.model_validate(result["maker_request"])
+
+
+@pytest.mark.asyncio
 async def test_observability_persistence_failure_does_not_fail_provider_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

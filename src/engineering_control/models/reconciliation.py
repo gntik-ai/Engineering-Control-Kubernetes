@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import UUID
@@ -98,10 +99,130 @@ class ImmutablePromotionPolicy(ReconciliationModel):
         return self
 
 
+_KUBERNETES_NAME = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+_WORKFLOW_REFERENCE = r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,159}$"
+
+
+class ReleaseTagPolicy(ReconciliationModel):
+    """Optional semver release tag that triggers a tag-driven image build."""
+
+    enabled: bool = False
+    prefix: str = Field(default="v", pattern=r"^[A-Za-z]{0,8}$")
+    bump: Literal["patch"] = "patch"
+
+
+class CiBaselineMarker(ReconciliationModel):
+    """NEW-63: a marker file that makes one CI path group run on a baseline branch."""
+
+    # The group is included when the delivered PR changes any path starting with scope.
+    scope: str = Field(pattern=r"^[A-Za-z0-9._/-]{1,200}$")
+    path: str = Field(pattern=r"^[A-Za-z0-9._/-]{1,240}$")
+
+    @field_validator("path")
+    @classmethod
+    def bounded_marker_path(cls, value: str) -> str:
+        parts = PurePosixPath(value).parts
+        if value.startswith("/") or ".." in parts or (parts and parts[0] == ".github"):
+            raise ValueError("CI baseline markers must be repository-relative, outside .github")
+        return value
+
+
+class CiBaselinePolicy(ReconciliationModel):
+    """NEW-63: PR CI jobs that also fail on unchanged main are pre-existing, not blockers.
+
+    Hermes opens a draft PR from main plus marker files (hermes/ci-baseline/*) so the same
+    path-filtered jobs run on main's code, then blocks only on jobs that fail in the
+    delivered PR but not on that baseline.
+    """
+
+    enabled: bool = False
+    markers: tuple[CiBaselineMarker, ...] = Field(default=(), max_length=30)
+
+    @model_validator(mode="after")
+    def enabled_requires_markers(self) -> CiBaselinePolicy:
+        if self.enabled and not self.markers:
+            raise ValueError("an enabled CI baseline requires at least one marker")
+        return self
+
+
+class StagingFlowPolicy(ReconciliationModel):
+    """Post-merge staging GitOps delivery (Argo CD + argocd-image-updater)."""
+
+    enabled: bool = False
+    kind: Literal["argocd-image-updater"] = "argocd-image-updater"
+    argo_application: str = Field(pattern=_KUBERNETES_NAME)
+    argo_namespace: str = Field(default="argocd", pattern=_KUBERNETES_NAME)
+    namespaces: tuple[str, ...] = Field(min_length=1, max_length=10)
+    source_ci_workflow: str = Field(pattern=_WORKFLOW_REFERENCE)
+    main_ci_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
+    image_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
+    release_tag: ReleaseTagPolicy = Field(default_factory=ReleaseTagPolicy)
+    deploy_repository: str = Field(
+        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
+    )
+    deploy_values_file: str = Field(pattern=r"^[A-Za-z0-9._/-]{1,240}\.ya?ml$")
+    deploy_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
+    image_repositories: tuple[str, ...] = Field(min_length=1, max_length=20)
+    tag_prefix: str = Field(default="sha-", pattern=r"^[A-Za-z0-9._-]{0,20}$")
+    tag_length: int = Field(default=7, ge=7, le=40)
+    chart_source_repository: str | None = Field(
+        default=None,
+        pattern=r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)\.git$",
+    )
+    pin_chart_to_merge: bool = False
+    # NEW-62: R3 ChangeSets (e.g. database migrations) are never merged unless the project
+    # opts in; the operator allows it only for staging-only clusters.
+    allow_r3_merge: bool = False
+    ci_baseline: CiBaselinePolicy = Field(default_factory=CiBaselinePolicy)
+    external_secrets_namespace: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
+    external_secrets_deployment: str = Field(default="external-secrets", pattern=_KUBERNETES_NAME)
+
+    @field_validator("namespaces")
+    @classmethod
+    def kubernetes_namespaces(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("staging flow namespaces must be unique")
+        for value in values:
+            if not re.fullmatch(_KUBERNETES_NAME, value) or value in {
+                "kube-system",
+                "kube-public",
+                "default",
+            }:
+                raise ValueError("staging flow namespaces must be bounded project namespaces")
+        return values
+
+    @field_validator("deploy_values_file")
+    @classmethod
+    def relative_values_file(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("deploy values file must be a bounded repository-relative path")
+        return value
+
+    @field_validator("image_repositories")
+    @classmethod
+    def first_party_images(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("staging flow image repositories must be unique")
+        for value in values:
+            if not re.fullmatch(r"ghcr\.io/gntik-ai/[a-z0-9._/-]{1,160}", value):
+                raise ValueError("staging flow image repositories must be first-party GHCR images")
+        return values
+
+    @model_validator(mode="after")
+    def coherent_staging_flow(self) -> StagingFlowPolicy:
+        if self.pin_chart_to_merge and self.chart_source_repository is None:
+            raise ValueError("pinning the chart to the merge requires chart_source_repository")
+        if self.release_tag.enabled and self.image_workflow is None:
+            raise ValueError("a release tag requires the image_workflow it triggers")
+        return self
+
+
 class DeliveryControlPolicy(ReconciliationModel):
     source_ci_workflow: str = Field(min_length=1, max_length=160)
     candidate_build: CandidateBuildPolicy
     immutable_promotion: ImmutablePromotionPolicy
+    staging_flow: StagingFlowPolicy | None = None
 
 
 class CIReconciliationPlan(ReconciliationModel):

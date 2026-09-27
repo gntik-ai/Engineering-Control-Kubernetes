@@ -54,14 +54,44 @@ class Settings(BaseSettings):
     runtime_target_root: Path = Path("/etc/engineering-control/runtime")
     temporary_root: Path = Path("/srv/engineering/tmp")
     codex_executable: Path = Path("/usr/local/bin/codex")
+    # NEW-36: pin the Codex model instead of inheriting the CLI default, which changed
+    # under us (codex-cli 0.149.0 defaulted to gpt-5.4, refused for the ChatGPT account).
+    # Operator choice 2026-09-23; override with ENGINEERING_CODEX_MODEL.
+    codex_model: str | None = "gpt-5.6-terra"
     claude_executable: Path = Path("/usr/local/bin/claude")
+    # NEW-53: optional Claude model pins for the delivery spec architect and the
+    # independent checker (passed as --model). None keeps the CLI default.
+    # NEW-53 (operator 2026-09-25): Opus 5.5 for the Claude spec and checker roles. Needs
+    # Claude Code >= 2.1.280 on the worker (upgraded to 2.1.282 on 2026-09-25).
+    claude_spec_model: str | None = "claude-opus-5-5"
+    claude_checker_model: str | None = "claude-opus-5-5"
     helm_executable: Path = Path("/usr/local/bin/helm")
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")
+    staging_kubeconfig_path: Path = Path("/etc/engineering-control/credentials/staging/kubeconfig")
     argocd_executable: Path = Path("/usr/local/bin/argocd")
     release_credential_root: Path = Path("/etc/engineering-control/env/release")
     observer_credential_root: Path = Path("/etc/engineering-control/credentials")
     node_executable: Path = Path("/usr/local/bin/node")
     pnpm_executable: Path = Path("/opt/engineering-browser/node_modules/.bin/pnpm")
+    # Delivery toolchain preparation (scan worker, delivery.prepare_toolchain). The
+    # browser worker's pnpm above is a different, pinned consumer-suite install.
+    uv_executable: Path = Path("/usr/local/bin/uv")
+    toolchain_pnpm_executable: Path = Path("/usr/local/bin/pnpm")
+    # NEW-75: makers are offline; delivery.resolve_dependencies (scan worker, network)
+    # regenerates go.sum / pnpm-lock.yaml after the maker edited only the manifests.
+    go_executable: Path = Path("/usr/local/go/bin/go")
+    python312_executable: Path = Path("/usr/local/bin/python3.12")
+    # NEW-49: contract test commands are wrapped in coreutils timeout (NEW-46).
+    timeout_executable: Path = Path("/usr/bin/timeout")
+    # Must sit under the scan worker unit's ReadWritePaths (/srv/engineering/cache/%i).
+    toolchain_cache_root: Path = Path("/srv/engineering/cache/scan/toolchain")
+    # NEW-52: a retry/correction of a ChangeSet keeps the previous attempt's commits
+    # (when they descend from the base) instead of re-implementing from the base.
+    delivery_resume_prior_commits: bool = True
+    # NEW-53: a retry/correction of a ChangeSet reuses the OpenSpec created by an earlier
+    # attempt when the issue content it was generated from is unchanged, instead of
+    # re-running the spec architect (whose structured output fails ~13% of runs).
+    delivery_reuse_spec: bool = True
     browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")
@@ -85,6 +115,23 @@ class Settings(BaseSettings):
     application_data_mutation_enabled: bool = False
     github_issue_write_validation_file: Path = GITHUB_WRITE_POLICY_PATH
     github_registry_auth_file: Path | None = None
+    # NEW-61: ChangeSet worktrees live on the worker host while every GitHub write stays
+    # on the controller. delivery.publish fetches the exact validated branch from the
+    # worker's ChangeSet Git metadata over SSH (host alias below, resolved by the
+    # transport identity's ~/.ssh/config) into a controller-local scratch repository and
+    # pushes from there. The worker's worktree manager grants this identity read access
+    # to that metadata repository only. Disable to publish from a local worktree.
+    publication_fetch_from_worker: bool = True
+    publication_transport_host: str = Field(
+        default="worker", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
+    )
+    publication_transport_identity: str = Field(
+        default="hermes", pattern=r"^[a-z_][a-z0-9_-]{0,31}$"
+    )
+    # NEW-71: the worker's canonical mirrors (worktree bases) are never fetched there
+    # (no GitHub credentials on the worker); github.refresh_mirrors pushes the refreshed
+    # controller mirror to the same path on the worker over the transport above.
+    mirror_sync_to_worker: bool = True
     git_executable: Path = Path("/usr/bin/git")
     delivery_credential_root: Path = Path("/etc/engineering-control/env/delivery")
     gitleaks_executable: Path = Path("/usr/local/bin/gitleaks")
@@ -98,6 +145,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     synthetic_mode: bool = False
     worker_kind: WorkerKind = "controller"
+    build_id: str | None = None
     notification_sink_url: str | None = None
     notification_token_file: Path | None = None
     notification_poll_seconds: int = Field(default=10, ge=2, le=300)

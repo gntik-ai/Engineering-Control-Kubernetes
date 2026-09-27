@@ -18,9 +18,9 @@ from engineering_control.api.schemas import (
     AuditPlanRequest,
     BacklogApprovalCandidateRequest,
     BacklogApprovalRequest,
-    BacklogDeliveryApprovalRequest,
     BacklogImportAccepted,
     BacklogIssueAction,
+    BacklogOwnershipReleaseRequest,
     CampaignStart,
     DeliveryReconcile,
     DeliveryStart,
@@ -173,6 +173,13 @@ def create_app(
     commands_dependency = Depends(commands)
     control_metrics = ControlPlaneMetrics()
 
+    def approval_actor(subject: str) -> str:
+        """Authorize a raw API channel subject and return its durable actor."""
+        try:
+            return canonical_operator_approval_actor(subject)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="approval channel is not allowed") from None
+
     @app.post("/v1/commands", status_code=202)
     async def typed_command(
         body: dict[str, Any],
@@ -180,11 +187,14 @@ def create_app(
         idempotency_key: str = Header(alias="Idempotency-Key", min_length=16, max_length=128),
         bus: TypedCommandBus = commands_dependency,
     ) -> dict[str, Any]:
+        # This private HTTP ingress is used by the fixed Telegram hook and the
+        # hermes-owned CLI.  The dashboard invokes TypedCommandBus in-process
+        # only after password reauthentication, so it cannot self-assert an
+        # HTTP actor header here.
+        durable_actor = approval_actor(subject)
         try:
-            if subject != "engineering-ctl:hermes" and not subject.startswith("telegram:"):
-                raise HTTPException(status_code=403, detail="typed command channel is not allowed")
             command = parse_command(body)
-            source_channel = "telegram" if subject.startswith("telegram:") else "cli"
+            source_channel = "telegram" if durable_actor.startswith("telegram:") else "cli"
             result = await bus.submit(
                 command,
                 source_channel=source_channel,  # type: ignore[arg-type]
@@ -494,9 +504,9 @@ def create_app(
 
     @app.get("/v1/r3-issues/candidate")
     async def r3_issue_candidate_get(
-        project: str = Query(pattern=r"^musematic$"),
-        surface: str = Query(pattern=r"^source$"),
-        issue_number: int = Query(ge=1119, le=1119),
+        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        surface: str = Query(pattern=r"^(source|deployment)$"),
+        issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
         repository: OperationsRepository = operations_dependency,
     ) -> dict[str, Any]:
@@ -507,9 +517,9 @@ def create_app(
 
     @app.post("/v1/r3-issues/candidate", status_code=201)
     async def r3_issue_candidate_create(
-        project: str = Query(pattern=r"^musematic$"),
-        surface: str = Query(pattern=r"^source$"),
-        issue_number: int = Query(ge=1119, le=1119),
+        project: str = Query(pattern=r"^(falcone|musematic|llmwiki)$"),
+        surface: str = Query(pattern=r"^(source|deployment)$"),
+        issue_number: int = Query(ge=1),
         _subject: str = auth_dependency,
         repository: OperationsRepository = operations_dependency,
     ) -> dict[str, Any]:
@@ -531,7 +541,7 @@ def create_app(
                 body.issue_number,
                 body.binding,
                 body.confirmation_phrase,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -761,7 +771,24 @@ def create_app(
                 campaign_id,
                 body.project,
                 body.approval_binding,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/backlogs/{campaign_id}/release-ownership")
+    async def backlog_release_ownership(
+        campaign_id: UUID,
+        body: BacklogOwnershipReleaseRequest,
+        subject: str = auth_dependency,
+        repository: MetadataRepository = metadata_dependency,
+    ) -> dict[str, Any]:
+        try:
+            return await repository.release_backlog_ownership(
+                campaign_id,
+                body.project,
+                body.typed_confirmation,
+                approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -810,40 +837,6 @@ def create_app(
             )
             return {"status": "ACCEPTED"}
         raise HTTPException(status_code=404, detail="unknown backlog loop action")
-
-    @app.post("/v1/backlog-loops/{workflow_id}/approve-delivery")
-    async def backlog_delivery_approve(
-        workflow_id: str,
-        body: BacklogDeliveryApprovalRequest,
-        _subject: str = auth_dependency,
-    ) -> dict[str, str]:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "staging approval candidate is not yet available; the campaign remains "
-                f"bound to workflow {workflow_id}"
-            ),
-        )
-
-    @app.get("/v1/backlog-loops/{workflow_id}/delivery-candidate")
-    async def backlog_delivery_candidate(
-        workflow_id: str,
-        repository: str = Query(
-            pattern=r"^(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-        ),
-        issue_number: int = Query(ge=1),
-        _subject: str = auth_dependency,
-        service: ControlService = control_dependency,
-    ) -> dict[str, Any]:
-        state = await service.get_workflow(workflow_id)
-        return {
-            "status": "BLOCKED_BY_DELIVERY",
-            "workflow_id": workflow_id,
-            "repository": f"gntik-ai/{repository}",
-            "issue_number": issue_number,
-            "blocker": "ISSUE_HAS_NOT_REACHED_AWAITING_STAGING_DELIVERY",
-            "workflow_state": state,
-        }
 
     @app.get("/v1/loops/{workflow_id}")
     async def issue_loop_get(
@@ -908,7 +901,7 @@ def create_app(
             return await repository.approve_enhancement(
                 enhancement_id,
                 body.approval_binding,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -924,7 +917,7 @@ def create_app(
             return await repository.reject_enhancement(
                 enhancement_id,
                 body.reason,
-                canonical_operator_approval_actor(subject),
+                approval_actor(subject),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -1007,7 +1000,7 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> dict[str, str]:
         try:
-            await service.record_approval(body, canonical_operator_approval_actor(subject))
+            await service.record_approval(body, approval_actor(subject))
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"status": "ACCEPTED"}

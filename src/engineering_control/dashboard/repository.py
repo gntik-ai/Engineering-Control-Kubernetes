@@ -218,12 +218,13 @@ class DashboardRepository:
                 func.row_number()
                 .over(
                     partition_by=(
+                        GitHubBacklogCampaign.project,
                         BacklogIssueRecord.repository,
                         BacklogIssueRecord.issue_number,
                     ),
                     order_by=(
                         GitHubBacklogCampaign.imported_at.desc().nulls_last(),
-                        GitHubBacklogCampaign.created_at.desc(),
+                        GitHubBacklogCampaign.created_at.desc().nulls_last(),
                         BacklogIssueRecord.updated_at.desc(),
                         BacklogIssueRecord.id.desc(),
                     ),

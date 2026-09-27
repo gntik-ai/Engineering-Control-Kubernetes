@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from jsonschema.validators import Draft202012Validator
@@ -27,10 +27,12 @@ from engineering_control.db.models import (
     Finding,
     FindingVerification,
     Incident,
+    Issue,
     QuotaSnapshot,
     Run,
     WorktreeLease,
 )
+from engineering_control.models.enums import Project
 from engineering_control.policy.approvals import ApprovalService
 
 
@@ -2094,3 +2096,293 @@ async def test_cleanup_protects_all_resources_owned_by_rate_limited_run(tmp_path
     assert discovered["cleanup_candidates"] == []
     assert discovered["component_lease_cleanup_candidates"] == []
     assert discovered["file_cleanup_candidates"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow", ["repository-static", "current-state-revalidation"])
+async def test_verifier_prompt_states_the_evidence_binding_controls_enforce(
+    tmp_path: Path, flow: str
+) -> None:
+    # NEW-22: live verifiers reproduced findings correctly but omitted the snapshot
+    # hash (or padded a git SHA to 64 chars), because the prompt never said
+    # _evaluate_controls requires it; one attempt also failed closed looking for a
+    # GitHub issue index the control plane never supplies.
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'finding.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    cell = audit_cell()
+    await handler.handle(
+        "campaign.persist_coverage",
+        {"campaign_id": str(campaign.id), "cells": [cell], "total": 1},
+    )
+    await handler.handle(
+        "campaign.persist_cell_result",
+        {
+            "campaign_id": str(campaign.id),
+            "cell": cell,
+            "deterministic_evidence_sha256": "d" * 64,
+            "agent_result": {
+                "provider": "claude",
+                "run_id": str(uuid4()),
+                "structured_result": {
+                    "summary": "bounded mismatch",
+                    "decision": "FAIL",
+                    "evidence": [{"kind": "source", "reference": "gw", "sha256": "d" * 64}],
+                    "open_questions": [],
+                    "finding": {
+                        "severity": "medium",
+                        "confidence": 0.9,
+                        "expected_behavior": "request follows the declared contract",
+                        "actual_behavior": "request diverges from the declared contract",
+                        "minimal_reproduction": ["inspect the bounded fixture"],
+                        "affected_component": "gateway",
+                        "security_impact": None,
+                        "data_impact": None,
+                        "recommended_action": "independently reproduce before filing",
+                    },
+                },
+            },
+        },
+    )
+    with handler.sessions() as session:
+        finding = session.scalar(select(Finding))
+    assert finding is not None
+    workflow_id = f"finding-verify-{finding.id}-{uuid4()}"
+    loaded = await handler.handle(
+        "finding.load_candidate",
+        {
+            "finding_id": str(finding.id),
+            "project": "falcone",
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    loaded = {**loaded, "flow": flow}
+    anchor = "a5f81bf64f588d77c051d1213c7fe814c339eb58bb36be3c94f7570ad9643558"
+    snapshot = {
+        **loaded,
+        "source_sha": "a" * 40,
+        "deployment_sha": "b" * 40,
+        "source_worktree": str(tmp_path / "fresh-source"),
+        "deployment_worktree": str(tmp_path / "fresh-deployment"),
+        "snapshot_evidence_sha256": anchor,
+    }
+    prepared = await handler.handle(
+        "finding.prepare_verifier",
+        {
+            "finding": loaded,
+            "snapshot": snapshot,
+            "ordinal": 1,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    prompt = prepared["verifier_request"]["prompt"]
+
+    assert f'kind "fresh_snapshot" and sha256 exactly "{anchor}"' in prompt
+    assert "No GitHub issue index is supplied" in prompt
+    assert "must not set environment_valid to false" in prompt
+    assert ("its own issue is expected to exist" in prompt) is (
+        flow == "current-state-revalidation"
+    )
+    # NEW-73: revalidation verifiers judge from source when the steps need network/CI.
+    assert ("This is a current-SOURCE revalidation" in prompt) is (
+        flow == "current-state-revalidation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_backlog_issue_is_bound_to_the_changeset_for_openspec(
+    tmp_path: Path,
+) -> None:
+    # NEW-29: the first delivery past prechecks (musematic #1025) failed at
+    # delivery.create_openspec with "OpenSpec requires a ChangeSet with a GitHub issue":
+    # the revalidated backlog issue was linked to the finding but never to the ChangeSet,
+    # which only the finding-publication path did.
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'delivery.sqlite'}",
+            worktree_root=tmp_path / "worktrees",
+            state_root=tmp_path / "state",
+            project_config_root=Path(__file__).parents[1] / "config/projects",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign = add_campaign(handler)
+    coverage = CoverageCell(
+        id=uuid4(),
+        campaign_id=campaign.id,
+        domain="gateway",
+        persona="tenant-admin",
+        lens="correctness",
+        environment="snapshot",
+        status="CONFIRMED_FINDING",
+        blocker=None,
+        exclusion_approval_id=None,
+        evidence_json=[{"sha256": "c" * 64}],
+        result_json={"provider": "claude"},
+    )
+    finding = Finding(
+        id=uuid4(),
+        campaign_id=campaign.id,
+        coverage_cell_id=coverage.id,
+        fingerprint="f" * 64,
+        project="falcone",
+        domain="gateway",
+        persona="tenant-admin",
+        severity="medium",
+        confidence=0.9,
+        risk_class="R1",
+        disposition="CONFIRMED",
+        expected_behavior="bounded contract",
+        actual_behavior="bounded mismatch",
+        evidence_json=[{"sha256": "c" * 64}],
+        minimal_reproduction=["inspect the bounded contract"],
+        affected_source_sha="a" * 40,
+        affected_deployment_sha="b" * 40,
+        affected_image_digest=None,
+        affected_component="gateway",
+        impact_json={},
+        recommended_action="implement the bounded fix",
+    )
+    source_issue_repository, _ = handler._project_issue_repositories(Project.FALCONE)
+    issue = Issue(
+        id=uuid4(),
+        finding_id=finding.id,
+        repository=source_issue_repository,
+        number=1025,
+        url=f"https://github.com/{source_issue_repository}/issues/1025",
+        state="OPEN",
+        openspec_change=None,
+    )
+    workflow_id = f"backlog-loop-falcone-issue-1-attempt-1-{finding.id}"
+    run = Run(
+        id=uuid4(),
+        campaign_id=None,
+        change_set_id=None,
+        workflow_id=workflow_id,
+        run_type="issue-delivery",
+        status="QUEUED",
+        project="falcone",
+    )
+    with handler.sessions.begin() as session:
+        session.add_all([coverage, finding, issue, run])
+
+    loaded = await handler.handle(
+        "delivery.load_confirmed_finding",
+        {
+            "finding_id": str(finding.id),
+            "risk_class": "R1",
+            "dry_run": False,
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    spec = await handler.handle(
+        "delivery.create_openspec",
+        {
+            **loaded,
+            "agent_result": {"structured_result": {"decision": "READY", "title": "fix"}},
+        },
+    )
+
+    assert loaded["issue_number"] == 1025
+    assert spec["status"] == "OPENSPEC_READY"
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, UUID(loaded["change_set_id"]))
+        assert change_set is not None and change_set.issue_id == issue.id
+
+
+@pytest.mark.parametrize(
+    ("state", "run_status", "finished", "lease_released", "activity_days", "expected"),
+    [
+        # NEW-85: delivered ChangeSets end RUNTIME_VERIFIED, never ISSUE_CLOSED.
+        ("RUNTIME_VERIFIED", "SUCCESS", True, False, 20, "ABANDONED_LEASE_EXPIRED"),
+        ("RUNTIME_VERIFIED", "SUCCESS", True, True, 20, "RELEASED_RETENTION_EXPIRED"),
+        # A published ChangeSet may still be merged/released: never auto-cleaned.
+        ("SOURCE_PR", "SUCCESS", True, True, 20, None),
+        # Killed pre-GO attempts: Run never finished, lease never released.
+        ("CONFIRMED", "RUNNING", False, False, 20, "ABANDONED_CHANGESET_STALE"),
+        ("PLANNED", "RUNNING", False, False, 20, "ABANDONED_CHANGESET_STALE"),
+        # ...but not while anything touched the ChangeSet within the retention period.
+        ("CONFIRMED", "RUNNING", False, False, 3, None),
+    ],
+)
+def test_worktree_cleanup_eligibility_covers_delivered_and_abandoned_changesets(
+    tmp_path: Path,
+    state: str,
+    run_status: str,
+    finished: bool,
+    lease_released: bool,
+    activity_days: int,
+    expected: str | None,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'eligibility.sqlite'}",
+            worktree_root=tmp_path / "worktrees",
+            cleanup_retention_days=14,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    now = datetime.now(UTC)
+    old = now - timedelta(days=activity_days)
+    change_set_id, run_id, lease_id = uuid4(), uuid4(), uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                issue_id=None,
+                project="musematic",
+                risk_class="R1",
+                state=state,
+                version=1,
+                source_repository="musematic",
+                source_branch=f"agent/musematic/1/{change_set_id}",
+                source_base_sha="a" * 40,
+                source_head_sha="b" * 40,
+                source_pr_url=None,
+                deployment_repository="musematic-deploy",
+                deployment_branch=f"agent/musematic-deploy/1/{change_set_id}",
+                deployment_base_sha="c" * 40,
+                deployment_head_sha="d" * 40,
+                deployment_pr_url=None,
+                image_digests={},
+                chart_version=None,
+                recovery_json={},
+                created_at=old,
+                updated_at=old,
+            )
+        )
+        session.add(
+            Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id=f"delivery-{run_id}",
+                run_type="issue-delivery",
+                status=run_status,
+                project="musematic",
+                started_at=old,
+                finished_at=old if finished else None,
+                created_at=old,
+                updated_at=old,
+            )
+        )
+        session.add(
+            WorktreeLease(
+                id=lease_id,
+                change_set_id=change_set_id,
+                repository="musematic",
+                worktree_path=str(tmp_path / "worktrees" / "musematic" / str(change_set_id)),
+                branch=f"agent/musematic/1/{change_set_id}",
+                owner_run_id=run_id,
+                base_sha="a" * 40,
+                expires_at=old,
+                released_at=old if lease_released else None,
+            )
+        )
+
+    with handler.sessions() as session:
+        lease = session.get(WorktreeLease, lease_id)
+        assert lease is not None
+        assert handler._cleanup_lease_eligibility(session, lease, now) == expected

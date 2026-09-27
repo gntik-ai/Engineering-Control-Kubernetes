@@ -23,9 +23,15 @@ from engineering_control.security.redaction import SecretRedactor
 class CodexCLIAdapter:
     provider = Provider.CODEX
 
-    def __init__(self, executable: str = "codex", temp_root: str | None = None) -> None:
+    def __init__(
+        self,
+        executable: str = "codex",
+        temp_root: str | None = None,
+        default_model: str | None = None,
+    ) -> None:
         self.executable = executable
         self.temp_root = temp_root
+        self.default_model = default_model
 
     async def authenticated(self) -> bool:
         import asyncio
@@ -40,6 +46,33 @@ class CodexCLIAdapter:
             env=subscription_only_environment(self.provider.value),
         )
         return await process.wait() == 0
+
+    @staticmethod
+    def _git_metadata_roots(worktree: Path) -> list[str]:
+        """NEW-37: a linked worktree keeps its index, HEAD and objects outside the
+        worktree (the per-worktree gitdir and the shared commondir). The workspace-write
+        sandbox only allows writes under the working directory, so the maker could edit
+        and test but never `git commit` ("index.lock" read-only). Return those two git
+        directories -- the maker's ACL already grants them -- as extra writable roots."""
+        marker = worktree / ".git"
+        if not marker.is_file():
+            return []
+        text = marker.read_text(encoding="utf-8").strip()
+        if not text.startswith("gitdir:"):
+            return []
+        gitdir = Path(text.removeprefix("gitdir:").strip())
+        if not gitdir.is_absolute():
+            gitdir = worktree / gitdir
+        gitdir = gitdir.resolve()
+        roots = [gitdir]
+        commondir_file = gitdir / "commondir"
+        if commondir_file.is_file():
+            common = Path(commondir_file.read_text(encoding="utf-8").strip())
+            common = (common if common.is_absolute() else gitdir / common).resolve()
+            if common not in roots:
+                roots.append(common)
+        worktree_root = worktree.resolve()
+        return [str(root) for root in roots if not root.is_relative_to(worktree_root)]
 
     async def execute(
         self, request: AgentRequest, on_event: EventCallback | None = None
@@ -77,8 +110,12 @@ class CodexCLIAdapter:
             ]
             if request.skip_git_repository_check:
                 command.append("--skip-git-repo-check")
-            if request.model:
-                command.extend(("--model", request.model))
+            if request.writable:
+                for root in self._git_metadata_roots(Path(request.working_directory)):
+                    command.extend(("--add-dir", root))
+            model = request.model or self.default_model
+            if model:
+                command.extend(("--model", model))
             if request.effort:
                 command.extend(("--config", f'model_reasoning_effort="{request.effort}"'))
             command.append("-")

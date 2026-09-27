@@ -231,7 +231,18 @@ class TemporalControlService:
         )
 
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None:
-        allowed = {"pause", "resume", "cancel", "approval", "skip", "retry"}
+        # NEW-30: pause_after_current/stop_after_current are real workflow signals the
+        # command bus forwards, but were missing here, so both were always refused.
+        allowed = {
+            "pause",
+            "pause_after_current",
+            "resume",
+            "stop_after_current",
+            "cancel",
+            "approval",
+            "skip",
+            "retry",
+        }
         if signal not in allowed:
             raise ValueError("unsupported control signal")
         handle = self.client.get_workflow_handle(workflow_id)
@@ -429,7 +440,11 @@ class TemporalControlService:
         campaign = await self.repository.get_backlog_campaign(request.backlog_campaign_id)
         if campaign is None or campaign.get("project") != request.project:
             raise ValueError("existing backlog campaign does not exist")
-        if campaign.get("status") not in {"APPROVED_POLICY_PENDING", "APPROVED"}:
+        if campaign.get("status") not in {
+            "APPROVED_POLICY_PENDING",
+            "APPROVED",
+            "APPROVED_INVENTORY",
+        }:
             raise ValueError("existing backlog campaign requires its exact Telegram approval")
         if campaign.get("maximum_risk") != request.maximum_risk.value:
             raise ValueError("existing backlog maximum risk changed after approval")

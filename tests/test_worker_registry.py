@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,10 @@ from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
     GITHUB_TASK_QUEUE,
     ROLE_WORKER_REGISTRY,
+    WORKER_DEPLOYMENT_NAME,
     provider_task_queue,
     role_worker_spec,
+    worker_deployment_kwargs,
 )
 
 ROOT = Path(__file__).parents[1]
@@ -27,6 +30,7 @@ GITHUB_STEPS = frozenset(
         "llmwiki.bootstrap.plan",
         "github.refresh_mirrors",
         "backlog.github_import",
+        "delivery.refresh_issue_body",
         "finding.dedupe",
         "delivery.publish",
         "reconcile.inspect_ci",
@@ -40,6 +44,13 @@ GITHUB_STEPS = frozenset(
         "enhancement.publish",
         "enhancement.github_dedupe",
         "finding.publish",
+        "gitops.pr_checks",
+        "gitops.merge",
+        "gitops.release_tag",
+        "gitops.workflow_run",
+        "gitops.image_pin",
+        "gitops.environment_issue",
+        "gitops.close_issue",
     }
 )
 
@@ -54,6 +65,26 @@ def test_role_worker_registry_is_complete_and_github_is_controller_only() -> Non
     assert ROLE_WORKER_REGISTRY["github"].task_queue == "engineering-github"
     assert all(
         spec.host == "worker" for kind, spec in ROLE_WORKER_REGISTRY.items() if kind != "github"
+    )
+
+
+def test_worker_deployment_kwargs_is_a_noop_when_build_id_unset() -> None:
+    assert worker_deployment_kwargs(None) == {}
+    assert worker_deployment_kwargs("") == {}
+
+
+def test_worker_deployment_kwargs_enables_auto_upgrade_versioning_when_set() -> None:
+    from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
+    from temporalio.worker import WorkerDeploymentConfig
+
+    kwargs = worker_deployment_kwargs("abc123")
+    assert set(kwargs) == {"deployment_config"}
+    config = kwargs["deployment_config"]
+    assert isinstance(config, WorkerDeploymentConfig)
+    assert config.use_worker_versioning is True
+    assert config.default_versioning_behavior == VersioningBehavior.AUTO_UPGRADE
+    assert config.version == WorkerDeploymentVersion(
+        deployment_name=WORKER_DEPLOYMENT_NAME, build_id="abc123"
     )
 
 
@@ -119,6 +150,55 @@ def test_every_registered_activity_routes_to_a_worker_that_owns_it() -> None:
         owner = queue_owners.get(queue)
         owners = {kind for kind in worker_kinds if step in ControlActivities.steps_for_worker(kind)}
         assert owner in owners, f"{step} routes to {queue}, owners={sorted(owners)}"
+
+
+def _literal_workflow_step_calls() -> set[str]:
+    """Every literal step name passed to self._step/_github_write_step/_agent_step
+    in workflows/definitions.py -- misses only genuinely dynamic (variable) step
+    names, which are the caller's own responsibility to get right at the literal
+    call site that supplies them.
+    """
+    source = (ROOT / "src/engineering_control/workflows/definitions.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    steps: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"_step", "_github_write_step", "_agent_step"}
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            steps.add(node.args[0].value)
+    return steps
+
+
+def test_every_literal_step_a_workflow_calls_is_a_registered_activity() -> None:
+    """Regression test for a real production incident (2026-09-22): NEW-16's fix
+    added a `backlog.register_run` step call in workflows/definitions.py, but
+    never added it to ControlActivities._allowed_steps -- so every fresh
+    ExistingGitHubBacklogLoopWorkflow execution failed immediately with
+    'unknown or invalid control step', a non-retryable ApplicationError, on its
+    second activity call. Existing tests all mocked execute_control_step and
+    never caught it. This checks the real dispatcher's registered steps against
+    every literal step name workflows/definitions.py actually calls.
+    """
+    called_steps = _literal_workflow_step_calls()
+    assert len(called_steps) > 50  # sanity: the AST walk actually found calls
+    worker_kinds = ("controller", *ROLE_WORKER_REGISTRY)
+    registered = set().union(
+        *(ControlActivities.steps_for_worker(kind) for kind in worker_kinds)
+    )
+    missing = called_steps - registered
+    assert not missing, (
+        f"workflows/definitions.py calls step(s) never registered in any "
+        f"ControlActivities allowed-steps set: {sorted(missing)}"
+    )
 
 
 def test_observability_canary_routes_each_step_to_one_bounded_worker() -> None:
@@ -203,6 +283,12 @@ def test_github_systemd_contract_is_hardened_and_secret_free() -> None:
     assert "/home/hermes/.claude" in unit
     assert "/home/hermes/.kube" in unit
     assert "/etc/engineering-control/env/release" in unit
+    # NEW-61: only the worker alias config, its key and known_hosts are exposed, read-only.
+    assert "TemporaryFileSystem=/home/hermes/.ssh:ro" in unit
+    assert (
+        "BindReadOnlyPaths=-/home/hermes/.ssh/config -/home/hermes/.ssh/hermes_worker "
+        "-/home/hermes/.ssh/known_hosts"
+    ) in unit
     for forbidden in ("GITHUB_TOKEN", "GH_TOKEN", "auth token", "worker-common.env"):
         assert forbidden not in unit
 

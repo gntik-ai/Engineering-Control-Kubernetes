@@ -1,4 +1,5 @@
 import hashlib
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -6,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from engineering_control.worktrees import manager as manager_module
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -253,6 +255,25 @@ def test_maker_acl_covers_worktree_traversal_and_isolated_git_metadata(
         and any("u:codex-runner:r-X" in argument for argument in command)
         for command in commands
     )
+    # NEW-56: files the maker creates inherit read for the publishing identity.
+    assert any(
+        command[-1] == str(target) and any("d:u:delivery-runner:r-x" in a for a in command)
+        for command in commands
+    )
+    assert not any("release-runner" in a for command in commands for a in command)
+
+    commands.clear()
+    manager._grant_access(
+        target,
+        metadata,
+        canonical,
+        WorktreeAccess("codex-runner", "claude-runner"),
+        repository="musematic-deploy",
+    )
+    assert any(
+        command[-1] == str(target) and any("d:u:release-runner:r-x" in a for a in command)
+        for command in commands
+    )
 
 
 def test_release_read_is_limited_to_exact_deployment_worktree(tmp_path: Path) -> None:
@@ -294,3 +315,551 @@ def test_release_read_is_limited_to_exact_deployment_worktree(tmp_path: Path) ->
         manager.grant_release_read("falcone", allocation.path)
     with pytest.raises(WorktreeError, match="exact deployment worktree"):
         manager.grant_release_read("falcone-charts", tmp_path)
+
+
+def test_retry_archives_and_resets_a_stopped_attempts_worktree(tmp_path: Path) -> None:
+    # NEW-38: musematic #1026's Codex maker left 9 uncommitted files; every later retry
+    # then failed at allocation ("existing worktree is dirty and will not be reused").
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    change_set_id = uuid4()
+    request = {
+        "repository": "falcone",
+        "project": "falcone",
+        "issue": "1026",
+        "change_set_id": change_set_id,
+        "base_ref": "refs/heads/main",
+        "expected_base_sha": sha,
+    }
+    first = manager.allocate(**request)
+    git(
+        [
+            "-c",
+            "user.name=m",
+            "-c",
+            "user.email=m@invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "maker commit",
+        ],
+        first.path,
+    )
+    ahead = git(["rev-parse", "HEAD"], first.path)
+    (first.path / "README.md").write_text("maker edit\n", encoding="utf-8")
+    (first.path / "new_benchmark.py").write_text("print('x')\n", encoding="utf-8")
+
+    second = manager.allocate(**request)
+
+    assert second.path == first.path
+    assert git(["rev-parse", "HEAD"], second.path) == sha
+    assert git(["status", "--porcelain=v1"], second.path) == ""
+    archived = git(
+        ["for-each-ref", "--format=%(refname)", f"refs/archive/{change_set_id}"], second.path
+    ).splitlines()
+    head_ref = next(ref for ref in archived if ref.endswith("-head"))
+    work_ref = next(ref for ref in archived if ref.endswith("-worktree"))
+    assert git(["rev-parse", head_ref], second.path) == ahead
+    assert "maker edit" in git(["show", f"{work_ref}:README.md"], second.path)
+    assert "print('x')" in git(["show", f"{work_ref}^3:new_benchmark.py"], second.path)
+
+
+def _resume_fixture(tmp_path: Path) -> tuple[GitWorktreeManager, dict[str, object], Path, str]:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    request: dict[str, object] = {
+        "repository": "falcone",
+        "project": "falcone",
+        "issue": "993",
+        "change_set_id": uuid4(),
+        "base_ref": "refs/heads/main",
+        "expected_base_sha": sha,
+    }
+    first = manager.allocate(**request)  # type: ignore[arg-type]
+    (first.path / "feature.py").write_text("print('previous attempt')\n", encoding="utf-8")
+    git(["add", "feature.py"], first.path)
+    git(["commit", "-q", "-m", "previous attempt"], first.path)
+    return manager, request, first.path, sha
+
+
+def test_retry_resumes_from_the_previous_attempts_commits(tmp_path: Path) -> None:
+    # NEW-52: musematic #993 needed 11 rounds / ~60 attempts because every correction
+    # was reset to the base (NEW-38) and re-implemented the whole feature.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.path == path
+    assert second.base_sha == sha
+    assert second.resumed_from_sha == head
+    assert git(["rev-parse", "HEAD"], path) == head
+    assert (path / "feature.py").read_text(encoding="utf-8") == "print('previous attempt')\n"
+    assert git(["status", "--porcelain=v1"], path) == ""
+    change_set_id = request["change_set_id"]
+    assert git(["for-each-ref", f"refs/archive/{change_set_id}"], path) == ""
+
+
+def test_dirty_resume_archives_leftovers_then_resets_to_the_attempts_head(
+    tmp_path: Path,
+) -> None:
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    (path / "feature.py").write_text("half-finished edit\n", encoding="utf-8")
+    (path / "scratch.txt").write_text("untracked\n", encoding="utf-8")
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.resumed_from_sha == head
+    assert git(["rev-parse", "HEAD"], path) == head
+    assert git(["status", "--porcelain=v1"], path) == ""
+    assert (path / "feature.py").read_text(encoding="utf-8") == "print('previous attempt')\n"
+    assert not (path / "scratch.txt").exists()
+    archived = git(
+        ["for-each-ref", "--format=%(refname)", f"refs/archive/{request['change_set_id']}"],
+        path,
+    ).splitlines()
+    work_ref = next(ref for ref in archived if ref.endswith("-worktree"))
+    assert "half-finished edit" in git(["show", f"{work_ref}:feature.py"], path)
+    assert "untracked" in git(["show", f"{work_ref}^3:scratch.txt"], path)
+
+
+def _advance_main(tmp_path: Path) -> str:
+    source = tmp_path / "source"
+    (source / "CHANGELOG.md").write_text("main moved\n", encoding="utf-8")
+    git(["add", "CHANGELOG.md"], source)
+    git(["commit", "-q", "-m", "main moved"], source)
+    # The GitHub worker refreshes the canonical mirror in production.
+    git(
+        ["fetch", "-q", "origin", "+refs/heads/*:refs/heads/*"],
+        tmp_path / "mirrors" / "falcone.git",
+    )
+    return git(["rev-parse", "HEAD"], source)
+
+
+def test_ci_repair_resume_tolerates_main_moving_ahead(tmp_path: Path) -> None:
+    # NEW-64: a CI-repair re-delivery resumes the published branch after main moved on;
+    # it keeps the imported base (no rebase) instead of failing on a base mismatch.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    _advance_main(tmp_path)
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.base_sha == sha
+    assert second.resumed_from_sha == head
+    assert git(["rev-parse", "HEAD"], path) == head
+
+
+def test_moved_main_still_refuses_fresh_or_non_resumed_allocations(tmp_path: Path) -> None:
+    manager, request, _path, _sha = _resume_fixture(tmp_path)
+    _advance_main(tmp_path)
+
+    with pytest.raises(WorktreeError, match="base SHA mismatch"):
+        manager.allocate(**request, resume_prior_commits=False)  # type: ignore[arg-type]
+    fresh = {**request, "change_set_id": uuid4()}
+    with pytest.raises(WorktreeError, match="base SHA mismatch"):
+        manager.allocate(**fresh, resume_prior_commits=True)  # type: ignore[arg-type]
+
+
+def test_resume_falls_back_to_the_base_when_head_does_not_descend_from_it(
+    tmp_path: Path,
+) -> None:
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    # Foreign history: an orphan commit that does not contain the base.
+    git(["checkout", "-q", "--orphan", "tmp-orphan"], path)
+    git(["commit", "-q", "-m", "foreign"], path)
+    foreign = git(["rev-parse", "HEAD"], path)
+    branch = f"agent/falcone/993/{request['change_set_id']}"
+    git(["checkout", "-q", "-B", branch, foreign], path)
+
+    second = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+
+    assert second.resumed_from_sha is None
+    assert git(["rev-parse", "HEAD"], path) == sha
+    assert not (path / "feature.py").exists()
+
+
+def test_resume_disabled_keeps_the_new38_reset_to_base(tmp_path: Path) -> None:
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+
+    second = manager.allocate(**request, resume_prior_commits=False)  # type: ignore[arg-type]
+
+    assert second.resumed_from_sha is None
+    assert git(["rev-parse", "HEAD"], path) == sha
+    archived = git(
+        ["for-each-ref", "--format=%(objectname)", f"refs/archive/{request['change_set_id']}"],
+        path,
+    )
+    assert head in archived
+
+
+def test_retry_still_refuses_a_worktree_on_another_branch(tmp_path: Path) -> None:
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    request = {
+        "repository": "falcone",
+        "project": "falcone",
+        "issue": "1026",
+        "change_set_id": uuid4(),
+        "base_ref": "refs/heads/main",
+        "expected_base_sha": sha,
+    }
+    first = manager.allocate(**request)
+    git(["checkout", "-q", "-b", "somewhere-else"], first.path)
+
+    with pytest.raises(WorktreeError, match="does not match the ChangeSet allocation"):
+        manager.allocate(**request)
+
+
+def test_manager_keeps_access_to_what_the_maker_creates(tmp_path: Path) -> None:
+    # NEW-38b: archiving a stopped attempt failed with "Permission denied" on
+    # openspec/changes/... -- directories the Codex maker created were unreadable to
+    # the scan worker that manages the worktree.
+    import os
+    import pwd
+
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "musematic" / str(uuid4())
+    target.mkdir(parents=True)
+    metadata_root = tmp_path / "cache" / "scan" / "worktree-git"
+    metadata = metadata_root / "musematic" / f"{target.name}.git"
+    metadata.mkdir(parents=True)
+    canonical = tmp_path / "mirrors" / "musematic.git"
+    canonical.mkdir(parents=True)
+    manager = GitWorktreeManager(
+        mirror_root=tmp_path / "mirrors",
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+    )
+    commands: list[list[str]] = []
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        commands.append(args)
+        return ""
+
+    manager._run = record  # type: ignore[method-assign]
+    manager._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+
+    me = pwd.getpwuid(os.geteuid()).pw_name
+    for path in (target, metadata):
+        acls = [command for command in commands if command[-1] == str(path)]
+        assert any(f"u:{me}:rwX" in argument for command in acls for argument in command)
+        assert any(f"d:u:{me}:rwx" in argument for command in acls for argument in command)
+
+
+def test_allocated_worktree_has_a_commit_identity(tmp_path: Path) -> None:
+    # NEW-40: musematic #993's corrected implementation was staged but the maker could
+    # not commit it -- "Git has no configured author identity".
+    mirror_root, sha = create_mirror(tmp_path)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+    allocation = manager.allocate(
+        repository="falcone",
+        project="falcone",
+        issue="993",
+        change_set_id=uuid4(),
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    (allocation.path / "feature.txt").write_text("x\n", encoding="utf-8")
+    git(["add", "feature.txt"], allocation.path)
+    subprocess.run(  # noqa: S603 - fixed executable and test-controlled arguments
+        [GIT, "commit", "-q", "-m", "maker"],
+        cwd=allocation.path,
+        check=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path / "empty-home")},
+    )
+    assert git(["log", "-1", "--format=%an <%ae>"], allocation.path) == (
+        "Engineering Control <engineering-control@local.invalid>"
+    )
+
+
+def _eperm_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lines: list[str]
+) -> GitWorktreeManager:
+    """A manager whose setfacl is refused on the given lines, running as another uid."""
+    manager = GitWorktreeManager(
+        mirror_root=tmp_path / "mirrors",
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+    )
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 1, "", "\n".join(lines) + "\n")
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+
+    def refused(args: list[str], cwd: Path, **kwargs: object) -> str:
+        raise WorktreeError("Git command failed (1): truncated")
+
+    manager._run = refused  # type: ignore[method-assign]
+    monkeypatch.setattr(manager_module.os, "geteuid", lambda: os.getuid() + 12345)
+    return manager
+
+
+def test_read_grant_accepts_foreign_files_that_are_already_world_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-55: maker-owned files refuse setfacl but are readable through 'other'."""
+    tree = tmp_path / "tree"
+    (tree / "dir").mkdir(parents=True)
+    os.chmod(tree / "dir", 0o755)  # noqa: S103 - the world-readable case under test
+    (tree / "dir" / "file.py").write_text("x", encoding="utf-8")
+    os.chmod(tree / "dir" / "file.py", 0o644)
+    manager = _eperm_manager(
+        tmp_path,
+        monkeypatch,
+        [
+            f"setfacl: {tree / 'dir'}: Operation not permitted",
+            f"setfacl: {tree / 'dir' / 'file.py'}: Operation not permitted",
+        ],
+    )
+
+    manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+
+def test_read_grant_still_fails_for_unreadable_or_other_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    private = tree / "private.env"
+    private.write_text("x", encoding="utf-8")
+    os.chmod(private, 0o600)
+    manager = _eperm_manager(
+        tmp_path, monkeypatch, [f"setfacl: {private}: Operation not permitted"]
+    )
+    with pytest.raises(WorktreeError, match="cannot grant read access"):
+        manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+    other = _eperm_manager(tmp_path, monkeypatch, ["setfacl: /x: No such file or directory"])
+    with pytest.raises(WorktreeError, match="setfacl failed"):
+        other._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+
+def test_read_grant_accepts_foreign_files_whose_acl_already_grants_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-56: maker files are 660 but inherit u:delivery-runner:r-x from the default ACL."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    owned = tree / "tasks.md"
+    owned.write_text("x", encoding="utf-8")
+    os.chmod(owned, 0o660)
+    manager = _eperm_manager(tmp_path, monkeypatch, [f"setfacl: {owned}: Operation not permitted"])
+    acl = "user::rw-\nuser:delivery-runner:r-x\t#effective:r--\ngroup::rw-\nmask::rw-\n"
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[0] == "getfacl":
+            return subprocess.CompletedProcess(args, 0, acl, "")
+        return subprocess.CompletedProcess(
+            args, 1, "", f"setfacl: {owned}: Operation not permitted\n"
+        )
+
+    monkeypatch.setattr(manager_module.subprocess, "run", fake_run)
+    manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+    missing = "user::rw-\ngroup::rw-\nmask::rw-\n"
+    monkeypatch.setattr(
+        manager_module.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            0 if args[0] == "getfacl" else 1,
+            missing if args[0] == "getfacl" else "",
+            "" if args[0] == "getfacl" else f"setfacl: {owned}: Operation not permitted\n",
+        ),
+    )
+    with pytest.raises(WorktreeError, match="cannot grant read access"):
+        manager._grant_tree_read_access(tree, ("delivery-runner",), cwd=tree)
+
+
+def test_publication_transport_identity_reads_only_changeset_git_metadata(
+    tmp_path: Path,
+) -> None:
+    """NEW-61: the controller fetches validated commits over SSH as the operator.
+
+    (Not "hermes" here: the tests run as hermes, which is the manager identity.)
+    """
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "falcone" / str(uuid4())
+    target.mkdir(parents=True)
+    metadata_root = tmp_path / "cache" / "scan" / "worktree-git"
+    metadata = metadata_root / "falcone" / f"{target.name}.git"
+    (metadata / "objects").mkdir(parents=True)
+    mirror_root = tmp_path / "mirrors"
+    canonical = mirror_root / "falcone.git"
+    canonical.mkdir(parents=True)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+        publication_transport_identity="transport",
+    )
+    commands: list[list[str]] = []
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        commands.append(args)
+        return ""
+
+    manager._run = record  # type: ignore[method-assign]
+    manager._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+
+    def grants(path: Path, entry: str) -> bool:
+        return any(
+            command[0] == "setfacl" and command[-1] == str(path) and entry in command[-2]
+            for command in commands
+        )
+
+    # Allocation default ACL: what the maker commits inherits read for the transport.
+    assert grants(metadata, "u:transport:r-X")
+    assert grants(metadata, "d:u:transport:r-x")
+    assert grants(metadata / "objects", "d:u:transport:r-x")
+    assert grants(metadata.parent, "u:transport:--x")
+    assert grants(canonical, "u:transport:r-X")
+    # Never the worktree itself.
+    assert not any(
+        command[-1] in {str(target), str(target.parent)} and "u:transport:" in command[-2]
+        for command in commands
+    )
+
+    commands.clear()
+    manager.verify_mirror = lambda repository: canonical  # type: ignore[method-assign]
+    manager.grant_delivery_read("falcone", target)
+    assert grants(metadata, "u:transport:r-X")
+    assert grants(metadata / "objects", "d:u:transport:r-x")
+    assert grants(canonical, "u:transport:r-X")
+    assert grants(target, "u:delivery-runner:r-X")
+    assert not any(
+        command[-1] in {str(target), str(target.parent)} and "u:transport:" in command[-2]
+        for command in commands
+    )
+
+    commands.clear()
+    without = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+    )
+    without._run = record  # type: ignore[method-assign]
+    without._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+    assert not any("u:transport:" in argument for command in commands for argument in command)
+
+
+@pytest.mark.parametrize("identity", ["codex-runner", "claude-runner", "Hermes", "a b", ""])
+def test_publication_transport_identity_must_be_a_plain_non_model_user(identity: str) -> None:
+    with pytest.raises(ValueError, match="transport identity"):
+        GitWorktreeManager(publication_transport_identity=identity)
+
+
+def test_abandoned_dirty_worktree_is_archived_then_removed(tmp_path: Path) -> None:
+    # NEW-85: an abandoned attempt's uncommitted work is kept under refs/archive/.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    (path / "feature.py").write_text("half-finished\n", encoding="utf-8")
+    allocation = manager_module.WorktreeAllocation(
+        "falcone",
+        path,
+        f"agent/falcone/993/{request['change_set_id']}",
+        sha,
+        request["change_set_id"],
+    )
+
+    with pytest.raises(WorktreeError, match="dirty worktree"):
+        manager.cleanup(allocation, evidence_captured=False)
+    manager.cleanup(allocation, evidence_captured=False, archive_dirty=True)
+
+    assert not path.exists()
+    metadata = manager.metadata_path("falcone", request["change_set_id"])
+    refs = git(
+        ["for-each-ref", "--format=%(refname)", f"refs/archive/{request['change_set_id']}"],
+        metadata,
+    )
+    assert any(ref.endswith("-worktree") for ref in refs.splitlines())
+    assert (
+        git(["rev-parse", f"refs/heads/agent/falcone/993/{request['change_set_id']}"], metadata)
+        == head
+    )
+
+
+def test_allocation_recreates_a_cleaned_worktree_from_its_surviving_branch(tmp_path: Path) -> None:
+    # NEW-85: cleanup removes the worktree but keeps the branch; the next delivery resumes
+    # it (NEW-52) or, without resume, archives it and starts from the base.
+    manager, request, path, sha = _resume_fixture(tmp_path)
+    head = git(["rev-parse", "HEAD"], path)
+    metadata = manager.metadata_path("falcone", request["change_set_id"])
+    git(["worktree", "remove", "--force", str(path)], metadata)
+
+    resumed = manager.allocate(**request, resume_prior_commits=True)  # type: ignore[arg-type]
+    assert resumed.resumed_from_sha == head and git(["rev-parse", "HEAD"], path) == head
+
+    git(["worktree", "remove", "--force", str(path)], metadata)
+    fresh = manager.allocate(**request, resume_prior_commits=False)  # type: ignore[arg-type]
+    assert fresh.resumed_from_sha is None and git(["rev-parse", "HEAD"], path) == sha
+    archived = git(
+        ["for-each-ref", "--format=%(objectname)", f"refs/archive/{request['change_set_id']}"],
+        metadata,
+    )
+    assert head in archived.splitlines()
+
+
+def test_prune_orphan_worktrees_removes_only_old_untracked_directories(tmp_path: Path) -> None:
+    # NEW-85: ~40 detached snapshot directories on the worker were invisible to cleanup.
+    # Unknown slugs (the root-owned acceptance/ tree) are never walked: the scan worker
+    # can only traverse the worktree root, not list it.
+    manager, request, changeset_path, sha = _resume_fixture(tmp_path)
+    manager._grant_read_access = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    campaign = uuid4()
+    snapshot = manager.allocate_audit_snapshot(
+        repository="falcone",
+        campaign_id=campaign,
+        base_ref="refs/heads/main",
+        expected_base_sha=sha,
+    )
+    unowned = tmp_path / "worktrees" / "acceptance" / str(uuid4())
+    unowned.mkdir(parents=True)
+    (unowned / "leftover.txt").write_text("x\n", encoding="utf-8")
+    recent = tmp_path / "worktrees" / "acceptance" / str(uuid4())
+    recent.mkdir()
+    old = 1_000_000_000
+    for directory in (snapshot.path, unowned, changeset_path):
+        os.utime(directory, (old, old))
+    from datetime import UTC, datetime, timedelta
+
+    cutoff = datetime.now(UTC) - timedelta(days=14)
+    dry = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=True)
+    assert {item["path"] for item in dry["removed"]} == {str(snapshot.path)}
+    assert snapshot.path.exists() and unowned.exists()
+
+    done = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=False)
+
+    assert [item["kind"] for item in done["removed"]] == ["SNAPSHOT"]
+    assert not snapshot.path.exists() and unowned.exists()
+    assert not manager.metadata_path("falcone", campaign).exists()
+    assert changeset_path.exists() and recent.exists()  # lease-tracked / too recent

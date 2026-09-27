@@ -107,3 +107,178 @@ def test_claude_usage_ignores_malformed_or_redacted_counters() -> None:
     assert usage.input_tokens is None
     assert usage.output_tokens is None
     assert usage.cached_input_tokens is None
+
+
+def test_error_result_reason_reaches_the_run_summary() -> None:
+    # NEW-31: a live spec run (musematic #1026) exited 1 after 10 minutes; the error
+    # result event had no "result" text, so the summary showed only an unrelated stderr
+    # warning and the real reason was lost.
+    structured, summary, session_id = ClaudeCLIAdapter._final(
+        (
+            {"type": "system", "session_id": "s-1"},
+            {
+                "type": "result",
+                "subtype": "error_max_structured_output_retries",
+                "is_error": True,
+                "errors": ["structured output did not match the schema"],
+                "session_id": "s-1",
+            },
+        )
+    )
+
+    assert structured == {}
+    assert session_id == "s-1"
+    assert summary == (
+        "claude result error_max_structured_output_retries: "
+        "structured output did not match the schema"
+    )
+
+
+_RECOVERY_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "scope"],
+    "properties": {
+        "decision": {"type": "string", "enum": ["READY", "BLOCKED"]},
+        "scope": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    },
+}
+
+
+def _structured_attempt(candidate: object) -> dict[str, Any]:
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "returning the result"},
+                {"type": "tool_use", "id": "t", "name": "StructuredOutput", "input": candidate},
+            ]
+        },
+    }
+
+
+_RETRIES_EXHAUSTED = {
+    "type": "result",
+    "subtype": "error_max_structured_output_retries",
+    "is_error": True,
+    "errors": ["Failed to provide valid structured output after 5 attempts"],
+}
+
+
+async def _execute_with_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    events: tuple[dict[str, Any], ...],
+    *,
+    exit_code: int = 1,
+    model: str | None = None,
+) -> tuple[Any, list[str]]:
+    observed: dict[str, Any] = {}
+
+    async def fake_run(command: list[str], **kwargs: Any) -> ProcessResult:
+        observed["command"] = command
+        return ProcessResult(exit_code=exit_code, events=events, stderr="")
+
+    monkeypatch.setattr(claude_module, "run_jsonl_process", fake_run)
+    request = AgentRequest(
+        project=Project.MUSEMATIC,
+        role="product-spec-architect",
+        provider=Provider.CLAUDE,
+        model_class=ModelClass.JUDGE,
+        prompt="produce a bounded spec",
+        working_directory=str(tmp_path),
+        output_schema=_RECOVERY_SCHEMA,
+        model=model,
+    )
+    result = await ClaudeCLIAdapter().execute(request)
+    return result, observed["command"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {"decision": "READY", "scope": ["cap uploads"]},
+        json.dumps({"decision": "READY", "scope": ["cap uploads"]}),
+        {"decision": "READY", "scope": json.dumps(["cap uploads"])},
+    ],
+    ids=["object", "json-string", "stringified-array"],
+)
+async def test_valid_last_candidate_is_recovered_after_structured_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate: object
+) -> None:
+    # NEW-53: ~13% of spec runs ended in error_max_structured_output_retries and burned
+    # a whole delivery attempt although the last candidate may satisfy our schema.
+    result, _ = await _execute_with_events(
+        tmp_path,
+        monkeypatch,
+        (
+            _structured_attempt({"decision": "MAYBE"}),
+            _structured_attempt(candidate),
+            _RETRIES_EXHAUSTED,
+        ),
+    )
+
+    assert result.status is RunStatus.SUCCESS
+    assert result.error_code is None
+    assert result.recovered_from_structured_retry is True
+    assert result.structured_result == {"decision": "READY", "scope": ["cap uploads"]}
+    assert result.summary.startswith("recovered_from_structured_retry")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "events",
+    [
+        (_RETRIES_EXHAUSTED,),
+        (_structured_attempt({"decision": "READY", "scope": []}), _RETRIES_EXHAUSTED),
+        (_structured_attempt("{not json"), _RETRIES_EXHAUSTED),
+        (
+            _structured_attempt({"decision": "READY", "scope": ["x"], "extra": 1}),
+            _RETRIES_EXHAUSTED,
+        ),
+        (
+            _structured_attempt({"decision": "READY", "scope": ["x"]}),
+            {"type": "result", "subtype": "error_max_turns", "is_error": True},
+        ),
+    ],
+    ids=["no-candidate", "invalid", "unparseable", "extra-key", "other-error"],
+)
+async def test_structured_retry_failure_stands_without_a_valid_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, events: tuple[dict[str, Any], ...]
+) -> None:
+    result, _ = await _execute_with_events(tmp_path, monkeypatch, events)
+
+    assert result.status is RunStatus.FAILED
+    assert result.error_code == "PROVIDER_EXIT_NONZERO"
+    assert result.recovered_from_structured_retry is False
+    assert result.structured_result == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "claude-opus-4-9"])
+async def test_request_model_reaches_the_cli_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str | None
+) -> None:
+    # NEW-53: claude_spec_model / claude_checker_model travel as AgentRequest.model.
+    _, command = await _execute_with_events(
+        tmp_path,
+        monkeypatch,
+        ({"type": "result", "subtype": "success", "structured_output": {}},),
+        exit_code=0,
+        model=model,
+    )
+
+    if model is None:
+        assert "--model" not in command
+    else:
+        assert command[command.index("--model") + 1] == model
+
+
+def test_successful_result_text_is_still_the_summary() -> None:
+    _, summary, _ = ClaudeCLIAdapter._final(
+        ({"type": "result", "subtype": "success", "result": "done"},)
+    )
+
+    assert summary == "done"

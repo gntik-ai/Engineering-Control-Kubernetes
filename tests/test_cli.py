@@ -6,10 +6,14 @@ import pytest
 from engineering_control.cli import APIClient, dispatch, parser
 
 
-def test_cli_accepts_service_group_read_token(tmp_path: Path) -> None:
+def test_cli_accepts_service_group_read_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     token = tmp_path / "api.token"
     token.write_text("x" * 48, encoding="utf-8")
     os.chmod(token, 0o640)
+    identity = type("Identity", (), {"pw_name": "hermes"})()
+    monkeypatch.setattr("engineering_control.cli.pwd.getpwuid", lambda _uid: identity)
 
     client = APIClient("http://127.0.0.1:8740", token)
 
@@ -30,10 +34,27 @@ def test_cli_refuses_a_non_operator_unix_identity(
         APIClient("http://127.0.0.1:8740", token)
 
 
-def test_cli_rejects_group_writable_token(tmp_path: Path) -> None:
+def test_cli_refuses_an_unmapped_effective_unix_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = tmp_path / "api.token"
+    token.write_text("x" * 48, encoding="utf-8")
+    os.chmod(token, 0o640)
+    monkeypatch.setattr(
+        "engineering_control.cli.pwd.getpwuid",
+        lambda _uid: (_ for _ in ()).throw(KeyError("missing")),
+    )
+
+    with pytest.raises(PermissionError, match="must run as the hermes operator"):
+        APIClient("http://127.0.0.1:8740", token)
+
+
+def test_cli_rejects_group_writable_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     token = tmp_path / "api.token"
     token.write_text("x" * 48, encoding="utf-8")
     os.chmod(token, 0o660)
+    identity = type("Identity", (), {"pw_name": "hermes"})()
+    monkeypatch.setattr("engineering_control.cli.pwd.getpwuid", lambda _uid: identity)
 
     with pytest.raises(PermissionError, match="permissions are too broad"):
         APIClient("http://127.0.0.1:8740", token)

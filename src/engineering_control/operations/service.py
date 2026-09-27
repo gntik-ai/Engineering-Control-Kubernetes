@@ -19,6 +19,7 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
+from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.operations.connections import ConnectionHealthProjector
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
@@ -132,6 +133,23 @@ class TypedCommandBus:
                     level="INFO",
                     message="Typed operation completed without starting a workflow",
                 )
+            elif isinstance(command, WorkflowControlCommand):
+                # NEW-35: a control only signals an existing workflow. Leaving it STARTED
+                # bound to that long-lived loop made it "active" forever, so every later
+                # retry/skip/resume of the same loop was deduplicated onto it unsent.
+                await self.operations.finish(
+                    operation_id,
+                    status="COMPLETED",
+                    workflow_id=accepted.workflow_id,
+                    run_id=accepted.run_id,
+                )
+                await self.operations.record_dispatch_event(
+                    operation_id,
+                    event_type="operation.completed",
+                    level="INFO",
+                    message="Typed workflow control signal delivered",
+                    workflow_id=accepted.workflow_id,
+                )
             else:
                 await self.operations.finish(
                     operation_id,
@@ -146,6 +164,31 @@ class TypedCommandBus:
                     message="Typed operation started one durable workflow",
                     workflow_id=accepted.workflow_id,
                 )
+
+    policy_activation_timeout_seconds = 60.0
+    policy_activation_poll_seconds = 2.0
+
+    async def _await_policy_activation(self, campaign_id: UUID, approval: dict[str, Any]) -> None:
+        # Starting moves the campaign to RUNNING at once, after which the root policy
+        # reconciler rejects the queued request and the GitHub write policy is never
+        # enabled (NEW-26). Start only once the reconciler has promoted the campaign.
+        if approval.get("status") != "APPROVED_POLICY_PENDING":
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.policy_activation_timeout_seconds
+        while True:
+            campaign = await self.metadata.get_backlog_campaign(campaign_id)
+            if campaign is not None and campaign.get("status") in {
+                "APPROVED",
+                "APPROVED_INVENTORY",
+            }:
+                return
+            if loop.time() >= deadline:
+                raise ValueError(
+                    "GitHub write policy activation did not complete; check "
+                    "engineering-github-policy-reconciler before starting"
+                )
+            await asyncio.sleep(self.policy_activation_poll_seconds)
 
     async def _execute(
         self,
@@ -168,12 +211,13 @@ class TypedCommandBus:
                     maximum_items=1,
                 ),
             )
-            await self.metadata.approve_backlog_campaign(
+            approval = await self.metadata.approve_backlog_campaign(
                 command.backlog_campaign_id,
                 command.project.value,
                 str(candidate["approval_binding"]),
                 self._approval_actor(operator_class),
             )
+            await self._await_policy_activation(command.backlog_campaign_id, approval)
             return await self.control.start_existing_backlog_loop(
                 ExistingBacklogLoopStart(
                     project=command.project.value,
@@ -197,12 +241,13 @@ class TypedCommandBus:
                     maximum_items=command.maximum_items,
                 ),
             )
-            await self.metadata.approve_backlog_campaign(
+            approval = await self.metadata.approve_backlog_campaign(
                 command.backlog_campaign_id,
                 command.project,
                 str(candidate["approval_binding"]),
                 self._approval_actor(operator_class),
             )
+            await self._await_policy_activation(command.backlog_campaign_id, approval)
             return await self.control.start_existing_backlog_loop(
                 ExistingBacklogLoopStart(
                     project=command.project,
@@ -353,12 +398,11 @@ class TypedCommandBus:
     @staticmethod
     def _approval_actor(operator_class: str) -> str:
         if operator_class == "password-reauthenticated-operator":
-            return "dashboard:reauthenticated:hermes"
-        if operator_class.startswith("telegram:"):
-            return operator_class
-        if operator_class == "engineering-ctl:hermes":
-            return "cli:engineering-ctl:hermes"
-        raise ValueError("operation requires an allowlisted operator channel")
+            return "dashboard:reauthenticated"
+        try:
+            return canonical_operator_approval_actor(operator_class)
+        except ValueError as error:
+            raise ValueError("operation requires an allowlisted operator channel") from error
 
     @staticmethod
     def _enhancement_binding(

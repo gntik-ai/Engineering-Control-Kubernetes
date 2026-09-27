@@ -219,3 +219,48 @@ async def test_multi_project_audit_service_creates_one_parent_and_three_bound_ch
         for child in client.workflow_input.child_workflow_ids.values()
     )
     assert repository.request is not None and repository.request.production is False
+
+
+class _SignalHandle:
+    def __init__(self) -> None:
+        self.signals: list[tuple[str, Any]] = []
+
+    async def signal(self, name: str, argument: Any = None) -> None:
+        self.signals.append((name, argument))
+
+
+class _SignalClient:
+    def __init__(self, handle: _SignalHandle) -> None:
+        self.handle = handle
+
+    def get_workflow_handle(self, workflow_id: str) -> _SignalHandle:
+        return self.handle
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["pause_after_current", "stop_after_current"])
+async def test_after_current_controls_reach_the_workflow(signal: str) -> None:
+    # NEW-30: the command bus forwards these two real workflow signals, but the service
+    # allowlist refused them ("unsupported control signal"), so they never worked.
+    handle = _SignalHandle()
+    service = TemporalControlService(
+        _SignalClient(handle),  # type: ignore[arg-type]
+        "engineering-control",
+        EmptyMetadataRepository(),
+    )
+
+    await service.signal("backlog-loop-musematic-synthetic", signal)
+
+    assert handle.signals == [(signal, None)]
+
+
+@pytest.mark.asyncio
+async def test_unknown_control_signal_is_still_refused() -> None:
+    service = TemporalControlService(
+        _SignalClient(_SignalHandle()),  # type: ignore[arg-type]
+        "engineering-control",
+        EmptyMetadataRepository(),
+    )
+
+    with pytest.raises(ValueError, match="unsupported control signal"):
+        await service.signal("backlog-loop-musematic-synthetic", "terminate")

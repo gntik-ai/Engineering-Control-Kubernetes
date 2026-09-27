@@ -9,7 +9,11 @@ from engineering_control.activities.core import ControlActivities
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
 from engineering_control.observability.heartbeat import WorkerHeartbeatPublisher
-from engineering_control.workflows.worker_registry import ROLE_TASK_QUEUES, role_worker_spec
+from engineering_control.workflows.worker_registry import (
+    ROLE_TASK_QUEUES,
+    role_worker_spec,
+    worker_deployment_kwargs,
+)
 
 QUEUES = ROLE_TASK_QUEUES
 
@@ -26,6 +30,7 @@ async def serve() -> None:
         workflows=[],
         activities=[activities.execute_control_step],
         max_concurrent_activities=spec.max_concurrent_activities,
+        **worker_deployment_kwargs(settings.build_id),
     )
     heartbeat = WorkerHeartbeatPublisher(settings, f"{spec.kind}-runner")
     heartbeat_task = asyncio.create_task(heartbeat.serve())

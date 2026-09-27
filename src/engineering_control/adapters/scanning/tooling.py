@@ -39,7 +39,9 @@ class DeterministicScanner:
             check=False,
         )
         if result.return_code not in {0, 2}:
-            raise RuntimeError("gitleaks execution failed")
+            raise RuntimeError(
+                f"gitleaks execution failed ({result.return_code}): {result.stderr[-2000:]}"
+            )
         payload = self._sanitize_gitleaks(report)
         return {"status": "FINDINGS" if payload else "PASS", "findings": payload}
 
@@ -67,7 +69,9 @@ class DeterministicScanner:
             timeout_seconds=1800,
         )
         if result.return_code:
-            raise RuntimeError("Trivy execution failed")
+            raise RuntimeError(
+                f"Trivy execution failed ({result.return_code}): {result.stderr[-2000:]}"
+            )
         return self._sanitize_trivy(report)
 
     def semgrep(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
@@ -79,13 +83,17 @@ class DeterministicScanner:
             "semgrep",
             [
                 "scan",
+                # NEW-19, 2026-09-22: "--config auto" hard-fails on semgrep 1.174.0
+                # ("Cannot create auto config when metrics are off") because auto
+                # mode's registry lookup requires the metrics ping this platform
+                # deliberately disables. p/ci is semgrep's own general-purpose
+                # default ruleset and works fine with metrics off.
                 "--config",
-                "auto",
+                "p/ci",
                 "--json",
                 "--output",
                 str(report),
                 "--metrics=off",
-                "--no-suppress-errors",
                 str(worktree),
             ],
             cwd=worktree,
@@ -93,7 +101,9 @@ class DeterministicScanner:
             timeout_seconds=1800,
         )
         if result.return_code not in {0, 1}:
-            raise RuntimeError("Semgrep execution failed")
+            raise RuntimeError(
+                f"Semgrep execution failed ({result.return_code}): {result.stderr[-2000:]}"
+            )
         return self._sanitize_semgrep(report)
 
     def sbom(self, worktree: Path, evidence_directory: Path) -> dict[str, Any]:
@@ -109,7 +119,9 @@ class DeterministicScanner:
             timeout_seconds=1800,
         )
         if result.return_code:
-            raise RuntimeError("Syft execution failed")
+            raise RuntimeError(
+                f"Syft execution failed ({result.return_code}): {result.stderr[-2000:]}"
+            )
         return self._sanitize_object(report)
 
     def validate_manifests(self, manifest: Path, worktree: Path) -> None:

@@ -13,6 +13,7 @@ class WorkflowName(StrEnum):
     RUNTIME_VERIFICATION = "RuntimeVerificationWorkflow"
     RECOVERY = "RecoveryWorkflow"
     QUOTA_REFRESH = "QuotaRefreshWorkflow"
+    CONNECTIONS_REFRESH = "ConnectionsRefreshWorkflow"
     CLEANUP = "CleanupWorkflow"
     ACCEPTANCE_LIFECYCLE = "AcceptanceLifecycleWorkflow"
     OBSERVABILITY_ACCEPTANCE = "ObservabilityAcceptanceWorkflow"
@@ -25,3 +26,4 @@ class WorkflowName(StrEnum):
     ENHANCEMENT_DELIVERY = "EnhancementDeliveryWorkflow"
     ENHANCEMENT_SOLUTION_LOOP = "EnhancementSolutionLoopWorkflow"
     LLMWIKI_STAGING_BOOTSTRAP = "LLMWikiStagingBootstrapWorkflow"
+    STAGING_GITOPS_DELIVERY = "StagingGitOpsDeliveryWorkflow"

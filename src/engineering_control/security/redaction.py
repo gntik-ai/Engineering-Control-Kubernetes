@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 REDACTED = "[REDACTED]"
+# Patterns that replace a remainder must not re-match their own output: the ingest
+# service re-redacts pre-redacted evidence and rejects it on any replacement.
+_NOT_REDACTED = rf"(?!\s*{re.escape(REDACTED)})"
 
 
 @dataclass(frozen=True)
@@ -31,7 +34,7 @@ class SecretRedactor:
         ),
         (
             "cookie",
-            re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)[^\r\n]{4,}"),
+            re.compile(rf"(?i)\b((?:set-)?cookie\s*:\s*){_NOT_REDACTED}[^\r\n]{{4,}}"),
             rf"\1{REDACTED}",
         ),
         (
@@ -61,25 +64,27 @@ class SecretRedactor:
         (
             "credential_assignment",
             re.compile(
-                r"(?im)^(\s*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|encryption[_-]?key|telegram[_-]?bot[_-]?token)\s*[:=]\s*)([^\s#]+|['\"][^'\"]+['\"])(\s*(?:#.*)?)$"
+                r"(?im)^(\s*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|encryption[_-]?key|telegram[_-]?bot[_-]?token)\s*[:=]\s*)"
+                rf"{_NOT_REDACTED}([^\s#]+|['\"][^'\"]+['\"])(\s*(?:#.*)?)$"
             ),
             rf"\1{REDACTED}\3",
         ),
         (
             "url_credentials",
-            re.compile(r"(?i)(https?://[^\s:/@]+:)[^\s/@]+(@)"),
+            re.compile(rf"(?i)(https?://[^\s:/@]+:){_NOT_REDACTED}[^\s/@]+(@)"),
             rf"\1{REDACTED}\2",
         ),
         (
             "url_query_credential",
             re.compile(
-                r"(?i)([?&](?:access[_-]?token|auth|authorization|key|password|passwd|secret|session|signature|token)=)[^&#\s]+"
+                r"(?i)([?&](?:access[_-]?token|auth|authorization|key|password|passwd|secret|session|signature|token)=)"
+                rf"{_NOT_REDACTED}[^&#\s]+"
             ),
             rf"\1{REDACTED}",
         ),
         (
             "kubeconfig_credential",
-            re.compile(r"(?im)^(\s*(?:token|client-key-data|password)\s*:\s*)[^\r\n]+$"),
+            re.compile(rf"(?im)^(\s*(?:token|client-key-data|password)\s*:\s*){_NOT_REDACTED}[^\r\n]+$"),
             rf"\1{REDACTED}",
         ),
     )

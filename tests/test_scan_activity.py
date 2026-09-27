@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from temporalio.exceptions import ApplicationError
 
+import engineering_control.activities.scan as scan_module
 from engineering_control.activities.retention import cleanup_authorization_sha256
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.adapters.command import CommandResult
@@ -145,7 +146,9 @@ class FakeCleanupManager:
     def is_dirty(self, path: Path) -> bool:
         return self.dirty
 
-    def cleanup(self, allocation: Any, *, evidence_captured: bool) -> None:
+    def cleanup(
+        self, allocation: Any, *, evidence_captured: bool, archive_dirty: bool = False
+    ) -> None:
         assert evidence_captured is False
         self.cleaned.append(str(allocation.path))
 
@@ -406,3 +409,357 @@ async def test_cleanup_protects_dirty_and_executes_only_controller_authorization
     )
     assert result["removed_lease_ids"] == [str(lease_id)]
     assert manager.cleaned == [str(path)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "expected_method"),
+    [
+        ("project.snapshot_pair", "_snapshot_pair"),
+        ("runtime.deterministic_checks", "_runtime_deterministic_checks"),
+        ("identity.observer_attest", "_observer_attestation"),
+        ("reconcile.apply_promotion", "_apply_promotion"),
+        ("delivery.deterministic_prechecks", "_delivery_prechecks"),
+        ("delivery.validate_changeset", "_validate_changeset"),
+        ("delivery.prepare_toolchain", "_prepare_toolchain"),
+    ],
+)
+async def test_scan_dispatch_runs_blocking_kubectl_and_scanner_steps_off_the_event_loop(
+    step: str, expected_method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-08: these steps all end up calling kubectl (via KubernetesObserver), git (via
+    the promotion runner), or gitleaks/trivy/semgrep/syft (via DeterministicScanner) --
+    all blocking subprocess calls through SafeCommandRunner. Confirm handle() schedules
+    the actual work via asyncio.to_thread rather than running it inline on the event loop.
+    """
+    handler = ScanActivityHandler(Settings())  # type: ignore[arg-type]
+    calls: list[str] = []
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(getattr(func, "__name__", str(func)))
+        return {"status": "OK"}
+
+    monkeypatch.setattr(scan_module.asyncio, "to_thread", fake_to_thread)
+
+    result = await handler.handle(step, {"status": "PENDING"})
+
+    assert calls == [expected_method]
+    assert result == {"status": "OK"}
+
+
+class BaselineScanner:
+    """Scanner double: each repository's findings for the current phase (pre/post)."""
+
+    def __init__(self) -> None:
+        self.findings: dict[str, dict[str, Any]] = {}
+
+    def _for(self, worktree: Path) -> dict[str, Any]:
+        return self.findings.get(worktree.name, {})
+
+    def secret_scan(self, worktree: Path, output: Path) -> dict[str, Any]:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "gitleaks.json").write_text("[]\n", encoding="utf-8")
+        found = [
+            {"RuleID": rule, "File": f"{worktree}/{path}", "StartLine": line}
+            for rule, path, line in self._for(worktree).get("secrets", [])
+        ]
+        return {"status": "FINDINGS" if found else "PASS", "findings": found}
+
+    def vulnerability_scan(self, worktree: Path, output: Path) -> dict[str, Any]:
+        vulnerabilities = [
+            {
+                "VulnerabilityID": cve,
+                "PkgName": package,
+                "InstalledVersion": "1.0",
+                "Severity": "HIGH",
+            }
+            for cve, package in self._for(worktree).get("vulnerabilities", [])
+        ]
+        return {"Results": [{"Target": "requirements.txt", "Vulnerabilities": vulnerabilities}]}
+
+    def semgrep(self, worktree: Path, output: Path) -> dict[str, Any]:
+        return {
+            "results": [
+                {"check_id": rule, "path": f"{worktree}/{path}", "start": {"line": line}}
+                for rule, path, line in self._for(worktree).get("semgrep", [])
+            ]
+        }
+
+    def sbom(self, worktree: Path, output: Path) -> dict[str, Any]:
+        return {}
+
+
+class ChangeManager:
+    def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
+        return (
+            {"changed_file_count": 1, "changed_paths": ["app/service.py"]},
+            "--- a/app/service.py\n+++ b/app/service.py\n+fixed = True\n",
+        )
+
+    def grant_delivery_read(self, repository: str, path: Path) -> None:
+        pass
+
+    def grant_release_read(self, repository: str, path: Path) -> None:
+        pass
+
+
+class ReceiptPublisher:
+    def publish(self, path: Path, **_: Any) -> dict[str, Any]:
+        return {"id": str(uuid4()), "filename": path.name}
+
+
+def _baseline_handler(
+    tmp_path: Path,
+) -> tuple[ScanActivityHandler, BaselineScanner, dict[str, Any]]:
+    worktrees = tmp_path / "worktrees"
+    for name in ("source", "deployment"):
+        (worktrees / name).mkdir(parents=True)
+    scanner = BaselineScanner()
+    handler = ScanActivityHandler(
+        Settings(evidence_root=tmp_path / "evidence", worktree_root=worktrees),
+        ChangeManager(),  # type: ignore[arg-type]
+        scanner=scanner,  # type: ignore[arg-type]
+        publisher=ReceiptPublisher(),  # type: ignore[arg-type]
+    )
+    maker = {"structured_result": {"tests": [{"status": "PASS"}]}}
+    payload = {
+        "project": "musematic",
+        "change_set_id": str(uuid4()),
+        "source_worktree": str(worktrees / "source"),
+        "deployment_worktree": str(worktrees / "deployment"),
+        "source_repository": "musematic",
+        "deployment_repository": "musematic-deploy",
+        "source_base_sha": "a" * 40,
+        "deployment_base_sha": "b" * 40,
+        "agent_result": {"structured_result": {"decision": "PASS"}},
+        "source_maker_result": maker,
+        "deployment_maker_result": maker,
+    }
+    return handler, scanner, payload
+
+
+EXISTING = {
+    "secrets": [("generic-api-key", "tests/fixtures/sample.env", 3)],
+    "semgrep": [("python.lang.security.audit.eval", "app/service.py", 10)],
+    "vulnerabilities": [("CVE-2024-0001", "requests")],
+}
+
+
+def test_prechecks_record_existing_findings_as_baseline_instead_of_blocking(
+    tmp_path: Path,
+) -> None:
+    # NEW-28: musematic's unmodified repo (156 semgrep findings, 363 HIGH/CRITICAL vulns,
+    # gitleaks findings) blocked every delivery at prechecks, before any change existed.
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+
+    prechecks = handler._delivery_prechecks(payload)
+
+    assert prechecks["status"] == "PRECHECKS_PASS"
+    assert prechecks["blocker"] is None
+    assert prechecks["prechecks"]["source"]["semgrep_findings"] == 1
+
+
+def test_postchecks_pass_when_the_change_only_shifts_existing_findings(tmp_path: Path) -> None:
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+    handler._delivery_prechecks(payload)
+    shifted = {
+        "secrets": [("generic-api-key", "tests/fixtures/sample.env", 9)],
+        "semgrep": [("python.lang.security.audit.eval", "app/service.py", 14)],
+        "vulnerabilities": EXISTING["vulnerabilities"],
+    }
+    scanner.findings = {"source": shifted, "deployment": EXISTING}
+
+    validated = handler._validate_changeset(payload)
+
+    assert validated["status"] == "LOCAL_VALIDATION_PASS"
+    source = validated["change_evidence"]["source"]
+    assert source["introduced_findings"] == {"secrets": 0, "semgrep": 0, "vulnerabilities": 0}
+    assert source["diff_withheld"] is False
+
+
+@pytest.mark.parametrize(
+    ("category", "added", "withheld"),
+    [
+        ("semgrep", ("python.lang.security.audit.eval", "app/service.py", 30), False),
+        ("secrets", ("aws-access-token", "app/service.py", 2), True),
+        ("vulnerabilities", ("CVE-2025-9999", "urllib3"), False),
+    ],
+)
+def test_postchecks_block_findings_the_change_introduces(
+    tmp_path: Path, category: str, added: tuple[Any, ...], withheld: bool
+) -> None:
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+    handler._delivery_prechecks(payload)
+    changed = {key: list(value) for key, value in EXISTING.items()}
+    changed[category].append(added)
+    scanner.findings = {"source": changed, "deployment": EXISTING}
+
+    validated = handler._validate_changeset(payload)
+
+    # NEW-76: introduced findings go back to the maker as a correction request, named.
+    assert validated["status"] == "REQUEST_CHANGES"
+    assert validated["blocker"] == "CHANGESET_VALIDATION_FINDINGS"
+    source = validated["change_evidence"]["source"]
+    assert source["introduced_findings"][category] == 1
+    assert source["diff_withheld"] is withheld
+    [finding] = validated["validation_findings"]
+    assert finding.startswith("source: ") and str(added[0]) in finding
+
+
+def test_postchecks_fail_closed_to_absolute_gate_without_a_baseline(tmp_path: Path) -> None:
+    handler, scanner, payload = _baseline_handler(tmp_path)
+    scanner.findings = {"source": EXISTING, "deployment": EXISTING}
+
+    validated = handler._validate_changeset(payload)
+
+    assert validated["status"] == "BLOCKED"
+    assert validated["change_evidence"]["source"]["diff_withheld"] is True
+
+
+class ResumingManager:
+    """NEW-52 allocation double: the source worktree resumes, the deployment does not."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.resume_flags: list[bool] = []
+
+    def allocate(self, **kwargs: Any) -> WorktreeAllocation:
+        self.resume_flags.append(kwargs["resume_prior_commits"])
+        repository = kwargs["repository"]
+        return WorktreeAllocation(
+            repository=repository,
+            path=self.root / repository,
+            branch=f"agent/{repository}",
+            base_sha=kwargs["expected_base_sha"],
+            change_set_id=kwargs["change_set_id"],
+            resumed_from_sha="d" * 40 if repository == "musematic" else None,
+        )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_allocation_threads_the_resume_setting_and_resumed_head(
+    tmp_path: Path, enabled: bool
+) -> None:
+    manager = ResumingManager(tmp_path)
+    handler = ScanActivityHandler(
+        Settings(delivery_resume_prior_commits=enabled),
+        manager,  # type: ignore[arg-type]
+    )
+    request = {
+        "change_set_id": str(uuid4()),
+        "project": "musematic",
+        "issue": "993",
+        "source_repository": "musematic",
+        "source_base_sha": "a" * 40,
+        "deployment_repository": "musematic-deploy",
+        "deployment_base_sha": "b" * 40,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+
+    allocated = handler._allocate({"allocation_request": request})
+
+    assert manager.resume_flags == [enabled, enabled]
+    assert allocated["status"] == "WORKTREES_ALLOCATED"
+    assert allocated["source_resumed_from_sha"] == "d" * 40
+    assert allocated["deployment_resumed_from_sha"] is None
+
+
+class BaseMirrorManager(ChangeManager):
+    def __init__(self, mirror: Path) -> None:
+        self.mirror = mirror
+
+    def verify_mirror(self, repository: str) -> Path:
+        assert repository == "musematic"
+        return self.mirror
+
+
+class RecordingBaselineScanner(BaselineScanner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scanned: list[tuple[Path, list[str]]] = []
+
+    def secret_scan(self, worktree: Path, output: Path) -> dict[str, Any]:
+        files = sorted(item.name for item in worktree.iterdir())
+        self.scanned.append((worktree, files))
+        return super().secret_scan(worktree, output)
+
+
+def test_resumed_worktree_prechecks_baseline_is_taken_at_the_base(tmp_path: Path) -> None:
+    # NEW-52: a resumed worktree already holds the previous attempt's commits. Its own
+    # findings must not become the NEW-28 baseline, or postchecks would miss them.
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    assert git is not None
+    mirror = tmp_path / "mirrors" / "musematic"
+    mirror.mkdir(parents=True)
+    (mirror / "README.md").write_text("base\n", encoding="utf-8")
+
+    def run(*arguments: str) -> str:
+        return subprocess.run(  # noqa: S603 - fixed Git executable in the test harness
+            [git, *arguments], cwd=mirror, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    run("init", "-q")
+    run("add", ".")
+    run("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "base")
+    base = run("rev-parse", "HEAD")
+
+    worktrees = tmp_path / "worktrees"
+    for name in ("source", "deployment"):
+        (worktrees / name).mkdir(parents=True)
+    (worktrees / "source" / "resumed_feature.py").write_text("eval(x)\n", encoding="utf-8")
+    scanner = RecordingBaselineScanner()
+    handler = ScanActivityHandler(
+        Settings(
+            evidence_root=tmp_path / "evidence",
+            worktree_root=worktrees,
+            toolchain_cache_root=tmp_path / "toolchain",
+        ),
+        BaseMirrorManager(mirror),  # type: ignore[arg-type]
+        scanner=scanner,  # type: ignore[arg-type]
+        publisher=ReceiptPublisher(),  # type: ignore[arg-type]
+    )
+    maker = {"structured_result": {"tests": [{"status": "PASS"}]}}
+    payload = {
+        "project": "musematic",
+        "change_set_id": str(uuid4()),
+        "source_worktree": str(worktrees / "source"),
+        "deployment_worktree": str(worktrees / "deployment"),
+        "source_repository": "musematic",
+        "deployment_repository": "musematic-deploy",
+        "source_base_sha": base,
+        "deployment_base_sha": "b" * 40,
+        "source_resumed_from_sha": "d" * 40,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "PASS"}},
+        "source_maker_result": maker,
+        "deployment_maker_result": maker,
+    }
+    introduced = ("python.lang.security.audit.eval", "resumed_feature.py", 1)
+    resumed = {**EXISTING, "semgrep": [*EXISTING["semgrep"], introduced]}
+    # The resumed worktree already carries the previous attempt's finding; the base
+    # checkout ("source-base") only has the pre-existing ones.
+    scanner.findings = {"source": resumed, "source-base": EXISTING, "deployment": EXISTING}
+
+    prechecks = handler._delivery_prechecks(payload)
+
+    assert prechecks["status"] == "PRECHECKS_PASS"
+    base_scan = next(item for item in scanner.scanned if item[0].name == "source-base")
+    assert base_scan[1] == ["README.md"]  # the base tree, without the resumed commit
+    assert not base_scan[0].exists()  # the scratch checkout is removed afterwards
+    assert (worktrees / "deployment").resolve() in [item[0] for item in scanner.scanned]
+
+    validated = handler._validate_changeset(payload)
+
+    # NEW-76: the maker's own finding is handed back to it by name.
+    assert validated["status"] == "REQUEST_CHANGES"
+    assert validated["blocker"] == "CHANGESET_VALIDATION_FINDINGS"
+    assert any("resumed_feature.py" in item for item in validated["validation_findings"])
+    assert validated["change_evidence"]["source"]["introduced_findings"]["semgrep"] == 1
+    assert validated["change_evidence"]["deployment"]["introduced_findings"]["semgrep"] == 0

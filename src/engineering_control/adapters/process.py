@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from engineering_control.security.redaction import SecretRedactor
@@ -19,6 +21,38 @@ class ProcessResult:
     events: tuple[dict[str, Any], ...]
     stderr: str
     timed_out: bool = False
+
+
+# NEW-79a: offline toolchains the scan worker prepares for makers and checkers
+# (delivery.prepare_toolchain fills these caches with network; they are read-only here).
+TOOLCHAIN_CACHE_ROOT = Path(
+    os.environ.get("ENGINEERING_TOOLCHAIN_CACHE_ROOT", "/srv/engineering/cache/scan/toolchain")
+)
+GO_ROOT_BIN = Path("/usr/local/go/bin")
+
+
+def sandbox_toolchain_environment(base: Mapping[str, str]) -> dict[str, str]:
+    """Go (module cache prefilled, no proxy) and Trivy (DB prefilled, offline) settings."""
+    path = base.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    if GO_ROOT_BIN.is_dir() and str(GO_ROOT_BIN) not in path.split(":"):
+        path = f"{GO_ROOT_BIN}:{path}"
+    return {
+        "PATH": path,
+        "GOMODCACHE": str(TOOLCHAIN_CACHE_ROOT / "go-mod"),
+        # The sandbox may write only the worktree and the temp directory.
+        "GOCACHE": str(Path(tempfile.gettempdir()) / f"go-build-{os.getuid()}"),
+        "GOPROXY": "off",
+        "GOTOOLCHAIN": "local",
+        "GOTELEMETRY": "off",
+        # Two parallel compile jobs: the worker has little RAM (NEW-77 OOM kills).
+        "GOFLAGS": "-mod=mod -p=2",
+        "TRIVY_CACHE_DIR": str(TOOLCHAIN_CACHE_ROOT / "trivy"),
+        "TRIVY_SKIP_DB_UPDATE": "true",
+        "TRIVY_SKIP_JAVA_DB_UPDATE": "true",
+        "TRIVY_OFFLINE_SCAN": "true",
+        "TRIVY_CACHE_BACKEND": "memory",
+        "TRIVY_NO_PROGRESS": "true",
+    }
 
 
 def subscription_only_environment(
@@ -45,11 +79,30 @@ def subscription_only_environment(
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
     }
     for key in forbidden:
         env.pop(key, None)
     env["ENGINEERING_PROVIDER"] = provider
     env["NO_COLOR"] = "1"
+    # NEW-45: makers/checkers run the project's tests in shared worktrees. pytest
+    # creates .pytest_cache through a 0700 temp directory, so the scan worker's next
+    # `git clean` of that worktree failed with "Permission denied". No cache, no
+    # bytecode: nothing an agent's test run leaves behind is unremovable.
+    env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # NEW-48: a worktree .mypy_cache written by the maker is not writable by the
+    # checker (another runner uid). /dev/null is mypy's documented "no cache".
+    env["MYPY_CACHE_DIR"] = "/dev/null"
+    env.update(sandbox_toolchain_environment(env))
     if overrides:
         disallowed = forbidden.intersection(overrides)
         if disallowed:

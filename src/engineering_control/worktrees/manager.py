@@ -3,9 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import re
+import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -24,6 +28,9 @@ class WorktreeAllocation:
     branch: str
     base_sha: str
     change_set_id: UUID
+    # NEW-52: the previous attempt's committed HEAD (a descendant of base_sha) this
+    # allocation kept instead of resetting to the base; None for a fresh/reset worktree.
+    resumed_from_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,7 @@ class GitWorktreeManager:
         worktree_root: Path = Path("/srv/engineering/worktrees"),
         lease_root: Path = Path("/var/lib/engineering-control/leases/worktrees"),
         metadata_root: Path | None = None,
+        publication_transport_identity: str | None = None,
     ) -> None:
         self.mirror_root = mirror_root
         self.worktree_root = worktree_root
@@ -69,6 +77,15 @@ class GitWorktreeManager:
         self.metadata_root = metadata_root or (
             worktree_root.parent / "cache" / "scan" / "worktree-git"
         )
+        # NEW-61: the controller's GitHub worker fetches the validated commits over SSH
+        # as this operator identity; it reads the ChangeSet's Git metadata (and, through
+        # its alternates, the canonical mirror) but never the worktree.
+        if publication_transport_identity is not None and (
+            not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", publication_transport_identity)
+            or publication_transport_identity in WorktreeAccess._allowed_identities
+        ):
+            raise ValueError("publication transport identity is invalid")
+        self.publication_transport_identity = publication_transport_identity
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -209,6 +226,7 @@ class GitWorktreeManager:
         base_ref: str,
         expected_base_sha: str,
         access: WorktreeAccess | None = None,
+        resume_prior_commits: bool = False,
     ) -> WorktreeAllocation:
         if not re.fullmatch(r"[a-f0-9]{40}", expected_base_sha):
             raise ValueError("expected base must be a full 40-character SHA")
@@ -219,42 +237,113 @@ class GitWorktreeManager:
             self.fetch(repository)
             fetched_ref = self._fetched_ref(base_ref, mirror)
             actual = self._run(["git", "rev-parse", f"{fetched_ref}^{{commit}}"], mirror)
-            if actual != expected_base_sha:
-                raise WorktreeError(
-                    f"base SHA mismatch for {repository}: expected {expected_base_sha}, "
-                    f"got {actual}"
-                )
+            mismatch = WorktreeError(
+                f"base SHA mismatch for {repository}: expected {expected_base_sha}, got {actual}"
+            )
+            # NEW-64: a CI-repair re-delivery resumes an already published branch; main may
+            # have moved ahead (fast-forward) since import. Only that resume may proceed,
+            # and it stays bound to the imported base (never rebased onto the new main).
+            base_moved = actual != expected_base_sha
+            if base_moved and not (
+                resume_prior_commits and self._descends_from(mirror, expected_base_sha, actual)
+            ):
+                raise mismatch
             metadata = self._ensure_metadata_mirror(repository, change_set_id, mirror)
+            # NEW-40: a maker could implement and stage a change yet fail to commit
+            # ("Git has no configured author identity"). Give the ChangeSet's repository
+            # the same identity the platform uses for its own commits.
+            self._run(["git", "config", "user.name", "Engineering Control"], metadata)
+            self._run(
+                ["git", "config", "user.email", "engineering-control@local.invalid"], metadata
+            )
             repo_slug = self._slug(repository)
             target = self.worktree_root / repo_slug / str(change_set_id)
             branch = f"agent/{self._slug(project)}/{self._slug(issue)}/{str(change_set_id)}"
             if target.exists():
                 actual_head = self._run(["git", "rev-parse", "HEAD"], target)
                 actual_branch = self._run(["git", "branch", "--show-current"], target)
-                if actual_head != expected_base_sha or actual_branch != branch:
+                if actual_branch != branch:
                     raise WorktreeError(
                         f"existing worktree does not match the ChangeSet allocation: {target}"
                     )
-                if self.is_dirty(target):
-                    raise WorktreeError(
-                        f"existing worktree is dirty and will not be reused: {target}"
+                if (
+                    resume_prior_commits
+                    and actual_head != expected_base_sha
+                    and self._descends_from(target, expected_base_sha, actual_head)
+                ):
+                    # NEW-52: musematic #993 churned through 11 rounds because every
+                    # correction re-implemented the feature from the base. Keep the
+                    # previous attempt's commits (they descend from this base); only
+                    # uncommitted leftovers are archived and dropped.
+                    if self.is_dirty(target):
+                        self._archive_and_reset(
+                            target, expected_base_sha, change_set_id, reset_to=actual_head
+                        )
+                    return WorktreeAllocation(
+                        repository,
+                        target,
+                        branch,
+                        expected_base_sha,
+                        change_set_id,
+                        resumed_from_sha=actual_head,
                     )
+                if base_moved:
+                    raise mismatch
+                if actual_head != expected_base_sha or self.is_dirty(target):
+                    # NEW-38: a stopped attempt's maker left work behind, so no retry or
+                    # correction of this ChangeSet could ever start. The exclusive
+                    # implementation component lease is held before allocation, so no other
+                    # delivery can be using this worktree: archive it, then start clean.
+                    self._archive_and_reset(target, expected_base_sha, change_set_id)
                 return WorktreeAllocation(repository, target, branch, actual, change_set_id)
+            # NEW-85: the cleanup may have removed this ChangeSet's worktree while its
+            # branch (and any archived work) stays in the metadata repository.
+            self._run(["git", "worktree", "prune"], metadata)
+            existing_head = self._branch_head(metadata, branch)
+            resumed_from: str | None = None
+            if (
+                existing_head is not None
+                and resume_prior_commits
+                and self._descends_from(metadata, expected_base_sha, existing_head)
+            ):
+                resumed_from = existing_head
+            elif base_moved:
+                raise mismatch
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
-            self._run(
-                ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha],
-                metadata,
-                timeout=900,
-            )
+            if resumed_from is not None:
+                add = ["git", "worktree", "add", str(target), branch]
+            elif existing_head is not None:
+                if existing_head != expected_base_sha:
+                    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                    self._run(
+                        [
+                            "git",
+                            "update-ref",
+                            f"refs/archive/{change_set_id}/{stamp}-head",
+                            existing_head,
+                        ],
+                        metadata,
+                    )
+                add = ["git", "worktree", "add", "-B", branch, str(target), expected_base_sha]
+            else:
+                add = ["git", "worktree", "add", "-b", branch, str(target), expected_base_sha]
+            self._run(add, metadata, timeout=900)
             if self.is_dirty(target):
                 raise WorktreeError("newly allocated worktree is unexpectedly dirty")
             if access is not None:
                 try:
-                    self._grant_access(target, metadata, mirror, access)
+                    self._grant_access(target, metadata, mirror, access, repository=repository)
                 except Exception:
                     self._run(["git", "worktree", "remove", str(target)], metadata)
                     raise
-            return WorktreeAllocation(repository, target, branch, actual, change_set_id)
+            return WorktreeAllocation(
+                repository,
+                target,
+                branch,
+                expected_base_sha if resumed_from is not None else actual,
+                change_set_id,
+                resumed_from_sha=resumed_from,
+            )
 
     def allocate_audit_snapshot(
         self,
@@ -321,14 +410,36 @@ class GitWorktreeManager:
         metadata: Path,
         canonical_mirror: Path,
         access: WorktreeAccess,
+        *,
+        repository: str | None = None,
     ) -> None:
         """Grant the maker write and checker read access to exactly one worktree."""
         resolved_root = self.worktree_root.resolve()
         resolved_target = target.resolve()
         if not resolved_target.is_relative_to(resolved_root) or resolved_target == resolved_root:
             raise WorktreeError("refusing to grant access outside a bounded worktree")
-        access_acl = f"u:{access.maker_identity}:rwX,u:{access.checker_identity}:r-X,m::rwX"
-        default_acl = f"d:u:{access.maker_identity}:rwx,d:u:{access.checker_identity}:r-x,d:m::rwx"
+        # NEW-38b: the manager's own identity (the scan worker) must keep access to files
+        # the maker creates, or it cannot archive/reset (or later diff) that worktree.
+        manager = pwd.getpwuid(os.geteuid()).pw_name
+        manager_acl = f"u:{manager}:rwX,"
+        manager_default_acl = f"d:u:{manager}:rwx,"
+        # NEW-56: the publishing identities read the worktree after validation, but only a
+        # file's owner may add them to its ACL later, and every file the maker creates is
+        # owned by its runner (mode 660/770). Grant them read in the default ACL up front so
+        # maker-created files inherit it.
+        readers = ["delivery-runner"]
+        if repository in self._deployment_repositories:
+            readers.append("release-runner")
+        reader_acl = "".join(f"u:{reader}:r-X," for reader in readers)
+        reader_default_acl = "".join(f"d:u:{reader}:r-x," for reader in readers)
+        access_acl = (
+            f"{manager_acl}u:{access.maker_identity}:rwX,"
+            f"u:{access.checker_identity}:r-X,{reader_acl}m::rwX"
+        )
+        default_acl = (
+            f"{manager_default_acl}d:u:{access.maker_identity}:rwx,"
+            f"d:u:{access.checker_identity}:r-x,{reader_default_acl}d:m::rwx"
+        )
         traverse_acl = f"u:{access.maker_identity}:--x,u:{access.checker_identity}:--x"
         self._run(
             ["setfacl", "--modify", traverse_acl, str(resolved_target.parent)],
@@ -340,14 +451,26 @@ class GitWorktreeManager:
 
         identities = (access.maker_identity, access.checker_identity)
         self._grant_metadata_traverse(metadata, identities)
-        metadata_acl = f"u:{access.maker_identity}:rwX,u:{access.checker_identity}:r-X,m::rwX"
-        metadata_default_acl = (
-            f"d:u:{access.maker_identity}:rwx,d:u:{access.checker_identity}:r-x,d:m::rwx"
-        )
+        metadata_acl = access_acl
+        metadata_default_acl = default_acl
+        transport = self.publication_transport_identity
+        if transport is not None:
+            # NEW-61: objects and refs the maker commits inherit read for the transport
+            # identity, so the controller can fetch the validated branch after checking.
+            # Metadata only: the worktree ACL above is unchanged.
+            metadata_acl = access_acl.replace(",m::rwX", f",u:{transport}:r-X,m::rwX")
+            metadata_default_acl = default_acl.replace(
+                ",d:m::rwx", f",d:u:{transport}:r-x,d:m::rwx"
+            )
+            self._grant_metadata_traverse(metadata, (transport,))
         self._run(["setfacl", "--recursive", "--modify", metadata_acl, str(metadata)], metadata)
         for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
             self._run(["setfacl", "--modify", metadata_default_acl, str(directory)], metadata)
         self._grant_canonical_read(canonical_mirror, identities)
+        if transport is not None:
+            # NEW-61: the metadata repository is a --shared clone; upload-pack reads the
+            # base history through its alternates in the canonical mirror.
+            self._grant_canonical_read(canonical_mirror, (transport,))
 
     def _grant_read_access(
         self,
@@ -407,6 +530,25 @@ class GitWorktreeManager:
         self._grant_metadata_traverse(metadata, ("delivery-runner",))
         self._grant_tree_read_access(metadata, ("delivery-runner",), cwd=metadata)
         self._grant_canonical_read(mirror, ("delivery-runner",))
+        self._grant_publication_transport_read(metadata, mirror)
+
+    def _grant_publication_transport_read(self, metadata: Path, mirror: Path) -> None:
+        """NEW-61: let the controller's GitHub worker fetch the validated branch over SSH.
+
+        Only the ChangeSet's bare Git metadata repository (and the canonical mirror its
+        alternates point at) become readable; the worktree is never granted. Maker-owned
+        files must already carry the read entry from the allocation default ACL (or be
+        readable otherwise), else this fails closed like every other read grant.
+        """
+        transport = self.publication_transport_identity
+        if transport is None:
+            return
+        self._grant_metadata_traverse(metadata, (transport,))
+        self._grant_tree_read_access(metadata, (transport,), cwd=metadata)
+        default_acl = f"d:u:{transport}:r-x"
+        for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
+            self._setfacl_readable(["setfacl", "--modify", default_acl, str(directory)], metadata)
+        self._grant_canonical_read(mirror, (transport,))
 
     def _metadata_for_target(self, repository: str, target: Path) -> Path:
         try:
@@ -456,7 +598,9 @@ class GitWorktreeManager:
             resolved_target,
             *(item for item in resolved_target.rglob("*") if item.is_dir()),
         ):
-            self._run(["setfacl", "--modify", default_acl, str(directory)], resolved_target)
+            self._setfacl_readable(
+                ["setfacl", "--modify", default_acl, str(directory)], resolved_target
+            )
 
     def _grant_tree_read_access(
         self,
@@ -466,7 +610,152 @@ class GitWorktreeManager:
         cwd: Path,
     ) -> None:
         reader_acl = ",".join(f"u:{identity}:r-X" for identity in identities)
-        self._run(["setfacl", "--recursive", "--modify", reader_acl, str(target)], cwd)
+        self._setfacl_readable(["setfacl", "--recursive", "--modify", reader_acl, str(target)], cwd)
+
+    _SETFACL_EPERM = re.compile(r"^setfacl: (.+): Operation not permitted$")
+
+    def _setfacl_readable(self, args: list[str], cwd: Path) -> None:
+        """NEW-55: run a read-granting setfacl, tolerating only files it may not modify.
+
+        Files the maker creates are owned by its runner identity, and only a file's
+        owner (or root) may change its ACL, so granting delivery-runner/release-runner
+        read after validation failed with "Operation not permitted" on every maker
+        file. Such a file is accepted only when it is not ours and is already readable
+        by any identity through its "other" permission bits (directories also
+        traversable); anything else still fails closed.
+        """
+        try:
+            self._run(args, cwd)
+            return
+        except WorktreeError:
+            pass
+        # _run keeps only the last 4000 characters; re-run (idempotent) for every path.
+        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            args, cwd=cwd, check=False, text=True, capture_output=True, timeout=300
+        )
+        if not result.returncode:
+            return
+        # NEW-56: identities named in the ACL argument (u:<id>:... or d:u:<id>:...).
+        identities = tuple(
+            dict.fromkeys(re.findall(r"(?:^|,)(?:d:)?u:([a-z][a-z0-9-]*):", args[-2]))
+        )
+        lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+        unreadable: list[str] = []
+        for line in lines:
+            match = self._SETFACL_EPERM.match(line)
+            if match is None:
+                output = str(SecretRedactor().redact_text("\n".join(lines)).value)
+                raise WorktreeError(f"setfacl failed ({result.returncode}): {output[-4000:]}")
+            path = Path(match.group(1))
+            try:
+                info = path.lstat()
+            except OSError:
+                unreadable.append(str(path))
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            other_ok = bool(info.st_mode & stat.S_IROTH) and (
+                not stat.S_ISDIR(info.st_mode) or bool(info.st_mode & stat.S_IXOTH)
+            )
+            if info.st_uid == os.geteuid() or not (
+                other_ok or self._acl_grants_read(path, identities, stat.S_ISDIR(info.st_mode))
+            ):
+                unreadable.append(str(path))
+        if unreadable:
+            raise WorktreeError(
+                "cannot grant read access to "
+                f"{len(unreadable)} path(s), e.g. {unreadable[0][-300:]}"
+            )
+
+    @staticmethod
+    def _acl_grants_read(path: Path, identities: tuple[str, ...], directory: bool) -> bool:
+        """NEW-56: True when every identity has an effective read (and, for a directory,
+        traverse) entry in the path's access ACL, e.g. inherited from a default ACL."""
+        if not identities:
+            return False
+        command = ["getfacl", "--omit-header", "--absolute-names", "--", str(path)]
+        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode:
+            return False
+        effective: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if line.startswith("default:"):
+                continue
+            match = re.match(r"^user:([^:]+):([rwx-]{3})(?:\s+#effective:([rwx-]{3}))?", line)
+            if match:
+                effective[match.group(1)] = match.group(3) or match.group(2)
+        return all(
+            identity in effective
+            and effective[identity][0] == "r"
+            and (not directory or effective[identity][2] == "x")
+            for identity in identities
+        )
+
+    def _branch_head(self, metadata: Path, branch: str) -> str | None:
+        try:
+            head = self._run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], metadata)
+        except WorktreeError:
+            return None
+        return head if re.fullmatch(r"[a-f0-9]{40}", head) else None
+
+    def _descends_from(self, target: Path, base_sha: str, head: str) -> bool:
+        """True when head is a strict descendant of base_sha (NEW-52 resume guard)."""
+        if not re.fullmatch(r"[a-f0-9]{40}", head) or head == base_sha:
+            return False
+        try:
+            self._run(["git", "merge-base", "--is-ancestor", base_sha, head], target)
+        except WorktreeError:
+            return False  # not an ancestor (exit 1) or unknown history: reset to base
+        return True
+
+    def _archive_and_reset(
+        self,
+        target: Path,
+        base_sha: str,
+        change_set_id: UUID,
+        *,
+        reset_to: str | None = None,
+    ) -> None:
+        """Keep a stopped attempt's work under refs/archive/<changeset>/ in the ChangeSet's
+        git metadata, then reset the worktree to its base (or, NEW-52, to reset_to: the
+        attempt's own committed HEAD, so only uncommitted leftovers are dropped)."""
+        destination = reset_to or base_sha
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        prefix = f"refs/archive/{change_set_id}/{stamp}"
+        head = self._run(["git", "rev-parse", "HEAD"], target)
+        if head != base_sha:
+            self._run(["git", "update-ref", f"{prefix}-head", head], target)
+        if self.is_dirty(target):
+            self._run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=engineering-control",
+                    "-c",
+                    "user.email=engineering-control@localhost",
+                    "stash",
+                    "push",
+                    "--include-untracked",
+                    "--message",
+                    f"archived stopped delivery attempt {stamp}",
+                ],
+                target,
+            )
+            stash = self._run(["git", "rev-parse", "refs/stash"], target)
+            self._run(["git", "update-ref", f"{prefix}-worktree", stash], target)
+        self._run(["git", "reset", "--hard", destination], target)
+        self._run(["git", "clean", "-ffdx"], target)
+        if (
+            self.is_dirty(target)
+            or self._run(["git", "rev-parse", "HEAD"], target) != destination
+        ):
+            raise WorktreeError(f"could not reset the archived worktree to its base: {target}")
 
     def is_dirty(self, path: Path) -> bool:
         return bool(self._run(["git", "status", "--porcelain=v1"], path))
@@ -545,7 +834,67 @@ class GitWorktreeManager:
         }
         return summary, diff
 
-    def cleanup(self, allocation: WorktreeAllocation, *, evidence_captured: bool) -> None:
+    def prune_orphan_worktrees(
+        self, *, older_than: datetime, dry_run: bool, limit: int = 200
+    ) -> dict[str, list[dict[str, str]]]:
+        """NEW-85: remove worktree directories no lease ever tracks.
+
+        Detached audit/revalidation snapshots (keyed by campaign or finding, never by a
+        ChangeSet) are removed once untouched since ``older_than``. Branch-bearing
+        ChangeSet worktrees are left to the lease-based cleanup. Only the known
+        repositories' directories are walked: the worktree root itself is root-owned and
+        traverse-only for the scan worker, so anything else under it (old acceptance
+        runs) is out of reach by design. Nothing is followed through a symlink; failures
+        are reported, never raised.
+        """
+        root = self.worktree_root.resolve()
+        removed: list[dict[str, str]] = []
+        kept: list[dict[str, str]] = []
+        slugs = sorted({self._slug(repository) for repository in self._repositories})
+        for slug in slugs:
+            repository_dir = root / slug
+            if repository_dir.is_symlink() or not repository_dir.is_dir():
+                continue
+            for target in sorted(repository_dir.iterdir()):
+                if len(removed) >= limit:
+                    break
+                try:
+                    identity = UUID(target.name)
+                except ValueError:
+                    continue
+                if target.is_symlink() or not target.is_dir():
+                    continue
+                modified = datetime.fromtimestamp(target.stat().st_mtime, UTC)
+                if modified > older_than:
+                    continue
+                record = {
+                    "path": str(target),
+                    "modified_at": modified.isoformat(),
+                    "kind": "SNAPSHOT",
+                }
+                try:
+                    if self._run(["git", "branch", "--show-current"], target):
+                        continue  # a ChangeSet worktree: lease-based cleanup only
+                    metadata = self.metadata_path(slug, identity)
+                    if dry_run:
+                        removed.append(record)
+                        continue
+                    self._run(["git", "worktree", "remove", "--force", str(target)], metadata)
+                    remaining = self._run(["git", "worktree", "list", "--porcelain"], metadata)
+                    if remaining.count("worktree ") <= 1 and metadata.is_dir():
+                        shutil.rmtree(metadata)
+                    removed.append(record)
+                except (WorktreeError, OSError) as error:
+                    kept.append({**record, "reason": str(error)[:200]})
+        return {"removed": removed, "kept": kept}
+
+    def cleanup(
+        self,
+        allocation: WorktreeAllocation,
+        *,
+        evidence_captured: bool,
+        archive_dirty: bool = False,
+    ) -> None:
         self.verify_mirror(allocation.repository)
         if not allocation.path.exists():
             return
@@ -560,11 +909,18 @@ class GitWorktreeManager:
         actual_branch = self._run(["git", "branch", "--show-current"], resolved)
         if actual_branch != allocation.branch:
             raise WorktreeError("cleanup target branch changed after authorization")
-        if self.is_dirty(allocation.path):
-            if not evidence_captured:
-                raise WorktreeError("dirty worktree is protected until evidence is captured")
-            raise WorktreeError(
-                "dirty worktree cleanup requires the abandoned-run cleanup workflow"
-            )
         metadata = self._metadata_for_target(allocation.repository, resolved)
-        self._run(["git", "worktree", "remove", str(allocation.path)], metadata)
+        if self.is_dirty(allocation.path):
+            if not archive_dirty:
+                if not evidence_captured:
+                    raise WorktreeError("dirty worktree is protected until evidence is captured")
+                raise WorktreeError(
+                    "dirty worktree cleanup requires the abandoned-run cleanup workflow"
+                )
+            # NEW-85: an abandoned attempt's uncommitted work is kept under
+            # refs/archive/<changeset>/ in its git metadata before the worktree goes.
+            head = self._run(["git", "rev-parse", "HEAD"], resolved)
+            self._archive_and_reset(
+                resolved, allocation.base_sha, allocation.change_set_id, reset_to=head
+            )
+        self._run(["git", "worktree", "remove", "--force", str(allocation.path)], metadata)
