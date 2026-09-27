@@ -1910,6 +1910,29 @@ class EngineeringActivityHandler:
             "REVALIDATION_RECORDED",
         )
 
+    @staticmethod
+    def _release_loop_child_leases(session: Any, loop_workflow_id: str) -> int:
+        """Release every unreleased lease owned by one loop's child runs."""
+        child_runs = set(
+            session.scalars(
+                select(db.Run.id).where(db.Run.workflow_id.like(f"{loop_workflow_id}-issue-%"))
+            ).all()
+        )
+        if not child_runs:
+            return 0
+        now = datetime.now(UTC)
+        released = 0
+        for model in (db.ComponentLease, db.WorktreeLease):
+            for lease in session.scalars(
+                select(model).where(
+                    model.owner_run_id.in_(child_runs),
+                    model.released_at.is_(None),
+                )
+            ).all():
+                lease.released_at = now
+                released += 1
+        return released
+
     def _record_backlog_loop_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
         status = str(payload.get("loop_status", "PAUSED"))
@@ -1936,6 +1959,11 @@ class EngineeringActivityHandler:
                         if status in {"CANCELLED", "COMPLETE", "STOPPED", "FAILED"}
                         else None
                     )
+                if status in {"CANCELLED", "STOPPED", "FAILED"}:
+                    # NEW-60: a cancelled loop's child runs never reach their own lease
+                    # release; the next loop for the same issue then failed with
+                    # COMPONENT_LEASE_CONFLICT / worktree lease conflicts (#993).
+                    self._release_loop_child_leases(session, run_workflow_id)
             raw_global_id = payload.get("global_campaign_id")
             linked_global_ids = {
                 candidate.id

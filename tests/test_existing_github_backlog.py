@@ -1271,3 +1271,59 @@ def test_runtime_required_issues_proceed_on_source_repro_in_staged_full_delivery
         {**staged, "project": "falcone", "item": {**confirmed, "repository": "gntik-ai/falcone"}}
     )
     assert unstaged["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
+
+
+def test_a_cancelled_loop_releases_only_its_own_child_runs_leases(tmp_path: Path) -> None:
+    # NEW-60: musematic #993's cancelled loop left its child runs' component/worktree
+    # leases held (4h/8h); the next loop failed with COMPONENT_LEASE_CONFLICT.
+    from uuid import uuid4
+
+    from engineering_control.db.models import ComponentLease, Run
+
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'leases.sqlite'}",
+        project_config_root=ROOT / "config/projects",
+    )
+    handler = EngineeringActivityHandler(settings)
+    Base.metadata.create_all(handler.engine)
+    loop = "backlog-loop-musematic-camp-old"
+    owners = {}
+    with handler.sessions.begin() as session:
+        for key, workflow_id in (
+            ("child", f"{loop}-issue-1-attempt-1"),
+            ("staging", f"{loop}-issue-1-staging-gitops"),
+            ("other", "backlog-loop-musematic-camp-new-issue-1-attempt-1"),
+        ):
+            run_id = uuid4()
+            owners[key] = run_id
+            session.add(
+                Run(
+                    id=run_id,
+                    workflow_id=workflow_id,
+                    run_type="issue-delivery",
+                    status="RUNNING",
+                    project="musematic",
+                )
+            )
+            session.flush()
+            session.add(
+                ComponentLease(
+                    component_key=f"musematic:{key}",
+                    owner_run_id=run_id,
+                    mode="implementation",
+                    expires_at=datetime.now(UTC) + timedelta(hours=4),
+                    released_at=None,
+                )
+            )
+
+    with handler.sessions.begin() as session:
+        released = handler._release_loop_child_leases(session, loop)
+
+    assert released == 2
+    with handler.sessions() as session:
+        leases = {
+            lease.owner_run_id: lease.released_at
+            for lease in session.scalars(select(ComponentLease))
+        }
+    assert leases[owners["child"]] is not None and leases[owners["staging"]] is not None
+    assert leases[owners["other"]] is None  # another loop's lease is never touched
