@@ -7,7 +7,10 @@
 #
 # Settings are written idempotently to /etc/engineering-control/env/control.env (controller:
 # scheduler decides dry-run vs execute, temporal worker runs the lease rules) and
-# /etc/engineering-control/env/scan-worker.env (worker: the scan step that deletes), then
+# /etc/engineering-control/env/worker-common.env (worker: every role worker runs one of the
+# cleanup.execute_* steps -- delivery, browser, codex, release, scan -- and each checks the
+# flag itself). Copies left in scan-worker.env by the first version of this script are
+# removed, since that file is read after worker-common.env and would override it. Then
 # only the services that read them are restarted. No workflow is interrupted by design:
 # check that no delivery loop is running before phase 2.
 set -euo pipefail
@@ -33,8 +36,9 @@ sudo bash -c "$SET_KV" _ /etc/engineering-control/env/control.env "${SETTINGS[@]
 sudo systemctl restart engineering-scheduler engineering-temporal-worker
 systemctl is-active engineering-scheduler engineering-temporal-worker
 
-echo "=== worker: /etc/engineering-control/env/scan-worker.env ==="
 QUOTED=$(printf '%q ' "${SETTINGS[@]}")
-ssh -t worker "sudo touch /etc/engineering-control/env/scan-worker.env && sudo bash -c '$SET_KV' _ /etc/engineering-control/env/scan-worker.env $QUOTED && sudo systemctl restart engineering-worker@scan && systemctl is-active engineering-worker@scan"
+echo "=== worker: /etc/engineering-control/env/worker-common.env ==="
+WORKERS="engineering-worker@scan engineering-worker@delivery engineering-worker@browser engineering-worker@codex engineering-worker@claude engineering-release-worker"
+ssh -t worker "sudo bash -c '$SET_KV' _ /etc/engineering-control/env/worker-common.env $QUOTED && sudo sed -i '/^ENGINEERING_CLEANUP_/d' /etc/engineering-control/env/scan-worker.env && sudo systemctl restart $WORKERS && systemctl is-active $WORKERS"
 
 echo "Done: ${SETTINGS[*]}"
