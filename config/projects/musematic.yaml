@@ -77,6 +77,26 @@ toolchain:
     - cwd: "."
       argv: [pnpm, install, --frozen-lockfile]
       timeout_seconds: 1200
+    # NEW-79a: prefill the read-only Go module cache and the offline Trivy DB that the
+    # makers and the checker use without network.
+    - cwd: services/reasoning-engine
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/runtime-controller
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/sandbox-manager
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/simulation-controller
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: services/shared/secrets
+      argv: [go, mod, download]
+      timeout_seconds: 300
+    - cwd: "."
+      argv: [trivy, image, --download-db-only, --quiet]
+      timeout_seconds: 600
   test_commands:
     - cwd: apps/control-plane
       # NEW-46: in the maker's no-network sandbox this suite has hung for 75+ min
@@ -102,6 +122,24 @@ toolchain:
       # NEW-64: CI fails on OpenAPI snapshot drift when API routes change.
       argv: [timeout, --kill-after=30, "600", apps/control-plane/.venv/bin/python, scripts/export-openapi.py]
       description: regenerate docs/api-reference/openapi.json; if it changed, commit it (CI fails on OpenAPI drift)
+    - cwd: services/reasoning-engine
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/reasoning-engine (offline module cache; NEW-79a)
+    - cwd: services/runtime-controller
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/runtime-controller (offline module cache; NEW-79a)
+    - cwd: services/sandbox-manager
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/sandbox-manager (offline module cache; NEW-79a)
+    - cwd: services/simulation-controller
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/simulation-controller (offline module cache; NEW-79a)
+    - cwd: services/shared/secrets
+      argv: [timeout, --kill-after=30, "900", go, test, ./...]
+      description: Go build + unit tests for services/shared/secrets (offline module cache; NEW-79a)
+    - cwd: "."
+      argv: [timeout, --kill-after=30, "900", trivy, fs, --scanners, vuln, --severity, "HIGH,CRITICAL", --skip-dirs, node_modules, --skip-dirs, .venv, "."]
+      description: offline dependency vulnerability scan (NEW-79a); main already has findings, so only findings your change introduces matter
   cleanup_paths_ignored_only: true
 deployment_test_commands:
   - [python3, scripts/verify_argocd_release_drift.py, --help]

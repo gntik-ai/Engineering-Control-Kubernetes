@@ -53,7 +53,13 @@ def enabled_toolchain(project_config_root: Path, project: str) -> ToolchainPolic
 
 def prepare_executables(settings: Settings) -> dict[str, Path]:
     """The only executables a prepare command may run (argv[0] name -> absolute path)."""
-    return {"uv": settings.uv_executable, "pnpm": settings.toolchain_pnpm_executable}
+    return {
+        "uv": settings.uv_executable,
+        "pnpm": settings.toolchain_pnpm_executable,
+        # NEW-79a: Go module downloads and the offline Trivy DB for the sandbox.
+        "go": settings.go_executable,
+        "trivy": settings.trivy_executable,
+    }
 
 
 def render_argv(argv: list[str], settings: Settings) -> list[str]:

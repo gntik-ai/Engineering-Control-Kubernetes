@@ -1493,7 +1493,19 @@ class ScanActivityHandler:
         """Network-enabled installer environment: private caches, no credentials."""
         root = self.settings.toolchain_cache_root
         directories = {
-            name: root / name for name in ("uv", "pnpm-store", "pnpm-cache", "home", "xdg-cache")
+            name: root / name
+            for name in (
+                "uv",
+                "pnpm-store",
+                "pnpm-cache",
+                "home",
+                "xdg-cache",
+                # NEW-75/79a: Go modules and the Trivy DB, read-only for makers/checkers.
+                "go-mod",
+                "go-build",
+                "go-path",
+                "trivy",
+            )
         }
         for directory in (root, *directories.values()):
             directory.mkdir(parents=True, exist_ok=True, mode=0o750)
@@ -1520,6 +1532,14 @@ class ScanActivityHandler:
             "npm_config_package_import_method": "copy",
             "pnpm_config_package_import_method": "copy",
             "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+            "GOMODCACHE": str(directories["go-mod"]),
+            "GOCACHE": str(directories["go-build"]),
+            "GOPATH": str(directories["go-path"]),
+            "GOTOOLCHAIN": "local",
+            "GOTELEMETRY": "off",
+            "GOFLAGS": "-modcacherw",
+            "TRIVY_CACHE_DIR": str(directories["trivy"]),
+            "TRIVY_NO_PROGRESS": "true",
         }
 
     # NEW-75: the only commands the platform runs to resolve maker-edited manifests
@@ -1630,19 +1650,7 @@ class ScanActivityHandler:
 
     def _dependency_environment(self) -> dict[str, str]:
         """The toolchain installer environment plus private Go caches (never GOPROXY auth)."""
-        root = self.settings.toolchain_cache_root
-        directories = {name: root / name for name in ("go-mod", "go-build", "go-path")}
-        for directory in directories.values():
-            directory.mkdir(parents=True, exist_ok=True, mode=0o750)
-        return {
-            **self._toolchain_environment(),
-            "GOMODCACHE": str(directories["go-mod"]),
-            "GOCACHE": str(directories["go-build"]),
-            "GOPATH": str(directories["go-path"]),
-            "GOTOOLCHAIN": "local",
-            "GOFLAGS": "-modcacherw",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
+        return {**self._toolchain_environment(), "GIT_TERMINAL_PROMPT": "0"}
 
     @staticmethod
     def _dependency_blocked(

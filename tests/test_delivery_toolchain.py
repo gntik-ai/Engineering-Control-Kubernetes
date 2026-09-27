@@ -42,6 +42,16 @@ def _source_repo(worktree_root: Path) -> Path:
     repo = worktree_root / "musematic" / str(uuid4())
     (repo / "apps" / "control-plane").mkdir(parents=True)
     (repo / "apps" / "control-plane" / "pyproject.toml").write_text("[project]\n")
+    # NEW-79a: the musematic contract prepares Go modules in these directories too.
+    for module in (
+        "services/reasoning-engine",
+        "services/runtime-controller",
+        "services/sandbox-manager",
+        "services/simulation-controller",
+        "services/shared/secrets",
+    ):
+        (repo / module).mkdir(parents=True, exist_ok=True)
+        (repo / module / "README").write_text("x\n")
     (repo / "package.json").write_text("{}\n")
     (repo / ".gitignore").write_text(".venv/\nnode_modules/\n")
     _git(repo, "init", "-q")
@@ -115,7 +125,7 @@ def test_toolchain_contract_rejects_paths_outside_the_repository(cwd: str) -> No
     [["bash", "-c", "uv sync"], ["npm", "ci"], ["/usr/local/bin/uv", "sync"], ["curl", "x"]],
 )
 def test_toolchain_contract_rejects_executables_outside_the_allowlist(argv: list[str]) -> None:
-    with pytest.raises(ValidationError, match="must be one of pnpm, uv"):
+    with pytest.raises(ValidationError, match="must be one of go, pnpm, trivy, uv"):
         ToolchainPolicy.model_validate({"enabled": True, "prepare": [{"cwd": ".", "argv": argv}]})
 
 
@@ -144,7 +154,13 @@ def test_toolchain_contract_rejects_unknown_placeholders_shells_and_unbounded_bu
 def test_musematic_manifest_declares_a_valid_toolchain_and_real_test_command() -> None:
     policy = load_toolchain_policy(PROJECTS, "musematic")
     assert policy is not None and policy.enabled
-    assert [command.argv[0] for command in policy.prepare] == ["uv", "pnpm"]
+    # NEW-79a: Go modules and the offline Trivy DB are prefilled for the sandbox.
+    assert [command.argv[0] for command in policy.prepare] == [
+        "uv",
+        "pnpm",
+        *["go"] * 5,
+        "trivy",
+    ]
     rendered = render_argv(policy.prepare[0].argv, Settings())
     assert rendered[-2:] == ["--python", "/usr/local/bin/python3.12"]
     # NEW-64: the OpenAPI snapshot regeneration runs from the repository root.
@@ -152,6 +168,11 @@ def test_musematic_manifest_declares_a_valid_toolchain_and_real_test_command() -
         "apps/control-plane",
         "apps/web",
         ".",
+        "services/reasoning-engine",
+        "services/runtime-controller",
+        "services/sandbox-manager",
+        "services/simulation-controller",
+        "services/shared/secrets",
     }
     manifest = ProjectManifest.model_validate(
         yaml.safe_load((PROJECTS / "musematic.yaml").read_text())
@@ -177,14 +198,17 @@ def test_prepare_installs_in_the_source_worktree_with_private_offline_caches(
     assert result["blocker"] is None
     summary = result["toolchain_preparation"]
     assert summary["ignored_paths_created"] == ["apps/control-plane/.venv/", "node_modules/"]
-    assert [item["status"] for item in summary["commands"]] == ["PASS", "PASS"]
+    # uv + pnpm + 5 Go module downloads + the Trivy DB (NEW-79a).
+    assert [item["status"] for item in summary["commands"]] == ["PASS"] * 8
     assert summary["test_commands"][0]["argv"][:4] == [
         "timeout",
         "--kill-after=30",
         "900",
         ".venv/bin/pytest",
     ]
-    uv, pnpm = runner.calls
+    uv, pnpm, *go_downloads, trivy = runner.calls
+    assert [call["arguments"] for call in go_downloads] == [["mod", "download"]] * 5
+    assert trivy["arguments"] == ["image", "--download-db-only", "--quiet"]
     assert uv["cwd"] == repo / "apps" / "control-plane"
     assert uv["arguments"][-2:] == ["--python", "/opt/python/bin/python3.12"]
     assert pnpm["cwd"] == repo and pnpm["arguments"] == ["install", "--frozen-lockfile"]
@@ -195,6 +219,8 @@ def test_prepare_installs_in_the_source_worktree_with_private_offline_caches(
     assert environment["UV_CACHE_DIR"] == str(cache / "uv")
     assert environment["npm_config_store_dir"] == str(cache / "pnpm-store")
     assert environment["HOME"] == str(cache / "home")
+    assert environment["GOMODCACHE"] == str(cache / "go-mod")
+    assert environment["TRIVY_CACHE_DIR"] == str(cache / "trivy")
     assert not any("TOKEN" in key or "SSH" in key for key in environment)
     assert stat.S_IMODE(os.stat(cache).st_mode) == 0o750
     assert uv["timeout_seconds"] == 1200 and uv["check"] is False

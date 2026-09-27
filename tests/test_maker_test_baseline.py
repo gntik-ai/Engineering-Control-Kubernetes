@@ -45,9 +45,20 @@ def _git(repo: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+_PREPARE_COMMANDS = 8  # uv + pnpm + 5 Go module downloads + the Trivy DB (NEW-79a)
+_GO_MODULES = (
+    "services/reasoning-engine",
+    "services/runtime-controller",
+    "services/sandbox-manager",
+    "services/simulation-controller",
+    "services/shared/secrets",
+)
+
+
 def _mirror(tmp_path: Path) -> tuple[Path, str]:
     repo = tmp_path / "mirrors" / "musematic"
-    for directory in ("apps/control-plane", "apps/web"):
+    # NEW-79a: the musematic contract prepares Go modules in these directories too.
+    for directory in ("apps/control-plane", "apps/web", *_GO_MODULES):
         (repo / directory).mkdir(parents=True)
         (repo / directory / "README").write_text("x\n")
     (repo / ".gitignore").write_text(".venv/\nnode_modules/\n")
@@ -197,7 +208,8 @@ def test_preexisting_contract_failure_does_not_block_a_checker_pass(tmp_path: Pa
     assert "ghp_" not in evidence["base_output_tail"]
     checkout = _baseline_root(tmp_path, payload) / "worktree"
     assert _git(checkout, "rev-parse", "HEAD") == payload["source_base_sha"]
-    assert [executable for executable, _ in prepare.calls] == ["uv", "pnpm"]
+    # uv + pnpm + 5 Go module downloads + the Trivy DB (NEW-79a).
+    assert [executable for executable, _ in prepare.calls] == ["uv", "pnpm", *["go"] * 5, "trivy"]
     [call] = baseline.calls
     assert call["argv"] == MYPY
     assert call["cwd"] == (checkout / "apps" / "control-plane").resolve()
@@ -275,7 +287,7 @@ def test_cached_baseline_is_reused_by_retries_and_corrections(tmp_path: Path) ->
 
     assert first["preexisting_test_failures"] == second["preexisting_test_failures"]
     assert len(baseline.calls) == 1
-    assert len(prepare.calls) == 2
+    assert len(prepare.calls) == _PREPARE_COMMANDS
     cached = json.loads((_baseline_root(tmp_path, payload) / "results.json").read_text())
     assert [entry["exit_code"] for entry in cached.values()] == [1]
 
@@ -291,7 +303,7 @@ def test_prepared_baseline_checkout_is_reused_for_another_command(tmp_path: Path
 
     assert validated["preexisting_test_failures"][0]["base_exit_code"] == 2
     assert [call["argv"] for call in baseline.calls] == [MYPY, PYTEST]
-    assert len(prepare.calls) == 2  # the base checkout was prepared only once
+    assert len(prepare.calls) == _PREPARE_COMMANDS  # the base checkout was prepared only once
 
 
 @pytest.mark.parametrize("failure", ["mirror", "prepare", "timeout", "not_allowed", "base_sha"])

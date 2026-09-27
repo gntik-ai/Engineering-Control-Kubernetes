@@ -153,7 +153,7 @@ class DeploymentManifest(EngineeringModel):
         return self
 
 
-TOOLCHAIN_PREPARE_EXECUTABLES = frozenset({"uv", "pnpm"})
+TOOLCHAIN_PREPARE_EXECUTABLES = frozenset({"uv", "pnpm", "go", "trivy"})
 TOOLCHAIN_PLACEHOLDERS = frozenset({"{python312}"})
 TOOLCHAIN_TOTAL_TIMEOUT = 80 * 60
 _FORBIDDEN_TOOLCHAIN_COMMANDS = frozenset(
