@@ -19,11 +19,13 @@ BASELINE=/srv/engineering/cache/scan/toolchain/baselines/musematic/707ba5dddfc45
 LISTING=/tmp/worktrees.txt
 REPORT="$HOME/engineering/archives/worktree-inventory-$(date -u +%Y%m%dT%H%M%SZ).txt"
 
+trap 'echo "FAILED at line $LINENO (exit $?)" >&2' ERR
+
 echo "=== 1/3 worker: remove the stale baseline checkout and list worktrees ==="
-ssh -t worker "sudo bash -c 'rm -rf $BASELINE; ls -d /srv/engineering/worktrees/*/* ; df -h / | tail -1'" \
-  | tr -d '\r' > "$LISTING.raw"
-grep '^/srv/' "$LISTING.raw" > "$LISTING" || true
-grep -v '^/srv/' "$LISTING.raw" | grep -v '^\[sudo' || true
+# The sudo prompt must reach your terminal, so nothing is piped here: the worker writes
+# the listing to a file and it is copied back afterwards.
+ssh -t worker "sudo bash -c 'rm -rf $BASELINE; ls -d /srv/engineering/worktrees/*/* > /tmp/worktrees.txt; chmod 644 /tmp/worktrees.txt'; df -h / | tail -1"
+scp -q worker:/tmp/worktrees.txt "$LISTING"
 chmod 644 "$LISTING"
 echo "worktree directories found: $(wc -l < "$LISTING")"
 
@@ -37,4 +39,3 @@ sudo systemd-run --quiet --pipe --wait -p User=engineering-control \
 echo "=== 3/3 summary ==="
 awk '{print $2}' "$REPORT" | sort | uniq -c | sort -rn
 echo "Report saved to $REPORT"
-rm -f "$LISTING.raw"
