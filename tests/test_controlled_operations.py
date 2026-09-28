@@ -491,8 +491,12 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
         full_delivery.capability.blockers
     )
     # gntik-ai/falcone#1027: falcone full delivery runs the post-merge staging flow, so
-    # only the stale provider health blocks it here.
-    assert set(full_delivery.capability.blockers) <= {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"}
+    # exactly the stale provider health blocks it here.
+    assert set(full_delivery.capability.blockers) == {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"}
+    # A project without a staging flow still fails closed on its own contract blockers.
+    llmwiki_blockers = repository._full_delivery_blockers("llmwiki")
+    assert "LLMWIKI_CANDIDATE_BUILD_DISABLED" in llmwiki_blockers
+    assert "LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED" in llmwiki_blockers
 
 
 def test_full_delivery_capability_uses_project_contracts_and_fails_closed(

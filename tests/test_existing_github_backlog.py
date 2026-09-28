@@ -1268,7 +1268,7 @@ def test_runtime_required_issues_proceed_on_source_repro_in_staged_full_delivery
     )
     assert source_pr["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
     unstaged = handler._backlog_revalidate_gate(
-        {**staged, "project": "falcone", "item": {**confirmed, "repository": "gntik-ai/falcone"}}
+        {**staged, "project": "llmwiki", "item": {**confirmed, "repository": "gntik-ai/llmwiki"}}
     )
     assert unstaged["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
 
@@ -1292,7 +1292,8 @@ def test_source_pr_runtime_proof_waiver_is_per_issue_and_revalidates_source_firs
         "current_source_reproduction": "PENDING_CURRENT_STATE_REVALIDATION",
         "current_runtime_reproduction": "PENDING",
     }
-    plain = {"project": "falcone", "delivery_mode": "source-pr", "item": item}
+    # llmwiki: a project without an enabled staging flow (falcone has one since #1027).
+    plain = {"project": "llmwiki", "delivery_mode": "source-pr", "item": item}
     assert handler._backlog_revalidate_gate(plain)["blocker"] == (
         "CURRENT_SOURCE_REVALIDATION_REQUIRED"
     )

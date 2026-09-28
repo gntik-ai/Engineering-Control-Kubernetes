@@ -163,6 +163,85 @@ def test_pair_snapshot_uses_same_root_group_read_observer_contract(
     assert result["blocker"] == "RUNTIME_DEPLOYMENT_REVISION_UNPROVEN"
 
 
+def test_pair_snapshot_reads_the_argocd_application_from_the_argo_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # gntik-ai/falcone#1027 review: the Application lives in argocd, not in the workload
+    # namespace; reading it there returned NotFound for every Argo CD-managed project.
+    credential_root = tmp_path / "credentials"
+    credential_root.mkdir()
+    kubeconfig = credential_root / "observer.kubeconfig"
+    kubeconfig.write_text("bounded-test-fixture", encoding="utf-8")
+    kubeconfig.chmod(0o600)
+    run_root = tmp_path / "runs"
+    (run_root / "scan").mkdir(parents=True)
+    checked: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    reads: list[tuple[str, str | None, str | None]] = []
+
+    class SnapshotObserver:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def verify_permissions(
+            self, namespaces: tuple[str, ...], resources: tuple[str, ...]
+        ) -> None:
+            checked.append((namespaces, resources))
+
+        def identity(self) -> dict[str, str]:
+            return {
+                "context": "falcone-observer",
+                "api_server": "https://cluster.example.test",
+                "username": "system:serviceaccount:test:observer",
+            }
+
+        def get(
+            self, resource: str, *, namespace: str | None = None, name: str | None = None
+        ) -> CommandResult:
+            reads.append((resource, namespace, name))
+            if resource == "applications.argoproj.io":
+                return CommandResult(0, '{"metadata":{},"status":{}}', "")
+            return CommandResult(0, '{"items":[]}', "")
+
+    monkeypatch.setattr("engineering_control.activities.scan.KubernetesObserver", SnapshotObserver)
+    handler = ScanActivityHandler(
+        Settings(observer_credential_root=credential_root, run_root=run_root),
+        observer_runner=AttestationObserverRunner(),  # type: ignore[arg-type]
+    )
+    handler.catalog.project = lambda _project: SimpleNamespace(  # type: ignore[method-assign]
+        deployment=SimpleNamespace(
+            observer_credential_ref=f"file:{kubeconfig}",
+            kubernetes_context_ref="falcone-observer",
+            api_server_identity="https://cluster.example.test",
+            namespaces=["in-falcone-staging", "argocd"],
+            strategy="argocd",
+            argocd_application="falcone-staging",
+            deployment_revision_annotation="argocd.argoproj.io/tracking-id",
+            helm_release_revision_annotation=None,
+        ),
+        staging_flow=lambda: SimpleNamespace(argo_namespace="argocd"),
+    )
+
+    handler._snapshot_pair(
+        {
+            "project": "falcone",
+            "snapshot": {"source_sha": "a" * 40, "deployment_sha": "b" * 40},
+        }
+    )
+
+    assert (("argocd",), ("applications.argoproj.io",)) in checked
+    assert not any(
+        "applications.argoproj.io" in resources
+        for namespaces, resources in checked
+        if namespaces == ("in-falcone-staging",)
+    )
+    assert ("applications.argoproj.io", "argocd", "falcone-staging") in reads
+    assert all(
+        namespace == "in-falcone-staging"
+        for resource, namespace, _ in reads
+        if resource != "applications.argoproj.io"
+    )
+
+
 @pytest.mark.asyncio
 async def test_scan_worker_returns_only_bounded_observer_attestation(tmp_path: Path) -> None:
     credential_root = tmp_path / "credentials"
