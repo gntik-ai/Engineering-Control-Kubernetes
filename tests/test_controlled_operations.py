@@ -490,11 +490,13 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
     assert "FULL_DELIVERY_FINAL_CLOSURE_SERVICE_NOT_IMPLEMENTED" not in (
         full_delivery.capability.blockers
     )
-    assert "FALCONE_CANDIDATE_BUILD_CONTRACT_MISSING" in full_delivery.capability.blockers
-    assert (
-        "FALCONE_SCOPED_STAGING_RELEASER_AND_REPOSITORY_VALUES_MISSING"
-        in full_delivery.capability.blockers
-    )
+    # gntik-ai/falcone#1027: falcone full delivery runs the post-merge staging flow, so
+    # exactly the stale provider health blocks it here.
+    assert set(full_delivery.capability.blockers) == {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"}
+    # A project without a staging flow still fails closed on its own contract blockers.
+    llmwiki_blockers = repository._full_delivery_blockers("llmwiki")
+    assert "LLMWIKI_CANDIDATE_BUILD_DISABLED" in llmwiki_blockers
+    assert "LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED" in llmwiki_blockers
 
 
 def test_full_delivery_capability_uses_project_contracts_and_fails_closed(
@@ -678,14 +680,9 @@ async def test_r3_issue_candidate_is_generalized_across_all_three_projects(
     )
 
     falcone = await repository.r3_issue_candidate("falcone", "source", 953)
-    assert falcone["candidate"]["delivery_adapter"].startswith("helm:")
-    assert (
-        "helm-release-deployed-with-approved-image-digests"
-        in (falcone["candidate"]["verification"])
-    )
-    assert falcone["candidate"]["rollback"] == (
-        "helm-rollback-to-prior-revision-and-verify-exact-manifest-restored"
-    )
+    assert falcone["candidate"]["delivery_adapter"] == "argocd:falcone-staging"
+    assert "Argo-Synced-and-Healthy" in falcone["candidate"]["verification"]
+    assert falcone["candidate"]["rollback"] == "revert-protected-GitOps-change-and-reconcile"
     assert falcone["confirmation_phrase"].startswith("APPROVE_R3_FALCONE_953_")
 
     musematic = await repository.r3_issue_candidate("musematic", "source", 1119)

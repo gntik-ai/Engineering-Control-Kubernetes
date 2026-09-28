@@ -1268,9 +1268,111 @@ def test_runtime_required_issues_proceed_on_source_repro_in_staged_full_delivery
     )
     assert source_pr["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
     unstaged = handler._backlog_revalidate_gate(
-        {**staged, "project": "falcone", "item": {**confirmed, "repository": "gntik-ai/falcone"}}
+        {**staged, "project": "llmwiki", "item": {**confirmed, "repository": "gntik-ai/llmwiki"}}
     )
     assert unstaged["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
+
+
+def test_source_pr_runtime_proof_waiver_is_per_issue_and_revalidates_source_first(
+    tmp_path: Path,
+) -> None:
+    # NEW-88: falcone #1026 (text says "staging") and falcone-charts #46 (deployment owner)
+    # paused at CURRENT_RUNTIME_REVALIDATION_REQUIRED before any source revalidation ran, and
+    # source-pr had no way past it. The source revalidation now always runs first, and an
+    # operator may accept it as the proof for one source-pr issue operation.
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'gate.sqlite'}",
+        project_config_root=ROOT / "config/projects",
+    )
+    handler = EngineeringActivityHandler(settings)
+    item = {
+        "repository": "gntik-ai/falcone-charts",
+        "issue_number": 46,
+        "reproduction_mode": "DEPLOYMENT_REQUIRED",
+        "current_source_reproduction": "PENDING_CURRENT_STATE_REVALIDATION",
+        "current_runtime_reproduction": "PENDING",
+    }
+    # llmwiki: a project without an enabled staging flow (falcone has one since #1027).
+    plain = {"project": "llmwiki", "delivery_mode": "source-pr", "item": item}
+    assert handler._backlog_revalidate_gate(plain)["blocker"] == (
+        "CURRENT_SOURCE_REVALIDATION_REQUIRED"
+    )
+
+    confirmed = {**item, "current_source_reproduction": "REPRODUCED_CURRENT_DEPLOYMENT"}
+    assert handler._backlog_revalidate_gate({**plain, "item": confirmed})["blocker"] == (
+        "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
+    )
+    waived = {
+        **plain,
+        "item": confirmed,
+        "runtime_proof": "source-revalidation",
+        "target_issue_number": 46,
+    }
+    assert handler._backlog_revalidate_gate(waived)["blocker"] == (
+        "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED"
+    )
+    # The waiver never covers a campaign-wide loop or a full-delivery run.
+    for scope in ({"target_issue_number": None}, {"delivery_mode": "full-delivery"}):
+        assert handler._backlog_revalidate_gate({**waived, **scope})["blocker"] == (
+            "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
+        )
+    # Nor does it skip the source revalidation itself.
+    assert handler._backlog_revalidate_gate({**waived, "item": item})["blocker"] == (
+        "CURRENT_SOURCE_REVALIDATION_REQUIRED"
+    )
+
+
+def test_source_revalidation_runtime_proof_is_bound_to_source_pr_issue_operations() -> None:
+    from uuid import uuid4
+
+    from pydantic import ValidationError
+
+    from engineering_control.api.schemas import ExistingBacklogLoopStart
+    from engineering_control.operations.models import SolveIssueCommand
+
+    campaign = uuid4()
+    command = SolveIssueCommand(
+        project="falcone",
+        backlog_campaign_id=campaign,
+        repository="gntik-ai/falcone",
+        issue_number=1026,
+        delivery_mode="source-pr",
+        runtime_proof="source-revalidation",
+    )
+    assert command.runtime_proof == "source-revalidation"
+    assert (
+        SolveIssueCommand(
+            project="falcone",
+            backlog_campaign_id=campaign,
+            repository="gntik-ai/falcone",
+            issue_number=1026,
+        ).runtime_proof
+        == "runtime"
+    )
+    with pytest.raises(ValidationError):
+        SolveIssueCommand(
+            project="falcone",
+            backlog_campaign_id=campaign,
+            repository="gntik-ai/falcone",
+            issue_number=1026,
+            delivery_mode="full-delivery",
+            runtime_proof="source-revalidation",
+        )
+    base = {
+        "project": "falcone",
+        "backlog_campaign_id": campaign,
+        "maximum_risk": "R2",
+        "delivery_mode": "source-pr",
+        "runtime_proof": "source-revalidation",
+    }
+    assert (
+        ExistingBacklogLoopStart(
+            **base, target_repository="gntik-ai/falcone", target_issue_number=1026
+        ).runtime_proof
+        == "source-revalidation"
+    )
+    with pytest.raises(ValidationError):
+        ExistingBacklogLoopStart(**base, maximum_items=5)
 
 
 def test_a_cancelled_loop_releases_only_its_own_child_runs_leases(tmp_path: Path) -> None:

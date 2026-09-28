@@ -187,6 +187,7 @@ class ExistingBacklogLoopStart(APIModel):
     correction_limit: int = Field(default=2, ge=0, le=5)
     global_campaign_id: UUID | None = None
     r3_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    runtime_proof: Literal["runtime", "source-revalidation"] = "runtime"
 
     @model_validator(mode="after")
     def exact_issue_binding(self) -> ExistingBacklogLoopStart:
@@ -194,6 +195,13 @@ class ExistingBacklogLoopStart(APIModel):
             raise ValueError("target repository and issue number must be supplied together")
         if self.target_repository is not None and self.maximum_items != 1:
             raise ValueError("a direct issue operation must remain bound to one item")
+        if self.runtime_proof == "source-revalidation" and (
+            self.delivery_mode != "source-pr" or self.target_issue_number is None
+        ):
+            # NEW-88: the waiver is per issue and per source-pr operation, never campaign-wide.
+            raise ValueError(
+                "runtime proof by source revalidation requires one source-pr issue operation"
+            )
         return self
 
 

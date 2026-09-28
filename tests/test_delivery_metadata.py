@@ -859,7 +859,17 @@ def test_deployment_maker_may_complete_without_changes_and_ignores_baseline(
     # NEW-42: the image version comes from the build + promotion, never from the maker.
     assert "Never pin, change or require an image tag or digest" in prompt
     assert "GitHub Packages" in prompt
-    assert "empty changed_files" not in source["maker_request"]["prompt"]
+    # NEW-89: the source maker may skip only a deployment-only ChangeSet, never a
+    # required source change.
+    source_prompt = source["maker_request"]["prompt"]
+    assert "every change it requires is in the separate deployment repository" in source_prompt
+    assert "Any required source change must be implemented" in source_prompt
+    assert "return decision COMPLETE with an empty changed_files list" not in source_prompt
+    # A shared source/deployment repository (llmwiki) has no deployment-only split.
+    shared = handler._prepare_maker(
+        {**payload, "deployment_worktree": payload["source_worktree"]}, deployment=False
+    )["maker_request"]["prompt"]
+    assert "separate deployment repository" not in shared
 
 
 @pytest.mark.parametrize(("project_config", "prepared"), [("config/projects", True), (None, False)])

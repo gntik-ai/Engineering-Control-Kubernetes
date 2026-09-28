@@ -337,11 +337,27 @@ def test_musematic_contract_enables_a_consistent_staging_flow() -> None:
     assert flow.chart_source_repository == "https://github.com/gntik-ai/musematic.git"
     policy = DeliveryControlPolicy.model_validate(raw["delivery_control"])
     assert policy.staging_flow == flow
-    for project in ("falcone", "llmwiki"):
-        other = ProjectManifest.model_validate(
-            yaml.safe_load((ROOT / "config" / "projects" / f"{project}.yaml").read_text())
-        )
-        assert other.staging_flow() is None
+    llmwiki = ProjectManifest.model_validate(
+        yaml.safe_load((ROOT / "config" / "projects" / "llmwiki.yaml").read_text())
+    )
+    assert llmwiki.staging_flow() is None
+
+
+def test_falcone_contract_enables_a_consistent_staging_flow() -> None:
+    # gntik-ai/falcone#1027: falcone staging is the falcone-staging Argo CD Application;
+    # argocd-image-updater writes values/staging-argocd.yaml in falcone-charts.
+    raw = yaml.safe_load((ROOT / "config" / "projects" / "falcone.yaml").read_text())
+    manifest = ProjectManifest.model_validate(raw)
+    flow = manifest.staging_flow()
+    assert flow is not None and flow.enabled
+    assert manifest.staging_flow_blockers() == []
+    assert manifest.deployment.strategy == "argocd"
+    assert manifest.deployment.argocd_application == flow.argo_application == "falcone-staging"
+    assert flow.deploy_repository == "gntik-ai/falcone-charts"
+    assert flow.deploy_values_file == "charts/in-falcone/values/staging-argocd.yaml"
+    assert flow.image_workflow == "release-images.yml"
+    assert set(flow.image_repositories) == set(raw["deployment"]["image_repositories"].values())
+    assert not flow.pin_chart_to_merge
 
 
 @pytest.mark.parametrize(
@@ -487,7 +503,7 @@ async def test_flow_for_project_reports_contract_state(tmp_path: Path) -> None:
     handler = _controller(tmp_path, FakeKubectl())
     enabled = await handler.handle("gitops.flow_for_project", {"project": "musematic"})
     assert enabled["enabled"] is True and enabled["blockers"] == []
-    disabled = await handler.handle("gitops.flow_for_project", {"project": "falcone"})
+    disabled = await handler.handle("gitops.flow_for_project", {"project": "llmwiki"})
     assert disabled == {"status": "DISABLED", "enabled": False}
     invalid = await handler.handle("gitops.flow_for_project", {"project": "other"})
     assert invalid["enabled"] is False
@@ -1101,17 +1117,39 @@ async def test_workflow_run_states(tmp_path: Path) -> None:
 async def test_image_pin_detection_reads_the_deploy_values_file(tmp_path: Path) -> None:
     handler, fake = _github(tmp_path)
     key = ("gntik-ai/musematic-deploy", "apps/musematic-platform/values.override.yaml")
-    fake.files[key] = (
-        "controlPlane:\n  image:\n    repository: ghcr.io/gntik-ai/musematic/control-plane\n"
-        "    tag: sha-1111111\nsecretBlock:\n  password: do-not-leak\n"
-    )
+    repositories = [
+        "ghcr.io/gntik-ai/musematic/control-plane",
+        "ghcr.io/gntik-ai/musematic/runtime-controller",
+        "ghcr.io/gntik-ai/musematic/reasoning-engine",
+        "ghcr.io/gntik-ai/musematic/simulation-controller",
+        "ghcr.io/gntik-ai/musematic/sandbox-manager",
+        "ghcr.io/gntik-ai/musematic/web",
+    ]
+
+    def values(pinned: int) -> str:
+        return (
+            "".join(
+                f"c{index}:\n  image:\n    repository: {repository}\n"
+                f"    tag: {EXPECTED_TAG if index < pinned else 'sha-1111111'}\n"
+                for index, repository in enumerate(repositories)
+            )
+            + "secretBlock:\n  password: do-not-leak\n"
+        )
+
     payload = {"plan": _plan(), "merge_sha": MERGE_SHA}
-    pending = await handler.handle("gitops.image_pin", payload)
-    assert pending["status"] == "PIN_PENDING"
-    fake.files[key] = fake.files[key].replace("sha-1111111", EXPECTED_TAG)
+    fake.files[key] = values(0)
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    # NEW-93: argocd-image-updater pins images as their builds appear; falcone #956 synced
+    # after 5 of 6 pins. Every flow image must carry the merge tag before PINNED.
+    fake.files[key] = values(5)
+    partial = await handler.handle("gitops.image_pin", payload)
+    assert partial["status"] == "PIN_PENDING"
+    assert partial["missing_repositories"] == ["ghcr.io/gntik-ai/musematic/web"]
+    fake.files[key] = values(6)
     pinned = await handler.handle("gitops.image_pin", payload)
     assert pinned["status"] == "PINNED"
-    assert pinned["pinned_repositories"] == ["ghcr.io/gntik-ai/musematic/control-plane"]
+    assert pinned["pinned_repositories"] == sorted(repositories)
+    assert pinned["missing_repositories"] == []
     assert pinned["image_tag"] == EXPECTED_TAG
     assert "do-not-leak" not in json.dumps(pinned)
     read = [call for call in fake.calls if call[:3] == ["api", "-X", "GET"]][-1]

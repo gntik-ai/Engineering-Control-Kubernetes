@@ -229,6 +229,7 @@ class TypedCommandBus:
                     target_issue_number=command.issue_number,
                     continue_after_blocked_issue=False,
                     correction_limit=command.correction_limit,
+                    runtime_proof=command.runtime_proof,
                 )
             )
         if isinstance(command, SolveBacklogCommand):

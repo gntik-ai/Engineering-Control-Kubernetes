@@ -162,6 +162,11 @@ def parser() -> argparse.ArgumentParser:
                 choices=("source-pr", "full-delivery"),
                 default="source-pr",
             )
+            issue.add_argument(
+                "--runtime-proof",
+                choices=("runtime", "source-revalidation"),
+                default="runtime",
+            )
     r3_candidate = commands.add_parser("r3-candidate")
     r3_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     r3_candidate.add_argument("surface", choices=("source", "deployment"))
@@ -401,21 +406,21 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         issue = located.get("issue") if isinstance(located, dict) else None
         if not isinstance(issue, dict):
             raise ValueError("located issue projection is invalid")
-        return client.request(
-            "POST",
-            "/v1/commands",
-            {
-                "action": "solve_issue",
-                "project": arguments.project,
-                "backlog_campaign_id": located["backlog_campaign_id"],
-                "repository": issue["repository"],
-                "issue_number": arguments.issue_number,
-                "maximum_risk": "R2",
-                "delivery_mode": arguments.delivery_mode,
-                "correction_limit": 5,
-                "production": False,
-            },
-        )
+        solve: dict[str, Any] = {
+            "action": "solve_issue",
+            "project": arguments.project,
+            "backlog_campaign_id": located["backlog_campaign_id"],
+            "repository": issue["repository"],
+            "issue_number": arguments.issue_number,
+            "maximum_risk": "R2",
+            "delivery_mode": arguments.delivery_mode,
+            "correction_limit": 5,
+            "production": False,
+        }
+        if arguments.runtime_proof != "runtime":
+            # NEW-88: sent only when waived, so the default request is unchanged.
+            solve["runtime_proof"] = arguments.runtime_proof
+        return client.request("POST", "/v1/commands", solve)
     if command == "r3-candidate":
         query = httpx.QueryParams(
             {

@@ -66,7 +66,9 @@ later idempotent retry.
 
 ## Current discovered blockers
 
-The checked-in project policies intentionally disable candidate-build acceptance today:
+The checked-in project policies intentionally disable candidate-build acceptance today. This is
+the pre-merge path only: musematic and, since 2026-09-28, falcone deliver in full through the
+post-merge staging flow (`delivery_control.staging_flow`), which these blockers do not gate.
 
 - Falcone's current `release-images` workflow emits no control-plane manifest/attestation contract
   and explicitly disables build provenance, so it reports

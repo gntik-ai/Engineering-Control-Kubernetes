@@ -3197,6 +3197,20 @@ class MetadataActivityHandler:
                 if not deployment
                 else "Return an empty dependency_resolution list.\n"
             )
+            # NEW-89: falcone-charts #46's source maker returned BLOCKED ("all scoped target
+            # files are absent") for a deployment-only ChangeSet, while an earlier attempt of
+            # the same issue correctly returned COMPLETE. Only for separate repositories: a
+            # shared one (llmwiki) has no deployment-only split.
+            + (
+                "The OpenSpec may require no change in this source repository because every "
+                "change it requires is in the separate deployment repository (a "
+                "deployment-only ChangeSet). Only then, make no commit here and return decision "
+                "COMPLETE with an empty source changed_files list; never return BLOCKED only "
+                "because the ChangeSet's files live in the deployment repository. Any "
+                "required source change must be implemented.\n"
+                if not deployment and payload["source_worktree"] != payload["deployment_worktree"]
+                else ""
+            )
             # NEW-78: #1125's correction maker fixed every checker finding it could, then
             # returned BLOCKED because go test, Docker/Trivy and the OpenSpec CLI cannot run
             # offline; those are enforced after publication.

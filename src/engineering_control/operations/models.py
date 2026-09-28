@@ -43,8 +43,18 @@ class SolveIssueCommand(OperationModel):
     issue_number: int = Field(ge=1)
     maximum_risk: RiskClass = RiskClass.R2
     delivery_mode: Literal["source-pr", "full-delivery"] = "full-delivery"
+    # NEW-88: operator opt-in, for this one issue in source-pr mode, to accept the independent
+    # current-source revalidation as the proof of a RUNTIME/DEPLOYMENT_REQUIRED issue (no step
+    # can record a runtime reproduction, and source-pr deploys nothing to verify afterwards).
+    runtime_proof: Literal["runtime", "source-revalidation"] = "runtime"
     correction_limit: int = Field(default=2, ge=0, le=5)
     production: Literal[False] = False
+
+    @model_validator(mode="after")
+    def source_revalidation_is_source_pr_only(self) -> SolveIssueCommand:
+        if self.runtime_proof == "source-revalidation" and self.delivery_mode != "source-pr":
+            raise ValueError("runtime proof by source revalidation requires source-pr delivery")
+        return self
 
 
 class SolveBacklogCommand(OperationModel):

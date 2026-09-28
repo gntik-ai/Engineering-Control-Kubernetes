@@ -772,6 +772,97 @@ def test_publication_transport_identity_reads_only_changeset_git_metadata(
     assert not any("u:transport:" in argument for command in commands for argument in command)
 
 
+def test_mirror_syncing_transport_keeps_write_on_the_canonical_mirror(tmp_path: Path) -> None:
+    """NEW-90: the transport identity also pushes refreshed mirrors to the worker (NEW-71).
+
+    Publishing falcone #1026 re-granted it r-X recursively on the canonical mirror, which
+    replaced its rwx; the next mirror refresh failed with "unable to create temporary
+    object directory" (CANONICAL_MIRROR_REFRESH_FAILED).
+    """
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "falcone" / str(uuid4())
+    target.mkdir(parents=True)
+    metadata_root = tmp_path / "cache" / "scan" / "worktree-git"
+    metadata = metadata_root / "falcone" / f"{target.name}.git"
+    (metadata / "objects").mkdir(parents=True)
+    mirror_root = tmp_path / "mirrors"
+    canonical = mirror_root / "falcone.git"
+    canonical.mkdir(parents=True)
+    manager = GitWorktreeManager(
+        mirror_root=mirror_root,
+        worktree_root=worktree_root,
+        lease_root=tmp_path / "leases",
+        metadata_root=metadata_root,
+        publication_transport_identity="transport",
+        transport_syncs_mirrors=True,
+    )
+    commands: list[list[str]] = []
+
+    def record(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        commands.append(args)
+        return ""
+
+    manager._run = record  # type: ignore[method-assign]
+    manager.verify_mirror = lambda repository: canonical  # type: ignore[method-assign]
+    manager._grant_access(
+        target, metadata, canonical, WorktreeAccess("codex-runner", "claude-runner")
+    )
+    manager.grant_delivery_read("falcone", target)
+
+    canonical_entries = [command[-2] for command in commands if command[-1] == str(canonical)]
+    assert any("u:transport:rwX" in entry for entry in canonical_entries)
+    assert not any("u:transport:r-X" in entry for entry in canonical_entries)
+    # The ChangeSet metadata stays read-only for the transport.
+    assert any(
+        command[-1] == str(metadata) and "u:transport:r-X" in command[-2] for command in commands
+    )
+    assert not any(
+        command[-1] == str(metadata) and "u:transport:rwX" in command[-2] for command in commands
+    )
+
+
+def test_transport_write_grant_tolerates_only_transport_owned_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-90: a mirror push leaves objects owned by the transport identity, whose ACL
+    only it may change; that EPERM is harmless, any other still fails closed."""
+    import os
+    import pwd
+    import subprocess
+
+    owned = tmp_path / "objects" / "ab"
+    owned.mkdir(parents=True)
+    loose = owned / "cdef"
+    loose.write_text("object")
+    loose.chmod(0o444)  # Git stores loose and packed objects read-only.
+    me = pwd.getpwuid(os.geteuid()).pw_name
+    manager = GitWorktreeManager(mirror_root=tmp_path, publication_transport_identity="transport")
+
+    def failing_run(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        raise WorktreeError("setfacl failed")
+
+    manager._run = failing_run  # type: ignore[method-assign]
+
+    def eperm(output: str) -> None:
+        monkeypatch.setattr(
+            manager_module.subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 1, "", output),
+        )
+
+    args = ["setfacl", "--recursive", "--modify", f"u:{me}:rwX", str(tmp_path)]
+    eperm(f"setfacl: {owned}: Operation not permitted\nsetfacl: {loose}: Operation not permitted\n")
+    manager._setfacl_transport_write(args, tmp_path, me)
+    with pytest.raises(WorktreeError, match="may not grant the transport write"):
+        manager._setfacl_transport_write(args, tmp_path, "root")
+    eperm("setfacl: invalid argument\n")
+    with pytest.raises(WorktreeError, match="setfacl failed"):
+        manager._setfacl_transport_write(args, tmp_path, me)
+    eperm("")
+    with pytest.raises(WorktreeError, match="without output"):
+        manager._setfacl_transport_write(args, tmp_path, me)
+
+
 @pytest.mark.parametrize("identity", ["codex-runner", "claude-runner", "Hermes", "a b", ""])
 def test_publication_transport_identity_must_be_a_plain_non_model_user(identity: str) -> None:
     with pytest.raises(ValueError, match="transport identity"):

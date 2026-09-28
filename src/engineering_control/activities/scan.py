@@ -192,6 +192,7 @@ class ScanActivityHandler:
                 if settings.publication_fetch_from_worker
                 else None
             ),
+            transport_syncs_mirrors=settings.mirror_sync_to_worker,
         )
         self.scanner = scanner or DeterministicScanner(
             SafeCommandRunner(
@@ -1121,9 +1122,15 @@ class ScanActivityHandler:
         )
         namespace = manifest.deployment.namespaces[0]
         resources = ["deployments", "statefulsets", "pods", "events"]
-        if manifest.deployment.strategy == "argocd":
-            resources.append("applications.argoproj.io")
         observer.verify_permissions((namespace,), tuple(resources))
+        # The Argo CD Application lives in the Argo CD namespace, not the workload one
+        # (gntik-ai/falcone#1027 review): read it there.
+        argo_namespace = "argocd"
+        if manifest.deployment.strategy == "argocd":
+            flow = manifest.staging_flow()
+            argo_namespace = flow.argo_namespace if flow is not None else "argocd"
+            resources.append("applications.argoproj.io")
+            observer.verify_permissions((argo_namespace,), ("applications.argoproj.io",))
         identity = observer.identity()
         if identity["context"] != manifest.deployment.kubernetes_context_ref:
             raise PermissionError("observer Kubernetes context changed")
@@ -1141,7 +1148,12 @@ class ScanActivityHandler:
                 if resource == "applications.argoproj.io"
                 else None
             )
-            observed = json.loads(observer.get(resource, namespace=namespace, name=name).stdout)
+            resource_namespace = (
+                argo_namespace if resource == "applications.argoproj.io" else namespace
+            )
+            observed = json.loads(
+                observer.get(resource, namespace=resource_namespace, name=name).stdout
+            )
             summary = self._summarize_runtime_resource(
                 resource,
                 observed,
