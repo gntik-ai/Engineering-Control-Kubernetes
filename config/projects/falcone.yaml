@@ -109,7 +109,7 @@ delivery_control:
       prefix: v
       bump: patch
     deploy_repository: gntik-ai/falcone-charts
-    deploy_values_file: charts/in-falcone/values/staging.yaml
+    deploy_values_file: charts/in-falcone/values/staging-argocd.yaml
     deploy_branch: main
     image_repositories:
       - ghcr.io/gntik-ai/in-falcone-control-plane

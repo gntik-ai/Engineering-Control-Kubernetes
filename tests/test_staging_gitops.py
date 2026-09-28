@@ -353,7 +353,7 @@ def test_falcone_contract_declares_a_consistent_staging_flow() -> None:
     assert manifest.staging_flow_blockers() == ["STAGING_FLOW_DISABLED"]
     assert flow.argo_application == "falcone-staging"
     assert flow.deploy_repository == "gntik-ai/falcone-charts"
-    assert flow.deploy_values_file == "charts/in-falcone/values/staging.yaml"
+    assert flow.deploy_values_file == "charts/in-falcone/values/staging-argocd.yaml"
     assert flow.image_workflow == "release-images.yml"
     assert set(flow.image_repositories) == set(raw["deployment"]["image_repositories"].values())
     assert not flow.pin_chart_to_merge
