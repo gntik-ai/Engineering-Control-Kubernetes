@@ -1,6 +1,6 @@
 # Telegram worked examples
 
-Generated 2026-09-27, read-only. **No write command was run to produce these.** Conventions:
+Generated 2026-09-27, read-only. **No write command was run to produce these.** Updated 2026-09-28: falcone gained full delivery (gntik-ai/falcone#1027); the falcone rows below cite that real run. Conventions:
 
 - `👤` = operator message, `🤖` = bot reply. Replies are always one JSON message `{"next_cursor": …, "payload": …}` (see `commands.md` Part 1); long payloads are shortened here with `…`.
 - **[real API]** = the payload was fetched read-only from the live API on 2026-09-27 (`GET` equivalents of the command). **[real run]** = facts from Temporal history / GitHub for a run that happened (the run was started through the CLI/API; which channel was used is not recorded). **[reconstructed]** = built from the code paths cited in `commands.md`; field names are exact, values illustrative.
@@ -12,7 +12,7 @@ What each product supports today (from `config/projects/*.yaml`):
 | Product | `source-pr` | `full-delivery` | Why |
 |---|---|---|---|
 | musematic (+ musematic-deploy) | yes | **yes** — post-merge GitOps flow (`staging_flow.enabled: true`, Argo CD `musematic-platform`, argocd-image-updater) | `config/projects/musematic.yaml:176-184` |
-| falcone (+ falcone-charts) | yes | **no** — preflight BLOCKED `FALCONE_CANDIDATE_BUILD_CONTRACT_MISSING` (also `FALCONE_SCOPED_STAGING_RELEASER_AND_REPOSITORY_VALUES_MISSING`) | `config/projects/falcone.yaml:48-81`, `operations/repository.py:1110-1135` |
+| falcone (+ falcone-charts) | yes | **yes**: post-merge GitOps flow (`staging_flow.enabled: true`, Argo CD `falcone-staging`, argocd-image-updater writing `charts/in-falcone/values/staging-argocd.yaml`; `release-images` builds `sha-<merge7>` on the Hermes `v*.*.*` tag). First delivery 2026-09-28: gntik-ai/falcone#956 [real run] | `config/projects/falcone.yaml:18,40,96-127`; falcone-charts `deploy/argocd/README.md` |
 | llmwiki | yes | **no** — `LLMWIKI_CANDIDATE_BUILD_DISABLED`, `LLMWIKI_STAGING_BOOTSTRAP_APPROVAL_REQUIRED` | `config/projects/llmwiki.yaml:43-87` |
 
 In `source-pr` mode Hermes stops at an open, checked source PR: **merging it and closing the issue are manual**, and Hermes does not read PR review comments (no code path consumes them). **GitHub Project cards are never moved** — there is no Projects API code in `src/` (grep `projectV2|project_card` → nothing).
@@ -46,16 +46,23 @@ The campaign `3f24fc41…` was imported 2026-08-31 (82 issues) and its approval 
 
 Wait ~1–3 min, then `👤 /status backlog-import-falcone-<uuid>` until `"status": "COMPLETED"`. Check: Temporal UI → `GitHubBacklogImportWorkflow` completed; `/loop inventory falcone <new-uuid> 20` lists the issues.
 
-**Step 3 — try full delivery (shows the blocker)** [reconstructed from `operations/service.py:97-110`]
+**Step 3 — full delivery** [real run: gntik-ai/falcone#956, 2026-09-28]
 
 ```
-👤 /loop issue-start falcone deployment 45 full-delivery
-🤖 {"next_cursor": null, "payload": {"operation_id": "…", "action": "solve_issue", "source_channel": "telegram",
-     "status": "BLOCKED", "workflow_id": null,
-     "safe_error": "operation preflight changed: FALCONE_CANDIDATE_BUILD_CONTRACT_MISSING", …}}
+👤 /loop issue-start falcone source 956 full-delivery
+🤖 {"next_cursor": null, "payload": {"operation_id": "…", "action": "solve_issue", "status": "STARTED",
+     "workflow_id": "backlog-loop-falcone-9386a967-f865-458d-9c09-d3facca01ad0-7717d794-0955-472e-8af3-9371b060fc7a", …}}
 ```
 
-**Step 4 — start source-PR delivery** [reconstructed]
+What followed, with no operator step except one retry (see below):
+1. Revalidation, maker and independent checker, then PR [#1031](https://github.com/gntik-ai/falcone/pull/1031). After PR CI passed, Hermes merged it as `49dcecc`.
+2. Tag `v0.6.6` on `49dcecc`, then `release-images` built all six `ghcr.io/gntik-ai/in-falcone-*:sha-49dcecc` images.
+3. argocd-image-updater pinned them in falcone-charts (`91faa7c`), and Hermes triggered the `falcone-staging` sync.
+4. Verified: all images `sha-49dcecc`, app Synced/Healthy, `STAGING_VERIFIED`, and #956 closed by Hermes at 16:48Z.
+
+The first attempt paused `ARGO_SYNC_TIMEOUT`: Hermes synced when 5 of 6 images were pinned (fixed as NEW-93). `/loop retry <loop-id> falcone 956` then re-ran only the staging step and finished. Same shape for `deployment` issues (for example `falcone deployment 45`); in full delivery the post-deploy verification is the runtime proof (NEW-69).
+
+**Step 4 — or source-PR delivery (PR only)** [reconstructed]
 
 ```
 👤 /loop issue-start falcone deployment 45 source-pr
@@ -97,7 +104,7 @@ Expected path: mirror refresh → revalidation (FindingVerificationWorkflow, ~10
 🤖 {"payload": {"workflow_id": "backlog-import-llmwiki-<uuid>", "status": "ACCEPTED", "backlog_campaign_id": "<uuid>", …}}   [reconstructed]
 ```
 
-Then, as in example 1, in `source-pr` mode (`full-delivery` → BLOCKED `LLMWIKI_CANDIDATE_BUILD_DISABLED`):
+Then in `source-pr` mode. llmwiki has no staging flow, so `full-delivery` → BLOCKED `LLMWIKI_CANDIDATE_BUILD_DISABLED`:
 
 ```
 👤 /loop issue-start llmwiki source 7 source-pr
