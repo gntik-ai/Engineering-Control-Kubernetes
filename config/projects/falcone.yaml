@@ -129,11 +129,16 @@ delivery_control:
     # has no path filters, so one root marker runs every job; the scopes cover every
     # top-level entry. The exemption is per job (activities/gitops.py): a failing PR job
     # passes only if the same job also failed on the baseline, and a PR touching no
-    # covered path gets no baseline at all (CI_BASELINE_NOT_APPLICABLE).
+    # covered path gets no baseline at all (CI_BASELINE_NOT_APPLICABLE); one that changes
+    # .github/ never gets it (CI_BASELINE_CI_CONFIG_CHANGED), so .github/ is not a scope.
     ci_baseline:
       enabled: true
       markers:
-        - {scope: ".", path: .hermes-ci-baseline}
+        - {scope: .dockerignore, path: .hermes-ci-baseline}
+        - {scope: .env.example, path: .hermes-ci-baseline}
+        - {scope: .gitignore, path: .hermes-ci-baseline}
+        - {scope: .idea/, path: .hermes-ci-baseline}
+        - {scope: .markdownlint-cli2.jsonc, path: .hermes-ci-baseline}
         - {scope: LICENSE, path: .hermes-ci-baseline}
         - {scope: README, path: .hermes-ci-baseline}
         - {scope: apps/, path: .hermes-ci-baseline}

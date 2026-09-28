@@ -363,7 +363,7 @@ def test_falcone_contract_enables_a_consistent_staging_flow() -> None:
     assert flow.ci_baseline.enabled
     assert {marker.path for marker in flow.ci_baseline.markers} == {".hermes-ci-baseline"}
     top_level = (
-        ".dockerignore .env.example .github/ci.yml .gitignore .idea/x .markdownlint-cli2.jsonc "
+        ".dockerignore .env.example .gitignore .idea/x .markdownlint-cli2.jsonc "
         "LICENSE README.de.md README.md apps/web-console/x delivery-adapter/x deploy/x "
         "docs/x docs-site/x falcone-loop-state/x internal-contracts/x logo-original.png "
         "logo.svg openspec/x package.json packages/x pnpm-lock.yaml pnpm-workspace.yaml "
@@ -371,6 +371,7 @@ def test_falcone_contract_enables_a_consistent_staging_flow() -> None:
     ).split()
     scopes = [marker.scope for marker in flow.ci_baseline.markers]
     assert all(any(path.startswith(scope) for scope in scopes) for path in top_level)
+    assert not any(".github/ci.yml".startswith(scope) for scope in scopes)
 
 
 @pytest.mark.parametrize(
@@ -1499,8 +1500,24 @@ async def test_baseline_gate_waits_for_pending_pr_checks_and_skips_unmapped_path
     )
     blocked = await other.handle("gitops.pr_checks", {"plan": _plan()})
     assert blocked["blocker"] == "SOURCE_PR_CI_FAILED"
-    assert blocked["reason"] == "CI_BASELINE_NOT_APPLICABLE"
+    assert blocked["reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
     assert other_fake.branches == {}
+
+    # A mixed PR (covered app path plus CI configuration) gets no exemption either.
+    mixed, mixed_fake = _baseline_handler(
+        tmp_path / "mixed", ["apps/web/x.tsx", ".github/workflows/ci.yml"], PR_FAILURES
+    )
+    blocked = await mixed.handle("gitops.pr_checks", {"plan": _plan()})
+    assert blocked["blocker"] == "SOURCE_PR_CI_FAILED"
+    assert blocked["reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
+    assert mixed_fake.branches == {}
+
+    uncovered, uncovered_fake = _baseline_handler(
+        tmp_path / "uncovered", ["unmapped/x.txt"], PR_FAILURES
+    )
+    blocked = await uncovered.handle("gitops.pr_checks", {"plan": _plan()})
+    assert blocked["reason"] == "CI_BASELINE_NOT_APPLICABLE"
+    assert uncovered_fake.branches == {}
 
 
 @pytest.mark.asyncio
