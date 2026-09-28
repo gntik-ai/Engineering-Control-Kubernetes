@@ -93,3 +93,35 @@ delivery_control:
       function-runtime: controlPlane.functionExecutor.runtimeImage.digest
       workflow-worker: workflowWorker.image.digest
       mcp-runtime: mcp.runtimeImage.digest
+  staging_flow:
+    enabled: false
+    kind: argocd-image-updater
+    argo_application: falcone-staging
+    argo_namespace: argocd
+    namespaces: [in-falcone-staging]
+    source_ci_workflow: ci
+    # main CI does not publish images; release-images does, on the v*.*.* tag Hermes pushes
+    # on the merge commit (gntik-ai/falcone#1026).
+    main_ci_workflow: null
+    image_workflow: release-images.yml
+    release_tag:
+      enabled: true
+      prefix: v
+      bump: patch
+    deploy_repository: gntik-ai/falcone-charts
+    deploy_values_file: charts/in-falcone/values/staging.yaml
+    deploy_branch: main
+    image_repositories:
+      - ghcr.io/gntik-ai/in-falcone-control-plane
+      - ghcr.io/gntik-ai/in-falcone-control-plane-executor
+      - ghcr.io/gntik-ai/in-falcone-web-console
+      - ghcr.io/gntik-ai/in-falcone-fn-runtime
+      - ghcr.io/gntik-ai/in-falcone-workflow-worker
+      - ghcr.io/gntik-ai/in-falcone-mcp-runtime
+    tag_prefix: sha-
+    tag_length: 7
+    # The chart lives in falcone-charts main, not in the source repo.
+    pin_chart_to_merge: false
+    allow_r3_merge: true
+    external_secrets_namespace: external-secrets
+    external_secrets_deployment: external-secrets

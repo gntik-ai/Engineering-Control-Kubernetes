@@ -337,11 +337,31 @@ def test_musematic_contract_enables_a_consistent_staging_flow() -> None:
     assert flow.chart_source_repository == "https://github.com/gntik-ai/musematic.git"
     policy = DeliveryControlPolicy.model_validate(raw["delivery_control"])
     assert policy.staging_flow == flow
-    for project in ("falcone", "llmwiki"):
-        other = ProjectManifest.model_validate(
-            yaml.safe_load((ROOT / "config" / "projects" / f"{project}.yaml").read_text())
-        )
-        assert other.staging_flow() is None
+    llmwiki = ProjectManifest.model_validate(
+        yaml.safe_load((ROOT / "config" / "projects" / "llmwiki.yaml").read_text())
+    )
+    assert llmwiki.staging_flow() is None
+
+
+def test_falcone_contract_declares_a_consistent_staging_flow() -> None:
+    # Declared but disabled until the falcone-staging Argo CD Application and sha- image
+    # tags exist (gntik-ai/falcone#1027).
+    raw = yaml.safe_load((ROOT / "config" / "projects" / "falcone.yaml").read_text())
+    manifest = ProjectManifest.model_validate(raw)
+    flow = manifest.staging_flow()
+    assert flow is not None and not flow.enabled
+    assert manifest.staging_flow_blockers() == ["STAGING_FLOW_DISABLED"]
+    assert flow.argo_application == "falcone-staging"
+    assert flow.deploy_repository == "gntik-ai/falcone-charts"
+    assert flow.deploy_values_file == "charts/in-falcone/values/staging.yaml"
+    assert flow.image_workflow == "release-images.yml"
+    assert set(flow.image_repositories) == set(raw["deployment"]["image_repositories"].values())
+    assert not flow.pin_chart_to_merge
+    # Go-live flips these three fields together.
+    raw["deployment"]["strategy"] = "argocd"
+    raw["deployment"]["argocd_application"] = "falcone-staging"
+    raw["delivery_control"]["staging_flow"]["enabled"] = True
+    assert ProjectManifest.model_validate(raw).staging_flow_blockers() == []
 
 
 @pytest.mark.parametrize(
