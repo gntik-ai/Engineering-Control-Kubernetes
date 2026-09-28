@@ -1512,6 +1512,22 @@ async def test_baseline_gate_waits_for_pending_pr_checks_and_skips_unmapped_path
     assert blocked["reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
     assert mixed_fake.branches == {}
 
+    # A rename out of .github/ still counts as touching .github/ (previous_filename).
+    renamed, renamed_fake = _baseline_handler(
+        tmp_path / "renamed", ["apps/web/ci.yml\t.github/workflows/ci.yml"], PR_FAILURES
+    )
+    blocked = await renamed.handle("gitops.pr_checks", {"plan": _plan()})
+    assert blocked["reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
+    assert renamed_fake.branches == {}
+
+    # A listing at GitHub's 3000-file cap may be truncated: no exemption.
+    capped, capped_fake = _baseline_handler(
+        tmp_path / "capped", [f"apps/web/f{index}.tsx" for index in range(3000)], PR_FAILURES
+    )
+    blocked = await capped.handle("gitops.pr_checks", {"plan": _plan()})
+    assert blocked["reason"] == "CI_BASELINE_FILE_LISTING_TRUNCATED"
+    assert capped_fake.branches == {}
+
     uncovered, uncovered_fake = _baseline_handler(
         tmp_path / "uncovered", ["unmapped/x.txt"], PR_FAILURES
     )
