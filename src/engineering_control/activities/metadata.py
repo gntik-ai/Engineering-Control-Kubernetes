@@ -359,6 +359,9 @@ def _issue_content(payload: dict[str, Any]) -> str | None:
     )
 
 
+_ISSUE_CONTEXT_BUDGET = 30_000
+
+
 def _issue_context(payload: dict[str, Any]) -> str:
     """NEW-92: makers and checker saw only the generated OpenSpec, which summarised exact
     issue values away (falcone-charts #47: a waiver ID, a CRD version), so they guessed or
@@ -366,6 +369,11 @@ def _issue_context(payload: dict[str, Any]) -> str:
     content = _issue_content(payload)
     if content is None:
         return ""
+    if len(content) > _ISSUE_CONTEXT_BUDGET:
+        # Review: schema-valid findings can exceed the 200k prompt limit in aggregate; the
+        # OpenSpec (always present) carries the intent, this block only exact values.
+        omitted = len(content) - _ISSUE_CONTEXT_BUDGET
+        content = content[:_ISSUE_CONTEXT_BUDGET] + f"\n[truncated: {omitted} characters omitted]"
     return (
         "Where the OpenSpec needs exact values (identifiers, versions, names, paths) that "
         "the issue content below states, use them verbatim instead of inferring or blocking; "
