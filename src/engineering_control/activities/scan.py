@@ -192,6 +192,7 @@ class ScanActivityHandler:
                 if settings.publication_fetch_from_worker
                 else None
             ),
+            transport_syncs_mirrors=settings.mirror_sync_to_worker,
         )
         self.scanner = scanner or DeterministicScanner(
             SafeCommandRunner(

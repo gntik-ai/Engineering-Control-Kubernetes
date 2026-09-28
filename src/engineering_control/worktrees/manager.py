@@ -70,6 +70,7 @@ class GitWorktreeManager:
         lease_root: Path = Path("/var/lib/engineering-control/leases/worktrees"),
         metadata_root: Path | None = None,
         publication_transport_identity: str | None = None,
+        transport_syncs_mirrors: bool = False,
     ) -> None:
         self.mirror_root = mirror_root
         self.worktree_root = worktree_root
@@ -86,6 +87,10 @@ class GitWorktreeManager:
         ):
             raise ValueError("publication transport identity is invalid")
         self.publication_transport_identity = publication_transport_identity
+        # NEW-90: with NEW-71 the transport identity also pushes the refreshed canonical
+        # mirrors to this host, so it owns write access there; a recursive read grant
+        # replaced its rwx with r-x and every later mirror refresh failed to unpack.
+        self.transport_syncs_mirrors = transport_syncs_mirrors
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -470,7 +475,7 @@ class GitWorktreeManager:
         if transport is not None:
             # NEW-61: the metadata repository is a --shared clone; upload-pack reads the
             # base history through its alternates in the canonical mirror.
-            self._grant_canonical_read(canonical_mirror, (transport,))
+            self._grant_transport_canonical(canonical_mirror, transport)
 
     def _grant_read_access(
         self,
@@ -548,7 +553,21 @@ class GitWorktreeManager:
         default_acl = f"d:u:{transport}:r-x"
         for directory in (metadata, *(item for item in metadata.rglob("*") if item.is_dir())):
             self._setfacl_readable(["setfacl", "--modify", default_acl, str(directory)], metadata)
-        self._grant_canonical_read(mirror, (transport,))
+        self._grant_transport_canonical(mirror, transport)
+
+    def _grant_transport_canonical(self, mirror: Path, transport: str) -> None:
+        if not self.transport_syncs_mirrors:
+            self._grant_canonical_read(mirror, (transport,))
+            return
+        root = self.mirror_root.resolve()
+        resolved = mirror.resolve()
+        if resolved.parent != root:
+            raise WorktreeError("canonical mirror access escaped its root")
+        self._run(["setfacl", "--modify", f"u:{transport}:--x", str(root)], resolved)
+        self._run(
+            ["setfacl", "--recursive", "--modify", f"u:{transport}:rwX", str(resolved)],
+            resolved,
+        )
 
     def _metadata_for_target(self, repository: str, target: Path) -> Path:
         try:
