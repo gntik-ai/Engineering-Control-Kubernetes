@@ -832,6 +832,9 @@ def test_transport_write_grant_tolerates_only_transport_owned_objects(
 
     owned = tmp_path / "objects" / "ab"
     owned.mkdir(parents=True)
+    loose = owned / "cdef"
+    loose.write_text("object")
+    loose.chmod(0o444)  # Git stores loose and packed objects read-only.
     me = pwd.getpwuid(os.geteuid()).pw_name
     manager = GitWorktreeManager(mirror_root=tmp_path, publication_transport_identity="transport")
 
@@ -848,12 +851,15 @@ def test_transport_write_grant_tolerates_only_transport_owned_objects(
         )
 
     args = ["setfacl", "--recursive", "--modify", f"u:{me}:rwX", str(tmp_path)]
-    eperm(f"setfacl: {owned}: Operation not permitted\n")
+    eperm(f"setfacl: {owned}: Operation not permitted\nsetfacl: {loose}: Operation not permitted\n")
     manager._setfacl_transport_write(args, tmp_path, me)
     with pytest.raises(WorktreeError, match="may not grant the transport write"):
         manager._setfacl_transport_write(args, tmp_path, "root")
     eperm("setfacl: invalid argument\n")
     with pytest.raises(WorktreeError, match="setfacl failed"):
+        manager._setfacl_transport_write(args, tmp_path, me)
+    eperm("")
+    with pytest.raises(WorktreeError, match="without output"):
         manager._setfacl_transport_write(args, tmp_path, me)
 
 

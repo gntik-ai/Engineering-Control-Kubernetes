@@ -573,8 +573,8 @@ class GitWorktreeManager:
     def _setfacl_transport_write(self, args: list[str], cwd: Path, transport: str) -> None:
         """NEW-90: objects a mirror push created are owned by the transport identity, and
         only their owner may change their ACL. Tolerate "Operation not permitted" only on
-        paths the transport owns with owner rw (and x for directories); fail closed
-        otherwise."""
+        paths the transport itself owns (an owner can always use its own files, even Git's
+        0444 objects); fail closed otherwise."""
         try:
             self._run(args, cwd)
             return
@@ -590,6 +590,8 @@ class GitWorktreeManager:
         except KeyError as error:
             raise WorktreeError("publication transport identity does not exist") from error
         lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+        if not lines:
+            raise WorktreeError(f"setfacl failed ({result.returncode}) without output")
         for line in lines:
             match = self._SETFACL_EPERM.match(line)
             if match is None:
@@ -600,12 +602,7 @@ class GitWorktreeManager:
                 info = path.lstat()
             except OSError as error:
                 raise WorktreeError(f"setfacl could not inspect {path}") from error
-            if stat.S_ISLNK(info.st_mode):
-                continue
-            needed = (
-                stat.S_IRUSR | stat.S_IWUSR | (stat.S_IXUSR if stat.S_ISDIR(info.st_mode) else 0)
-            )
-            if info.st_uid != transport_uid or info.st_mode & needed != needed:
+            if info.st_uid != transport_uid:
                 raise WorktreeError(f"setfacl may not grant the transport write on {path}")
 
     def _metadata_for_target(self, repository: str, target: Path) -> Path:
