@@ -127,7 +127,9 @@ delivery_control:
     # the pnpm-audit `security` job before gntik-ai/falcone#1030) do not block delivery;
     # only jobs failing in the PR but not on a baseline PR from main do. falcone's ci.yml
     # has no path filters, so one root marker runs every job; the scopes cover every
-    # top-level entry (a new top-level path is not covered and fails closed as before).
+    # top-level entry. The exemption is per job (activities/gitops.py): a failing PR job
+    # passes only if the same job also failed on the baseline, and a PR touching no
+    # covered path gets no baseline at all (CI_BASELINE_NOT_APPLICABLE).
     ci_baseline:
       enabled: true
       markers:
