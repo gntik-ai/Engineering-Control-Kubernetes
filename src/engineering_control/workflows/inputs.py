@@ -158,6 +158,7 @@ class ExistingGitHubBacklogLoopInput:
     correction_limit: int = 2
     global_campaign_id: str | None = None
     r3_approval_binding: str | None = None
+    runtime_proof: str = "runtime"
 
 
 @dataclass

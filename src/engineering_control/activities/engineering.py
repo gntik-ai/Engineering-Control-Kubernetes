@@ -1633,6 +1633,16 @@ class EngineeringActivityHandler:
             return False
         return True
 
+    @staticmethod
+    def _runtime_proof_waived(payload: dict[str, Any]) -> bool:
+        """NEW-88: the operator accepted, for one source-pr issue operation, the independent
+        current-source revalidation as the proof of a runtime/deployment-gated issue."""
+        return (
+            payload.get("runtime_proof") == "source-revalidation"
+            and payload.get("delivery_mode") == "source-pr"
+            and payload.get("target_issue_number") is not None
+        )
+
     def _backlog_revalidate_gate(self, payload: dict[str, Any]) -> dict[str, Any]:
         item = payload.get("item")
         if not isinstance(item, dict):
@@ -1666,22 +1676,24 @@ class EngineeringActivityHandler:
         # post-deploy verification (Argo sync + workloads on the new image) is the runtime
         # proof; such issues proceed on the current-source revalidation.
         runtime_gate = mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"} and not (
-            self._runtime_proven_after_deploy(payload)
+            self._runtime_proven_after_deploy(payload) or self._runtime_proof_waived(payload)
         )
-        if runtime_gate:
-            reproduced = reproduced and runtime in {
-                "REPRODUCED_CURRENT_RUNTIME",
-                "REPRODUCED_CURRENT_DEPLOYMENT",
-            }
+        # NEW-88: the independent current-source revalidation always runs first; before, a
+        # runtime-gated issue paused on the runtime blocker without ever being revalidated.
         if not reproduced:
             return {
                 **payload,
                 "status": "BLOCKED",
-                "blocker": (
-                    "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
-                    if runtime_gate
-                    else "CURRENT_SOURCE_REVALIDATION_REQUIRED"
-                ),
+                "blocker": "CURRENT_SOURCE_REVALIDATION_REQUIRED",
+            }
+        if runtime_gate and runtime not in {
+            "REPRODUCED_CURRENT_RUNTIME",
+            "REPRODUCED_CURRENT_DEPLOYMENT",
+        }:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "CURRENT_RUNTIME_REVALIDATION_REQUIRED",
             }
         if not item.get("finding_id"):
             return {
