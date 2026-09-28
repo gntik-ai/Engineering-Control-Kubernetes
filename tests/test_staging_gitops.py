@@ -358,6 +358,19 @@ def test_falcone_contract_enables_a_consistent_staging_flow() -> None:
     assert flow.image_workflow == "release-images.yml"
     assert set(flow.image_repositories) == set(raw["deployment"]["image_repositories"].values())
     assert not flow.pin_chart_to_merge
+    # NEW-63 for falcone: ci.yml has no path filters, so one root marker runs every job;
+    # every top-level entry of gntik-ai/falcone (2026-09-28) must fall under a scope.
+    assert flow.ci_baseline.enabled
+    assert {marker.path for marker in flow.ci_baseline.markers} == {".hermes-ci-baseline"}
+    top_level = (
+        ".dockerignore .env.example .github/ci.yml .gitignore .idea/x .markdownlint-cli2.jsonc "
+        "LICENSE README.de.md README.md apps/web-console/x delivery-adapter/x deploy/x "
+        "docs/x docs-site/x falcone-loop-state/x internal-contracts/x logo-original.png "
+        "logo.svg openspec/x package.json packages/x pnpm-lock.yaml pnpm-workspace.yaml "
+        "scripts/x service-catalog.json spikes/x tests/x tools/x turbo.json"
+    ).split()
+    scopes = [marker.scope for marker in flow.ci_baseline.markers]
+    assert all(any(path.startswith(scope) for scope in scopes) for path in top_level)
 
 
 @pytest.mark.parametrize(
