@@ -1406,3 +1406,68 @@ def test_backlog_loop_outcome_is_compacted_below_the_payload_limit() -> None:
     assert len(outcome["results"]) == 200
     assert outcome["results"][0] == {"status": "REQUEST_CHANGES", "attempt": 3}
     assert len(json.dumps(outcome)) < 100_000
+
+
+async def test_gate_retry_reactivates_the_campaign_and_fails_closed_on_a_stale_reload() -> None:
+    """NEW-91 (falcone-charts #47, 2026-09-28): after a gate pause the operator's retry
+    reloaded the item while the campaign was still PAUSED, so its approval read as not
+    current, load_execution returned no items, and the loop re-ran revalidation on its
+    stale copy of the (already confirmed) finding, which then crashed.
+
+    The retry must record RUNNING (which reactivates the campaign approval) before the
+    reload, and a reload without items must pause on its blocker instead.
+    """
+    steps: list[tuple[str, dict[str, Any]]] = []
+    loads = 0
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        nonlocal loads
+        step = request["step"]
+        steps.append((step, request["payload"]))
+        if step == "backlog.load_execution":
+            loads += 1
+            if loads == 1:
+                return {
+                    "status": "READY",
+                    "items": [{"repository": "gntik-ai/musematic", "issue_number": 1026}],
+                }
+            return {"status": "BLOCKED", "blocker": "CURRENT_BACKLOG_APPROVAL_REQUIRED"}
+        if step == "backlog.revalidate_gate":
+            return {"status": "BLOCKED", "blocker": "CURRENT_RUNTIME_REVALIDATION_REQUIRED"}
+        if step == "github.refresh_mirrors":
+            return {"status": "PASS"}
+        if step in {"backlog.register_run", "backlog.record_loop_state"}:
+            return {"status": "RECORDED"}
+        raise AssertionError(f"unscripted step {step!r}")
+
+    history, result, _ = await _run_with_signals(
+        _single_issue_input(),
+        execute_control_step,
+        [("retry", "gntik-ai/musematic#1026"), ("cancel", None)],
+    )
+
+    assert result["status"] == "CANCELLED"
+    sequence = [
+        (step, payload.get("loop_status"), payload.get("blocker"))
+        for step, payload in steps
+        if step
+        in {"backlog.record_loop_state", "backlog.load_execution", "backlog.revalidate_gate"}
+    ]
+    first_pause = sequence.index(
+        ("backlog.record_loop_state", "PAUSED", "CURRENT_RUNTIME_REVALIDATION_REQUIRED")
+    )
+    after_retry = sequence[first_pause + 1 :]
+    # RUNNING is recorded before the reload...
+    assert after_retry[0] == ("backlog.record_loop_state", "RUNNING", None)
+    assert after_retry[1][0] == "backlog.load_execution"
+    # ...and the failed reload pauses on its own blocker without re-running the gate.
+    assert after_retry[2] == (
+        "backlog.record_loop_state",
+        "PAUSED",
+        "CURRENT_BACKLOG_APPROVAL_REQUIRED",
+    )
+    assert sum(1 for step, _, _ in sequence if step == "backlog.revalidate_gate") == 1
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
+    ).replay_workflow(history)
