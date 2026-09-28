@@ -343,25 +343,21 @@ def test_musematic_contract_enables_a_consistent_staging_flow() -> None:
     assert llmwiki.staging_flow() is None
 
 
-def test_falcone_contract_declares_a_consistent_staging_flow() -> None:
-    # Declared but disabled until the falcone-staging Argo CD Application and sha- image
-    # tags exist (gntik-ai/falcone#1027).
+def test_falcone_contract_enables_a_consistent_staging_flow() -> None:
+    # gntik-ai/falcone#1027: falcone staging is the falcone-staging Argo CD Application;
+    # argocd-image-updater writes values/staging-argocd.yaml in falcone-charts.
     raw = yaml.safe_load((ROOT / "config" / "projects" / "falcone.yaml").read_text())
     manifest = ProjectManifest.model_validate(raw)
     flow = manifest.staging_flow()
-    assert flow is not None and not flow.enabled
-    assert manifest.staging_flow_blockers() == ["STAGING_FLOW_DISABLED"]
-    assert flow.argo_application == "falcone-staging"
+    assert flow is not None and flow.enabled
+    assert manifest.staging_flow_blockers() == []
+    assert manifest.deployment.strategy == "argocd"
+    assert manifest.deployment.argocd_application == flow.argo_application == "falcone-staging"
     assert flow.deploy_repository == "gntik-ai/falcone-charts"
     assert flow.deploy_values_file == "charts/in-falcone/values/staging-argocd.yaml"
     assert flow.image_workflow == "release-images.yml"
     assert set(flow.image_repositories) == set(raw["deployment"]["image_repositories"].values())
     assert not flow.pin_chart_to_merge
-    # Go-live flips these three fields together.
-    raw["deployment"]["strategy"] = "argocd"
-    raw["deployment"]["argocd_application"] = "falcone-staging"
-    raw["delivery_control"]["staging_flow"]["enabled"] = True
-    assert ProjectManifest.model_validate(raw).staging_flow_blockers() == []
 
 
 @pytest.mark.parametrize(
@@ -507,7 +503,7 @@ async def test_flow_for_project_reports_contract_state(tmp_path: Path) -> None:
     handler = _controller(tmp_path, FakeKubectl())
     enabled = await handler.handle("gitops.flow_for_project", {"project": "musematic"})
     assert enabled["enabled"] is True and enabled["blockers"] == []
-    disabled = await handler.handle("gitops.flow_for_project", {"project": "falcone"})
+    disabled = await handler.handle("gitops.flow_for_project", {"project": "llmwiki"})
     assert disabled == {"status": "DISABLED", "enabled": False}
     invalid = await handler.handle("gitops.flow_for_project", {"project": "other"})
     assert invalid["enabled"] is False
