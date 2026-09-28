@@ -821,6 +821,42 @@ def test_mirror_syncing_transport_keeps_write_on_the_canonical_mirror(tmp_path: 
     )
 
 
+def test_transport_write_grant_tolerates_only_transport_owned_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-90: a mirror push leaves objects owned by the transport identity, whose ACL
+    only it may change; that EPERM is harmless, any other still fails closed."""
+    import os
+    import pwd
+    import subprocess
+
+    owned = tmp_path / "objects" / "ab"
+    owned.mkdir(parents=True)
+    me = pwd.getpwuid(os.geteuid()).pw_name
+    manager = GitWorktreeManager(mirror_root=tmp_path, publication_transport_identity="transport")
+
+    def failing_run(args: list[str], cwd: Path, *, timeout: int = 300) -> str:
+        raise WorktreeError("setfacl failed")
+
+    manager._run = failing_run  # type: ignore[method-assign]
+
+    def eperm(output: str) -> None:
+        monkeypatch.setattr(
+            manager_module.subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 1, "", output),
+        )
+
+    args = ["setfacl", "--recursive", "--modify", f"u:{me}:rwX", str(tmp_path)]
+    eperm(f"setfacl: {owned}: Operation not permitted\n")
+    manager._setfacl_transport_write(args, tmp_path, me)
+    with pytest.raises(WorktreeError, match="may not grant the transport write"):
+        manager._setfacl_transport_write(args, tmp_path, "root")
+    eperm("setfacl: invalid argument\n")
+    with pytest.raises(WorktreeError, match="setfacl failed"):
+        manager._setfacl_transport_write(args, tmp_path, me)
+
+
 @pytest.mark.parametrize("identity", ["codex-runner", "claude-runner", "Hermes", "a b", ""])
 def test_publication_transport_identity_must_be_a_plain_non_model_user(identity: str) -> None:
     with pytest.raises(ValueError, match="transport identity"):

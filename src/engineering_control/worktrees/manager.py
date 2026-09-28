@@ -564,10 +564,49 @@ class GitWorktreeManager:
         if resolved.parent != root:
             raise WorktreeError("canonical mirror access escaped its root")
         self._run(["setfacl", "--modify", f"u:{transport}:--x", str(root)], resolved)
-        self._run(
+        self._setfacl_transport_write(
             ["setfacl", "--recursive", "--modify", f"u:{transport}:rwX", str(resolved)],
             resolved,
+            transport,
         )
+
+    def _setfacl_transport_write(self, args: list[str], cwd: Path, transport: str) -> None:
+        """NEW-90: objects a mirror push created are owned by the transport identity, and
+        only their owner may change their ACL. Tolerate "Operation not permitted" only on
+        paths the transport owns with owner rw (and x for directories); fail closed
+        otherwise."""
+        try:
+            self._run(args, cwd)
+            return
+        except WorktreeError:
+            pass
+        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            args, cwd=cwd, check=False, text=True, capture_output=True, timeout=300
+        )
+        if not result.returncode:
+            return
+        try:
+            transport_uid = pwd.getpwnam(transport).pw_uid
+        except KeyError as error:
+            raise WorktreeError("publication transport identity does not exist") from error
+        lines = [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+        for line in lines:
+            match = self._SETFACL_EPERM.match(line)
+            if match is None:
+                output = str(SecretRedactor().redact_text("\n".join(lines)).value)
+                raise WorktreeError(f"setfacl failed ({result.returncode}): {output[-4000:]}")
+            path = Path(match.group(1))
+            try:
+                info = path.lstat()
+            except OSError as error:
+                raise WorktreeError(f"setfacl could not inspect {path}") from error
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            needed = (
+                stat.S_IRUSR | stat.S_IWUSR | (stat.S_IXUSR if stat.S_ISDIR(info.st_mode) else 0)
+            )
+            if info.st_uid != transport_uid or info.st_mode & needed != needed:
+                raise WorktreeError(f"setfacl may not grant the transport write on {path}")
 
     def _metadata_for_target(self, repository: str, target: Path) -> Path:
         try:
