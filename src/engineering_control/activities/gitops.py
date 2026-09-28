@@ -1092,7 +1092,26 @@ class GitOpsGitHubHandler:
                 change_binding=f"changeset:{plan.change_set_id}",
             )
             return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CI_RERUN_STARTED"}
-        changed = self.broker.pull_request_files(repository, plan.source_pr_number)
+        try:
+            changed = self.broker.pull_request_files(repository, plan.source_pr_number)
+        except GhCliPolicyError:
+            # A listing at GitHub's file cap may hide .github/ changes: no exemption.
+            return {
+                "status": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_FAILED",
+                "failed_checks": failed[:20],
+                "reason": "CI_BASELINE_FILE_LISTING_TRUNCATED",
+            }
+        if any(path.startswith(".github/") for path in changed):
+            # falcone CI-baseline review: a PR that edits CI configuration could drop the
+            # jobs exposing its own regression while a pre-existing failure is excused,
+            # so it never gets the baseline exemption.
+            return {
+                "status": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_FAILED",
+                "failed_checks": failed[:20],
+                "reason": "CI_BASELINE_CI_CONFIG_CHANGED",
+            }
         markers = sorted(
             {
                 marker.path

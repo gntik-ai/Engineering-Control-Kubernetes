@@ -123,5 +123,40 @@ delivery_control:
     # The chart lives in falcone-charts main, not in the source repo.
     pin_chart_to_merge: false
     allow_r3_merge: true
+    # NEW-63 for falcone: PR CI failures that also occur on unchanged main (for example
+    # the pnpm-audit `security` job before gntik-ai/falcone#1030) do not block delivery;
+    # only jobs failing in the PR but not on a baseline PR from main do. falcone's ci.yml
+    # has no path filters, so one root marker runs every job; the scopes cover every
+    # top-level entry. The exemption is per job (activities/gitops.py): a failing PR job
+    # passes only if the same job also failed on the baseline, and a PR touching no
+    # covered path gets no baseline at all (CI_BASELINE_NOT_APPLICABLE); one that changes
+    # .github/ never gets it (CI_BASELINE_CI_CONFIG_CHANGED), so .github/ is not a scope.
+    ci_baseline:
+      enabled: true
+      markers:
+        - {scope: .dockerignore, path: .hermes-ci-baseline}
+        - {scope: .env.example, path: .hermes-ci-baseline}
+        - {scope: .gitignore, path: .hermes-ci-baseline}
+        - {scope: .idea/, path: .hermes-ci-baseline}
+        - {scope: .markdownlint-cli2.jsonc, path: .hermes-ci-baseline}
+        - {scope: LICENSE, path: .hermes-ci-baseline}
+        - {scope: README, path: .hermes-ci-baseline}
+        - {scope: apps/, path: .hermes-ci-baseline}
+        - {scope: delivery-adapter/, path: .hermes-ci-baseline}
+        - {scope: deploy/, path: .hermes-ci-baseline}
+        - {scope: docs, path: .hermes-ci-baseline}
+        - {scope: falcone-loop-state/, path: .hermes-ci-baseline}
+        - {scope: internal-contracts/, path: .hermes-ci-baseline}
+        - {scope: logo, path: .hermes-ci-baseline}
+        - {scope: openspec/, path: .hermes-ci-baseline}
+        - {scope: package.json, path: .hermes-ci-baseline}
+        - {scope: packages/, path: .hermes-ci-baseline}
+        - {scope: pnpm-, path: .hermes-ci-baseline}
+        - {scope: scripts/, path: .hermes-ci-baseline}
+        - {scope: service-catalog.json, path: .hermes-ci-baseline}
+        - {scope: spikes/, path: .hermes-ci-baseline}
+        - {scope: tests/, path: .hermes-ci-baseline}
+        - {scope: tools/, path: .hermes-ci-baseline}
+        - {scope: turbo.json, path: .hermes-ci-baseline}
     external_secrets_namespace: external-secrets
     external_secrets_deployment: external-secrets

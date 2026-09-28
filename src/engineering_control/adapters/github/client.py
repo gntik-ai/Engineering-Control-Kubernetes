@@ -715,8 +715,13 @@ class GhCliBroker:
 
     # -- NEW-63: CI baseline pull requests (only ever on hermes/ci-baseline/* branches) --
 
+    # GitHub lists at most 3000 files per pull request; a listing that reaches the cap may
+    # be truncated, so it is refused rather than evaluated.
+    PULL_REQUEST_FILE_CAP = 3000
+
     def pull_request_files(self, repository: str, number: int) -> list[str]:
-        """Return the bounded list of paths changed by one pull request."""
+        """Return every path changed by one pull request, including the source path of a
+        rename (a file moved out of .github/ must still count as touching .github/)."""
         repository = self._batch(repository)
         if number < 1:
             raise GhCliPolicyError("pull request number is invalid")
@@ -726,12 +731,15 @@ class GhCliBroker:
                 f"repos/{repository}/pulls/{number}/files",
                 "--paginate",
                 "--jq",
-                ".[].filename",
+                '.[] | [.filename, (.previous_filename // "")] | @tsv',
             ]
         ).stdout
-        paths = [line for line in raw.splitlines() if line.strip()]
-        if len(paths) > 3000:
-            raise GhCliPolicyError("pull request file listing is unbounded")
+        entries = [line for line in raw.splitlines() if line.strip()]
+        if len(entries) >= self.PULL_REQUEST_FILE_CAP:
+            raise GhCliPolicyError("pull request file listing reached the GitHub cap")
+        paths: list[str] = []
+        for entry in entries:
+            paths.extend(part for part in entry.split("\t") if part)
         return paths
 
     def create_baseline_branch(
