@@ -3194,6 +3194,14 @@ class MetadataActivityHandler:
                 '"."). The platform regenerates and commits the lockfiles with network, '
                 "reinstalls the toolchain and calls you again to finish and test. Otherwise "
                 "return an empty dependency_resolution list.\n"
+                # NEW-89: falcone-charts #46's source maker returned BLOCKED ("all scoped
+                # target files are absent") for a deployment-only ChangeSet, while an
+                # earlier attempt of the same issue correctly returned COMPLETE.
+                "Only when every change the OpenSpec requires is in the deployment repository "
+                "(a deployment-only ChangeSet), make no commit here and return decision "
+                "COMPLETE with an empty source changed_files list; never return BLOCKED only "
+                "because the ChangeSet's files live in the deployment repository. Any "
+                "required source change must be implemented.\n"
                 if not deployment
                 else "Return an empty dependency_resolution list.\n"
             )
