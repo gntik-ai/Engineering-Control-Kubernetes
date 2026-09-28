@@ -1396,10 +1396,14 @@ class GitOpsGitHubHandler:
         )
         observed = image_tags_in_values(text, flow.image_repositories)
         pinned = sorted(repository for repository, tags in observed.items() if expected in tags)
+        # NEW-93: argocd-image-updater commits images as their builds appear; falcone #956
+        # synced after 5 of 6 pins, leaving web-console (the changed image) on the old tag.
+        missing = sorted(set(flow.image_repositories) - set(pinned))
         return {
-            "status": "PINNED" if pinned else "PIN_PENDING",
+            "status": "PIN_PENDING" if missing else "PINNED",
             "image_tag": expected,
             "pinned_repositories": pinned,
+            "missing_repositories": missing,
             "observed_tags": {key: sorted(set(value)) for key, value in observed.items()},
         }
 

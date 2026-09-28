@@ -1117,17 +1117,39 @@ async def test_workflow_run_states(tmp_path: Path) -> None:
 async def test_image_pin_detection_reads_the_deploy_values_file(tmp_path: Path) -> None:
     handler, fake = _github(tmp_path)
     key = ("gntik-ai/musematic-deploy", "apps/musematic-platform/values.override.yaml")
-    fake.files[key] = (
-        "controlPlane:\n  image:\n    repository: ghcr.io/gntik-ai/musematic/control-plane\n"
-        "    tag: sha-1111111\nsecretBlock:\n  password: do-not-leak\n"
-    )
+    repositories = [
+        "ghcr.io/gntik-ai/musematic/control-plane",
+        "ghcr.io/gntik-ai/musematic/runtime-controller",
+        "ghcr.io/gntik-ai/musematic/reasoning-engine",
+        "ghcr.io/gntik-ai/musematic/simulation-controller",
+        "ghcr.io/gntik-ai/musematic/sandbox-manager",
+        "ghcr.io/gntik-ai/musematic/web",
+    ]
+
+    def values(pinned: int) -> str:
+        return (
+            "".join(
+                f"c{index}:\n  image:\n    repository: {repository}\n"
+                f"    tag: {EXPECTED_TAG if index < pinned else 'sha-1111111'}\n"
+                for index, repository in enumerate(repositories)
+            )
+            + "secretBlock:\n  password: do-not-leak\n"
+        )
+
     payload = {"plan": _plan(), "merge_sha": MERGE_SHA}
-    pending = await handler.handle("gitops.image_pin", payload)
-    assert pending["status"] == "PIN_PENDING"
-    fake.files[key] = fake.files[key].replace("sha-1111111", EXPECTED_TAG)
+    fake.files[key] = values(0)
+    assert (await handler.handle("gitops.image_pin", payload))["status"] == "PIN_PENDING"
+    # NEW-93: argocd-image-updater pins images as their builds appear; falcone #956 synced
+    # after 5 of 6 pins. Every flow image must carry the merge tag before PINNED.
+    fake.files[key] = values(5)
+    partial = await handler.handle("gitops.image_pin", payload)
+    assert partial["status"] == "PIN_PENDING"
+    assert partial["missing_repositories"] == ["ghcr.io/gntik-ai/musematic/web"]
+    fake.files[key] = values(6)
     pinned = await handler.handle("gitops.image_pin", payload)
     assert pinned["status"] == "PINNED"
-    assert pinned["pinned_repositories"] == ["ghcr.io/gntik-ai/musematic/control-plane"]
+    assert pinned["pinned_repositories"] == sorted(repositories)
+    assert pinned["missing_repositories"] == []
     assert pinned["image_tag"] == EXPECTED_TAG
     assert "do-not-leak" not in json.dumps(pinned)
     read = [call for call in fake.calls if call[:3] == ["api", "-X", "GET"]][-1]
