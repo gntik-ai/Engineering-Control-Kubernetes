@@ -2462,6 +2462,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 raise TypeError("existing backlog issue must be an object")
             continue_to_next_issue = False
             revalidation_round = 0
+            # NEW-91: a reload that returns no items (for example the campaign approval no
+            # longer current) pauses on its blocker instead of reusing the stale item.
+            reload_blocker: str | None = None
             while True:
                 if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
                     cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
@@ -2472,8 +2475,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 # NEW-71: nothing refreshed the canonical mirrors for backlog delivery, so
                 # revalidation and allocation ran against a weeks-old main (and failed once
                 # main moved). Refresh them (controller fetch + push to the worker) first.
-                mirror_blocker: str | None = None
-                if workflow.patched("existing-backlog-refresh-mirrors-v1"):
+                mirror_blocker: str | None = reload_blocker
+                reload_blocker = None
+                if mirror_blocker is None and workflow.patched(
+                    "existing-backlog-refresh-mirrors-v1"
+                ):
                     try:
                         await self._step("github.refresh_mirrors", {"project": request.project})
                     except ActivityError:
@@ -2553,6 +2559,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         )
                     refreshed = await self._step("backlog.load_execution", asdict(request))
                     candidates = refreshed.get("items")
+                    stale_reload: str | None = None
                     if isinstance(candidates, list):
                         item = next(
                             (
@@ -2564,9 +2571,17 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             ),
                             item,
                         )
-                    if verification.get("status") == "CONFIRMED":
+                    elif workflow.patched("existing-backlog-reload-fail-closed-v1"):
+                        stale_reload = str(
+                            refreshed.get("blocker")
+                            or refreshed.get("status")
+                            or "BACKLOG_RELOAD_FAILED"
+                        )
+                    if stale_reload is None and verification.get("status") == "CONFIRMED":
                         continue
-                    blocker = f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
+                    blocker = stale_reload or (
+                        f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
+                    )
                 issue_ref = f"{item['repository']}#{item['issue_number']}"
                 if global_child_blocker_return and request.global_campaign_id is not None:
                     results.append(
@@ -2645,6 +2660,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     self._retry_step = None
                     continue
                 self._retry_step = None
+                if workflow.patched("existing-backlog-gate-retry-resume-v1"):
+                    # NEW-91: the gate pause set the campaign PAUSED, which voids its
+                    # approval; without RUNNING the reload below returned no items and the
+                    # loop re-ran revalidation on its stale copy of the item.
+                    resumed: dict[str, Any] = {**asdict(request), "loop_status": "RUNNING"}
+                    if register_run:
+                        resumed["workflow_id"] = workflow.info().workflow_id
+                    await self._step("backlog.record_loop_state", resumed)
                 refreshed = await self._step("backlog.load_execution", asdict(request))
                 candidates = refreshed.get("items")
                 if isinstance(candidates, list):
@@ -2657,6 +2680,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             and candidate.get("issue_number") == item.get("issue_number")
                         ),
                         item,
+                    )
+                elif workflow.patched("existing-backlog-reload-fail-closed-v1"):
+                    reload_blocker = str(
+                        refreshed.get("blocker")
+                        or refreshed.get("status")
+                        or "BACKLOG_RELOAD_FAILED"
                     )
             if continue_to_next_issue or (results and results[-1].get("status") == "SKIPPED"):
                 boundary = await self._after_issue_boundary(
