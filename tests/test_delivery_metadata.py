@@ -862,11 +862,14 @@ def test_deployment_maker_may_complete_without_changes_and_ignores_baseline(
     # NEW-89: the source maker may skip only a deployment-only ChangeSet, never a
     # required source change.
     source_prompt = source["maker_request"]["prompt"]
-    assert "Only when every change the OpenSpec requires is in the deployment repository" in (
-        source_prompt
-    )
+    assert "every change it requires is in the separate deployment repository" in source_prompt
     assert "Any required source change must be implemented" in source_prompt
     assert "return decision COMPLETE with an empty changed_files list" not in source_prompt
+    # A shared source/deployment repository (llmwiki) has no deployment-only split.
+    shared = handler._prepare_maker(
+        {**payload, "deployment_worktree": payload["source_worktree"]}, deployment=False
+    )["maker_request"]["prompt"]
+    assert "separate deployment repository" not in shared
 
 
 @pytest.mark.parametrize(("project_config", "prepared"), [("config/projects", True), (None, False)])
