@@ -742,7 +742,7 @@ class GhCliBroker:
             paths.extend(part for part in entry.split("\t") if part)
         return paths
 
-    def job_log_excerpt(self, repository: str, job_id: int) -> str:
+    def job_log_excerpt(self, repository: str, job_id: int, *, timeout_seconds: int = 15) -> str:
         """NEW-100: the failing lines of one Actions job log, bounded (untrusted text)."""
         repository = self._batch(repository)
         if job_id < 1:
@@ -750,6 +750,7 @@ class GhCliBroker:
         raw = self._run(
             ["api", f"repos/{repository}/actions/jobs/{job_id}/logs"],
             max_output_bytes=JOB_LOG_TAIL_BYTES,
+            timeout_seconds=timeout_seconds,
         ).stdout
         return failure_excerpt(raw)
 
@@ -1027,6 +1028,7 @@ class GhCliBroker:
         *,
         check_auth: bool = False,
         max_output_bytes: int | None = None,
+        timeout_seconds: int = 120,
     ) -> CommandResult:
         forbidden = {"secret", "environment", "variable", "collaborator"}
         if "auth" in arguments and "token" in arguments:
@@ -1044,7 +1046,7 @@ class GhCliBroker:
                     "gh",
                     arguments,
                     cwd=self.working_directory,
-                    timeout_seconds=120,
+                    timeout_seconds=timeout_seconds,
                     environment=environment,
                     max_output_bytes=max_output_bytes,
                 )

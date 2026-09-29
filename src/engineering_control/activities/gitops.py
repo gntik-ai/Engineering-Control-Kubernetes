@@ -24,7 +24,9 @@ import json
 import os
 import re
 import stat
+import subprocess
 import tempfile
+import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1183,16 +1185,26 @@ class GitOpsGitHubHandler:
         jobs = _failed_job_ids(pull_request)
         excerpts: dict[str, str] = {}
         attempts = 0
+        # The activity heartbeats once, so the optional log reads share a wall-clock budget
+        # well inside its heartbeat timeout.
+        deadline = time.monotonic() + _EXCERPT_BUDGET_SECONDS
         for name in names:
-            if len(excerpts) >= _MAX_EXCERPT_JOBS or attempts >= _MAX_EXCERPT_ATTEMPTS:
+            remaining = int(deadline - time.monotonic())
+            if (
+                len(excerpts) >= _MAX_EXCERPT_JOBS
+                or attempts >= _MAX_EXCERPT_ATTEMPTS
+                or remaining < 1
+            ):
                 break
             job_id = jobs.get(name)
             if job_id is None:
                 continue
             attempts += 1
             try:
-                excerpt = self.broker.job_log_excerpt(repository, job_id)
-            except (CommandFailure, GhCliPolicyError, OSError):
+                excerpt = self.broker.job_log_excerpt(
+                    repository, job_id, timeout_seconds=min(15, remaining)
+                )
+            except (CommandFailure, GhCliPolicyError, OSError, subprocess.TimeoutExpired):
                 continue
             if excerpt:
                 excerpts[name] = excerpt
@@ -1612,6 +1624,7 @@ class GitOpsGitHubHandler:
 
 _MAX_EXCERPT_JOBS = 5
 _MAX_EXCERPT_ATTEMPTS = 10
+_EXCERPT_BUDGET_SECONDS = 45
 _JOB_URL = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/([1-9][0-9]{0,19})")
 
 

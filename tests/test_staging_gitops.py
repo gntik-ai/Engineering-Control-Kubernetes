@@ -1790,6 +1790,7 @@ async def test_unreadable_job_logs_do_not_use_up_the_excerpt_budget(tmp_path: Pa
 
 def test_bounded_command_output_keeps_only_the_tail(tmp_path: Path) -> None:
     # NEW-100 review: a huge CI log must not be read into memory whole.
+    import subprocess
     import sys
 
     from engineering_control.adapters.command import SafeCommandRunner
@@ -1806,3 +1807,38 @@ def test_bounded_command_output_keeps_only_the_tail(tmp_path: Path) -> None:
         max_output_bytes=1000,
     )
     assert failed.return_code == 3
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner.run(
+            "python",
+            ["-c", "import time; time.sleep(30)"],
+            cwd=tmp_path,
+            timeout_seconds=1,
+            max_output_bytes=1000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_job_log_read_is_skipped(tmp_path: Path) -> None:
+    # NEW-100 review: a log request timing out must not abort the CI verdict.
+    import subprocess
+
+    job_url = "https://github.com/gntik-ai/musematic/actions/runs/5/job/{}"
+    checks = [
+        {**_check("slow", "FAILURE"), "detailsUrl": job_url.format(21)},
+        {**_check("quality", "FAILURE"), "detailsUrl": job_url.format(22)},
+    ]
+    handler, fake = _baseline_handler(tmp_path, [".github/workflows/ci.yml"], checks)
+    fake.job_logs = {22: "not ok 1 - quality"}
+    answer = fake._answer
+
+    def stalled(args: list[str]) -> str:
+        if "/actions/jobs/21/" in " ".join(args):
+            raise subprocess.TimeoutExpired("gh", 15)
+        return answer(args)
+
+    fake._answer = stalled  # type: ignore[method-assign]
+
+    blocked = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+
+    assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
+    assert set(blocked["failure_excerpts"]) == {"quality"}

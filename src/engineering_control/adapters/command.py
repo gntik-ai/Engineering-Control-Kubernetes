@@ -5,7 +5,7 @@ import hashlib
 import os
 import signal
 import subprocess
-import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,27 +191,47 @@ class SafeCommandRunner:
 def _run_keeping_tail(
     argv: list[str], cwd: Path, env: dict[str, str], timeout_seconds: int, max_bytes: int
 ) -> subprocess.CompletedProcess[str]:
-    """NEW-100: spool output to disk and read back only its last max_bytes (stdout) and
-    64 KiB (stderr), so a huge CI log never has to fit in the worker's memory."""
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        process = subprocess.Popen(  # noqa: S603 - fixed executable allowlist; no shell
-            argv, cwd=cwd, env=env, stdout=out, stderr=err, start_new_session=True
-        )
-        try:
-            return_code = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            raise
+    """NEW-100: stream output and keep only its last max_bytes (stdout) and 64 KiB
+    (stderr) in memory, so a huge CI log never reaches memory or disk whole."""
+    process = subprocess.Popen(  # noqa: S603 - fixed executable allowlist; no shell
+        argv,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    tails: dict[str, bytes] = {}
 
-        def tail(handle: IO[bytes], limit: int) -> str:
-            size = handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, size - limit))
-            return handle.read(limit).decode("utf-8", errors="replace")
+    def drain(name: str, stream: IO[bytes], limit: int) -> None:
+        buffer = bytearray()
+        for chunk in iter(lambda: stream.read(65_536), b""):
+            buffer += chunk
+            if len(buffer) > limit:
+                del buffer[: len(buffer) - limit]
+        tails[name] = bytes(buffer)
 
-        return subprocess.CompletedProcess(
-            argv, return_code, tail(out, max_bytes), tail(err, 65_536)
-        )
+    readers = [
+        threading.Thread(target=drain, args=("out", process.stdout, max_bytes), daemon=True),
+        threading.Thread(target=drain, args=("err", process.stderr, 65_536), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        return_code = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=10)
+    return subprocess.CompletedProcess(
+        argv,
+        return_code,
+        tails.get("out", b"").decode("utf-8", errors="replace"),
+        tails.get("err", b"").decode("utf-8", errors="replace"),
+    )
 
 
 def minimal_git_environment() -> dict[str, str]:
