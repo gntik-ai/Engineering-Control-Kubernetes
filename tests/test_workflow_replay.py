@@ -1373,6 +1373,38 @@ async def test_issue_delivery_keeps_the_imported_body_when_the_refresh_fails() -
     assert leases["payload"]["status"] == "ISSUE_READY"
 
 
+async def test_r3_issue_delivery_keeps_the_approved_issue_body_and_replays() -> None:
+    """NEW-95 review: an R3 delivery works only from the issue text its R3 approval bound
+    (the imported copy); a later edit to the live issue must not reach the maker."""
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "existing-github-issue",
+            "issue_repository": "gntik-ai/falcone",
+            "issue_number": 953,
+            "actual_behavior": "Approved issue body",
+        },
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_REFRESHED",
+            "body_excerpt": "Edited after approval",
+            "body_sha256": "0" * 64,
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R3", dry_run=False)
+
+    history, _ = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert "delivery.refresh_issue_body" not in _scheduled_step_names(history)
+    requests = _scheduled_steps(history)
+    leases = next(r for r in requests if r["step"] == "delivery.acquire_leases")
+    assert leases["payload"]["actual_behavior"] == "Approved issue body"
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
 async def test_issue_delivery_does_not_refresh_findings_without_an_existing_issue() -> None:
     """Hermes-discovered findings own their body; only imported backlog issues refresh."""
     script = {

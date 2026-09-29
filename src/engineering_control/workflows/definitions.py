@@ -942,6 +942,7 @@ class FindingVerificationWorkflow(ControlledWorkflow):
 class IssueDeliveryWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
+        self._risk_class = request.risk_class
         context = await self._step("delivery.load_confirmed_finding", asdict(request))
         # Makers and the checker have no network, so the scan worker installs the project
         # toolchain in the source worktree first -- after the prechecks, so the NEW-28
@@ -1108,6 +1109,13 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
         # and any failure keeps the imported copy. Histories recorded before this
         # step existed carry no marker and replay without it.
         if context.get("persona") != "existing-github-issue" or not context.get("issue_number"):
+            return context
+        if getattr(self, "_risk_class", None) == "R3" and workflow.patched(
+            "delivery-r3-approved-issue-body-v1"
+        ):
+            # NEW-95 review: an R3 delivery works only from the issue text the operator
+            # approved (the imported copy bound by its R3 candidate); a later edit must be
+            # re-imported and re-approved rather than reaching the maker unapproved.
             return context
         if not workflow.patched("delivery-refresh-issue-body-v1"):
             return context
