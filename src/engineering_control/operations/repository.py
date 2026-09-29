@@ -43,6 +43,7 @@ from engineering_control.engineering.backlog import (
     BacklogApprovalBinding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
+    r3_approval_payload_matches,
 )
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
@@ -752,7 +753,7 @@ class OperationsRepository:
                 if risk.get(issue.calculated_risk, 99) > risk[command.maximum_risk.value]:
                     blockers.append("ISSUE_RISK_EXCEEDS_BOUND")
                 if command.r3_approval_binding is not None and not self._approved_r3_binding(
-                    session, issue, command.r3_approval_binding, datetime.now(UTC)
+                    session, issue, campaign, command.r3_approval_binding, datetime.now(UTC)
                 ):
                     # NEW-95: the binding must name an approved, unexpired R3 candidate for
                     # exactly this issue, and the issue must be unchanged since approval.
@@ -1115,7 +1116,11 @@ class OperationsRepository:
 
     @staticmethod
     def _approved_r3_binding(
-        session: Session, issue: BacklogIssueRecord, binding: str, now: datetime
+        session: Session,
+        issue: BacklogIssueRecord,
+        campaign: GitHubBacklogCampaign,
+        binding: str,
+        now: datetime,
     ) -> bool:
         row = session.scalar(
             select(ActionCandidate).where(
@@ -1128,11 +1133,14 @@ class OperationsRepository:
         )
         if row is None or issue.calculated_risk != "R3":
             return False
-        payload = row.payload_json
-        return (
-            payload.get("issue_body_sha256") == issue.body_sha256
-            and payload.get("issue_updated_at") == issue.github_updated_at.isoformat()
-            and payload.get("production") is False
+        return r3_approval_payload_matches(
+            row.payload_json,
+            repository=issue.repository,
+            issue_number=issue.issue_number,
+            body_sha256=issue.body_sha256,
+            github_updated_at=issue.github_updated_at.isoformat(),
+            source_head=campaign.source_head_at_import,
+            deployment_head=campaign.deployment_head_at_import,
         )
 
     def _full_delivery_blockers(self, project: str) -> list[str]:

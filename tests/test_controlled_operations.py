@@ -2207,6 +2207,18 @@ async def test_r3_issue_start_requires_the_approved_binding_for_the_unchanged_is
     }
     # Another (well-formed) binding is refused.
     assert "R3_APPROVAL_REQUIRED" in await blockers("f" * 64)
+    # An approval made before the campaign's heads moved (a newer import) is refused.
+    with repository.sessions.begin() as session:
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        original_head = stored.source_head_at_import
+        stored.source_head_at_import = "9" * 40
+    assert "R3_APPROVAL_REQUIRED" in await blockers(binding)
+    with repository.sessions.begin() as session:
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        stored.source_head_at_import = original_head
+    assert "R3_APPROVAL_REQUIRED" not in await blockers(binding)
     # An issue edited after approval is refused until re-approved.
     with repository.sessions.begin() as session:
         issue = session.scalar(

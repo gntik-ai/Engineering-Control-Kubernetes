@@ -27,6 +27,7 @@ from engineering_control.engineering.backlog import (
     classify_issue,
     is_reauthenticated_backlog_operator,
     plan_records,
+    r3_approval_payload_matches,
 )
 from engineering_control.engineering.configuration import EngineeringCatalog
 from engineering_control.engineering.models import EnhancementProposal
@@ -1141,12 +1142,20 @@ class EngineeringActivityHandler:
         candidates = session.scalars(
             query.order_by(db.ActionCandidate.created_at.desc()).limit(10)
         ).all()
+        campaign = session.get(db.GitHubBacklogCampaign, issue.backlog_campaign_id)
+        if campaign is None:
+            return None
         for candidate in candidates:
-            payload = candidate.payload_json
-            if (
-                payload.get("issue_body_sha256") == issue.body_sha256
-                and payload.get("issue_updated_at") == issue.github_updated_at.isoformat()
-                and payload.get("production") is False
+            # NEW-95: the same rule as the operation preflight, including the campaign's
+            # imported heads, so an approval from an older import never applies.
+            if r3_approval_payload_matches(
+                candidate.payload_json,
+                repository=issue.repository,
+                issue_number=issue.issue_number,
+                body_sha256=issue.body_sha256,
+                github_updated_at=issue.github_updated_at.isoformat(),
+                source_head=campaign.source_head_at_import,
+                deployment_head=campaign.deployment_head_at_import,
             ):
                 return candidate
         return None
