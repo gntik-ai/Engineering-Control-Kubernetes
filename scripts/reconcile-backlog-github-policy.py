@@ -19,6 +19,7 @@ import yaml
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from engineering_control.activities.engineering import verified_backlog_approval
 from engineering_control.config import Settings
 from engineering_control.db.models import GitHubBacklogCampaign
 from engineering_control.engineering.backlog import (
@@ -203,6 +204,62 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
     return campaign
 
 
+OWNER_STATUSES = {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING", "PAUSED"}
+
+
+def verified_owner_expiry(campaign: GitHubBacklogCampaign, now: datetime) -> datetime | None:
+    """NEW-94: the expiry of an owner approval whose evidence fully verifies, else None, so
+    a tampered, copied, stale or incomplete row never keeps the shared policy enabled.
+
+    The evidence check is the workers' own (verified_backlog_approval: exact binding hash,
+    this campaign and project, imported heads, plan hash, mode, risk, a parseable
+    approved_at, unexpired), plus the reconciler's stricter operator, pair and production
+    rules. Status is judged by the caller (PAUSED still owns the policy here)."""
+    if not isinstance(campaign.approval_json, dict):
+        return None
+    if campaign.approval_json.get("policy_role") not in {None, "owner"}:
+        return None
+    binding = verified_backlog_approval(campaign, now=now)
+    if binding is None:
+        return None
+    evidence = campaign.approval_json
+    approval = evidence.get("approval") if "approval" in evidence else evidence
+    approved_by = approval.get("approved_by") if isinstance(approval, dict) else None
+    if not isinstance(approved_by, str) or not is_reauthenticated_backlog_operator(approved_by):
+        return None
+    raw_binding = evidence.get("binding") if "binding" in evidence else evidence
+    expected_pair = {
+        "falcone": ["gntik-ai/falcone", "gntik-ai/falcone-charts"],
+        "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
+        "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
+    }.get(campaign.project)
+    if (
+        not isinstance(raw_binding, dict)
+        or raw_binding.get("paired_repositories") != expected_pair
+        or raw_binding.get("production") is not False
+    ):
+        return None
+    expires_at = binding.expires_at
+    return expires_at.replace(tzinfo=UTC) if expires_at.tzinfo is None else expires_at
+
+
+def other_unexpired_owner(session: Session, campaign_id: UUID, now: datetime) -> UUID | None:
+    """NEW-94: the GitHub write policy is one shared switch. A campaign reaching a terminal
+    state must not disable it while a different campaign still owns an unexpired approval
+    (2026-09-28: cancelling a stale falcone loop disabled the policy that the running
+    falcone #1025 delivery owned, and its publication waited on POLICY_DISABLED)."""
+    for candidate in session.scalars(
+        select(GitHubBacklogCampaign).where(
+            GitHubBacklogCampaign.id != campaign_id,
+            GitHubBacklogCampaign.status.in_(OWNER_STATUSES),
+        )
+    ).all():
+        expires_at = verified_owner_expiry(candidate, now)
+        if expires_at is not None and expires_at > now:
+            return candidate.id
+    return None
+
+
 def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     """Expire all approval rows and report whether shared policy must be disabled."""
     active = session.scalars(
@@ -220,6 +277,10 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     ).all()
     unexpired_owner = False
     for campaign in active:
+        if not isinstance(campaign.approval_json, dict):
+            # Review: malformed evidence must not crash the fail-safe expiry pass.
+            campaign.status = "EXPIRED"
+            continue
         raw_binding = campaign.approval_json.get("binding")
         binding = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
         try:
@@ -231,16 +292,23 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
         if expires_at is None or expires_at <= now:
             campaign.status = "EXPIRED"
             continue
-        if campaign.status in {
-            "APPROVED_POLICY_PENDING",
-            "APPROVED",
-            "RUNNING",
-            "PAUSED",
-        } and campaign.approval_json.get("policy_role") in {None, "owner"}:
+        if campaign.status in OWNER_STATUSES and campaign.approval_json.get("policy_role") in {
+            None,
+            "owner",
+        }:
+            verified = verified_owner_expiry(campaign, now)
+            if verified is None or verified <= now:
+                # NEW-94 review: an owner row whose evidence does not verify is expired, so
+                # it neither keeps the policy enabled nor blocks a replacement approval.
+                campaign.status = "EXPIRED"
+                continue
             unexpired_owner = True
     if not unexpired_owner:
         for campaign in active:
-            if campaign.approval_json.get("policy_role") == "inventory":
+            if (
+                isinstance(campaign.approval_json, dict)
+                and campaign.approval_json.get("policy_role") == "inventory"
+            ):
                 campaign.status = "EXPIRED"
     return not unexpired_owner
 
@@ -424,6 +492,16 @@ def install_policy(path: Path, backup_root: Path, group_id: int, *, enabled: boo
         temporary.unlink(missing_ok=True)
 
 
+def reject_request(path: Path, request_bytes: bytes) -> None:
+    try:
+        if path.read_bytes() != request_bytes:
+            return
+    except FileNotFoundError:
+        return
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    path.rename(path.with_name(f"rejected-{stamp}.json"))
+
+
 def main() -> int:
     if os.geteuid() != 0:
         raise PermissionError("GitHub policy reconciliation requires root")
@@ -452,15 +530,40 @@ def main() -> int:
                     install_policy(args.policy, args.backup_root, group_id, enabled=False)
         print("GITHUB_BACKLOG_POLICY_EXPIRY_PASS")
         return 0
-    request = read_request(args.request, api_uid)
-    with Session(engine) as session, session.begin():
-        campaign = validate_campaign(session, request)
-        enable = request["action"] == "enable-existing-backlog"
-        install_policy(args.policy, args.backup_root, group_id, enabled=enable)
-        if enable:
-            campaign.status = "APPROVED"
-    args.request.unlink()
-    print("GITHUB_BACKLOG_POLICY_RECONCILIATION_PASS")
+    request_bytes = args.request.read_bytes()
+    kept_for: UUID | None = None
+    try:
+        request = read_request(args.request, api_uid)
+        if json.loads(request_bytes.decode("utf-8")) != request:
+            raise ValueError("GitHub policy request changed while it was read")
+        with Session(engine) as session, session.begin():
+            campaign = validate_campaign(session, request)
+            enable = request["action"] == "enable-existing-backlog"
+            if not enable:
+                kept_for = other_unexpired_owner(session, campaign.id, datetime.now(UTC))
+            if kept_for is None:
+                install_policy(args.policy, args.backup_root, group_id, enabled=enable)
+            if enable:
+                campaign.status = "APPROVED"
+    except ValueError:
+        # NEW-94 review: writers never overwrite a pending request, so a rejected one (for
+        # example an enable whose campaign was released before activation) would block every
+        # later request. Move exactly that request aside for audit, then fail visibly.
+        reject_request(args.request, request_bytes)
+        raise
+    # NEW-94 review: consume only the request that was reconciled. Writers no longer
+    # overwrite a pending request, so a different file here is a newer request; leave it for
+    # the path unit, which re-triggers while activate.json exists.
+    try:
+        current = args.request.read_bytes()
+    except FileNotFoundError:
+        current = None
+    if current == request_bytes:
+        args.request.unlink()
+    if kept_for is not None:
+        print(f"GITHUB_BACKLOG_POLICY_KEPT_FOR_OWNER {kept_for}")
+    else:
+        print("GITHUB_BACKLOG_POLICY_RECONCILIATION_PASS")
     return 0
 
 

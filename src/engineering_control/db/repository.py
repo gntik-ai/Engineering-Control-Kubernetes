@@ -836,7 +836,13 @@ class SQLMetadataRepository:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, target)
+            # NEW-94 review: never overwrite a request the root reconciler has not consumed.
+            try:
+                os.link(temporary, target)
+            except FileExistsError as error:
+                raise ValueError(
+                    "another GitHub policy request is pending; retry in a few seconds"
+                ) from error
         finally:
             temporary.unlink(missing_ok=True)
 
