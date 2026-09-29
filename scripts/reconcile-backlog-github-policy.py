@@ -203,6 +203,38 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
     return campaign
 
 
+OWNER_STATUSES = {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING", "PAUSED"}
+
+
+def binding_expires_at(campaign: GitHubBacklogCampaign) -> datetime | None:
+    raw_binding = campaign.approval_json.get("binding")
+    binding = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
+    try:
+        expires_at = datetime.fromisoformat(str(binding.get("expires_at")))
+    except (TypeError, ValueError):
+        return None
+    return expires_at.replace(tzinfo=UTC) if expires_at.tzinfo is None else expires_at
+
+
+def other_unexpired_owner(session: Session, campaign_id: UUID, now: datetime) -> UUID | None:
+    """NEW-94: the GitHub write policy is one shared switch. A campaign reaching a terminal
+    state must not disable it while a different campaign still owns an unexpired approval
+    (2026-09-28: cancelling a stale falcone loop disabled the policy that the running
+    falcone #1025 delivery owned, and its publication waited on POLICY_DISABLED)."""
+    for candidate in session.scalars(
+        select(GitHubBacklogCampaign).where(
+            GitHubBacklogCampaign.id != campaign_id,
+            GitHubBacklogCampaign.status.in_(OWNER_STATUSES),
+        )
+    ).all():
+        if candidate.approval_json.get("policy_role") not in {None, "owner"}:
+            continue
+        expires_at = binding_expires_at(candidate)
+        if expires_at is not None and expires_at > now:
+            return candidate.id
+    return None
+
+
 def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     """Expire all approval rows and report whether shared policy must be disabled."""
     active = session.scalars(
@@ -453,14 +485,21 @@ def main() -> int:
         print("GITHUB_BACKLOG_POLICY_EXPIRY_PASS")
         return 0
     request = read_request(args.request, api_uid)
+    kept_for: UUID | None = None
     with Session(engine) as session, session.begin():
         campaign = validate_campaign(session, request)
         enable = request["action"] == "enable-existing-backlog"
-        install_policy(args.policy, args.backup_root, group_id, enabled=enable)
+        if not enable:
+            kept_for = other_unexpired_owner(session, campaign.id, datetime.now(UTC))
+        if kept_for is None:
+            install_policy(args.policy, args.backup_root, group_id, enabled=enable)
         if enable:
             campaign.status = "APPROVED"
     args.request.unlink()
-    print("GITHUB_BACKLOG_POLICY_RECONCILIATION_PASS")
+    if kept_for is not None:
+        print(f"GITHUB_BACKLOG_POLICY_KEPT_FOR_OWNER {kept_for}")
+    else:
+        print("GITHUB_BACKLOG_POLICY_RECONCILIATION_PASS")
     return 0
 
 

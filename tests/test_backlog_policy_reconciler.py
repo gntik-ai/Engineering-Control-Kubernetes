@@ -27,6 +27,7 @@ VALIDATE_CAMPAIGN = SCRIPT["validate_campaign"]
 EXPIRE_CAMPAIGNS = SCRIPT["expire_campaign_approvals"]
 READ_REQUEST = SCRIPT["read_request"]
 AUDIT_ACTORS = SCRIPT["audit_approval_actors"]
+OTHER_OWNER = SCRIPT["other_unexpired_owner"]
 
 
 def campaign(
@@ -765,3 +766,53 @@ def test_install_policy_is_0640_under_the_units_umask(
 
     assert stat.S_IMODE(policy.stat().st_mode) == 0o640
     assert "enabled: true" in policy.read_text(encoding="utf-8")
+
+
+def test_disable_keeps_the_shared_policy_for_another_unexpired_owner(tmp_path: Path) -> None:
+    # NEW-94 (2026-09-28): cancelling the stale falcone #46 loop (campaign e0105017) sent a
+    # disable request that turned off the shared policy owned by the running falcone #1025
+    # campaign; its publication then waited on POLICY_DISABLED for hours.
+    engine = create_engine(f"sqlite:///{tmp_path / 'other-owner.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    ending = UUID("11111111-1111-4111-8111-111111111111")
+    owner = UUID("22222222-2222-4222-8222-222222222222")
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                campaign(ending, project="falcone", status="CANCELLED", role="owner", now=now),
+                campaign(owner, project="falcone", status="RUNNING", role="owner", now=now),
+            ]
+        )
+    with Session(engine) as session:
+        assert OTHER_OWNER(session, ending, now) == owner
+        # The owner itself ending never counts itself.
+        assert OTHER_OWNER(session, owner, now) is None
+
+
+@pytest.mark.parametrize(
+    ("status", "role", "age"),
+    [
+        ("RUNNING", "owner", timedelta(days=2)),  # expired approval
+        ("APPROVED_INVENTORY", "inventory", timedelta(0)),  # inventory-only, not an owner
+        ("CANCELLED", "owner", timedelta(0)),  # terminal, not an owner
+        ("PAUSED", "inventory", timedelta(0)),
+    ],
+)
+def test_disable_proceeds_without_another_unexpired_owner(
+    tmp_path: Path, status: str, role: str, age: timedelta
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'no-other-owner.sqlite'}")
+    Base.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    ending = UUID("11111111-1111-4111-8111-111111111111")
+    other = UUID("22222222-2222-4222-8222-222222222222")
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                campaign(ending, project="falcone", status="STOPPED", role="owner", now=now),
+                campaign(other, project="musematic", status=status, role=role, now=now - age),
+            ]
+        )
+    with Session(engine) as session:
+        assert OTHER_OWNER(session, ending, now) is None
