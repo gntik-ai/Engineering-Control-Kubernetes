@@ -99,7 +99,7 @@ def test_codex_failure_summary_uses_only_redacted_error_event_payload() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("request_model", "expected"),
-    [(None, "gpt-5.6-terra"), ("gpt-5.5", "gpt-5.5")],
+    [(None, "gpt-6-sol"), ("gpt-5.5", "gpt-5.5")],
 )
 async def test_codex_adapter_pins_the_configured_model(
     tmp_path: Path,
