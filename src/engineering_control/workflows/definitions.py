@@ -2383,6 +2383,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         outcome = await self._run_loop(request)
         return _compact_loop_outcome(outcome)
 
+    def _blocked_start_closes_run_patched(self) -> bool:
+        # NEW-97: a start blocked at selection records a closed Run so its operation ends.
+        return workflow.patched("existing-backlog-blocked-start-closes-run-v1")
+
     async def _run_loop(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
         if request.project not in {"falcone", "musematic", "llmwiki"}:
             raise ApplicationError(
@@ -2404,7 +2408,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         register_run = workflow.patched("existing-backlog-register-run-v1")
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
-            if register_run and workflow.patched("existing-backlog-blocked-start-closes-run-v1"):
+            if register_run and self._blocked_start_closes_run_patched():
                 # NEW-97: without a Run the operation stayed STARTED forever and every later
                 # start of the issue was refused as ISSUE_WORKFLOW_ALREADY_ACTIVE.
                 await self._step(

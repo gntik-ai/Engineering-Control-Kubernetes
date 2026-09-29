@@ -83,7 +83,6 @@ _ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNN
 # time. The buffer absorbs schedule jitter and the refresh workflow's own run time.
 _PROVIDER_HEALTH_STALE_AFTER = QUOTA_REFRESH_INTERVAL + timedelta(minutes=10)
 _CAMPAIGN_EXPORT_COLLECTIONS = ("root_blockers", "findings", "runs", "artifacts")
-_RUNLESS_OPERATION_GRACE = timedelta(minutes=30)
 _TERMINAL_WORKFLOW_STATES = frozenset(
     {
         "COMPLETE",
@@ -1273,18 +1272,47 @@ class OperationsRepository:
                     operation.status = "COMPLETED"
                     operation.completed_at = operation.completed_at or now
                     continue
-                if (
-                    workflow_state is None
-                    and _utc(operation.created_at) < now - _RUNLESS_OPERATION_GRACE
-                ):
-                    # NEW-97: a loop registers its Run within seconds of passing selection;
-                    # no Run after the grace period means the workflow ended before that
-                    # (e.g. blocked at selection by an older release) and holds nothing.
-                    operation.status = "COMPLETED"
-                    operation.completed_at = operation.completed_at or now
-                    continue
             return operation
         return None
+
+    async def runless_started_operations(self, *, limit: int = 20) -> list[tuple[UUID, str]]:
+        return await asyncio.to_thread(self._runless_started_operations, limit)
+
+    def _runless_started_operations(self, limit: int) -> list[tuple[UUID, str]]:
+        # NEW-97: a workflow that ended before recording a Run leaves its operation STARTED.
+        # Only Temporal can tell whether it is still alive, so the caller checks each one.
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(OperationRequest)
+                .where(
+                    OperationRequest.status == "STARTED",
+                    OperationRequest.workflow_id.is_not(None),
+                )
+                .order_by(OperationRequest.created_at)
+            )
+            found: list[tuple[UUID, str]] = []
+            for row in rows:
+                workflow_id = cast(str, row.workflow_id)
+                if self._workflow_state(session, workflow_id) is None:
+                    found.append((row.id, workflow_id))
+                    if len(found) >= limit:
+                        break
+            return found
+
+    async def complete_closed_runless_operation(self, operation_id: UUID) -> bool:
+        return await asyncio.to_thread(self._complete_closed_runless_operation, operation_id)
+
+    def _complete_closed_runless_operation(self, operation_id: UUID) -> bool:
+        """Complete a STARTED operation whose workflow Temporal reports closed without a Run."""
+        with self.sessions.begin() as session:
+            row = session.get(OperationRequest, operation_id, with_for_update=True)
+            if row is None or row.status != "STARTED" or not row.workflow_id:
+                return False
+            if self._workflow_state(session, row.workflow_id) is not None:
+                return False
+            row.status = "COMPLETED"
+            row.completed_at = row.completed_at or datetime.now(UTC)
+            return True
 
     async def capability(
         self,

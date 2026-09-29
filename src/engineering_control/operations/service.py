@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from typing import Any
 from uuid import UUID
@@ -44,6 +45,12 @@ from engineering_control.operations.models import (
     WorkflowControlCommand,
 )
 from engineering_control.operations.repository import OperationsRepository
+
+_LOG = logging.getLogger(__name__)
+_CLOSED_WORKFLOW_STATUSES = frozenset(
+    {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
+)
+_RUNLESS_RECONCILE_SECONDS = 60.0
 
 
 class TypedCommandBus:
@@ -164,6 +171,28 @@ class TypedCommandBus:
                     message="Typed operation started one durable workflow",
                     workflow_id=accepted.workflow_id,
                 )
+
+    async def reconcile_runless_operations(self) -> int:
+        """Complete STARTED operations whose workflow closed before recording a Run (NEW-97)."""
+        released = 0
+        for operation_id, workflow_id in await self.operations.runless_started_operations():
+            try:
+                description = await self.control.get_workflow(workflow_id)
+            except Exception:  # noqa: BLE001 - an unknown state keeps the operation active
+                _LOG.warning("runless operation %s: workflow state unavailable", operation_id)
+                continue
+            if str(description.get("status")) not in _CLOSED_WORKFLOW_STATUSES:
+                continue
+            if await self.operations.complete_closed_runless_operation(operation_id):
+                released += 1
+                await self.operations.record_dispatch_event(
+                    operation_id,
+                    event_type="operation.completed",
+                    level="INFO",
+                    message="Typed operation workflow closed before recording a run",
+                    workflow_id=workflow_id,
+                )
+        return released
 
     policy_activation_timeout_seconds = 60.0
     policy_activation_poll_seconds = 2.0
@@ -429,7 +458,15 @@ class TypedCommandBus:
 
 
 async def operation_dispatch_loop(bus: TypedCommandBus, stop: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+    next_reconcile = loop.time()
     while not stop.is_set():
+        if loop.time() >= next_reconcile:
+            next_reconcile = loop.time() + _RUNLESS_RECONCILE_SECONDS
+            try:
+                await bus.reconcile_runless_operations()
+            except Exception:  # noqa: BLE001 - reconciliation must never stop dispatch
+                _LOG.warning("runless operation reconciliation failed")
         worked = await bus.dispatch_pending()
         if not worked:
             try:

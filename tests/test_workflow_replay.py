@@ -1528,3 +1528,40 @@ async def test_a_start_blocked_at_selection_registers_a_closed_run_and_replays()
     assert len(registered) == 1
     assert registered[0]["closed_blocker"] == "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE"
     await Replayer(workflows=[ExistingGitHubBacklogLoopWorkflow]).replay_workflow(history)
+
+
+@workflow.defn(name="ExistingGitHubBacklogLoopWorkflow", sandboxed=False)
+class _PreClosedRunBacklogLoopWorkflow(ExistingGitHubBacklogLoopWorkflow):
+    """ExistingGitHubBacklogLoopWorkflow as it ran before the blocked start closed its Run."""
+
+    @workflow.run
+    async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+        return await super().run(request)
+
+    def _blocked_start_closes_run_patched(self) -> bool:
+        return False
+
+
+async def test_a_pre_patch_blocked_start_replays_without_registering_a_run() -> None:
+    """A blocked start recorded before NEW-97 (no marker) replays against the current code
+    without scheduling backlog.register_run."""
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        if request["step"] == "backlog.load_execution":
+            return {"status": "BLOCKED", "blocker": "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE"}
+        raise AssertionError(f"unscripted step {request['step']!r}")
+
+    history, result = await _run_to_history(
+        _PreClosedRunBacklogLoopWorkflow, _single_issue_input(), execute_control_step
+    )
+
+    assert result["blocker"] == "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE"
+    assert "backlog.register_run" not in _scheduled_step_names(history)
+    markers = [
+        event.marker_recorded_event_attributes.SerializeToString()
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+    ]
+    assert not any(b"blocked-start-closes-run" in marker for marker in markers)
+    await Replayer(workflows=[ExistingGitHubBacklogLoopWorkflow]).replay_workflow(history)
