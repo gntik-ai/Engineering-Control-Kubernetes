@@ -2454,3 +2454,47 @@ async def test_a_hanging_runless_sweep_never_delays_operation_dispatch() -> None
     await asyncio.wait_for(dispatched.wait(), timeout=2)
     stop.set()
     await asyncio.wait_for(task, timeout=2)
+
+
+async def test_a_runless_sweep_cut_short_resumes_at_the_unchecked_operation(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    created = datetime.now(UTC) - timedelta(days=1)
+    with repository.sessions.begin() as session:
+        for index, key in enumerate("ab"):
+            session.add(
+                OperationRequest(
+                    action="solve_issue",
+                    target_type="github_issue",
+                    target_id=f"gntik-ai/falcone#96{index}",
+                    payload_json={},
+                    source_channel="cli",
+                    operator_class="operator",
+                    idempotency_key=key * 64,
+                    binding_hash=key * 64,
+                    status="STARTED",
+                    workflow_id=f"backlog-loop-falcone-{key}",
+                    temporal_run_id=f"run-{key}",
+                    created_at=created + timedelta(minutes=index),
+                )
+            )
+    hang = {"run-b"}
+    seen: list[str] = []
+
+    async def workflow_run_status(workflow_id: str, run_id: str) -> str:
+        seen.append(run_id)
+        if run_id in hang:
+            await asyncio.Event().wait()
+        return "COMPLETED"
+
+    control = Mock()
+    control.workflow_run_status = workflow_run_status
+    bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(bus.reconcile_runless_operations(), timeout=0.5)
+    hang.clear()
+    assert await bus.reconcile_runless_operations() == 1
+    assert seen == ["run-a", "run-b", "run-b"]  # b was not skipped after the cut
+    with repository.sessions() as session:
+        assert {row.status for row in session.scalars(select(OperationRequest))} == {"COMPLETED"}

@@ -54,6 +54,7 @@ _CLOSED_WORKFLOW_STATUSES = frozenset(
 )
 _RUNLESS_RECONCILE_SECONDS = 60.0
 _RUNLESS_DESCRIBE_SECONDS = 10.0
+_RUNLESS_PAGE_SIZE = 20
 
 
 class TypedCommandBus:
@@ -182,30 +183,41 @@ class TypedCommandBus:
         Each pass checks one page and resumes after it next time, so operations that stay
         running never starve newer ones. A continued-as-new or unknown run stays active.
         """
-        page = await self.operations.runless_started_operations(after=self._runless_cursor)
-        self._runless_cursor = (page[-1][3], page[-1][0]) if page else None
+        page = await self.operations.runless_started_operations(
+            after=self._runless_cursor, limit=_RUNLESS_PAGE_SIZE
+        )
         released = 0
-        for operation_id, workflow_id, run_id, _created_at in page:
-            try:
-                status = await asyncio.wait_for(
-                    self.control.workflow_run_status(workflow_id, run_id),
-                    timeout=_RUNLESS_DESCRIBE_SECONDS,
-                )
-            except Exception:  # noqa: BLE001 - an unknown state keeps the operation active
-                _LOG.warning("runless operation %s: workflow state unavailable", operation_id)
-                continue
-            if status not in _CLOSED_WORKFLOW_STATUSES:
-                continue
-            if await self.operations.complete_closed_runless_operation(operation_id):
-                released += 1
-                await self.operations.record_dispatch_event(
-                    operation_id,
-                    event_type="operation.completed",
-                    level="INFO",
-                    message="Typed operation workflow closed before recording a run",
-                    workflow_id=workflow_id,
-                )
+        for operation_id, workflow_id, run_id, created_at in page:
+            released += await self._reconcile_runless_operation(operation_id, workflow_id, run_id)
+            # Advance only past checked rows, so a pass cut short resumes at the unchecked one.
+            self._runless_cursor = (created_at, operation_id)
+        if len(page) < _RUNLESS_PAGE_SIZE:
+            self._runless_cursor = None
         return released
+
+    async def _reconcile_runless_operation(
+        self, operation_id: UUID, workflow_id: str, run_id: str
+    ) -> int:
+        try:
+            status = await asyncio.wait_for(
+                self.control.workflow_run_status(workflow_id, run_id),
+                timeout=_RUNLESS_DESCRIBE_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - an unknown state keeps the operation active
+            _LOG.warning("runless operation %s: workflow state unavailable", operation_id)
+            return 0
+        if status not in _CLOSED_WORKFLOW_STATUSES:
+            return 0
+        if not await self.operations.complete_closed_runless_operation(operation_id):
+            return 0
+        await self.operations.record_dispatch_event(
+            operation_id,
+            event_type="operation.completed",
+            level="INFO",
+            message="Typed operation workflow closed before recording a run",
+            workflow_id=workflow_id,
+        )
+        return 1
 
     policy_activation_timeout_seconds = 60.0
     policy_activation_poll_seconds = 2.0
