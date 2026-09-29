@@ -475,6 +475,8 @@ class GitOpsControllerHandler:
             # NEW-63/64: CI job names only (the baseline gate's verdict).
             "ci_regressions": _check_names(payload.get("ci_regressions")),
             "ci_preexisting_failures": _check_names(payload.get("ci_preexisting_failures")),
+            # NEW-100: bounded, redacted failing-log lines per regressed job.
+            "ci_failure_excerpts": _excerpts(payload.get("ci_failure_excerpts")),
             # NEW-99: why the baseline could not excuse anything (None when it ran).
             "ci_regression_reason": (
                 str(payload["ci_regression_reason"])
@@ -1102,12 +1104,20 @@ class GitOpsGitHubHandler:
             changed = self.broker.pull_request_files(repository, plan.source_pr_number)
         except GhCliPolicyError:
             # A listing at GitHub's file cap may hide .github/ changes: no exemption.
-            return _unexempted_regressions(failed, "CI_BASELINE_FILE_LISTING_TRUNCATED")
+            return _unexempted_regressions(
+                failed,
+                "CI_BASELINE_FILE_LISTING_TRUNCATED",
+                self._failure_excerpts(repository, pull_request, failed),
+            )
         if any(path.startswith(".github/") for path in changed):
             # falcone CI-baseline review: a PR that edits CI configuration could drop the
             # jobs exposing its own regression while a pre-existing failure is excused,
             # so it never gets the baseline exemption.
-            return _unexempted_regressions(failed, "CI_BASELINE_CI_CONFIG_CHANGED")
+            return _unexempted_regressions(
+                failed,
+                "CI_BASELINE_CI_CONFIG_CHANGED",
+                self._failure_excerpts(repository, pull_request, failed),
+            )
         markers = sorted(
             {
                 marker.path
@@ -1155,12 +1165,34 @@ class GitOpsGitHubHandler:
                 "failed_checks": regressions[:20],
                 "preexisting_checks": preexisting[:40],
                 "baseline_pr": baseline_url,
+                "failure_excerpts": self._failure_excerpts(repository, pull_request, regressions),
             }
         return {
             "status": "CHECKS_PASSED",
             "check_count": len(states),
             "ci_baseline": {"pr": baseline_url, "preexisting_failures": preexisting[:40]},
         }
+
+    def _failure_excerpts(
+        self, repository: str, pull_request: dict[str, Any], names: list[str]
+    ) -> dict[str, str]:
+        """NEW-100: bounded failing-log lines per regressed job, for the CI-repair maker.
+
+        Best effort: a job whose log cannot be read is simply left out.
+        """
+        jobs = _failed_job_ids(pull_request)
+        excerpts: dict[str, str] = {}
+        for name in names[:_MAX_EXCERPT_JOBS]:
+            job_id = jobs.get(name)
+            if job_id is None:
+                continue
+            try:
+                excerpt = self.broker.job_log_excerpt(repository, job_id)
+            except (CommandFailure, GhCliPolicyError, OSError):
+                continue
+            if excerpt:
+                excerpts[name] = excerpt
+        return excerpts
 
     def _require_baseline_write(self, repository: str) -> None:
         """gitops.pr_checks is a read step; its baseline writes pass the write policy."""
@@ -1574,12 +1606,45 @@ class GitOpsGitHubHandler:
         }
 
 
+_MAX_EXCERPT_JOBS = 5
+_JOB_URL = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/([1-9][0-9]{0,19})")
+
+
+def _excerpts(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(name)[:200]: str(text)[:4000]
+        for name, text in list(value.items())[:_MAX_EXCERPT_JOBS]
+        if isinstance(name, str) and isinstance(text, str) and text
+    }
+
+
+def _failed_job_ids(pull_request: dict[str, Any]) -> dict[str, int]:
+    """NEW-100: failed check name -> Actions job ID, from the rollup's details URLs."""
+    jobs: dict[str, int] = {}
+    raw_checks = pull_request.get("statusCheckRollup")
+    for raw in raw_checks if isinstance(raw_checks, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        conclusion = str(raw.get("conclusion") or "").upper()
+        if conclusion in {"", "SUCCESS", "NEUTRAL", "SKIPPED"}:
+            continue
+        match = _JOB_URL.match(str(raw.get("detailsUrl") or ""))
+        name = str(raw.get("name") or "")[:200]
+        if match and name:
+            jobs.setdefault(name, int(match.group(1)))
+    return jobs
+
+
 UNVERIFIED_CI_REGRESSION_REASONS = frozenset(
     {"CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_FILE_LISTING_TRUNCATED"}
 )
 
 
-def _unexempted_regressions(failed: list[str], reason: str) -> dict[str, Any]:
+def _unexempted_regressions(
+    failed: list[str], reason: str, excerpts: dict[str, str]
+) -> dict[str, Any]:
     """NEW-99: when the baseline cannot excuse anything, every failure is a regression.
 
     Nothing is exempted, but the loop can still send the failures to the maker for CI
@@ -1591,6 +1656,7 @@ def _unexempted_regressions(failed: list[str], reason: str) -> dict[str, Any]:
         "failed_checks": failed[:20],
         "preexisting_checks": [],
         "reason": reason,
+        "failure_excerpts": excerpts,
     }
 
 

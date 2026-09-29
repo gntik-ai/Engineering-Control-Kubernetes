@@ -796,6 +796,11 @@ async def test_persist_result_records_merge_and_runtime_verified_state(tmp_path:
                 "blocker": "SOURCE_PR_CI_REGRESSION",
                 "ci_regressions": ["quality"],
                 "ci_regression_reason": reason,
+                "ci_failure_excerpts": {
+                    **{f"job-{index}": "not ok" for index in range(7)},
+                    "quality": "x" * 9000,
+                    "bad": 5,
+                },
             },
         )
         with handler.sessions.begin() as session:
@@ -803,6 +808,9 @@ async def test_persist_result_records_merge_and_runtime_verified_state(tmp_path:
             assert change_set is not None
             record = change_set.recovery_json["staging_gitops"]
             assert record["ci_regression_reason"] == recorded
+            # NEW-100: at most 5 string excerpts of at most 4000 characters each.
+            excerpts = record["ci_failure_excerpts"]
+            assert len(excerpts) == 5 and all(len(text) <= 4000 for text in excerpts.values())
     result = await handler.handle(
         "gitops.persist_result",
         {
@@ -1356,7 +1364,14 @@ class BaselineGh(FakeGh):
             )
         return super().run(executable, arguments, **kwargs)
 
+    job_logs: dict[int, str] = {}
+
     def _answer(self, args: list[str]) -> str:
+        if args[0] == "api" and "/actions/jobs/" in args[1] and args[1].endswith("/logs"):
+            job = int(args[1].split("/actions/jobs/", 1)[1].split("/", 1)[0])
+            if job not in self.job_logs:
+                raise CommandFailure("gh api failed: 404")
+            return self.job_logs[job]
         if args[0] == "api" and args[1].endswith("/pulls/77/files"):
             return "\n".join(self.changed)
         if args[0] == "api" and args[1].endswith("/commits/main"):
@@ -1707,3 +1722,47 @@ async def test_controller_kubectl_runs_in_the_writable_state_root(tmp_path: Path
         cwd == (tmp_path / "state" / "gitops").resolve() for cwd in kubectl.cwds
     )
     assert not (tmp_path / "runs" / "gitops").exists()
+
+
+_REPAIR_LOG = """\
+2026-09-29T16:53:56.1Z ok 277 - ut-flowrole: create works
+2026-09-29T16:53:56.2Z # Subtest: ut-flowrole: tenant_owner is authorized on delete_definition
+2026-09-29T16:53:56.3Z not ok 278 - ut-flowrole: tenant_owner is authorized on delete_definition
+2026-09-29T16:53:56.4Z   error: 'Flow not found'
+2026-09-29T16:53:56.5Z   code: 'FLOW_NOT_FOUND'
+2026-09-29T16:53:56.6Z ok 279 - ut-flowrole: failed operation creates a pending retry attempt
+2026-09-29T16:53:56.7Z ##[error]Process completed with exit code 1.
+"""
+
+
+def test_failure_excerpt_keeps_failing_lines_and_drops_passing_ones() -> None:
+    # NEW-100: the #1001 CI-repair maker saw only job names and could not act.
+    from engineering_control.adapters.github.client import failure_excerpt
+
+    excerpt = failure_excerpt(_REPAIR_LOG, context=2)
+    assert "not ok 278" in excerpt and "FLOW_NOT_FOUND" in excerpt
+    assert "##[error]Process completed" in excerpt
+    assert "2026-09-29T" not in excerpt  # timestamps stripped
+    assert "ok 277" not in excerpt  # passing lines are never markers
+    long = failure_excerpt("not ok 1 - x\n" * 10_000)
+    assert len(long) <= 4000 and long.count("\n") < 60
+
+
+@pytest.mark.asyncio
+async def test_unexempted_regressions_carry_bounded_failure_excerpts(tmp_path: Path) -> None:
+    job_url = "https://github.com/gntik-ai/musematic/actions/runs/5/job/{}"
+    checks = [
+        {**_check("quality", "FAILURE"), "detailsUrl": job_url.format(11)},
+        {**_check("relay", "FAILURE"), "detailsUrl": job_url.format(12)},
+        {**_check("docs", "FAILURE"), "detailsUrl": "https://example.invalid/x"},
+        {**_check("lint", "SUCCESS"), "detailsUrl": job_url.format(13)},
+    ]
+    handler, fake = _baseline_handler(tmp_path, [".github/workflows/ci.yml"], checks)
+    fake.job_logs = {11: _REPAIR_LOG}  # job 12's log is unavailable (404)
+
+    blocked = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+
+    assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
+    assert set(blocked["failure_excerpts"]) == {"quality"}
+    assert "FLOW_NOT_FOUND" in blocked["failure_excerpts"]["quality"]
+    assert not any("/actions/jobs/13/" in " ".join(call) for call in fake.calls)

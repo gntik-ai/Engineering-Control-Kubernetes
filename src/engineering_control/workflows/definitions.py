@@ -2149,6 +2149,9 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 if checks.get("reason"):
                     # NEW-99: the failures were not compared with unchanged main.
                     evidence["ci_regression_reason"] = checks.get("reason")
+                if checks.get("failure_excerpts"):
+                    # NEW-100: the repair maker needs the failing lines, not only job names.
+                    evidence["ci_failure_excerpts"] = checks.get("failure_excerpts")
             return self._blocked(checks, "SOURCE_PR_CI_FAILED")
 
         # 2. Ready + merge (source first, then the deployment PR when one exists).

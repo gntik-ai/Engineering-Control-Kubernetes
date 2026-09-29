@@ -720,6 +720,7 @@ async def test_staging_gitops_workflow_records_the_ci_baseline_verdict() -> None
                         "failed_checks": ["quality"],
                         "preexisting_checks": [],
                         "reason": "CI_BASELINE_CI_CONFIG_CHANGED",
+                        "failure_excerpts": {"quality": "not ok 278"},
                     }
                 }
             )
@@ -727,6 +728,7 @@ async def test_staging_gitops_workflow_records_the_ci_baseline_verdict() -> None
     )
     persisted = _scheduled_steps(unverified)[-1]["payload"]
     assert persisted["ci_regression_reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
+    assert persisted["ci_failure_excerpts"] == {"quality": "not ok 278"}
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(unverified)
 
     passed, _ = await _run_to_history(
