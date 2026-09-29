@@ -1590,3 +1590,92 @@ async def test_a_pre_patch_blocked_start_replays_without_registering_a_run() -> 
     ]
     assert not any(b"blocked-start-closes-run" in marker for marker in markers)
     await Replayer(workflows=[ExistingGitHubBacklogLoopWorkflow]).replay_workflow(history)
+
+
+@workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
+class _FirstRepairBlockedStub:
+    """IssueDeliveryWorkflow whose first CI repair blocks (#1001: the maker had no logs)."""
+
+    @workflow.run
+    async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
+        if "-ci-repair-1-" in workflow.info().workflow_id:
+            return {"status": "BLOCKED", "blocker": "SOURCE_MAKER_DID_NOT_COMPLETE"}
+        return {"status": "SOURCE_PR", "context": {"change_set_id": _GITOPS_PLAN["change_set_id"]}}
+
+
+_REPAIR_BLOCKED_WORKFLOWS = [
+    ExistingGitHubBacklogLoopWorkflow,
+    _FirstRepairBlockedStub,
+    StagingGitOpsDeliveryWorkflow,
+]
+_REGRESSION = {
+    "status": "BLOCKED",
+    "blocker": "SOURCE_PR_CI_REGRESSION",
+    "failed_checks": ["quality"],
+    "preexisting_checks": [],
+}
+
+
+async def test_a_retry_after_a_blocked_ci_repair_rechecks_ci_before_repairing() -> None:
+    # NEW-101: the retry re-runs the GitOps CI check so the second repair receives fresh
+    # failures (and NEW-100 log excerpts) instead of the stale evidence of the first.
+    history, result, children = await _run_loop(
+        _full_delivery_loop_script(**{"gitops.pr_checks": _REGRESSION}),
+        [
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
+        workflows=_REPAIR_BLOCKED_WORKFLOWS,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+        "1-ci-repair-1-attempt-1",
+        "1-staging-gitops-retry-1",
+        "1-ci-repair-2-attempt-1",
+        "1-staging-gitops-retry-2",
+    ]
+    paused = [
+        request["payload"]["blocker"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == ["CI_REPAIR_SOURCE_MAKER_DID_NOT_COMPLETE", "SOURCE_PR_CI_REGRESSION"]
+    await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)
+
+
+@workflow.defn(name="ExistingGitHubBacklogLoopWorkflow", sandboxed=False)
+class _PreRecheckBacklogLoopWorkflow(ExistingGitHubBacklogLoopWorkflow):
+    """The loop as it ran before NEW-101: a retry repaired again at once."""
+
+    @workflow.run
+    async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+        return await super().run(request)
+
+    def _repair_retry_rechecks_patched(self) -> bool:
+        return False
+
+
+async def test_a_pre_recheck_repair_retry_history_replays_unchanged() -> None:
+    workflows = [
+        _PreRecheckBacklogLoopWorkflow,
+        _FirstRepairBlockedStub,
+        StagingGitOpsDeliveryWorkflow,
+    ]
+    history, _, children = await _run_loop(
+        _full_delivery_loop_script(**{"gitops.pr_checks": _REGRESSION}),
+        [
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
+        workflows=workflows,
+    )
+
+    assert [child.rsplit("-issue-", 1)[1] for child in children][2:4] == [
+        "1-ci-repair-1-attempt-1",
+        "1-ci-repair-2-attempt-1",
+    ]
+    await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)

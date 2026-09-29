@@ -3228,7 +3228,17 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 resumed_state["workflow_id"] = workflow_root
             await self._step("backlog.record_loop_state", resumed_state)
             if outcome == "RETRY":
-                if gate is not None and (
+                if (
+                    gate is not None
+                    and blocker.startswith("CI_REPAIR_")
+                    and repair_round < self._CI_REPAIR_ROUNDS
+                    and self._repair_retry_rechecks_patched()
+                ):
+                    # NEW-101: re-check the PR's CI first, so the next repair gets the
+                    # current failures and their log excerpts (NEW-100), not stale evidence.
+                    repair_pending = False
+                    gitops_round += 1
+                elif gate is not None and (
                     blocker == "SOURCE_PR_CI_REGRESSION" or blocker.startswith("CI_REPAIR_")
                 ):
                     # NEW-64: the operator's retry repeats the CI repair, not only GitOps.
@@ -3241,6 +3251,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
 
     # NEW-64: automatic CI-repair re-deliveries before the loop waits for the operator.
     _CI_REPAIR_ROUNDS = 2
+
+    def _repair_retry_rechecks_patched(self) -> bool:
+        return workflow.patched("existing-backlog-ci-repair-retry-rechecks-v1")
 
     async def _ci_repair_delivery(
         self,
