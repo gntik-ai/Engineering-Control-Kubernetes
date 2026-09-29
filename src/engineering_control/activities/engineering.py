@@ -1394,16 +1394,18 @@ class EngineeringActivityHandler:
                         if row.calculated_risk == "R3"
                         else None
                     )
-                    if row.calculated_risk == "R3" and r3_candidate is None:
-                        awaiting_r3_approval = True
-                    if (
+                    selectable = (
                         reference not in processed
                         and blocked_until.get(reference, now) <= now
-                        and (
-                            risk_rank.get(row.calculated_risk, 99) <= 2 or r3_candidate is not None
-                        )
                         and row.issue_type != BacklogIssueType.ENHANCEMENT.value
-                    ):
+                    )
+                    if not selectable:
+                        continue
+                    if row.calculated_risk == "R3" and r3_candidate is None:
+                        # NEW-96 review: only an R3 issue the loop would otherwise run makes it
+                        # wait for an approval (not processed, enhancement or blocked rows).
+                        awaiting_r3_approval = True
+                    if risk_rank.get(row.calculated_risk, 99) <= 2 or r3_candidate is not None:
                         candidates.append((project, row))
             if not candidates:
                 metadata["current_issue"] = None

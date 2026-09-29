@@ -2288,3 +2288,27 @@ def test_backlog_selection_includes_only_operator_approvable_deferred_r3_rows(
         assert row is not None
         row.eligibility_status = "ELIGIBLE_FOR_REVALIDATION"
     assert selected() == [953]
+
+
+def test_only_filter_admitted_r3_issues_wait_for_operator_approval() -> None:
+    # NEW-96 review: the import filter applies before R3 deferral, so an R3 issue outside
+    # the campaign's filter keeps its filter reason and can never become selectable.
+    from engineering_control.engineering.backlog import BacklogIssueType, _eligibility
+
+    assert _eligibility(BacklogIssueType.SECURITY_DEFECT, "security", "R3", "") == (
+        False,
+        "R3_REQUIRES_OPERATOR",
+    )
+    assert _eligibility(BacklogIssueType.PRODUCT_BUG, "security", "R3", "") == (
+        False,
+        "FILTER_EXCLUDED",
+    )
+    assert _eligibility(BacklogIssueType.ENHANCEMENT, "bugs", "R3", "") == (
+        False,
+        "ENHANCEMENT_DEFERRED",
+    )
+    assert _eligibility(BacklogIssueType.SPEC_DECISION, "all", "R3", "") == (
+        False,
+        "NEEDS_PRODUCT_DECISION",
+    )
+    assert _eligibility(BacklogIssueType.PRODUCT_BUG, "all", "R2", "")[0] is True
