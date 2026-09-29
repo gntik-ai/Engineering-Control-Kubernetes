@@ -1080,6 +1080,9 @@ class GitOpsGitHubHandler:
         marker files that trigger the same path-filtered jobs. It is created once per main
         commit and marker set, read once complete, then closed and its branch deleted.
         """
+        # NEW-100: the activity heartbeats only at entry, just before this gate, so the
+        # optional CI log reads must finish within a fixed time from here.
+        excerpt_deadline = time.monotonic() + _EXCERPT_DEADLINE_SECONDS
         states = _check_states(pull_request)
         if not states or any(value == "PENDING" for value in states.values()):
             return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CHECKS_PENDING"}
@@ -1109,7 +1112,7 @@ class GitOpsGitHubHandler:
             return _unexempted_regressions(
                 failed,
                 "CI_BASELINE_FILE_LISTING_TRUNCATED",
-                self._failure_excerpts(repository, pull_request, failed),
+                self._failure_excerpts(repository, pull_request, failed, excerpt_deadline),
             )
         if any(path.startswith(".github/") for path in changed):
             # falcone CI-baseline review: a PR that edits CI configuration could drop the
@@ -1118,7 +1121,7 @@ class GitOpsGitHubHandler:
             return _unexempted_regressions(
                 failed,
                 "CI_BASELINE_CI_CONFIG_CHANGED",
-                self._failure_excerpts(repository, pull_request, failed),
+                self._failure_excerpts(repository, pull_request, failed, excerpt_deadline),
             )
         markers = sorted(
             {
@@ -1167,7 +1170,9 @@ class GitOpsGitHubHandler:
                 "failed_checks": regressions[:20],
                 "preexisting_checks": preexisting[:40],
                 "baseline_pr": baseline_url,
-                "failure_excerpts": self._failure_excerpts(repository, pull_request, regressions),
+                "failure_excerpts": self._failure_excerpts(
+                    repository, pull_request, regressions, excerpt_deadline
+                ),
             }
         return {
             "status": "CHECKS_PASSED",
@@ -1176,7 +1181,11 @@ class GitOpsGitHubHandler:
         }
 
     def _failure_excerpts(
-        self, repository: str, pull_request: dict[str, Any], names: list[str]
+        self,
+        repository: str,
+        pull_request: dict[str, Any],
+        names: list[str],
+        deadline: float,
     ) -> dict[str, str]:
         """NEW-100: bounded failing-log lines per regressed job, for the CI-repair maker.
 
@@ -1185,9 +1194,6 @@ class GitOpsGitHubHandler:
         jobs = _failed_job_ids(pull_request)
         excerpts: dict[str, str] = {}
         attempts = 0
-        # The activity heartbeats once, so the optional log reads share a wall-clock budget
-        # well inside its heartbeat timeout.
-        deadline = time.monotonic() + _EXCERPT_BUDGET_SECONDS
         for name in names:
             remaining = int(deadline - time.monotonic())
             if (
@@ -1624,7 +1630,9 @@ class GitOpsGitHubHandler:
 
 _MAX_EXCERPT_JOBS = 5
 _MAX_EXCERPT_ATTEMPTS = 10
-_EXCERPT_BUDGET_SECONDS = 45
+# Seconds after the gate starts by which log reads end; the activity's heartbeat timeout
+# is 2 minutes and each read is capped at 15 s, so they finish within about 90 s.
+_EXCERPT_DEADLINE_SECONDS = 75
 _JOB_URL = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/([1-9][0-9]{0,19})")
 
 
