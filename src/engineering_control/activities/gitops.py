@@ -1048,6 +1048,9 @@ class GitOpsGitHubHandler:
     # -- 1. PR checks ------------------------------------------------------------------
 
     def _pr_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # NEW-100: the activity heartbeats only on entry, so the optional CI log reads must
+        # end within a fixed time of it, whatever the GitHub calls before them cost.
+        excerpt_deadline = time.monotonic() + _EXCERPT_DEADLINE_SECONDS
         plan, flow = self._context(payload)
         pull_request = self.broker.view_pull_request(plan.source_repository, plan.source_pr_number)
         if (
@@ -1061,7 +1064,9 @@ class GitOpsGitHubHandler:
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_NOT_OPEN"}
         result = evaluate_pull_request_checks(pull_request, flow.source_ci_workflow)
         if result.get("blocker") == "SOURCE_PR_CI_FAILED" and flow.ci_baseline.enabled:
-            return self._baseline_gate(plan, flow, pull_request, create=True)
+            return self._baseline_gate(
+                plan, flow, pull_request, create=True, excerpt_deadline=excerpt_deadline
+            )
         return result
 
     # -- NEW-63: baseline-aware CI gate -----------------------------------------------------
@@ -1073,6 +1078,7 @@ class GitOpsGitHubHandler:
         pull_request: dict[str, Any],
         *,
         create: bool,
+        excerpt_deadline: float | None,
     ) -> dict[str, Any]:
         """Block only on PR CI jobs that do not also fail on unchanged main.
 
@@ -1080,9 +1086,6 @@ class GitOpsGitHubHandler:
         marker files that trigger the same path-filtered jobs. It is created once per main
         commit and marker set, read once complete, then closed and its branch deleted.
         """
-        # NEW-100: the activity heartbeats only at entry, just before this gate, so the
-        # optional CI log reads must finish within a fixed time from here.
-        excerpt_deadline = time.monotonic() + _EXCERPT_DEADLINE_SECONDS
         states = _check_states(pull_request)
         if not states or any(value == "PENDING" for value in states.values()):
             return {"status": "CHECKS_PENDING", "reason": "SOURCE_PR_CHECKS_PENDING"}
@@ -1185,12 +1188,14 @@ class GitOpsGitHubHandler:
         repository: str,
         pull_request: dict[str, Any],
         names: list[str],
-        deadline: float,
+        deadline: float | None,
     ) -> dict[str, str]:
         """NEW-100: bounded failing-log lines per regressed job, for the CI-repair maker.
 
         Best effort: a job whose log cannot be read is simply left out.
         """
+        if deadline is None:
+            return {}
         jobs = _failed_job_ids(pull_request)
         excerpts: dict[str, str] = {}
         attempts = 0
@@ -1305,7 +1310,10 @@ class GitOpsGitHubHandler:
             if merge_state == "UNSTABLE" and target == "source" and flow.ci_baseline.enabled:
                 # NEW-63: non-required checks failed; merge only when the baseline gate
                 # attributes every failure to unchanged main.
-                verdict = self._baseline_gate(plan, flow, current, create=False)
+                # The merge gate uses only the verdict, so it reads no CI logs.
+                verdict = self._baseline_gate(
+                    plan, flow, current, create=False, excerpt_deadline=None
+                )
                 if verdict.get("status") != "CHECKS_PASSED":
                     return {
                         "status": "BLOCKED",
@@ -1630,8 +1638,8 @@ class GitOpsGitHubHandler:
 
 _MAX_EXCERPT_JOBS = 5
 _MAX_EXCERPT_ATTEMPTS = 10
-# Seconds after the gate starts by which log reads end; the activity's heartbeat timeout
-# is 2 minutes and each read is capped at 15 s, so they finish within about 90 s.
+# Seconds after the pr_checks step starts by which log reads end; its heartbeat timeout is
+# 2 minutes and each read is capped at 15 s, so they finish within about 90 s of entry.
 _EXCERPT_DEADLINE_SECONDS = 75
 _JOB_URL = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/([1-9][0-9]{0,19})")
 
