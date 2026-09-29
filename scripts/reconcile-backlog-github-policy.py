@@ -492,6 +492,16 @@ def install_policy(path: Path, backup_root: Path, group_id: int, *, enabled: boo
         temporary.unlink(missing_ok=True)
 
 
+def reject_request(path: Path, request_bytes: bytes) -> None:
+    try:
+        if path.read_bytes() != request_bytes:
+            return
+    except FileNotFoundError:
+        return
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    path.rename(path.with_name(f"rejected-{stamp}.json"))
+
+
 def main() -> int:
     if os.geteuid() != 0:
         raise PermissionError("GitHub policy reconciliation requires root")
@@ -521,19 +531,26 @@ def main() -> int:
         print("GITHUB_BACKLOG_POLICY_EXPIRY_PASS")
         return 0
     request_bytes = args.request.read_bytes()
-    request = read_request(args.request, api_uid)
-    if json.loads(request_bytes.decode("utf-8")) != request:
-        raise ValueError("GitHub policy request changed while it was read")
     kept_for: UUID | None = None
-    with Session(engine) as session, session.begin():
-        campaign = validate_campaign(session, request)
-        enable = request["action"] == "enable-existing-backlog"
-        if not enable:
-            kept_for = other_unexpired_owner(session, campaign.id, datetime.now(UTC))
-        if kept_for is None:
-            install_policy(args.policy, args.backup_root, group_id, enabled=enable)
-        if enable:
-            campaign.status = "APPROVED"
+    try:
+        request = read_request(args.request, api_uid)
+        if json.loads(request_bytes.decode("utf-8")) != request:
+            raise ValueError("GitHub policy request changed while it was read")
+        with Session(engine) as session, session.begin():
+            campaign = validate_campaign(session, request)
+            enable = request["action"] == "enable-existing-backlog"
+            if not enable:
+                kept_for = other_unexpired_owner(session, campaign.id, datetime.now(UTC))
+            if kept_for is None:
+                install_policy(args.policy, args.backup_root, group_id, enabled=enable)
+            if enable:
+                campaign.status = "APPROVED"
+    except ValueError:
+        # NEW-94 review: writers never overwrite a pending request, so a rejected one (for
+        # example an enable whose campaign was released before activation) would block every
+        # later request. Move exactly that request aside for audit, then fail visibly.
+        reject_request(args.request, request_bytes)
+        raise
     # NEW-94 review: consume only the request that was reconciled. Writers no longer
     # overwrite a pending request, so a different file here is a newer request; leave it for
     # the path unit, which re-triggers while activate.json exists.

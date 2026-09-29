@@ -28,6 +28,7 @@ EXPIRE_CAMPAIGNS = SCRIPT["expire_campaign_approvals"]
 READ_REQUEST = SCRIPT["read_request"]
 AUDIT_ACTORS = SCRIPT["audit_approval_actors"]
 OTHER_OWNER = SCRIPT["other_unexpired_owner"]
+REJECT_REQUEST = SCRIPT["reject_request"]
 
 
 def campaign(
@@ -944,3 +945,19 @@ def test_a_verified_paused_owner_still_keeps_the_policy(tmp_path: Path) -> None:
         assert OTHER_OWNER(session, ending, now) == owner_id
     with Session(engine) as session, session.begin():
         assert EXPIRE_CAMPAIGNS(session, now) is False
+
+
+def test_a_rejected_request_is_moved_aside_so_it_cannot_block_the_queue(tmp_path: Path) -> None:
+    # NEW-94 review round 5: writers never overwrite a pending request, so a request the
+    # reconciler rejects must leave activate.json, or every later request would fail.
+    request = tmp_path / "activate.json"
+    body = b'{"action":"enable-existing-backlog"}\n'
+    request.write_bytes(body)
+    REJECT_REQUEST(request, body)
+    assert not request.exists()
+    [rejected] = list(tmp_path.glob("rejected-*.json"))
+    assert rejected.read_bytes() == body
+    # A newer request that replaced the rejected one is left alone.
+    request.write_bytes(b'{"action":"disable-existing-backlog"}\n')
+    REJECT_REQUEST(request, body)
+    assert request.exists()
