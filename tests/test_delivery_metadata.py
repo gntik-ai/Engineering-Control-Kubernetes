@@ -145,8 +145,9 @@ async def test_publication_plan_defers_unchanged_deployment_repository(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("domain", ["falcone:audit", "falcone:api(v2) $x; `y` && z\n"])
 async def test_every_publication_title_passes_the_gh_broker_value_policy(
-    tmp_path: Path,
+    tmp_path: Path, domain: str
 ) -> None:
     # NEW-98: falcone #1001's deployment PR title "... (deployment)" was rejected by
     # GhCliBroker._value (no parentheses), failing publication after the source PR.
@@ -176,7 +177,7 @@ async def test_every_publication_title_passes_the_gh_broker_value_policy(
             "issue_url": "https://github.com/gntik-ai/falcone/issues/1001",
             "openspec_identifier": f"engineering/{change_set_id}",
             "risk_class": "R3",
-            "domain": "falcone:audit",
+            "domain": domain,
         },
     )
 
