@@ -2323,13 +2323,25 @@ def test_selection_rechecks_the_import_filter_for_legacy_deferred_r3_rows() -> N
 
     from engineering_control.activities.engineering import _deferred_r3_row_in_filter
 
-    def row(issue_type: str, status: str = "DEFERRED") -> Any:
-        return SimpleNamespace(eligibility_status=status, issue_type=issue_type)
+    def row(
+        issue_type: str, status: str = "DEFERRED", body: object = "Tenant login fails."
+    ) -> Any:
+        return SimpleNamespace(
+            eligibility_status=status,
+            issue_type=issue_type,
+            title="bug: login",
+            github_snapshot_json={"body_excerpt": body} if body is not None else {},
+        )
 
     assert _deferred_r3_row_in_filter(row("SECURITY_DEFECT"), "security")
     assert not _deferred_r3_row_in_filter(row("PRODUCT_BUG"), "security")
     assert not _deferred_r3_row_in_filter(row("ENHANCEMENT"), "bugs")
     assert not _deferred_r3_row_in_filter(row("NOT_A_TYPE"), "all")
     assert _deferred_r3_row_in_filter(row("PRODUCT_BUG"), "all")
+    # Review round 3: the text rules apply too, and a missing stored body fails closed.
+    assert not _deferred_r3_row_in_filter(
+        row("SECURITY_DEFECT", body="Needs product decision on the realm model."), "all"
+    )
+    assert not _deferred_r3_row_in_filter(row("PRODUCT_BUG", body=None), "all")
     # Eligible rows were admitted by the filter at import and are left unchanged.
     assert _deferred_r3_row_in_filter(row("ENHANCEMENT", "READY"), "bugs")

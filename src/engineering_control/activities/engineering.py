@@ -86,7 +86,13 @@ def _deferred_r3_row_in_filter(row: db.BacklogIssueRecord, import_filter: str) -
         issue_type = BacklogIssueType(row.issue_type)
     except ValueError:
         return False
-    eligible, _ = _filter_eligibility(issue_type, import_filter, "")
+    snapshot = row.github_snapshot_json if isinstance(row.github_snapshot_json, dict) else {}
+    body = snapshot.get("body_excerpt")
+    if not isinstance(body, str):
+        return False
+    # The same text the import classified on (classify_issue), so "needs product
+    # decision" and similar text rules apply identically.
+    eligible, _ = _filter_eligibility(issue_type, import_filter, f"{row.title}\n{body}".lower())
     return eligible
 
 
