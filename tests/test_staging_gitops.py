@@ -1771,6 +1771,11 @@ async def test_unexempted_regressions_carry_bounded_failure_excerpts(tmp_path: P
     assert set(blocked["failure_excerpts"]) == {"quality"}
     assert "FLOW_NOT_FOUND" in blocked["failure_excerpts"]["quality"]
     assert not any("/actions/jobs/13/" in " ".join(call) for call in fake.calls)
+    # Log reads run no extra preflight (repo view) beyond the gate's own.
+    first_log = next(
+        index for index, call in enumerate(fake.calls) if "/actions/jobs/" in " ".join(call)
+    )
+    assert not any(call[:2] == ["repo", "view"] for call in fake.calls[first_log:])
 
 
 @pytest.mark.asyncio

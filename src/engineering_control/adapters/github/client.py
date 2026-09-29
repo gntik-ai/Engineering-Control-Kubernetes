@@ -743,8 +743,12 @@ class GhCliBroker:
         return paths
 
     def job_log_excerpt(self, repository: str, job_id: int, *, timeout_seconds: int = 15) -> str:
-        """NEW-100: the failing lines of one Actions job log, bounded (untrusted text)."""
-        repository = self._batch(repository)
+        """NEW-100: the failing lines of one Actions job log, bounded (untrusted text).
+
+        Only the allowlist is checked: the caller's gate already preflighted this repository
+        in the same step, and a second preflight would not be bounded by the read timeout.
+        """
+        repository = self._repository(repository)
         if job_id < 1:
             raise GhCliPolicyError("workflow job ID is invalid")
         raw = self._run(
