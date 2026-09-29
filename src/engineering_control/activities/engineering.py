@@ -2219,7 +2219,13 @@ class EngineeringActivityHandler:
                 stream.write(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, target)
+            # NEW-94 review: never overwrite a request the root reconciler has not consumed
+            # yet (a late disable clobbered a pending enable, or deleted another campaign's
+            # disable). link() fails if one is pending; the activity retries once consumed.
+            try:
+                os.link(temporary, target)
+            except FileExistsError as error:
+                raise RuntimeError("GITHUB_POLICY_REQUEST_PENDING") from error
         finally:
             temporary.unlink(missing_ok=True)
 

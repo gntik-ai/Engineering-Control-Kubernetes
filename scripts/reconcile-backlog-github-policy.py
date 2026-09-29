@@ -520,7 +520,10 @@ def main() -> int:
                     install_policy(args.policy, args.backup_root, group_id, enabled=False)
         print("GITHUB_BACKLOG_POLICY_EXPIRY_PASS")
         return 0
+    request_bytes = args.request.read_bytes()
     request = read_request(args.request, api_uid)
+    if json.loads(request_bytes.decode("utf-8")) != request:
+        raise ValueError("GitHub policy request changed while it was read")
     kept_for: UUID | None = None
     with Session(engine) as session, session.begin():
         campaign = validate_campaign(session, request)
@@ -531,7 +534,15 @@ def main() -> int:
             install_policy(args.policy, args.backup_root, group_id, enabled=enable)
         if enable:
             campaign.status = "APPROVED"
-    args.request.unlink()
+    # NEW-94 review: consume only the request that was reconciled. Writers no longer
+    # overwrite a pending request, so a different file here is a newer request; leave it for
+    # the path unit, which re-triggers while activate.json exists.
+    try:
+        current = args.request.read_bytes()
+    except FileNotFoundError:
+        current = None
+    if current == request_bytes:
+        args.request.unlink()
     if kept_for is not None:
         print(f"GITHUB_BACKLOG_POLICY_KEPT_FOR_OWNER {kept_for}")
     else:

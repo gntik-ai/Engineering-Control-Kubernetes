@@ -1465,3 +1465,26 @@ def test_write_policy_block_queues_one_bounded_telegram_notice(tmp_path: Path) -
     assert any(f"backlog-approve musematic {campaign}" in command for command in first["commands"])
     assert hostile["project"] is None and hostile["step"] is None
     assert "backlog-status" in hostile["commands"][0]
+
+
+def test_policy_request_writer_never_overwrites_a_pending_request(tmp_path: Path) -> None:
+    # NEW-94 review: one request file serves every campaign; a late disable must not clobber
+    # a pending enable (or another campaign's disable). The writer refuses while one is
+    # pending, and the activity's retry writes it after the reconciler consumed the first.
+    state_root = tmp_path / "state"
+    (state_root / "github-policy-requests").mkdir(parents=True, mode=0o700)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'writer.sqlite'}",
+        state_root=state_root,
+    )
+    handler = EngineeringActivityHandler(settings)
+    target = state_root / "github-policy-requests" / "activate.json"
+    handler._write_policy_request({"action": "enable-existing-backlog", "n": 1})
+    first = target.read_text()
+    with pytest.raises(RuntimeError, match="GITHUB_POLICY_REQUEST_PENDING"):
+        handler._write_policy_request({"action": "disable-existing-backlog", "n": 2})
+    assert target.read_text() == first
+    assert not list((state_root / "github-policy-requests").glob(".*.tmp"))
+    target.unlink()  # the reconciler consumed it
+    handler._write_policy_request({"action": "disable-existing-backlog", "n": 2})
+    assert json.loads(target.read_text())["n"] == 2
