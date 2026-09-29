@@ -167,6 +167,8 @@ def parser() -> argparse.ArgumentParser:
                 choices=("runtime", "source-revalidation"),
                 default="runtime",
             )
+            # NEW-95: start an R3 issue with the binding of its approved R3 candidate.
+            issue.add_argument("--r3-approval", metavar="BINDING", default=None)
     r3_candidate = commands.add_parser("r3-candidate")
     r3_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
     r3_candidate.add_argument("surface", choices=("source", "deployment"))
@@ -420,6 +422,10 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         if arguments.runtime_proof != "runtime":
             # NEW-88: sent only when waived, so the default request is unchanged.
             solve["runtime_proof"] = arguments.runtime_proof
+        if arguments.r3_approval is not None:
+            # NEW-95: an approved R3 candidate lifts the bound to R3 for this issue only.
+            solve["maximum_risk"] = "R3"
+            solve["r3_approval_binding"] = arguments.r3_approval
         return client.request("POST", "/v1/commands", solve)
     if command == "r3-candidate":
         query = httpx.QueryParams(

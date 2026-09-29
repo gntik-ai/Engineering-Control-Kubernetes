@@ -47,6 +47,9 @@ class SolveIssueCommand(OperationModel):
     # current-source revalidation as the proof of a RUNTIME/DEPLOYMENT_REQUIRED issue (no step
     # can record a runtime reproduction, and source-pr deploys nothing to verify afterwards).
     runtime_proof: Literal["runtime", "source-revalidation"] = "runtime"
+    # NEW-95: an R3 issue runs only with the binding of its operator-approved R3 candidate
+    # (r3-candidate -> r3-approve); the preflight re-verifies it against the current issue.
+    r3_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     correction_limit: int = Field(default=2, ge=0, le=5)
     production: Literal[False] = False
 
@@ -54,6 +57,10 @@ class SolveIssueCommand(OperationModel):
     def source_revalidation_is_source_pr_only(self) -> SolveIssueCommand:
         if self.runtime_proof == "source-revalidation" and self.delivery_mode != "source-pr":
             raise ValueError("runtime proof by source revalidation requires source-pr delivery")
+        if self.r3_approval_binding is not None and self.maximum_risk.value != "R3":
+            # An R3 bound without a binding stays a preflight blocker
+            # (R3_OPERATOR_ACTION_REQUIRED); a binding only ever lifts the bound to R3.
+            raise ValueError("an R3 approval binding requires maximum_risk R3")
         return self
 
 
