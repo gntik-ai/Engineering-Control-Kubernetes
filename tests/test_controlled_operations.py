@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
@@ -2319,7 +2321,6 @@ def test_selection_rechecks_the_import_filter_for_legacy_deferred_r3_rows() -> N
     # DEFERRED/R3_REQUIRES_OPERATOR although the campaign filter excludes them; selection
     # re-checks the filter so an approval can never run them.
     from types import SimpleNamespace
-    from typing import Any
 
     from engineering_control.activities.engineering import _deferred_r3_row_in_filter
 
@@ -2345,3 +2346,155 @@ def test_selection_rechecks_the_import_filter_for_legacy_deferred_r3_rows() -> N
     assert not _deferred_r3_row_in_filter(row("PRODUCT_BUG", body=None), "all")
     # Eligible rows were admitted by the filter at import and are left unchanged.
     assert _deferred_r3_row_in_filter(row("ENHANCEMENT", "READY"), "bugs")
+
+
+async def test_a_runless_started_operation_is_released_only_once_temporal_reports_it_closed(
+    tmp_path: Path,
+) -> None:
+    # NEW-97: falcone #953's first R3 start was blocked at selection before its loop
+    # registered a Run, so the operation stayed STARTED and every later start was refused
+    # as ISSUE_WORKFLOW_ALREADY_ACTIVE. A missing Run alone proves nothing (a start can be
+    # slow or retrying), so only the operation's own closed Temporal run releases it.
+    repository = _repository(tmp_path)
+    created = datetime.now(UTC) - timedelta(days=1)
+    statuses = {"run-a": "RUNNING", "run-b": "RUNNING", "run-c": "RUNNING"}
+    with repository.sessions.begin() as session:
+        for index, key in enumerate("abc"):
+            session.add(
+                OperationRequest(
+                    action="solve_issue",
+                    target_type="github_issue",
+                    target_id=f"gntik-ai/falcone#95{index}",
+                    payload_json={},
+                    source_channel="cli",
+                    operator_class="operator",
+                    idempotency_key=key * 64,
+                    binding_hash=key * 64,
+                    status="STARTED",
+                    workflow_id=f"backlog-loop-falcone-{key}",
+                    temporal_run_id=f"run-{key}",
+                    created_at=created + timedelta(minutes=index),
+                )
+            )
+        session.add(
+            Run(
+                workflow_id="backlog-loop-falcone-b",
+                run_type="existing-backlog-loop",
+                status="RUNNING",
+                project="falcone",
+            )
+        )
+    seen: list[tuple[str, str]] = []
+
+    async def workflow_run_status(workflow_id: str, run_id: str) -> str:
+        seen.append((workflow_id, run_id))
+        if run_id not in statuses:
+            raise RuntimeError("not found")
+        return statuses[run_id]
+
+    control = Mock()
+    control.workflow_run_status = workflow_run_status
+    bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
+
+    # Only operations without a Run are candidates, checked by their own run ID.
+    assert [row[1] for row in await repository.runless_started_operations()] == [
+        "backlog-loop-falcone-a",
+        "backlog-loop-falcone-c",
+    ]
+    assert await bus.reconcile_runless_operations() == 0
+    assert seen == [("backlog-loop-falcone-a", "run-a"), ("backlog-loop-falcone-c", "run-c")]
+    # Pages resume after the last row, so a still-running oldest operation never hides
+    # a newer closed one.
+    first = await repository.runless_started_operations(limit=1)
+    assert [row[1] for row in first] == ["backlog-loop-falcone-a"]
+    after = (first[0][3], first[0][0])
+    assert [row[1] for row in await repository.runless_started_operations(after=after)] == [
+        "backlog-loop-falcone-c"
+    ]
+    del statuses["run-a"]  # an unknown state fails closed
+    statuses["run-c"] = "CONTINUED_AS_NEW"  # the chain is still alive
+    statuses["run-b"] = "COMPLETED"  # has a Run: left to the Run state
+    bus._runless_cursor = None
+    assert await bus.reconcile_runless_operations() == 0
+    statuses["run-a"] = "COMPLETED"
+    bus._runless_cursor = None
+    assert await bus.reconcile_runless_operations() == 1
+    with repository.sessions() as session:
+        stored = {
+            row.workflow_id: row.status for row in session.scalars(select(OperationRequest))
+        }
+    assert stored == {
+        "backlog-loop-falcone-a": "COMPLETED",
+        "backlog-loop-falcone-b": "STARTED",
+        "backlog-loop-falcone-c": "STARTED",
+    }
+
+
+async def test_a_hanging_runless_sweep_never_delays_operation_dispatch() -> None:
+    from engineering_control.operations.service import operation_dispatch_loop
+
+    dispatched = asyncio.Event()
+    swept = asyncio.Event()
+
+    async def dispatch_pending() -> bool:
+        dispatched.set()
+        return False
+
+    async def reconcile_runless_operations() -> int:
+        swept.set()
+        await asyncio.Event().wait()  # a Temporal call that never answers
+        return 0
+
+    bus = Mock()
+    bus.dispatch_pending = dispatch_pending
+    bus.reconcile_runless_operations = reconcile_runless_operations
+    stop = asyncio.Event()
+    task = asyncio.create_task(operation_dispatch_loop(bus, stop))
+    await asyncio.wait_for(swept.wait(), timeout=2)
+    await asyncio.wait_for(dispatched.wait(), timeout=2)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+
+async def test_a_runless_sweep_cut_short_resumes_at_the_unchecked_operation(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    created = datetime.now(UTC) - timedelta(days=1)
+    with repository.sessions.begin() as session:
+        for index, key in enumerate("ab"):
+            session.add(
+                OperationRequest(
+                    action="solve_issue",
+                    target_type="github_issue",
+                    target_id=f"gntik-ai/falcone#96{index}",
+                    payload_json={},
+                    source_channel="cli",
+                    operator_class="operator",
+                    idempotency_key=key * 64,
+                    binding_hash=key * 64,
+                    status="STARTED",
+                    workflow_id=f"backlog-loop-falcone-{key}",
+                    temporal_run_id=f"run-{key}",
+                    created_at=created + timedelta(minutes=index),
+                )
+            )
+    hang = {"run-b"}
+    seen: list[str] = []
+
+    async def workflow_run_status(workflow_id: str, run_id: str) -> str:
+        seen.append(run_id)
+        if run_id in hang:
+            await asyncio.Event().wait()
+        return "COMPLETED"
+
+    control = Mock()
+    control.workflow_run_status = workflow_run_status
+    bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(bus.reconcile_runless_operations(), timeout=0.5)
+    hang.clear()
+    assert await bus.reconcile_runless_operations() == 1
+    assert seen == ["run-a", "run-b", "run-b"]  # b was not skipped after the cut
+    with repository.sessions() as session:
+        assert {row.status for row in session.scalars(select(OperationRequest))} == {"COMPLETED"}

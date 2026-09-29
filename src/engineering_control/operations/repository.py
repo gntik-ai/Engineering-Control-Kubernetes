@@ -12,7 +12,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import yaml
-from sqlalchemy import create_engine, desc, func, select
+from sqlalchemy import and_, create_engine, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -1261,6 +1261,7 @@ class OperationsRepository:
         )
         if exclude_operation_id is not None:
             statement = statement.where(OperationRequest.id != exclude_operation_id)
+        now = datetime.now(UTC)
         for operation in session.scalars(statement):
             if operation.status == "STARTED" and operation.workflow_id:
                 workflow_state = self._workflow_state(session, operation.workflow_id)
@@ -1269,10 +1270,72 @@ class OperationsRepository:
                     and workflow_state.upper() in _TERMINAL_WORKFLOW_STATES
                 ):
                     operation.status = "COMPLETED"
-                    operation.completed_at = operation.completed_at or datetime.now(UTC)
+                    operation.completed_at = operation.completed_at or now
                     continue
             return operation
         return None
+
+    async def runless_started_operations(
+        self, *, after: tuple[datetime, UUID] | None = None, limit: int = 20
+    ) -> list[tuple[UUID, str, str, datetime]]:
+        return await asyncio.to_thread(self._runless_started_operations, after, limit)
+
+    def _runless_started_operations(
+        self, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[tuple[UUID, str, str, datetime]]:
+        # NEW-97: a workflow that ended before recording a Run leaves its operation STARTED.
+        # Only Temporal can tell whether it is still alive, so the caller checks each one,
+        # paging by (created_at, id) so a long-lived page never hides newer operations.
+        statement = (
+            select(OperationRequest)
+            .where(
+                OperationRequest.status == "STARTED",
+                OperationRequest.workflow_id.is_not(None),
+                OperationRequest.temporal_run_id.is_not(None),
+                ~select(Run.id).where(Run.workflow_id == OperationRequest.workflow_id).exists(),
+                ~select(SolutionLoop.id)
+                .where(SolutionLoop.workflow_id == OperationRequest.workflow_id)
+                .exists(),
+            )
+            .order_by(OperationRequest.created_at, OperationRequest.id)
+            .limit(limit)
+        )
+        if after is not None:
+            created_at, operation_id = after
+            statement = statement.where(
+                or_(
+                    OperationRequest.created_at > created_at,
+                    and_(
+                        OperationRequest.created_at == created_at,
+                        OperationRequest.id > operation_id,
+                    ),
+                )
+            )
+        with self.sessions() as session:
+            return [
+                (
+                    row.id,
+                    cast(str, row.workflow_id),
+                    cast(str, row.temporal_run_id),
+                    row.created_at,
+                )
+                for row in session.scalars(statement)
+            ]
+
+    async def complete_closed_runless_operation(self, operation_id: UUID) -> bool:
+        return await asyncio.to_thread(self._complete_closed_runless_operation, operation_id)
+
+    def _complete_closed_runless_operation(self, operation_id: UUID) -> bool:
+        """Complete a STARTED operation whose workflow Temporal reports closed without a Run."""
+        with self.sessions.begin() as session:
+            row = session.get(OperationRequest, operation_id, with_for_update=True)
+            if row is None or row.status != "STARTED" or not row.workflow_id:
+                return False
+            if self._workflow_state(session, row.workflow_id) is not None:
+                return False
+            row.status = "COMPLETED"
+            row.completed_at = row.completed_at or datetime.now(UTC)
+            return True
 
     async def capability(
         self,

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import secrets
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -45,6 +48,14 @@ from engineering_control.operations.models import (
 )
 from engineering_control.operations.repository import OperationsRepository
 
+_LOG = logging.getLogger(__name__)
+_CLOSED_WORKFLOW_STATUSES = frozenset(
+    {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
+)
+_RUNLESS_RECONCILE_SECONDS = 60.0
+_RUNLESS_DESCRIBE_SECONDS = 10.0
+_RUNLESS_PAGE_SIZE = 20
+
 
 class TypedCommandBus:
     """One allowlisted application command path for dashboard, Telegram, and CLI."""
@@ -59,6 +70,7 @@ class TypedCommandBus:
         self.metadata = metadata
         self.operations = operations
         self.connections = ConnectionHealthProjector(operations)
+        self._runless_cursor: tuple[datetime, UUID] | None = None
 
     async def submit(
         self,
@@ -164,6 +176,48 @@ class TypedCommandBus:
                     message="Typed operation started one durable workflow",
                     workflow_id=accepted.workflow_id,
                 )
+
+    async def reconcile_runless_operations(self) -> int:
+        """Complete STARTED operations whose workflow closed before recording a Run (NEW-97).
+
+        Each pass checks one page and resumes after it next time, so operations that stay
+        running never starve newer ones. A continued-as-new or unknown run stays active.
+        """
+        page = await self.operations.runless_started_operations(
+            after=self._runless_cursor, limit=_RUNLESS_PAGE_SIZE
+        )
+        released = 0
+        for operation_id, workflow_id, run_id, created_at in page:
+            released += await self._reconcile_runless_operation(operation_id, workflow_id, run_id)
+            # Advance only past checked rows, so a pass cut short resumes at the unchecked one.
+            self._runless_cursor = (created_at, operation_id)
+        if len(page) < _RUNLESS_PAGE_SIZE:
+            self._runless_cursor = None
+        return released
+
+    async def _reconcile_runless_operation(
+        self, operation_id: UUID, workflow_id: str, run_id: str
+    ) -> int:
+        try:
+            status = await asyncio.wait_for(
+                self.control.workflow_run_status(workflow_id, run_id),
+                timeout=_RUNLESS_DESCRIBE_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - an unknown state keeps the operation active
+            _LOG.warning("runless operation %s: workflow state unavailable", operation_id)
+            return 0
+        if status not in _CLOSED_WORKFLOW_STATUSES:
+            return 0
+        if not await self.operations.complete_closed_runless_operation(operation_id):
+            return 0
+        await self.operations.record_dispatch_event(
+            operation_id,
+            event_type="operation.completed",
+            level="INFO",
+            message="Typed operation workflow closed before recording a run",
+            workflow_id=workflow_id,
+        )
+        return 1
 
     policy_activation_timeout_seconds = 60.0
     policy_activation_poll_seconds = 2.0
@@ -429,10 +483,31 @@ class TypedCommandBus:
 
 
 async def operation_dispatch_loop(bus: TypedCommandBus, stop: asyncio.Event) -> None:
+    # NEW-97: the run-less sweep runs beside dispatch so slow Temporal calls never delay it.
+    reconciler = asyncio.create_task(_runless_reconcile_loop(bus, stop))
+    try:
+        while not stop.is_set():
+            worked = await bus.dispatch_pending()
+            if not worked:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=0.5)
+                except TimeoutError:
+                    pass
+    finally:
+        reconciler.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reconciler
+
+
+async def _runless_reconcile_loop(bus: TypedCommandBus, stop: asyncio.Event) -> None:
     while not stop.is_set():
-        worked = await bus.dispatch_pending()
-        if not worked:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=0.5)
-            except TimeoutError:
-                pass
+        try:
+            await asyncio.wait_for(
+                bus.reconcile_runless_operations(), timeout=_RUNLESS_RECONCILE_SECONDS
+            )
+        except Exception:  # noqa: BLE001 - reconciliation must never stop the service
+            _LOG.warning("runless operation reconciliation failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=_RUNLESS_RECONCILE_SECONDS)
+        except TimeoutError:
+            pass
