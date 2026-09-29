@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -66,6 +67,7 @@ class TypedCommandBus:
         self.metadata = metadata
         self.operations = operations
         self.connections = ConnectionHealthProjector(operations)
+        self._runless_cursor: tuple[datetime, UUID] | None = None
 
     async def submit(
         self,
@@ -173,15 +175,21 @@ class TypedCommandBus:
                 )
 
     async def reconcile_runless_operations(self) -> int:
-        """Complete STARTED operations whose workflow closed before recording a Run (NEW-97)."""
+        """Complete STARTED operations whose workflow closed before recording a Run (NEW-97).
+
+        Each pass checks one page and resumes after it next time, so operations that stay
+        running never starve newer ones. A continued-as-new or unknown run stays active.
+        """
+        page = await self.operations.runless_started_operations(after=self._runless_cursor)
+        self._runless_cursor = (page[-1][3], page[-1][0]) if page else None
         released = 0
-        for operation_id, workflow_id in await self.operations.runless_started_operations():
+        for operation_id, workflow_id, run_id, _created_at in page:
             try:
-                description = await self.control.get_workflow(workflow_id)
+                status = await self.control.workflow_run_status(workflow_id, run_id)
             except Exception:  # noqa: BLE001 - an unknown state keeps the operation active
                 _LOG.warning("runless operation %s: workflow state unavailable", operation_id)
                 continue
-            if str(description.get("status")) not in _CLOSED_WORKFLOW_STATUSES:
+            if status not in _CLOSED_WORKFLOW_STATUSES:
                 continue
             if await self.operations.complete_closed_runless_operation(operation_id):
                 released += 1

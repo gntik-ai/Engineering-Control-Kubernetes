@@ -73,6 +73,7 @@ class ControlService(Protocol):
         self, request: RuntimeVerificationStart
     ) -> OperationAccepted: ...
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]: ...
+    async def workflow_run_status(self, workflow_id: str, run_id: str) -> str: ...
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
     async def start_acceptance(
         self, request: AcceptanceLifecycleStart, validation_root: str
@@ -324,6 +325,11 @@ class TemporalControlService:
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
+
+    async def workflow_run_status(self, workflow_id: str, run_id: str) -> str:
+        """Status of one execution, not of whatever later run reused the workflow ID."""
+        description = await self.client.get_workflow_handle(workflow_id, run_id=run_id).describe()
+        return description.status.name if description.status is not None else "UNKNOWN"
 
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         handle = self.client.get_workflow_handle(workflow_id)

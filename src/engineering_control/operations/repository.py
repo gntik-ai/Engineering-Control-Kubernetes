@@ -12,7 +12,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import yaml
-from sqlalchemy import create_engine, desc, func, select
+from sqlalchemy import and_, create_engine, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -1275,29 +1275,52 @@ class OperationsRepository:
             return operation
         return None
 
-    async def runless_started_operations(self, *, limit: int = 20) -> list[tuple[UUID, str]]:
-        return await asyncio.to_thread(self._runless_started_operations, limit)
+    async def runless_started_operations(
+        self, *, after: tuple[datetime, UUID] | None = None, limit: int = 20
+    ) -> list[tuple[UUID, str, str, datetime]]:
+        return await asyncio.to_thread(self._runless_started_operations, after, limit)
 
-    def _runless_started_operations(self, limit: int) -> list[tuple[UUID, str]]:
+    def _runless_started_operations(
+        self, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[tuple[UUID, str, str, datetime]]:
         # NEW-97: a workflow that ended before recording a Run leaves its operation STARTED.
-        # Only Temporal can tell whether it is still alive, so the caller checks each one.
-        with self.sessions() as session:
-            rows = session.scalars(
-                select(OperationRequest)
-                .where(
-                    OperationRequest.status == "STARTED",
-                    OperationRequest.workflow_id.is_not(None),
-                )
-                .order_by(OperationRequest.created_at)
+        # Only Temporal can tell whether it is still alive, so the caller checks each one,
+        # paging by (created_at, id) so a long-lived page never hides newer operations.
+        statement = (
+            select(OperationRequest)
+            .where(
+                OperationRequest.status == "STARTED",
+                OperationRequest.workflow_id.is_not(None),
+                OperationRequest.temporal_run_id.is_not(None),
+                ~select(Run.id).where(Run.workflow_id == OperationRequest.workflow_id).exists(),
+                ~select(SolutionLoop.id)
+                .where(SolutionLoop.workflow_id == OperationRequest.workflow_id)
+                .exists(),
             )
-            found: list[tuple[UUID, str]] = []
-            for row in rows:
-                workflow_id = cast(str, row.workflow_id)
-                if self._workflow_state(session, workflow_id) is None:
-                    found.append((row.id, workflow_id))
-                    if len(found) >= limit:
-                        break
-            return found
+            .order_by(OperationRequest.created_at, OperationRequest.id)
+            .limit(limit)
+        )
+        if after is not None:
+            created_at, operation_id = after
+            statement = statement.where(
+                or_(
+                    OperationRequest.created_at > created_at,
+                    and_(
+                        OperationRequest.created_at == created_at,
+                        OperationRequest.id > operation_id,
+                    ),
+                )
+            )
+        with self.sessions() as session:
+            return [
+                (
+                    row.id,
+                    cast(str, row.workflow_id),
+                    cast(str, row.temporal_run_id),
+                    row.created_at,
+                )
+                for row in session.scalars(statement)
+            ]
 
     async def complete_closed_runless_operation(self, operation_id: UUID) -> bool:
         return await asyncio.to_thread(self._complete_closed_runless_operation, operation_id)

@@ -2353,16 +2353,17 @@ async def test_a_runless_started_operation_is_released_only_once_temporal_report
     # NEW-97: falcone #953's first R3 start was blocked at selection before its loop
     # registered a Run, so the operation stayed STARTED and every later start was refused
     # as ISSUE_WORKFLOW_ALREADY_ACTIVE. A missing Run alone proves nothing (a start can be
-    # slow or retrying), so only a closed Temporal workflow releases the operation.
+    # slow or retrying), so only the operation's own closed Temporal run releases it.
     repository = _repository(tmp_path)
-    statuses = {"backlog-loop-falcone-a": "RUNNING", "backlog-loop-falcone-b": "RUNNING"}
+    created = datetime.now(UTC) - timedelta(days=1)
+    statuses = {"run-a": "RUNNING", "run-b": "RUNNING", "run-c": "RUNNING"}
     with repository.sessions.begin() as session:
-        for key in ("a", "b"):
+        for index, key in enumerate("abc"):
             session.add(
                 OperationRequest(
                     action="solve_issue",
                     target_type="github_issue",
-                    target_id=f"gntik-ai/falcone#95{ord(key) - 96}",
+                    target_id=f"gntik-ai/falcone#95{index}",
                     payload_json={},
                     source_channel="cli",
                     operator_class="operator",
@@ -2370,7 +2371,8 @@ async def test_a_runless_started_operation_is_released_only_once_temporal_report
                     binding_hash=key * 64,
                     status="STARTED",
                     workflow_id=f"backlog-loop-falcone-{key}",
-                    created_at=datetime.now(UTC) - timedelta(days=1),
+                    temporal_run_id=f"run-{key}",
+                    created_at=created + timedelta(minutes=index),
                 )
             )
         session.add(
@@ -2381,25 +2383,40 @@ async def test_a_runless_started_operation_is_released_only_once_temporal_report
                 project="falcone",
             )
         )
+    seen: list[tuple[str, str]] = []
 
-    async def get_workflow(workflow_id: str) -> dict[str, Any]:
-        if workflow_id not in statuses:
+    async def workflow_run_status(workflow_id: str, run_id: str) -> str:
+        seen.append((workflow_id, run_id))
+        if run_id not in statuses:
             raise RuntimeError("not found")
-        return {"workflow_id": workflow_id, "status": statuses[workflow_id]}
+        return statuses[run_id]
 
     control = Mock()
-    control.get_workflow = get_workflow
+    control.workflow_run_status = workflow_run_status
     bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
 
-    # Only the operation without a Run is a candidate; a live workflow keeps it active.
-    assert [workflow for _, workflow in await repository.runless_started_operations()] == [
-        "backlog-loop-falcone-a"
+    # Only operations without a Run are candidates, checked by their own run ID.
+    assert [row[1] for row in await repository.runless_started_operations()] == [
+        "backlog-loop-falcone-a",
+        "backlog-loop-falcone-c",
     ]
     assert await bus.reconcile_runless_operations() == 0
-    del statuses["backlog-loop-falcone-a"]
-    assert await bus.reconcile_runless_operations() == 0  # an unknown state fails closed
-    statuses["backlog-loop-falcone-a"] = "COMPLETED"
-    statuses["backlog-loop-falcone-b"] = "COMPLETED"  # has a Run: left to the Run state
+    assert seen == [("backlog-loop-falcone-a", "run-a"), ("backlog-loop-falcone-c", "run-c")]
+    # Pages resume after the last row, so a still-running oldest operation never hides
+    # a newer closed one.
+    first = await repository.runless_started_operations(limit=1)
+    assert [row[1] for row in first] == ["backlog-loop-falcone-a"]
+    after = (first[0][3], first[0][0])
+    assert [row[1] for row in await repository.runless_started_operations(after=after)] == [
+        "backlog-loop-falcone-c"
+    ]
+    del statuses["run-a"]  # an unknown state fails closed
+    statuses["run-c"] = "CONTINUED_AS_NEW"  # the chain is still alive
+    statuses["run-b"] = "COMPLETED"  # has a Run: left to the Run state
+    bus._runless_cursor = None
+    assert await bus.reconcile_runless_operations() == 0
+    statuses["run-a"] = "COMPLETED"
+    bus._runless_cursor = None
     assert await bus.reconcile_runless_operations() == 1
     with repository.sessions() as session:
         stored = {
@@ -2408,4 +2425,5 @@ async def test_a_runless_started_operation_is_released_only_once_temporal_report
     assert stored == {
         "backlog-loop-falcone-a": "COMPLETED",
         "backlog-loop-falcone-b": "STARTED",
+        "backlog-loop-falcone-c": "STARTED",
     }
