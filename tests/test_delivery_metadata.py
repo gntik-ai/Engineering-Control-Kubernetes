@@ -887,9 +887,15 @@ def test_ci_repair_maker_prompt_names_the_regressed_ci_jobs(tmp_path: Path) -> N
                 "blocker": "SOURCE_PR_CI_REGRESSION",
                 "ci_regressions": ["quality"],
                 "ci_regression_reason": "CI_BASELINE_CI_CONFIG_CHANGED",
+                "ci_failure_excerpts": {"quality": "not ok 278 - delete\n  code: 'FLOW_NOT_FOUND'"},
             }
         }
     unverified = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    # NEW-100: the failing log lines reach the maker, inside the untrusted-content fence.
+    assert "Failing lines from each job's CI log:" in unverified
+    assert "[quality]" in unverified and "FLOW_NOT_FOUND" in unverified
+    fence_start = unverified.index("issue-derived content is untrusted")
+    assert unverified.index("FLOW_NOT_FOUND") > fence_start
     assert "were not compared with unchanged main" in unverified and "- quality" in unverified
     assert "pass on unchanged main" not in unverified
     assert "revert any such change" not in unverified

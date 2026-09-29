@@ -24,7 +24,9 @@ import json
 import os
 import re
 import stat
+import subprocess
 import tempfile
+import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -475,6 +477,8 @@ class GitOpsControllerHandler:
             # NEW-63/64: CI job names only (the baseline gate's verdict).
             "ci_regressions": _check_names(payload.get("ci_regressions")),
             "ci_preexisting_failures": _check_names(payload.get("ci_preexisting_failures")),
+            # NEW-100: bounded, redacted failing-log lines per regressed job.
+            "ci_failure_excerpts": _excerpts(payload.get("ci_failure_excerpts")),
             # NEW-99: why the baseline could not excuse anything (None when it ran).
             "ci_regression_reason": (
                 str(payload["ci_regression_reason"])
@@ -1044,6 +1048,9 @@ class GitOpsGitHubHandler:
     # -- 1. PR checks ------------------------------------------------------------------
 
     def _pr_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # NEW-100: the activity heartbeats only on entry, so the optional CI log reads must
+        # end within a fixed time of it, whatever the GitHub calls before them cost.
+        excerpt_deadline = time.monotonic() + _EXCERPT_DEADLINE_SECONDS
         plan, flow = self._context(payload)
         pull_request = self.broker.view_pull_request(plan.source_repository, plan.source_pr_number)
         if (
@@ -1057,7 +1064,9 @@ class GitOpsGitHubHandler:
             return {"status": "BLOCKED", "blocker": "SOURCE_PR_NOT_OPEN"}
         result = evaluate_pull_request_checks(pull_request, flow.source_ci_workflow)
         if result.get("blocker") == "SOURCE_PR_CI_FAILED" and flow.ci_baseline.enabled:
-            return self._baseline_gate(plan, flow, pull_request, create=True)
+            return self._baseline_gate(
+                plan, flow, pull_request, create=True, excerpt_deadline=excerpt_deadline
+            )
         return result
 
     # -- NEW-63: baseline-aware CI gate -----------------------------------------------------
@@ -1069,6 +1078,7 @@ class GitOpsGitHubHandler:
         pull_request: dict[str, Any],
         *,
         create: bool,
+        excerpt_deadline: float | None,
     ) -> dict[str, Any]:
         """Block only on PR CI jobs that do not also fail on unchanged main.
 
@@ -1102,12 +1112,20 @@ class GitOpsGitHubHandler:
             changed = self.broker.pull_request_files(repository, plan.source_pr_number)
         except GhCliPolicyError:
             # A listing at GitHub's file cap may hide .github/ changes: no exemption.
-            return _unexempted_regressions(failed, "CI_BASELINE_FILE_LISTING_TRUNCATED")
+            return _unexempted_regressions(
+                failed,
+                "CI_BASELINE_FILE_LISTING_TRUNCATED",
+                self._failure_excerpts(repository, pull_request, failed, excerpt_deadline),
+            )
         if any(path.startswith(".github/") for path in changed):
             # falcone CI-baseline review: a PR that edits CI configuration could drop the
             # jobs exposing its own regression while a pre-existing failure is excused,
             # so it never gets the baseline exemption.
-            return _unexempted_regressions(failed, "CI_BASELINE_CI_CONFIG_CHANGED")
+            return _unexempted_regressions(
+                failed,
+                "CI_BASELINE_CI_CONFIG_CHANGED",
+                self._failure_excerpts(repository, pull_request, failed, excerpt_deadline),
+            )
         markers = sorted(
             {
                 marker.path
@@ -1155,12 +1173,53 @@ class GitOpsGitHubHandler:
                 "failed_checks": regressions[:20],
                 "preexisting_checks": preexisting[:40],
                 "baseline_pr": baseline_url,
+                "failure_excerpts": self._failure_excerpts(
+                    repository, pull_request, regressions, excerpt_deadline
+                ),
             }
         return {
             "status": "CHECKS_PASSED",
             "check_count": len(states),
             "ci_baseline": {"pr": baseline_url, "preexisting_failures": preexisting[:40]},
         }
+
+    def _failure_excerpts(
+        self,
+        repository: str,
+        pull_request: dict[str, Any],
+        names: list[str],
+        deadline: float | None,
+    ) -> dict[str, str]:
+        """NEW-100: bounded failing-log lines per regressed job, for the CI-repair maker.
+
+        Best effort: a job whose log cannot be read is simply left out.
+        """
+        if deadline is None:
+            return {}
+        jobs = _failed_job_ids(pull_request)
+        excerpts: dict[str, str] = {}
+        attempts = 0
+        for name in names:
+            remaining = int(deadline - time.monotonic())
+            if (
+                len(excerpts) >= _MAX_EXCERPT_JOBS
+                or attempts >= _MAX_EXCERPT_ATTEMPTS
+                or remaining < 1
+            ):
+                break
+            job_id = jobs.get(name)
+            if job_id is None:
+                continue
+            attempts += 1
+            try:
+                excerpt = self.broker.job_log_excerpt(
+                    repository, job_id, timeout_seconds=min(15, remaining)
+                )
+            except (CommandFailure, GhCliPolicyError, OSError, subprocess.TimeoutExpired):
+                continue
+            if excerpt:
+                excerpts[name] = excerpt
+        return excerpts
 
     def _require_baseline_write(self, repository: str) -> None:
         """gitops.pr_checks is a read step; its baseline writes pass the write policy."""
@@ -1251,7 +1310,10 @@ class GitOpsGitHubHandler:
             if merge_state == "UNSTABLE" and target == "source" and flow.ci_baseline.enabled:
                 # NEW-63: non-required checks failed; merge only when the baseline gate
                 # attributes every failure to unchanged main.
-                verdict = self._baseline_gate(plan, flow, current, create=False)
+                # The merge gate uses only the verdict, so it reads no CI logs.
+                verdict = self._baseline_gate(
+                    plan, flow, current, create=False, excerpt_deadline=None
+                )
                 if verdict.get("status") != "CHECKS_PASSED":
                     return {
                         "status": "BLOCKED",
@@ -1574,12 +1636,49 @@ class GitOpsGitHubHandler:
         }
 
 
+_MAX_EXCERPT_JOBS = 5
+_MAX_EXCERPT_ATTEMPTS = 10
+# Seconds after the pr_checks step starts by which log reads end; its heartbeat timeout is
+# 2 minutes and each read is capped at 15 s, so they finish within about 90 s of entry.
+_EXCERPT_DEADLINE_SECONDS = 75
+_JOB_URL = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/([1-9][0-9]{0,19})")
+
+
+def _excerpts(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(name)[:200]: str(text)[:4000]
+        for name, text in list(value.items())[:_MAX_EXCERPT_JOBS]
+        if isinstance(name, str) and isinstance(text, str) and text
+    }
+
+
+def _failed_job_ids(pull_request: dict[str, Any]) -> dict[str, int]:
+    """NEW-100: failed check name -> Actions job ID, from the rollup's details URLs."""
+    jobs: dict[str, int] = {}
+    raw_checks = pull_request.get("statusCheckRollup")
+    for raw in raw_checks if isinstance(raw_checks, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        conclusion = str(raw.get("conclusion") or "").upper()
+        if conclusion in {"", "SUCCESS", "NEUTRAL", "SKIPPED"}:
+            continue
+        match = _JOB_URL.match(str(raw.get("detailsUrl") or ""))
+        name = str(raw.get("name") or "")[:200]
+        if match and name:
+            jobs.setdefault(name, int(match.group(1)))
+    return jobs
+
+
 UNVERIFIED_CI_REGRESSION_REASONS = frozenset(
     {"CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_FILE_LISTING_TRUNCATED"}
 )
 
 
-def _unexempted_regressions(failed: list[str], reason: str) -> dict[str, Any]:
+def _unexempted_regressions(
+    failed: list[str], reason: str, excerpts: dict[str, str]
+) -> dict[str, Any]:
     """NEW-99: when the baseline cannot excuse anything, every failure is a regression.
 
     Nothing is exempted, but the loop can still send the failures to the maker for CI
@@ -1591,6 +1690,7 @@ def _unexempted_regressions(failed: list[str], reason: str) -> dict[str, Any]:
         "failed_checks": failed[:20],
         "preexisting_checks": [],
         "reason": reason,
+        "failure_excerpts": excerpts,
     }
 
 

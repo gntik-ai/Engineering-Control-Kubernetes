@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import signal
 import subprocess
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 import yaml
 
@@ -47,6 +50,7 @@ class SafeCommandRunner:
         timeout_seconds: int = 900,
         environment: Mapping[str, str] | None = None,
         check: bool = True,
+        max_output_bytes: int | None = None,
     ) -> CommandResult:
         process = self._invoke(
             executable,
@@ -54,6 +58,7 @@ class SafeCommandRunner:
             cwd=cwd,
             timeout_seconds=timeout_seconds,
             environment=environment,
+            max_output_bytes=max_output_bytes,
         )
         stdout = str(self.redactor.redact_text(process.stdout).value)
         stderr = str(self.redactor.redact_text(process.stderr).value)
@@ -150,6 +155,7 @@ class SafeCommandRunner:
         cwd: Path,
         timeout_seconds: int,
         environment: Mapping[str, str] | None,
+        max_output_bytes: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
         resolved = self.allowed_executables.get(executable)
         if resolved is None or not resolved.is_absolute():
@@ -166,6 +172,10 @@ class SafeCommandRunner:
         }
         if environment:
             env.update(environment)
+        if max_output_bytes is not None:
+            return _run_keeping_tail(
+                [str(resolved), *arguments], cwd, env, timeout_seconds, max_output_bytes
+            )
         return subprocess.run(  # noqa: S603 - fixed executable allowlist; shell is never used
             [str(resolved), *arguments],
             cwd=cwd,
@@ -176,6 +186,52 @@ class SafeCommandRunner:
             timeout=timeout_seconds,
             start_new_session=True,
         )
+
+
+def _run_keeping_tail(
+    argv: list[str], cwd: Path, env: dict[str, str], timeout_seconds: int, max_bytes: int
+) -> subprocess.CompletedProcess[str]:
+    """NEW-100: stream output and keep only its last max_bytes (stdout) and 64 KiB
+    (stderr) in memory, so a huge CI log never reaches memory or disk whole."""
+    process = subprocess.Popen(  # noqa: S603 - fixed executable allowlist; no shell
+        argv,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    tails: dict[str, bytes] = {}
+
+    def drain(name: str, stream: IO[bytes], limit: int) -> None:
+        buffer = bytearray()
+        for chunk in iter(lambda: stream.read(65_536), b""):
+            buffer += chunk
+            if len(buffer) > limit:
+                del buffer[: len(buffer) - limit]
+        tails[name] = bytes(buffer)
+
+    readers = [
+        threading.Thread(target=drain, args=("out", process.stdout, max_bytes), daemon=True),
+        threading.Thread(target=drain, args=("err", process.stderr, 65_536), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        return_code = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=10)
+    return subprocess.CompletedProcess(
+        argv,
+        return_code,
+        tails.get("out", b"").decode("utf-8", errors="replace"),
+        tails.get("err", b"").decode("utf-8", errors="replace"),
+    )
 
 
 def minimal_git_environment() -> dict[str, str]:

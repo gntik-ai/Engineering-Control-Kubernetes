@@ -3090,7 +3090,7 @@ class MetadataActivityHandler:
         findings = record.get("findings") if isinstance(record, dict) else None
         return [str(item) for item in findings if isinstance(item, str)] if findings else []
 
-    def _ci_regressions(self, change_set_id: UUID) -> tuple[list[str], bool]:
+    def _ci_regressions(self, change_set_id: UUID) -> tuple[list[str], bool, dict[str, str]]:
         """NEW-64: PR CI jobs the staging baseline gate attributed to this ChangeSet.
 
         NEW-99: the flag is True when the baseline could not run (the PR edits CI
@@ -3102,12 +3102,26 @@ class MetadataActivityHandler:
                 "staging_gitops"
             )
         if not isinstance(record, dict) or record.get("blocker") != "SOURCE_PR_CI_REGRESSION":
-            return [], False
+            return [], False, {}
         names = record.get("ci_regressions")
         if not isinstance(names, list):
-            return [], False
+            return [], False, {}
         unverified = bool(record.get("ci_regression_reason"))
-        return [str(name)[:200] for name in names if isinstance(name, str)][:20], unverified
+        raw = record.get("ci_failure_excerpts")
+        excerpts = (
+            {
+                str(name)[:200]: str(text)[:4000]
+                for name, text in list(raw.items())[:5]
+                if isinstance(name, str) and isinstance(text, str) and text
+            }
+            if isinstance(raw, dict)
+            else {}
+        )
+        return (
+            [str(name)[:200] for name in names if isinstance(name, str)][:20],
+            unverified,
+            excerpts,
+        )
 
     def _prior_checker_findings(self, change_set_id: UUID, workflow_id: str) -> list[str]:
         """Findings of the latest checker that requested changes on an earlier attempt."""
@@ -3192,8 +3206,8 @@ class MetadataActivityHandler:
             ) + "".join(f"- {item}\n" for item in validation_findings)
         # NEW-64: a CI-repair re-delivery names the PR CI jobs the baseline gate attributed
         # to this ChangeSet (they pass on unchanged main).
-        ci_regressions, unverified = (
-            ([], False) if deployment else self._ci_regressions(change_set_id)
+        ci_regressions, unverified, ci_excerpts = (
+            ([], False, {}) if deployment else self._ci_regressions(change_set_id)
         )
         if ci_regressions and unverified:
             derived_content += (
@@ -3220,6 +3234,11 @@ class MetadataActivityHandler:
                 "for reasons outside this ChangeSet (CI tooling, a run against an older main), "
                 "leave it and explain it in open_questions:\n"
             ) + "".join(f"- {name}\n" for name in ci_regressions)
+        if ci_regressions and ci_excerpts:
+            # NEW-100: the failing log lines (CI output is untrusted data, fenced below).
+            derived_content += "Failing lines from each job's CI log:\n" + "".join(
+                f"[{name}]\n{text}\n" for name, text in ci_excerpts.items()
+            )
         dependency_round = 0 if deployment else int(payload.get("dependency_round") or 0)
         resolution = payload.get("dependency_resolution_result")
         if not deployment and dependency_round and isinstance(resolution, dict):

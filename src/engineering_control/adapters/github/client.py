@@ -742,6 +742,22 @@ class GhCliBroker:
             paths.extend(part for part in entry.split("\t") if part)
         return paths
 
+    def job_log_excerpt(self, repository: str, job_id: int, *, timeout_seconds: int = 15) -> str:
+        """NEW-100: the failing lines of one Actions job log, bounded (untrusted text).
+
+        Only the allowlist is checked: the caller's gate already preflighted this repository
+        in the same step, and a second preflight would not be bounded by the read timeout.
+        """
+        repository = self._repository(repository)
+        if job_id < 1:
+            raise GhCliPolicyError("workflow job ID is invalid")
+        raw = self._run(
+            ["api", f"repos/{repository}/actions/jobs/{job_id}/logs"],
+            max_output_bytes=JOB_LOG_TAIL_BYTES,
+            timeout_seconds=timeout_seconds,
+        ).stdout
+        return failure_excerpt(raw)
+
     def create_baseline_branch(
         self, *, repository: str, branch: str, sha: str, change_binding: str
     ) -> None:
@@ -1010,7 +1026,14 @@ class GhCliBroker:
             raise GhCliPolicyError("GitHub write is not bound to an approved control-plane record")
         return repository
 
-    def _run(self, arguments: list[str], *, check_auth: bool = False) -> CommandResult:
+    def _run(
+        self,
+        arguments: list[str],
+        *,
+        check_auth: bool = False,
+        max_output_bytes: int | None = None,
+        timeout_seconds: int = 120,
+    ) -> CommandResult:
         forbidden = {"secret", "environment", "variable", "collaborator"}
         if "auth" in arguments and "token" in arguments:
             raise GhCliPolicyError("gh auth token is prohibited")
@@ -1022,6 +1045,15 @@ class GhCliBroker:
             "GH_PROMPT_DISABLED": "1",
         }
         try:
+            if max_output_bytes is not None:
+                return self.runner.run(
+                    "gh",
+                    arguments,
+                    cwd=self.working_directory,
+                    timeout_seconds=timeout_seconds,
+                    environment=environment,
+                    max_output_bytes=max_output_bytes,
+                )
             return self.runner.run(
                 "gh",
                 arguments,
@@ -1084,6 +1116,46 @@ class GhCliBroker:
         if not resolved.is_file() or not resolved.is_relative_to(self.working_directory.resolve()):
             raise GhCliPolicyError("GitHub body file escaped the broker working directory")
         return resolved
+
+
+# NEW-100: only the tail of a job log is read (failures and the final error are last).
+JOB_LOG_TAIL_BYTES = 2_000_000
+_LOG_PREFIX = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[0-9:.]+Z ")
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_FAILURE_LINE = re.compile(
+    r"^not ok\b|##\[error\]|\b(?:error|failed|failure|assert(?:ion)?|expected|actual|"
+    r"exception|traceback|panic)\b|^\s*(?:throw|at )|^\s*--- FAIL\b|^FAIL\b|"
+    r"\bgot\b.*\bwant\b",
+    re.IGNORECASE,
+)
+_PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
+
+
+def failure_excerpt(
+    raw: str, *, context: int = 8, max_lines: int = 60, max_chars: int = 4000
+) -> str:
+    """NEW-100: keep the lines around each failure marker of a CI log, bounded.
+
+    Timestamps and ANSI colours are stripped; passing test lines never count as markers.
+    """
+    lines = [
+        _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300]
+        for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
+    ]
+    keep: list[int] = []
+    for index, line in enumerate(lines):
+        if _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
+            keep.extend(range(max(0, index - 1), min(len(lines), index + context + 1)))
+    selected: list[str] = []
+    last = -2
+    for index in sorted(set(keep)):
+        if index != last + 1 and selected:
+            selected.append("...")
+        selected.append(lines[index])
+        last = index
+        if len(selected) >= max_lines:
+            break
+    return "\n".join(selected)[:max_chars]
 
 
 GitHubDeliveryAdapter = GhCliBroker
