@@ -747,7 +747,10 @@ class GhCliBroker:
         repository = self._batch(repository)
         if job_id < 1:
             raise GhCliPolicyError("workflow job ID is invalid")
-        raw = self._run(["api", f"repos/{repository}/actions/jobs/{job_id}/logs"]).stdout
+        raw = self._run(
+            ["api", f"repos/{repository}/actions/jobs/{job_id}/logs"],
+            max_output_bytes=JOB_LOG_TAIL_BYTES,
+        ).stdout
         return failure_excerpt(raw)
 
     def create_baseline_branch(
@@ -1018,7 +1021,13 @@ class GhCliBroker:
             raise GhCliPolicyError("GitHub write is not bound to an approved control-plane record")
         return repository
 
-    def _run(self, arguments: list[str], *, check_auth: bool = False) -> CommandResult:
+    def _run(
+        self,
+        arguments: list[str],
+        *,
+        check_auth: bool = False,
+        max_output_bytes: int | None = None,
+    ) -> CommandResult:
         forbidden = {"secret", "environment", "variable", "collaborator"}
         if "auth" in arguments and "token" in arguments:
             raise GhCliPolicyError("gh auth token is prohibited")
@@ -1030,6 +1039,15 @@ class GhCliBroker:
             "GH_PROMPT_DISABLED": "1",
         }
         try:
+            if max_output_bytes is not None:
+                return self.runner.run(
+                    "gh",
+                    arguments,
+                    cwd=self.working_directory,
+                    timeout_seconds=120,
+                    environment=environment,
+                    max_output_bytes=max_output_bytes,
+                )
             return self.runner.run(
                 "gh",
                 arguments,
@@ -1094,11 +1112,14 @@ class GhCliBroker:
         return resolved
 
 
+# NEW-100: only the tail of a job log is read (failures and the final error are last).
+JOB_LOG_TAIL_BYTES = 2_000_000
 _LOG_PREFIX = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[0-9:.]+Z ")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _FAILURE_LINE = re.compile(
     r"^not ok\b|##\[error\]|\b(?:error|failed|failure|assert(?:ion)?|expected|actual|"
-    r"exception|traceback)\b|^\s*(?:throw|at )",
+    r"exception|traceback|panic)\b|^\s*(?:throw|at )|^\s*--- FAIL\b|^FAIL\b|"
+    r"\bgot\b.*\bwant\b",
     re.IGNORECASE,
 )
 _PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
@@ -1113,7 +1134,7 @@ def failure_excerpt(
     """
     lines = [
         _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300]
-        for line in raw[-2_000_000:].splitlines()
+        for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
     ]
     keep: list[int] = []
     for index, line in enumerate(lines):

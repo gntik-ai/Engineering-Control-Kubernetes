@@ -1182,10 +1182,14 @@ class GitOpsGitHubHandler:
         """
         jobs = _failed_job_ids(pull_request)
         excerpts: dict[str, str] = {}
-        for name in names[:_MAX_EXCERPT_JOBS]:
+        attempts = 0
+        for name in names:
+            if len(excerpts) >= _MAX_EXCERPT_JOBS or attempts >= _MAX_EXCERPT_ATTEMPTS:
+                break
             job_id = jobs.get(name)
             if job_id is None:
                 continue
+            attempts += 1
             try:
                 excerpt = self.broker.job_log_excerpt(repository, job_id)
             except (CommandFailure, GhCliPolicyError, OSError):
@@ -1607,6 +1611,7 @@ class GitOpsGitHubHandler:
 
 
 _MAX_EXCERPT_JOBS = 5
+_MAX_EXCERPT_ATTEMPTS = 10
 _JOB_URL = re.compile(r"https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/([1-9][0-9]{0,19})")
 
 

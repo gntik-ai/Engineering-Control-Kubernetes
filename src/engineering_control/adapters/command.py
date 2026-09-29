@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import signal
 import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 import yaml
 
@@ -47,6 +50,7 @@ class SafeCommandRunner:
         timeout_seconds: int = 900,
         environment: Mapping[str, str] | None = None,
         check: bool = True,
+        max_output_bytes: int | None = None,
     ) -> CommandResult:
         process = self._invoke(
             executable,
@@ -54,6 +58,7 @@ class SafeCommandRunner:
             cwd=cwd,
             timeout_seconds=timeout_seconds,
             environment=environment,
+            max_output_bytes=max_output_bytes,
         )
         stdout = str(self.redactor.redact_text(process.stdout).value)
         stderr = str(self.redactor.redact_text(process.stderr).value)
@@ -150,6 +155,7 @@ class SafeCommandRunner:
         cwd: Path,
         timeout_seconds: int,
         environment: Mapping[str, str] | None,
+        max_output_bytes: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
         resolved = self.allowed_executables.get(executable)
         if resolved is None or not resolved.is_absolute():
@@ -166,6 +172,10 @@ class SafeCommandRunner:
         }
         if environment:
             env.update(environment)
+        if max_output_bytes is not None:
+            return _run_keeping_tail(
+                [str(resolved), *arguments], cwd, env, timeout_seconds, max_output_bytes
+            )
         return subprocess.run(  # noqa: S603 - fixed executable allowlist; shell is never used
             [str(resolved), *arguments],
             cwd=cwd,
@@ -175,6 +185,32 @@ class SafeCommandRunner:
             text=True,
             timeout=timeout_seconds,
             start_new_session=True,
+        )
+
+
+def _run_keeping_tail(
+    argv: list[str], cwd: Path, env: dict[str, str], timeout_seconds: int, max_bytes: int
+) -> subprocess.CompletedProcess[str]:
+    """NEW-100: spool output to disk and read back only its last max_bytes (stdout) and
+    64 KiB (stderr), so a huge CI log never has to fit in the worker's memory."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        process = subprocess.Popen(  # noqa: S603 - fixed executable allowlist; no shell
+            argv, cwd=cwd, env=env, stdout=out, stderr=err, start_new_session=True
+        )
+        try:
+            return_code = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise
+
+        def tail(handle: IO[bytes], limit: int) -> str:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - limit))
+            return handle.read(limit).decode("utf-8", errors="replace")
+
+        return subprocess.CompletedProcess(
+            argv, return_code, tail(out, max_bytes), tail(err, 65_536)
         )
 
 

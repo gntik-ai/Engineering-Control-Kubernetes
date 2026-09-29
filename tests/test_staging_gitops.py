@@ -867,6 +867,7 @@ class FakeGh:
         timeout_seconds: int = 900,
         environment: dict[str, str] | None = None,
         check: bool = True,
+        max_output_bytes: int | None = None,
     ) -> CommandResult:
         assert executable == "gh"
         args = list(arguments)
@@ -1744,6 +1745,10 @@ def test_failure_excerpt_keeps_failing_lines_and_drops_passing_ones() -> None:
     assert "##[error]Process completed" in excerpt
     assert "2026-09-29T" not in excerpt  # timestamps stripped
     assert "ok 277" not in excerpt  # passing lines are never markers
+    # Go test output: "--- FAIL" and "got ...; want ..." far from the final error line.
+    go_log = "--- FAIL: TestDelete (0.01s)\n    store_test.go:42: got nil; want flow\n"
+    go = failure_excerpt(go_log + "=== RUN TestOther\n" * 50 + "##[error]exit 1\n", context=1)
+    assert "--- FAIL: TestDelete" in go and "got nil; want flow" in go
     long = failure_excerpt("not ok 1 - x\n" * 10_000)
     assert len(long) <= 4000 and long.count("\n") < 60
 
@@ -1766,3 +1771,38 @@ async def test_unexempted_regressions_carry_bounded_failure_excerpts(tmp_path: P
     assert set(blocked["failure_excerpts"]) == {"quality"}
     assert "FLOW_NOT_FOUND" in blocked["failure_excerpts"]["quality"]
     assert not any("/actions/jobs/13/" in " ".join(call) for call in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_job_logs_do_not_use_up_the_excerpt_budget(tmp_path: Path) -> None:
+    job_url = "https://github.com/gntik-ai/musematic/actions/runs/5/job/{}"
+    checks = [
+        {**_check(f"job-{index}", "FAILURE"), "detailsUrl": job_url.format(100 + index)}
+        for index in range(8)
+    ]
+    handler, fake = _baseline_handler(tmp_path, [".github/workflows/ci.yml"], checks)
+    fake.job_logs = {106: "not ok 1 - six", 107: "not ok 1 - seven"}  # the rest are 404
+
+    blocked = await handler.handle("gitops.pr_checks", {"plan": _plan()})
+
+    assert set(blocked["failure_excerpts"]) == {"job-6", "job-7"}
+
+
+def test_bounded_command_output_keeps_only_the_tail(tmp_path: Path) -> None:
+    # NEW-100 review: a huge CI log must not be read into memory whole.
+    import sys
+
+    from engineering_control.adapters.command import SafeCommandRunner
+
+    runner = SafeCommandRunner({"python": Path(sys.executable)})
+    script = "import sys; sys.stdout.write('a' * 5_000_000 + 'END')"
+    result = runner.run("python", ["-c", script], cwd=tmp_path, max_output_bytes=1000)
+    assert len(result.stdout) == 1000 and result.stdout.endswith("END")
+    failed = runner.run(
+        "python",
+        ["-c", "import sys; sys.exit(3)"],
+        cwd=tmp_path,
+        check=False,
+        max_output_bytes=1000,
+    )
+    assert failed.return_code == 3
