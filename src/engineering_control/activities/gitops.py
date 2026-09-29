@@ -475,6 +475,12 @@ class GitOpsControllerHandler:
             # NEW-63/64: CI job names only (the baseline gate's verdict).
             "ci_regressions": _check_names(payload.get("ci_regressions")),
             "ci_preexisting_failures": _check_names(payload.get("ci_preexisting_failures")),
+            # NEW-99: why the baseline could not excuse anything (None when it ran).
+            "ci_regression_reason": (
+                str(payload["ci_regression_reason"])
+                if payload.get("ci_regression_reason") in UNVERIFIED_CI_REGRESSION_REASONS
+                else None
+            ),
             "ci_baseline_pr": (
                 str(payload["ci_baseline_pr"])
                 if isinstance(payload.get("ci_baseline_pr"), str)
@@ -1096,22 +1102,12 @@ class GitOpsGitHubHandler:
             changed = self.broker.pull_request_files(repository, plan.source_pr_number)
         except GhCliPolicyError:
             # A listing at GitHub's file cap may hide .github/ changes: no exemption.
-            return {
-                "status": "BLOCKED",
-                "blocker": "SOURCE_PR_CI_FAILED",
-                "failed_checks": failed[:20],
-                "reason": "CI_BASELINE_FILE_LISTING_TRUNCATED",
-            }
+            return _unexempted_regressions(failed, "CI_BASELINE_FILE_LISTING_TRUNCATED")
         if any(path.startswith(".github/") for path in changed):
             # falcone CI-baseline review: a PR that edits CI configuration could drop the
             # jobs exposing its own regression while a pre-existing failure is excused,
             # so it never gets the baseline exemption.
-            return {
-                "status": "BLOCKED",
-                "blocker": "SOURCE_PR_CI_FAILED",
-                "failed_checks": failed[:20],
-                "reason": "CI_BASELINE_CI_CONFIG_CHANGED",
-            }
+            return _unexempted_regressions(failed, "CI_BASELINE_CI_CONFIG_CHANGED")
         markers = sorted(
             {
                 marker.path
@@ -1576,6 +1572,26 @@ class GitOpsGitHubHandler:
             "comment_url": comment.get("comment_url"),
             "issue_url": closed.get("issue_url"),
         }
+
+
+UNVERIFIED_CI_REGRESSION_REASONS = frozenset(
+    {"CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_FILE_LISTING_TRUNCATED"}
+)
+
+
+def _unexempted_regressions(failed: list[str], reason: str) -> dict[str, Any]:
+    """NEW-99: when the baseline cannot excuse anything, every failure is a regression.
+
+    Nothing is exempted, but the loop can still send the failures to the maker for CI
+    repair instead of pausing on a PR whose own changes broke its checks (falcone #1001).
+    """
+    return {
+        "status": "BLOCKED",
+        "blocker": "SOURCE_PR_CI_REGRESSION",
+        "failed_checks": failed[:20],
+        "preexisting_checks": [],
+        "reason": reason,
+    }
 
 
 def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:

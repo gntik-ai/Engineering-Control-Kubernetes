@@ -2146,6 +2146,9 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         if checks.get("status") != "CHECKS_PASSED":
             if checks.get("blocker") == "SOURCE_PR_CI_REGRESSION":
                 evidence["ci_regressions"] = checks.get("failed_checks") or []
+                if checks.get("reason"):
+                    # NEW-99: the failures were not compared with unchanged main.
+                    evidence["ci_regression_reason"] = checks.get("reason")
             return self._blocked(checks, "SOURCE_PR_CI_FAILED")
 
         # 2. Ready + merge (source first, then the deployment PR when one exists).

@@ -705,6 +705,29 @@ async def test_staging_gitops_workflow_records_the_ci_baseline_verdict() -> None
     persisted = _scheduled_steps(history)[-1]["payload"]
     assert persisted["ci_regressions"] == ["Lint Frontend"]
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+    assert "ci_regression_reason" not in persisted
+
+    # NEW-99: an unverified regression (the PR edits CI configuration) keeps its reason.
+    unverified, _ = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _gitops_script(
+                **{
+                    "gitops.pr_checks": {
+                        "status": "BLOCKED",
+                        "blocker": "SOURCE_PR_CI_REGRESSION",
+                        "failed_checks": ["quality"],
+                        "preexisting_checks": [],
+                        "reason": "CI_BASELINE_CI_CONFIG_CHANGED",
+                    }
+                }
+            )
+        ),
+    )
+    persisted = _scheduled_steps(unverified)[-1]["payload"]
+    assert persisted["ci_regression_reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(unverified)
 
     passed, _ = await _run_to_history(
         StagingGitOpsDeliveryWorkflow,

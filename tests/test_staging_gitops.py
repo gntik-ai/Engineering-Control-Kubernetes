@@ -783,6 +783,26 @@ async def test_persist_result_records_merge_and_runtime_verified_state(tmp_path:
         {"plan": plan, "outcome": "BLOCKED", "blocker": "IMAGE_NOT_PINNED", "merge_sha": MERGE_SHA},
     )
     assert blocked["change_set_state"] == "SOURCE_MERGED"
+    # NEW-99: only a known unverified-regression reason is recorded.
+    for reason, recorded in (
+        ("CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_CI_CONFIG_CHANGED"),
+        ("ANYTHING_ELSE", None),
+    ):
+        await handler.handle(
+            "gitops.persist_result",
+            {
+                "plan": plan,
+                "outcome": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_REGRESSION",
+                "ci_regressions": ["quality"],
+                "ci_regression_reason": reason,
+            },
+        )
+        with handler.sessions.begin() as session:
+            change_set = session.get(db.ChangeSet, change_set_id)
+            assert change_set is not None
+            record = change_set.recovery_json["staging_gitops"]
+            assert record["ci_regression_reason"] == recorded
     result = await handler.handle(
         "gitops.persist_result",
         {
@@ -1499,16 +1519,24 @@ async def test_baseline_gate_waits_for_pending_pr_checks_and_skips_unmapped_path
         tmp_path / "other", [".github/workflows/ci.yml"], PR_FAILURES
     )
     blocked = await other.handle("gitops.pr_checks", {"plan": _plan()})
-    assert blocked["blocker"] == "SOURCE_PR_CI_FAILED"
+    # NEW-99: nothing is excused, but every failure goes to CI repair as a regression.
+    assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
     assert blocked["reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
+    assert blocked["failed_checks"] == sorted(
+        str(check["name"]) for check in PR_FAILURES if check.get("conclusion") == "FAILURE"
+    )
+    assert blocked["preexisting_checks"] == []
     assert other_fake.branches == {}
+    merge = await other.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert merge == {"status": "BLOCKED", "blocker": "SOURCE_PR_CI_REGRESSION"}
+    assert not any(call[:2] == ["pr", "merge"] for call in other_fake.calls)
 
     # A mixed PR (covered app path plus CI configuration) gets no exemption either.
     mixed, mixed_fake = _baseline_handler(
         tmp_path / "mixed", ["apps/web/x.tsx", ".github/workflows/ci.yml"], PR_FAILURES
     )
     blocked = await mixed.handle("gitops.pr_checks", {"plan": _plan()})
-    assert blocked["blocker"] == "SOURCE_PR_CI_FAILED"
+    assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
     assert blocked["reason"] == "CI_BASELINE_CI_CONFIG_CHANGED"
     assert mixed_fake.branches == {}
 
@@ -1526,6 +1554,8 @@ async def test_baseline_gate_waits_for_pending_pr_checks_and_skips_unmapped_path
     )
     blocked = await capped.handle("gitops.pr_checks", {"plan": _plan()})
     assert blocked["reason"] == "CI_BASELINE_FILE_LISTING_TRUNCATED"
+    assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
+    assert blocked["preexisting_checks"] == []
     assert capped_fake.branches == {}
 
     uncovered, uncovered_fake = _baseline_handler(
