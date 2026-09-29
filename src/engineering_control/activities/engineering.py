@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import and_, create_engine, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.activities.gitops import StagingFlowBlocked, enabled_staging_flow
@@ -22,6 +22,7 @@ from engineering_control.engineering.backlog import (
     BacklogIssueRecord,
     BacklogIssueType,
     GitHubBacklogImportSnapshot,
+    _filter_eligibility,
     approval_binding,
     canonical_sha256,
     classify_issue,
@@ -56,6 +57,43 @@ _TERMINAL_GLOBAL_BLOCKERS = frozenset(
         "NEEDS_PRODUCT_DECISION",
     }
 )
+
+
+def _selectable_backlog_issue() -> Any:
+    """Rows a backlog loop may select: eligible ones, plus R3 rows deferred only because
+    they need an operator's R3 approval. NEW-96: R3 rows are imported as DEFERRED
+    (R3_REQUIRES_OPERATOR), so both selections silently excluded every R3 issue even with
+    an approved R3 candidate; the callers still admit such a row only with a valid one."""
+    return or_(
+        db.BacklogIssueRecord.eligibility_status.in_(
+            {"ELIGIBLE_FOR_REVALIDATION", "ELIGIBLE_FOR_RUNTIME_REVALIDATION", "READY"}
+        ),
+        and_(
+            db.BacklogIssueRecord.eligibility_status == "DEFERRED",
+            db.BacklogIssueRecord.eligibility_reason == "R3_REQUIRES_OPERATOR",
+            db.BacklogIssueRecord.calculated_risk == "R3",
+        ),
+    )
+
+
+def _deferred_r3_row_in_filter(row: db.BacklogIssueRecord, import_filter: str) -> bool:
+    """NEW-96 review: a DEFERRED/R3_REQUIRES_OPERATOR row is selectable only if the
+    campaign's import filter admits its issue type, re-checked at selection so rows
+    imported before the filter-first classification cannot slip through."""
+    if row.eligibility_status != "DEFERRED":
+        return True
+    try:
+        issue_type = BacklogIssueType(row.issue_type)
+    except ValueError:
+        return False
+    snapshot = row.github_snapshot_json if isinstance(row.github_snapshot_json, dict) else {}
+    body = snapshot.get("body_excerpt")
+    if not isinstance(body, str):
+        return False
+    # The same text the import classified on (classify_issue), so "needs product
+    # decision" and similar text rules apply identically.
+    eligible, _ = _filter_eligibility(issue_type, import_filter, f"{row.title}\n{body}".lower())
+    return eligible
 
 
 def verified_backlog_approval(
@@ -993,13 +1031,7 @@ class EngineeringActivityHandler:
                 select(db.BacklogIssueRecord)
                 .where(
                     db.BacklogIssueRecord.backlog_campaign_id == campaign_id,
-                    db.BacklogIssueRecord.eligibility_status.in_(
-                        {
-                            "ELIGIBLE_FOR_REVALIDATION",
-                            "ELIGIBLE_FOR_RUNTIME_REVALIDATION",
-                            "READY",
-                        }
-                    ),
+                    _selectable_backlog_issue(),
                 )
                 .order_by(db.BacklogIssueRecord.planned_order)
             ).all()
@@ -1019,7 +1051,8 @@ class EngineeringActivityHandler:
             selected = [
                 self._serialize_backlog_issue(row)
                 for row in rows
-                if risk_rank.get(row.calculated_risk, 99) <= maximum
+                if _deferred_r3_row_in_filter(row, campaign.import_filter)
+                and risk_rank.get(row.calculated_risk, 99) <= maximum
                 and (
                     row.calculated_risk != "R3"
                     or self._valid_r3_candidate(
@@ -1369,17 +1402,13 @@ class EngineeringActivityHandler:
             candidates: list[tuple[str, db.BacklogIssueRecord]] = []
             awaiting_r3_approval = False
             for project, raw_id in ids.items():
+                inventory = session.get(db.GitHubBacklogCampaign, UUID(str(raw_id)))
+                import_filter = inventory.import_filter if inventory is not None else ""
                 rows = session.scalars(
                     select(db.BacklogIssueRecord).where(
                         db.BacklogIssueRecord.backlog_campaign_id == UUID(str(raw_id)),
                         db.BacklogIssueRecord.delivery_status.in_({"NOT_STARTED", "RETRY_PENDING"}),
-                        db.BacklogIssueRecord.eligibility_status.in_(
-                            {
-                                "ELIGIBLE_FOR_REVALIDATION",
-                                "ELIGIBLE_FOR_RUNTIME_REVALIDATION",
-                                "READY",
-                            }
-                        ),
+                        _selectable_backlog_issue(),
                     )
                 ).all()
                 for row in rows:
@@ -1389,16 +1418,19 @@ class EngineeringActivityHandler:
                         if row.calculated_risk == "R3"
                         else None
                     )
-                    if row.calculated_risk == "R3" and r3_candidate is None:
-                        awaiting_r3_approval = True
-                    if (
-                        reference not in processed
+                    selectable = (
+                        _deferred_r3_row_in_filter(row, import_filter)
+                        and reference not in processed
                         and blocked_until.get(reference, now) <= now
-                        and (
-                            risk_rank.get(row.calculated_risk, 99) <= 2 or r3_candidate is not None
-                        )
                         and row.issue_type != BacklogIssueType.ENHANCEMENT.value
-                    ):
+                    )
+                    if not selectable:
+                        continue
+                    if row.calculated_risk == "R3" and r3_candidate is None:
+                        # NEW-96 review: only an R3 issue the loop would otherwise run makes it
+                        # wait for an approval (not processed, enhancement or blocked rows).
+                        awaiting_r3_approval = True
+                    if risk_rank.get(row.calculated_risk, 99) <= 2 or r3_candidate is not None:
                         candidates.append((project, row))
             if not candidates:
                 metadata["current_issue"] = None

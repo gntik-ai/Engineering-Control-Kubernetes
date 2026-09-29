@@ -2239,3 +2239,109 @@ def test_r3_issue_command_binds_the_risk_bound_to_the_approval() -> None:
     with pytest.raises(ValueError):
         SolveIssueCommand(**base, maximum_risk="R2", r3_approval_binding="a" * 64)
     assert SolveIssueCommand(**base, maximum_risk="R3", r3_approval_binding="a" * 64)
+
+
+def test_backlog_selection_includes_only_operator_approvable_deferred_r3_rows(
+    tmp_path: Path,
+) -> None:
+    # NEW-96: R3 rows are imported DEFERRED (R3_REQUIRES_OPERATOR), and both loop
+    # selections filtered on eligible statuses only, so no R3 issue could ever run even
+    # with an approved R3 candidate (falcone #953, 2026-09-29). The callers still require a
+    # valid approved candidate for every R3 row they admit.
+    from engineering_control.activities.engineering import _selectable_backlog_issue
+
+    repository = _repository(tmp_path)
+    campaign_id = UUID("44444444-4444-4444-8444-444444444444")
+    _seed_r3_issue(
+        repository,
+        campaign_id=campaign_id,
+        project="falcone",
+        source_repository="gntik-ai/falcone",
+        deployment_repository="gntik-ai/falcone-charts",
+        issue_number=953,
+    )
+
+    def selected() -> list[int]:
+        with repository.sessions() as session:
+            return [
+                row.issue_number
+                for row in session.scalars(
+                    select(BacklogIssueRecord).where(_selectable_backlog_issue())
+                ).all()
+            ]
+
+    assert selected() == [953]
+    for reason in ("NEEDS_PRODUCT_DECISION", "ENHANCEMENT_DEFERRED"):
+        with repository.sessions.begin() as session:
+            row = session.scalar(select(BacklogIssueRecord))
+            assert row is not None
+            row.eligibility_reason = reason
+        assert selected() == []
+    with repository.sessions.begin() as session:
+        row = session.scalar(select(BacklogIssueRecord))
+        assert row is not None
+        row.eligibility_reason = "R3_REQUIRES_OPERATOR"
+        row.calculated_risk = "R2"  # a DEFERRED non-R3 row is never included
+    assert selected() == []
+    with repository.sessions.begin() as session:
+        row = session.scalar(select(BacklogIssueRecord))
+        assert row is not None
+        row.eligibility_status = "ELIGIBLE_FOR_REVALIDATION"
+    assert selected() == [953]
+
+
+def test_only_filter_admitted_r3_issues_wait_for_operator_approval() -> None:
+    # NEW-96 review: the import filter applies before R3 deferral, so an R3 issue outside
+    # the campaign's filter keeps its filter reason and can never become selectable.
+    from engineering_control.engineering.backlog import BacklogIssueType, _eligibility
+
+    assert _eligibility(BacklogIssueType.SECURITY_DEFECT, "security", "R3", "") == (
+        False,
+        "R3_REQUIRES_OPERATOR",
+    )
+    assert _eligibility(BacklogIssueType.PRODUCT_BUG, "security", "R3", "") == (
+        False,
+        "FILTER_EXCLUDED",
+    )
+    assert _eligibility(BacklogIssueType.ENHANCEMENT, "bugs", "R3", "") == (
+        False,
+        "ENHANCEMENT_DEFERRED",
+    )
+    assert _eligibility(BacklogIssueType.SPEC_DECISION, "all", "R3", "") == (
+        False,
+        "NEEDS_PRODUCT_DECISION",
+    )
+    assert _eligibility(BacklogIssueType.PRODUCT_BUG, "all", "R2", "")[0] is True
+
+
+def test_selection_rechecks_the_import_filter_for_legacy_deferred_r3_rows() -> None:
+    # NEW-96 review round 2: rows imported before the filter-first classification may be
+    # DEFERRED/R3_REQUIRES_OPERATOR although the campaign filter excludes them; selection
+    # re-checks the filter so an approval can never run them.
+    from types import SimpleNamespace
+    from typing import Any
+
+    from engineering_control.activities.engineering import _deferred_r3_row_in_filter
+
+    def row(
+        issue_type: str, status: str = "DEFERRED", body: object = "Tenant login fails."
+    ) -> Any:
+        return SimpleNamespace(
+            eligibility_status=status,
+            issue_type=issue_type,
+            title="bug: login",
+            github_snapshot_json={"body_excerpt": body} if body is not None else {},
+        )
+
+    assert _deferred_r3_row_in_filter(row("SECURITY_DEFECT"), "security")
+    assert not _deferred_r3_row_in_filter(row("PRODUCT_BUG"), "security")
+    assert not _deferred_r3_row_in_filter(row("ENHANCEMENT"), "bugs")
+    assert not _deferred_r3_row_in_filter(row("NOT_A_TYPE"), "all")
+    assert _deferred_r3_row_in_filter(row("PRODUCT_BUG"), "all")
+    # Review round 3: the text rules apply too, and a missing stored body fails closed.
+    assert not _deferred_r3_row_in_filter(
+        row("SECURITY_DEFECT", body="Needs product decision on the realm model."), "all"
+    )
+    assert not _deferred_r3_row_in_filter(row("PRODUCT_BUG", body=None), "all")
+    # Eligible rows were admitted by the filter at import and are left unchanged.
+    assert _deferred_r3_row_in_filter(row("ENHANCEMENT", "READY"), "bugs")

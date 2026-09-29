@@ -716,6 +716,17 @@ def _wave(
 def _eligibility(
     issue_type: BacklogIssueType, import_filter: str, risk: str, text: str
 ) -> tuple[bool, str]:
+    eligible, reason = _filter_eligibility(issue_type, import_filter, text)
+    if eligible and risk == "R3":
+        # NEW-96 review: only an issue the campaign's import filter admits can wait for an
+        # operator's R3 approval (and so become selectable once approved).
+        return False, "R3_REQUIRES_OPERATOR"
+    return eligible, reason
+
+
+def _filter_eligibility(
+    issue_type: BacklogIssueType, import_filter: str, text: str
+) -> tuple[bool, str]:
     terminal = {
         BacklogIssueType.DUPLICATE: "DUPLICATE",
         BacklogIssueType.STALE: "STALE_REQUIRES_CURRENT_EVIDENCE",
@@ -727,8 +738,6 @@ def _eligibility(
     }
     if issue_type in terminal:
         return False, terminal[issue_type]
-    if risk == "R3":
-        return False, "R3_REQUIRES_OPERATOR"
     if issue_type is BacklogIssueType.ENHANCEMENT:
         return (
             (True, "FILTER_MATCH_PENDING_REVALIDATION")
