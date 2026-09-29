@@ -816,3 +816,39 @@ def test_disable_proceeds_without_another_unexpired_owner(
         )
     with Session(engine) as session:
         assert OTHER_OWNER(session, ending, now) is None
+
+
+def test_a_tampered_or_incomplete_owner_never_keeps_the_policy(tmp_path: Path) -> None:
+    # NEW-94 review: only fully verified approval evidence keeps the shared policy enabled;
+    # a forged future expires_at (binding hash no longer matches) or missing approval
+    # evidence counts as no owner, both for a disable request and for the expiry pass.
+    now = datetime.now(UTC)
+    ending = UUID("11111111-1111-4111-8111-111111111111")
+    other = UUID("22222222-2222-4222-8222-222222222222")
+    for name, mutate in (
+        (
+            "forged-expiry",
+            lambda e: e["binding"].update(expires_at=(now + timedelta(days=9)).isoformat()),
+        ),
+        ("no-approval-actor", lambda e: e["approval"].pop("approved_by")),
+        ("wrong-phrase", lambda e: e["approval"].update(typed_confirmation="yes")),
+    ):
+        engine = create_engine(f"sqlite:///{tmp_path / (name + '.sqlite')}")
+        Base.metadata.create_all(engine)
+        owner = campaign(
+            other, project="falcone", status="RUNNING", role="owner", now=now - timedelta(days=2)
+        )
+        evidence = json.loads(json.dumps(owner.approval_json))
+        mutate(evidence)
+        owner.approval_json = evidence
+        with Session(engine) as session, session.begin():
+            session.add_all(
+                [
+                    campaign(ending, project="falcone", status="CANCELLED", role="owner", now=now),
+                    owner,
+                ]
+            )
+        with Session(engine) as session:
+            assert OTHER_OWNER(session, ending, now) is None, name
+        with Session(engine) as session, session.begin():
+            assert EXPIRE_CAMPAIGNS(session, now) is True, name

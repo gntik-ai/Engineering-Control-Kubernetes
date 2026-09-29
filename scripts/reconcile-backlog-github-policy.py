@@ -206,13 +206,46 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
 OWNER_STATUSES = {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING", "PAUSED"}
 
 
-def binding_expires_at(campaign: GitHubBacklogCampaign) -> datetime | None:
-    raw_binding = campaign.approval_json.get("binding")
-    binding = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
-    try:
-        expires_at = datetime.fromisoformat(str(binding.get("expires_at")))
-    except (TypeError, ValueError):
+def verified_owner_expiry(campaign: GitHubBacklogCampaign) -> datetime | None:
+    """NEW-94 review: the expiry of an owner approval whose evidence fully verifies (exact
+    binding hashing to the stored approval_binding, reauthenticated operator, typed phrase,
+    approved_at, the project's repository pair, never production); None otherwise, so a
+    tampered or incomplete row can never keep the shared policy enabled."""
+    evidence = campaign.approval_json
+    if not isinstance(evidence, dict) or evidence.get("policy_role") not in {None, "owner"}:
         return None
+    nested = "binding" in evidence or "approval" in evidence
+    binding = evidence.get("binding") if nested else evidence
+    approval = evidence.get("approval") if nested else evidence
+    if not isinstance(binding, dict) or not isinstance(approval, dict):
+        return None
+    try:
+        exact = BacklogApprovalBinding.model_validate(
+            {field: binding.get(field) for field in BacklogApprovalBinding.model_fields}
+        )
+    except ValueError:
+        return None
+    if canonical_sha256(exact.model_dump(mode="json")) != campaign.approval_binding:
+        return None
+    approved_by = approval.get("approved_by")
+    if (
+        not isinstance(approved_by, str)
+        or not is_reauthenticated_backlog_operator(approved_by)
+        or approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
+        or not approval.get("approved_at")
+    ):
+        return None
+    expected_pair = {
+        "falcone": ["gntik-ai/falcone", "gntik-ai/falcone-charts"],
+        "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
+        "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
+    }.get(campaign.project)
+    if (
+        binding.get("paired_repositories") != expected_pair
+        or binding.get("production") is not False
+    ):
+        return None
+    expires_at = exact.expires_at
     return expires_at.replace(tzinfo=UTC) if expires_at.tzinfo is None else expires_at
 
 
@@ -227,9 +260,7 @@ def other_unexpired_owner(session: Session, campaign_id: UUID, now: datetime) ->
             GitHubBacklogCampaign.status.in_(OWNER_STATUSES),
         )
     ).all():
-        if candidate.approval_json.get("policy_role") not in {None, "owner"}:
-            continue
-        expires_at = binding_expires_at(candidate)
+        expires_at = verified_owner_expiry(candidate)
         if expires_at is not None and expires_at > now:
             return candidate.id
     return None
@@ -263,12 +294,9 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
         if expires_at is None or expires_at <= now:
             campaign.status = "EXPIRED"
             continue
-        if campaign.status in {
-            "APPROVED_POLICY_PENDING",
-            "APPROVED",
-            "RUNNING",
-            "PAUSED",
-        } and campaign.approval_json.get("policy_role") in {None, "owner"}:
+        verified = verified_owner_expiry(campaign)
+        if campaign.status in OWNER_STATUSES and verified is not None and verified > now:
+            # NEW-94 review: only a fully verified, unexpired owner keeps the policy enabled.
             unexpired_owner = True
     if not unexpired_owner:
         for campaign in active:
