@@ -1619,13 +1619,37 @@ _REGRESSION = {
 async def test_a_retry_after_a_blocked_ci_repair_rechecks_ci_before_repairing() -> None:
     # NEW-101: the retry re-runs the GitOps CI check so the second repair receives fresh
     # failures (and NEW-100 log excerpts) instead of the stale evidence of the first.
+    script = _full_delivery_loop_script()
+    scripted = _scripted_execute_control_step(script)
+    checks = 0
+    order: list[str] = []
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        nonlocal checks
+        payload = request["payload"]
+        if request["step"] == "gitops.persist_result":
+            order.append(f"persist {payload.get('ci_failure_excerpts', {}).get('quality')}")
+        if request["step"] == "backlog.register_child_run" and "-ci-repair-" in str(
+            payload.get("child_workflow_id")
+        ):
+            order.append("repair " + str(payload["child_workflow_id"]).rsplit("-issue-", 1)[1])
+        if request["step"] == "gitops.pr_checks":
+            checks += 1
+            return {**_REGRESSION, "failure_excerpts": {"quality": f"not ok round-{checks}"}}
+        return await scripted(request)
+
     history, result, children = await _run_loop(
-        _full_delivery_loop_script(**{"gitops.pr_checks": _REGRESSION}),
+        script,
         [
+            ("retry", "gntik-ai/musematic#1026"),
+            # At the automatic limit the recheck pauses on the regression; the operator's
+            # retry then repairs with that fresh evidence, never without a recheck.
             ("retry", "gntik-ai/musematic#1026"),
             ("skip", "gntik-ai/musematic#1026|OPERATOR"),
         ],
         workflows=_REPAIR_BLOCKED_WORKFLOWS,
+        activity_fn=execute_control_step,
     )
 
     assert result["status"] == "COMPLETE"
@@ -1636,14 +1660,31 @@ async def test_a_retry_after_a_blocked_ci_repair_rechecks_ci_before_repairing() 
         "1-staging-gitops-retry-1",
         "1-ci-repair-2-attempt-1",
         "1-staging-gitops-retry-2",
+        "1-ci-repair-3-attempt-1",
+        "1-staging-gitops-retry-3",
     ]
+    steps = _scheduled_steps(history)
     paused = [
         request["payload"]["blocker"]
-        for request in _scheduled_steps(history)
+        for request in steps
         if request["step"] == "backlog.record_loop_state"
         and request["payload"].get("loop_status") == "PAUSED"
     ]
-    assert paused == ["CI_REPAIR_SOURCE_MAKER_DID_NOT_COMPLETE", "SOURCE_PR_CI_REGRESSION"]
+    assert paused == [
+        "CI_REPAIR_SOURCE_MAKER_DID_NOT_COMPLETE",
+        "SOURCE_PR_CI_REGRESSION",
+        "SOURCE_PR_CI_REGRESSION",
+    ]
+    # Each repair after the first follows a GitOps run that persisted fresh excerpts.
+    assert order == [
+        "persist not ok round-1",
+        "repair 1-ci-repair-1-attempt-1",
+        "persist not ok round-2",
+        "repair 1-ci-repair-2-attempt-1",
+        "persist not ok round-3",
+        "repair 1-ci-repair-3-attempt-1",
+        "persist not ok round-4",
+    ]
     await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)
 
 
@@ -1655,7 +1696,7 @@ class _PreRecheckBacklogLoopWorkflow(ExistingGitHubBacklogLoopWorkflow):
     async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
         return await super().run(request)
 
-    def _repair_retry_rechecks_patched(self) -> bool:
+    def _repair_retry_rechecks_patched(self, ordinal: int) -> bool:
         return False
 
 
