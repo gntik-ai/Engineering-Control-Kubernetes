@@ -2158,3 +2158,84 @@ async def test_a_paused_loop_can_be_retried_more_than_once(tmp_path: Path) -> No
 
     assert first.operation_id != second.operation_id
     assert control.signal.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_r3_issue_start_requires_the_approved_binding_for_the_unchanged_issue(
+    tmp_path: Path,
+) -> None:
+    # NEW-95: a direct issue operation can run an R3 issue only with the binding of its
+    # operator-approved R3 candidate; the preflight re-verifies it against the issue.
+    repository = _repository(tmp_path)
+    campaign_id = UUID("44444444-4444-4444-8444-444444444444")
+    _seed_r3_issue(
+        repository,
+        campaign_id=campaign_id,
+        project="falcone",
+        source_repository="gntik-ai/falcone",
+        deployment_repository="gntik-ai/falcone-charts",
+        issue_number=953,
+    )
+
+    def command(binding: str | None) -> SolveIssueCommand:
+        return SolveIssueCommand(
+            project="falcone",
+            backlog_campaign_id=campaign_id,
+            repository="gntik-ai/falcone",
+            issue_number=953,
+            maximum_risk="R3" if binding else "R2",
+            r3_approval_binding=binding,
+        )
+
+    async def blockers(binding: str | None) -> set[str]:
+        return set((await repository.candidate(command(binding), SESSION_A)).capability.blockers)
+
+    # Without a binding the ordinary R2 bound applies.
+    assert "ISSUE_RISK_EXCEEDS_BOUND" in await blockers(None)
+    candidate = await repository.r3_issue_candidate("falcone", "source", 953)
+    binding = candidate["binding"]
+    # Created but not yet approved: refused.
+    assert "R3_APPROVAL_REQUIRED" in await blockers(binding)
+    await repository.approve_r3_issue(
+        "falcone", "source", 953, binding, candidate["confirmation_phrase"], "telegram:42"
+    )
+    approved = await blockers(binding)
+    assert not approved & {
+        "R3_APPROVAL_REQUIRED",
+        "R3_OPERATOR_ACTION_REQUIRED",
+        "ISSUE_RISK_EXCEEDS_BOUND",
+    }
+    # Another (well-formed) binding is refused.
+    assert "R3_APPROVAL_REQUIRED" in await blockers("f" * 64)
+    # An approval made before the campaign's heads moved (a newer import) is refused.
+    with repository.sessions.begin() as session:
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        original_head = stored.source_head_at_import
+        stored.source_head_at_import = "9" * 40
+    assert "R3_APPROVAL_REQUIRED" in await blockers(binding)
+    with repository.sessions.begin() as session:
+        stored = session.get(GitHubBacklogCampaign, campaign_id)
+        assert stored is not None
+        stored.source_head_at_import = original_head
+    assert "R3_APPROVAL_REQUIRED" not in await blockers(binding)
+    # An issue edited after approval is refused until re-approved.
+    with repository.sessions.begin() as session:
+        issue = session.scalar(
+            select(BacklogIssueRecord).where(BacklogIssueRecord.issue_number == 953)
+        )
+        assert issue is not None
+        issue.body_sha256 = "d" * 64
+    assert "R3_APPROVAL_REQUIRED" in await blockers(binding)
+
+
+def test_r3_issue_command_binds_the_risk_bound_to_the_approval() -> None:
+    base = {
+        "project": "falcone",
+        "backlog_campaign_id": CAMPAIGN_ID,
+        "repository": "gntik-ai/falcone",
+        "issue_number": 953,
+    }
+    with pytest.raises(ValueError):
+        SolveIssueCommand(**base, maximum_risk="R2", r3_approval_binding="a" * 64)
+    assert SolveIssueCommand(**base, maximum_risk="R3", r3_approval_binding="a" * 64)

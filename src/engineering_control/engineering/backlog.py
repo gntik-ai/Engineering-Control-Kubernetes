@@ -335,6 +335,30 @@ def evaluate_final_closure(evidence: BacklogFinalClosureEvidence) -> str:
     return "FIXED_CLOSURE_ELIGIBLE"
 
 
+def r3_approval_payload_matches(
+    payload: dict[str, Any],
+    *,
+    repository: str,
+    issue_number: int,
+    body_sha256: str,
+    github_updated_at: str,
+    source_head: str,
+    deployment_head: str,
+) -> bool:
+    """NEW-95: an approved R3 candidate applies only to the exact issue text it was approved
+    for, in a campaign imported at the same source and deployment heads. Shared by the
+    operation preflight and the loop's runtime selection so both apply the same rule."""
+    return (
+        payload.get("repository") == repository
+        and payload.get("issue_number") == issue_number
+        and payload.get("issue_body_sha256") == body_sha256
+        and payload.get("issue_updated_at") == github_updated_at
+        and payload.get("source_head") == source_head
+        and payload.get("deployment_head") == deployment_head
+        and payload.get("production") is False
+    )
+
+
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()

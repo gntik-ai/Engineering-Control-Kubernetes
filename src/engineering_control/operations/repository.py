@@ -43,6 +43,7 @@ from engineering_control.engineering.backlog import (
     BacklogApprovalBinding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
+    r3_approval_payload_matches,
 )
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
@@ -716,7 +717,7 @@ class OperationsRepository:
                 blockers.append("BACKLOG_CAMPAIGN_ALREADY_ACTIVE")
                 binding["existing_workflow_id"] = active.workflow_id
         elif isinstance(command, SolveIssueCommand):
-            if command.maximum_risk.value == "R3":
+            if command.maximum_risk.value == "R3" and command.r3_approval_binding is None:
                 blockers.append("R3_OPERATOR_ACTION_REQUIRED")
             if command.delivery_mode == "full-delivery":
                 blockers.extend(self._full_delivery_blockers(command.project.value))
@@ -751,6 +752,12 @@ class OperationsRepository:
                 risk = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
                 if risk.get(issue.calculated_risk, 99) > risk[command.maximum_risk.value]:
                     blockers.append("ISSUE_RISK_EXCEEDS_BOUND")
+                if command.r3_approval_binding is not None and not self._approved_r3_binding(
+                    session, issue, campaign, command.r3_approval_binding, datetime.now(UTC)
+                ):
+                    # NEW-95: the binding must name an approved, unexpired R3 candidate for
+                    # exactly this issue, and the issue must be unchanged since approval.
+                    blockers.append("R3_APPROVAL_REQUIRED")
                 issue_operation = self._active_operation(
                     session,
                     "solve_issue",
@@ -1106,6 +1113,35 @@ class OperationsRepository:
         if manifest.project != project:
             raise ValueError("project contract identity mismatch")
         return manifest
+
+    @staticmethod
+    def _approved_r3_binding(
+        session: Session,
+        issue: BacklogIssueRecord,
+        campaign: GitHubBacklogCampaign,
+        binding: str,
+        now: datetime,
+    ) -> bool:
+        row = session.scalar(
+            select(ActionCandidate).where(
+                ActionCandidate.action == "r3_issue_approval",
+                ActionCandidate.target_id == f"{issue.repository}#{issue.issue_number}",
+                ActionCandidate.binding_hash == binding,
+                ActionCandidate.used_at.is_not(None),
+                ActionCandidate.expires_at > now,
+            )
+        )
+        if row is None or issue.calculated_risk != "R3":
+            return False
+        return r3_approval_payload_matches(
+            row.payload_json,
+            repository=issue.repository,
+            issue_number=issue.issue_number,
+            body_sha256=issue.body_sha256,
+            github_updated_at=issue.github_updated_at.isoformat(),
+            source_head=campaign.source_head_at_import,
+            deployment_head=campaign.deployment_head_at_import,
+        )
 
     def _full_delivery_blockers(self, project: str) -> list[str]:
         blockers: list[str] = []

@@ -230,6 +230,7 @@ class TypedCommandBus:
                     continue_after_blocked_issue=False,
                     correction_limit=command.correction_limit,
                     runtime_proof=command.runtime_proof,
+                    r3_approval_binding=command.r3_approval_binding,
                 )
             )
         if isinstance(command, SolveBacklogCommand):
