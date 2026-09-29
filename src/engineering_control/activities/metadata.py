@@ -3503,7 +3503,9 @@ class MetadataActivityHandler:
                     "branch": str(payload["deployment_branch"]),
                     "head_sha": deployment_head,
                     "base_branch": "main",
-                    "title": title + " (deployment)",
+                    # NEW-98: the gh broker's safe-value set has no parentheses, so a
+                    # "(deployment)" suffix made every deployment PR creation fail.
+                    "title": title + " - deployment",
                     "body": body + "\nRepository role: deployment\n",
                 }
             )
