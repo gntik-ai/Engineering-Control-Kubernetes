@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 from datetime import UTC, datetime, timedelta
@@ -2427,3 +2428,29 @@ async def test_a_runless_started_operation_is_released_only_once_temporal_report
         "backlog-loop-falcone-b": "STARTED",
         "backlog-loop-falcone-c": "STARTED",
     }
+
+
+async def test_a_hanging_runless_sweep_never_delays_operation_dispatch() -> None:
+    from engineering_control.operations.service import operation_dispatch_loop
+
+    dispatched = asyncio.Event()
+    swept = asyncio.Event()
+
+    async def dispatch_pending() -> bool:
+        dispatched.set()
+        return False
+
+    async def reconcile_runless_operations() -> int:
+        swept.set()
+        await asyncio.Event().wait()  # a Temporal call that never answers
+        return 0
+
+    bus = Mock()
+    bus.dispatch_pending = dispatch_pending
+    bus.reconcile_runless_operations = reconcile_runless_operations
+    stop = asyncio.Event()
+    task = asyncio.create_task(operation_dispatch_loop(bus, stop))
+    await asyncio.wait_for(swept.wait(), timeout=2)
+    await asyncio.wait_for(dispatched.wait(), timeout=2)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)

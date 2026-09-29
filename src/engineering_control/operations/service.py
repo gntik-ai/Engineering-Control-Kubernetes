@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 from datetime import datetime
@@ -52,6 +53,7 @@ _CLOSED_WORKFLOW_STATUSES = frozenset(
     {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
 )
 _RUNLESS_RECONCILE_SECONDS = 60.0
+_RUNLESS_DESCRIBE_SECONDS = 10.0
 
 
 class TypedCommandBus:
@@ -185,7 +187,10 @@ class TypedCommandBus:
         released = 0
         for operation_id, workflow_id, run_id, _created_at in page:
             try:
-                status = await self.control.workflow_run_status(workflow_id, run_id)
+                status = await asyncio.wait_for(
+                    self.control.workflow_run_status(workflow_id, run_id),
+                    timeout=_RUNLESS_DESCRIBE_SECONDS,
+                )
             except Exception:  # noqa: BLE001 - an unknown state keeps the operation active
                 _LOG.warning("runless operation %s: workflow state unavailable", operation_id)
                 continue
@@ -466,18 +471,31 @@ class TypedCommandBus:
 
 
 async def operation_dispatch_loop(bus: TypedCommandBus, stop: asyncio.Event) -> None:
-    loop = asyncio.get_running_loop()
-    next_reconcile = loop.time()
+    # NEW-97: the run-less sweep runs beside dispatch so slow Temporal calls never delay it.
+    reconciler = asyncio.create_task(_runless_reconcile_loop(bus, stop))
+    try:
+        while not stop.is_set():
+            worked = await bus.dispatch_pending()
+            if not worked:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=0.5)
+                except TimeoutError:
+                    pass
+    finally:
+        reconciler.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reconciler
+
+
+async def _runless_reconcile_loop(bus: TypedCommandBus, stop: asyncio.Event) -> None:
     while not stop.is_set():
-        if loop.time() >= next_reconcile:
-            next_reconcile = loop.time() + _RUNLESS_RECONCILE_SECONDS
-            try:
-                await bus.reconcile_runless_operations()
-            except Exception:  # noqa: BLE001 - reconciliation must never stop dispatch
-                _LOG.warning("runless operation reconciliation failed")
-        worked = await bus.dispatch_pending()
-        if not worked:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=0.5)
-            except TimeoutError:
-                pass
+        try:
+            await asyncio.wait_for(
+                bus.reconcile_runless_operations(), timeout=_RUNLESS_RECONCILE_SECONDS
+            )
+        except Exception:  # noqa: BLE001 - reconciliation must never stop the service
+            _LOG.warning("runless operation reconciliation failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=_RUNLESS_RECONCILE_SECONDS)
+        except TimeoutError:
+            pass
