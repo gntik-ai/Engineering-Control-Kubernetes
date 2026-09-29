@@ -22,6 +22,7 @@ from engineering_control.engineering.backlog import (
     BacklogIssueRecord,
     BacklogIssueType,
     GitHubBacklogImportSnapshot,
+    _filter_eligibility,
     approval_binding,
     canonical_sha256,
     classify_issue,
@@ -73,6 +74,20 @@ def _selectable_backlog_issue() -> Any:
             db.BacklogIssueRecord.calculated_risk == "R3",
         ),
     )
+
+
+def _deferred_r3_row_in_filter(row: db.BacklogIssueRecord, import_filter: str) -> bool:
+    """NEW-96 review: a DEFERRED/R3_REQUIRES_OPERATOR row is selectable only if the
+    campaign's import filter admits its issue type, re-checked at selection so rows
+    imported before the filter-first classification cannot slip through."""
+    if row.eligibility_status != "DEFERRED":
+        return True
+    try:
+        issue_type = BacklogIssueType(row.issue_type)
+    except ValueError:
+        return False
+    eligible, _ = _filter_eligibility(issue_type, import_filter, "")
+    return eligible
 
 
 def verified_backlog_approval(
@@ -1030,7 +1045,8 @@ class EngineeringActivityHandler:
             selected = [
                 self._serialize_backlog_issue(row)
                 for row in rows
-                if risk_rank.get(row.calculated_risk, 99) <= maximum
+                if _deferred_r3_row_in_filter(row, campaign.import_filter)
+                and risk_rank.get(row.calculated_risk, 99) <= maximum
                 and (
                     row.calculated_risk != "R3"
                     or self._valid_r3_candidate(
@@ -1380,6 +1396,8 @@ class EngineeringActivityHandler:
             candidates: list[tuple[str, db.BacklogIssueRecord]] = []
             awaiting_r3_approval = False
             for project, raw_id in ids.items():
+                inventory = session.get(db.GitHubBacklogCampaign, UUID(str(raw_id)))
+                import_filter = inventory.import_filter if inventory is not None else ""
                 rows = session.scalars(
                     select(db.BacklogIssueRecord).where(
                         db.BacklogIssueRecord.backlog_campaign_id == UUID(str(raw_id)),
@@ -1395,7 +1413,8 @@ class EngineeringActivityHandler:
                         else None
                     )
                     selectable = (
-                        reference not in processed
+                        _deferred_r3_row_in_filter(row, import_filter)
+                        and reference not in processed
                         and blocked_until.get(reference, now) <= now
                         and row.issue_type != BacklogIssueType.ENHANCEMENT.value
                     )

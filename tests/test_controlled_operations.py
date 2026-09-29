@@ -2312,3 +2312,24 @@ def test_only_filter_admitted_r3_issues_wait_for_operator_approval() -> None:
         "NEEDS_PRODUCT_DECISION",
     )
     assert _eligibility(BacklogIssueType.PRODUCT_BUG, "all", "R2", "")[0] is True
+
+
+def test_selection_rechecks_the_import_filter_for_legacy_deferred_r3_rows() -> None:
+    # NEW-96 review round 2: rows imported before the filter-first classification may be
+    # DEFERRED/R3_REQUIRES_OPERATOR although the campaign filter excludes them; selection
+    # re-checks the filter so an approval can never run them.
+    from types import SimpleNamespace
+    from typing import Any
+
+    from engineering_control.activities.engineering import _deferred_r3_row_in_filter
+
+    def row(issue_type: str, status: str = "DEFERRED") -> Any:
+        return SimpleNamespace(eligibility_status=status, issue_type=issue_type)
+
+    assert _deferred_r3_row_in_filter(row("SECURITY_DEFECT"), "security")
+    assert not _deferred_r3_row_in_filter(row("PRODUCT_BUG"), "security")
+    assert not _deferred_r3_row_in_filter(row("ENHANCEMENT"), "bugs")
+    assert not _deferred_r3_row_in_filter(row("NOT_A_TYPE"), "all")
+    assert _deferred_r3_row_in_filter(row("PRODUCT_BUG"), "all")
+    # Eligible rows were admitted by the filter at import and are left unchanged.
+    assert _deferred_r3_row_in_filter(row("ENHANCEMENT", "READY"), "bugs")
