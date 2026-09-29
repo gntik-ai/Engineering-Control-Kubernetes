@@ -145,6 +145,50 @@ async def test_publication_plan_defers_unchanged_deployment_repository(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("domain", ["falcone:audit", "falcone:api(v2) $x; `y` && z\n"])
+async def test_every_publication_title_passes_the_gh_broker_value_policy(
+    tmp_path: Path, domain: str
+) -> None:
+    # NEW-98: falcone #1001's deployment PR title "... (deployment)" was rejected by
+    # GhCliBroker._value (no parentheses), failing publication after the source PR.
+    from engineering_control.adapters.github.client import GhCliBroker
+
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'plan.sqlite'}")
+    )
+    change_set_id = uuid4()
+    branch = f"agent/falcone/1001/{change_set_id}"
+    result = await handler.handle(
+        "delivery.prepare_publication",
+        {
+            "change_set_id": str(change_set_id),
+            "change_evidence": {
+                "source": {"head_sha": "b" * 40, "changed_file_count": 1},
+                "deployment": {"head_sha": "d" * 40, "changed_file_count": 1},
+            },
+            "source_base_sha": "a" * 40,
+            "deployment_base_sha": "c" * 40,
+            "source_repository": "falcone",
+            "deployment_repository": "falcone-charts",
+            "source_worktree": str(tmp_path / "source"),
+            "deployment_worktree": str(tmp_path / "deployment"),
+            "source_branch": branch,
+            "deployment_branch": branch,
+            "issue_url": "https://github.com/gntik-ai/falcone/issues/1001",
+            "openspec_identifier": f"engineering/{change_set_id}",
+            "risk_class": "R3",
+            "domain": domain,
+        },
+    )
+
+    publications = result["publication_plan"]["publications"]
+    assert [item["repository_slug"] for item in publications] == ["falcone", "falcone-charts"]
+    for item in publications:
+        assert GhCliBroker._value(item["title"], "pull request title", maximum=240)
+    assert publications[1]["title"].endswith(" - deployment")
+
+
+@pytest.mark.asyncio
 async def test_publication_persists_both_prs_and_releases_implementation_leases(
     tmp_path: Path,
 ) -> None:

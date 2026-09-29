@@ -3477,7 +3477,10 @@ class MetadataActivityHandler:
             "This draft was implemented in one bounded worktree and independently reviewed "
             "by the opposite provider. Merge remains governed by repository protection.\n"
         )
-        title = f"changeset {str(change_set_id)[:8]}: {payload['domain']} finding"
+        # NEW-98: PR titles reach the gh broker's safe-value check; imported component
+        # labels are free text, so characters outside its set become "-".
+        domain = re.sub(r"[^A-Za-z0-9._:/@+ =,-]", "-", str(payload["domain"]))[:160]
+        title = f"changeset {str(change_set_id)[:8]}: {domain} finding"
         publications = [
             {
                 "repository": repositories[source_repository],
@@ -3503,7 +3506,9 @@ class MetadataActivityHandler:
                     "branch": str(payload["deployment_branch"]),
                     "head_sha": deployment_head,
                     "base_branch": "main",
-                    "title": title + " (deployment)",
+                    # NEW-98: the gh broker's safe-value set has no parentheses, so a
+                    # "(deployment)" suffix made every deployment PR creation fail.
+                    "title": title + " - deployment",
                     "body": body + "\nRepository role: deployment\n",
                 }
             )
