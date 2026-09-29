@@ -475,6 +475,12 @@ class GitOpsControllerHandler:
             # NEW-63/64: CI job names only (the baseline gate's verdict).
             "ci_regressions": _check_names(payload.get("ci_regressions")),
             "ci_preexisting_failures": _check_names(payload.get("ci_preexisting_failures")),
+            # NEW-99: why the baseline could not excuse anything (None when it ran).
+            "ci_regression_reason": (
+                str(payload["ci_regression_reason"])
+                if payload.get("ci_regression_reason") in UNVERIFIED_CI_REGRESSION_REASONS
+                else None
+            ),
             "ci_baseline_pr": (
                 str(payload["ci_baseline_pr"])
                 if isinstance(payload.get("ci_baseline_pr"), str)
@@ -1566,6 +1572,11 @@ class GitOpsGitHubHandler:
             "comment_url": comment.get("comment_url"),
             "issue_url": closed.get("issue_url"),
         }
+
+
+UNVERIFIED_CI_REGRESSION_REASONS = frozenset(
+    {"CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_FILE_LISTING_TRUNCATED"}
+)
 
 
 def _unexempted_regressions(failed: list[str], reason: str) -> dict[str, Any]:

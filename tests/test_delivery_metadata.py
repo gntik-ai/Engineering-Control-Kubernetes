@@ -874,6 +874,26 @@ def test_ci_repair_maker_prompt_names_the_regressed_ci_jobs(tmp_path: Path) -> N
     assert "- Lint Frontend" in source and "- Build documentation" in source
     assert "Never change CI workflows, CI tests or security/supply-chain gates" in source
     assert "failed these CI jobs" not in deployment
+    assert "pass on unchanged main" in source and "not compared" not in source
+
+    # NEW-99: a PR editing CI configuration was never compared with main, so the maker
+    # is not told its failures were caused by this ChangeSet or to revert its CI changes.
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.recovery_json = {
+            "staging_gitops": {
+                "status": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_REGRESSION",
+                "ci_regressions": ["quality"],
+                "ci_regression_reason": "CI_BASELINE_CI_CONFIG_CHANGED",
+            }
+        }
+    unverified = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    assert "were not compared with unchanged main" in unverified and "- quality" in unverified
+    assert "pass on unchanged main" not in unverified
+    assert "revert any such change" not in unverified
+    assert "never weaken, remove or narrow" in unverified
 
 
 def test_makers_and_checker_see_the_fenced_issue_content(tmp_path: Path) -> None:

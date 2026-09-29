@@ -3090,19 +3090,24 @@ class MetadataActivityHandler:
         findings = record.get("findings") if isinstance(record, dict) else None
         return [str(item) for item in findings if isinstance(item, str)] if findings else []
 
-    def _ci_regressions(self, change_set_id: UUID) -> list[str]:
-        """NEW-64: PR CI jobs the staging baseline gate attributed to this ChangeSet."""
+    def _ci_regressions(self, change_set_id: UUID) -> tuple[list[str], bool]:
+        """NEW-64: PR CI jobs the staging baseline gate attributed to this ChangeSet.
+
+        NEW-99: the flag is True when the baseline could not run (the PR edits CI
+        configuration or its file listing was truncated), so no job was compared with main.
+        """
         with self.sessions.begin() as session:
             change_set = session.get(ChangeSet, change_set_id)
             record = dict((change_set.recovery_json or {}) if change_set else {}).get(
                 "staging_gitops"
             )
         if not isinstance(record, dict) or record.get("blocker") != "SOURCE_PR_CI_REGRESSION":
-            return []
+            return [], False
         names = record.get("ci_regressions")
         if not isinstance(names, list):
-            return []
-        return [str(name)[:200] for name in names if isinstance(name, str)][:20]
+            return [], False
+        unverified = bool(record.get("ci_regression_reason"))
+        return [str(name)[:200] for name in names if isinstance(name, str)][:20], unverified
 
     def _prior_checker_findings(self, change_set_id: UUID, workflow_id: str) -> list[str]:
         """Findings of the latest checker that requested changes on an earlier attempt."""
@@ -3187,8 +3192,23 @@ class MetadataActivityHandler:
             ) + "".join(f"- {item}\n" for item in validation_findings)
         # NEW-64: a CI-repair re-delivery names the PR CI jobs the baseline gate attributed
         # to this ChangeSet (they pass on unchanged main).
-        ci_regressions = [] if deployment else self._ci_regressions(change_set_id)
-        if ci_regressions:
+        ci_regressions, unverified = (
+            ([], False) if deployment else self._ci_regressions(change_set_id)
+        )
+        if ci_regressions and unverified:
+            derived_content += (
+                "The published pull request for this ChangeSet failed these CI jobs. They "
+                "were not compared with unchanged main, because this ChangeSet edits CI "
+                "configuration or its file list was too large to check, so each may be "
+                "caused by this ChangeSet or may already fail on main. Fix every failure "
+                "this ChangeSet caused, on top of the existing commits, and run the matching "
+                "repository test commands before committing. CI workflow and CI test changes "
+                "that are part of this ChangeSet's scope may be corrected, but never weaken, "
+                "remove or narrow a CI job, CI test or security/supply-chain gate to make it "
+                "pass; if a job fails for reasons outside this ChangeSet, leave it and "
+                "explain it in open_questions:\n"
+            ) + "".join(f"- {name}\n" for name in ci_regressions)
+        elif ci_regressions:
             derived_content += (
                 "The published pull request for this ChangeSet failed these CI jobs, which "
                 "pass on unchanged main, so this ChangeSet caused them. Fix each one on top "

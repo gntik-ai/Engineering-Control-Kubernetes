@@ -783,6 +783,26 @@ async def test_persist_result_records_merge_and_runtime_verified_state(tmp_path:
         {"plan": plan, "outcome": "BLOCKED", "blocker": "IMAGE_NOT_PINNED", "merge_sha": MERGE_SHA},
     )
     assert blocked["change_set_state"] == "SOURCE_MERGED"
+    # NEW-99: only a known unverified-regression reason is recorded.
+    for reason, recorded in (
+        ("CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_CI_CONFIG_CHANGED"),
+        ("ANYTHING_ELSE", None),
+    ):
+        await handler.handle(
+            "gitops.persist_result",
+            {
+                "plan": plan,
+                "outcome": "BLOCKED",
+                "blocker": "SOURCE_PR_CI_REGRESSION",
+                "ci_regressions": ["quality"],
+                "ci_regression_reason": reason,
+            },
+        )
+        with handler.sessions.begin() as session:
+            change_set = session.get(db.ChangeSet, change_set_id)
+            assert change_set is not None
+            record = change_set.recovery_json["staging_gitops"]
+            assert record["ci_regression_reason"] == recorded
     result = await handler.handle(
         "gitops.persist_result",
         {
