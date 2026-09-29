@@ -83,6 +83,7 @@ _ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNN
 # time. The buffer absorbs schedule jitter and the refresh workflow's own run time.
 _PROVIDER_HEALTH_STALE_AFTER = QUOTA_REFRESH_INTERVAL + timedelta(minutes=10)
 _CAMPAIGN_EXPORT_COLLECTIONS = ("root_blockers", "findings", "runs", "artifacts")
+_RUNLESS_OPERATION_GRACE = timedelta(minutes=30)
 _TERMINAL_WORKFLOW_STATES = frozenset(
     {
         "COMPLETE",
@@ -1261,6 +1262,7 @@ class OperationsRepository:
         )
         if exclude_operation_id is not None:
             statement = statement.where(OperationRequest.id != exclude_operation_id)
+        now = datetime.now(UTC)
         for operation in session.scalars(statement):
             if operation.status == "STARTED" and operation.workflow_id:
                 workflow_state = self._workflow_state(session, operation.workflow_id)
@@ -1269,7 +1271,17 @@ class OperationsRepository:
                     and workflow_state.upper() in _TERMINAL_WORKFLOW_STATES
                 ):
                     operation.status = "COMPLETED"
-                    operation.completed_at = operation.completed_at or datetime.now(UTC)
+                    operation.completed_at = operation.completed_at or now
+                    continue
+                if (
+                    workflow_state is None
+                    and _utc(operation.created_at) < now - _RUNLESS_OPERATION_GRACE
+                ):
+                    # NEW-97: a loop registers its Run within seconds of passing selection;
+                    # no Run after the grace period means the workflow ended before that
+                    # (e.g. blocked at selection by an older release) and holds nothing.
+                    operation.status = "COMPLETED"
+                    operation.completed_at = operation.completed_at or now
                     continue
             return operation
         return None

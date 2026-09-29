@@ -1488,3 +1488,68 @@ def test_policy_request_writer_never_overwrites_a_pending_request(tmp_path: Path
     target.unlink()  # the reconciler consumed it
     handler._write_policy_request({"action": "disable-existing-backlog", "n": 2})
     assert json.loads(target.read_text())["n"] == 2
+
+
+def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: Path) -> None:
+    # NEW-97: the Run of a start blocked at selection is created STOPPED with its blocker,
+    # which ends the operation (a terminal workflow state for _active_operation).
+    from engineering_control.db.models import Run
+
+    handler = EngineeringActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'closed-run.sqlite'}",
+            state_root=tmp_path,
+            project_config_root=ROOT / "config/projects",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    campaign_id = UUID("44444444-4444-4444-8444-444444444444")
+    with handler.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=campaign_id,
+                project="falcone",
+                source_repository="gntik-ai/falcone",
+                deployment_repository="gntik-ai/falcone-charts",
+                imported_at=NOW,
+                issue_query="state:open",
+                import_filter="all",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=1,
+                eligible_count=0,
+                deferred_count=1,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=1,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                approval_binding=None,
+                approval_json={},
+                maximum_risk=None,
+                maximum_items=1,
+                maximum_concurrency=1,
+                delivery_mode=None,
+                include_enhancements=False,
+                status="APPROVED",
+                workflow_id="backlog-import-falcone",
+            )
+        )
+    handler._register_backlog_run(
+        {
+            "backlog_campaign_id": str(campaign_id),
+            "workflow_id": "backlog-loop-falcone-blocked",
+            "closed_blocker": "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE",
+        }
+    )
+    with handler.sessions() as session:
+        run = session.scalar(select(Run).where(Run.workflow_id == "backlog-loop-falcone-blocked"))
+        assert run is not None
+        assert run.status == "STOPPED" and run.finished_at is not None
+        assert "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE" in (run.summary or "")
+        campaign = session.get(GitHubBacklogCampaign, campaign_id)
+        assert campaign is not None and campaign.status == "APPROVED"  # untouched

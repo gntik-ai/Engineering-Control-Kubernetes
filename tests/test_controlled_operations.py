@@ -2345,3 +2345,42 @@ def test_selection_rechecks_the_import_filter_for_legacy_deferred_r3_rows() -> N
     assert not _deferred_r3_row_in_filter(row("PRODUCT_BUG", body=None), "all")
     # Eligible rows were admitted by the filter at import and are left unchanged.
     assert _deferred_r3_row_in_filter(row("ENHANCEMENT", "READY"), "bugs")
+
+
+def test_a_runless_started_operation_stops_blocking_its_issue_after_the_grace(
+    tmp_path: Path,
+) -> None:
+    # NEW-97: falcone #953's first R3 start was blocked at selection before its loop
+    # registered a Run, so the operation stayed STARTED and every later start was refused
+    # as ISSUE_WORKFLOW_ALREADY_ACTIVE.
+    repository = _repository(tmp_path)
+    now = datetime.now(UTC)
+
+    def add(created_at: datetime, key: str) -> None:
+        with repository.sessions.begin() as session:
+            session.add(
+                OperationRequest(
+                    action="solve_issue",
+                    target_type="github_issue",
+                    target_id="gntik-ai/falcone#953",
+                    payload_json={},
+                    source_channel="cli",
+                    operator_class="operator",
+                    idempotency_key=key * 64,
+                    binding_hash=key * 64,
+                    status="STARTED",
+                    workflow_id=f"backlog-loop-falcone-{key}",
+                    created_at=created_at,
+                )
+            )
+
+    add(now - timedelta(minutes=5), "a")
+    with repository.sessions.begin() as session:
+        active = repository._active_operation(session, "solve_issue", "gntik-ai/falcone#953")
+        assert active is not None  # a fresh start may not have registered its Run yet
+        active.created_at = now - timedelta(minutes=45)
+    with repository.sessions.begin() as session:
+        assert repository._active_operation(session, "solve_issue", "gntik-ai/falcone#953") is None
+    with repository.sessions() as session:
+        stored = session.scalar(select(OperationRequest))
+        assert stored is not None and stored.status == "COMPLETED"

@@ -2160,14 +2160,21 @@ class EngineeringActivityHandler:
                     {**payload, "run_id": str(existing.id)},
                     "REGISTERED",
                 )
+            # NEW-97: a loop whose start was blocked at selection registers its Run already
+            # closed, so its operation ends and the issue can be started again.
+            closed_blocker = payload.get("closed_blocker")
+            now = datetime.now(UTC)
             run = db.Run(
                 campaign_id=None,
                 workflow_id=workflow_id,
                 run_type="existing-backlog-loop",
-                status="RUNNING",
+                status="STOPPED" if closed_blocker else "RUNNING",
                 project=campaign.project,
-                started_at=datetime.now(UTC),
+                started_at=now,
             )
+            if closed_blocker:
+                run.finished_at = now
+                run.summary = f"Blocked before start: {str(closed_blocker)[:200]}"
             session.add(run)
             session.flush()
             return self._envelope(

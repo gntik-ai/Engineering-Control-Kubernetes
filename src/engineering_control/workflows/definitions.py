@@ -2404,6 +2404,17 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         register_run = workflow.patched("existing-backlog-register-run-v1")
         context = await self._step("backlog.load_execution", asdict(request))
         if context.get("status") == "BLOCKED":
+            if register_run and workflow.patched("existing-backlog-blocked-start-closes-run-v1"):
+                # NEW-97: without a Run the operation stayed STARTED forever and every later
+                # start of the issue was refused as ISSUE_WORKFLOW_ALREADY_ACTIVE.
+                await self._step(
+                    "backlog.register_run",
+                    {
+                        **asdict(request),
+                        "workflow_id": workflow.info().workflow_id,
+                        "closed_blocker": str(context.get("blocker") or "BLOCKED"),
+                    },
+                )
             return context
         try:
             if register_run:
