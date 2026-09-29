@@ -2239,3 +2239,52 @@ def test_r3_issue_command_binds_the_risk_bound_to_the_approval() -> None:
     with pytest.raises(ValueError):
         SolveIssueCommand(**base, maximum_risk="R2", r3_approval_binding="a" * 64)
     assert SolveIssueCommand(**base, maximum_risk="R3", r3_approval_binding="a" * 64)
+
+
+def test_backlog_selection_includes_only_operator_approvable_deferred_r3_rows(
+    tmp_path: Path,
+) -> None:
+    # NEW-96: R3 rows are imported DEFERRED (R3_REQUIRES_OPERATOR), and both loop
+    # selections filtered on eligible statuses only, so no R3 issue could ever run even
+    # with an approved R3 candidate (falcone #953, 2026-09-29). The callers still require a
+    # valid approved candidate for every R3 row they admit.
+    from engineering_control.activities.engineering import _selectable_backlog_issue
+
+    repository = _repository(tmp_path)
+    campaign_id = UUID("44444444-4444-4444-8444-444444444444")
+    _seed_r3_issue(
+        repository,
+        campaign_id=campaign_id,
+        project="falcone",
+        source_repository="gntik-ai/falcone",
+        deployment_repository="gntik-ai/falcone-charts",
+        issue_number=953,
+    )
+
+    def selected() -> list[int]:
+        with repository.sessions() as session:
+            return [
+                row.issue_number
+                for row in session.scalars(
+                    select(BacklogIssueRecord).where(_selectable_backlog_issue())
+                ).all()
+            ]
+
+    assert selected() == [953]
+    for reason in ("NEEDS_PRODUCT_DECISION", "ENHANCEMENT_DEFERRED"):
+        with repository.sessions.begin() as session:
+            row = session.scalar(select(BacklogIssueRecord))
+            assert row is not None
+            row.eligibility_reason = reason
+        assert selected() == []
+    with repository.sessions.begin() as session:
+        row = session.scalar(select(BacklogIssueRecord))
+        assert row is not None
+        row.eligibility_reason = "R3_REQUIRES_OPERATOR"
+        row.calculated_risk = "R2"  # a DEFERRED non-R3 row is never included
+    assert selected() == []
+    with repository.sessions.begin() as session:
+        row = session.scalar(select(BacklogIssueRecord))
+        assert row is not None
+        row.eligibility_status = "ELIGIBLE_FOR_REVALIDATION"
+    assert selected() == [953]

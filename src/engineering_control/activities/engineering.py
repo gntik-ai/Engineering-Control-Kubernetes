@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import and_, create_engine, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.activities.gitops import StagingFlowBlocked, enabled_staging_flow
@@ -56,6 +56,23 @@ _TERMINAL_GLOBAL_BLOCKERS = frozenset(
         "NEEDS_PRODUCT_DECISION",
     }
 )
+
+
+def _selectable_backlog_issue() -> Any:
+    """Rows a backlog loop may select: eligible ones, plus R3 rows deferred only because
+    they need an operator's R3 approval. NEW-96: R3 rows are imported as DEFERRED
+    (R3_REQUIRES_OPERATOR), so both selections silently excluded every R3 issue even with
+    an approved R3 candidate; the callers still admit such a row only with a valid one."""
+    return or_(
+        db.BacklogIssueRecord.eligibility_status.in_(
+            {"ELIGIBLE_FOR_REVALIDATION", "ELIGIBLE_FOR_RUNTIME_REVALIDATION", "READY"}
+        ),
+        and_(
+            db.BacklogIssueRecord.eligibility_status == "DEFERRED",
+            db.BacklogIssueRecord.eligibility_reason == "R3_REQUIRES_OPERATOR",
+            db.BacklogIssueRecord.calculated_risk == "R3",
+        ),
+    )
 
 
 def verified_backlog_approval(
@@ -993,13 +1010,7 @@ class EngineeringActivityHandler:
                 select(db.BacklogIssueRecord)
                 .where(
                     db.BacklogIssueRecord.backlog_campaign_id == campaign_id,
-                    db.BacklogIssueRecord.eligibility_status.in_(
-                        {
-                            "ELIGIBLE_FOR_REVALIDATION",
-                            "ELIGIBLE_FOR_RUNTIME_REVALIDATION",
-                            "READY",
-                        }
-                    ),
+                    _selectable_backlog_issue(),
                 )
                 .order_by(db.BacklogIssueRecord.planned_order)
             ).all()
@@ -1373,13 +1384,7 @@ class EngineeringActivityHandler:
                     select(db.BacklogIssueRecord).where(
                         db.BacklogIssueRecord.backlog_campaign_id == UUID(str(raw_id)),
                         db.BacklogIssueRecord.delivery_status.in_({"NOT_STARTED", "RETRY_PENDING"}),
-                        db.BacklogIssueRecord.eligibility_status.in_(
-                            {
-                                "ELIGIBLE_FOR_REVALIDATION",
-                                "ELIGIBLE_FOR_RUNTIME_REVALIDATION",
-                                "READY",
-                            }
-                        ),
+                        _selectable_backlog_issue(),
                     )
                 ).all()
                 for row in rows:
