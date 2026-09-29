@@ -227,6 +227,9 @@ def verified_owner_expiry(campaign: GitHubBacklogCampaign) -> datetime | None:
         return None
     if canonical_sha256(exact.model_dump(mode="json")) != campaign.approval_binding:
         return None
+    if exact.backlog_campaign_id != str(campaign.id) or exact.project != campaign.project:
+        # Review: evidence copied from another campaign must not verify for this row.
+        return None
     approved_by = approval.get("approved_by")
     if (
         not isinstance(approved_by, str)
@@ -283,6 +286,10 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
     ).all()
     unexpired_owner = False
     for campaign in active:
+        if not isinstance(campaign.approval_json, dict):
+            # Review: malformed evidence must not crash the fail-safe expiry pass.
+            campaign.status = "EXPIRED"
+            continue
         raw_binding = campaign.approval_json.get("binding")
         binding = raw_binding if isinstance(raw_binding, dict) else campaign.approval_json
         try:
@@ -300,7 +307,10 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
             unexpired_owner = True
     if not unexpired_owner:
         for campaign in active:
-            if campaign.approval_json.get("policy_role") == "inventory":
+            if (
+                isinstance(campaign.approval_json, dict)
+                and campaign.approval_json.get("policy_role") == "inventory"
+            ):
                 campaign.status = "EXPIRED"
     return not unexpired_owner
 

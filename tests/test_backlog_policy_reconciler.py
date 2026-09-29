@@ -852,3 +852,42 @@ def test_a_tampered_or_incomplete_owner_never_keeps_the_policy(tmp_path: Path) -
             assert OTHER_OWNER(session, ending, now) is None, name
         with Session(engine) as session, session.begin():
             assert EXPIRE_CAMPAIGNS(session, now) is True, name
+
+
+def test_copied_or_malformed_owner_evidence_never_keeps_the_policy(tmp_path: Path) -> None:
+    # NEW-94 review round 2: evidence copied from another campaign (valid hash, wrong
+    # campaign id) is not an owner, and malformed evidence expires instead of crashing the
+    # fail-safe expiry pass.
+    now = datetime.now(UTC)
+    donor = UUID("33333333-3333-4333-8333-333333333333")
+    copier = UUID("22222222-2222-4222-8222-222222222222")
+    ending = UUID("11111111-1111-4111-8111-111111111111")
+    engine = create_engine(f"sqlite:///{tmp_path / 'copied.sqlite'}")
+    Base.metadata.create_all(engine)
+    source = campaign(donor, project="falcone", status="COMPLETE", role="owner", now=now)
+    copied = campaign(copier, project="falcone", status="RUNNING", role="owner", now=now)
+    copied.approval_json = json.loads(json.dumps(source.approval_json))
+    copied.approval_binding = source.approval_binding
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                source,
+                copied,
+                campaign(ending, project="falcone", status="CANCELLED", role="owner", now=now),
+            ]
+        )
+    with Session(engine) as session:
+        assert OTHER_OWNER(session, ending, now) is None
+    with Session(engine) as session, session.begin():
+        assert EXPIRE_CAMPAIGNS(session, now) is True
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'malformed.sqlite'}")
+    Base.metadata.create_all(engine)
+    broken = campaign(copier, project="falcone", status="RUNNING", role="owner", now=now)
+    broken.approval_json = ["not", "an", "object"]  # type: ignore[assignment]
+    with Session(engine) as session, session.begin():
+        session.add(broken)
+    with Session(engine) as session, session.begin():
+        assert EXPIRE_CAMPAIGNS(session, now) is True
+    with Session(engine) as session:
+        assert session.get(GitHubBacklogCampaign, copier).status == "EXPIRED"
