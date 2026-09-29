@@ -19,6 +19,7 @@ import yaml
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from engineering_control.activities.engineering import verified_backlog_approval
 from engineering_control.config import Settings
 from engineering_control.db.models import GitHubBacklogCampaign
 from engineering_control.engineering.backlog import (
@@ -206,49 +207,39 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
 OWNER_STATUSES = {"APPROVED_POLICY_PENDING", "APPROVED", "RUNNING", "PAUSED"}
 
 
-def verified_owner_expiry(campaign: GitHubBacklogCampaign) -> datetime | None:
-    """NEW-94 review: the expiry of an owner approval whose evidence fully verifies (exact
-    binding hashing to the stored approval_binding, reauthenticated operator, typed phrase,
-    approved_at, the project's repository pair, never production); None otherwise, so a
-    tampered or incomplete row can never keep the shared policy enabled."""
+def verified_owner_expiry(campaign: GitHubBacklogCampaign, now: datetime) -> datetime | None:
+    """NEW-94: the expiry of an owner approval whose evidence fully verifies, else None, so
+    a tampered, copied, stale or incomplete row never keeps the shared policy enabled.
+
+    The evidence check is the workers' own (verified_backlog_approval: exact binding hash,
+    this campaign and project, imported heads, plan hash, mode, risk, a parseable
+    approved_at, unexpired), plus the reconciler's stricter operator, pair and production
+    rules. Status is judged by the caller (PAUSED still owns the policy here)."""
+    if not isinstance(campaign.approval_json, dict):
+        return None
+    if campaign.approval_json.get("policy_role") not in {None, "owner"}:
+        return None
+    binding = verified_backlog_approval(campaign, now=now)
+    if binding is None:
+        return None
     evidence = campaign.approval_json
-    if not isinstance(evidence, dict) or evidence.get("policy_role") not in {None, "owner"}:
+    approval = evidence.get("approval") if "approval" in evidence else evidence
+    approved_by = approval.get("approved_by") if isinstance(approval, dict) else None
+    if not isinstance(approved_by, str) or not is_reauthenticated_backlog_operator(approved_by):
         return None
-    nested = "binding" in evidence or "approval" in evidence
-    binding = evidence.get("binding") if nested else evidence
-    approval = evidence.get("approval") if nested else evidence
-    if not isinstance(binding, dict) or not isinstance(approval, dict):
-        return None
-    try:
-        exact = BacklogApprovalBinding.model_validate(
-            {field: binding.get(field) for field in BacklogApprovalBinding.model_fields}
-        )
-    except ValueError:
-        return None
-    if canonical_sha256(exact.model_dump(mode="json")) != campaign.approval_binding:
-        return None
-    if exact.backlog_campaign_id != str(campaign.id) or exact.project != campaign.project:
-        # Review: evidence copied from another campaign must not verify for this row.
-        return None
-    approved_by = approval.get("approved_by")
-    if (
-        not isinstance(approved_by, str)
-        or not is_reauthenticated_backlog_operator(approved_by)
-        or approval.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
-        or not approval.get("approved_at")
-    ):
-        return None
+    raw_binding = evidence.get("binding") if "binding" in evidence else evidence
     expected_pair = {
         "falcone": ["gntik-ai/falcone", "gntik-ai/falcone-charts"],
         "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
         "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
     }.get(campaign.project)
     if (
-        binding.get("paired_repositories") != expected_pair
-        or binding.get("production") is not False
+        not isinstance(raw_binding, dict)
+        or raw_binding.get("paired_repositories") != expected_pair
+        or raw_binding.get("production") is not False
     ):
         return None
-    expires_at = exact.expires_at
+    expires_at = binding.expires_at
     return expires_at.replace(tzinfo=UTC) if expires_at.tzinfo is None else expires_at
 
 
@@ -263,7 +254,7 @@ def other_unexpired_owner(session: Session, campaign_id: UUID, now: datetime) ->
             GitHubBacklogCampaign.status.in_(OWNER_STATUSES),
         )
     ).all():
-        expires_at = verified_owner_expiry(candidate)
+        expires_at = verified_owner_expiry(candidate, now)
         if expires_at is not None and expires_at > now:
             return candidate.id
     return None
@@ -301,9 +292,16 @@ def expire_campaign_approvals(session: Session, now: datetime) -> bool:
         if expires_at is None or expires_at <= now:
             campaign.status = "EXPIRED"
             continue
-        verified = verified_owner_expiry(campaign)
-        if campaign.status in OWNER_STATUSES and verified is not None and verified > now:
-            # NEW-94 review: only a fully verified, unexpired owner keeps the policy enabled.
+        if campaign.status in OWNER_STATUSES and campaign.approval_json.get("policy_role") in {
+            None,
+            "owner",
+        }:
+            verified = verified_owner_expiry(campaign, now)
+            if verified is None or verified <= now:
+                # NEW-94 review: an owner row whose evidence does not verify is expired, so
+                # it neither keeps the policy enabled nor blocks a replacement approval.
+                campaign.status = "EXPIRED"
+                continue
             unexpired_owner = True
     if not unexpired_owner:
         for campaign in active:

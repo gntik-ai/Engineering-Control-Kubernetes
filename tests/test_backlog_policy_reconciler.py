@@ -891,3 +891,56 @@ def test_copied_or_malformed_owner_evidence_never_keeps_the_policy(tmp_path: Pat
         assert EXPIRE_CAMPAIGNS(session, now) is True
     with Session(engine) as session:
         assert session.get(GitHubBacklogCampaign, copier).status == "EXPIRED"
+
+
+@pytest.mark.parametrize("defect", ["junk-approved-at", "moved-heads", "changed-plan"])
+def test_owner_must_pass_the_workers_approval_check(tmp_path: Path, defect: str) -> None:
+    # NEW-94 review round 3: the reconciler uses the workers' own evidence check
+    # (verified_backlog_approval), so an unparseable approved_at or a binding that no longer
+    # matches the imported heads / plan is not an owner, and the row is expired so it can
+    # neither keep the policy enabled nor block a replacement approval.
+    now = datetime.now(UTC)
+    owner_id = UUID("22222222-2222-4222-8222-222222222222")
+    ending = UUID("11111111-1111-4111-8111-111111111111")
+    engine = create_engine(f"sqlite:///{tmp_path / (defect + '.sqlite')}")
+    Base.metadata.create_all(engine)
+    owner = campaign(owner_id, project="falcone", status="RUNNING", role="owner", now=now)
+    if defect == "junk-approved-at":
+        evidence = json.loads(json.dumps(owner.approval_json))
+        evidence["approval"]["approved_at"] = "junk"
+        owner.approval_json = evidence
+    elif defect == "moved-heads":
+        owner.source_head_at_import = "d" * 40
+    else:
+        owner.plan_hash = "e" * 64
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [owner, campaign(ending, project="falcone", status="CANCELLED", role="owner", now=now)]
+        )
+    with Session(engine) as session:
+        assert OTHER_OWNER(session, ending, now) is None
+    with Session(engine) as session, session.begin():
+        assert EXPIRE_CAMPAIGNS(session, now) is True
+    with Session(engine) as session:
+        assert session.get(GitHubBacklogCampaign, owner_id).status == "EXPIRED"
+
+
+def test_a_verified_paused_owner_still_keeps_the_policy(tmp_path: Path) -> None:
+    # A loop paused for an operator retry (falcone #1025 on 2026-09-28) must keep owning the
+    # policy, or another campaign ending would disable it again (the original NEW-94).
+    now = datetime.now(UTC)
+    owner_id = UUID("22222222-2222-4222-8222-222222222222")
+    ending = UUID("11111111-1111-4111-8111-111111111111")
+    engine = create_engine(f"sqlite:///{tmp_path / 'paused.sqlite'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                campaign(owner_id, project="falcone", status="PAUSED", role="owner", now=now),
+                campaign(ending, project="falcone", status="CANCELLED", role="owner", now=now),
+            ]
+        )
+    with Session(engine) as session:
+        assert OTHER_OWNER(session, ending, now) == owner_id
+    with Session(engine) as session, session.begin():
+        assert EXPIRE_CAMPAIGNS(session, now) is False

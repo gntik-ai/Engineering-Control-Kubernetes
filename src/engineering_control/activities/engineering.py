@@ -57,32 +57,26 @@ _TERMINAL_GLOBAL_BLOCKERS = frozenset(
 )
 
 
-def _current_backlog_approval(
-    campaign: db.GitHubBacklogCampaign | None,
-    *,
-    delivery_mode: str,
-    maximum_risk: str,
-    now: datetime,
+def verified_backlog_approval(
+    campaign: db.GitHubBacklogCampaign, *, now: datetime
 ) -> BacklogApprovalBinding | None:
-    if (
-        campaign is None
-        or campaign.status
-        not in {"APPROVED_POLICY_PENDING", "APPROVED_INVENTORY", "APPROVED", "RUNNING"}
-        or campaign.delivery_mode != delivery_mode
-        or campaign.maximum_risk != maximum_risk
-        or not campaign.approval_binding
-        or not isinstance(campaign.approval_json, dict)
-    ):
+    """The campaign's approval binding if its durable evidence fully verifies and is
+    unexpired, whatever the campaign status. Shared by the workers' execution check and
+    the root GitHub-policy reconciler (NEW-94), so both agree on what a valid owner is."""
+    if not campaign.approval_binding or not isinstance(campaign.approval_json, dict):
         return None
     approval = campaign.approval_json
     raw_binding = approval.get("binding")
     binding_value = raw_binding if isinstance(raw_binding, dict) else approval
     raw_approval = approval.get("approval")
     approval_record = raw_approval if isinstance(raw_approval, dict) else approval
+    try:
+        datetime.fromisoformat(str(approval_record.get("approved_at")))
+    except ValueError:
+        return None
     if (
         approval_record.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
         or not isinstance(approval_record.get("approved_by"), str)
-        or not approval_record.get("approved_at")
     ):
         return None
     try:
@@ -98,12 +92,30 @@ def _current_backlog_approval(
         or binding.source_head != campaign.source_head_at_import
         or binding.deployment_head != campaign.deployment_head_at_import
         or binding.dependency_plan_hash != campaign.plan_hash
-        or binding.delivery_mode != delivery_mode
-        or binding.maximum_risk != maximum_risk
+        or binding.delivery_mode != campaign.delivery_mode
+        or binding.maximum_risk != campaign.maximum_risk
         or _as_utc(binding.expires_at) <= now
     ):
         return None
     return binding
+
+
+def _current_backlog_approval(
+    campaign: db.GitHubBacklogCampaign | None,
+    *,
+    delivery_mode: str,
+    maximum_risk: str,
+    now: datetime,
+) -> BacklogApprovalBinding | None:
+    if (
+        campaign is None
+        or campaign.status
+        not in {"APPROVED_POLICY_PENDING", "APPROVED_INVENTORY", "APPROVED", "RUNNING"}
+        or campaign.delivery_mode != delivery_mode
+        or campaign.maximum_risk != maximum_risk
+    ):
+        return None
+    return verified_backlog_approval(campaign, now=now)
 
 
 class EngineeringActivityHandler:
