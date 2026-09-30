@@ -3263,7 +3263,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     if (
                         blocker == "CHANGE_SET_STATE_NOT_DELIVERABLE"
                         and repair_round > 0
-                        and self._repair_restores_published_patched(ordinal)
+                        and self._late_reset_restores_patched(ordinal)
                     ):
                         # NEW-102: a late repair write reset the ChangeSet after its restore;
                         # restore it again before the recheck.
@@ -3308,6 +3308,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         if applied.get("status") != "RESTORED":
             return f"CI_REPAIR_RESTORE_{applied.get('reason') or 'REFUSED'}"[:120]
         return None
+
+    def _late_reset_restores_patched(self, ordinal: int) -> bool:
+        return workflow.patched(f"existing-backlog-late-reset-restores-v1-{ordinal}")
 
     def _repair_restores_published_patched(self, ordinal: int) -> bool:
         return workflow.patched(f"existing-backlog-ci-repair-restores-published-v1-{ordinal}")
