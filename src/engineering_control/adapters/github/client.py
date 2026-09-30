@@ -1132,6 +1132,7 @@ _FAILURE_LINE = re.compile(
 )
 # NEW-104: a pnpm audit advisory table row for a high or critical finding.
 _AUDIT_FINDING_ROW = re.compile(r"^\s*│\s*(?:high|critical)\s*│", re.IGNORECASE)
+_AUDIT_SEVERITY_ROW = re.compile(r"^\s*│\s*(?:info|low|moderate|high|critical)\s*│", re.IGNORECASE)
 _AUDIT_TABLE_ROWS = 24
 _TABLE_RULING = re.compile(r"\s*[─━┌┐└┘├┤┬┴┼╭╮╰╯│]+[─━┌┐└┘├┤┬┴┼╭╮╰╯│ ]*")
 _PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
@@ -1151,19 +1152,24 @@ def failure_excerpt(
         _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300]
         for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
     ]
+    audit_tables = _audit_table_rows(lines)
     keep: list[int] = []
     for index, line in enumerate(lines):
-        if _AUDIT_FINDING_ROW.match(line):
-            for row in range(index, min(len(lines), index + _AUDIT_TABLE_ROWS)):
-                if lines[row].lstrip().startswith("└"):
-                    break
-                keep.append(row)  # inner rulings are dropped at output
+        if index in audit_tables:
+            # Only a high/critical advisory is a finding; its table's rows are kept whole.
+            if _AUDIT_FINDING_ROW.match(line):
+                row = index
+                while row in audit_tables and (
+                    row == index or not _AUDIT_SEVERITY_ROW.match(lines[row])
+                ):
+                    keep.append(row)
+                    row += 1
         elif _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
             keep.extend(range(max(0, index - 1), min(len(lines), index + context + 1)))
     selected: list[str] = []
     last = -2
     for index in sorted(set(keep)):
-        if _TABLE_RULING.fullmatch(lines[index]) and _in_audit_table(lines, index):
+        if index in audit_tables and _TABLE_RULING.fullmatch(lines[index]):
             last = index  # an inner audit-table ruling is skipped, not a gap
             continue
         if index != last + 1 and selected:
@@ -1175,11 +1181,22 @@ def failure_excerpt(
     return "\n".join(selected)[:max_chars]
 
 
-def _in_audit_table(lines: list[str], index: int) -> bool:
-    """A ruling directly inside an advisory table (its neighbours are table rows)."""
-    before = lines[index - 1] if index > 0 else ""
-    after = lines[index + 1] if index + 1 < len(lines) else ""
-    return before.lstrip().startswith("│") and after.lstrip().startswith("│")
+def _audit_table_rows(lines: list[str]) -> set[int]:
+    """NEW-104: indices of pnpm audit advisory table rows (any severity), each from its
+    severity row to the line before the table's closing ruling (bounded)."""
+    rows: set[int] = set()
+    index = 0
+    while index < len(lines):
+        if not _AUDIT_SEVERITY_ROW.match(lines[index]):
+            index += 1
+            continue
+        end = min(len(lines), index + _AUDIT_TABLE_ROWS)
+        row = index
+        while row < end and not lines[row].lstrip().startswith("└"):
+            rows.add(row)
+            row += 1
+        index = max(row, index + 1)
+    return rows
 
 
 GitHubDeliveryAdapter = GhCliBroker

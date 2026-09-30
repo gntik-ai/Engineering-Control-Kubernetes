@@ -1770,7 +1770,7 @@ def test_failure_excerpt_keeps_failing_lines_and_drops_passing_ones() -> None:
     audit_log = (
         "Progress: resolved 838, reused 833\n" * 40
         + "┌─────────────────────┬──────────────────────────────────────────┐\n"
-        + "│ moderate            │ esbuild dev server CORS                                │\n"
+        + "│ moderate            │ esbuild dev server CORS Error handling                 │\n"
         + ruling
         + "│ Package             │ esbuild                                                │\n"
         + ruling
@@ -1805,9 +1805,16 @@ def test_failure_excerpt_keeps_failing_lines_and_drops_passing_ones() -> None:
     assert "undici  <6.24.0" in npm_audit and "Severity: high" in npm_audit
     # Box drawings outside an audit table (e.g. a snapshot diff) are kept verbatim.
     snapshot = failure_excerpt(
-        "not ok 3 - renders the panel\n  expected:\n  ┌──────┐\n  │ OK   │\n  └──────┘\n"
+        "not ok 3 - renders the panel\n  expected:\n  ┌──────┐\n  │ OK   │\n"
+        "  ├──────┤\n  │ Save │\n  └──────┘\n"
     )
-    assert "┌──────┐" in snapshot and "└──────┘" in snapshot
+    assert all(part in snapshot for part in ("┌──────┐", "├──────┤", "│ Save │", "└──────┘"))
+    # Many moderate advisories (even ones mentioning "Error") never crowd out a high one.
+    moderate = (
+        "┌──┐\n│ moderate │ parser Error recovery │\n├──┤\n│ Package │ other │\n└──┘\n"
+    ) * 30
+    crowded = failure_excerpt(moderate + audit_log[audit_log.index("┌", 1000) :])
+    assert "@grpc/grpc-js" in crowded and "other" not in crowded
     long = failure_excerpt("not ok 1 - x\n" * 10_000)
     assert len(long) <= 4000 and long.count("\n") < 60
 
