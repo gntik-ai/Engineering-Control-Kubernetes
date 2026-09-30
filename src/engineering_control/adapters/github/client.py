@@ -1126,11 +1126,13 @@ _FAILURE_LINE = re.compile(
     r"^not ok\b|##\[error\]|\b(?:error|failed|failure|assert(?:ion)?|expected|actual|"
     r"exception|traceback|panic)\b|^\s*(?:throw|at )|^\s*--- FAIL\b|^FAIL\b|"
     r"\bgot\b.*\bwant\b|"
-    # NEW-104: dependency-audit findings (pnpm/npm audit table rows and npm's "Severity:"
-    # lines), so a failed audit job names each high/critical package and its fix.
-    r"^\s*[│|]\s*(?:high|critical)\s*[│|]|^\s*Severity:\s*(?:high|critical)\s*$",
+    # NEW-104: npm audit's per-package "Severity: high|critical" lines.
+    r"^\s*Severity:\s*(?:high|critical)\s*$",
     re.IGNORECASE,
 )
+# NEW-104: a pnpm audit advisory table row for a high or critical finding.
+_AUDIT_FINDING_ROW = re.compile(r"^\s*│\s*(?:high|critical)\s*│", re.IGNORECASE)
+_AUDIT_TABLE_ROWS = 24
 _TABLE_RULING = re.compile(r"\s*[─━┌┐└┘├┤┬┴┼╭╮╰╯│]+[─━┌┐└┘├┤┬┴┼╭╮╰╯│ ]*")
 _PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
 
@@ -1141,21 +1143,29 @@ def failure_excerpt(
     """NEW-100: keep the lines around each failure marker of a CI log, bounded.
 
     Timestamps and ANSI colours are stripped; passing test lines never count as markers.
+    NEW-104: a high/critical dependency-audit row keeps exactly its own advisory table
+    (down to that table's closing ruling, without the inner rulings), so the package,
+    patched versions and paths fit and no neighbouring advisory bleeds in.
     """
     lines = [
-        cleaned
+        _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300]
         for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
-        # NEW-104: table rulings (audit output) carry no content and would crowd out the
-        # rows that follow a finding.
-        if not _TABLE_RULING.fullmatch(cleaned := _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300])
     ]
     keep: list[int] = []
     for index, line in enumerate(lines):
-        if _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
+        if _AUDIT_FINDING_ROW.match(line):
+            for row in range(index, min(len(lines), index + _AUDIT_TABLE_ROWS)):
+                if lines[row].lstrip().startswith("└"):
+                    break
+                keep.append(row)  # inner rulings are dropped at output
+        elif _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
             keep.extend(range(max(0, index - 1), min(len(lines), index + context + 1)))
     selected: list[str] = []
     last = -2
     for index in sorted(set(keep)):
+        if _TABLE_RULING.fullmatch(lines[index]) and _in_audit_table(lines, index):
+            last = index  # an inner audit-table ruling is skipped, not a gap
+            continue
         if index != last + 1 and selected:
             selected.append("...")
         selected.append(lines[index])
@@ -1163,6 +1173,13 @@ def failure_excerpt(
         if len(selected) >= max_lines:
             break
     return "\n".join(selected)[:max_chars]
+
+
+def _in_audit_table(lines: list[str], index: int) -> bool:
+    """A ruling directly inside an advisory table (its neighbours are table rows)."""
+    before = lines[index - 1] if index > 0 else ""
+    after = lines[index + 1] if index + 1 < len(lines) else ""
+    return before.lstrip().startswith("│") and after.lstrip().startswith("│")
 
 
 GitHubDeliveryAdapter = GhCliBroker
