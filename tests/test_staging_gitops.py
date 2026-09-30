@@ -1764,6 +1764,68 @@ def test_failure_excerpt_keeps_failing_lines_and_drops_passing_ones() -> None:
     go_log = "--- FAIL: TestDelete (0.01s)\n    store_test.go:42: got nil; want flow\n"
     go = failure_excerpt(go_log + "=== RUN TestOther\n" * 50 + "##[error]exit 1\n", context=1)
     assert "--- FAIL: TestDelete" in go and "got nil; want flow" in go
+    # NEW-104: a failed dependency audit names each high/critical advisory and its fix,
+    # keeping exactly that advisory's table (no neighbouring advisory bleeds in).
+    ruling = "├─────────────────────┼──────────────────────────────────────────┤\n"
+    audit_log = (
+        "Progress: resolved 838, reused 833\n" * 40
+        + "┌─────────────────────┬──────────────────────────────────────────┐\n"
+        + "│ moderate            │ esbuild dev server CORS Error handling                 │\n"
+        + ruling
+        + "│ Package             │ esbuild                                                │\n"
+        + ruling
+        + "│ Patched versions    │ >=0.25.0                                               │\n"
+        + "└─────────────────────┴──────────────────────────────────────────┘\n"
+        + "┌─────────────────────┬──────────────────────────────────────────┐\n"
+        + "│ high                │ @grpc/grpc-js: In certain configurations,              │\n"
+        + ruling
+        + "│ Package             │ @grpc/grpc-js                                          │\n"
+        + ruling
+        + "│ Vulnerable versions │ <1.14.5                                                │\n"
+        + ruling
+        + "│ Patched versions    │ >=1.14.5                                               │\n"
+        + ruling
+        + "│ Paths               │ apps/control-plane-executor > @grpc/grpc-js@1.14.4     │\n"
+        + ruling
+        + "│ More info           │ https://github.com/advisories/GHSA-m9gg-hp2v-232j      │\n"
+        + "└─────────────────────┴──────────────────────────────────────────┘\n"
+        + "Severity: 4 low | 17 moderate | 4 high\n"
+        + " ELIFECYCLE  Command failed with exit code 1.\n"
+        + "##[error]Process completed with exit code 1.\n"
+    )
+    audit = failure_excerpt(audit_log)
+    assert "@grpc/grpc-js: In certain configurations" in audit
+    assert "Patched versions    │ >=1.14.5" in audit and "GHSA-m9gg-hp2v-232j" in audit
+    assert "Paths               │ apps/control-plane-executor" in audit
+    assert "esbuild" not in audit and ">=0.25.0" not in audit  # no moderate bleed-through
+    assert "├" not in audit and "Progress: resolved" not in audit
+    npm_audit = failure_excerpt(
+        "undici  <6.24.0\nSeverity: high\nDenial of Service\nfix available\n"
+    )
+    assert "undici  <6.24.0" in npm_audit and "Severity: high" in npm_audit
+    # Box drawings outside an audit table (e.g. a snapshot diff) are kept verbatim.
+    snapshot = failure_excerpt(
+        "not ok 3 - renders the panel\n  expected:\n  ┌──────┐\n  │ OK   │\n"
+        "  ├──────┤\n  │ Save │\n  └──────┘\n"
+    )
+    assert all(part in snapshot for part in ("┌──────┐", "├──────┤", "│ Save │", "└──────┘"))
+    # Many moderate advisories (even ones mentioning "Error") never crowd out a high one.
+    moderate = (
+        "┌──┐\n│ moderate │ parser Error recovery │\n├──┤\n│ Package │ other │\n└──┘\n"
+    ) * 30
+    crowded = failure_excerpt(moderate + audit_log[audit_log.index("┌", 1000) :])
+    assert "@grpc/grpc-js" in crowded and "other" not in crowded
+    # A truncated advisory (no closing ruling) never swallows the job's error lines.
+    truncated = failure_excerpt(
+        "┌──┐\n│ moderate │ parser │\n├──┤\n│ Package │ other │\n"
+        "Process exited\n##[error]Process completed with exit code 1.\n"
+    )
+    assert "##[error]Process completed" in truncated
+    # A snapshot box with a severity-looking row but no Package row is not an audit table.
+    boxed = failure_excerpt(
+        "not ok 4 - risk badge\n  ┌──────┐\n  │ high │ badge │\n  ├──────┤\n  └──────┘\n"
+    )
+    assert "├──────┤" in boxed
     long = failure_excerpt("not ok 1 - x\n" * 10_000)
     assert len(long) <= 4000 and long.count("\n") < 60
 

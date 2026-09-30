@@ -1125,9 +1125,17 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _FAILURE_LINE = re.compile(
     r"^not ok\b|##\[error\]|\b(?:error|failed|failure|assert(?:ion)?|expected|actual|"
     r"exception|traceback|panic)\b|^\s*(?:throw|at )|^\s*--- FAIL\b|^FAIL\b|"
-    r"\bgot\b.*\bwant\b",
+    r"\bgot\b.*\bwant\b|"
+    # NEW-104: npm audit's per-package "Severity: high|critical" lines.
+    r"^\s*Severity:\s*(?:high|critical)\s*$",
     re.IGNORECASE,
 )
+# NEW-104: a pnpm audit advisory table row for a high or critical finding.
+_AUDIT_FINDING_ROW = re.compile(r"^\s*│\s*(?:high|critical)\s*│", re.IGNORECASE)
+_AUDIT_PACKAGE_ROW = re.compile(r"^\s*│\s*Package\s*│")
+_AUDIT_SEVERITY_ROW = re.compile(r"^\s*│\s*(?:info|low|moderate|high|critical)\s*│", re.IGNORECASE)
+_AUDIT_TABLE_ROWS = 24
+_TABLE_RULING = re.compile(r"\s*[─━┌┐└┘├┤┬┴┼╭╮╰╯│]+[─━┌┐└┘├┤┬┴┼╭╮╰╯│ ]*")
 _PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
 
 
@@ -1137,18 +1145,34 @@ def failure_excerpt(
     """NEW-100: keep the lines around each failure marker of a CI log, bounded.
 
     Timestamps and ANSI colours are stripped; passing test lines never count as markers.
+    NEW-104: a high/critical dependency-audit row keeps exactly its own advisory table
+    (down to that table's closing ruling, without the inner rulings), so the package,
+    patched versions and paths fit and no neighbouring advisory bleeds in.
     """
     lines = [
         _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300]
         for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
     ]
+    audit_tables = _audit_table_rows(lines)
     keep: list[int] = []
     for index, line in enumerate(lines):
-        if _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
+        if index in audit_tables:
+            # Only a high/critical advisory is a finding; its table's rows are kept whole.
+            if _AUDIT_FINDING_ROW.match(line):
+                row = index
+                while row in audit_tables and (
+                    row == index or not _AUDIT_SEVERITY_ROW.match(lines[row])
+                ):
+                    keep.append(row)
+                    row += 1
+        elif _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
             keep.extend(range(max(0, index - 1), min(len(lines), index + context + 1)))
     selected: list[str] = []
     last = -2
     for index in sorted(set(keep)):
+        if index in audit_tables and _TABLE_RULING.fullmatch(lines[index]):
+            last = index  # an inner audit-table ruling is skipped, not a gap
+            continue
         if index != last + 1 and selected:
             selected.append("...")
         selected.append(lines[index])
@@ -1156,6 +1180,36 @@ def failure_excerpt(
         if len(selected) >= max_lines:
             break
     return "\n".join(selected)[:max_chars]
+
+
+def _audit_table_rows(lines: list[str]) -> set[int]:
+    """NEW-104: indices of pnpm audit advisory table rows (any severity).
+
+    A table starts at a severity row and ends before its closing ruling, at the first
+    line that is not a table row or ruling (a truncated table), or after a bound. It is
+    an audit table only if it has a "│ Package │" row; anything else is left alone.
+    """
+    rows: set[int] = set()
+    index = 0
+    while index < len(lines):
+        if not _AUDIT_SEVERITY_ROW.match(lines[index]):
+            index += 1
+            continue
+        end = min(len(lines), index + _AUDIT_TABLE_ROWS)
+        row = index
+        while row < end:
+            stripped = lines[row].lstrip()
+            if stripped.startswith("└") or not (
+                stripped.startswith("│") or _TABLE_RULING.fullmatch(lines[row])
+            ):
+                break
+            if row > index and _AUDIT_SEVERITY_ROW.match(lines[row]):
+                break
+            row += 1
+        if any(_AUDIT_PACKAGE_ROW.match(lines[candidate]) for candidate in range(index, row)):
+            rows.update(range(index, row))
+        index = max(row, index + 1)
+    return rows
 
 
 GitHubDeliveryAdapter = GhCliBroker
