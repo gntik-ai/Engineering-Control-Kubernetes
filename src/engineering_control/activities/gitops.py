@@ -1114,10 +1114,12 @@ class GitOpsGitHubHandler:
         if pull_request.get("state") != "OPEN":
             return {"status": "BLOCKED", "blocker": "DEPLOYMENT_PR_NOT_OPEN"}
         states = _check_states(pull_request)
-        if not states or any(value == "PENDING" for value in states.values()):
-            return {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CHECKS_PENDING"}
         failed = sorted(name for name, value in states.items() if value == "FAILED")
         if not failed:
+            # A failure is reported at once (even while other checks run) so the bounded
+            # repair can start; otherwise wait for every check and the configured workflow.
+            if not states or any(value == "PENDING" for value in states.values()):
+                return {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CHECKS_PENDING"}
             if not _workflow_succeeded(pull_request, flow.deployment_ci_workflow):
                 # The configured CI never ran (or only skipped jobs): not a pass.
                 return {"status": "CHECKS_PENDING", "reason": "REQUIRED_DEPLOYMENT_CI_MISSING"}

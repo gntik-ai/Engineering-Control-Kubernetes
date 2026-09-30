@@ -1914,6 +1914,7 @@ async def test_deployment_pr_checks_gate_the_merge_of_both_prs(tmp_path: Path) -
         statusCheckRollup=[
             {**_check("validate", "FAILURE"), "detailsUrl": job_url.format(31)},
             _check("lint", "SUCCESS"),
+            _check("slow", None),  # a still-running check never hides the failure
         ]
     )
     fake.job_logs = {31: "not ok 51 - default umbrella stays at its approved baseline"}
