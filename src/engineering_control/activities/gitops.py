@@ -504,6 +504,12 @@ class GitOpsControllerHandler:
             recovery = dict(change_set.recovery_json or {})
             recovery["staging_gitops"] = record
             change_set.recovery_json = recovery
+            if merge_sha is not None:
+                # NEW-102: the merged PR heads are what was delivered; a stale write (e.g. a
+                # repair's unpublished local head) never survives on a merged ChangeSet.
+                change_set.source_head_sha = plan.source_head_sha
+                if plan.deployment_pr_number is not None and plan.deployment_head_sha:
+                    change_set.deployment_head_sha = plan.deployment_head_sha
             if outcome == "STAGING_VERIFIED":
                 change_set.state = ChangeSetState.RUNTIME_VERIFIED.value
             elif merge_sha is not None and change_set.state in {

@@ -2227,7 +2227,18 @@ class EngineeringActivityHandler:
                 )
             if not change_set.source_pr_url or not all(map(_is_sha, published.values())):
                 return refused("PUBLICATION_BINDING_MISSING")
-            if change_set.state not in self._REPAIR_INTERMEDIATE_STATES:
+            # An already-published binding (the repair stopped before resetting the state,
+            # or an earlier apply committed but its result was lost) is restored as a no-op.
+            already = (
+                change_set.state == "SOURCE_PR"
+                and change_set.source_head_sha == published[str(change_set.source_pr_url)]
+                and (
+                    not change_set.deployment_pr_url
+                    or change_set.deployment_head_sha
+                    == published[str(change_set.deployment_pr_url)]
+                )
+            )
+            if change_set.state not in self._REPAIR_INTERMEDIATE_STATES and not already:
                 return refused(f"STATE_{change_set.state}")
             if phase == "plan":
                 return {
@@ -2249,6 +2260,8 @@ class EngineeringActivityHandler:
                     return refused("PUBLISHED_PR_NOT_OPEN")
                 if observed.get("head_sha") != head:
                     return refused("PUBLISHED_PR_HEAD_CHANGED")
+            if already:
+                return {**self._envelope(step, payload, "RESTORED"), "already_published": True}
             recovery["ci_repair_restore"] = {
                 "from_state": change_set.state,
                 "from_source_head_sha": change_set.source_head_sha,

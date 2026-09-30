@@ -1567,6 +1567,8 @@ def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: P
         ("PLANNED", True, True, "closed", "NOT_RESTORED", "PUBLISHED_PR_NOT_OPEN"),
         ("PLANNED", True, True, "raced", "NOT_RESTORED", "CHANGE_SET_CHANGED_SINCE_PLAN"),
         ("SOURCE_MERGED", True, True, "published", "NOT_RESTORED", "STATE_SOURCE_MERGED"),
+        ("SOURCE_PR", True, True, "published", "NOT_RESTORED", "STATE_SOURCE_PR"),
+        ("ALREADY", True, True, "published", "RESTORED", None),
         ("PLANNED", False, True, "published", "NOT_RESTORED", "PUBLICATION_BINDING_MISSING"),
     ],
 )
@@ -1597,6 +1599,9 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
     source_url = "https://github.com/gntik-ai/falcone/pull/1038"
     deployment_url = "https://github.com/gntik-ai/falcone-charts/pull/50"
     change_set_id = uuid4()
+    # "ALREADY": the ChangeSet is SOURCE_PR at its published heads (the repair stopped
+    # before resetting it, or an earlier apply committed but lost its result): a no-op.
+    already = state == "ALREADY"
     with handler.sessions.begin() as session:
         session.add(
             db.ChangeSet(
@@ -1604,15 +1609,16 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
                 finding_id=uuid4(),
                 project="falcone",
                 risk_class="R3",
-                state=state,
+                state="SOURCE_PR" if already else state,
                 version=3,
                 source_repository="falcone",
                 source_base_sha="c" * 40,
-                source_head_sha="d" * 40,  # the repair's unpublished local head
+                # the repair's unpublished local head (or the published one when "ALREADY")
+                source_head_sha=published_source if already else "d" * 40,
                 source_pr_url=source_url,
                 deployment_repository="falcone-charts",
                 deployment_base_sha="e" * 40,
-                deployment_head_sha="f" * 40,
+                deployment_head_sha=published_deployment if already else "f" * 40,
                 deployment_pr_url=deployment_url if deployment_pr else None,
                 image_digests={},
                 recovery_json=(
@@ -1658,7 +1664,11 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
     with handler.sessions() as session:
         change_set = session.get(db.ChangeSet, change_set_id)
         assert change_set is not None
-        if expected == "RESTORED":
+        if already:
+            assert result["already_published"] is True
+            assert change_set.state == "SOURCE_PR" and change_set.version == 3
+            assert "ci_repair_restore" not in change_set.recovery_json
+        elif expected == "RESTORED":
             assert change_set.state == "SOURCE_PR" and change_set.version == 4
             assert change_set.source_head_sha == published_source
             assert change_set.deployment_head_sha == (
