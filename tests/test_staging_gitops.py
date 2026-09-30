@@ -783,6 +783,21 @@ async def test_persist_result_records_merge_and_runtime_verified_state(tmp_path:
         {"plan": plan, "outcome": "BLOCKED", "blocker": "IMAGE_NOT_PINNED", "merge_sha": MERGE_SHA},
     )
     assert blocked["change_set_state"] == "SOURCE_MERGED"
+    # NEW-102: a merged ChangeSet records the plan's delivered head and SOURCE_MERGED, even
+    # after a late repair write reset it to PLANNED with an unpublished head.
+    with handler.sessions.begin() as session:
+        stale = session.get(db.ChangeSet, change_set_id)
+        assert stale is not None
+        stale.source_head_sha = "9" * 40
+        stale.state = "PLANNED"
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": plan, "outcome": "BLOCKED", "blocker": "IMAGE_NOT_PINNED", "merge_sha": MERGE_SHA},
+    )
+    with handler.sessions.begin() as session:
+        merged = session.get(db.ChangeSet, change_set_id)
+        assert merged is not None and merged.source_head_sha == plan["source_head_sha"]
+        assert merged.state == "SOURCE_MERGED"
     # NEW-99: only a known unverified-regression reason is recorded.
     for reason, recorded in (
         ("CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_CI_CONFIG_CHANGED"),
@@ -1847,3 +1862,19 @@ async def test_a_stalled_job_log_read_is_skipped(tmp_path: Path) -> None:
 
     assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
     assert set(blocked["failure_excerpts"]) == {"quality"}
+
+
+@pytest.mark.asyncio
+async def test_pr_heads_reads_each_bound_pull_request(tmp_path: Path) -> None:
+    # NEW-102: the restore compares recorded published heads with the live PRs.
+    handler, fake = _baseline_handler(tmp_path, [], [])
+    url = "https://github.com/gntik-ai/musematic/pull/77"
+    result = await handler.handle("gitops.pr_heads", {"pull_requests": [{"url": url}]})
+    assert result["status"] == "OK"
+    [head] = result["heads"]
+    assert head["url"] == url and head["state"] == "OPEN"
+    assert head["head_sha"] == fake.pull_requests[("gntik-ai/musematic", 77)]["headRefOid"]
+    outside = await handler.handle(
+        "gitops.pr_heads", {"pull_requests": [{"url": "https://github.com/evil/x/pull/1"}]}
+    )
+    assert outside["status"] == "BLOCKED"

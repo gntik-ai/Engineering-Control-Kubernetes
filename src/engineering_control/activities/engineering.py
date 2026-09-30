@@ -185,6 +185,7 @@ class EngineeringActivityHandler:
             "backlog.record_revalidation",
             "backlog.revalidate_gate",
             "backlog.record_loop_state",
+            "backlog.restore_published_change_set",
             "notify.write_policy_required",
             "backlog.register_child_run",
             "backlog.register_run",
@@ -320,6 +321,8 @@ class EngineeringActivityHandler:
             return self._backlog_revalidate_gate(payload)
         if step == "backlog.record_loop_state":
             return self._record_backlog_loop_state(payload)
+        if step == "backlog.restore_published_change_set":
+            return self._restore_published_change_set(payload)
         if step == "notify.write_policy_required":
             return self._notify_write_policy_required(payload)
         if step == "backlog.register_child_run":
@@ -2183,6 +2186,99 @@ class EngineeringActivityHandler:
                 "REGISTERED",
             )
 
+    # NEW-102: states a CI-repair re-delivery leaves behind when it stops before publishing.
+    _REPAIR_INTERMEDIATE_STATES = frozenset({"PLANNED", "IMPLEMENTING", "REQUEST_CHANGES"})
+
+    def _restore_published_change_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-102: return a ChangeSet to its published PRs after a CI repair stopped
+        without publishing (falcone #1001: left PLANNED, so the recheck was refused).
+
+        Two phases around a read of the live PR heads (gitops.pr_heads, GitHub worker):
+        "plan" names the bound PRs and the ChangeSet version, and "apply" restores SOURCE_PR
+        only if the version is unchanged (no late repair write) and every bound PR is open
+        at exactly the head recorded at publication. Heads return to those published heads,
+        so unpublished commits are never delivered. Any mismatch is NOT_RESTORED.
+        """
+        step = "backlog.restore_published_change_set"
+        phase = str(payload.get("phase") or "")
+        if phase not in {"plan", "apply"}:
+            raise ValueError("restore phase is invalid")
+        change_set_id = UUID(str(payload["change_set_id"]))
+
+        def refused(reason: str) -> dict[str, Any]:
+            return {**self._envelope(step, payload, "NOT_RESTORED"), "reason": reason[:80]}
+
+        with self.sessions.begin() as session:
+            change_set = session.get(db.ChangeSet, change_set_id, with_for_update=True)
+            if change_set is None:
+                raise ValueError("CI-repair ChangeSet is missing")
+            recovery = dict(change_set.recovery_json or {})
+            evidence = recovery.get("change_evidence")
+            source = evidence.get("source") if isinstance(evidence, dict) else None
+            deployment = evidence.get("deployment") if isinstance(evidence, dict) else None
+            published = {
+                str(change_set.source_pr_url or ""): (
+                    source.get("head_sha") if isinstance(source, dict) else None
+                )
+            }
+            if change_set.deployment_pr_url:
+                published[str(change_set.deployment_pr_url)] = (
+                    deployment.get("head_sha") if isinstance(deployment, dict) else None
+                )
+            if not change_set.source_pr_url or not all(map(_is_sha, published.values())):
+                return refused("PUBLICATION_BINDING_MISSING")
+            # An already-published binding (the repair stopped before resetting the state,
+            # or an earlier apply committed but its result was lost) is restored as a no-op.
+            already = (
+                change_set.state == "SOURCE_PR"
+                and change_set.source_head_sha == published[str(change_set.source_pr_url)]
+                and (
+                    not change_set.deployment_pr_url
+                    or change_set.deployment_head_sha
+                    == published[str(change_set.deployment_pr_url)]
+                )
+            )
+            if change_set.state not in self._REPAIR_INTERMEDIATE_STATES and not already:
+                return refused(f"STATE_{change_set.state}")
+            if phase == "plan":
+                return {
+                    **self._envelope(step, payload, "READY"),
+                    "version": change_set.version,
+                    "pull_requests": [{"url": url} for url in published],
+                }
+            if payload.get("version") != change_set.version:
+                return refused("CHANGE_SET_CHANGED_SINCE_PLAN")
+            live = payload.get("live_heads")
+            by_url = (
+                {str(item.get("url")): item for item in live if isinstance(item, dict)}
+                if isinstance(live, list)
+                else {}
+            )
+            for url, head in published.items():
+                observed = by_url.get(url)
+                if observed is None or observed.get("state") != "OPEN":
+                    return refused("PUBLISHED_PR_NOT_OPEN")
+                if observed.get("head_sha") != head:
+                    return refused("PUBLISHED_PR_HEAD_CHANGED")
+            if already:
+                return {**self._envelope(step, payload, "RESTORED"), "already_published": True}
+            recovery["ci_repair_restore"] = {
+                "from_state": change_set.state,
+                "from_source_head_sha": change_set.source_head_sha,
+                "from_deployment_head_sha": change_set.deployment_head_sha,
+                "restored_at": datetime.now(UTC).isoformat(),
+                "workflow_id": str(payload.get("workflow_id") or "")[:240],
+            }
+            change_set.recovery_json = recovery
+            change_set.state = "SOURCE_PR"
+            change_set.source_head_sha = str(published[str(change_set.source_pr_url)])
+            if change_set.deployment_pr_url:
+                change_set.deployment_head_sha = str(
+                    published[str(change_set.deployment_pr_url)]
+                )
+            change_set.version += 1
+        return self._envelope(step, payload, "RESTORED")
+
     def _register_backlog_child_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         child_kind = str(payload.get("child_kind", ""))
         child_workflow_id = str(payload.get("child_workflow_id", ""))
@@ -2594,3 +2690,7 @@ class EngineeringActivityHandler:
             "evidence_sha256": hashlib.sha256(canonical).hexdigest(),
             "recorded_at": datetime.now(UTC).isoformat(),
         }
+
+
+def _is_sha(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None

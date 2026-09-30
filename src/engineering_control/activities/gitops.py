@@ -504,11 +504,22 @@ class GitOpsControllerHandler:
             recovery = dict(change_set.recovery_json or {})
             recovery["staging_gitops"] = record
             change_set.recovery_json = recovery
+            if merge_sha is not None:
+                # NEW-102: the merged PR heads are what was delivered; a stale write (e.g. a
+                # repair's unpublished local head) never survives on a merged ChangeSet.
+                change_set.source_head_sha = plan.source_head_sha
+                if plan.deployment_pr_number is not None and plan.deployment_head_sha:
+                    change_set.deployment_head_sha = plan.deployment_head_sha
             if outcome == "STAGING_VERIFIED":
                 change_set.state = ChangeSetState.RUNTIME_VERIFIED.value
             elif merge_sha is not None and change_set.state in {
                 ChangeSetState.SOURCE_PR.value,
                 ChangeSetState.CI_VALIDATED.value,
+                # NEW-102: a late repair write may have reset the state after prepare;
+                # the merge is what happened, so the ChangeSet is SOURCE_MERGED.
+                ChangeSetState.PLANNED.value,
+                ChangeSetState.IMPLEMENTING.value,
+                ChangeSetState.REQUEST_CHANGES.value,
             }:
                 change_set.state = ChangeSetState.SOURCE_MERGED.value
             change_set.version += 1
@@ -937,6 +948,7 @@ class GitOpsGitHubHandler:
     write_capable_steps = GITOPS_WRITE_CAPABLE_GITHUB_STEPS
     _failure_blockers = {
         "gitops.pr_checks": "SOURCE_PR_CHECKS_UNAVAILABLE",
+        "gitops.pr_heads": "PR_HEADS_UNAVAILABLE",
         "gitops.merge": "PROTECTED_MERGE_FAILED",
         "gitops.release_tag": "RELEASE_TAG_FAILED",
         "gitops.workflow_run": "WORKFLOW_RUN_UNAVAILABLE",
@@ -973,6 +985,7 @@ class GitOpsGitHubHandler:
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         handlers = {
             "gitops.pr_checks": self._pr_checks,
+            "gitops.pr_heads": self._pr_heads,
             "gitops.merge": self._merge,
             "gitops.release_tag": self._release_tag,
             "gitops.workflow_run": self._workflow_run,
@@ -1046,6 +1059,27 @@ class GitOpsGitHubHandler:
         return path
 
     # -- 1. PR checks ------------------------------------------------------------------
+
+    def _pr_heads(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-102: live head and state of each named pull request (read-only)."""
+        raw = payload.get("pull_requests")
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 2:
+            raise ValueError("pull request head request is invalid")
+        heads: list[dict[str, Any]] = []
+        for item in raw:
+            url = str(item.get("url") if isinstance(item, dict) else "")
+            match = _PR_URL.fullmatch(url)
+            if match is None:
+                raise ValueError("pull request URL is outside the allowlist")
+            pull_request = self.broker.view_pull_request(match.group(1), int(match.group(2)))
+            heads.append(
+                {
+                    "url": url,
+                    "head_sha": str(pull_request.get("headRefOid") or ""),
+                    "state": str(pull_request.get("state") or ""),
+                }
+            )
+        return {"status": "OK", "heads": heads}
 
     def _pr_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
         # NEW-100: the activity heartbeats only on entry, so the optional CI log reads must

@@ -13,6 +13,7 @@ from sqlalchemy import event, select
 from engineering_control.activities.engineering import EngineeringActivityHandler
 from engineering_control.api.schemas import BacklogApprovalCandidateRequest
 from engineering_control.config import Settings
+from engineering_control.db import models as db
 from engineering_control.db.base import Base
 from engineering_control.db.models import BacklogIssueRecord, CoverageCell, GitHubBacklogCampaign
 from engineering_control.db.repository import SQLMetadataRepository
@@ -1553,3 +1554,128 @@ def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: P
         assert "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE" in (run.summary or "")
         campaign = session.get(GitHubBacklogCampaign, campaign_id)
         assert campaign is not None and campaign.status == "APPROVED"  # untouched
+
+
+
+@pytest.mark.parametrize(
+    ("state", "evidence", "deployment_pr", "live", "expected", "reason"),
+    [
+        ("PLANNED", True, True, "published", "RESTORED", None),
+        ("IMPLEMENTING", True, False, "published", "RESTORED", None),
+        ("REQUEST_CHANGES", True, True, "published", "RESTORED", None),
+        ("PLANNED", True, True, "moved", "NOT_RESTORED", "PUBLISHED_PR_HEAD_CHANGED"),
+        ("PLANNED", True, True, "closed", "NOT_RESTORED", "PUBLISHED_PR_NOT_OPEN"),
+        ("PLANNED", True, True, "raced", "NOT_RESTORED", "CHANGE_SET_CHANGED_SINCE_PLAN"),
+        ("SOURCE_MERGED", True, True, "published", "NOT_RESTORED", "STATE_SOURCE_MERGED"),
+        ("SOURCE_PR", True, True, "published", "NOT_RESTORED", "STATE_SOURCE_PR"),
+        ("ALREADY", True, True, "published", "RESTORED", None),
+        ("PLANNED", False, True, "published", "NOT_RESTORED", "PUBLICATION_BINDING_MISSING"),
+    ],
+)
+def test_a_stopped_ci_repair_restores_the_last_published_binding(
+    tmp_path: Path,
+    state: str,
+    evidence: bool,
+    deployment_pr: bool,
+    live: str,
+    expected: str,
+    reason: str | None,
+) -> None:
+    # NEW-102: falcone #1001's CI repair stopped without publishing and left the
+    # ChangeSet PLANNED, so the recheck was refused. The loop restores SOURCE_PR and the
+    # heads recorded at publication, only if every bound PR is still open at exactly those
+    # heads and nothing wrote the ChangeSet since the plan.
+    from uuid import uuid4
+
+    handler = EngineeringActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'restore.sqlite'}",
+            state_root=tmp_path,
+            project_config_root=ROOT / "config/projects",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    published_source, published_deployment = "a" * 40, "b" * 40
+    source_url = "https://github.com/gntik-ai/falcone/pull/1038"
+    deployment_url = "https://github.com/gntik-ai/falcone-charts/pull/50"
+    change_set_id = uuid4()
+    # "ALREADY": the ChangeSet is SOURCE_PR at its published heads (the repair stopped
+    # before resetting it, or an earlier apply committed but lost its result): a no-op.
+    already = state == "ALREADY"
+    with handler.sessions.begin() as session:
+        session.add(
+            db.ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                project="falcone",
+                risk_class="R3",
+                state="SOURCE_PR" if already else state,
+                version=3,
+                source_repository="falcone",
+                source_base_sha="c" * 40,
+                # the repair's unpublished local head (or the published one when "ALREADY")
+                source_head_sha=published_source if already else "d" * 40,
+                source_pr_url=source_url,
+                deployment_repository="falcone-charts",
+                deployment_base_sha="e" * 40,
+                deployment_head_sha=published_deployment if already else "f" * 40,
+                deployment_pr_url=deployment_url if deployment_pr else None,
+                image_digests={},
+                recovery_json=(
+                    {
+                        "change_evidence": {
+                            "source": {"head_sha": published_source},
+                            "deployment": {"head_sha": published_deployment},
+                        }
+                    }
+                    if evidence
+                    else {}
+                ),
+            )
+        )
+    base = {"change_set_id": str(change_set_id), "workflow_id": "backlog-loop-falcone-x"}
+
+    plan = handler._restore_published_change_set({**base, "phase": "plan"})
+    if plan["status"] == "READY":
+        assert [item["url"] for item in plan["pull_requests"]] == (
+            [source_url, deployment_url] if deployment_pr else [source_url]
+        )
+        heads = [
+            {"url": source_url, "head_sha": published_source, "state": "OPEN"},
+            {"url": deployment_url, "head_sha": published_deployment, "state": "OPEN"},
+        ]
+        if live == "moved":
+            heads[0]["head_sha"] = "9" * 40  # e.g. a partial publication pushed the source
+        if live == "closed":
+            heads[1]["state"] = "CLOSED"
+        if live == "raced":
+            with handler.sessions.begin() as session:
+                raced = session.get(db.ChangeSet, change_set_id)
+                assert raced is not None
+                raced.version += 1  # a late repair write after the plan
+        result = handler._restore_published_change_set(
+            {**base, "phase": "apply", "version": plan["version"], "live_heads": heads}
+        )
+    else:
+        result = plan
+
+    assert result["status"] == expected
+    assert result.get("reason") == reason
+    with handler.sessions() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        if already:
+            assert result["already_published"] is True
+            assert change_set.state == "SOURCE_PR" and change_set.version == 3
+            assert "ci_repair_restore" not in change_set.recovery_json
+        elif expected == "RESTORED":
+            assert change_set.state == "SOURCE_PR" and change_set.version == 4
+            assert change_set.source_head_sha == published_source
+            assert change_set.deployment_head_sha == (
+                published_deployment if deployment_pr else "f" * 40
+            )
+            restore = change_set.recovery_json["ci_repair_restore"]
+            assert restore["from_state"] == state
+            assert restore["from_source_head_sha"] == "d" * 40
+        else:
+            assert change_set.state == state and change_set.source_head_sha == "d" * 40

@@ -1302,3 +1302,49 @@ async def test_validation_findings_reach_the_next_maker_round(tmp_path: Path) ->
 
     assert "found these NEW findings" in source and "CVE-2026-84445" in source
     assert "CVE-2026-84445" not in deployment
+
+
+def test_a_late_repair_write_never_resets_a_delivered_change_set(tmp_path: Path) -> None:
+    # NEW-102: a timed-out repair's handoff completing after the merge must be refused.
+    handler, allocation = _lease_fixture(tmp_path)
+    change_set_id = UUID(allocation["change_set_id"])
+    run_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=run_id,
+                workflow_id="backlog-loop-x-issue-1-ci-repair-1-attempt-1",
+                run_type="delivery",
+                status="RUNNING",
+                project="musematic",
+                change_set_id=change_set_id,
+            )
+        )
+    for state, refused in (("SOURCE_MERGED", True), ("RUNTIME_VERIFIED", True), ("PLANNED", False)):
+        with handler.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            assert change_set is not None
+            change_set.state = state
+        payload = {
+            **allocation,
+            "run_id": str(run_id),
+            "change_evidence": {
+                "source": {"head_sha": "e" * 40},
+                "deployment": {"head_sha": "c" * 40, "changed_file_count": 0},
+            },
+            "source_base_sha": "a" * 40,
+            "deployment_base_sha": "c" * 40,
+            "maker_provider": "codex",
+            "checker_provider": "claude",
+        }
+        if refused:
+            with pytest.raises(ValueError, match="already delivered"):
+                handler._persist_delivery_handoff(payload)
+            with handler.sessions.begin() as session:
+                change_set = session.get(ChangeSet, change_set_id)
+                assert change_set is not None and change_set.state == state
+        else:
+            try:
+                handler._persist_delivery_handoff(payload)
+            except ValueError as error:
+                assert "already delivered" not in str(error)

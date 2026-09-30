@@ -361,6 +361,7 @@ class ControlledWorkflow:
             return GITHUB_TASK_QUEUE
         if step in {
             "gitops.pr_checks",
+            "gitops.pr_heads",
             "gitops.merge",
             "gitops.release_tag",
             "gitops.workflow_run",
@@ -3143,9 +3144,20 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         gitops_round = 0
         repair_round = 0
         repair_pending = False
+        restore_pending = False
         while True:
             staged: dict[str, Any] | None = None
-            if repair_pending and gate is not None:
+            if restore_pending and change_set_id:
+                # NEW-102: a stopped repair left the ChangeSet mid-implementation; return it
+                # to its published PRs before the recheck, or pause with the reason.
+                restore_blocker = await self._restore_published_change_set(
+                    change_set_id, workflow_root
+                )
+                if restore_blocker is None:
+                    restore_pending = False
+                else:
+                    staged = {"status": "BLOCKED", "blocker": restore_blocker}
+            if staged is None and repair_pending and gate is not None:
                 repair_round += 1
                 repaired = await self._ci_repair_delivery(
                     request=request,
@@ -3239,6 +3251,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     # operator's next retry repairs with that fresh evidence.
                     repair_pending = False
                     gitops_round += 1
+                    if self._repair_restores_published_patched(ordinal):
+                        restore_pending = True
                 elif gate is not None and (
                     blocker == "SOURCE_PR_CI_REGRESSION" or blocker.startswith("CI_REPAIR_")
                 ):
@@ -3246,12 +3260,60 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     repair_pending = True
                 else:
                     gitops_round += 1
+                    if (
+                        blocker == "CHANGE_SET_STATE_NOT_DELIVERABLE"
+                        and repair_round > 0
+                        and self._late_reset_restores_patched(ordinal)
+                    ):
+                        # NEW-102: a late repair write reset the ChangeSet after its restore;
+                        # restore it again before the recheck.
+                        restore_pending = True
                 continue
             results.append(skipped)
             return "SKIPPED", blocker
 
     # NEW-64: automatic CI-repair re-deliveries before the loop waits for the operator.
     _CI_REPAIR_ROUNDS = 2
+
+    async def _restore_published_change_set(
+        self, change_set_id: str, workflow_root: str
+    ) -> str | None:
+        """NEW-102: plan, read live PR heads, apply; None when restored, else a blocker.
+
+        Failures become a CI_REPAIR_RESTORE_* pause (retry repeats the restore) instead of
+        an activity error that an operator skip or cancel would turn into a failed loop.
+        """
+        step = "backlog.restore_published_change_set"
+        base = {"change_set_id": change_set_id, "workflow_id": workflow_root}
+        try:
+            plan = await self._step(step, {**base, "phase": "plan"})
+            if plan.get("status") != "READY":
+                return f"CI_REPAIR_RESTORE_{plan.get('reason') or 'REFUSED'}"[:120]
+            heads = await self._step(
+                "gitops.pr_heads", {"pull_requests": plan.get("pull_requests") or []}
+            )
+            if heads.get("status") != "OK":
+                return "CI_REPAIR_RESTORE_PR_HEADS_UNAVAILABLE"
+            applied = await self._step(
+                step,
+                {
+                    **base,
+                    "phase": "apply",
+                    "version": plan.get("version"),
+                    "live_heads": heads.get("heads") or [],
+                },
+            )
+        except ActivityError:
+            return "CI_REPAIR_RESTORE_STEP_FAILED"
+        if applied.get("status") != "RESTORED":
+            return f"CI_REPAIR_RESTORE_{applied.get('reason') or 'REFUSED'}"[:120]
+        return None
+
+    def _late_reset_restores_patched(self, ordinal: int) -> bool:
+        return workflow.patched(f"existing-backlog-late-reset-restores-v1-{ordinal}")
+
+    def _repair_restores_published_patched(self, ordinal: int) -> bool:
+        return workflow.patched(f"existing-backlog-ci-repair-restores-published-v1-{ordinal}")
 
     def _repair_retry_rechecks_patched(self, ordinal: int) -> bool:
         # Temporal memoizes a patch per workflow, so the decision is scoped to the issue:

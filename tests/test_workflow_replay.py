@@ -867,6 +867,7 @@ def _full_delivery_loop_script(
         "backlog.register_child_run": {"status": "REGISTERED"},
         "backlog.record_loop_state": {"status": "RECORDED"},
         "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
+        "backlog.restore_published_change_set": {"status": "RESTORED"},
         "gitops.flow_for_project": {"status": "ENABLED", "enabled": True},
         **_gitops_script(**gitops_overrides),
     }
@@ -1634,6 +1635,14 @@ async def test_a_retry_after_a_blocked_ci_repair_rechecks_ci_before_repairing() 
             payload.get("child_workflow_id")
         ):
             order.append("repair " + str(payload["child_workflow_id"]).rsplit("-issue-", 1)[1])
+        if request["step"] == "backlog.restore_published_change_set":
+            order.append(f"restore {payload['phase']}")
+            if payload["phase"] == "plan":
+                return {"status": "READY", "version": 7, "pull_requests": [{"url": "u"}]}
+            assert payload["version"] == 7 and payload["live_heads"] == [{"url": "u"}]
+            return {"status": "RESTORED"}
+        if request["step"] == "gitops.pr_heads":
+            return {"status": "OK", "heads": [{"url": "u"}]}
         if request["step"] == "gitops.pr_checks":
             checks += 1
             return {**_REGRESSION, "failure_excerpts": {"quality": f"not ok round-{checks}"}}
@@ -1676,9 +1685,13 @@ async def test_a_retry_after_a_blocked_ci_repair_rechecks_ci_before_repairing() 
         "SOURCE_PR_CI_REGRESSION",
     ]
     # Each repair after the first follows a GitOps run that persisted fresh excerpts.
+    # NEW-102: the retry after the stopped repair (round 1) restores the published binding
+    # before its recheck; the regression retry at the limit repairs directly.
     assert order == [
         "persist not ok round-1",
         "repair 1-ci-repair-1-attempt-1",
+        "restore plan",
+        "restore apply",
         "persist not ok round-2",
         "repair 1-ci-repair-2-attempt-1",
         "persist not ok round-3",
@@ -1718,5 +1731,123 @@ async def test_a_pre_recheck_repair_retry_history_replays_unchanged() -> None:
     assert [child.rsplit("-issue-", 1)[1] for child in children][2:4] == [
         "1-ci-repair-1-attempt-1",
         "1-ci-repair-2-attempt-1",
+    ]
+    await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_refused_or_failing_restore_pauses_and_the_retry_restores_again() -> None:
+    # NEW-102: a restore that is refused (e.g. the PR head moved) pauses with its reason;
+    # the retry repeats the restore. A restore step that raises becomes a pause too, and
+    # an operator skip then ends the issue without failing the loop.
+    script = _full_delivery_loop_script(**{"gitops.pr_checks": _REGRESSION})
+    scripted = _scripted_execute_control_step(script)
+    applies = 0
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        nonlocal applies
+        if request["step"] == "backlog.restore_published_change_set":
+            if request["payload"]["phase"] == "plan":
+                return {"status": "READY", "version": 1, "pull_requests": [{"url": "u"}]}
+            applies += 1
+            if applies == 1:
+                return {"status": "NOT_RESTORED", "reason": "PUBLISHED_PR_HEAD_CHANGED"}
+            raise ApplicationError("database unavailable", non_retryable=True)
+        if request["step"] == "gitops.pr_heads":
+            return {"status": "OK", "heads": [{"url": "u"}]}
+        return await scripted(request)
+
+    history, result, children = await _run_loop(
+        script,
+        [
+            ("retry", "gntik-ai/musematic#1026"),
+            ("retry", "gntik-ai/musematic#1026"),
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
+        workflows=_REPAIR_BLOCKED_WORKFLOWS,
+        activity_fn=execute_control_step,
+    )
+
+    assert result["status"] == "COMPLETE"
+    paused = [
+        request["payload"]["blocker"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == [
+        "CI_REPAIR_SOURCE_MAKER_DID_NOT_COMPLETE",
+        "CI_REPAIR_RESTORE_PUBLISHED_PR_HEAD_CHANGED",
+        "CI_REPAIR_RESTORE_STEP_FAILED",
+        "CI_REPAIR_RESTORE_STEP_FAILED",
+    ]
+    # No recheck or further repair ran while the ChangeSet was not restored.
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+        "1-ci-repair-1-attempt-1",
+    ]
+    await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_late_reset_after_restore_is_restored_again_on_retry() -> None:
+    # NEW-102 review: a timed-out repair's late write resets the ChangeSet after the
+    # restore, so the recheck's prepare refuses it; the retry restores again first.
+    script = _full_delivery_loop_script(**{"gitops.pr_checks": _REGRESSION})
+    scripted = _scripted_execute_control_step(script)
+    prepares = 0
+    order: list[str] = []
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        nonlocal prepares
+        step = request["step"]
+        if step == "backlog.restore_published_change_set":
+            order.append(f"restore {request['payload']['phase']}")
+            if request["payload"]["phase"] == "plan":
+                return {"status": "READY", "version": 1, "pull_requests": [{"url": "u"}]}
+            return {"status": "RESTORED"}
+        if step == "gitops.pr_heads":
+            return {"status": "OK", "heads": [{"url": "u"}]}
+        if step == "gitops.prepare":
+            prepares += 1
+            order.append(f"prepare {prepares}")
+            if prepares == 2:
+                return {"status": "BLOCKED", "blocker": "CHANGE_SET_STATE_NOT_DELIVERABLE"}
+        return await scripted(request)
+
+    history, result, _ = await _run_loop(
+        script,
+        [
+            ("retry", "gntik-ai/musematic#1026"),
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
+        workflows=_REPAIR_BLOCKED_WORKFLOWS,
+        activity_fn=execute_control_step,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert order[:8] == [
+        "prepare 1",
+        "restore plan",
+        "restore apply",
+        "prepare 2",
+        "restore plan",
+        "restore apply",
+        "prepare 3",
+        "prepare 4",
+    ]
+    paused = [
+        request["payload"]["blocker"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == [
+        "CI_REPAIR_SOURCE_MAKER_DID_NOT_COMPLETE",
+        "CHANGE_SET_STATE_NOT_DELIVERABLE",
+        "SOURCE_PR_CI_REGRESSION",
     ]
     await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)

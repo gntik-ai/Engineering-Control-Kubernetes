@@ -207,6 +207,7 @@ class ControlActivities:
         "backlog.record_revalidation",
         "backlog.revalidate_gate",
         "backlog.record_loop_state",
+        "backlog.restore_published_change_set",
         "notify.write_policy_required",
         "backlog.register_child_run",
         "backlog.register_run",
@@ -237,6 +238,7 @@ class ControlActivities:
         "gitops.persist_result",
         # ... and GitHub-worker steps (GitOpsGitHubHandler via GitHubActivityHandler).
         "gitops.pr_checks",
+        "gitops.pr_heads",
         "gitops.merge",
         "gitops.release_tag",
         "gitops.workflow_run",
