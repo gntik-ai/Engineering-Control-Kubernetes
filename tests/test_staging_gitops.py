@@ -783,11 +783,13 @@ async def test_persist_result_records_merge_and_runtime_verified_state(tmp_path:
         {"plan": plan, "outcome": "BLOCKED", "blocker": "IMAGE_NOT_PINNED", "merge_sha": MERGE_SHA},
     )
     assert blocked["change_set_state"] == "SOURCE_MERGED"
-    # NEW-102: a merged ChangeSet records the plan's delivered head, never a stale one.
+    # NEW-102: a merged ChangeSet records the plan's delivered head and SOURCE_MERGED, even
+    # after a late repair write reset it to PLANNED with an unpublished head.
     with handler.sessions.begin() as session:
         stale = session.get(db.ChangeSet, change_set_id)
         assert stale is not None
         stale.source_head_sha = "9" * 40
+        stale.state = "PLANNED"
     await handler.handle(
         "gitops.persist_result",
         {"plan": plan, "outcome": "BLOCKED", "blocker": "IMAGE_NOT_PINNED", "merge_sha": MERGE_SHA},
@@ -795,6 +797,7 @@ async def test_persist_result_records_merge_and_runtime_verified_state(tmp_path:
     with handler.sessions.begin() as session:
         merged = session.get(db.ChangeSet, change_set_id)
         assert merged is not None and merged.source_head_sha == plan["source_head_sha"]
+        assert merged.state == "SOURCE_MERGED"
     # NEW-99: only a known unverified-regression reason is recorded.
     for reason, recorded in (
         ("CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_CI_CONFIG_CHANGED"),

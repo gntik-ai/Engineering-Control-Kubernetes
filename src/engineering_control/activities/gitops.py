@@ -515,6 +515,11 @@ class GitOpsControllerHandler:
             elif merge_sha is not None and change_set.state in {
                 ChangeSetState.SOURCE_PR.value,
                 ChangeSetState.CI_VALIDATED.value,
+                # NEW-102: a late repair write may have reset the state after prepare;
+                # the merge is what happened, so the ChangeSet is SOURCE_MERGED.
+                ChangeSetState.PLANNED.value,
+                ChangeSetState.IMPLEMENTING.value,
+                ChangeSetState.REQUEST_CHANGES.value,
             }:
                 change_set.state = ChangeSetState.SOURCE_MERGED.value
             change_set.version += 1

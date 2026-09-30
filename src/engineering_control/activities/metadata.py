@@ -3007,9 +3007,10 @@ class MetadataActivityHandler:
             else ""
         )
         with self.sessions.begin() as session:
-            change_set = session.get(ChangeSet, change_set_id)
+            change_set = session.get(ChangeSet, change_set_id, with_for_update=True)
             if change_set is None or change_set.issue_id is None:
                 raise ValueError("OpenSpec requires a ChangeSet with a GitHub issue")
+            _refuse_delivered(change_set)
             issue = session.get(Issue, change_set.issue_id)
             if issue is None:
                 raise ValueError("OpenSpec issue metadata is missing")
@@ -3045,9 +3046,10 @@ class MetadataActivityHandler:
         spec_input_sha256 = str(payload.get("spec_input_sha256", ""))
         with self.sessions.begin() as session:
             document = self._reusable_openspec(session, change_set_id, spec_input_sha256)
-            change_set = session.get(ChangeSet, change_set_id)
+            change_set = session.get(ChangeSet, change_set_id, with_for_update=True)
             if document is None or change_set is None:
                 raise ValueError("reused OpenSpec is no longer bound to this issue content")
+            _refuse_delivered(change_set)
             change_set.state = "PLANNED"
             change_set.version += 1
             reused_from = dict(change_set.recovery_json or {})["openspec"].get("workflow_id")
@@ -3583,10 +3585,11 @@ class MetadataActivityHandler:
             if isinstance(item, dict)
         }
         with self.sessions.begin() as session:
-            change_set = session.get(ChangeSet, change_set_id)
+            change_set = session.get(ChangeSet, change_set_id, with_for_update=True)
             run = session.get(Run, run_id)
             if change_set is None or run is None or run.change_set_id != change_set_id:
                 raise ValueError("publication metadata binding is missing")
+            _refuse_delivered(change_set)
             source_plan = self._object(
                 planned.get(change_set.source_repository), "source publication plan"
             )
@@ -5671,10 +5674,11 @@ class MetadataActivityHandler:
         change_set_id = UUID(str(payload["change_set_id"]))
         run_id = UUID(str(payload["run_id"]))
         with self.sessions.begin() as session:
-            change_set = session.get(ChangeSet, change_set_id)
+            change_set = session.get(ChangeSet, change_set_id, with_for_update=True)
             run = session.get(Run, run_id)
             if change_set is None or run is None:
                 raise ValueError("delivery handoff metadata is missing")
+            _refuse_delivered(change_set)
             change_set.source_branch = str(payload["source_branch"])
             change_set.deployment_branch = str(payload["deployment_branch"])
             change_set.source_head_sha = str(source["head_sha"])
@@ -8867,3 +8871,24 @@ class MetadataActivityHandler:
                 "risk_assessment": {"type": "string"},
             },
         }
+
+
+# NEW-102: a ChangeSet whose source PR was merged (or anything later) is delivered; a late
+# write from a timed-out repair must never reset it to an implementation state.
+_DELIVERED_CHANGE_SET_STATES = frozenset(
+    {
+        ChangeSetState.SOURCE_MERGED.value,
+        ChangeSetState.FINAL_ARTIFACT_BUILT.value,
+        ChangeSetState.DEPLOY_PR.value,
+        ChangeSetState.AWAITING_STAGING_APPROVAL.value,
+        ChangeSetState.STAGING_APPROVED.value,
+        ChangeSetState.STAGING_DEPLOYED.value,
+        ChangeSetState.RUNTIME_VERIFIED.value,
+        ChangeSetState.ISSUE_CLOSED.value,
+    }
+)
+
+
+def _refuse_delivered(change_set: ChangeSet) -> None:
+    if change_set.state in _DELIVERED_CHANGE_SET_STATES:
+        raise ValueError("ChangeSet is already delivered; a late delivery write is refused")
