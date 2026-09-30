@@ -1924,6 +1924,19 @@ async def test_deployment_pr_checks_gate_the_merge_of_both_prs(tmp_path: Path) -
     assert failed["reason"] == "DEPLOYMENT_CI_NOT_BASELINED"
     assert "approved baseline" in failed["failure_excerpts"]["validate"]
 
+    # All green is not enough: the configured deployment CI workflow must have succeeded.
+    deployment_pr(statusCheckRollup=[_check("lint", "SUCCESS")])
+    unrelated = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert unrelated == {"status": "CHECKS_PENDING", "reason": "REQUIRED_DEPLOYMENT_CI_MISSING"}
+    deployment_pr(
+        statusCheckRollup=[
+            {**_check("guard", "SUCCESS"), "workflowName": "gitops-release-guard"},
+            {**_check("publish", "SKIPPED"), "workflowName": "gitops-release-guard"},
+        ]
+    )
+    passed = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert passed["status"] == "CHECKS_PASSED"
+
     deployment_pr(headRefOid="f" * 40)
     moved = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
     assert moved["blocker"] == "DEPLOYMENT_PR_BINDING_CHANGED"

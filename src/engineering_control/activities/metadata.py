@@ -3234,8 +3234,7 @@ class MetadataActivityHandler:
             why = (
                 "the deployment repository has no CI baseline"
                 if ci_reason == "DEPLOYMENT_CI_NOT_BASELINED"
-                else "this ChangeSet edits CI configuration or its file list was too large "
-                "to check"
+                else "this ChangeSet edits CI configuration or its file list was too large to check"
             )
             derived_content += (
                 "The published pull request for this ChangeSet failed these CI jobs. They "
@@ -3663,8 +3662,22 @@ class MetadataActivityHandler:
             ]
             if deployment is not None:
                 expected_results.append((deployment, str(change_set.deployment_head_sha or "")))
+            # NEW-103: a deployment-PR CI repair re-publishes a ChangeSet whose source PR
+            # may already be merged at exactly the validated head (falcone #1001); only that
+            # already-bound source PR may be merged, the deployment PR must be open.
+            source_merged = (
+                source.get("pr_state") == "MERGED"
+                and source.get("head_sha") == str(change_set.source_head_sha or "")
+                and bool(change_set.source_pr_url)
+                and source.get("pr_url") == change_set.source_pr_url
+                and deployment is not None
+            )
             for record, expected_sha in expected_results:
-                if record.get("head_sha") != expected_sha or record.get("pr_state") != "OPEN":
+                allowed_state = "MERGED" if record is source and source_merged else "OPEN"
+                if (
+                    record.get("head_sha") != expected_sha
+                    or record.get("pr_state") != allowed_state
+                ):
                     raise ValueError("published PR is not open at the validated head")
                 if not re.fullmatch(
                     r"https://github\.com/gntik-ai/[a-z0-9-]+/pull/[1-9][0-9]*",
@@ -3787,7 +3800,11 @@ class MetadataActivityHandler:
             # NEW-76: a published head passed validation; earlier findings are resolved.
             recovery.pop("validation_findings", None)
             change_set.recovery_json = recovery
-            change_set.state = ChangeSetState.SOURCE_PR.value
+            change_set.state = (
+                ChangeSetState.SOURCE_MERGED.value
+                if source_merged
+                else ChangeSetState.SOURCE_PR.value
+            )
             change_set.version += 1
             run.status = "SUCCESS"
             run.summary = (

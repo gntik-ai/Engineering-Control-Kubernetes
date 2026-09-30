@@ -154,6 +154,8 @@ class StagingFlowPolicy(ReconciliationModel):
     argo_namespace: str = Field(default="argocd", pattern=_KUBERNETES_NAME)
     namespaces: tuple[str, ...] = Field(min_length=1, max_length=10)
     source_ci_workflow: str = Field(pattern=_WORKFLOW_REFERENCE)
+    # NEW-103: the deployment repository's PR CI workflow; its checks gate both merges.
+    deployment_ci_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
     main_ci_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
     image_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
     release_tag: ReleaseTagPolicy = Field(default_factory=ReleaseTagPolicy)

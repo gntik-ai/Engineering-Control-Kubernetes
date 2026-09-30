@@ -1096,9 +1096,12 @@ class GitOpsGitHubHandler:
         repositories, so every failure is a regression for the bounded CI repair.
         """
         excerpt_deadline = time.monotonic() + _EXCERPT_DEADLINE_SECONDS
-        plan, _flow = self._context(payload)
+        plan, flow = self._context(payload)
         if plan.deployment_pr_number is None or plan.deployment_head_sha is None:
             return {"status": "CHECKS_PASSED", "deployment_pr": False}
+        if flow.deployment_ci_workflow is None:
+            # Without the workflow's identity an unrelated green check could pass the gate.
+            return {"status": "BLOCKED", "blocker": "DEPLOYMENT_CI_WORKFLOW_NOT_CONFIGURED"}
         repository = plan.deployment_repository
         pull_request = self.broker.view_pull_request(repository, plan.deployment_pr_number)
         if (
@@ -1115,6 +1118,9 @@ class GitOpsGitHubHandler:
             return {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CHECKS_PENDING"}
         failed = sorted(name for name, value in states.items() if value == "FAILED")
         if not failed:
+            if not _workflow_succeeded(pull_request, flow.deployment_ci_workflow):
+                # The configured CI never ran (or only skipped jobs): not a pass.
+                return {"status": "CHECKS_PENDING", "reason": "REQUIRED_DEPLOYMENT_CI_MISSING"}
             return {"status": "CHECKS_PASSED", "check_count": len(states)}
         return {
             "status": "BLOCKED",
@@ -1776,6 +1782,17 @@ def _unexempted_regressions(
         "reason": reason,
         "failure_excerpts": excerpts,
     }
+
+
+def _workflow_succeeded(pull_request: dict[str, Any], workflow: str) -> bool:
+    """NEW-103: at least one check of the named workflow concluded SUCCESS."""
+    raw_checks = pull_request.get("statusCheckRollup")
+    return any(
+        isinstance(raw, dict)
+        and str(raw.get("workflowName") or raw.get("workflow") or "") == workflow
+        and str(raw.get("conclusion") or "").upper() == "SUCCESS"
+        for raw in (raw_checks if isinstance(raw_checks, list) else [])
+    )
 
 
 def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:
