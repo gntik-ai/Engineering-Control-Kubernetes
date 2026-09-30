@@ -847,6 +847,19 @@ class DeliveryActivityHandler:
     def _publish(self, plan: RepositoryPublication, change_set_id: UUID) -> dict[str, Any]:
         if plan.branch.rsplit("/", 1)[-1] != str(change_set_id):
             raise ValueError("publication branch does not bind its ChangeSet")
+        # NEW-103: a CI repair of the deployment PR may re-publish a ChangeSet whose source
+        # PR is already merged; that branch is delivered and must never move.
+        merged = [
+            item
+            for item in self.broker.list_pull_requests(
+                plan.repository, head=plan.branch, state="merged"
+            )
+            if item.get("baseRefName") == plan.base_branch
+        ]
+        if any(item.get("headRefOid") != plan.head_sha for item in merged):
+            raise ValueError("a merged pull request's branch cannot be republished")
+        if merged:
+            return self._bind_pull_request(plan)  # already merged at exactly this head
         if self.settings.publication_fetch_from_worker:
             # NEW-61: the worktree lives on the worker host; bring only its commits here.
             self._push_from_worker(plan, change_set_id)

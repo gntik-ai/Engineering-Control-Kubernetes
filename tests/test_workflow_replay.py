@@ -1851,3 +1851,83 @@ async def test_a_late_reset_after_restore_is_restored_again_on_retry() -> None:
         "SOURCE_PR_CI_REGRESSION",
     ]
     await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)
+
+
+_DEPLOYMENT_PLAN = {
+    **_GITOPS_PLAN,
+    "deployment_pr_number": 9,
+    "deployment_pr_url": "https://github.com/gntik-ai/musematic-deploy/pull/9",
+    "deployment_head_sha": "e" * 40,
+}
+_DEPLOYMENT_REGRESSION = {
+    "status": "BLOCKED",
+    "blocker": "DEPLOYMENT_PR_CI_REGRESSION",
+    "failed_checks": ["validate"],
+    "preexisting_checks": [],
+    "reason": "DEPLOYMENT_CI_NOT_BASELINED",
+    "failure_excerpts": {"validate": "not ok 51 - approved baseline"},
+}
+
+
+def _deployment_prepare() -> dict[str, Any]:
+    prepared = dict(_gitops_script()["gitops.prepare"])
+    prepared["plan"] = _DEPLOYMENT_PLAN
+    return prepared
+
+
+async def test_a_failing_deployment_pr_ci_blocks_before_either_merge_and_replays() -> None:
+    # NEW-103: falcone #1001 merged its source while the falcone-charts CI was still
+    # running and then failed; now nothing merges until the deployment CI passes.
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _gitops_script(
+                **{
+                    "gitops.prepare": _deployment_prepare(),
+                    "gitops.deployment_pr_checks": _DEPLOYMENT_REGRESSION,
+                }
+            )
+        ),
+    )
+
+    assert result is not None and result["blocker"] == "DEPLOYMENT_PR_CI_REGRESSION"
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert "gitops.merge" not in steps
+    assert steps.index("gitops.pr_checks") < steps.index("gitops.deployment_pr_checks")
+    persisted = _scheduled_steps(history)[-1]["payload"]
+    assert persisted["ci_regressions"] == ["validate"]
+    assert persisted["ci_regression_target"] == "deployment"
+    assert persisted["ci_regression_reason"] == "DEPLOYMENT_CI_NOT_BASELINED"
+    assert persisted["ci_failure_excerpts"] == {"validate": "not ok 51 - approved baseline"}
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_a_deployment_ci_regression_is_repaired_like_a_source_one() -> None:
+    history, result, children = await _run_loop(
+        _full_delivery_loop_script(
+            **{
+                "gitops.prepare": _deployment_prepare(),
+                "gitops.deployment_pr_checks": _DEPLOYMENT_REGRESSION,
+            }
+        ),
+        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+        "1-ci-repair-1-attempt-1",
+        "1-staging-gitops-retry-1",
+        "1-ci-repair-2-attempt-1",
+        "1-staging-gitops-retry-2",
+    ]
+    paused = [
+        request["payload"]["blocker"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == ["DEPLOYMENT_PR_CI_REGRESSION"]
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)

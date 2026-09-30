@@ -180,6 +180,8 @@ delivery_control:
     argo_namespace: argocd
     namespaces: [musematic-platform, platform-data]
     source_ci_workflow: CI
+    # NEW-103: the deployment PR's CI must pass before either PR merges.
+    deployment_ci_workflow: gitops-release-guard
     # main CI is intentionally unset: it does not publish images (deploy.yml does).
     main_ci_workflow: null
     image_workflow: deploy.yml

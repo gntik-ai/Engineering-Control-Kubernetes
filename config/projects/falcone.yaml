@@ -100,6 +100,8 @@ delivery_control:
     argo_namespace: argocd
     namespaces: [in-falcone-staging]
     source_ci_workflow: ci
+    # NEW-103: the deployment PR's CI must pass before either PR merges.
+    deployment_ci_workflow: Chart release
     # main CI does not publish images; release-images does, on the v*.*.* tag Hermes pushes
     # on the merge commit (gntik-ai/falcone#1026).
     main_ci_workflow: null

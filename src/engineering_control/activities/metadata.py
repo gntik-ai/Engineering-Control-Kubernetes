@@ -3092,23 +3092,32 @@ class MetadataActivityHandler:
         findings = record.get("findings") if isinstance(record, dict) else None
         return [str(item) for item in findings if isinstance(item, str)] if findings else []
 
-    def _ci_regressions(self, change_set_id: UUID) -> tuple[list[str], bool, dict[str, str]]:
-        """NEW-64: PR CI jobs the staging baseline gate attributed to this ChangeSet.
+    def _ci_regressions(
+        self, change_set_id: UUID
+    ) -> tuple[list[str], str | None, dict[str, str], str]:
+        """NEW-64: PR CI jobs the staging gates attributed to this ChangeSet.
 
-        NEW-99: the flag is True when the baseline could not run (the PR edits CI
-        configuration or its file listing was truncated), so no job was compared with main.
+        Returns (job names, reason, log excerpts, target). NEW-99: a reason means the jobs
+        were not compared with unchanged main. NEW-103: target is "deployment" when the
+        deployment PR's own CI gate failed, else "source".
         """
         with self.sessions.begin() as session:
             change_set = session.get(ChangeSet, change_set_id)
             record = dict((change_set.recovery_json or {}) if change_set else {}).get(
                 "staging_gitops"
             )
-        if not isinstance(record, dict) or record.get("blocker") != "SOURCE_PR_CI_REGRESSION":
-            return [], False, {}
+        if not isinstance(record, dict) or record.get("blocker") not in {
+            "SOURCE_PR_CI_REGRESSION",
+            "DEPLOYMENT_PR_CI_REGRESSION",
+        }:
+            return [], None, {}, "source"
+        target = "deployment" if record.get("ci_regression_target") == "deployment" else "source"
+        if record.get("blocker") == "DEPLOYMENT_PR_CI_REGRESSION":
+            target = "deployment"
         names = record.get("ci_regressions")
         if not isinstance(names, list):
-            return [], False, {}
-        unverified = bool(record.get("ci_regression_reason"))
+            return [], None, {}, target
+        reason = record.get("ci_regression_reason")
         raw = record.get("ci_failure_excerpts")
         excerpts = (
             {
@@ -3121,8 +3130,9 @@ class MetadataActivityHandler:
         )
         return (
             [str(name)[:200] for name in names if isinstance(name, str)][:20],
-            unverified,
+            str(reason) if reason else None,
             excerpts,
+            target,
         )
 
     def _prior_checker_findings(self, change_set_id: UUID, workflow_id: str) -> list[str]:
@@ -3208,14 +3218,27 @@ class MetadataActivityHandler:
             ) + "".join(f"- {item}\n" for item in validation_findings)
         # NEW-64: a CI-repair re-delivery names the PR CI jobs the baseline gate attributed
         # to this ChangeSet (they pass on unchanged main).
-        ci_regressions, unverified, ci_excerpts = (
-            ([], False, {}) if deployment else self._ci_regressions(change_set_id)
-        )
+        ci_regressions, ci_reason, ci_excerpts, ci_target = self._ci_regressions(change_set_id)
+        if ci_target != ("deployment" if deployment else "source"):
+            # NEW-103: only the maker of the repository whose PR CI failed repairs it.
+            if ci_regressions and not deployment:
+                derived_content += (
+                    "Only the deployment pull request's CI failed; the deployment maker fixes "
+                    "it. Leave the source unchanged: make no source commit unless the "
+                    "deployment failure cannot be fixed without one, and never change the "
+                    "source when its pull request is already merged.\n"
+                )
+            ci_regressions, ci_reason, ci_excerpts = [], None, {}
+        unverified = ci_reason is not None
         if ci_regressions and unverified:
+            why = (
+                "the deployment repository has no CI baseline"
+                if ci_reason == "DEPLOYMENT_CI_NOT_BASELINED"
+                else "this ChangeSet edits CI configuration or its file list was too large to check"
+            )
             derived_content += (
                 "The published pull request for this ChangeSet failed these CI jobs. They "
-                "were not compared with unchanged main, because this ChangeSet edits CI "
-                "configuration or its file list was too large to check, so each may be "
+                f"were not compared with unchanged main, because {why}, so each may be "
                 "caused by this ChangeSet or may already fail on main. Fix every failure "
                 "this ChangeSet caused, on top of the existing commits, and run the matching "
                 "repository test commands before committing. CI workflow and CI test changes "
@@ -3639,8 +3662,22 @@ class MetadataActivityHandler:
             ]
             if deployment is not None:
                 expected_results.append((deployment, str(change_set.deployment_head_sha or "")))
+            # NEW-103: a deployment-PR CI repair re-publishes a ChangeSet whose source PR
+            # may already be merged at exactly the validated head (falcone #1001); only that
+            # already-bound source PR may be merged, the deployment PR must be open.
+            source_merged = (
+                source.get("pr_state") == "MERGED"
+                and source.get("head_sha") == str(change_set.source_head_sha or "")
+                and bool(change_set.source_pr_url)
+                and source.get("pr_url") == change_set.source_pr_url
+                and deployment is not None
+            )
             for record, expected_sha in expected_results:
-                if record.get("head_sha") != expected_sha or record.get("pr_state") != "OPEN":
+                allowed_state = "MERGED" if record is source and source_merged else "OPEN"
+                if (
+                    record.get("head_sha") != expected_sha
+                    or record.get("pr_state") != allowed_state
+                ):
                     raise ValueError("published PR is not open at the validated head")
                 if not re.fullmatch(
                     r"https://github\.com/gntik-ai/[a-z0-9-]+/pull/[1-9][0-9]*",
@@ -3763,7 +3800,11 @@ class MetadataActivityHandler:
             # NEW-76: a published head passed validation; earlier findings are resolved.
             recovery.pop("validation_findings", None)
             change_set.recovery_json = recovery
-            change_set.state = ChangeSetState.SOURCE_PR.value
+            change_set.state = (
+                ChangeSetState.SOURCE_MERGED.value
+                if source_merged
+                else ChangeSetState.SOURCE_PR.value
+            )
             change_set.version += 1
             run.status = "SUCCESS"
             run.summary = (
@@ -8890,5 +8931,15 @@ _DELIVERED_CHANGE_SET_STATES = frozenset(
 
 
 def _refuse_delivered(change_set: ChangeSet) -> None:
-    if change_set.state in _DELIVERED_CHANGE_SET_STATES:
-        raise ValueError("ChangeSet is already delivered; a late delivery write is refused")
+    if change_set.state not in _DELIVERED_CHANGE_SET_STATES:
+        return
+    record = dict(change_set.recovery_json or {}).get("staging_gitops")
+    if (
+        change_set.state == ChangeSetState.SOURCE_MERGED.value
+        and change_set.deployment_pr_url
+        and not (isinstance(record, dict) and record.get("deployment_merge_sha"))
+    ):
+        # NEW-103: the source merged but its deployment PR did not (falcone #1001): the
+        # deployment half is still being delivered, so its CI repair may write.
+        return
+    raise ValueError("ChangeSet is already delivered; a late delivery write is refused")

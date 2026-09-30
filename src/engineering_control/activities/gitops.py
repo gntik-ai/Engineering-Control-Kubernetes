@@ -479,6 +479,10 @@ class GitOpsControllerHandler:
             "ci_preexisting_failures": _check_names(payload.get("ci_preexisting_failures")),
             # NEW-100: bounded, redacted failing-log lines per regressed job.
             "ci_failure_excerpts": _excerpts(payload.get("ci_failure_excerpts")),
+            # NEW-103: which PR's CI regressed (the deployment PR has its own gate).
+            "ci_regression_target": (
+                "deployment" if payload.get("ci_regression_target") == "deployment" else "source"
+            ),
             # NEW-99: why the baseline could not excuse anything (None when it ran).
             "ci_regression_reason": (
                 str(payload["ci_regression_reason"])
@@ -949,6 +953,7 @@ class GitOpsGitHubHandler:
     _failure_blockers = {
         "gitops.pr_checks": "SOURCE_PR_CHECKS_UNAVAILABLE",
         "gitops.pr_heads": "PR_HEADS_UNAVAILABLE",
+        "gitops.deployment_pr_checks": "DEPLOYMENT_PR_CHECKS_UNAVAILABLE",
         "gitops.merge": "PROTECTED_MERGE_FAILED",
         "gitops.release_tag": "RELEASE_TAG_FAILED",
         "gitops.workflow_run": "WORKFLOW_RUN_UNAVAILABLE",
@@ -986,6 +991,7 @@ class GitOpsGitHubHandler:
         handlers = {
             "gitops.pr_checks": self._pr_checks,
             "gitops.pr_heads": self._pr_heads,
+            "gitops.deployment_pr_checks": self._deployment_pr_checks,
             "gitops.merge": self._merge,
             "gitops.release_tag": self._release_tag,
             "gitops.workflow_run": self._workflow_run,
@@ -1080,6 +1086,54 @@ class GitOpsGitHubHandler:
                 }
             )
         return {"status": "OK", "heads": heads}
+
+    def _deployment_pr_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-103: the deployment PR's CI must pass before either PR merges.
+
+        The deployment merge used to wait only ~10 minutes for a CLEAN merge state, so a
+        slower deployment CI (falcone-charts) or a real failure left the source merged and
+        the deployment PR unmerged (falcone #1001). There is no CI baseline for deployment
+        repositories, so every failure is a regression for the bounded CI repair.
+        """
+        excerpt_deadline = time.monotonic() + _EXCERPT_DEADLINE_SECONDS
+        plan, flow = self._context(payload)
+        if plan.deployment_pr_number is None or plan.deployment_head_sha is None:
+            return {"status": "CHECKS_PASSED", "deployment_pr": False}
+        if flow.deployment_ci_workflow is None:
+            # Without the workflow's identity an unrelated green check could pass the gate.
+            return {"status": "BLOCKED", "blocker": "DEPLOYMENT_CI_WORKFLOW_NOT_CONFIGURED"}
+        repository = plan.deployment_repository
+        pull_request = self.broker.view_pull_request(repository, plan.deployment_pr_number)
+        if (
+            pull_request.get("headRefOid") != plan.deployment_head_sha
+            or pull_request.get("baseRefName") != plan.deployment_base_branch
+        ):
+            return {"status": "BLOCKED", "blocker": "DEPLOYMENT_PR_BINDING_CHANGED"}
+        if pull_request.get("state") == "MERGED":
+            return {"status": "CHECKS_PASSED", "already_merged": True}
+        if pull_request.get("state") != "OPEN":
+            return {"status": "BLOCKED", "blocker": "DEPLOYMENT_PR_NOT_OPEN"}
+        states = _check_states(pull_request)
+        failed = sorted(name for name, value in states.items() if value == "FAILED")
+        if not failed:
+            # A failure is reported at once (even while other checks run) so the bounded
+            # repair can start; otherwise wait for every check and the configured workflow.
+            if not states or any(value == "PENDING" for value in states.values()):
+                return {"status": "CHECKS_PENDING", "reason": "DEPLOYMENT_PR_CHECKS_PENDING"}
+            if not _workflow_succeeded(pull_request, flow.deployment_ci_workflow):
+                # The configured CI never ran (or only skipped jobs): not a pass.
+                return {"status": "CHECKS_PENDING", "reason": "REQUIRED_DEPLOYMENT_CI_MISSING"}
+            return {"status": "CHECKS_PASSED", "check_count": len(states)}
+        return {
+            "status": "BLOCKED",
+            "blocker": "DEPLOYMENT_PR_CI_REGRESSION",
+            "failed_checks": failed[:20],
+            "preexisting_checks": [],
+            "reason": "DEPLOYMENT_CI_NOT_BASELINED",
+            "failure_excerpts": self._failure_excerpts(
+                repository, pull_request, failed, excerpt_deadline
+            ),
+        }
 
     def _pr_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
         # NEW-100: the activity heartbeats only on entry, so the optional CI log reads must
@@ -1706,7 +1760,11 @@ def _failed_job_ids(pull_request: dict[str, Any]) -> dict[str, int]:
 
 
 UNVERIFIED_CI_REGRESSION_REASONS = frozenset(
-    {"CI_BASELINE_CI_CONFIG_CHANGED", "CI_BASELINE_FILE_LISTING_TRUNCATED"}
+    {
+        "CI_BASELINE_CI_CONFIG_CHANGED",
+        "CI_BASELINE_FILE_LISTING_TRUNCATED",
+        "DEPLOYMENT_CI_NOT_BASELINED",
+    }
 )
 
 
@@ -1726,6 +1784,17 @@ def _unexempted_regressions(
         "reason": reason,
         "failure_excerpts": excerpts,
     }
+
+
+def _workflow_succeeded(pull_request: dict[str, Any], workflow: str) -> bool:
+    """NEW-103: at least one check of the named workflow concluded SUCCESS."""
+    raw_checks = pull_request.get("statusCheckRollup")
+    return any(
+        isinstance(raw, dict)
+        and str(raw.get("workflowName") or raw.get("workflow") or "") == workflow
+        and str(raw.get("conclusion") or "").upper() == "SUCCESS"
+        for raw in (raw_checks if isinstance(raw_checks, list) else [])
+    )
 
 
 def _check_states(pull_request: dict[str, Any]) -> dict[str, str]:

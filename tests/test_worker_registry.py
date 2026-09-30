@@ -46,6 +46,7 @@ GITHUB_STEPS = frozenset(
         "finding.publish",
         "gitops.pr_checks",
         "gitops.pr_heads",
+        "gitops.deployment_pr_checks",
         "gitops.merge",
         "gitops.release_tag",
         "gitops.workflow_run",

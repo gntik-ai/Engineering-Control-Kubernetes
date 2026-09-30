@@ -2230,7 +2230,7 @@ class EngineeringActivityHandler:
             # An already-published binding (the repair stopped before resetting the state,
             # or an earlier apply committed but its result was lost) is restored as a no-op.
             already = (
-                change_set.state == "SOURCE_PR"
+                change_set.state in {"SOURCE_PR", "SOURCE_MERGED"}
                 and change_set.source_head_sha == published[str(change_set.source_pr_url)]
                 and (
                     not change_set.deployment_pr_url
@@ -2254,11 +2254,17 @@ class EngineeringActivityHandler:
                 if isinstance(live, list)
                 else {}
             )
+            source_merged = False
             for url, head in published.items():
                 observed = by_url.get(url)
-                if observed is None or observed.get("state") != "OPEN":
+                state = observed.get("state") if observed is not None else None
+                # NEW-103: the source PR may already be merged while its deployment PR is
+                # repaired; a merged source at its published head is still that binding.
+                if url == change_set.source_pr_url and state == "MERGED":
+                    source_merged = True
+                elif state != "OPEN":
                     return refused("PUBLISHED_PR_NOT_OPEN")
-                if observed.get("head_sha") != head:
+                if observed is None or observed.get("head_sha") != head:
                     return refused("PUBLISHED_PR_HEAD_CHANGED")
             if already:
                 return {**self._envelope(step, payload, "RESTORED"), "already_published": True}
@@ -2270,7 +2276,7 @@ class EngineeringActivityHandler:
                 "workflow_id": str(payload.get("workflow_id") or "")[:240],
             }
             change_set.recovery_json = recovery
-            change_set.state = "SOURCE_PR"
+            change_set.state = "SOURCE_MERGED" if source_merged else "SOURCE_PR"
             change_set.source_head_sha = str(published[str(change_set.source_pr_url)])
             if change_set.deployment_pr_url:
                 change_set.deployment_head_sha = str(

@@ -1556,7 +1556,6 @@ def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: P
         assert campaign is not None and campaign.status == "APPROVED"  # untouched
 
 
-
 @pytest.mark.parametrize(
     ("state", "evidence", "deployment_pr", "live", "expected", "reason"),
     [
@@ -1566,6 +1565,7 @@ def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: P
         ("PLANNED", True, True, "moved", "NOT_RESTORED", "PUBLISHED_PR_HEAD_CHANGED"),
         ("PLANNED", True, True, "closed", "NOT_RESTORED", "PUBLISHED_PR_NOT_OPEN"),
         ("PLANNED", True, True, "raced", "NOT_RESTORED", "CHANGE_SET_CHANGED_SINCE_PLAN"),
+        ("PLANNED", True, True, "source_merged", "RESTORED", None),
         ("SOURCE_MERGED", True, True, "published", "NOT_RESTORED", "STATE_SOURCE_MERGED"),
         ("SOURCE_PR", True, True, "published", "NOT_RESTORED", "STATE_SOURCE_PR"),
         ("ALREADY", True, True, "published", "RESTORED", None),
@@ -1648,6 +1648,8 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
             heads[0]["head_sha"] = "9" * 40  # e.g. a partial publication pushed the source
         if live == "closed":
             heads[1]["state"] = "CLOSED"
+        if live == "source_merged":
+            heads[0]["state"] = "MERGED"  # NEW-103: the deployment PR is being repaired
         if live == "raced":
             with handler.sessions.begin() as session:
                 raced = session.get(db.ChangeSet, change_set_id)
@@ -1669,7 +1671,8 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
             assert change_set.state == "SOURCE_PR" and change_set.version == 3
             assert "ci_repair_restore" not in change_set.recovery_json
         elif expected == "RESTORED":
-            assert change_set.state == "SOURCE_PR" and change_set.version == 4
+            assert change_set.version == 4
+            assert change_set.state == ("SOURCE_MERGED" if live == "source_merged" else "SOURCE_PR")
             assert change_set.source_head_sha == published_source
             assert change_set.deployment_head_sha == (
                 published_deployment if deployment_pr else "f" * 40

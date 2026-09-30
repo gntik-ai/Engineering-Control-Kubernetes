@@ -189,8 +189,18 @@ async def test_every_publication_title_passes_the_gh_broker_value_policy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_state", "bound_source_url", "expected"),
+    [
+        ("OPEN", None, "SOURCE_PR"),
+        # NEW-103: a deployment-PR CI repair re-publishes a ChangeSet whose already-bound
+        # source PR merged at exactly the validated head (falcone #1001).
+        ("MERGED", "https://github.com/gntik-ai/falcone/pull/1", "SOURCE_MERGED"),
+        ("MERGED", None, "REFUSED"),
+    ],
+)
 async def test_publication_persists_both_prs_and_releases_implementation_leases(
-    tmp_path: Path,
+    tmp_path: Path, source_state: str, bound_source_url: str | None, expected: str
 ) -> None:
     handler = MetadataActivityHandler(
         Settings(database_url=f"sqlite:///{tmp_path / 'publication.sqlite'}")
@@ -215,7 +225,7 @@ async def test_publication_persists_both_prs_and_releases_implementation_leases(
                 source_branch=None,
                 source_base_sha="a" * 40,
                 source_head_sha=None,
-                source_pr_url=None,
+                source_pr_url=bound_source_url,
                 deployment_repository="falcone-charts",
                 deployment_branch=None,
                 deployment_base_sha="c" * 40,
@@ -264,7 +274,7 @@ async def test_publication_persists_both_prs_and_releases_implementation_leases(
         {
             "repository_slug": "falcone",
             "head_sha": source_head,
-            "pr_state": "OPEN",
+            "pr_state": source_state,
             "pr_url": "https://github.com/gntik-ai/falcone/pull/1",
         },
         {
@@ -275,29 +285,32 @@ async def test_publication_persists_both_prs_and_releases_implementation_leases(
         },
     ]
 
-    result = await handler.handle(
-        "delivery.persist_publication",
-        {
-            "change_set_id": str(change_set_id),
-            "run_id": str(run_id),
-            "status": "SOURCE_PRS_CREATED",
-            "publication_plan": plan,
-            "publication_results": results,
-            "change_evidence": publication_evidence(
-                source_head, deployment_head, deployment_changed=True
-            ),
-            "agent_result": checker_result(),
-            "maker_provider": "codex",
-            "checker_provider": "claude",
-        },
-    )
+    request = {
+        "change_set_id": str(change_set_id),
+        "run_id": str(run_id),
+        "status": "SOURCE_PRS_CREATED",
+        "publication_plan": plan,
+        "publication_results": results,
+        "change_evidence": publication_evidence(
+            source_head, deployment_head, deployment_changed=True
+        ),
+        "agent_result": checker_result(),
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+    if expected == "REFUSED":
+        # A merged source PR that is not this ChangeSet's bound PR is never accepted.
+        with pytest.raises(Exception, match="invalid metadata activity input"):
+            await handler.handle("delivery.persist_publication", request)
+        return
+    result = await handler.handle("delivery.persist_publication", request)
 
     assert result["status"] == "SOURCE_PR"
     with handler.sessions() as session:
         change_set = session.get(ChangeSet, change_set_id)
         run = session.get(Run, run_id)
         lease = session.scalar(select(ComponentLease))
-        assert change_set is not None and change_set.state == "SOURCE_PR"
+        assert change_set is not None and change_set.state == expected
         assert change_set.source_head_sha == source_head
         assert change_set.deployment_pr_url == results[1]["pr_url"]
         assert run is not None and run.status == "SUCCESS"
@@ -813,12 +826,12 @@ def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
     }
 
     resumed = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
-    reset = handler._prepare_maker(
-        {**payload, "source_resumed_from_sha": None}, deployment=False
-    )["maker_request"]["prompt"]
-    deployment = handler._prepare_maker(payload, deployment=True)[
-        "deployment_maker_request"
+    reset = handler._prepare_maker({**payload, "source_resumed_from_sha": None}, deployment=False)[
+        "maker_request"
     ]["prompt"]
+    deployment = handler._prepare_maker(payload, deployment=True)["deployment_maker_request"][
+        "prompt"
+    ]
     checker = handler._prepare_checker(payload)["checker_request"]["prompt"]
 
     assert "missing size check on resume" in resumed
@@ -1343,6 +1356,103 @@ def test_a_late_repair_write_never_resets_a_delivered_change_set(tmp_path: Path)
             with handler.sessions.begin() as session:
                 change_set = session.get(ChangeSet, change_set_id)
                 assert change_set is not None and change_set.state == state
+        else:
+            try:
+                handler._persist_delivery_handoff(payload)
+            except ValueError as error:
+                assert "already delivered" not in str(error)
+
+
+def test_a_deployment_ci_regression_goes_to_the_deployment_maker(tmp_path: Path) -> None:
+    # NEW-103: the deployment PR's own CI gate failed (falcone #1001's falcone-charts
+    # baseline and reuse-values failures); only the deployment maker repairs it.
+    handler, allocation = _lease_fixture(tmp_path)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.recovery_json = {
+            "staging_gitops": {
+                "status": "BLOCKED",
+                "blocker": "DEPLOYMENT_PR_CI_REGRESSION",
+                "ci_regressions": ["validate"],
+                "ci_regression_reason": "DEPLOYMENT_CI_NOT_BASELINED",
+                "ci_regression_target": "deployment",
+                "ci_failure_excerpts": {"validate": "not ok 268 - reuse-values topic name"},
+            }
+        }
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+        "orchestration": {"workflow_id": "backlog-loop-falcone-issue-1-ci-repair-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/falcone/issues/1001",
+        "risk_class": "R3",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "audit"},
+        "source_resumed_from_sha": "d" * 40,
+        "deployment_resumed_from_sha": None,
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+
+    source = handler._prepare_maker(payload, deployment=False)["maker_request"]["prompt"]
+    deployment = handler._prepare_maker(payload, deployment=True)["deployment_maker_request"][
+        "prompt"
+    ]
+
+    assert "failed these CI jobs" in deployment and "- validate" in deployment
+    assert "the deployment repository has no CI baseline" in deployment
+    assert "reuse-values topic name" in deployment
+    assert "failed these CI jobs" not in source and "reuse-values" not in source
+    assert "Only the deployment pull request's CI failed" in source
+    assert "never change the source when its pull request is already merged" in source
+
+
+def test_a_source_merged_change_set_accepts_repair_writes_until_its_deployment_merges(
+    tmp_path: Path,
+) -> None:
+    # NEW-103: the NEW-102 fence protects delivered ChangeSets, but a source-merged one
+    # whose deployment PR is unmerged is still being delivered.
+    handler, allocation = _lease_fixture(tmp_path)
+    change_set_id = UUID(allocation["change_set_id"])
+    run_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=run_id,
+                workflow_id="backlog-loop-x-issue-1-ci-repair-1-attempt-1",
+                run_type="delivery",
+                status="RUNNING",
+                project="musematic",
+                change_set_id=change_set_id,
+            )
+        )
+    payload = {
+        **allocation,
+        "run_id": str(run_id),
+        "change_evidence": {
+            "source": {"head_sha": "e" * 40},
+            "deployment": {"head_sha": "c" * 40, "changed_file_count": 0},
+        },
+        "source_base_sha": "a" * 40,
+        "deployment_base_sha": "c" * 40,
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+    for deployment_merged, refused in ((False, False), (True, True)):
+        with handler.sessions.begin() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            assert change_set is not None
+            change_set.state = "SOURCE_MERGED"
+            change_set.deployment_pr_url = "https://github.com/gntik-ai/musematic-deploy/pull/9"
+            change_set.recovery_json = {
+                "staging_gitops": {
+                    "blocker": "DEPLOYMENT_PR_CI_REGRESSION",
+                    "deployment_merge_sha": "f" * 40 if deployment_merged else None,
+                }
+            }
+        if refused:
+            with pytest.raises(ValueError, match="already delivered"):
+                handler._persist_delivery_handoff(payload)
         else:
             try:
                 handler._persist_delivery_handoff(payload)
