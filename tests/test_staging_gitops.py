@@ -1815,6 +1815,17 @@ def test_failure_excerpt_keeps_failing_lines_and_drops_passing_ones() -> None:
     ) * 30
     crowded = failure_excerpt(moderate + audit_log[audit_log.index("┌", 1000) :])
     assert "@grpc/grpc-js" in crowded and "other" not in crowded
+    # A truncated advisory (no closing ruling) never swallows the job's error lines.
+    truncated = failure_excerpt(
+        "┌──┐\n│ moderate │ parser │\n├──┤\n│ Package │ other │\n"
+        "Process exited\n##[error]Process completed with exit code 1.\n"
+    )
+    assert "##[error]Process completed" in truncated
+    # A snapshot box with a severity-looking row but no Package row is not an audit table.
+    boxed = failure_excerpt(
+        "not ok 4 - risk badge\n  ┌──────┐\n  │ high │ badge │\n  ├──────┤\n  └──────┘\n"
+    )
+    assert "├──────┤" in boxed
     long = failure_excerpt("not ok 1 - x\n" * 10_000)
     assert len(long) <= 4000 and long.count("\n") < 60
 

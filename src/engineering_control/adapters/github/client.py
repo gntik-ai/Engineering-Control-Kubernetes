@@ -1132,6 +1132,7 @@ _FAILURE_LINE = re.compile(
 )
 # NEW-104: a pnpm audit advisory table row for a high or critical finding.
 _AUDIT_FINDING_ROW = re.compile(r"^\s*│\s*(?:high|critical)\s*│", re.IGNORECASE)
+_AUDIT_PACKAGE_ROW = re.compile(r"^\s*│\s*Package\s*│")
 _AUDIT_SEVERITY_ROW = re.compile(r"^\s*│\s*(?:info|low|moderate|high|critical)\s*│", re.IGNORECASE)
 _AUDIT_TABLE_ROWS = 24
 _TABLE_RULING = re.compile(r"\s*[─━┌┐└┘├┤┬┴┼╭╮╰╯│]+[─━┌┐└┘├┤┬┴┼╭╮╰╯│ ]*")
@@ -1182,8 +1183,12 @@ def failure_excerpt(
 
 
 def _audit_table_rows(lines: list[str]) -> set[int]:
-    """NEW-104: indices of pnpm audit advisory table rows (any severity), each from its
-    severity row to the line before the table's closing ruling (bounded)."""
+    """NEW-104: indices of pnpm audit advisory table rows (any severity).
+
+    A table starts at a severity row and ends before its closing ruling, at the first
+    line that is not a table row or ruling (a truncated table), or after a bound. It is
+    an audit table only if it has a "│ Package │" row; anything else is left alone.
+    """
     rows: set[int] = set()
     index = 0
     while index < len(lines):
@@ -1192,9 +1197,17 @@ def _audit_table_rows(lines: list[str]) -> set[int]:
             continue
         end = min(len(lines), index + _AUDIT_TABLE_ROWS)
         row = index
-        while row < end and not lines[row].lstrip().startswith("└"):
-            rows.add(row)
+        while row < end:
+            stripped = lines[row].lstrip()
+            if stripped.startswith("└") or not (
+                stripped.startswith("│") or _TABLE_RULING.fullmatch(lines[row])
+            ):
+                break
+            if row > index and _AUDIT_SEVERITY_ROW.match(lines[row]):
+                break
             row += 1
+        if any(_AUDIT_PACKAGE_ROW.match(lines[candidate]) for candidate in range(index, row)):
+            rows.update(range(index, row))
         index = max(row, index + 1)
     return rows
 
