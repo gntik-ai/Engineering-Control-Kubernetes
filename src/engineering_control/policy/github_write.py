@@ -47,6 +47,7 @@ GITOPS_READ_ONLY_GITHUB_STEPS = frozenset(
     {
         "gitops.pr_checks",
         "gitops.pr_heads",
+        "gitops.deployment_pr_checks",
         "gitops.workflow_run",
         "gitops.image_pin",
     }

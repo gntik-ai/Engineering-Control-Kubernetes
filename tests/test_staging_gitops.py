@@ -1878,3 +1878,56 @@ async def test_pr_heads_reads_each_bound_pull_request(tmp_path: Path) -> None:
         "gitops.pr_heads", {"pull_requests": [{"url": "https://github.com/evil/x/pull/1"}]}
     )
     assert outside["status"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_deployment_pr_checks_gate_the_merge_of_both_prs(tmp_path: Path) -> None:
+    # NEW-103: falcone #1001 merged its source while falcone-charts CI was still running
+    # (and then failed); the deployment PR's CI must pass before either PR merges.
+    deployment_head = "e" * 40
+    job_url = "https://github.com/gntik-ai/musematic-deploy/actions/runs/5/job/{}"
+    handler, fake = _baseline_handler(tmp_path, [], [])
+    plan = _plan(
+        deployment_pr_number=9,
+        deployment_pr_url="https://github.com/gntik-ai/musematic-deploy/pull/9",
+        deployment_head_sha=deployment_head,
+    )
+
+    def deployment_pr(**changes: Any) -> None:
+        fake.pull_requests[("gntik-ai/musematic-deploy", 9)] = _pull_request(
+            **{
+                "number": 9,
+                "url": "https://github.com/gntik-ai/musematic-deploy/pull/9",
+                "headRefOid": deployment_head,
+                **changes,
+            }
+        )
+
+    no_deployment = await handler.handle("gitops.deployment_pr_checks", {"plan": _plan()})
+    assert no_deployment["status"] == "CHECKS_PASSED"
+
+    deployment_pr(statusCheckRollup=[_check("validate", None)])
+    pending = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert pending["status"] == "CHECKS_PENDING"
+
+    deployment_pr(
+        statusCheckRollup=[
+            {**_check("validate", "FAILURE"), "detailsUrl": job_url.format(31)},
+            _check("lint", "SUCCESS"),
+        ]
+    )
+    fake.job_logs = {31: "not ok 51 - default umbrella stays at its approved baseline"}
+    failed = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert failed["status"] == "BLOCKED"
+    assert failed["blocker"] == "DEPLOYMENT_PR_CI_REGRESSION"
+    assert failed["failed_checks"] == ["validate"] and failed["preexisting_checks"] == []
+    assert failed["reason"] == "DEPLOYMENT_CI_NOT_BASELINED"
+    assert "approved baseline" in failed["failure_excerpts"]["validate"]
+
+    deployment_pr(headRefOid="f" * 40)
+    moved = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert moved["blocker"] == "DEPLOYMENT_PR_BINDING_CHANGED"
+
+    deployment_pr(state="MERGED")
+    merged = await handler.handle("gitops.deployment_pr_checks", {"plan": plan})
+    assert merged["status"] == "CHECKS_PASSED" and merged["already_merged"] is True

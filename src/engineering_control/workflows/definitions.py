@@ -362,6 +362,7 @@ class ControlledWorkflow:
         if step in {
             "gitops.pr_checks",
             "gitops.pr_heads",
+            "gitops.deployment_pr_checks",
             "gitops.merge",
             "gitops.release_tag",
             "gitops.workflow_run",
@@ -2155,6 +2156,31 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     evidence["ci_failure_excerpts"] = checks.get("failure_excerpts")
             return self._blocked(checks, "SOURCE_PR_CI_FAILED")
 
+        # 1b. NEW-103: the deployment PR's CI must also pass before either PR merges,
+        # so a deployment failure can no longer leave the source merged on its own.
+        if plan.get("deployment_pr_number") and workflow.patched(
+            "gitops-deployment-ci-gate-v1"
+        ):
+            deployment_checks = await self._poll(
+                "gitops.deployment_pr_checks",
+                base,
+                pending=frozenset({"CHECKS_PENDING"}),
+                attempts=90,
+                interval=minute,
+            )
+            if deployment_checks.get("status") == "TIMED_OUT":
+                return {"status": "BLOCKED", "blocker": "DEPLOYMENT_PR_CI_TIMEOUT"}
+            if deployment_checks.get("status") != "CHECKS_PASSED":
+                if deployment_checks.get("blocker") == "DEPLOYMENT_PR_CI_REGRESSION":
+                    evidence["ci_regressions"] = deployment_checks.get("failed_checks") or []
+                    evidence["ci_regression_reason"] = deployment_checks.get("reason")
+                    evidence["ci_regression_target"] = "deployment"
+                    if deployment_checks.get("failure_excerpts"):
+                        evidence["ci_failure_excerpts"] = deployment_checks.get(
+                            "failure_excerpts"
+                        )
+                return self._blocked(deployment_checks, "DEPLOYMENT_PR_CI_FAILED")
+
         # 2. Ready + merge (source first, then the deployment PR when one exists).
         targets = ["source"]
         if plan.get("deployment_pr_number"):
@@ -3217,7 +3243,13 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 return "DONE", ""
             blocker = str(staged.get("blocker") or staged.get("status") or "STAGING_GITOPS_FAILED")
             if (
-                blocker == "SOURCE_PR_CI_REGRESSION"
+                (
+                    blocker == "SOURCE_PR_CI_REGRESSION"
+                    or (
+                        blocker == "DEPLOYMENT_PR_CI_REGRESSION"
+                        and self._deployment_ci_repair_patched(ordinal)
+                    )
+                )
                 and gate is not None
                 and repair_round < self._CI_REPAIR_ROUNDS
                 and workflow.patched("existing-backlog-gitops-ci-repair-v1")
@@ -3254,7 +3286,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     if self._repair_restores_published_patched(ordinal):
                         restore_pending = True
                 elif gate is not None and (
-                    blocker == "SOURCE_PR_CI_REGRESSION" or blocker.startswith("CI_REPAIR_")
+                    blocker == "SOURCE_PR_CI_REGRESSION"
+                    or blocker.startswith("CI_REPAIR_")
+                    or (
+                        blocker == "DEPLOYMENT_PR_CI_REGRESSION"
+                        and self._deployment_ci_repair_patched(ordinal)
+                    )
                 ):
                     # NEW-64: the operator's retry repeats the CI repair, not only GitOps.
                     repair_pending = True
@@ -3308,6 +3345,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         if applied.get("status") != "RESTORED":
             return f"CI_REPAIR_RESTORE_{applied.get('reason') or 'REFUSED'}"[:120]
         return None
+
+    def _deployment_ci_repair_patched(self, ordinal: int) -> bool:
+        # NEW-103: deployment-PR CI regressions go through the same bounded CI repair.
+        return workflow.patched(f"existing-backlog-deployment-ci-repair-v1-{ordinal}")
 
     def _late_reset_restores_patched(self, ordinal: int) -> bool:
         return workflow.patched(f"existing-backlog-late-reset-restores-v1-{ordinal}")

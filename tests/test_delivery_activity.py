@@ -570,3 +570,63 @@ async def test_delivery_dispatch_runs_blocking_github_cli_steps_off_the_event_lo
 
     assert calls == [expected_method]
     assert result == {"status": "OK"}
+
+
+class MergedSourceRunner(FakePublicationRunner):
+    """The falcone PR of this branch is already merged (NEW-103, falcone #1001)."""
+
+    def __init__(self, branch: str, heads: dict[str, str], merged_head: str) -> None:
+        super().__init__(branch, heads)
+        self.merged_head = merged_head
+
+    def run(
+        self, executable: str, arguments: list[str], *, cwd: Path, **kwargs: Any
+    ) -> CommandResult:
+        if executable == "gh" and arguments[:2] == ["pr", "list"]:
+            repository = arguments[arguments.index("--repo") + 1]
+            if repository == "gntik-ai/falcone":
+                merged = {
+                    "number": 1043,
+                    "url": "https://github.com/gntik-ai/falcone/pull/1043",
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "headRefOid": self.merged_head,
+                    "baseRefName": "main",
+                }
+                return CommandResult(0, json.dumps([merged]), "")
+        return super().run(executable, arguments, cwd=cwd, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_head", [True, False])
+async def test_a_merged_source_branch_is_never_republished(tmp_path: Path, same_head: bool) -> None:
+    # NEW-103: a deployment-PR CI repair re-publishes a ChangeSet whose source PR merged.
+    worktree_root = tmp_path / "worktrees"
+    payload, branch, heads = publication_payload(worktree_root)
+    runner = MergedSourceRunner(branch, heads, heads["falcone"] if same_head else "9" * 40)
+    project_root, policy = enabled_write_policy(
+        tmp_path, ("gntik-ai/falcone", "gntik-ai/falcone-charts")
+    )
+    handler = DeliveryActivityHandler(
+        Settings(
+            worktree_root=worktree_root,
+            run_root=tmp_path / "runs",
+            github_writes_enabled=True,
+            project_config_root=project_root,
+            github_issue_write_validation_file=policy,
+        ),
+        runner,  # type: ignore[arg-type]
+    )
+
+    result = await handler.handle("delivery.publish", payload)
+
+    assert "falcone" not in runner.pushes  # the merged source branch never moves
+    if same_head:
+        assert result["status"] == "SOURCE_PRS_CREATED"
+        source = result["publication_results"][0]
+        assert source["pr_number"] == 1043 and source["pr_state"] == "MERGED"
+        assert runner.pushes == ["falcone-charts"]
+    else:
+        assert result["status"] == "BLOCKED"
+        assert result["blocker"] == "GITHUB_PUBLICATION_FAILED"
+        assert runner.pushes == []
