@@ -1847,3 +1847,19 @@ async def test_a_stalled_job_log_read_is_skipped(tmp_path: Path) -> None:
 
     assert blocked["blocker"] == "SOURCE_PR_CI_REGRESSION"
     assert set(blocked["failure_excerpts"]) == {"quality"}
+
+
+@pytest.mark.asyncio
+async def test_pr_heads_reads_each_bound_pull_request(tmp_path: Path) -> None:
+    # NEW-102: the restore compares recorded published heads with the live PRs.
+    handler, fake = _baseline_handler(tmp_path, [], [])
+    url = "https://github.com/gntik-ai/musematic/pull/77"
+    result = await handler.handle("gitops.pr_heads", {"pull_requests": [{"url": url}]})
+    assert result["status"] == "OK"
+    [head] = result["heads"]
+    assert head["url"] == url and head["state"] == "OPEN"
+    assert head["head_sha"] == fake.pull_requests[("gntik-ai/musematic", 77)]["headRefOid"]
+    outside = await handler.handle(
+        "gitops.pr_heads", {"pull_requests": [{"url": "https://github.com/evil/x/pull/1"}]}
+    )
+    assert outside["status"] == "BLOCKED"

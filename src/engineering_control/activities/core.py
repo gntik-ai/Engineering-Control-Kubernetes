@@ -238,6 +238,7 @@ class ControlActivities:
         "gitops.persist_result",
         # ... and GitHub-worker steps (GitOpsGitHubHandler via GitHubActivityHandler).
         "gitops.pr_checks",
+        "gitops.pr_heads",
         "gitops.merge",
         "gitops.release_tag",
         "gitops.workflow_run",

@@ -937,6 +937,7 @@ class GitOpsGitHubHandler:
     write_capable_steps = GITOPS_WRITE_CAPABLE_GITHUB_STEPS
     _failure_blockers = {
         "gitops.pr_checks": "SOURCE_PR_CHECKS_UNAVAILABLE",
+        "gitops.pr_heads": "PR_HEADS_UNAVAILABLE",
         "gitops.merge": "PROTECTED_MERGE_FAILED",
         "gitops.release_tag": "RELEASE_TAG_FAILED",
         "gitops.workflow_run": "WORKFLOW_RUN_UNAVAILABLE",
@@ -973,6 +974,7 @@ class GitOpsGitHubHandler:
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         handlers = {
             "gitops.pr_checks": self._pr_checks,
+            "gitops.pr_heads": self._pr_heads,
             "gitops.merge": self._merge,
             "gitops.release_tag": self._release_tag,
             "gitops.workflow_run": self._workflow_run,
@@ -1046,6 +1048,27 @@ class GitOpsGitHubHandler:
         return path
 
     # -- 1. PR checks ------------------------------------------------------------------
+
+    def _pr_heads(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-102: live head and state of each named pull request (read-only)."""
+        raw = payload.get("pull_requests")
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 2:
+            raise ValueError("pull request head request is invalid")
+        heads: list[dict[str, Any]] = []
+        for item in raw:
+            url = str(item.get("url") if isinstance(item, dict) else "")
+            match = _PR_URL.fullmatch(url)
+            if match is None:
+                raise ValueError("pull request URL is outside the allowlist")
+            pull_request = self.broker.view_pull_request(match.group(1), int(match.group(2)))
+            heads.append(
+                {
+                    "url": url,
+                    "head_sha": str(pull_request.get("headRefOid") or ""),
+                    "state": str(pull_request.get("state") or ""),
+                }
+            )
+        return {"status": "OK", "heads": heads}
 
     def _pr_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
         # NEW-100: the activity heartbeats only on entry, so the optional CI log reads must

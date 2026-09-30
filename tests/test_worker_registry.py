@@ -45,6 +45,7 @@ GITHUB_STEPS = frozenset(
         "enhancement.github_dedupe",
         "finding.publish",
         "gitops.pr_checks",
+        "gitops.pr_heads",
         "gitops.merge",
         "gitops.release_tag",
         "gitops.workflow_run",

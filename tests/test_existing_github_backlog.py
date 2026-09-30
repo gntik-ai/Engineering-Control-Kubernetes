@@ -1558,13 +1558,16 @@ def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("state", "evidence", "deployment_pr", "expected", "reason"),
+    ("state", "evidence", "deployment_pr", "live", "expected", "reason"),
     [
-        ("PLANNED", True, True, "RESTORED", None),
-        ("IMPLEMENTING", True, False, "RESTORED", None),
-        ("REQUEST_CHANGES", True, True, "RESTORED", None),
-        ("SOURCE_MERGED", True, True, "NOT_RESTORED", "STATE_SOURCE_MERGED"),
-        ("PLANNED", False, True, "NOT_RESTORED", "PUBLICATION_BINDING_MISSING"),
+        ("PLANNED", True, True, "published", "RESTORED", None),
+        ("IMPLEMENTING", True, False, "published", "RESTORED", None),
+        ("REQUEST_CHANGES", True, True, "published", "RESTORED", None),
+        ("PLANNED", True, True, "moved", "NOT_RESTORED", "PUBLISHED_PR_HEAD_CHANGED"),
+        ("PLANNED", True, True, "closed", "NOT_RESTORED", "PUBLISHED_PR_NOT_OPEN"),
+        ("PLANNED", True, True, "raced", "NOT_RESTORED", "CHANGE_SET_CHANGED_SINCE_PLAN"),
+        ("SOURCE_MERGED", True, True, "published", "NOT_RESTORED", "STATE_SOURCE_MERGED"),
+        ("PLANNED", False, True, "published", "NOT_RESTORED", "PUBLICATION_BINDING_MISSING"),
     ],
 )
 def test_a_stopped_ci_repair_restores_the_last_published_binding(
@@ -1572,12 +1575,14 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
     state: str,
     evidence: bool,
     deployment_pr: bool,
+    live: str,
     expected: str,
     reason: str | None,
 ) -> None:
     # NEW-102: falcone #1001's CI repair stopped without publishing and left the
-    # ChangeSet PLANNED, so the recheck refused it. The loop now restores SOURCE_PR and
-    # the heads recorded at publication (never the repair's unpublished local heads).
+    # ChangeSet PLANNED, so the recheck was refused. The loop restores SOURCE_PR and the
+    # heads recorded at publication, only if every bound PR is still open at exactly those
+    # heads and nothing wrote the ChangeSet since the plan.
     from uuid import uuid4
 
     handler = EngineeringActivityHandler(
@@ -1589,6 +1594,8 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
     )
     Base.metadata.create_all(handler.engine)
     published_source, published_deployment = "a" * 40, "b" * 40
+    source_url = "https://github.com/gntik-ai/falcone/pull/1038"
+    deployment_url = "https://github.com/gntik-ai/falcone-charts/pull/50"
     change_set_id = uuid4()
     with handler.sessions.begin() as session:
         session.add(
@@ -1602,13 +1609,11 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
                 source_repository="falcone",
                 source_base_sha="c" * 40,
                 source_head_sha="d" * 40,  # the repair's unpublished local head
-                source_pr_url="https://github.com/gntik-ai/falcone/pull/1038",
+                source_pr_url=source_url,
                 deployment_repository="falcone-charts",
                 deployment_base_sha="e" * 40,
                 deployment_head_sha="f" * 40,
-                deployment_pr_url=(
-                    "https://github.com/gntik-ai/falcone-charts/pull/50" if deployment_pr else None
-                ),
+                deployment_pr_url=deployment_url if deployment_pr else None,
                 image_digests={},
                 recovery_json=(
                     {
@@ -1622,10 +1627,31 @@ def test_a_stopped_ci_repair_restores_the_last_published_binding(
                 ),
             )
         )
+    base = {"change_set_id": str(change_set_id), "workflow_id": "backlog-loop-falcone-x"}
 
-    result = handler._restore_published_change_set(
-        {"change_set_id": str(change_set_id), "workflow_id": "backlog-loop-falcone-x"}
-    )
+    plan = handler._restore_published_change_set({**base, "phase": "plan"})
+    if plan["status"] == "READY":
+        assert [item["url"] for item in plan["pull_requests"]] == (
+            [source_url, deployment_url] if deployment_pr else [source_url]
+        )
+        heads = [
+            {"url": source_url, "head_sha": published_source, "state": "OPEN"},
+            {"url": deployment_url, "head_sha": published_deployment, "state": "OPEN"},
+        ]
+        if live == "moved":
+            heads[0]["head_sha"] = "9" * 40  # e.g. a partial publication pushed the source
+        if live == "closed":
+            heads[1]["state"] = "CLOSED"
+        if live == "raced":
+            with handler.sessions.begin() as session:
+                raced = session.get(db.ChangeSet, change_set_id)
+                assert raced is not None
+                raced.version += 1  # a late repair write after the plan
+        result = handler._restore_published_change_set(
+            {**base, "phase": "apply", "version": plan["version"], "live_heads": heads}
+        )
+    else:
+        result = plan
 
     assert result["status"] == expected
     assert result.get("reason") == reason
