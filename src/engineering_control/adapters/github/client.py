@@ -1125,9 +1125,13 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _FAILURE_LINE = re.compile(
     r"^not ok\b|##\[error\]|\b(?:error|failed|failure|assert(?:ion)?|expected|actual|"
     r"exception|traceback|panic)\b|^\s*(?:throw|at )|^\s*--- FAIL\b|^FAIL\b|"
-    r"\bgot\b.*\bwant\b",
+    r"\bgot\b.*\bwant\b|"
+    # NEW-104: dependency-audit findings (pnpm/npm audit table rows and npm's "Severity:"
+    # lines), so a failed audit job names each high/critical package and its fix.
+    r"^\s*[│|]\s*(?:high|critical)\s*[│|]|^\s*Severity:\s*(?:high|critical)\s*$",
     re.IGNORECASE,
 )
+_TABLE_RULING = re.compile(r"\s*[─━┌┐└┘├┤┬┴┼╭╮╰╯│]+[─━┌┐└┘├┤┬┴┼╭╮╰╯│ ]*")
 _PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
 
 
@@ -1139,8 +1143,11 @@ def failure_excerpt(
     Timestamps and ANSI colours are stripped; passing test lines never count as markers.
     """
     lines = [
-        _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300]
+        cleaned
         for line in raw[-JOB_LOG_TAIL_BYTES:].splitlines()
+        # NEW-104: table rulings (audit output) carry no content and would crowd out the
+        # rows that follow a finding.
+        if not _TABLE_RULING.fullmatch(cleaned := _ANSI.sub("", _LOG_PREFIX.sub("", line))[:300])
     ]
     keep: list[int] = []
     for index, line in enumerate(lines):
