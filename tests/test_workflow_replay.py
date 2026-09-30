@@ -867,6 +867,7 @@ def _full_delivery_loop_script(
         "backlog.register_child_run": {"status": "REGISTERED"},
         "backlog.record_loop_state": {"status": "RECORDED"},
         "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
+        "backlog.restore_published_change_set": {"status": "RESTORED"},
         "gitops.flow_for_project": {"status": "ENABLED", "enabled": True},
         **_gitops_script(**gitops_overrides),
     }
@@ -1634,6 +1635,8 @@ async def test_a_retry_after_a_blocked_ci_repair_rechecks_ci_before_repairing() 
             payload.get("child_workflow_id")
         ):
             order.append("repair " + str(payload["child_workflow_id"]).rsplit("-issue-", 1)[1])
+        if request["step"] == "backlog.restore_published_change_set":
+            order.append("restore")
         if request["step"] == "gitops.pr_checks":
             checks += 1
             return {**_REGRESSION, "failure_excerpts": {"quality": f"not ok round-{checks}"}}
@@ -1676,9 +1679,12 @@ async def test_a_retry_after_a_blocked_ci_repair_rechecks_ci_before_repairing() 
         "SOURCE_PR_CI_REGRESSION",
     ]
     # Each repair after the first follows a GitOps run that persisted fresh excerpts.
+    # NEW-102: only the stopped repair (round 1) restores the published binding, after the
+    # repair child and before the recheck.
     assert order == [
         "persist not ok round-1",
         "repair 1-ci-repair-1-attempt-1",
+        "restore",
         "persist not ok round-2",
         "repair 1-ci-repair-2-attempt-1",
         "persist not ok round-3",

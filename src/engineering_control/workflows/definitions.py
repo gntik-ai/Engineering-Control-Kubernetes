@@ -3163,6 +3163,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 else:
                     reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
                     staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
+                    if change_set_id and self._repair_restores_published_patched(ordinal):
+                        # NEW-102: the stopped repair left the ChangeSet mid-implementation;
+                        # return it to its published PRs so the retry's recheck (NEW-101)
+                        # delivers exactly what was published.
+                        await self._loop_step(
+                            request,
+                            item,
+                            "backlog.restore_published_change_set",
+                            {
+                                **asdict(request),
+                                "change_set_id": change_set_id,
+                                "workflow_id": workflow_root,
+                            },
+                            register_run=register_run,
+                        )
             if staged is None and change_set_id:
                 child_id = f"{workflow_root}-issue-{ordinal}-staging-gitops"
                 if gitops_round:
@@ -3252,6 +3267,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
 
     # NEW-64: automatic CI-repair re-deliveries before the loop waits for the operator.
     _CI_REPAIR_ROUNDS = 2
+
+    def _repair_restores_published_patched(self, ordinal: int) -> bool:
+        return workflow.patched(f"existing-backlog-ci-repair-restores-published-v1-{ordinal}")
 
     def _repair_retry_rechecks_patched(self, ordinal: int) -> bool:
         # Temporal memoizes a patch per workflow, so the decision is scoped to the issue:

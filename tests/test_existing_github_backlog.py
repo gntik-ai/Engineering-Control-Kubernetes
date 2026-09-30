@@ -13,6 +13,7 @@ from sqlalchemy import event, select
 from engineering_control.activities.engineering import EngineeringActivityHandler
 from engineering_control.api.schemas import BacklogApprovalCandidateRequest
 from engineering_control.config import Settings
+from engineering_control.db import models as db
 from engineering_control.db.base import Base
 from engineering_control.db.models import BacklogIssueRecord, CoverageCell, GitHubBacklogCampaign
 from engineering_control.db.repository import SQLMetadataRepository
@@ -1553,3 +1554,92 @@ def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: P
         assert "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE" in (run.summary or "")
         campaign = session.get(GitHubBacklogCampaign, campaign_id)
         assert campaign is not None and campaign.status == "APPROVED"  # untouched
+
+
+
+@pytest.mark.parametrize(
+    ("state", "evidence", "deployment_pr", "expected", "reason"),
+    [
+        ("PLANNED", True, True, "RESTORED", None),
+        ("IMPLEMENTING", True, False, "RESTORED", None),
+        ("REQUEST_CHANGES", True, True, "RESTORED", None),
+        ("SOURCE_MERGED", True, True, "NOT_RESTORED", "STATE_SOURCE_MERGED"),
+        ("PLANNED", False, True, "NOT_RESTORED", "PUBLICATION_BINDING_MISSING"),
+    ],
+)
+def test_a_stopped_ci_repair_restores_the_last_published_binding(
+    tmp_path: Path,
+    state: str,
+    evidence: bool,
+    deployment_pr: bool,
+    expected: str,
+    reason: str | None,
+) -> None:
+    # NEW-102: falcone #1001's CI repair stopped without publishing and left the
+    # ChangeSet PLANNED, so the recheck refused it. The loop now restores SOURCE_PR and
+    # the heads recorded at publication (never the repair's unpublished local heads).
+    from uuid import uuid4
+
+    handler = EngineeringActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'restore.sqlite'}",
+            state_root=tmp_path,
+            project_config_root=ROOT / "config/projects",
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    published_source, published_deployment = "a" * 40, "b" * 40
+    change_set_id = uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            db.ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                project="falcone",
+                risk_class="R3",
+                state=state,
+                version=3,
+                source_repository="falcone",
+                source_base_sha="c" * 40,
+                source_head_sha="d" * 40,  # the repair's unpublished local head
+                source_pr_url="https://github.com/gntik-ai/falcone/pull/1038",
+                deployment_repository="falcone-charts",
+                deployment_base_sha="e" * 40,
+                deployment_head_sha="f" * 40,
+                deployment_pr_url=(
+                    "https://github.com/gntik-ai/falcone-charts/pull/50" if deployment_pr else None
+                ),
+                image_digests={},
+                recovery_json=(
+                    {
+                        "change_evidence": {
+                            "source": {"head_sha": published_source},
+                            "deployment": {"head_sha": published_deployment},
+                        }
+                    }
+                    if evidence
+                    else {}
+                ),
+            )
+        )
+
+    result = handler._restore_published_change_set(
+        {"change_set_id": str(change_set_id), "workflow_id": "backlog-loop-falcone-x"}
+    )
+
+    assert result["status"] == expected
+    assert result.get("reason") == reason
+    with handler.sessions() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        if expected == "RESTORED":
+            assert change_set.state == "SOURCE_PR" and change_set.version == 4
+            assert change_set.source_head_sha == published_source
+            assert change_set.deployment_head_sha == (
+                published_deployment if deployment_pr else "f" * 40
+            )
+            restore = change_set.recovery_json["ci_repair_restore"]
+            assert restore["from_state"] == state
+            assert restore["from_source_head_sha"] == "d" * 40
+        else:
+            assert change_set.state == state and change_set.source_head_sha == "d" * 40
