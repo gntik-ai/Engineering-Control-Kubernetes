@@ -3260,6 +3260,14 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     repair_pending = True
                 else:
                     gitops_round += 1
+                    if (
+                        blocker == "CHANGE_SET_STATE_NOT_DELIVERABLE"
+                        and repair_round > 0
+                        and self._repair_restores_published_patched(ordinal)
+                    ):
+                        # NEW-102: a late repair write reset the ChangeSet after its restore;
+                        # restore it again before the recheck.
+                        restore_pending = True
                 continue
             results.append(skipped)
             return "SKIPPED", blocker

@@ -1789,3 +1789,65 @@ async def test_a_refused_or_failing_restore_pauses_and_the_retry_restores_again(
         "1-ci-repair-1-attempt-1",
     ]
     await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)
+
+
+async def test_a_late_reset_after_restore_is_restored_again_on_retry() -> None:
+    # NEW-102 review: a timed-out repair's late write resets the ChangeSet after the
+    # restore, so the recheck's prepare refuses it; the retry restores again first.
+    script = _full_delivery_loop_script(**{"gitops.pr_checks": _REGRESSION})
+    scripted = _scripted_execute_control_step(script)
+    prepares = 0
+    order: list[str] = []
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        nonlocal prepares
+        step = request["step"]
+        if step == "backlog.restore_published_change_set":
+            order.append(f"restore {request['payload']['phase']}")
+            if request["payload"]["phase"] == "plan":
+                return {"status": "READY", "version": 1, "pull_requests": [{"url": "u"}]}
+            return {"status": "RESTORED"}
+        if step == "gitops.pr_heads":
+            return {"status": "OK", "heads": [{"url": "u"}]}
+        if step == "gitops.prepare":
+            prepares += 1
+            order.append(f"prepare {prepares}")
+            if prepares == 2:
+                return {"status": "BLOCKED", "blocker": "CHANGE_SET_STATE_NOT_DELIVERABLE"}
+        return await scripted(request)
+
+    history, result, _ = await _run_loop(
+        script,
+        [
+            ("retry", "gntik-ai/musematic#1026"),
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
+        workflows=_REPAIR_BLOCKED_WORKFLOWS,
+        activity_fn=execute_control_step,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert order[:8] == [
+        "prepare 1",
+        "restore plan",
+        "restore apply",
+        "prepare 2",
+        "restore plan",
+        "restore apply",
+        "prepare 3",
+        "prepare 4",
+    ]
+    paused = [
+        request["payload"]["blocker"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == "PAUSED"
+    ]
+    assert paused == [
+        "CI_REPAIR_SOURCE_MAKER_DID_NOT_COMPLETE",
+        "CHANGE_SET_STATE_NOT_DELIVERABLE",
+        "SOURCE_PR_CI_REGRESSION",
+    ]
+    await Replayer(workflows=_REPAIR_BLOCKED_WORKFLOWS).replay_workflow(history)
