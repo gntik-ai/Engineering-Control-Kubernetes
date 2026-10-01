@@ -3800,16 +3800,28 @@ class ChangeRequestWorkflow(ControlledWorkflow):
     async def _finalize_change_request_run(
         self, request: ChangeRequestInput, status: str, error_code: Any
     ) -> None:
-        """Close the control Run that the provider invocations opened (if any)."""
-        await self._step(
-            "change_request.finalize_run",
-            {
-                "change_request_id": request.change_request_id,
-                "revision": request.revision,
-                "terminal_status": status,
-                "error_code": error_code,
-            },
-        )
+        """Close the control Run that the provider invocations opened (if any).
+
+        Best effort: a finalization failure (e.g. the same database outage) must never
+        replace the request's own outcome or the original exception, so it is logged and
+        the Run is left for the operator to see as still running.
+        """
+        try:
+            await self._step(
+                "change_request.finalize_run",
+                {
+                    "change_request_id": request.change_request_id,
+                    "revision": request.revision,
+                    "terminal_status": status,
+                    "error_code": error_code,
+                },
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "change request %s revision %s: control Run finalization failed",
+                request.change_request_id,
+                request.revision,
+            )
 
     async def _draft_and_review(self, request: ChangeRequestInput) -> dict[str, Any]:
         context = await self._step("change_request.load", asdict(request))

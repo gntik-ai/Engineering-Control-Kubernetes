@@ -485,3 +485,79 @@ def test_each_provider_invocation_starts_without_earlier_results() -> None:
     assert review["status"] == "REVIEW_READY" and redraft["status"] == "DRAFT_READY"
     for prepared in (review, redraft):
         assert not set(stale) & set(prepared)
+
+
+def finalize_outage(payload: dict[str, Any]) -> dict[str, Any]:
+    raise ApplicationError("database unavailable", type="DatabaseUnavailable", non_retryable=True)
+
+
+def persist_outage(payload: dict[str, Any]) -> dict[str, Any]:
+    raise ApplicationError("persist failed first", type="PersistFailed", non_retryable=True)
+
+
+def without_steps(handler: ChangeRequestActivityHandler, *steps: str) -> None:
+    """Route the named controller steps to scripted responses instead of the real handler."""
+    handler.supported_steps = handler.supported_steps - set(steps)  # type: ignore[misc]
+
+
+@pytestmark_temporal
+async def test_a_failed_run_finalization_keeps_the_candidate_result(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id = new_request(repository)
+    handler = ChangeRequestActivityHandler(Settings(), repository=repository)
+    without_steps(handler, "change_request.finalize_run")
+    activity_fn = scripted_activity(
+        handler,
+        {
+            "project.snapshot": [snapshot],
+            "change_request.draft": [agent(PROPOSAL)],
+            "change_request.review": [agent(APPROVE)],
+            "change_request.github_dedupe": [dedupe],
+            "change_request.finalize_run": [finalize_outage],
+        },
+        [],
+    )
+    result, _ = await run_workflow(
+        ChangeRequestWorkflow,
+        ChangeRequestInput(change_request_id=str(change_request_id), revision=1),
+        activity_fn,
+        change_request_workflow_id(str(change_request_id), 1),
+    )
+    assert result["status"] == "CANDIDATE"
+    assert result["review_decision"] == "APPROVE"
+
+
+@pytestmark_temporal
+async def test_a_failed_run_finalization_keeps_the_original_step_failure(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id = new_request(repository)
+    handler = ChangeRequestActivityHandler(Settings(), repository=repository)
+    without_steps(handler, "change_request.persist", "change_request.finalize_run")
+    activity_fn = scripted_activity(
+        handler,
+        {
+            "project.snapshot": [snapshot],
+            "change_request.draft": [agent(PROPOSAL)],
+            "change_request.review": [agent(APPROVE)],
+            "change_request.github_dedupe": [dedupe],
+            "change_request.persist": [persist_outage],
+            "change_request.finalize_run": [finalize_outage],
+        },
+        [],
+    )
+    with pytest.raises(Exception) as failure:
+        await run_workflow(
+            ChangeRequestWorkflow,
+            ChangeRequestInput(change_request_id=str(change_request_id), revision=1),
+            activity_fn,
+            change_request_workflow_id(str(change_request_id), 1),
+        )
+    chain: list[str] = []
+    error: BaseException | None = failure.value
+    while error is not None:
+        chain.append(str(error))
+        error = error.__cause__
+    assert any("persist failed first" in message for message in chain)
+    assert not any("database unavailable" in message for message in chain)
