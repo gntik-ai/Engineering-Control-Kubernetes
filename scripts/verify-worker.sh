@@ -42,7 +42,7 @@ for service in engineering-worker@codex engineering-worker@claude engineering-wo
   engineering-worker@scan engineering-worker@delivery engineering-release-worker; do
   systemctl is-active --quiet "${service}.service"
 done
-[[ $(sudo -u codex-runner -H codex --version) == "codex-cli 0.149.0" ]]
+[[ $(sudo -u codex-runner -H codex --version) == "codex-cli 0.159.3" ]]
 [[ $(sudo -u claude-runner -H claude --version) == "2.1.239 (Claude Code)" ]]
 if ! sudo -u codex-runner -H env -i \
   HOME=/var/lib/engineering-control/identities/codex-runner \

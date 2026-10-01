@@ -40,7 +40,7 @@ ssh -t worker 'gh auth status --hostname github.com && gh auth setup-git && \
 The controller application constrains the broad operator identity to five allowlisted repositories
 and typed operations. GitHub writes stay disabled until an approval-bound policy enables them.
 
-The bootstrap installs Codex 0.149.0, Claude Code 2.1.239, Playwright 1.62.1, GitHub CLI 2.98.0,
+The bootstrap installs Codex 0.159.3 (gpt-6.1-sol needs codex-cli 0.159 or later), Claude Code 2.1.239, Playwright 1.62.1, GitHub CLI 2.98.0,
 Gitleaks 8.30.0,
 Trivy 0.74.0, Semgrep 1.174.0, kubeconform 0.8.0, and Syft 1.51.0. Release archives are checked
 against upstream checksum manifests. It also pins the deterministic adapters to kubectl 1.36.3,

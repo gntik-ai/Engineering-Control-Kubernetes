@@ -191,7 +191,7 @@ if [[ ${NODE_SOURCE} != /usr/local/bin/node ]]; then
   mv -f -- /usr/local/bin/.engineering-node.new /usr/local/bin/node
 fi
 "/usr/local/bin/node" "${NPM_CLI}" install --prefix "${CLI_ROOT}" \
-  @openai/codex@0.149.0 @anthropic-ai/claude-code@2.1.239
+  @openai/codex@0.159.3 @anthropic-ai/claude-code@2.1.239
 chmod -R a+rX "${CLI_ROOT}"
 ln -sfn "${CLI_ROOT}/node_modules/.bin/codex" /usr/local/bin/codex
 ln -sfn "${CLI_ROOT}/node_modules/.bin/claude" /usr/local/bin/claude

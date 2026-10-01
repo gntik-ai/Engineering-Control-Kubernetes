@@ -56,10 +56,11 @@ class Settings(BaseSettings):
     codex_executable: Path = Path("/usr/local/bin/codex")
     # NEW-36: pin the Codex model instead of inheriting the CLI default, which changed
     # under us (codex-cli 0.149.0 defaulted to gpt-5.4, refused for the ChatGPT account).
-    # Operator choice 2026-09-23 (gpt-5.6-terra); 2026-09-29: gpt-6-sol, the GPT-6
-    # "workhorse model for coding and everyday work" (terra's role; codex-cli >= 0.157
-    # lists it). Override with ENGINEERING_CODEX_MODEL.
-    codex_model: str | None = "gpt-6-sol"
+    # Operator choice 2026-09-23 (gpt-5.6-terra); 2026-09-29: gpt-6-sol; 2026-10-01:
+    # gpt-6.1-sol, the "latest workhorse model for coding and everyday work" (gpt-6-sol
+    # is now "previous generation"; codex-cli >= 0.159 lists it). Override with
+    # ENGINEERING_CODEX_MODEL.
+    codex_model: str | None = "gpt-6.1-sol"
     claude_executable: Path = Path("/usr/local/bin/claude")
     # NEW-53: optional Claude model pins for the delivery spec architect and the
     # independent checker (passed as --model). None keeps the CLI default.
