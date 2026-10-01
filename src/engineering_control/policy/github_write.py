@@ -248,6 +248,7 @@ class ChangeRequestIssueCreateDenialReason(StrEnum):
     WRITES_DISABLED = "WRITES_DISABLED"
     NOT_APPROVED = "NOT_APPROVED"
     REVISION_MISMATCH = "REVISION_MISMATCH"
+    DECISION_SUPERSEDED = "DECISION_SUPERSEDED"
     BINDING_MISMATCH = "BINDING_MISMATCH"
     REPOSITORY_NOT_ALLOWLISTED = "REPOSITORY_NOT_ALLOWLISTED"
     CONTENT_TAMPERED = "CONTENT_TAMPERED"
@@ -303,6 +304,7 @@ class ChangeRequestIssueCreatePolicy:
         workflow_id: str,
         change_request_id: str,
         revision: object,
+        decision_sequence: object,
         approval_binding: str,
         attestation: ChangeRequestAttestation | None,
     ) -> ChangeRequestIssuePlan | ChangeRequestIssueCreateDenial:
@@ -321,6 +323,10 @@ class ChangeRequestIssueCreatePolicy:
             return ChangeRequestIssueCreateDenial(reason_code=reason.WORKFLOW_NOT_BOUND)
         if revision != attestation.revision:
             return ChangeRequestIssueCreateDenial(reason_code=reason.REVISION_MISMATCH)
+        # The workflow is bound to the approval decision it started from; an attestation
+        # from any other decision (older or newer) cannot authorize it.
+        if decision_sequence != attestation.decision_sequence:
+            return ChangeRequestIssueCreateDenial(reason_code=reason.DECISION_SUPERSEDED)
         if not self.writes_enabled:
             return ChangeRequestIssueCreateDenial(reason_code=reason.WRITES_DISABLED)
         if not re.fullmatch(r"[a-f0-9]{64}", approval_binding) or not hmac.compare_digest(

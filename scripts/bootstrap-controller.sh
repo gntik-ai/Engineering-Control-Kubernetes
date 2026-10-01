@@ -89,8 +89,9 @@ install -d -o engineering-control -g engineering-control -m 0700 \
 install -d -o root -g root -m 0700 "${STATE_ROOT}/github-policy-backups"
 # NEW-108: change-request approval requests (API/controller) and root attestations
 # (read by the GitHub worker through its engineering-control supplementary group).
-install -d -o engineering-control -g engineering-control -m 0700 \
-  "${STATE_ROOT}/change-request-approvals"
+# The request directory is root-owned and drop-only (sticky, group create, no listing);
+# the attestor opens it O_NOFOLLOW and requires exactly this ownership and mode.
+install -d -o root -g engineering-control -m 1730 "${STATE_ROOT}/change-request-approvals"
 install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy/change-requests"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/github"

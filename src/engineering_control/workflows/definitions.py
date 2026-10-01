@@ -3915,11 +3915,7 @@ class ChangeRequestPublishWorkflow(ControlledWorkflow):
             )
         # Only identity and the durable intent travel to the GitHub worker; what it may
         # publish comes from the root-attested durable approval.
-        payload = {
-            **asdict(request),
-            "publish_intent_at": intent.get("publish_intent_at"),
-            "prior_intent": intent.get("prior_intent") is True,
-        }
+        payload = {**asdict(request), "publish_intent_at": intent.get("publish_intent_at")}
         published: dict[str, Any] = {}
         for wait in range(self._attestation_waits + 1):
             try:

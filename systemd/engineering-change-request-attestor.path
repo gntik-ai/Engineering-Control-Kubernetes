@@ -2,7 +2,7 @@
 Description=Watch for operator change-request approval changes to attest
 
 [Path]
-DirectoryNotEmpty=/var/lib/engineering-control/change-request-approvals
+PathExistsGlob=/var/lib/engineering-control/change-request-approvals/*.json
 Unit=engineering-change-request-attestor.service
 
 [Install]

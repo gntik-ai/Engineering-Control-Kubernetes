@@ -43,8 +43,6 @@ def main() -> int:
     args = parse_args()
     request_owner = pwd.getpwnam("engineering-control").pw_uid
     group = grp.getgrnam("engineering-control").gr_gid
-    if args.attestations.is_symlink() or not args.attestations.is_dir():
-        raise ValueError("attestation root must be a real directory")
     repository = ChangeRequestRepository(Settings().database_url.get_secret_value())
     try:
         summary = repository.reconcile_attestations_sync(
@@ -52,7 +50,10 @@ def main() -> int:
             args.attestations,
             now=datetime.now(UTC),
             request_owner=request_owner,
-            attestation_group=group,
+            group=group,
+            # Both directories are opened O_NOFOLLOW and must be exactly root-owned:
+            # requests root:engineering-control 01730, attestations 0750.
+            strict=True,
         )
     finally:
         repository.engine.dispose()

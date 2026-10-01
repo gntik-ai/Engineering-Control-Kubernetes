@@ -439,14 +439,20 @@ class ChangeRequestActivityHandler:
         loaded = self.repository.load_approved_sync(
             change_request_id, str(payload.get("approval_binding", ""))
         )
-        if loaded["status"] == "APPROVED" and loaded["revision"] != payload.get("revision"):
-            return {**payload, "status": "BLOCKED", "blocker": "CHANGE_REQUEST_REVISION_CHANGED"}
+        if loaded["status"] == "APPROVED" and (
+            loaded["revision"] != payload.get("revision")
+            or loaded["decision_sequence"] != payload.get("decision_sequence")
+        ):
+            return {**payload, "status": "BLOCKED", "blocker": "CHANGE_REQUEST_DECISION_CHANGED"}
         return {**payload, **loaded}
 
     def _record_publish_intent(self, payload: dict[str, Any]) -> dict[str, Any]:
         change_request_id, revision = self._identity(payload)
+        sequence = payload.get("decision_sequence")
+        if not isinstance(sequence, int):
+            return {**self._slim(payload), "status": "BLOCKED", "blocker": "DECISION_UNBOUND"}
         recorded = self.repository.record_publish_intent_sync(
-            change_request_id, str(payload.get("approval_binding", "")), revision
+            change_request_id, str(payload.get("approval_binding", "")), revision, sequence
         )
         return {**self._slim(payload), **recorded}
 
@@ -504,7 +510,7 @@ class ChangeRequestActivityHandler:
 
     @staticmethod
     def _slim(payload: dict[str, Any]) -> dict[str, Any]:
-        keys = ("change_request_id", "revision", "project", "approval_binding")
+        keys = ("change_request_id", "revision", "decision_sequence", "project", "approval_binding")
         return {key: payload[key] for key in keys if key in payload}
 
 
@@ -607,6 +613,7 @@ class ChangeRequestGitHubHandler:
             workflow_id=str(context.get("workflow_id", "")),
             change_request_id=change_request_id,
             revision=payload.get("revision"),
+            decision_sequence=payload.get("decision_sequence"),
             approval_binding=str(payload.get("approval_binding", "")),
             attestation=attestation,
         )
@@ -618,18 +625,15 @@ class ChangeRequestGitHubHandler:
                 type="CHANGE_REQUEST_ATTESTATION_PENDING" if pending else "PolicyViolation",
                 non_retryable=True,
             )
+        # The earliest intent ever recorded durably for this request (any revision). Every
+        # attempt looks up conclusively first: no workflow, loop or attempt state can skip it.
         intent_at = self._intent(payload)
-        attempt = context.get("attempt")
-        needs_lookup = payload.get("prior_intent") is not False or (
-            isinstance(attempt, int) and attempt > 1
-        )
         self._ensure_root()
         try:
-            if needs_lookup:
-                login = self.broker.preflight((decision.repository,)).login
-                adopted = self._conclusive_lookup(decision, intent_at, login)
-                if adopted is not None:
-                    return self._published(decision, adopted, adopted=True, labels=())
+            login = self.broker.preflight((decision.repository,)).login
+            adopted = self._conclusive_lookup(decision, intent_at, login)
+            if adopted is not None:
+                return self._published(decision, adopted, adopted=True, labels=())
             labels = self._existing_labels(decision)
             url = self._create(decision, labels)
         except GhCliAuthError as error:
@@ -645,7 +649,7 @@ class ChangeRequestGitHubHandler:
                 non_retryable=True,
             ) from error
         except CommandFailure as error:
-            # Retryable: a retry is attempt > 1, so it first looks up conclusively.
+            # Retryable: every attempt first looks up conclusively.
             raise ApplicationError(
                 "GitHub issue publication failed", type="GITHUB_ISSUE_PUBLICATION_FAILED"
             ) from error
@@ -695,7 +699,12 @@ class ChangeRequestGitHubHandler:
                         adopted = found
                 if concluded:
                     return adopted
-        except (CommandFailure, GhCliPolicyError, ValueError, TypeError) as error:
+        except CommandFailure as error:
+            # Retryable; once retries are exhausted the run fails as outcome unknown.
+            raise ApplicationError(
+                "change request publication lookup failed", type="PUBLISH_OUTCOME_UNKNOWN"
+            ) from error
+        except (GhCliPolicyError, ValueError, TypeError) as error:
             raise ApplicationError(
                 "change request publication outcome cannot be determined",
                 type="PUBLISH_OUTCOME_UNKNOWN",

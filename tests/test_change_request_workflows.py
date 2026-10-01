@@ -374,7 +374,10 @@ async def test_publish_workflow_records_intent_then_publishes_and_records_the_is
     result, _ = await run_workflow(
         ChangeRequestPublishWorkflow,
         ChangeRequestPublishInput(
-            change_request_id=str(change_request_id), approval_binding=binding, revision=1
+            change_request_id=str(change_request_id),
+            approval_binding=binding,
+            revision=1,
+            decision_sequence=1,
         ),
         scripted_activity(handler, {"change_request.publish": [publish]}, calls),
         change_request_publish_workflow_id(str(change_request_id), 1),
@@ -388,7 +391,7 @@ async def test_publish_workflow_records_intent_then_publishes_and_records_the_is
         "change_request.persist_publication",
     ]
     # Only identity and the durable intent reach the GitHub worker -- no content.
-    assert payloads[0]["prior_intent"] is False and payloads[0]["publish_intent_at"]
+    assert payloads[0]["publish_intent_at"] and payloads[0]["decision_sequence"] == 1
     assert payloads[0]["orchestration"]["workflow_type"] == "ChangeRequestPublishWorkflow"
     assert not {"publication", "issue_body", "issue_title", "proposal"} & set(payloads[0])
     view = repository.get_sync(change_request_id)
@@ -431,7 +434,7 @@ async def test_a_failed_publish_fails_the_run_so_a_reapproval_can_retry(
             service = TemporalControlService(
                 env.client, CONTROL_TASK_QUEUE, EmptyMetadataRepository()
             )
-            first = await service.start_change_request_publish(change_request_id, 1, binding)
+            first = await service.start_change_request_publish(change_request_id, 1, binding, 1)
             with pytest.raises(WorkflowFailureError):
                 await env.client.get_workflow_handle(first.workflow_id).result()
             failed = repository.get_sync(change_request_id)
@@ -444,11 +447,12 @@ async def test_a_failed_publish_fails_the_run_so_a_reapproval_can_retry(
                 change_request_id, binding, approval_phrase("falcone", binding), "telegram:42"
             )
             assert replay["replayed"] is True
-            second = await service.start_change_request_publish(change_request_id, 1, binding)
+            second = await service.start_change_request_publish(change_request_id, 1, binding, 1)
             assert second.workflow_id == first.workflow_id and second.run_id != first.run_id
             result = await env.client.get_workflow_handle(second.workflow_id).result()
     assert result["status"] == "PUBLISHED"
-    assert [payload["prior_intent"] for payload in payloads] == [False, True]
+    # Both runs carry the same durable (earliest) intent, so both look up first.
+    assert payloads[0]["publish_intent_at"] == payloads[1]["publish_intent_at"]
     view = repository.get_sync(change_request_id)
     assert view is not None and view["status"] == "PUBLISHED" and view["error_code"] is None
 

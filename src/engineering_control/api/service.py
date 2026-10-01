@@ -117,7 +117,11 @@ class ControlService(Protocol):
         self, change_request_id: UUID, revision: int
     ) -> OperationAccepted: ...
     async def start_change_request_publish(
-        self, change_request_id: UUID, revision: int, approval_binding: str
+        self,
+        change_request_id: UUID,
+        revision: int,
+        approval_binding: str,
+        decision_sequence: int,
     ) -> OperationAccepted: ...
 
 
@@ -581,7 +585,11 @@ class TemporalControlService:
         )
 
     async def start_change_request_publish(
-        self, change_request_id: UUID, revision: int, approval_binding: str
+        self,
+        change_request_id: UUID,
+        revision: int,
+        approval_binding: str,
+        decision_sequence: int,
     ) -> OperationAccepted:
         """NEW-108: one deterministic publish workflow per approved revision."""
         return await self._start_once(
@@ -590,6 +598,7 @@ class TemporalControlService:
                 change_request_id=str(change_request_id),
                 approval_binding=approval_binding,
                 revision=revision,
+                decision_sequence=decision_sequence,
             ),
             change_request_publish_workflow_id(str(change_request_id), revision),
         )

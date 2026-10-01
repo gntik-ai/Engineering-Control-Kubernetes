@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -141,7 +142,7 @@ def service() -> Mock:
         )
     )
     fake.start_change_request_publish = AsyncMock(
-        side_effect=lambda change_request_id, revision, binding: OperationAccepted(
+        side_effect=lambda change_request_id, revision, binding, sequence: OperationAccepted(
             workflow_id=change_request_publish_workflow_id(str(change_request_id), revision),
             run_id="run",
         )
@@ -483,6 +484,7 @@ def test_approve_rejects_wrong_phrase_binding_actor_and_status_then_publishes(
         UUID(value["id"]),
         1,
         binding,
+        1,
     )
     assert shown["status"] == "APPROVED"
     assert shown["confirmation_phrase"] is None
@@ -681,6 +683,7 @@ def evaluate(
     *,
     change_request_id: str | None = None,
     revision: object = 1,
+    decision_sequence: object = 1,
     step: str = "change_request.publish",
     operation: str = "create_issue",
     workflow_type: str = "ChangeRequestPublishWorkflow",
@@ -695,6 +698,7 @@ def evaluate(
         workflow_id=workflow_id or change_request_publish_workflow_id(identifier, 1),
         change_request_id=identifier,
         revision=revision,
+        decision_sequence=decision_sequence,
         approval_binding=binding,
         attestation=attestation,
     )
@@ -713,15 +717,20 @@ def test_root_attestation_exists_only_for_a_reverified_approved_unpublished_row(
     change_request_id, binding = approve(repository)
     # A request for a row that does not exist and a forged request file are both inert.
     assert repository.attestation_request_root is not None
-    request_attestation(repository.attestation_request_root, uuid4(), now=datetime.now(UTC))
     request_attestation(
-        repository.attestation_request_root, UUID(candidate_only["id"]), now=datetime.now(UTC)
+        repository.attestation_request_root, uuid4(), decision_sequence=0, now=datetime.now(UTC)
+    )
+    request_attestation(
+        repository.attestation_request_root,
+        UUID(candidate_only["id"]),
+        decision_sequence=0,
+        now=datetime.now(UTC),
     )
     (repository.attestation_request_root / "forged.json").write_text("{}", encoding="utf-8")
     summary = reconcile(repository, tmp_path)
     assert summary["attested"] == [str(change_request_id)]
-    assert summary["rejected_requests"] == ["forged.json"]
-    assert list(repository.attestation_request_root.iterdir()) == []
+    assert len(summary["quarantined"]) == 1  # never unlinked, moved aside for the operator
+    assert [path.name for path in repository.attestation_request_root.iterdir()] == [".quarantine"]
     attestation = attestation_for(tmp_path, change_request_id)
     assert attestation is not None
     assert attestation.approval_binding == binding
@@ -841,6 +850,7 @@ def test_load_approved_detects_tampered_stored_content(
     assert repository.load_approved_sync(change_request_id, binding) == {
         "status": "APPROVED",
         "revision": 1,
+        "decision_sequence": 1,
     }
     assert repository.load_approved_sync(change_request_id, "d" * 64)["status"] == "BLOCKED"
     with repository.sessions.begin() as session:
@@ -862,7 +872,7 @@ def test_unpublished_approved_requests_can_be_revised_or_rejected_and_lose_attes
         attestation_for(tmp_path, item) is not None
         for item in (revised_id, rejected_id, published_id)
     )
-    intent = repository.record_publish_intent_sync(revised_id, "f" * 64, 1)
+    intent = repository.record_publish_intent_sync(revised_id, "f" * 64, 1, 1)
     assert intent["status"] == "BLOCKED"
     revised = repository.revise_sync(revised_id, "Admins only, please.", "telegram:42")
     assert revised["status"] == "DRAFTING" and revised["revision"] == 2
@@ -887,12 +897,15 @@ def test_publish_intent_is_recorded_once_before_any_create(
     repository: ChangeRequestRepository,
 ) -> None:
     change_request_id, binding = approve(repository)
-    first = repository.record_publish_intent_sync(change_request_id, binding, 1)
-    second = repository.record_publish_intent_sync(change_request_id, binding, 1)
+    first = repository.record_publish_intent_sync(change_request_id, binding, 1, 1)
+    second = repository.record_publish_intent_sync(change_request_id, binding, 1, 1)
     assert first["status"] == second["status"] == "INTENT_RECORDED"
-    assert first["prior_intent"] is False and second["prior_intent"] is True
     assert first["publish_intent_at"] == second["publish_intent_at"]
-    assert repository.record_publish_intent_sync(change_request_id, binding, 2)["status"] == (
+    assert repository.record_publish_intent_sync(change_request_id, binding, 2, 1)["status"] == (
+        "BLOCKED"
+    )
+    # A workflow bound to an older decision cannot record (or reach) a publication.
+    assert repository.record_publish_intent_sync(change_request_id, binding, 1, 0)["status"] == (
         "BLOCKED"
     )
 
@@ -985,7 +998,8 @@ def publish_payload(
     change_request_id: UUID,
     binding: str,
     *,
-    prior_intent: bool = False,
+    decision_sequence: int = 1,
+    revision: int = 1,
     attempt: int = 1,
     workflow_type: str = "ChangeRequestPublishWorkflow",
     intent_at: datetime | None = None,
@@ -993,12 +1007,12 @@ def publish_payload(
 ) -> dict[str, Any]:
     return {
         "change_request_id": str(change_request_id),
-        "revision": 1,
+        "revision": revision,
         "approval_binding": binding,
         "publish_intent_at": (intent_at or datetime.now(UTC)).isoformat(),
-        "prior_intent": prior_intent,
+        "decision_sequence": decision_sequence,
         "orchestration": {
-            "workflow_id": change_request_publish_workflow_id(str(change_request_id), 1),
+            "workflow_id": change_request_publish_workflow_id(str(change_request_id), revision),
             "workflow_type": workflow_type,
             "attempt": attempt,
         },
@@ -1054,7 +1068,8 @@ async def test_publish_applies_only_existing_labels_and_never_creates_one(
     assert kwargs["labels"] == ("hermes:change-request",)
     assert kwargs["change_binding"] == f"change-request:{change_request_id}"
     assert not kwargs["body_file"].exists()  # the bounded body file is removed afterwards
-    broker.list_issues_page.assert_not_called()  # first attempt with no prior intent
+    # Even the first attempt looks up conclusively (one short page concludes it).
+    assert broker.list_issues_page.call_count == 1
     assert {call[0] for call in broker.method_calls} <= _ALLOWED_BROKER_CALLS
     # The broker has no label-creating (or other label-mutating) operation at all.
     assert [name for name in dir(GhCliBroker) if "label" in name] == ["list_labels"]
@@ -1130,7 +1145,7 @@ async def test_a_retry_after_a_lost_response_adopts_the_exact_issue_without_crea
     ours = issue_item(attestation, number=41, created_at=intent_at + timedelta(minutes=1))
     older = issue_item(attestation, number=7, created_at=intent_at - timedelta(hours=2))
     pages = {1: newer, 2: [ours, {"pull_request": {}, **newer[0]}, older]}
-    for prior_intent, attempt in ((True, 1), (False, 2)):
+    for attempt in (1, 2):
         broker = fake_broker()
         broker.list_issues_page.side_effect = lambda repository, page, per_page: pages[page]
         result = await github_handler(tmp_path, broker).handle(
@@ -1138,7 +1153,6 @@ async def test_a_retry_after_a_lost_response_adopts_the_exact_issue_without_crea
             publish_payload(
                 change_request_id,
                 binding,
-                prior_intent=prior_intent,
                 attempt=attempt,
                 intent_at=intent_at,
             ),
@@ -1165,7 +1179,7 @@ async def test_a_conclusive_lookup_that_finds_nothing_creates_once(
     ]
     result = await github_handler(tmp_path, broker).handle(
         "change_request.publish",
-        publish_payload(change_request_id, binding, prior_intent=True, intent_at=intent_at),
+        publish_payload(change_request_id, binding, intent_at=intent_at),
     )
     assert result["adopted"] is False
     broker.create_issue.assert_called_once()
@@ -1199,7 +1213,7 @@ async def test_adoption_refuses_anything_but_the_exact_publication(
     with pytest.raises(ApplicationError) as conflict:
         await github_handler(tmp_path, broker).handle(
             "change_request.publish",
-            publish_payload(change_request_id, binding, prior_intent=True),
+            publish_payload(change_request_id, binding),
         )
     assert conflict.value.type == "CHANGE_REQUEST_PUBLICATION_CONFLICT"
     assert conflict.value.non_retryable
@@ -1228,10 +1242,11 @@ async def test_an_inconclusive_lookup_fails_closed_without_creating(
         with pytest.raises(ApplicationError) as unknown:
             await github_handler(tmp_path, broker).handle(
                 "change_request.publish",
-                publish_payload(change_request_id, binding, prior_intent=True),
+                publish_payload(change_request_id, binding),
             )
         assert unknown.value.type == "PUBLISH_OUTCOME_UNKNOWN"
-        assert unknown.value.non_retryable
+        # A failed page is retried (each retry looks up again); the page cap is final.
+        assert unknown.value.non_retryable is (broker is endless)
         broker.create_issue.assert_not_called()
     assert endless.list_issues_page.call_count == 20
 
@@ -1542,7 +1557,7 @@ async def test_temporal_service_starts_each_revision_once_and_joins_duplicates()
     change_request_id = uuid4()
     first = await service.start_change_request(change_request_id, 1)
     duplicate = await service.start_change_request(change_request_id, 1)
-    publish = await service.start_change_request_publish(change_request_id, 1, "a" * 64)
+    publish = await service.start_change_request_publish(change_request_id, 1, "a" * 64, 1)
     assert first == duplicate
     assert first.workflow_id == f"change-request-{change_request_id}-r1"
     assert publish.workflow_id == f"change-request-publish-{change_request_id}-r1"
@@ -1579,13 +1594,322 @@ def test_root_attestor_is_root_only_and_wired_like_the_backlog_policy_reconciler
         "ReadWritePaths=/etc/engineering-control/policy/change-requests "
         "/var/lib/engineering-control/change-request-approvals"
     ) in service
-    assert "DirectoryNotEmpty=/var/lib/engineering-control/change-request-approvals" in path_unit
+    assert "PathExistsGlob=/var/lib/engineering-control/change-request-approvals/*.json" in (
+        path_unit
+    )
     # The GitHub worker reads attestations but still has no database credential.
     assert "-/etc/engineering-control/policy/change-requests" in worker
-    assert "control.env" not in worker
+    assert "EnvironmentFile=/etc/engineering-control/env/control.env" not in worker
     assert (
         'install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy/change-requests"'
         in bootstrap
     )
     for unit in ("service", "path", "timer"):
         assert bootstrap.count(f"engineering-change-request-attestor.{unit}") >= 2
+
+
+# Round-2 review: hardened attestor, decision ordering, durable intent ---------------------
+
+
+def test_the_attestor_never_follows_a_symlinked_request_or_attestation_directory(
+    repository: ChangeRequestRepository, tmp_path: Path
+) -> None:
+    victims = tmp_path / "systemd-wants"
+    victims.mkdir()
+    (victims / "engineering-api.service").write_text("[Unit]\n", encoding="utf-8")
+    link = tmp_path / "redirected-requests"
+    link.symlink_to(victims, target_is_directory=True)
+    attestations = tmp_path / "attestations"
+    attestations.mkdir(mode=0o750)
+    with pytest.raises(OSError):
+        repository.reconcile_attestations_sync(link, attestations, now=datetime.now(UTC))
+    assert (victims / "engineering-api.service").exists()
+    redirected_attestations = tmp_path / "redirected-attestations"
+    redirected_attestations.symlink_to(victims, target_is_directory=True)
+    assert repository.attestation_request_root is not None
+    with pytest.raises(OSError):
+        repository.reconcile_attestations_sync(
+            repository.attestation_request_root,
+            redirected_attestations,
+            now=datetime.now(UTC),
+        )
+    # Strict (production) mode refuses any request directory that is not the exact
+    # root-owned drop directory, e.g. one the writer swapped in.
+    with pytest.raises(PermissionError):
+        repository.reconcile_attestations_sync(
+            repository.attestation_request_root,
+            attestations,
+            now=datetime.now(UTC),
+            strict=True,
+            group=os.getegid(),
+        )
+
+
+def test_unexpected_request_entries_are_quarantined_never_followed_or_unlinked(
+    repository: ChangeRequestRepository, tmp_path: Path
+) -> None:
+    assert repository.attestation_request_root is not None
+    requests = repository.attestation_request_root
+    outside = tmp_path / "precious.service"
+    outside.write_text("keep me", encoding="utf-8")
+    linked = requests / f"{uuid4()}.json"
+    linked.symlink_to(outside)
+    directory = requests / f"{uuid4()}.json"
+    directory.mkdir()
+    (requests / "notes.txt").write_text("hello", encoding="utf-8")
+    summary = reconcile(repository, tmp_path)
+    assert len(summary["quarantined"]) == 3
+    assert outside.read_text(encoding="utf-8") == "keep me"
+    assert [path.name for path in requests.iterdir()] == [".quarantine"]
+    quarantined = list((requests / ".quarantine").iterdir())
+    assert len(quarantined) == 3
+    assert any(path.is_symlink() for path in quarantined)  # moved aside, not followed
+    assert any(path.is_dir() and not path.is_symlink() for path in quarantined)
+
+
+def test_a_decision_committed_during_attestation_is_never_lost(
+    repository: ChangeRequestRepository, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    change_request_id, _ = approve(repository)
+    original = repository.attestation_sync
+    calls: list[UUID] = []
+
+    def interleaved(identifier: UUID, *, now: datetime) -> ChangeRequestAttestation | None:
+        result = original(identifier, now=now)
+        calls.append(identifier)
+        if len(calls) == 1:
+            # The operator rejects after the attestor read APPROVED, before it writes.
+            repository.reject_sync(change_request_id, "Changed my mind.", "telegram:42")
+        return result
+
+    monkeypatch.setattr(repository, "attestation_sync", interleaved)
+    summary = reconcile(repository, tmp_path)
+    assert summary["revoked"] == [str(change_request_id)]
+    assert summary["attested"] == []
+    assert attestation_for(tmp_path, change_request_id) is None
+    # The newer revocation request was not consumed with the stale one.
+    assert summary["retained_requests"] == [f"{change_request_id}.json"]
+    monkeypatch.setattr(repository, "attestation_sync", original)
+    again = reconcile(repository, tmp_path)
+    assert again["retained_requests"] == [] and again["attested"] == []
+    assert repository.attestation_request_root is not None
+    assert not (repository.attestation_request_root / f"{change_request_id}.json").exists()
+
+
+def test_attestations_and_workflows_are_bound_to_one_decision(
+    repository: ChangeRequestRepository, tmp_path: Path
+) -> None:
+    change_request_id, binding = approve(repository)
+    reconcile(repository, tmp_path)
+    attestation = attestation_for(tmp_path, change_request_id)
+    assert attestation is not None and attestation.decision_sequence == 1
+    Reason = ChangeRequestIssueCreateDenialReason
+    for sequence in (0, 2, None):
+        denied = evaluate(attestation, binding, decision_sequence=sequence)
+        assert reason(denied) is Reason.DECISION_SUPERSEDED
+    # A consistent rewrite of the row (content, binding and rendering) without the
+    # approval-time decision record is not attested.
+    with repository.sessions.begin() as session:
+        row = session.get(ChangeRequest, change_request_id)
+        assert row is not None
+        row.proposal_json = {**row.proposal_json, "what_changes": ["Something never approved."]}
+        rerendered = ChangeRequestRepository.rendered(row)
+        row.fingerprint = rerendered.fingerprint
+        row.issue_title = rerendered.title
+        row.issue_body = rerendered.body
+        row.approval_binding_sha256 = rerendered.approval_binding
+    assert repository.attestation_sync(change_request_id, now=datetime.now(UTC)) is None
+    assert str(change_request_id) in reconcile(repository, tmp_path)["revoked"]
+
+
+async def test_an_unresolved_publication_survives_revision_and_blocks_a_second_issue(
+    repository: ChangeRequestRepository, tmp_path: Path
+) -> None:
+    change_request_id, binding = approve(repository)
+    reconcile(repository, tmp_path)
+    first_revision = attestation_for(tmp_path, change_request_id)
+    assert first_revision is not None
+    intent = repository.record_publish_intent_sync(change_request_id, binding, 1, 1)
+    repository.record_publish_failure_sync(change_request_id, binding, "PUBLISH_OUTCOME_UNKNOWN")
+    with pytest.raises(ValueError, match="reconciled first"):
+        repository.revise_sync(change_request_id, "Admins only.", "cli:engineering-ctl")
+    with pytest.raises(ValueError, match="reconciled first"):
+        repository.reject_sync(change_request_id, "Not needed.", "cli:engineering-ctl")
+    with pytest.raises(ValueError, match="not found"):
+        repository.reconcile_publication_sync(
+            uuid4(), None, "Checked GitHub.", "cli:engineering-ctl"
+        )
+    other_id, _ = approve(repository)
+    with pytest.raises(ValueError, match="only an unresolved publication"):
+        repository.reconcile_publication_sync(
+            other_id, None, "Nothing to reconcile.", "cli:engineering-ctl"
+        )
+    reconciled = repository.reconcile_publication_sync(
+        change_request_id, None, "Checked GitHub: nothing visible yet.", "cli:engineering-ctl"
+    )
+    assert reconciled["error_code"] is None and reconciled["status"] == "APPROVED"
+    revised = repository.revise_sync(change_request_id, "Admins only.", "cli:engineering-ctl")
+    assert revised["publish_attempted_at"] == intent["publish_intent_at"]
+    repository.persist_candidate_sync(
+        change_request_id,
+        2,
+        ChangeProposal.model_validate({**PROPOSAL, "title": "Admin-only CSV export"}),
+        approved_review(),
+        {"status": "CLEAR", "matches": []},
+    )
+    view = repository.get_sync(change_request_id)
+    assert view is not None
+    second_binding = view["approval_binding"]
+    approved = repository.approve_sync(
+        change_request_id,
+        second_binding,
+        approval_phrase("falcone", second_binding),
+        "cli:engineering-ctl",
+    )
+    sequence = approved["decision_sequence"]
+    second_intent = repository.record_publish_intent_sync(
+        change_request_id, second_binding, 2, sequence
+    )
+    # The intent of revision 1 survives, so revision 2 looks back past it.
+    assert second_intent["publish_intent_at"] == intent["publish_intent_at"]
+    reconcile(repository, tmp_path)
+    broker = fake_broker()
+    # Revision 1 did reach GitHub after all.
+    broker.list_issues_page.return_value = [issue_item(first_revision, number=12)]
+    with pytest.raises(ApplicationError) as conflict:
+        await github_handler(tmp_path, broker).handle(
+            "change_request.publish",
+            publish_payload(
+                change_request_id,
+                second_binding,
+                revision=2,
+                decision_sequence=sequence,
+                intent_at=datetime.fromisoformat(str(second_intent["publish_intent_at"])),
+            ),
+        )
+    assert conflict.value.type == "CHANGE_REQUEST_PUBLICATION_CONFLICT"
+    broker.create_issue.assert_not_called()
+
+
+def test_reconciling_with_the_found_issue_marks_it_published(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id, binding = approve(repository)
+    repository.record_publish_failure_sync(change_request_id, binding, "PUBLISH_CONFLICT")
+    with pytest.raises(ValueError, match="outside the approved repository"):
+        repository.reconcile_publication_sync(
+            change_request_id,
+            "https://github.com/gntik-ai/musematic/issues/5",
+            "Found it.",
+            "cli:engineering-ctl",
+        )
+    published = repository.reconcile_publication_sync(
+        change_request_id,
+        "https://github.com/gntik-ai/falcone/issues/5",
+        "Found it on GitHub.",
+        "telegram:42",
+    )
+    assert published["status"] == "PUBLISHED" and published["issue_number"] == 5
+    with pytest.raises(ValueError, match="revised"):
+        repository.revise_sync(change_request_id, "Too late.", "cli:engineering-ctl")
+
+
+async def test_a_lost_create_response_is_adopted_even_after_an_attempt_reset(
+    repository: ChangeRequestRepository, tmp_path: Path
+) -> None:
+    change_request_id, binding = approve(repository)
+    reconcile(repository, tmp_path)
+    attestation = attestation_for(tmp_path, change_request_id)
+    assert attestation is not None
+    issues: list[dict[str, Any]] = []
+    broker = fake_broker()
+    broker.list_issues_page.side_effect = lambda repository, page, per_page: list(issues)
+
+    def create_then_lose_response(**_: Any) -> str:
+        issues.append(issue_item(attestation, number=41))
+        raise CommandFailure("connection reset after the issue was created")
+
+    broker.create_issue.side_effect = create_then_lose_response
+    handler = github_handler(tmp_path, broker)
+    intent_at = datetime.now(UTC)
+    with pytest.raises(ApplicationError) as lost:
+        await handler.handle(
+            "change_request.publish",
+            publish_payload(change_request_id, binding, attempt=1, intent_at=intent_at),
+        )
+    assert lost.value.type == "GITHUB_ISSUE_PUBLICATION_FAILED"
+    # A brand-new activity (attempt 1 again, e.g. after an attestation wait) must not
+    # create a second issue: it looks up from the durable intent and adopts.
+    result = await handler.handle(
+        "change_request.publish",
+        publish_payload(change_request_id, binding, attempt=1, intent_at=intent_at),
+    )
+    assert result["adopted"] is True and result["issue_number"] == 41
+    assert broker.create_issue.call_count == 1
+    assert broker.list_issues_page.call_count == 2
+
+
+def test_cli_reconcile_states_exactly_one_resolution() -> None:
+    from engineering_control.cli import dispatch, parser
+
+    identifier = "11111111-1111-4111-8111-111111111111"
+    found = dispatch(
+        RecordingClient(),  # type: ignore[arg-type]
+        parser().parse_args(
+            [
+                "change-reconcile",
+                identifier,
+                "--issue-url",
+                "https://github.com/gntik-ai/falcone/issues/5",
+                "--reason",
+                "Found it",
+            ]
+        ),
+    )
+    assert found == {
+        "method": "POST",
+        "path": f"/v1/change-requests/{identifier}/reconcile-publication",
+        "payload": {
+            "reason": "Found it",
+            "issue_url": "https://github.com/gntik-ai/falcone/issues/5",
+        },
+    }
+    none = dispatch(
+        RecordingClient(),  # type: ignore[arg-type]
+        parser().parse_args(["change-reconcile", identifier, "--no-issue", "--reason", "None"]),
+    )
+    assert none["payload"] == {"reason": "None", "no_issue": True}
+    with pytest.raises(SystemExit):
+        parser().parse_args(["change-reconcile", identifier, "--reason", "x"])
+
+
+def test_reconcile_publication_api_requires_an_operator_and_one_resolution(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id, binding = approve(repository)
+    repository.record_publish_failure_sync(change_request_id, binding, "PUBLISH_OUTCOME_UNKNOWN")
+    path = f"/v1/change-requests/{change_request_id}/reconcile-publication"
+    with client_for(repository, service()) as client:
+        forged = client.post(
+            path,
+            headers={**CLI, "X-Engineering-Actor": "engineering-ctl:root"},
+            json={"no_issue": True, "reason": "Checked."},
+        )
+        both = client.post(
+            path,
+            headers=CLI,
+            json={
+                "no_issue": True,
+                "issue_url": "https://github.com/gntik-ai/falcone/issues/5",
+                "reason": "Checked.",
+            },
+        )
+        neither = client.post(path, headers=CLI, json={"reason": "Checked."})
+        resolved = client.post(
+            path, headers=TELEGRAM, json={"no_issue": True, "reason": "Checked GitHub."}
+        )
+        again = client.post(path, headers=CLI, json={"no_issue": True, "reason": "Again."})
+    assert forged.status_code == 403
+    assert both.status_code == 422 and neither.status_code == 422
+    assert resolved.status_code == 200 and resolved.json()["error_code"] is None
+    assert again.status_code == 409

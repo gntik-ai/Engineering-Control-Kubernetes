@@ -160,7 +160,24 @@ the kind) are applied only if they already exist and are never created.
 
 A failed publication fails the workflow run and leaves the request `APPROVED` with an
 `error_code`. Repeating the same `change-approve` command starts a fresh run. An `APPROVED` request
-that is not yet published can still be revised or rejected, which revokes its attestation.
+that is not yet published can still be revised or rejected, which revokes its attestation. The
+exceptions are `PUBLISH_OUTCOME_UNKNOWN` and `PUBLISH_CONFLICT`: check GitHub first, then run
+`engineering-ctl change-reconcile <id> (--issue-url URL | --no-issue) --reason TEXT`.
+
+The intent timestamp survives revisions, so every publication of a request (any revision) looks
+up issues conclusively first. An issue from another revision is a conflict, never a second issue.
+Attestations and publish runs are bound to the approval's decision sequence. Any later decision
+supersedes them.
+
+The request directory is `root:engineering-control 01730`, a drop-only directory. The attestor
+opens both directories `O_NOFOLLOW` and requires their exact ownership and mode. It handles every
+entry relative to the directory descriptor. Anything unexpected is moved to `.quarantine` for the
+operator, never followed or unlinked. A request is consumed only if it is unchanged since it was
+read. Every attestation is re-checked against the row after it is written. The attestor also
+refuses a row whose content no longer matches the decision record written at approval. The GitHub
+worker keeps the `engineering-control` group for the write policy, the attestations and its own
+evidence token, but `control.env` and every other database or identity credential are
+`InaccessiblePaths`.
 
 Backlog import reads a `Change request:` issue's `kind:` line. A `feature`, `bug` or `chore`
 request is classified like the same hand-written issue without that metadata, so it is eligible

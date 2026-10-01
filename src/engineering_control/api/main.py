@@ -25,6 +25,7 @@ from engineering_control.api.schemas import (
     ChangeRequestAccepted,
     ChangeRequestApproval,
     ChangeRequestCreate,
+    ChangeRequestPublicationReconciliation,
     ChangeRequestRejection,
     ChangeRequestRevision,
     DeliveryReconcile,
@@ -1042,7 +1043,10 @@ def create_app(
             ) from error
         try:
             accepted = await service.start_change_request_publish(
-                change_request_id, int(approved["revision"]), body.approval_binding
+                change_request_id,
+                int(approved["revision"]),
+                body.approval_binding,
+                int(approved["decision_sequence"]),
             )
         except Exception as error:  # noqa: BLE001 - the APPROVED row can be re-approved
             raise HTTPException(
@@ -1107,6 +1111,27 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
         except OSError as error:
             # The decision is durable; repeating the same command re-requests attestation.
+            raise HTTPException(
+                status_code=503, detail="change request attestation request failed"
+            ) from error
+
+    @app.post("/v1/change-requests/{change_request_id}/reconcile-publication")
+    async def change_request_reconcile_publication(
+        change_request_id: UUID,
+        body: ChangeRequestPublicationReconciliation,
+        subject: str = auth_dependency,
+        repository: ChangeRequestRepository = change_requests_dependency,
+    ) -> dict[str, Any]:
+        actor = approval_actor(subject)
+        try:
+            return await repository.reconcile_publication(
+                change_request_id, body.issue_url, body.reason, actor
+            )
+        except ChangeRequestNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except OSError as error:
             raise HTTPException(
                 status_code=503, detail="change request attestation request failed"
             ) from error
