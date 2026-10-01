@@ -422,6 +422,8 @@ class MetadataActivityHandler:
         "observability.invoke_claude": "checker_request",
         "observability.invoke_claude_maker": "maker_request",
         "observability.invoke_codex_checker": "checker_request",
+        "change_request.draft": "draft_request",
+        "change_request.review": "review_request",
     }
 
     supported_steps = frozenset(
@@ -1330,6 +1332,8 @@ class MetadataActivityHandler:
             return "runtime-verification"
         if provider_step.startswith("observability."):
             return "synthetic-observability"
+        if provider_step.startswith("change_request."):
+            return "change-request"
         raise ValueError("provider telemetry step has no bounded run type")
 
     @staticmethod

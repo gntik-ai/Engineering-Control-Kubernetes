@@ -199,6 +199,18 @@ class EnhancementSolutionLoopInput:
 
 
 @dataclass
+class ChangeRequestInput:
+    change_request_id: str
+    revision: int
+
+
+@dataclass
+class ChangeRequestPublishInput:
+    change_request_id: str
+    approval_binding: str
+
+
+@dataclass
 class LLMWikiStagingBootstrapInput:
     project: str = "llmwiki"
     environment: str = "staging"

@@ -33,6 +33,7 @@ def test_metadata_contains_required_tables() -> None:
         "github_backlog_campaigns",
         "backlog_issue_records",
         "operation_exports",
+        "change_requests",
     }
     assert required.issubset(Base.metadata.tables)
     quota_columns = Base.metadata.tables["quota_snapshots"].columns
@@ -43,7 +44,7 @@ def test_metadata_contains_required_tables() -> None:
 
 def test_all_workflows_expose_control_signals() -> None:
     expected_signals = {"pause", "resume", "cancel", "approval", "skip", "retry"}
-    assert len(ALL_WORKFLOWS) == 25
+    assert len(ALL_WORKFLOWS) == 27
     for workflow_class in ALL_WORKFLOWS:
         definition = _Definition.must_from_class(workflow_class)
         assert expected_signals.issubset(definition.signals)

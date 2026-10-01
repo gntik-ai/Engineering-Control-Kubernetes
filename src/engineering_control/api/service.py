@@ -5,6 +5,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from temporalio.client import Client
+from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from engineering_control.api.schemas import (
@@ -31,6 +32,10 @@ from engineering_control.api.schemas import (
     RuntimeVerificationStart,
 )
 from engineering_control.db.repository import MetadataRepository
+from engineering_control.engineering.change_requests import (
+    change_request_publish_workflow_id,
+    change_request_workflow_id,
+)
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.models.enums import Project
 from engineering_control.policy.approvals import ApprovalService
@@ -38,6 +43,8 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
+    ChangeRequestInput,
+    ChangeRequestPublishInput,
     DeliveryReconciliationInput,
     EnhancementDiscoveryInput,
     EnhancementSolutionLoopInput,
@@ -105,6 +112,12 @@ class ControlService(Protocol):
     ) -> OperationAccepted: ...
     async def start_llmwiki_bootstrap(
         self, request: LLMWikiBootstrapExecuteRequest
+    ) -> OperationAccepted: ...
+    async def start_change_request(
+        self, change_request_id: UUID, revision: int
+    ) -> OperationAccepted: ...
+    async def start_change_request_publish(
+        self, change_request_id: UUID, revision: int, approval_binding: str
     ) -> OperationAccepted: ...
 
 
@@ -556,3 +569,43 @@ class TemporalControlService:
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
+
+    async def start_change_request(
+        self, change_request_id: UUID, revision: int
+    ) -> OperationAccepted:
+        """NEW-108: one deterministic draft workflow per change request revision."""
+        return await self._start_once(
+            WorkflowName.CHANGE_REQUEST.value,
+            ChangeRequestInput(change_request_id=str(change_request_id), revision=revision),
+            change_request_workflow_id(str(change_request_id), revision),
+        )
+
+    async def start_change_request_publish(
+        self, change_request_id: UUID, revision: int, approval_binding: str
+    ) -> OperationAccepted:
+        """NEW-108: one deterministic publish workflow per approved revision."""
+        return await self._start_once(
+            WorkflowName.CHANGE_REQUEST_PUBLISH.value,
+            ChangeRequestPublishInput(
+                change_request_id=str(change_request_id), approval_binding=approval_binding
+            ),
+            change_request_publish_workflow_id(str(change_request_id), revision),
+        )
+
+    async def _start_once(
+        self, workflow: str, argument: Any, workflow_id: str
+    ) -> OperationAccepted:
+        # A duplicate request joins the existing execution; only a failed one may rerun.
+        try:
+            handle = await self.client.start_workflow(
+                workflow,
+                argument,
+                id=workflow_id,
+                task_queue=self.task_queue,
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+            )
+            run_id = handle.first_execution_run_id or ""
+        except WorkflowAlreadyStartedError:
+            description = await self.client.get_workflow_handle(workflow_id).describe()
+            run_id = description.run_id
+        return OperationAccepted(workflow_id=workflow_id, run_id=run_id)

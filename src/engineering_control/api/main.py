@@ -22,6 +22,11 @@ from engineering_control.api.schemas import (
     BacklogIssueAction,
     BacklogOwnershipReleaseRequest,
     CampaignStart,
+    ChangeRequestAccepted,
+    ChangeRequestApproval,
+    ChangeRequestCreate,
+    ChangeRequestRejection,
+    ChangeRequestRevision,
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
@@ -46,12 +51,17 @@ from engineering_control.api.schemas import (
 )
 from engineering_control.api.service import ControlService, TemporalControlService
 from engineering_control.config import Settings, get_settings
+from engineering_control.db.change_requests import (
+    ChangeRequestNotFoundError,
+    ChangeRequestRepository,
+)
 from engineering_control.db.repository import (
     EmptyMetadataRepository,
     MetadataRepository,
     SQLMetadataRepository,
 )
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
+from engineering_control.engineering.change_requests import prepare_intake
 from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project, RiskClass
 from engineering_control.observability.agent import (
@@ -73,6 +83,7 @@ def create_app(
     gateway_repository: AgentObservabilityRepository | None = None,
     operations_repository: OperationsRepository | None = None,
     command_bus: TypedCommandBus | None = None,
+    change_request_repository: ChangeRequestRepository | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
 
@@ -119,6 +130,12 @@ def create_app(
                 resolved_operations,
             )
         app.state.command_bus = resolved_bus
+        resolved_change_requests = change_request_repository
+        if resolved_change_requests is None and service is None:
+            resolved_change_requests = ChangeRequestRepository(
+                resolved.database_url.get_secret_value()
+            )
+        app.state.change_request_repository = resolved_change_requests
         stop = asyncio.Event()
         dispatcher = (
             asyncio.create_task(operation_dispatch_loop(resolved_bus, stop))
@@ -133,6 +150,8 @@ def create_app(
             cast(AgentObservabilityRepository, app.state.gateway_repository).engine.dispose()
         if operations_repository is None and resolved_operations is not None:
             resolved_operations.engine.dispose()
+        if change_request_repository is None and resolved_change_requests is not None:
+            resolved_change_requests.engine.dispose()
 
     app = FastAPI(
         title="Engineering Control API",
@@ -167,7 +186,14 @@ def create_app(
             raise HTTPException(status_code=503, detail="typed command bus unavailable")
         return cast(TypedCommandBus, value)
 
+    def change_requests(request: Request) -> ChangeRequestRepository:
+        value = request.app.state.change_request_repository
+        if value is None:
+            raise HTTPException(status_code=503, detail="change request repository unavailable")
+        return cast(ChangeRequestRepository, value)
+
     control_dependency = Depends(control)
+    change_requests_dependency = Depends(change_requests)
     metadata_dependency = Depends(metadata)
     operations_dependency = Depends(operations)
     commands_dependency = Depends(commands)
@@ -934,6 +960,140 @@ def create_app(
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
         return await service.start_enhancement_solution(enhancement_id, body)
+
+    @app.post("/v1/change-requests", response_model=ChangeRequestAccepted, status_code=202)
+    async def change_request_create(
+        body: ChangeRequestCreate,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: ChangeRequestRepository = change_requests_dependency,
+    ) -> ChangeRequestAccepted:
+        actor = approval_actor(subject)
+        try:
+            intake = prepare_intake(body.project, body.description, body.target_repository)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        created = await repository.create(intake, actor)
+        change_request_id = UUID(str(created["id"]))
+        try:
+            accepted = await service.start_change_request(change_request_id, 1)
+        except Exception as error:  # noqa: BLE001 - surfaced as a durable FAILED row
+            await repository.record_start_failure(change_request_id, 1)
+            raise HTTPException(
+                status_code=503, detail="change request workflow could not be started"
+            ) from error
+        return ChangeRequestAccepted(
+            workflow_id=accepted.workflow_id,
+            run_id=accepted.run_id,
+            change_request_id=change_request_id,
+            request_key=str(created["request_key"]),
+            revision=1,
+            redacted=intake.redacted,
+        )
+
+    @app.get("/v1/change-requests", response_model=RecordList)
+    async def change_request_list(
+        project: str | None = Query(default=None, pattern=r"^(falcone|musematic|llmwiki)$"),
+        status: str | None = Query(
+            default=None,
+            pattern=r"^(DRAFTING|CANDIDATE|APPROVED|PUBLISHED|REJECTED|FAILED)$",
+        ),
+        limit: int = Query(default=20, ge=1, le=200),
+        _subject: str = auth_dependency,
+        repository: ChangeRequestRepository = change_requests_dependency,
+    ) -> RecordList:
+        return RecordList(
+            items=await repository.list_requests(project, status, limit), next_cursor=None
+        )
+
+    @app.get("/v1/change-requests/{change_request_id}")
+    async def change_request_get(
+        change_request_id: UUID,
+        _subject: str = auth_dependency,
+        repository: ChangeRequestRepository = change_requests_dependency,
+    ) -> dict[str, Any]:
+        value = await repository.get(change_request_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="change request not found")
+        return value
+
+    @app.post("/v1/change-requests/{change_request_id}/approve")
+    async def change_request_approve(
+        change_request_id: UUID,
+        body: ChangeRequestApproval,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: ChangeRequestRepository = change_requests_dependency,
+    ) -> dict[str, Any]:
+        actor = approval_actor(subject)
+        try:
+            approved = await repository.approve(
+                change_request_id, body.approval_binding, body.typed_confirmation, actor
+            )
+        except ChangeRequestNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            accepted = await service.start_change_request_publish(
+                change_request_id, int(approved["revision"]), body.approval_binding
+            )
+        except Exception as error:  # noqa: BLE001 - the APPROVED row can be re-approved
+            raise HTTPException(
+                status_code=503, detail="change request publish workflow could not be started"
+            ) from error
+        return {**approved, "publish_workflow_id": accepted.workflow_id, "run_id": accepted.run_id}
+
+    @app.post(
+        "/v1/change-requests/{change_request_id}/revise",
+        response_model=ChangeRequestAccepted,
+        status_code=202,
+    )
+    async def change_request_revise(
+        change_request_id: UUID,
+        body: ChangeRequestRevision,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: ChangeRequestRepository = change_requests_dependency,
+    ) -> ChangeRequestAccepted:
+        actor = approval_actor(subject)
+        try:
+            revised = await repository.revise(change_request_id, body.note, actor)
+        except ChangeRequestNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        revision = int(revised["revision"])
+        try:
+            accepted = await service.start_change_request(change_request_id, revision)
+        except Exception as error:  # noqa: BLE001 - surfaced as a durable FAILED row
+            await repository.record_start_failure(change_request_id, revision)
+            raise HTTPException(
+                status_code=503, detail="change request workflow could not be started"
+            ) from error
+        return ChangeRequestAccepted(
+            workflow_id=accepted.workflow_id,
+            run_id=accepted.run_id,
+            change_request_id=change_request_id,
+            request_key=str(revised["request_key"]),
+            revision=revision,
+            redacted=bool(revised["redacted"]),
+        )
+
+    @app.post("/v1/change-requests/{change_request_id}/reject")
+    async def change_request_reject(
+        change_request_id: UUID,
+        body: ChangeRequestRejection,
+        subject: str = auth_dependency,
+        repository: ChangeRequestRepository = change_requests_dependency,
+    ) -> dict[str, Any]:
+        actor = approval_actor(subject)
+        try:
+            return await repository.reject(change_request_id, body.reason, actor)
+        except ChangeRequestNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/v1/findings/{finding_id}")
     async def finding_get(

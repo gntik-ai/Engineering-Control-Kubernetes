@@ -103,3 +103,53 @@ kubeconfig, then idempotent PostgreSQL lease release/evidence/deployment tombsto
 generic shell/kubectl arguments, active work, and protected evidence have no override path. Partial
 completion is safe to retry from fresh discovery. This retention workflow is distinct from the
 bootstrap software cleanup plan gated by `APPROVE CLEANUP`.
+
+## Operator change requests (NEW-108)
+
+An operator can turn a free-text description of a wanted change into one reviewed, approved
+GitHub issue. The flow stops at the published issue. Delivery then uses the existing
+`backlog-import`, `backlog-approve` and `backlog-start` path.
+
+```bash
+engineering-ctl change-draft --project falcone --text "Add a CSV export of the tenant audit log"
+engineering-ctl change-draft --project musematic --file request.md --repository musematic-deploy
+engineering-ctl changes --project falcone --status CANDIDATE
+engineering-ctl change-show <id>      # rendered title/body, binding, findings, approve command
+engineering-ctl change-approve <id> <binding> APPROVE_CHANGE_<PROJECT>_<FIRST16HEX>
+engineering-ctl change-revise <id> --note "Only administrators may export"
+engineering-ctl change-reject <id> --reason "Superseded by the reporting epic"
+```
+
+The description must be 20 characters to 8 KiB of UTF-8. Credentials are redacted before the
+description is stored, and only the redacted text is kept (`redacted: true`). The target
+repository defaults to the project's source repository and must be one of the project's two
+allowlisted repositories. `ChangeRequestWorkflow` (`change-request-<id>-r<revision>`) allocates a
+read-only audit snapshot of the current main branch. The Claude spec architect drafts a proposal
+(the `create-openspec` skill and the pinned spec model), and the Codex checker reviews it (the
+`code-reviewer` role with the `review-change` skill). A `REVISE` verdict gets one automatic
+redraft and re-review. If the re-review still says `REVISE`, the request becomes a `CANDIDATE`
+anyway, and its unresolved findings appear in `change-show` and in the issue body. Nothing is
+ever approved automatically. Similar open issues in the target repository are attached as
+warnings only. Draft or review failures end in `FAILED` with a safe error code, and
+`change-revise` retries them.
+
+`change-show` prints the exact approve command. The typed phrase binds the project and the
+first 16 hex digits of the approval binding. The binding covers the request, its revision,
+the proposal fingerprint, the target repository, the issue title and the body hash, so any
+revision or edit invalidates it. Approval accepts only the CLI operator and allowlisted
+`telegram:<id>` actors. It starts `ChangeRequestPublishWorkflow`
+(`change-request-publish-<id>-r<revision>`). Its `change_request.publish` step is a separate,
+narrow capability that can only create an issue. It is not one of the backlog write-capable
+steps and does not need backlog write-policy ownership. Only the global
+`ENGINEERING_GITHUB_WRITES_ENABLED` switch applies. Before creating an issue it re-renders the
+stored content to check the binding, and it adopts an existing issue that already carries the
+hidden `hermes-change-request` marker. It applies the `hermes:change-request` and kind labels only
+if they already exist and never creates labels. If publication fails, the request stays
+`APPROVED` with an `error_code`. Repeating the same `change-approve` command replays the publish
+idempotently.
+
+Backlog import reads a `Change request:` issue's `kind:` line. A `feature`, `bug` or `chore`
+request is classified like the same hand-written issue without that metadata, so it is eligible
+under the bug filters. An `enhancement` request follows the existing enhancement rules. Its
+`Risk: R<n>` line is a floor: the imported risk is the higher of the declared risk and the
+keyword-detected risk.

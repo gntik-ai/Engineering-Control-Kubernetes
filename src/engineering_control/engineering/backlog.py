@@ -377,9 +377,16 @@ def classify_issue(
         raise ValueError("backlog classification input is not allowlisted")
     labels = tuple(sorted({label.strip().lower() for label in issue.labels if label.strip()}))
     text = f"{issue.title}\n{issue.body_excerpt}".lower()
-    issue_type = _issue_type(issue.repository, labels, text)
+    change_kind = _change_request_kind(text)
+    issue_type = (
+        _issue_type(issue.repository, labels, text)
+        if change_kind is None
+        else _change_request_issue_type(issue.repository, labels, text, change_kind)
+    )
     severity = _severity(labels, text)
     risk = _risk(issue_type, severity, text)
+    if change_kind is not None:
+        risk = _declared_risk_floor(risk, text)
     owner: Literal["source", "deployment"] = (
         "deployment" if issue.repository.endswith(("-charts", "-deploy")) else "source"
     )
@@ -624,6 +631,55 @@ def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogI
     if "question" in label_text or issue_title_is_question(text):
         return BacklogIssueType.QUESTION
     return BacklogIssueType.PRODUCT_BUG
+
+
+_CHANGE_REQUEST_KIND = re.compile(r"(?im)^\s*kind\s*:\s*([a-z][a-z0-9_-]{0,79})\s*$")
+_DECLARED_RISK = re.compile(r"(?im)^\s*risk\s*:\s*r([0-3])\s*$")
+# NEW-108: the label Hermes applies to a published operator change request.
+CHANGE_REQUEST_LABEL = "hermes:change-request"
+_RISK_LEVELS: tuple[Literal["R0", "R1", "R2", "R3"], ...] = ("R0", "R1", "R2", "R3")
+
+
+def _change_request_kind(text: str) -> str | None:
+    """NEW-108: the kind of a Hermes ``Change request:`` issue, from its first kind line."""
+    if not text.startswith("change request:"):
+        return None
+    match = _CHANGE_REQUEST_KIND.search(text)
+    if match is None or match.group(1) not in {"feature", "enhancement", "bug", "chore"}:
+        return None
+    return match.group(1)
+
+
+def _change_request_issue_type(
+    repository: str, labels: tuple[str, ...], text: str, kind: str
+) -> BacklogIssueType:
+    """Classify a change request by its kind line.
+
+    An enhancement keeps the existing enhancement rules. A feature, bug or chore is
+    classified exactly as the same issue written by hand without Hermes' own kind metadata
+    (the kind line and the labels Hermes applies), so it is eligible under the same import
+    filters; nothing else about the issue is ignored.
+    """
+    if kind == "enhancement":
+        return _issue_type(repository, labels, text)
+    own_labels = {CHANGE_REQUEST_LABEL, kind}
+    stripped = "\n".join(
+        line for line in text.splitlines() if not _CHANGE_REQUEST_KIND.fullmatch(line)
+    )
+    return _issue_type(
+        repository, tuple(label for label in labels if label not in own_labels), stripped
+    )
+
+
+def _declared_risk_floor(
+    detected: Literal["R0", "R1", "R2", "R3"], text: str
+) -> Literal["R0", "R1", "R2", "R3"]:
+    """A change request's ``Risk: R<n>`` line can only raise the keyword-detected risk."""
+    match = _DECLARED_RISK.search(text)
+    if match is None:
+        return detected
+    declared = int(match.group(1))
+    return detected if int(detected[1]) >= declared else _RISK_LEVELS[declared]
 
 
 def issue_title_is_question(text: str) -> bool:

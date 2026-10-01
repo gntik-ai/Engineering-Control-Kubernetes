@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from engineering_control.activities.change_requests import ChangeRequestGitHubHandler
 from engineering_control.activities.core import ControlActivities
 from engineering_control.activities.delivery import DeliveryActivityHandler
 from engineering_control.activities.github import GitHubActivityHandler
@@ -53,6 +54,8 @@ GITHUB_STEPS = frozenset(
         "gitops.image_pin",
         "gitops.environment_issue",
         "gitops.close_issue",
+        "change_request.github_dedupe",
+        "change_request.publish",
     }
 )
 
@@ -115,7 +118,9 @@ def test_github_activity_set_is_typed_reachable_and_exclusive() -> None:
     registered = ControlActivities.steps_for_worker("github")
     assert registered == GITHUB_STEPS
     assert registered == (
-        GitHubActivityHandler.supported_steps | DeliveryActivityHandler.supported_steps
+        GitHubActivityHandler.supported_steps
+        | DeliveryActivityHandler.supported_steps
+        | ChangeRequestGitHubHandler.supported_steps
     )
     assert all(
         ControlledWorkflow._activity_queue(step, {}) == GITHUB_TASK_QUEUE for step in registered

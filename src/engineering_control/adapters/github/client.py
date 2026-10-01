@@ -426,9 +426,22 @@ class GhCliBroker:
         return {"sha": sha, "tree": tree}
 
     def create_issue(
-        self, *, repository: str, title: str, body_file: Path, change_binding: str
+        self,
+        *,
+        repository: str,
+        title: str,
+        body_file: Path,
+        change_binding: str,
+        labels: tuple[str, ...] = (),
     ) -> str:
         repository = self._write(repository, change_binding)
+        if len(labels) > 10:
+            raise GhCliPolicyError("issue labels exceed their bound")
+        label_arguments = [
+            argument
+            for label in labels
+            for argument in ("--label", self._value(label, "issue label", maximum=100))
+        ]
         return self._run(
             [
                 "issue",
@@ -439,8 +452,48 @@ class GhCliBroker:
                 self._value(title, "issue title", maximum=200),
                 "--body-file",
                 str(self._bounded_file(body_file)),
+                *label_arguments,
             ]
         ).stdout.strip()
+
+    def list_labels(self, repository: str) -> list[str]:
+        """NEW-108: names of the labels that already exist (read-only; never creates)."""
+        repository = self._batch(repository)
+        value = self._json(
+            self._run(
+                ["label", "list", "--repo", repository, "--json", "name", "--limit", "500"]
+            ).stdout,
+            "repository labels",
+        )
+        return [
+            str(item["name"])
+            for item in self._list(value, "repository labels", maximum=500)
+            if isinstance(item.get("name"), str)
+        ]
+
+    def recent_issues(self, repository: str, *, limit: int = 30) -> list[dict[str, Any]]:
+        """NEW-108: the newest issues in any state, which search indexing may not show yet."""
+        repository = self._batch(repository)
+        if not 1 <= limit <= 100:
+            raise GhCliPolicyError("recent issue limit is out of bounds")
+        value = self._json(
+            self._run(
+                [
+                    "issue",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--state",
+                    "all",
+                    "--json",
+                    "number,title,url,state",
+                    "--limit",
+                    str(limit),
+                ]
+            ).stdout,
+            "recent issues",
+        )
+        return self._list(value, "recent issues")
 
     def create_pull_request(
         self,
@@ -1021,7 +1074,8 @@ class GhCliBroker:
         if not self.writes_enabled:
             raise GhCliPolicyError("GitHub writes are disabled by policy")
         if not re.fullmatch(
-            r"(?:changeset|campaign|finding|enhancement):[A-Za-z0-9-]{8,200}", change_binding
+            r"(?:changeset|campaign|finding|enhancement|change-request):[A-Za-z0-9-]{8,200}",
+            change_binding,
         ):
             raise GhCliPolicyError("GitHub write is not bound to an approved control-plane record")
         return repository

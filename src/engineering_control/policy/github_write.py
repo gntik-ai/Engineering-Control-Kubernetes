@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import os
+import re
 import stat
 from collections.abc import Callable
 from enum import StrEnum
@@ -11,6 +13,14 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES, READ_ONLY_REPOSITORIES
+from engineering_control.engineering.backlog import CHANGE_REQUEST_LABEL
+from engineering_control.engineering.change_requests import (
+    ChangeReviewRecord,
+    change_request_publish_workflow_id,
+    render_change_request,
+    target_repository_allowed,
+    validate_proposal,
+)
 
 GITHUB_WRITE_POLICY_PATH = Path(
     "/etc/engineering-control/policy/github-issue-write-validation.yaml"
@@ -60,11 +70,20 @@ GITOPS_WRITE_CAPABLE_GITHUB_STEPS = frozenset(
         "gitops.close_issue",
     }
 )
+# NEW-108 operator change requests. The publish step is a separate, narrow issue-create
+# capability: it is deliberately NOT write-capable in the sense above, is never gated on
+# backlog-campaign write-policy ownership, and is authorized only by
+# ChangeRequestIssueCreatePolicy below.
+CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS = frozenset({"change_request.github_dedupe"})
+CHANGE_REQUEST_ISSUE_CREATE_STEPS = frozenset({"change_request.publish"})
+CHANGE_REQUEST_ISSUE_CREATE_OPERATION = "create_issue"
 GITHUB_ACTIVITY_STEPS = (
     READ_ONLY_GITHUB_STEPS
     | WRITE_CAPABLE_GITHUB_STEPS
     | GITOPS_READ_ONLY_GITHUB_STEPS
     | GITOPS_WRITE_CAPABLE_GITHUB_STEPS
+    | CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS
+    | CHANGE_REQUEST_ISSUE_CREATE_STEPS
 )
 WRITE_REPOSITORIES = ALLOWED_REPOSITORIES - READ_ONLY_REPOSITORIES
 
@@ -217,4 +236,122 @@ class GitHubWritePolicyEvaluator:
         return GitHubWritePolicyDenial(
             policy=GitHubWritePolicyState(enabled=enabled, repository_allowed=False),
             reason_code=reason,
+        )
+
+
+class ChangeRequestIssueCreateDenialReason(StrEnum):
+    STEP_NOT_ALLOWED = "STEP_NOT_ALLOWED"
+    OPERATION_NOT_ALLOWED = "OPERATION_NOT_ALLOWED"
+    WORKFLOW_NOT_BOUND = "WORKFLOW_NOT_BOUND"
+    WRITES_DISABLED = "WRITES_DISABLED"
+    NOT_APPROVED = "NOT_APPROVED"
+    BINDING_MISMATCH = "BINDING_MISMATCH"
+    REPOSITORY_NOT_ALLOWLISTED = "REPOSITORY_NOT_ALLOWLISTED"
+    CONTENT_TAMPERED = "CONTENT_TAMPERED"
+
+
+class ChangeRequestIssueCreateDenial(BaseModel):
+    """Secret-free denial returned before any GitHub command is constructed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["BLOCKED_BY_POLICY"] = "BLOCKED_BY_POLICY"
+    reason_code: ChangeRequestIssueCreateDenialReason
+    external_mutation_attempted: Literal[False] = False
+
+
+class ChangeRequestIssuePlan(BaseModel):
+    """The only GitHub write a change request may perform: create this exact issue."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: Literal["create_issue"] = "create_issue"
+    change_request_id: str
+    revision: int
+    repository: str
+    title: str
+    body: str
+    marker: str
+    approval_binding: str
+    wanted_labels: tuple[str, ...]
+
+
+class ChangeRequestIssueCreatePolicy:
+    """Authorize exactly one issue creation for one approved, untampered change request.
+
+    Independent of GitHubWritePolicyEvaluator and backlog write-policy ownership: the
+    operator's typed approval of the exact rendered content is the authorization. Only the
+    global GitHub write switch still applies.
+    """
+
+    def __init__(self, *, writes_enabled: bool) -> None:
+        self.writes_enabled = writes_enabled
+
+    def evaluate(
+        self,
+        *,
+        step: str,
+        operation: str,
+        workflow_id: str,
+        approval_binding: str,
+        publication: object,
+    ) -> ChangeRequestIssuePlan | ChangeRequestIssueCreateDenial:
+        reason = ChangeRequestIssueCreateDenialReason
+        if step not in CHANGE_REQUEST_ISSUE_CREATE_STEPS:
+            return ChangeRequestIssueCreateDenial(reason_code=reason.STEP_NOT_ALLOWED)
+        if operation != CHANGE_REQUEST_ISSUE_CREATE_OPERATION:
+            return ChangeRequestIssueCreateDenial(reason_code=reason.OPERATION_NOT_ALLOWED)
+        if not isinstance(publication, dict):
+            return ChangeRequestIssueCreateDenial(reason_code=reason.NOT_APPROVED)
+        change_request_id = str(publication.get("change_request_id", ""))
+        revision = publication.get("revision")
+        if not isinstance(revision, int) or workflow_id != change_request_publish_workflow_id(
+            change_request_id, revision
+        ):
+            return ChangeRequestIssueCreateDenial(reason_code=reason.WORKFLOW_NOT_BOUND)
+        if not self.writes_enabled:
+            return ChangeRequestIssueCreateDenial(reason_code=reason.WRITES_DISABLED)
+        if publication.get("status") != "APPROVED":
+            return ChangeRequestIssueCreateDenial(reason_code=reason.NOT_APPROVED)
+        stored = str(publication.get("approval_binding_sha256", ""))
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", approval_binding)
+            or not stored
+            or not hmac.compare_digest(stored, approval_binding)
+        ):
+            return ChangeRequestIssueCreateDenial(reason_code=reason.BINDING_MISMATCH)
+        project = str(publication.get("project", ""))
+        repository = str(publication.get("target_repository", ""))
+        if repository not in WRITE_REPOSITORIES or not target_repository_allowed(
+            project, repository
+        ):
+            return ChangeRequestIssueCreateDenial(reason_code=reason.REPOSITORY_NOT_ALLOWLISTED)
+        try:
+            proposal = validate_proposal(publication.get("proposal"), project)
+            rendered = render_change_request(
+                change_request_id=change_request_id,
+                revision=revision,
+                project=project,
+                target_repository=repository,
+                proposal=proposal,
+                review=ChangeReviewRecord.model_validate(publication.get("review")),
+                description_redacted=str(publication.get("description_redacted", "")),
+            )
+        except ValueError:
+            return ChangeRequestIssueCreateDenial(reason_code=reason.CONTENT_TAMPERED)
+        if (
+            not hmac.compare_digest(rendered.approval_binding, stored)
+            or rendered.title != publication.get("issue_title")
+            or rendered.body != publication.get("issue_body")
+        ):
+            return ChangeRequestIssueCreateDenial(reason_code=reason.CONTENT_TAMPERED)
+        return ChangeRequestIssuePlan(
+            change_request_id=change_request_id,
+            revision=revision,
+            repository=repository,
+            title=rendered.title,
+            body=rendered.body,
+            marker=rendered.marker,
+            approval_binding=stored,
+            wanted_labels=(CHANGE_REQUEST_LABEL, proposal.kind),
         )

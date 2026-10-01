@@ -42,6 +42,10 @@ class AgentInstructionPack:
         "observability.invoke_claude": "review-change",
         "observability.invoke_claude_maker": "implement-issue",
         "observability.invoke_codex_checker": "review-change",
+        # NEW-108: the spec architect drafts with its OpenSpec skill; the independent
+        # Codex checker reviews the proposal with the checker role's review skill.
+        "change_request.draft": "create-openspec",
+        "change_request.review": "review-change",
     }
 
     def __init__(self, root: Path) -> None:
