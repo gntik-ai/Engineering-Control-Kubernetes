@@ -7768,7 +7768,19 @@ class MetadataActivityHandler:
                     if isinstance(value, dict) and "lease_id" in value
                 }
                 completed_ids = {str(value) for value in [*removed, *absent]}
-                if completed_ids != authorized_ids:
+                # NEW-105: cleanup.execute keeps a worktree it cannot remove (NEW-85, e.g. a
+                # maker-owned path it may not delete) as protected. That worktree stays
+                # leased and is reported; it no longer fails the whole run.
+                raw_protected = payload.get("protected_cleanup_candidates", [])
+                if not isinstance(raw_protected, list) or not all(
+                    isinstance(value, dict) and isinstance(value.get("lease_id"), str)
+                    for value in raw_protected
+                ):
+                    raise ValueError("cleanup protection evidence is invalid")
+                protected_ids = {str(value["lease_id"]) for value in raw_protected}
+                if (completed_ids & protected_ids) or (
+                    completed_ids | protected_ids
+                ) != authorized_ids:
                     raise ValueError("cleanup completion does not match its authorization")
                 for lease_id in completed_ids:
                     lease = session.get(WorktreeLease, UUID(lease_id))
@@ -7823,7 +7835,14 @@ class MetadataActivityHandler:
                     f"{len(completed_file_ids)} bounded files, "
                     f"{len(authorized_component_ids)} component leases, "
                     f"{len(authorized_preview_ids)} preview namespaces"
+                    + (
+                        f"; {len(protected_ids)} protected worktrees retained for the operator"
+                        if protected_ids
+                        else ""
+                    )
                 )
+                if protected_ids:
+                    run.error_code = "CLEANUP_PROTECTED_WORKTREES_RETAINED"
             elif terminal == "DRY_RUN":
                 run.status = "SUCCESS"
                 run.summary = "cleanup dry run completed without mutation"

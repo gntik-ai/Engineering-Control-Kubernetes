@@ -140,9 +140,10 @@ async def test_provider_activity_does_not_echo_prompt_text_back_into_its_result(
 
     result = await handler.handle(
         "delivery.invoke_maker",
-        {"maker_request": request_for(worktree).model_dump(mode="json") | {
-            "prompt": original_prompt
-        }},
+        {
+            "maker_request": request_for(worktree).model_dump(mode="json")
+            | {"prompt": original_prompt}
+        },
     )
 
     assert result["status"] == "SUCCESS"
@@ -375,3 +376,57 @@ async def test_provider_activity_fails_closed_on_invalid_agent_pack(tmp_path: Pa
     assert result["blocker"] == "AGENT_PACK_INVALID"
     assert result["blocker_detail"] == "ValueError"
     assert "agent_result" not in result
+
+
+@pytest.mark.asyncio
+async def test_maker_runs_restore_manager_access_to_their_own_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NEW-105: musematic #1125's codex-runner created openspec/ directories whose narrow
+    # ACL mask stopped the scan worker from removing the abandoned worktree, and the
+    # daily cleanup failed. After a maker run its runner re-grants the manager access.
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.activity.heartbeat", lambda _: None
+    )
+    calls: list[list[str]] = []
+
+    class Done:
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*args: str, **_: Any) -> Done:
+        calls.append(list(args))
+        return Done()
+
+    monkeypatch.setattr(
+        "engineering_control.activities.provider.asyncio.create_subprocess_exec", fake_exec
+    )
+    worktree_root = tmp_path / "worktrees"
+    worktree = worktree_root / "musematic" / "change-set"
+    (worktree / "openspec" / "changes" / "fix").mkdir(parents=True)
+    (worktree / "openspec" / "changes" / "fix" / "tasks.md").write_text("x", encoding="utf-8")
+    (worktree / "link").symlink_to(worktree / "openspec")
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=worktree_root, run_root=tmp_path / "runs"),
+        "codex",
+        FakeAdapter(),
+        FakeInstructionPack(),
+    )
+
+    result = await handler.handle(
+        "delivery.invoke_maker",
+        {"maker_request": request_for(worktree).model_dump(mode="json")},
+    )
+
+    assert result["worktree_access_repair"] == {"status": "REPAIRED", "paths": 4}
+    files_call, directories_call = calls
+    assert files_call[:4] == ["/usr/bin/setfacl", "--modify", "u:scan-runner:rwX,m::rwX", "--"]
+    assert files_call[4:] == [str(worktree / "openspec" / "changes" / "fix" / "tasks.md")]
+    assert "d:u:scan-runner:rwx,d:m::rwx" in directories_call[2]
+    assert str(worktree / "link") not in files_call + directories_call  # symlinks skipped
+    assert len(directories_call[4:]) == 3
+    # Checkers and other steps never touch ACLs, and a path outside the root is skipped.
+    assert await handler._restore_manager_access(tmp_path) == {
+        "status": "SKIPPED",
+        "reason": "WORKTREE_OUTSIDE_ROOT",
+    }

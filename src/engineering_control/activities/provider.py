@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -47,6 +49,34 @@ class InstructionPack(Protocol):
     def enrich(
         self, request: AgentRequest, step: str
     ) -> tuple[AgentRequest, InstructionBundle]: ...
+
+
+# NEW-105: steps whose runner writes into an implementation worktree.
+_MAKER_STEPS = frozenset({"delivery.invoke_maker", "delivery.invoke_deployment_maker"})
+# The worktree manager (scan worker) identity, as granted by WorktreeManager._grant_access.
+_WORKTREE_MANAGER_IDENTITY = "scan-runner"
+_SETFACL = "/usr/bin/setfacl"
+_ACL_BATCH = 200
+
+
+def _runner_owned_paths(worktree_root: Path, worktree: Path) -> tuple[list[str], list[str]] | None:
+    """NEW-105: (files, directories) in one bounded worktree owned by this process's user,
+    without following symlinks; None when the path is not a worktree under the root."""
+    root = worktree_root.resolve()
+    target = worktree.resolve()
+    if target == root or not target.is_relative_to(root) or not target.is_dir():
+        return None
+    owner = os.geteuid()
+    files: list[str] = []
+    directories: list[str] = []
+    for current, dirnames, filenames in os.walk(target, followlinks=False):
+        for name in (*dirnames, *filenames):
+            path = os.path.join(current, name)
+            info = os.lstat(path)
+            if info.st_uid != owner or stat.S_ISLNK(info.st_mode):
+                continue
+            (directories if stat.S_ISDIR(info.st_mode) else files).append(path)
+    return files, directories
 
 
 class ProviderActivityHandler:
@@ -265,6 +295,11 @@ class ProviderActivityHandler:
             recorder.transcript_incomplete = True
         if result.status is RunStatus.SUCCESS:
             self._validate_result_schema(request, result)
+        access_repair = (
+            await self._restore_manager_access(Path(request.working_directory))
+            if step in _MAKER_STEPS
+            else None
+        )
 
         response = {
             **runtime_payload,
@@ -277,12 +312,53 @@ class ProviderActivityHandler:
                 "output_truncated": recorder.output_truncated,
             },
         }
+        if access_repair is not None:
+            response["worktree_access_repair"] = access_repair
         if result.status is RunStatus.RATE_LIMITED:
             response["handoff_hashes"] = self._persist_handoff(request, result, runtime_payload)
         safe = self.redactor.redact(response).value
         if not isinstance(safe, dict):
             raise TypeError("redacted provider response must remain an object")
         return safe
+
+    async def _restore_manager_access(self, worktree: Path) -> dict[str, Any]:
+        """NEW-105: keep every file this runner created deletable by the worktree manager.
+
+        The worktree's default ACL grants the manager rwx, but a tool that creates a path
+        with an explicit narrow mode (e.g. 0755) narrows that path's ACL mask, so the
+        manager could not later archive or remove it (cleanup failed on falcone/musematic
+        #1125's openspec/ directories, owned by codex-runner). Only a file's owner may
+        change its ACL, so the maker's runner re-grants it here after each run.
+        Best effort: a failure is reported, never fatal.
+        """
+        try:
+            owned = await asyncio.to_thread(
+                _runner_owned_paths, self.settings.worktree_root, worktree
+            )
+            if owned is None:
+                return {"status": "SKIPPED", "reason": "WORKTREE_OUTSIDE_ROOT"}
+            files, directories = owned
+            manager = _WORKTREE_MANAGER_IDENTITY
+            for paths, acl in (
+                (files, f"u:{manager}:rwX,m::rwX"),
+                (directories, f"u:{manager}:rwX,m::rwX,d:u:{manager}:rwx,d:m::rwx"),
+            ):
+                for start in range(0, len(paths), _ACL_BATCH):
+                    process = await asyncio.create_subprocess_exec(
+                        _SETFACL,
+                        "--modify",
+                        acl,
+                        "--",
+                        *paths[start : start + _ACL_BATCH],
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    if await asyncio.wait_for(process.wait(), timeout=120) != 0:
+                        return {"status": "FAILED", "reason": "SETFACL_FAILED"}
+            return {"status": "REPAIRED", "paths": len(files) + len(directories)}
+        except (OSError, TimeoutError) as error:
+            return {"status": "FAILED", "reason": type(error).__name__}
 
     async def _cli_version(self) -> str | None:
         executable = getattr(self.adapter, "executable", None)
