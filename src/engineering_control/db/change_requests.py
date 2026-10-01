@@ -6,7 +6,6 @@ import asyncio
 import hmac
 import re
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,17 +25,9 @@ from engineering_control.engineering.change_requests import (
     ChangeReviewRecord,
     RenderedChangeRequest,
     approval_phrase,
-    change_request_publish_workflow_id,
     change_request_workflow_id,
     render_change_request,
     validate_proposal,
-)
-from engineering_control.policy.change_request_attestation import (
-    ATTESTATION_TTL,
-    AttestationDirectory,
-    ChangeRequestAttestation,
-    RequestDirectory,
-    request_attestation,
 )
 from engineering_control.security.redaction import SecretRedactor
 
@@ -45,10 +36,6 @@ _ISSUE_URL = re.compile(
     r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)"
     r"/issues/([1-9][0-9]*)$"
 )
-
-
-# An unresolved publication outcome must be reconciled before revise or reject.
-UNRESOLVED_PUBLICATION_ERRORS = frozenset({"PUBLISH_OUTCOME_UNKNOWN", "PUBLISH_CONFLICT"})
 
 
 class ChangeRequestNotFoundError(ValueError):
@@ -63,7 +50,6 @@ class ChangeRequestRepository:
         database_url: str | None = None,
         *,
         engine: Engine | None = None,
-        attestation_request_root: Path | None = None,
     ) -> None:
         if engine is None:
             if database_url is None:
@@ -79,8 +65,6 @@ class ChangeRequestRepository:
             )
         self.engine = engine
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
-        # Where approval changes ask the root reconciler to (re)attest from durable state.
-        self.attestation_request_root = attestation_request_root
 
     # Operator API -----------------------------------------------------------------------
 
@@ -180,8 +164,6 @@ class ChangeRequestRepository:
                 row.approval_snapshot_json = self._approval_snapshot(row)
                 session.flush()
                 replayed = {**self._view(row), "replayed": False}
-            sequence = row.decision_sequence
-        self._request_attestation(change_request_id, sequence)
         return replayed
 
     async def revise(self, change_request_id: UUID, note: str, actor: str) -> dict[str, Any]:
@@ -198,9 +180,7 @@ class ChangeRequestRepository:
             if not self._decision_open(row, {"CANDIDATE", "FAILED"}):
                 raise ValueError(
                     "only a CANDIDATE, FAILED or unpublished APPROVED change request can be revised"
-                    " (an unresolved publication must be reconciled first)"
                 )
-            revoked = row.status == "APPROVED"
             now = datetime.now(UTC)
             row.status = "DRAFTING"
             row.revision += 1
@@ -213,18 +193,13 @@ class ChangeRequestRepository:
             row.issue_body = None
             row.approval_binding_sha256 = None
             row.error_code = None
-            # publish_attempted_at survives: any earlier revision may already be on GitHub.
             row.approval_snapshot_json = None
             row.decision_sequence += 1
             row.decided_by = actor
             row.decided_at = now
             row.decision_reason = None
             session.flush()
-            view = self._view(row)
-            sequence = row.decision_sequence
-        if revoked:
-            self._request_attestation(change_request_id, sequence)
-        return view
+            return self._view(row)
 
     async def reject(self, change_request_id: UUID, reason: str, actor: str) -> dict[str, Any]:
         return await asyncio.to_thread(self.reject_sync, change_request_id, reason, actor)
@@ -238,68 +213,74 @@ class ChangeRequestRepository:
         with self.sessions.begin() as session:
             row = self._locked(session, change_request_id)
             if not self._decision_open(row, {"DRAFTING", "CANDIDATE", "FAILED"}):
-                raise ValueError(
-                    "change request cannot be rejected from its current state"
-                    " (an unresolved publication must be reconciled first)"
-                )
-            revoked = row.status == "APPROVED"
+                raise ValueError("change request cannot be rejected from its current state")
             row.status = "REJECTED"
             row.decided_by = actor
             row.decided_at = datetime.now(UTC)
             row.decision_reason = safe_reason
             row.decision_sequence += 1
             session.flush()
-            view = self._view(row)
-            sequence = row.decision_sequence
-        if revoked:
-            self._request_attestation(change_request_id, sequence)
-        return view
+            return self._view(row)
 
-    async def reconcile_publication(
-        self, change_request_id: UUID, issue_url: str | None, reason: str, actor: str
+    async def mark_published(
+        self,
+        change_request_id: UUID,
+        issue_url: str,
+        binding: str,
+        decision_sequence: int,
+        actor: str,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self.reconcile_publication_sync, change_request_id, issue_url, reason, actor
+            self.mark_published_sync,
+            change_request_id,
+            issue_url,
+            binding,
+            decision_sequence,
+            actor,
         )
 
-    def reconcile_publication_sync(
-        self, change_request_id: UUID, issue_url: str | None, reason: str, actor: str
+    def mark_published_sync(
+        self,
+        change_request_id: UUID,
+        issue_url: str,
+        binding: str,
+        decision_sequence: int,
+        actor: str,
     ) -> dict[str, Any]:
-        """Operator resolution of PUBLISH_OUTCOME_UNKNOWN or PUBLISH_CONFLICT.
+        """Record the issue the operator published with their own gh login (final state).
 
-        With an issue URL the request becomes PUBLISHED; without one the operator states
-        that no publication exists, which reopens revise/reject. The intent timestamp is
-        kept either way, so any later publication still looks up conclusively.
+        Idempotent for the same URL; bound to the approved content and decision.
         """
         if not is_reauthenticated_backlog_operator(actor):
-            raise ValueError("publication reconciliation requires an allowlisted operator")
-        safe_reason = str(SecretRedactor().redact_text(reason.strip()).value)
-        if not 3 <= len(safe_reason) <= 1000:
-            raise ValueError("reconciliation reason must be 3 to 1000 characters")
-        match = _ISSUE_URL.fullmatch(issue_url) if issue_url is not None else None
-        if issue_url is not None and match is None:
-            raise ValueError("reconciled issue reference is invalid")
+            raise ValueError("change request publication requires an allowlisted operator")
+        match = _ISSUE_URL.fullmatch(issue_url)
+        if match is None:
+            raise ValueError("published issue reference is invalid")
         with self.sessions.begin() as session:
             row = self._locked(session, change_request_id)
-            if row.status != "APPROVED" or row.error_code not in UNRESOLVED_PUBLICATION_ERRORS:
-                raise ValueError("only an unresolved publication can be reconciled")
-            if match is not None:
-                if f"gntik-ai/{match.group(1)}" != row.target_repository:
-                    raise ValueError("reconciled issue is outside the approved repository")
-                row.status = "PUBLISHED"
-                row.issue_url = issue_url
-                row.issue_number = int(match.group(2))
-                row.published_at = datetime.now(UTC)
+            stored = row.approval_binding_sha256 or ""
+            if not stored or not hmac.compare_digest(stored, binding):
+                raise ValueError("change request approval binding changed")
+            if row.decision_sequence != decision_sequence:
+                raise ValueError("change request decision changed since approval")
+            if f"gntik-ai/{match.group(1)}" != row.target_repository:
+                raise ValueError("published issue is outside the approved repository")
+            if row.status == "PUBLISHED":
+                if row.issue_url != issue_url:
+                    raise ValueError("change request was already published elsewhere")
+                return {**self._view(row), "replayed": True}
+            if row.status != "APPROVED":
+                raise ValueError("only an APPROVED change request can be published")
+            self._verify_stored_content(row)
+            if row.approval_snapshot_json != self._approval_snapshot(row):
+                raise ValueError("change request content no longer matches its approval record")
+            row.status = "PUBLISHED"
+            row.issue_url = issue_url
+            row.issue_number = int(match.group(2))
+            row.published_at = datetime.now(UTC)
             row.error_code = None
-            row.decided_by = actor
-            row.decided_at = datetime.now(UTC)
-            row.decision_reason = f"publication reconciled: {safe_reason}"
-            row.decision_sequence += 1
             session.flush()
-            view = self._view(row)
-            sequence = row.decision_sequence
-        self._request_attestation(change_request_id, sequence)
-        return view
+            return {**self._view(row), "replayed": False}
 
     async def record_start_failure(self, change_request_id: UUID, revision: int) -> None:
         await asyncio.to_thread(
@@ -382,216 +363,6 @@ class ChangeRequestRepository:
             session.flush()
             return {"status": "FAILED", "error_code": code}
 
-    def load_approved_sync(self, change_request_id: UUID, binding: str) -> dict[str, Any]:
-        with self.sessions() as session:
-            row = session.get(ChangeRequest, change_request_id)
-            if row is None:
-                raise ChangeRequestNotFoundError("change request not found")
-            stored = row.approval_binding_sha256 or ""
-            if not stored or not hmac.compare_digest(stored, binding):
-                return {"status": "BLOCKED", "blocker": "APPROVAL_BINDING_MISMATCH"}
-            if row.status == "PUBLISHED":
-                return {
-                    "status": "PUBLISHED",
-                    "issue_url": row.issue_url,
-                    "issue_number": row.issue_number,
-                }
-            if row.status != "APPROVED":
-                return {"status": "BLOCKED", "blocker": "CHANGE_REQUEST_NOT_APPROVED"}
-            try:
-                self._verify_stored_content(row)
-            except ValueError:
-                return {"status": "BLOCKED", "blocker": "CHANGE_REQUEST_CONTENT_CHANGED"}
-            # No content travels to the GitHub worker: it publishes only what the root
-            # reconciler attested from this same durable row.
-            return {
-                "status": "APPROVED",
-                "revision": row.revision,
-                "decision_sequence": row.decision_sequence,
-            }
-
-    def record_publish_intent_sync(
-        self, change_request_id: UUID, binding: str, revision: int, decision_sequence: int
-    ) -> dict[str, Any]:
-        """Durably record, before any create, that a publication may have started.
-
-        Returns the earliest intent ever recorded for the request (any revision); the
-        GitHub worker always looks up conclusively back past it before creating.
-        """
-        with self.sessions.begin() as session:
-            row = self._locked(session, change_request_id)
-            stored = row.approval_binding_sha256 or ""
-            if (
-                row.status != "APPROVED"
-                or row.revision != revision
-                or row.decision_sequence != decision_sequence
-                or not stored
-                or not hmac.compare_digest(stored, binding)
-            ):
-                return {"status": "BLOCKED", "blocker": "CHANGE_REQUEST_NOT_APPROVED"}
-            if row.publish_attempted_at is None:
-                row.publish_attempted_at = datetime.now(UTC)
-                session.flush()
-            return {
-                "status": "INTENT_RECORDED",
-                "publish_intent_at": self._iso(row.publish_attempted_at),
-            }
-
-    def persist_publication_sync(
-        self, change_request_id: UUID, binding: str, issue_url: str, issue_number: int
-    ) -> dict[str, Any]:
-        match = _ISSUE_URL.fullmatch(issue_url)
-        if match is None or int(match.group(2)) != issue_number:
-            raise ValueError("published issue reference is invalid")
-        with self.sessions.begin() as session:
-            row = self._locked(session, change_request_id)
-            stored = row.approval_binding_sha256 or ""
-            if not stored or not hmac.compare_digest(stored, binding):
-                raise ValueError("change request approval binding changed")
-            if f"gntik-ai/{match.group(1)}" != row.target_repository:
-                raise ValueError("published issue is outside the approved repository")
-            if row.status == "PUBLISHED":
-                if row.issue_url != issue_url:
-                    raise ValueError("change request was already published elsewhere")
-                return {"status": "PUBLISHED", "issue_url": row.issue_url}
-            if row.status != "APPROVED":
-                raise ValueError("only an APPROVED change request can be published")
-            row.status = "PUBLISHED"
-            row.issue_url = issue_url
-            row.issue_number = issue_number
-            row.published_at = datetime.now(UTC)
-            row.error_code = None
-            row.decision_sequence += 1
-            session.flush()
-            sequence = row.decision_sequence
-        self._request_attestation(change_request_id, sequence)
-        return {"status": "PUBLISHED", "issue_url": issue_url, "issue_number": issue_number}
-
-    def record_publish_failure_sync(
-        self, change_request_id: UUID, binding: str, error_code: str
-    ) -> dict[str, Any]:
-        """Keep the row APPROVED (re-approval replays the publish) but surface the cause."""
-        code = error_code if _ERROR_CODE.fullmatch(error_code) else "PUBLISH_FAILED"
-        with self.sessions.begin() as session:
-            row = self._locked(session, change_request_id)
-            stored = row.approval_binding_sha256 or ""
-            if row.status != "APPROVED" or not hmac.compare_digest(stored, binding):
-                return {"status": "SUPERSEDED", "current_status": row.status}
-            row.error_code = code
-            session.flush()
-            return {"status": "PUBLISH_FAILED", "error_code": code}
-
-    # Root attestation reconciler ------------------------------------------------------------
-
-    def attestation_sync(
-        self, change_request_id: UUID, *, now: datetime
-    ) -> ChangeRequestAttestation | None:
-        """An attestation only for an APPROVED, unpublished row that still matches the
-        decision record written at approval time (defense in depth against row rewrites)."""
-        with self.sessions() as session:
-            row = session.get(ChangeRequest, change_request_id)
-            if (
-                row is None
-                or row.status != "APPROVED"
-                or row.issue_url is not None
-                or row.decided_at is None
-                or not isinstance(row.decided_by, str)
-                or not is_reauthenticated_backlog_operator(row.decided_by)
-            ):
-                return None
-            try:
-                self._verify_stored_content(row)
-            except ValueError:
-                return None
-            snapshot = row.approval_snapshot_json
-            if not isinstance(snapshot, dict) or snapshot != self._approval_snapshot(row):
-                return None
-            return ChangeRequestAttestation(
-                change_request_id=str(row.id),
-                revision=row.revision,
-                decision_sequence=row.decision_sequence,
-                project=row.project,  # type: ignore[arg-type]
-                target_repository=row.target_repository,
-                approval_binding=str(row.approval_binding_sha256),
-                fingerprint=str(row.fingerprint),
-                proposal=row.proposal_json,
-                review=row.review_json,
-                description_redacted=row.description_redacted,
-                issue_title=str(row.issue_title),
-                issue_body=str(row.issue_body),
-                approved_by=row.decided_by,
-                approved_at=row.decided_at,
-                attested_at=now,
-                expires_at=now + ATTESTATION_TTL,
-            )
-
-    def reconcile_attestations_sync(
-        self,
-        request_root: Path,
-        attestation_root: Path,
-        *,
-        now: datetime,
-        request_owner: int | None = None,
-        group: int | None = None,
-        strict: bool = False,
-    ) -> dict[str, Any]:
-        """Run as root: (re)write or revoke every requested or existing attestation.
-
-        A decision committed while this runs is never lost: an attestation is re-checked
-        after it is written, and a request is consumed only if unchanged since it was read.
-        """
-        attested: list[str] = []
-        revoked: list[str] = []
-        retained: list[str] = []
-        with (
-            RequestDirectory(
-                request_root, owner=request_owner, group=group, strict=strict
-            ) as requests,
-            AttestationDirectory(attestation_root, group=group, strict=strict) as attestations,
-        ):
-            pending, quarantined = requests.scan()
-            identifiers = {item.change_request_id for item in pending}
-            identifiers.update(attestations.identifiers())
-            for identifier in sorted(identifiers, key=str):
-                attestation = self.attestation_sync(identifier, now=now)
-                if attestation is None:
-                    if attestations.revoke(identifier):
-                        revoked.append(str(identifier))
-                    continue
-                attestations.write(attestation)
-                current = self.attestation_sync(identifier, now=now)
-                if current is None or (
-                    current.decision_sequence,
-                    current.revision,
-                    current.approval_binding,
-                ) != (
-                    attestation.decision_sequence,
-                    attestation.revision,
-                    attestation.approval_binding,
-                ):
-                    attestations.revoke(identifier)
-                    revoked.append(str(identifier))
-                    continue
-                attested.append(str(identifier))
-            for request in pending:
-                if not requests.consume(request):
-                    retained.append(request.name)
-        return {
-            "attested": attested,
-            "revoked": revoked,
-            "quarantined": quarantined,
-            "retained_requests": retained,
-        }
-
-    def _request_attestation(self, change_request_id: UUID, decision_sequence: int) -> None:
-        if self.attestation_request_root is not None:
-            request_attestation(
-                self.attestation_request_root,
-                change_request_id,
-                decision_sequence=decision_sequence,
-                now=datetime.now(UTC),
-            )
-
     @classmethod
     def _approval_snapshot(cls, row: ChangeRequest) -> dict[str, Any]:
         """The approval decision record and a hash of exactly the approved content."""
@@ -618,9 +389,7 @@ class ChangeRequestRepository:
     @staticmethod
     def _decision_open(row: ChangeRequest, statuses: set[str]) -> bool:
         """Revise/reject are open in these statuses, or while APPROVED but unpublished."""
-        if row.status == "APPROVED":
-            return row.issue_url is None and row.error_code not in UNRESOLVED_PUBLICATION_ERRORS
-        return row.status in statuses
+        return row.status in statuses or (row.status == "APPROVED" and row.issue_url is None)
 
     # Helpers --------------------------------------------------------------------------------
 
@@ -715,6 +484,9 @@ class ChangeRequestRepository:
             "issue_body": row.issue_body,
             "approval_binding": binding,
             "confirmation_phrase": phrase,
+            "publish_command": (
+                f"engineering-ctl change-publish {row.id}" if row.status == "APPROVED" else None
+            ),
             "approve_command": (
                 f"engineering-ctl change-approve {row.id} {binding} {phrase}"
                 if phrase is not None
@@ -726,8 +498,6 @@ class ChangeRequestRepository:
             "decision_reason": row.decision_reason,
             "decided_at": cls._iso(row.decided_at),
             "published_at": cls._iso(row.published_at),
-            "publish_attempted_at": cls._iso(row.publish_attempted_at),
             "decision_sequence": row.decision_sequence,
             "workflow_id": change_request_workflow_id(str(row.id), row.revision),
-            "publish_workflow_id": change_request_publish_workflow_id(str(row.id), row.revision),
         }

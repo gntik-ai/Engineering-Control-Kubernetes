@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hmac
 import os
-import re
 import stat
 from collections.abc import Callable
 from enum import StrEnum
@@ -13,15 +11,6 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES, READ_ONLY_REPOSITORIES
-from engineering_control.engineering.backlog import CHANGE_REQUEST_LABEL
-from engineering_control.engineering.change_requests import (
-    ChangeReviewRecord,
-    change_request_publish_workflow_id,
-    render_change_request,
-    target_repository_allowed,
-    validate_proposal,
-)
-from engineering_control.policy.change_request_attestation import ChangeRequestAttestation
 
 GITHUB_WRITE_POLICY_PATH = Path(
     "/etc/engineering-control/policy/github-issue-write-validation.yaml"
@@ -71,20 +60,15 @@ GITOPS_WRITE_CAPABLE_GITHUB_STEPS = frozenset(
         "gitops.close_issue",
     }
 )
-# NEW-108 operator change requests. The publish step is a separate, narrow issue-create
-# capability: it is deliberately NOT write-capable in the sense above, is never gated on
-# backlog-campaign write-policy ownership, and is authorized only by
-# ChangeRequestIssueCreatePolicy below.
+# NEW-108 operator change requests only search GitHub; the operator publishes the issue
+# with their own gh login (engineering-ctl change-publish), never a Hermes worker.
 CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS = frozenset({"change_request.github_dedupe"})
-CHANGE_REQUEST_ISSUE_CREATE_STEPS = frozenset({"change_request.publish"})
-CHANGE_REQUEST_ISSUE_CREATE_OPERATION = "create_issue"
 GITHUB_ACTIVITY_STEPS = (
     READ_ONLY_GITHUB_STEPS
     | WRITE_CAPABLE_GITHUB_STEPS
     | GITOPS_READ_ONLY_GITHUB_STEPS
     | GITOPS_WRITE_CAPABLE_GITHUB_STEPS
     | CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS
-    | CHANGE_REQUEST_ISSUE_CREATE_STEPS
 )
 WRITE_REPOSITORIES = ALLOWED_REPOSITORIES - READ_ONLY_REPOSITORIES
 
@@ -237,134 +221,4 @@ class GitHubWritePolicyEvaluator:
         return GitHubWritePolicyDenial(
             policy=GitHubWritePolicyState(enabled=enabled, repository_allowed=False),
             reason_code=reason,
-        )
-
-
-class ChangeRequestIssueCreateDenialReason(StrEnum):
-    STEP_NOT_ALLOWED = "STEP_NOT_ALLOWED"
-    OPERATION_NOT_ALLOWED = "OPERATION_NOT_ALLOWED"
-    WORKFLOW_TYPE_NOT_ALLOWED = "WORKFLOW_TYPE_NOT_ALLOWED"
-    WORKFLOW_NOT_BOUND = "WORKFLOW_NOT_BOUND"
-    WRITES_DISABLED = "WRITES_DISABLED"
-    NOT_APPROVED = "NOT_APPROVED"
-    REVISION_MISMATCH = "REVISION_MISMATCH"
-    DECISION_SUPERSEDED = "DECISION_SUPERSEDED"
-    BINDING_MISMATCH = "BINDING_MISMATCH"
-    REPOSITORY_NOT_ALLOWLISTED = "REPOSITORY_NOT_ALLOWLISTED"
-    CONTENT_TAMPERED = "CONTENT_TAMPERED"
-
-
-class ChangeRequestIssueCreateDenial(BaseModel):
-    """Secret-free denial returned before any GitHub command is constructed."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    status: Literal["BLOCKED_BY_POLICY"] = "BLOCKED_BY_POLICY"
-    reason_code: ChangeRequestIssueCreateDenialReason
-    external_mutation_attempted: Literal[False] = False
-
-
-class ChangeRequestIssuePlan(BaseModel):
-    """The only GitHub write a change request may perform: create this exact issue."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    operation: Literal["create_issue"] = "create_issue"
-    change_request_id: str
-    revision: int
-    repository: str
-    title: str
-    body: str
-    marker: str
-    approval_binding: str
-    wanted_labels: tuple[str, ...]
-
-
-class ChangeRequestIssueCreatePolicy:
-    """Authorize exactly one issue creation for one durably approved change request.
-
-    Authorization comes only from the root-owned attestation the reconciler derived from
-    the PostgreSQL row (the GitHub worker has no database credential) and from the
-    activity's own Temporal identity -- never from activity payload content. It is
-    independent of GitHubWritePolicyEvaluator and backlog write-policy ownership; only
-    the global GitHub write switch still applies.
-    """
-
-    workflow_type = "ChangeRequestPublishWorkflow"
-
-    def __init__(self, *, writes_enabled: bool) -> None:
-        self.writes_enabled = writes_enabled
-
-    def evaluate(
-        self,
-        *,
-        step: str,
-        operation: str,
-        workflow_type: str,
-        workflow_id: str,
-        change_request_id: str,
-        revision: object,
-        decision_sequence: object,
-        approval_binding: str,
-        attestation: ChangeRequestAttestation | None,
-    ) -> ChangeRequestIssuePlan | ChangeRequestIssueCreateDenial:
-        reason = ChangeRequestIssueCreateDenialReason
-        if step not in CHANGE_REQUEST_ISSUE_CREATE_STEPS:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.STEP_NOT_ALLOWED)
-        if operation != CHANGE_REQUEST_ISSUE_CREATE_OPERATION:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.OPERATION_NOT_ALLOWED)
-        if workflow_type != self.workflow_type:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.WORKFLOW_TYPE_NOT_ALLOWED)
-        if attestation is None or attestation.change_request_id != change_request_id:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.NOT_APPROVED)
-        if workflow_id != change_request_publish_workflow_id(
-            attestation.change_request_id, attestation.revision
-        ):
-            return ChangeRequestIssueCreateDenial(reason_code=reason.WORKFLOW_NOT_BOUND)
-        if revision != attestation.revision:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.REVISION_MISMATCH)
-        # The workflow is bound to the approval decision it started from; an attestation
-        # from any other decision (older or newer) cannot authorize it.
-        if decision_sequence != attestation.decision_sequence:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.DECISION_SUPERSEDED)
-        if not self.writes_enabled:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.WRITES_DISABLED)
-        if not re.fullmatch(r"[a-f0-9]{64}", approval_binding) or not hmac.compare_digest(
-            attestation.approval_binding, approval_binding
-        ):
-            return ChangeRequestIssueCreateDenial(reason_code=reason.BINDING_MISMATCH)
-        repository = attestation.target_repository
-        if repository not in WRITE_REPOSITORIES or not target_repository_allowed(
-            attestation.project, repository
-        ):
-            return ChangeRequestIssueCreateDenial(reason_code=reason.REPOSITORY_NOT_ALLOWLISTED)
-        try:
-            proposal = validate_proposal(attestation.proposal, attestation.project)
-            rendered = render_change_request(
-                change_request_id=attestation.change_request_id,
-                revision=attestation.revision,
-                project=attestation.project,
-                target_repository=repository,
-                proposal=proposal,
-                review=ChangeReviewRecord.model_validate(attestation.review),
-                description_redacted=attestation.description_redacted,
-            )
-        except ValueError:
-            return ChangeRequestIssueCreateDenial(reason_code=reason.CONTENT_TAMPERED)
-        if (
-            not hmac.compare_digest(rendered.approval_binding, attestation.approval_binding)
-            or rendered.fingerprint != attestation.fingerprint
-            or rendered.title != attestation.issue_title
-            or rendered.body != attestation.issue_body
-        ):
-            return ChangeRequestIssueCreateDenial(reason_code=reason.CONTENT_TAMPERED)
-        return ChangeRequestIssuePlan(
-            change_request_id=attestation.change_request_id,
-            revision=attestation.revision,
-            repository=repository,
-            title=attestation.issue_title,
-            body=attestation.issue_body,
-            marker=rendered.marker,
-            approval_binding=attestation.approval_binding,
-            wanted_labels=(CHANGE_REQUEST_LABEL, proposal.kind),
         )

@@ -365,33 +365,3 @@ def test_github_worker_cannot_read_database_or_other_identity_credentials() -> N
     assert "EnvironmentFile=/etc/engineering-control/env/github-worker.env" in unit
     assert "EnvironmentFile=/etc/engineering-control/env/control.env" not in unit
     assert "DATABASE_URL" not in unit
-
-
-def test_change_request_attestor_writes_only_its_two_directories() -> None:
-    service = (
-        REPOSITORY_ROOT / "systemd" / "engineering-change-request-attestor.service"
-    ).read_text(encoding="utf-8")
-    path_unit = (
-        REPOSITORY_ROOT / "systemd" / "engineering-change-request-attestor.path"
-    ).read_text(encoding="utf-8")
-    bootstrap = (REPOSITORY_ROOT / "scripts" / "bootstrap-controller.sh").read_text(
-        encoding="utf-8"
-    )
-    writable = [line for line in service.splitlines() if line.startswith("ReadWritePaths=")]
-    assert writable == [
-        "ReadWritePaths=/etc/engineering-control/policy/change-requests "
-        "/var/lib/engineering-control/change-request-approvals"
-    ]
-    assert "User=root" in service and "ProtectSystem=strict" in service
-    assert "NoNewPrivileges=true" in service and "ProtectHome=true" in service
-    assert (
-        "PathExistsGlob=/var/lib/engineering-control/change-request-approvals/*.json" in path_unit
-    )
-    assert (
-        'install -d -o root -g engineering-control -m 1730 "${STATE_ROOT}/change-request-approvals"'
-        in bootstrap
-    )
-    assert (
-        'install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy/change-requests"'
-        in bootstrap
-    )

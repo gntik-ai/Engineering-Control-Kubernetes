@@ -203,10 +203,6 @@ class ControlActivities:
         "change_request.github_dedupe",
         "change_request.persist",
         "change_request.record_failure",
-        "change_request.load_approved",
-        "change_request.record_publish_intent",
-        "change_request.publish",
-        "change_request.persist_publication",
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",
@@ -361,7 +357,6 @@ class ControlActivities:
             "change_request.draft",
             "change_request.review",
             "change_request.github_dedupe",
-            "change_request.publish",
         }
         - GITOPS_GITHUB_STEPS,
         "scan": {
@@ -456,7 +451,6 @@ class ControlActivities:
             "enhancement.github_dedupe",
             "finding.publish",
             "change_request.github_dedupe",
-            "change_request.publish",
             *GITOPS_GITHUB_STEPS,
         },
         "release": {
@@ -556,8 +550,6 @@ class ControlActivities:
             and self.delivery_handler is not None
         ):
             return await self.delivery_handler.handle(step, safe_payload)
-        # NEW-108: the narrow change-request issue create is authorized only by its own
-        # policy inside this handler, never by the generic mutation path below.
         if (
             self.change_request_github_handler is not None
             and step in self.change_request_github_handler.supported_steps
@@ -656,7 +648,6 @@ class ControlActivities:
             "orchestration": {
                 "workflow_id": info.workflow_id,
                 "workflow_run_id": info.workflow_run_id,
-                "workflow_type": info.workflow_type,
                 "activity_run_id": info.activity_run_id,
                 "activity_id": info.activity_id,
                 "attempt": info.attempt,

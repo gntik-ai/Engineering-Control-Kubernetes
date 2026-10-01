@@ -25,7 +25,7 @@ from engineering_control.api.schemas import (
     ChangeRequestAccepted,
     ChangeRequestApproval,
     ChangeRequestCreate,
-    ChangeRequestPublicationReconciliation,
+    ChangeRequestPublication,
     ChangeRequestRejection,
     ChangeRequestRevision,
     DeliveryReconcile,
@@ -134,8 +134,7 @@ def create_app(
         resolved_change_requests = change_request_repository
         if resolved_change_requests is None and service is None:
             resolved_change_requests = ChangeRequestRepository(
-                resolved.database_url.get_secret_value(),
-                attestation_request_root=resolved.state_root / "change-request-approvals",
+                resolved.database_url.get_secret_value()
             )
         app.state.change_request_repository = resolved_change_requests
         stop = asyncio.Event()
@@ -1024,7 +1023,6 @@ def create_app(
         change_request_id: UUID,
         body: ChangeRequestApproval,
         subject: str = auth_dependency,
-        service: ControlService = control_dependency,
         repository: ChangeRequestRepository = change_requests_dependency,
     ) -> dict[str, Any]:
         actor = approval_actor(subject)
@@ -1036,23 +1034,8 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        except OSError as error:
-            # The decision is durable; repeating the same command re-requests attestation.
-            raise HTTPException(
-                status_code=503, detail="change request attestation request failed"
-            ) from error
-        try:
-            accepted = await service.start_change_request_publish(
-                change_request_id,
-                int(approved["revision"]),
-                body.approval_binding,
-                int(approved["decision_sequence"]),
-            )
-        except Exception as error:  # noqa: BLE001 - the APPROVED row can be re-approved
-            raise HTTPException(
-                status_code=503, detail="change request publish workflow could not be started"
-            ) from error
-        return {**approved, "publish_workflow_id": accepted.workflow_id, "run_id": accepted.run_id}
+        # Hermes never publishes: the operator runs `engineering-ctl change-publish` next.
+        return approved
 
     @app.post(
         "/v1/change-requests/{change_request_id}/revise",
@@ -1073,11 +1056,6 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        except OSError as error:
-            # The decision is durable; repeating the same command re-requests attestation.
-            raise HTTPException(
-                status_code=503, detail="change request attestation request failed"
-            ) from error
         revision = int(revised["revision"])
         try:
             accepted = await service.start_change_request(change_request_id, revision)
@@ -1109,32 +1087,27 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        except OSError as error:
-            # The decision is durable; repeating the same command re-requests attestation.
-            raise HTTPException(
-                status_code=503, detail="change request attestation request failed"
-            ) from error
 
-    @app.post("/v1/change-requests/{change_request_id}/reconcile-publication")
-    async def change_request_reconcile_publication(
+    @app.post("/v1/change-requests/{change_request_id}/published")
+    async def change_request_published(
         change_request_id: UUID,
-        body: ChangeRequestPublicationReconciliation,
+        body: ChangeRequestPublication,
         subject: str = auth_dependency,
         repository: ChangeRequestRepository = change_requests_dependency,
     ) -> dict[str, Any]:
         actor = approval_actor(subject)
         try:
-            return await repository.reconcile_publication(
-                change_request_id, body.issue_url, body.reason, actor
+            return await repository.mark_published(
+                change_request_id,
+                body.issue_url,
+                body.approval_binding,
+                body.decision_sequence,
+                actor,
             )
         except ChangeRequestNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        except OSError as error:
-            raise HTTPException(
-                status_code=503, detail="change request attestation request failed"
-            ) from error
 
     @app.get("/v1/findings/{finding_id}")
     async def finding_get(

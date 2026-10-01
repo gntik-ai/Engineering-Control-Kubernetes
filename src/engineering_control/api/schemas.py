@@ -328,24 +328,17 @@ class ChangeRequestRejection(APIModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
-class ChangeRequestPublicationReconciliation(APIModel):
-    """Operator resolution of an unknown or conflicting publication outcome."""
+class ChangeRequestPublication(APIModel):
+    """NEW-108: the issue the operator published with their own gh login."""
 
-    issue_url: str | None = Field(
-        default=None,
+    issue_url: str = Field(
         pattern=(
             r"^https://github\.com/gntik-ai/"
             r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)/issues/[1-9][0-9]*$"
-        ),
+        )
     )
-    no_issue: bool = False
-    reason: str = Field(min_length=3, max_length=1000)
-
-    @model_validator(mode="after")
-    def one_resolution(self) -> ChangeRequestPublicationReconciliation:
-        if (self.issue_url is None) == (self.no_issue is False):
-            raise ValueError("state exactly one of issue_url or no_issue")
-        return self
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    decision_sequence: int = Field(ge=1)
 
 
 class DeliveryStart(APIModel):

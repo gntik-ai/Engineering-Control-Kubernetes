@@ -28,4 +28,3 @@ class WorkflowName(StrEnum):
     LLMWIKI_STAGING_BOOTSTRAP = "LLMWikiStagingBootstrapWorkflow"
     STAGING_GITOPS_DELIVERY = "StagingGitOpsDeliveryWorkflow"
     CHANGE_REQUEST = "ChangeRequestWorkflow"
-    CHANGE_REQUEST_PUBLISH = "ChangeRequestPublishWorkflow"

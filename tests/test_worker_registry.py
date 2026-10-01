@@ -55,7 +55,6 @@ GITHUB_STEPS = frozenset(
         "gitops.environment_issue",
         "gitops.close_issue",
         "change_request.github_dedupe",
-        "change_request.publish",
     }
 )
 

@@ -13,7 +13,6 @@ from engineering_control.workflows.inputs import (
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
     ChangeRequestInput,
-    ChangeRequestPublishInput,
     CleanupInput,
     ConnectionsRefreshInput,
     DeliveryReconciliationInput,
@@ -319,7 +318,7 @@ class ControlledWorkflow:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.execute":
             return task_queue_for("release")
-        if step in {"change_request.github_dedupe", "change_request.publish"}:
+        if step == "change_request.github_dedupe":
             return GITHUB_TASK_QUEUE
         # NEW-108: fixed opposite providers -- Claude drafts, Codex independently reviews.
         if step == "change_request.draft":
@@ -3877,90 +3876,6 @@ class ChangeRequestWorkflow(ControlledWorkflow):
         }
 
 
-@workflow.defn(name="ChangeRequestPublishWorkflow")
-class ChangeRequestPublishWorkflow(ControlledWorkflow):
-    """NEW-108: publish one approved change request as exactly one GitHub issue.
-
-    Delivery is not started here; the operator imports and approves the issue through
-    the existing backlog path.
-    """
-
-    # The root reconciler attests an approval within seconds of its request file.
-    _attestation_waits = 10
-    _attestation_wait = timedelta(seconds=30)
-
-    @workflow.run
-    async def run(self, request: ChangeRequestPublishInput) -> dict[str, Any]:
-        context = await self._step("change_request.load_approved", asdict(request))
-        if context.get("status") == "PUBLISHED":
-            return {
-                "status": "PUBLISHED",
-                "change_request_id": request.change_request_id,
-                "issue_url": context.get("issue_url"),
-                "issue_number": context.get("issue_number"),
-            }
-        if context.get("status") != "APPROVED":
-            raise ApplicationError(
-                "change request is not publishable: "
-                + str(context.get("blocker", "CHANGE_REQUEST_APPROVAL_REQUIRED")),
-                type="ApprovalMismatch",
-                non_retryable=True,
-            )
-        intent = await self._step("change_request.record_publish_intent", asdict(request))
-        if intent.get("status") != "INTENT_RECORDED":
-            raise ApplicationError(
-                "change request publication intent was refused",
-                type="ApprovalMismatch",
-                non_retryable=True,
-            )
-        # Only identity and the durable intent travel to the GitHub worker; what it may
-        # publish comes from the root-attested durable approval.
-        payload = {**asdict(request), "publish_intent_at": intent.get("publish_intent_at")}
-        published: dict[str, Any] = {}
-        for wait in range(self._attestation_waits + 1):
-            try:
-                published = await self._step("change_request.publish", payload)
-                break
-            except ActivityError as error:
-                cause = error.cause
-                blocker = (
-                    cause.type
-                    if isinstance(cause, ApplicationError) and cause.type
-                    else "PUBLISH_ACTIVITY_FAILED"
-                )
-                if (
-                    blocker == "CHANGE_REQUEST_ATTESTATION_PENDING"
-                    and wait < self._attestation_waits
-                ):
-                    self._phase = "AWAITING_APPROVAL_ATTESTATION"
-                    await workflow.sleep(self._attestation_wait)
-                    continue
-                recorded = await self._step(
-                    "change_request.record_failure",
-                    {
-                        "change_request_id": request.change_request_id,
-                        "approval_binding": request.approval_binding,
-                        "failure_phase": "publish",
-                        "blocker": blocker,
-                    },
-                )
-                # A failed execution lets the operator's re-approval start a fresh run
-                # under the same deterministic workflow id.
-                raise ApplicationError(
-                    f"change request publication failed: {recorded.get('error_code')}",
-                    type="ChangeRequestPublishFailed",
-                    non_retryable=True,
-                ) from error
-        persisted = await self._step("change_request.persist_publication", published)
-        return {
-            "status": persisted.get("status", "PUBLISHED"),
-            "change_request_id": request.change_request_id,
-            "issue_url": persisted.get("issue_url"),
-            "issue_number": persisted.get("issue_number"),
-            "adopted": published.get("adopted"),
-        }
-
-
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     MultiProjectAuditWorkflow,
@@ -3988,5 +3903,4 @@ ALL_WORKFLOWS = [
     LLMWikiStagingBootstrapWorkflow,
     StagingGitOpsDeliveryWorkflow,
     ChangeRequestWorkflow,
-    ChangeRequestPublishWorkflow,
 ]

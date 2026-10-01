@@ -107,7 +107,8 @@ bootstrap software cleanup plan gated by `APPROVE CLEANUP`.
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved
-GitHub issue. The flow stops at the published issue. Delivery then uses the existing
+GitHub issue. Hermes drafts and reviews the request but never publishes it: the operator
+publishes it on the controller with their own `gh` login. Delivery then uses the normal
 `backlog-import`, `backlog-approve` and `backlog-start` path.
 
 ```bash
@@ -116,6 +117,8 @@ engineering-ctl change-draft --project musematic --file request.md --repository 
 engineering-ctl changes --project falcone --status CANDIDATE
 engineering-ctl change-show <id>      # rendered title/body, binding, findings, approve command
 engineering-ctl change-approve <id> <binding> APPROVE_CHANGE_<PROJECT>_<FIRST16HEX>
+engineering-ctl change-publish <id> --dry-run   # exact title, body and gh command; no writes
+engineering-ctl change-publish <id>             # publish with the operator's own gh login
 engineering-ctl change-revise <id> --note "Only administrators may export"
 engineering-ctl change-reject <id> --reason "Superseded by the reporting epic"
 ```
@@ -131,53 +134,28 @@ redraft and re-review. If the re-review still says `REVISE`, the request becomes
 anyway, and its unresolved findings appear in `change-show` and in the issue body. Nothing is
 ever approved automatically. Similar open issues in the target repository are attached as
 warnings only. Draft or review failures end in `FAILED` with a safe error code, and
-`change-revise` retries them.
+`change-revise` retries them. All model-written and operator-written text is escaped, so it can't
+hide or imitate the issue's `kind:`/`Risk:` lines, headings, checkboxes, review or hidden marker.
 
 `change-show` prints the exact approve command. The typed phrase binds the project and the
 first 16 hex digits of the approval binding. The binding covers the request, its revision,
 the proposal fingerprint, the target repository, the issue title and the body hash, so any
-revision or edit invalidates it. Approval accepts only the CLI operator and allowlisted
-`telegram:<id>` actors. It starts `ChangeRequestPublishWorkflow`
-(`change-request-publish-<id>-r<revision>`). Its `change_request.publish` step is a separate,
-narrow capability that can only create an issue. It is not one of the backlog write-capable
-steps and does not need backlog write-policy ownership. Only the global
-`ENGINEERING_GITHUB_WRITES_ENABLED` switch applies.
+revision or edit invalidates it. Approve, revise, reject and publish accept only the CLI operator
+and allowlisted `telegram:<id>` actors. Approval records a decision record and bumps the
+request's decision sequence.
 
-The GitHub worker has no database credential, so its authorization does not come from the
-workflow payload. Every approval change drops an id-only request in
-`/var/lib/engineering-control/change-request-approvals`. The root
-`engineering-change-request-attestor` (a path unit plus a 15-minute timer) reads the row from
-PostgreSQL. For an `APPROVED`, unpublished, re-verified row it writes a 24-hour attestation to
-`/etc/engineering-control/policy/change-requests` (`root:engineering-control 0640`); otherwise it
-revokes it. The worker re-renders that attestation and checks the binding, revision, workflow type
-and workflow id before it publishes the attested title and body. Before the first create, the
-publish intent is recorded durably. Every later attempt first pages the repository's issues
-newest-first through the REST API back past that intent. It adopts only an issue whose title and
-body exactly match the approved ones, whose last line is the marker and whose author is the Hermes
-identity. Any other issue that claims the request is a conflict. A lookup that cannot finish
-fails as `PUBLISH_OUTCOME_UNKNOWN` without creating anything. Labels (`hermes:change-request` and
-the kind) are applied only if they already exist and are never created.
-
-A failed publication fails the workflow run and leaves the request `APPROVED` with an
-`error_code`. Repeating the same `change-approve` command starts a fresh run. An `APPROVED` request
-that is not yet published can still be revised or rejected, which revokes its attestation. The
-exceptions are `PUBLISH_OUTCOME_UNKNOWN` and `PUBLISH_CONFLICT`: check GitHub first, then run
-`engineering-ctl change-reconcile <id> (--issue-url URL | --no-issue) --reason TEXT`.
-
-The intent timestamp survives revisions, so every publication of a request (any revision) looks
-up issues conclusively first. An issue from another revision is a conflict, never a second issue.
-Attestations and publish runs are bound to the approval's decision sequence. Any later decision
-supersedes them.
-
-The request directory is `root:engineering-control 01730`, a drop-only directory. The attestor
-opens both directories `O_NOFOLLOW` and requires their exact ownership and mode. It handles every
-entry relative to the directory descriptor. Anything unexpected is moved to `.quarantine` for the
-operator, never followed or unlinked. A request is consumed only if it is unchanged since it was
-read. Every attestation is re-checked against the row after it is written. The attestor also
-refuses a row whose content no longer matches the decision record written at approval. The GitHub
-worker keeps the `engineering-control` group for the write policy, the attestations and its own
-evidence token, but `control.env` and every other database or identity credential are
-`InaccessiblePaths`.
+`change-publish` runs on the controller as the operator. It fetches the `APPROVED` request,
+re-renders the title and body locally from the stored proposal, and recomputes the binding. It
+refuses on any mismatch or on a repository outside the allowlist. With the operator's `gh` (an
+argument list, never a shell), it searches the repository for an issue that already carries this
+request's hidden marker, from any revision. It adopts an issue only if the title, body and final
+marker line match exactly; any other claimant stops the command. Otherwise it runs `gh issue
+create`. The `hermes:change-request` and kind labels are added only if they already exist and are
+never created. Finally it calls `POST /v1/change-requests/<id>/published` with the URL, binding and
+decision sequence. That moves the request to `PUBLISHED` (final) only if all of them still match.
+It is idempotent for the same URL, so rerunning `change-publish` adopts the issue instead of
+creating another. An `APPROVED` request that is not yet published can still be revised or
+rejected.
 
 Backlog import reads a `Change request:` issue's `kind:` line. A `feature`, `bug` or `chore`
 request is classified like the same hand-written issue without that metadata, so it is eligible

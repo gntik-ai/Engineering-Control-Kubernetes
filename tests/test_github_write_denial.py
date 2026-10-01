@@ -41,7 +41,7 @@ class NoCommandRunner:
 
 
 def test_github_activity_classification_is_complete_and_disjoint() -> None:
-    assert len(GITHUB_ACTIVITY_STEPS) == 28
+    assert len(GITHUB_ACTIVITY_STEPS) == 27
     assert len(READ_ONLY_GITHUB_STEPS) == 9
     assert len(WRITE_CAPABLE_GITHUB_STEPS) == 8
     assert len(GITOPS_READ_ONLY_GITHUB_STEPS) == 5

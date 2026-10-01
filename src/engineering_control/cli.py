@@ -339,12 +339,10 @@ def parser() -> argparse.ArgumentParser:
     change_revise = commands.add_parser("change-revise")
     change_revise.add_argument("change_request_id")
     change_revise.add_argument("--note", required=True)
-    change_reconcile = commands.add_parser("change-reconcile")
-    change_reconcile.add_argument("change_request_id")
-    change_resolution = change_reconcile.add_mutually_exclusive_group(required=True)
-    change_resolution.add_argument("--issue-url")
-    change_resolution.add_argument("--no-issue", action="store_true")
-    change_reconcile.add_argument("--reason", required=True)
+    # Hermes never publishes: the operator does, with their own gh login on the controller.
+    change_publish = commands.add_parser("change-publish")
+    change_publish.add_argument("change_request_id")
+    change_publish.add_argument("--dry-run", action="store_true")
     change_reject = commands.add_parser("change-reject")
     change_reject.add_argument("change_request_id")
     change_reject.add_argument("--reason", required=True)
@@ -759,16 +757,13 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             f"/v1/change-requests/{arguments.change_request_id}/revise",
             {"note": arguments.note},
         )
-    if command == "change-reconcile":
-        resolution: dict[str, Any] = {"reason": arguments.reason}
-        if arguments.no_issue:
-            resolution["no_issue"] = True
-        else:
-            resolution["issue_url"] = arguments.issue_url
-        return client.request(
-            "POST",
-            f"/v1/change-requests/{arguments.change_request_id}/reconcile-publication",
-            resolution,
+    if command == "change-publish":
+        from engineering_control.engineering.change_request_publisher import (
+            publish_change_request,
+        )
+
+        return publish_change_request(
+            client, arguments.change_request_id, dry_run=arguments.dry_run
         )
     if command == "change-reject":
         return client.request(

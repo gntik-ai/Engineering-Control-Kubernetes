@@ -9,11 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
-import tempfile
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -40,27 +36,10 @@ from engineering_control.engineering.change_requests import (
 )
 from engineering_control.models.core import AgentRequest, resolve_agent_effort
 from engineering_control.models.enums import ModelClass, Project, Provider
-from engineering_control.policy.change_request_attestation import load_attestation
-from engineering_control.policy.github_write import (
-    CHANGE_REQUEST_ISSUE_CREATE_OPERATION,
-    CHANGE_REQUEST_ISSUE_CREATE_STEPS,
-    CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS,
-    ChangeRequestIssueCreateDenial,
-    ChangeRequestIssueCreateDenialReason,
-    ChangeRequestIssueCreatePolicy,
-    ChangeRequestIssuePlan,
-)
+from engineering_control.policy.github_write import CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS
 from engineering_control.security.redaction import SecretRedactor
 
 _FENCE_LIKE = re.compile(r"-{2,}\s*(BEGIN|END)\s+(UNTRUSTED|OPERATOR|PROPOSAL)", re.IGNORECASE)
-_MARKER = re.compile(
-    r"<!-- hermes-change-request id=([0-9a-f-]{36}) revision=([0-9]+) "
-    r"fingerprint=(sha256:[a-f0-9]{64}) binding=([a-f0-9]{64}) -->"
-)
-# NEW-108: a retried publication pages back conclusively past its durable intent.
-_INTENT_CLOCK_SKEW = timedelta(minutes=10)
-_LOOKUP_PAGE_SIZE = 50
-_LOOKUP_MAXIMUM_PAGES = 20
 _SEARCH_WORD = re.compile(r"[a-z0-9]{3,40}")
 _STOP_WORDS = frozenset(
     {
@@ -98,7 +77,6 @@ _FAILURE_PHASES = {
     "draft": "DRAFT",
     "review": "REVIEW",
     "internal": "CHANGE_REQUEST",
-    "publish": "PUBLISH",
 }
 
 _DRAFT_RULES = (
@@ -149,17 +127,8 @@ def _fenced(label: str, content: str) -> str:
     return f"--- BEGIN {label.upper()} ---\n{content.strip()}\n--- END {label.upper()} ---"
 
 
-_PUBLISH_FAILURES = {
-    "PUBLISH_OUTCOME_UNKNOWN": "PUBLISH_OUTCOME_UNKNOWN",
-    "CHANGE_REQUEST_PUBLICATION_CONFLICT": "PUBLISH_CONFLICT",
-    "CHANGE_REQUEST_ATTESTATION_PENDING": "PUBLISH_NOT_ATTESTED",
-}
-
-
 def _failure_code(phase: str, blocker: str) -> str:
     prefix = _FAILURE_PHASES.get(phase, "CHANGE_REQUEST")
-    if phase == "publish" and blocker in _PUBLISH_FAILURES:
-        return _PUBLISH_FAILURES[blocker]
     if blocker in {"SchemaViolation", f"{prefix}_SCHEMA_INVALID"}:
         return f"{prefix}_SCHEMA_INVALID"
     if blocker in _PROVIDER_UNAVAILABLE:
@@ -184,9 +153,6 @@ class ChangeRequestActivityHandler:
             "change_request.record_review",
             "change_request.persist",
             "change_request.record_failure",
-            "change_request.load_approved",
-            "change_request.record_publish_intent",
-            "change_request.persist_publication",
         }
     )
 
@@ -195,8 +161,7 @@ class ChangeRequestActivityHandler:
     ) -> None:
         self.settings = settings
         self.repository = repository or ChangeRequestRepository(
-            settings.database_url.get_secret_value(),
-            attestation_request_root=settings.state_root / "change-request-approvals",
+            settings.database_url.get_secret_value()
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -207,9 +172,6 @@ class ChangeRequestActivityHandler:
             "change_request.record_review": self._record_review,
             "change_request.persist": self._persist,
             "change_request.record_failure": self._record_failure,
-            "change_request.load_approved": self._load_approved,
-            "change_request.record_publish_intent": self._record_publish_intent,
-            "change_request.persist_publication": self._persist_publication,
         }
         handler = handlers.get(step)
         if handler is None:
@@ -418,64 +380,9 @@ class ChangeRequestActivityHandler:
     def _record_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
         phase = str(payload.get("failure_phase", "internal"))
         code = _failure_code(phase, str(payload.get("blocker") or payload.get("status") or ""))
-        if phase == "publish":
-            result = self.repository.record_publish_failure_sync(
-                UUID(str(payload["change_request_id"])),
-                str(payload.get("approval_binding", "")),
-                code,
-            )
-            return {**self._slim(payload), **result}
         change_request_id, revision = self._identity(payload)
         result = self.repository.record_failure_sync(change_request_id, revision, code)
         return {**self._slim(payload), **result}
-
-    def _load_approved(self, payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            change_request_id = UUID(str(payload["change_request_id"]))
-        except (KeyError, ValueError) as error:
-            raise ApplicationError(
-                "change request identity is invalid", type="PolicyViolation", non_retryable=True
-            ) from error
-        loaded = self.repository.load_approved_sync(
-            change_request_id, str(payload.get("approval_binding", ""))
-        )
-        if loaded["status"] == "APPROVED" and (
-            loaded["revision"] != payload.get("revision")
-            or loaded["decision_sequence"] != payload.get("decision_sequence")
-        ):
-            return {**payload, "status": "BLOCKED", "blocker": "CHANGE_REQUEST_DECISION_CHANGED"}
-        return {**payload, **loaded}
-
-    def _record_publish_intent(self, payload: dict[str, Any]) -> dict[str, Any]:
-        change_request_id, revision = self._identity(payload)
-        sequence = payload.get("decision_sequence")
-        if not isinstance(sequence, int):
-            return {**self._slim(payload), "status": "BLOCKED", "blocker": "DECISION_UNBOUND"}
-        recorded = self.repository.record_publish_intent_sync(
-            change_request_id, str(payload.get("approval_binding", "")), revision, sequence
-        )
-        return {**self._slim(payload), **recorded}
-
-    def _persist_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
-        number = payload.get("issue_number")
-        if payload.get("status") != "PUBLISHED" or not isinstance(number, int):
-            raise ApplicationError(
-                "change request publication result is invalid",
-                type="PolicyViolation",
-                non_retryable=True,
-            )
-        try:
-            result = self.repository.persist_publication_sync(
-                UUID(str(payload["change_request_id"])),
-                str(payload.get("approval_binding", "")),
-                str(payload.get("issue_url", "")),
-                number,
-            )
-        except ValueError as error:
-            raise ApplicationError(
-                str(error), type="PolicyViolation", non_retryable=True
-            ) from error
-        return {**payload, **result}
 
     @staticmethod
     def _structured_result(payload: dict[str, Any]) -> Any:
@@ -510,18 +417,17 @@ class ChangeRequestActivityHandler:
 
     @staticmethod
     def _slim(payload: dict[str, Any]) -> dict[str, Any]:
-        keys = ("change_request_id", "revision", "decision_sequence", "project", "approval_binding")
+        keys = ("change_request_id", "revision", "project")
         return {key: payload[key] for key in keys if key in payload}
 
 
 class ChangeRequestGitHubHandler:
-    """GitHub-worker change-request steps: a read-only search and one narrow issue create.
+    """GitHub-worker change-request step: a read-only search for similar open issues.
 
-    The broker is reachable only through this class, which never comments, edits, closes,
-    labels, creates labels, merges or pushes; the policy authorizes the single create.
+    Hermes never publishes a change request; the operator does, with their own gh login.
     """
 
-    supported_steps = CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS | CHANGE_REQUEST_ISSUE_CREATE_STEPS
+    supported_steps = CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS
 
     def __init__(self, settings: Settings, broker: GhCliBroker | None = None) -> None:
         self.settings = settings
@@ -531,18 +437,12 @@ class ChangeRequestGitHubHandler:
             self.root,
             writes_enabled=settings.github_writes_enabled,
             authenticated_home=settings.github_authenticated_home,
-            maximum_json_bytes=16_000_000,
-        )
-        self.policy = ChangeRequestIssueCreatePolicy(
-            writes_enabled=settings.github_writes_enabled and self.broker.writes_enabled
         )
         self.redactor = SecretRedactor()
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         if step in CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS:
             return await asyncio.to_thread(self._dedupe, payload)
-        if step in CHANGE_REQUEST_ISSUE_CREATE_STEPS:
-            return await asyncio.to_thread(self._publish, step, payload)
         raise ApplicationError(
             "unsupported change request GitHub activity",
             type="PolicyViolation",
@@ -593,224 +493,6 @@ class ChangeRequestGitHubHandler:
             **payload,
             "dedupe": {**dedupe, "status": "MATCHES" if matches else "CLEAR", "matches": matches},
         }
-
-    def _publish(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
-        orchestration = payload.get("orchestration")
-        context = orchestration if isinstance(orchestration, dict) else {}
-        change_request_id = str(payload.get("change_request_id", ""))
-        # Durable authorization: the root-owned attestation derived from the database row,
-        # never the activity payload, decides what (and whether) to publish.
-        attestation = load_attestation(
-            self.settings.change_request_attestation_root,
-            change_request_id,
-            production=self.settings.environment == "production",
-            now=datetime.now(UTC),
-        )
-        decision = self.policy.evaluate(
-            step=step,
-            operation=CHANGE_REQUEST_ISSUE_CREATE_OPERATION,
-            workflow_type=str(context.get("workflow_type", "")),
-            workflow_id=str(context.get("workflow_id", "")),
-            change_request_id=change_request_id,
-            revision=payload.get("revision"),
-            decision_sequence=payload.get("decision_sequence"),
-            approval_binding=str(payload.get("approval_binding", "")),
-            attestation=attestation,
-        )
-        if isinstance(decision, ChangeRequestIssueCreateDenial):
-            pending = decision.reason_code is ChangeRequestIssueCreateDenialReason.NOT_APPROVED
-            raise ApplicationError(
-                f"change request issue creation denied: {decision.reason_code.value}",
-                decision.model_dump(mode="json"),
-                type="CHANGE_REQUEST_ATTESTATION_PENDING" if pending else "PolicyViolation",
-                non_retryable=True,
-            )
-        # The earliest intent ever recorded durably for this request (any revision). Every
-        # attempt looks up conclusively first: no workflow, loop or attempt state can skip it.
-        intent_at = self._intent(payload)
-        self._ensure_root()
-        try:
-            login = self.broker.preflight((decision.repository,)).login
-            adopted = self._conclusive_lookup(decision, intent_at, login)
-            if adopted is not None:
-                return self._published(decision, adopted, adopted=True, labels=())
-            labels = self._existing_labels(decision)
-            url = self._create(decision, labels)
-        except GhCliAuthError as error:
-            raise ApplicationError(
-                "GitHub CLI authentication is unavailable",
-                type="BLOCKED_BY_GH_AUTH",
-                non_retryable=True,
-            ) from error
-        except GhCliPolicyError as error:
-            raise ApplicationError(
-                "GitHub broker rejected the change request issue",
-                type="PolicyViolation",
-                non_retryable=True,
-            ) from error
-        except CommandFailure as error:
-            # Retryable: every attempt first looks up conclusively.
-            raise ApplicationError(
-                "GitHub issue publication failed", type="GITHUB_ISSUE_PUBLICATION_FAILED"
-            ) from error
-        return self._published(decision, url, adopted=False, labels=labels)
-
-    @staticmethod
-    def _intent(payload: dict[str, Any]) -> datetime:
-        try:
-            value = datetime.fromisoformat(str(payload["publish_intent_at"]))
-        except (KeyError, ValueError) as error:
-            raise ApplicationError(
-                "change request publication intent was not recorded",
-                type="PolicyViolation",
-                non_retryable=True,
-            ) from error
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
-
-    def _conclusive_lookup(
-        self, plan: ChangeRequestIssuePlan, intent_at: datetime, login: str
-    ) -> str | None:
-        """Page every issue newest-first back past the durable intent (not the search index).
-
-        Returns the exact earlier publication to adopt, or None when none exists; anything
-        that cannot be decided fails closed with PUBLISH_OUTCOME_UNKNOWN.
-        """
-        cutoff = intent_at - _INTENT_CLOCK_SKEW
-        adopted: str | None = None
-        try:
-            for page in range(1, _LOOKUP_MAXIMUM_PAGES + 1):
-                items = self.broker.list_issues_page(
-                    plan.repository, page, per_page=_LOOKUP_PAGE_SIZE
-                )
-                concluded = len(items) < _LOOKUP_PAGE_SIZE
-                for item in items:
-                    created = datetime.fromisoformat(str(item.get("created_at")))
-                    if created.tzinfo is None:
-                        raise ValueError("issue creation time has no timezone")
-                    if created < cutoff:
-                        concluded = True
-                        break
-                    if "pull_request" in item:
-                        continue
-                    found = self._exact_publication(plan, item, login)
-                    if found is not None:
-                        if adopted is not None and adopted != found:
-                            raise self._conflict("several publications of this change request")
-                        adopted = found
-                if concluded:
-                    return adopted
-        except CommandFailure as error:
-            # Retryable; once retries are exhausted the run fails as outcome unknown.
-            raise ApplicationError(
-                "change request publication lookup failed", type="PUBLISH_OUTCOME_UNKNOWN"
-            ) from error
-        except (GhCliPolicyError, ValueError, TypeError) as error:
-            raise ApplicationError(
-                "change request publication outcome cannot be determined",
-                type="PUBLISH_OUTCOME_UNKNOWN",
-                non_retryable=True,
-            ) from error
-        raise ApplicationError(
-            "change request publication lookup exceeded its page bound",
-            type="PUBLISH_OUTCOME_UNKNOWN",
-            non_retryable=True,
-        )
-
-    def _exact_publication(
-        self, plan: ChangeRequestIssuePlan, item: dict[str, Any], login: str
-    ) -> str | None:
-        """The issue's URL if it is exactly this approved publication; a conflict if it only
-        claims this change request; None if it is unrelated."""
-        raw_body = item.get("body")
-        body = raw_body if isinstance(raw_body, str) else ""
-        if not any(match[0] == plan.change_request_id for match in _MARKER.findall(body)):
-            return None
-        normalized = body.replace("\r\n", "\n").rstrip("\n")
-        user = item.get("user")
-        number = item.get("number")
-        if (
-            item.get("title") != plan.title
-            or normalized != plan.body.rstrip("\n")
-            or normalized.splitlines()[-1] != plan.marker
-            or not isinstance(user, dict)
-            or user.get("login") != login
-            or not isinstance(number, int)
-        ):
-            raise self._conflict("an issue claims this change request but is not its publication")
-        return self._issue_url(plan.repository, str(item.get("html_url", "")), number)
-
-    @staticmethod
-    def _conflict(message: str) -> ApplicationError:
-        return ApplicationError(
-            message, type="CHANGE_REQUEST_PUBLICATION_CONFLICT", non_retryable=True
-        )
-
-    def _existing_labels(self, plan: ChangeRequestIssuePlan) -> tuple[str, ...]:
-        """Only labels the repository already has; labels are never created."""
-        try:
-            available = set(self.broker.list_labels(plan.repository))
-        except (CommandFailure, GhCliPolicyError):
-            return ()
-        return tuple(label for label in plan.wanted_labels if label in available)
-
-    def _create(self, plan: ChangeRequestIssuePlan, labels: tuple[str, ...]) -> str:
-        if self.redactor.redact_text(plan.body).value != plan.body:
-            raise ApplicationError(
-                "change request body is not redaction-stable",
-                type="PolicyViolation",
-                non_retryable=True,
-            )
-        descriptor, raw_path = tempfile.mkstemp(
-            prefix="change-request-", suffix=".md", dir=self.root
-        )
-        body_path = Path(raw_path)
-        os.chmod(body_path, 0o600)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(plan.body)
-            created = self.broker.create_issue(
-                repository=plan.repository,
-                title=plan.title,
-                body_file=body_path,
-                change_binding=f"change-request:{plan.change_request_id}",
-                labels=labels,
-            )
-        finally:
-            body_path.unlink(missing_ok=True)
-        return self._issue_url(plan.repository, created, None)
-
-    def _published(
-        self,
-        plan: ChangeRequestIssuePlan,
-        url: str,
-        *,
-        adopted: bool,
-        labels: tuple[str, ...],
-    ) -> dict[str, Any]:
-        return {
-            "change_request_id": plan.change_request_id,
-            "revision": plan.revision,
-            "approval_binding": plan.approval_binding,
-            "status": "PUBLISHED",
-            "issue_url": url,
-            "issue_number": int(url.rsplit("/", 1)[-1]),
-            "adopted": adopted,
-            "labels_applied": list(labels),
-        }
-
-    @staticmethod
-    def _issue_url(repository: str, value: str, number: int | None) -> str:
-        url = value.strip()
-        match = re.fullmatch(
-            rf"https://github\.com/{re.escape(repository)}/issues/([1-9][0-9]*)", url
-        )
-        if match is None or (number is not None and int(match.group(1)) != number):
-            raise ApplicationError(
-                "GitHub issue publication result is invalid",
-                type="PolicyViolation",
-                non_retryable=True,
-            )
-        return url
 
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)

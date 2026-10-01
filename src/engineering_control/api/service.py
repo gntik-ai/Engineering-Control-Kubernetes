@@ -32,10 +32,7 @@ from engineering_control.api.schemas import (
     RuntimeVerificationStart,
 )
 from engineering_control.db.repository import MetadataRepository
-from engineering_control.engineering.change_requests import (
-    change_request_publish_workflow_id,
-    change_request_workflow_id,
-)
+from engineering_control.engineering.change_requests import change_request_workflow_id
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.models.enums import Project
 from engineering_control.policy.approvals import ApprovalService
@@ -44,7 +41,6 @@ from engineering_control.workflows.inputs import (
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
     ChangeRequestInput,
-    ChangeRequestPublishInput,
     DeliveryReconciliationInput,
     EnhancementDiscoveryInput,
     EnhancementSolutionLoopInput,
@@ -115,13 +111,6 @@ class ControlService(Protocol):
     ) -> OperationAccepted: ...
     async def start_change_request(
         self, change_request_id: UUID, revision: int
-    ) -> OperationAccepted: ...
-    async def start_change_request_publish(
-        self,
-        change_request_id: UUID,
-        revision: int,
-        approval_binding: str,
-        decision_sequence: int,
     ) -> OperationAccepted: ...
 
 
@@ -582,25 +571,6 @@ class TemporalControlService:
             WorkflowName.CHANGE_REQUEST.value,
             ChangeRequestInput(change_request_id=str(change_request_id), revision=revision),
             change_request_workflow_id(str(change_request_id), revision),
-        )
-
-    async def start_change_request_publish(
-        self,
-        change_request_id: UUID,
-        revision: int,
-        approval_binding: str,
-        decision_sequence: int,
-    ) -> OperationAccepted:
-        """NEW-108: one deterministic publish workflow per approved revision."""
-        return await self._start_once(
-            WorkflowName.CHANGE_REQUEST_PUBLISH.value,
-            ChangeRequestPublishInput(
-                change_request_id=str(change_request_id),
-                approval_binding=approval_binding,
-                revision=revision,
-                decision_sequence=decision_sequence,
-            ),
-            change_request_publish_workflow_id(str(change_request_id), revision),
         )
 
     async def _start_once(

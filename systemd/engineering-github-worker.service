@@ -32,11 +32,11 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadOnlyPaths=/home/hermes/.config/gh /home/hermes/.gitconfig /etc/engineering-control/policy/github-issue-write-validation.yaml -/etc/engineering-control/policy/change-requests
+ReadOnlyPaths=/home/hermes/.config/gh /home/hermes/.gitconfig /etc/engineering-control/policy/github-issue-write-validation.yaml
 InaccessiblePaths=-/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.kube -/etc/engineering-control/credentials -/etc/engineering-control/env/release
-# NEW-108: the engineering-control group is still needed for the write policy, the
-# change-request attestations and this worker's own evidence token, but no database
-# credential or other identity's token is reachable.
+# NEW-108: the engineering-control group is still needed for the write policy and this
+# worker's own evidence token, but no database credential or other identity's token is
+# reachable.
 InaccessiblePaths=-/etc/engineering-control/env/control.env -/etc/engineering-control/env/infrastructure.env -/etc/engineering-control/env/evidence-ingest.env
 InaccessiblePaths=-/etc/engineering-control/env/evidence-uploaders/codex-runner.token -/etc/engineering-control/env/evidence-uploaders/claude-runner.token -/etc/engineering-control/env/evidence-uploaders/browser-runner.token -/etc/engineering-control/env/evidence-uploaders/scan-runner.token -/etc/engineering-control/env/evidence-uploaders/delivery-runner.token -/etc/engineering-control/env/evidence-uploaders/release-runner.token
 # NEW-61: delivery.publish fetches the validated ChangeSet commits from the worker host

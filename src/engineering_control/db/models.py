@@ -458,11 +458,7 @@ class ChangeRequest(UUIDPrimaryKey, Timestamps, Base):
     decision_reason: Mapped[str | None] = mapped_column(Text)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Set durably before the first GitHub create of ANY revision and never cleared: every
-    # later publication of this request must first look up conclusively.
-    publish_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Incremented by every operator decision and by publication; attestations and publish
-    # workflows are bound to it, so a later decision invalidates them.
+    # Incremented by every operator decision; publication is bound to the approved one.
     decision_sequence: Mapped[int] = mapped_column(Integer, default=0)
     # Written only at approval: the decision record and a hash of the approved content.
     approval_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

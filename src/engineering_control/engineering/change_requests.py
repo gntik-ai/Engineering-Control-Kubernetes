@@ -34,6 +34,11 @@ _REPOSITORY_PATTERN = r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-de
 # The GitHub broker accepts only this character set in an issue title (GhCliBroker._value).
 _TITLE_UNSAFE = re.compile(r"[^A-Za-z0-9._:/@+ =,\"'-]+")
 _BINDING = re.compile(r"^[a-f0-9]{64}$")
+# Any revision's hidden marker for a change request (group 1 is the request id).
+MARKER_PATTERN = re.compile(
+    r"<!-- hermes-change-request id=([0-9a-f-]{36}) revision=([0-9]+) "
+    r"fingerprint=(sha256:[a-f0-9]{64}) binding=([a-f0-9]{64}) -->"
+)
 
 
 class ChangeRequestModel(BaseModel):
@@ -220,10 +225,6 @@ def approval_phrase(project: str, binding: str) -> str:
 
 def change_request_workflow_id(change_request_id: str, revision: int) -> str:
     return f"change-request-{change_request_id}-r{revision}"
-
-
-def change_request_publish_workflow_id(change_request_id: str, revision: int) -> str:
-    return f"change-request-publish-{change_request_id}-r{revision}"
 
 
 def change_request_marker(
