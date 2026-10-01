@@ -2015,6 +2015,7 @@ async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(
         if outcome == "protected":
             assert cleanup_run.error_code == "CLEANUP_PROTECTED_WORKTREES_RETAINED"
             assert "1 protected worktrees retained" in (cleanup_run.summary or "")
+            assert f"{lease_id}: Permission denied" in (cleanup_run.summary or "")
         else:
             assert cleanup_run.error_code is None
 

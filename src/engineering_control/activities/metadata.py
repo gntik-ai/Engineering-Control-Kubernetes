@@ -7835,14 +7835,19 @@ class MetadataActivityHandler:
                     f"{len(completed_file_ids)} bounded files, "
                     f"{len(authorized_component_ids)} component leases, "
                     f"{len(authorized_preview_ids)} preview namespaces"
-                    + (
-                        f"; {len(protected_ids)} protected worktrees retained for the operator"
-                        if protected_ids
-                        else ""
-                    )
                 )
                 if protected_ids:
+                    # The lease stays held and is re-authorized daily until an operator
+                    # fixes the worktree; record which ones and why, durably on the Run.
+                    details = "; ".join(
+                        f"{value['lease_id']}: {str(value.get('reason') or 'unknown')[:120]}"
+                        for value in sorted(raw_protected, key=lambda item: item["lease_id"])
+                    )
                     run.error_code = "CLEANUP_PROTECTED_WORKTREES_RETAINED"
+                    run.summary = (
+                        f"{run.summary}; {len(protected_ids)} protected worktrees retained "
+                        f"for the operator: {details}"
+                    )[:4000]
             elif terminal == "DRY_RUN":
                 run.status = "SUCCESS"
                 run.summary = "cleanup dry run completed without mutation"
