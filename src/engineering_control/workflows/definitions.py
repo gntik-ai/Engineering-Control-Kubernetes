@@ -3787,6 +3787,31 @@ class ChangeRequestWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: ChangeRequestInput) -> dict[str, Any]:
+        try:
+            result = await self._draft_and_review(request)
+        except ActivityError:
+            await self._finalize_change_request_run(request, "FAILED", "CHANGE_REQUEST_FAILED")
+            raise
+        await self._finalize_change_request_run(
+            request, str(result.get("status", "FAILED")), result.get("error_code")
+        )
+        return result
+
+    async def _finalize_change_request_run(
+        self, request: ChangeRequestInput, status: str, error_code: Any
+    ) -> None:
+        """Close the control Run that the provider invocations opened (if any)."""
+        await self._step(
+            "change_request.finalize_run",
+            {
+                "change_request_id": request.change_request_id,
+                "revision": request.revision,
+                "terminal_status": status,
+                "error_code": error_code,
+            },
+        )
+
+    async def _draft_and_review(self, request: ChangeRequestInput) -> dict[str, Any]:
         context = await self._step("change_request.load", asdict(request))
         if context.get("status") != "DRAFTING":
             return {

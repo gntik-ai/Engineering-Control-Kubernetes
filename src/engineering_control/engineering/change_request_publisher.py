@@ -26,6 +26,7 @@ from engineering_control.engineering.change_requests import (
     MARKER_PATTERN,
     ChangeReviewRecord,
     approval_binding,
+    approval_record_matches,
     render_change_request,
     target_repository_allowed,
     validate_proposal,
@@ -131,6 +132,24 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
         or rendered.body != body
     ):
         raise ChangePublishError("change request title, body or repository changed since approval")
+    # The same approval-record check /published applies, before any GitHub write.
+    if not approval_record_matches(
+        view.get("approval_snapshot"),
+        project=project,
+        target_repository=repository,
+        proposal=view.get("proposal"),
+        review=view.get("review"),
+        description_redacted=str(view.get("description_redacted", "")),
+        issue_title=title,
+        issue_body=body,
+        fingerprint=fingerprint,
+        revision=revision,
+        decision_sequence=sequence,
+        decided_by=view.get("decided_by"),
+        decided_at=view.get("decided_at"),
+        approval_binding=binding,
+    ):
+        raise ChangePublishError("change request no longer matches its approval record")
     return PublicationPlan(
         change_request_id=change_request_id,
         revision=revision,

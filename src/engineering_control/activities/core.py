@@ -203,6 +203,7 @@ class ControlActivities:
         "change_request.github_dedupe",
         "change_request.persist",
         "change_request.record_failure",
+        "change_request.finalize_run",
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",

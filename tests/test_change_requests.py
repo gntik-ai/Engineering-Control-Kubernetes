@@ -1365,3 +1365,34 @@ def test_cli_change_publish_dispatches_to_the_operator_publisher(
     dispatch(client, parser().parse_args(["change-publish", identifier, "--dry-run"]))  # type: ignore[arg-type]
     dispatch(client, parser().parse_args(["change-publish", identifier]))  # type: ignore[arg-type]
     assert calls == [(client, identifier, True), (client, identifier, False)]
+
+
+def test_change_publish_refuses_a_post_approval_rewrite_before_any_gh_call(
+    repository: ChangeRequestRepository,
+) -> None:
+    view = approved_view(repository)
+    change_request_id = UUID(view["id"])
+    # A consistent rewrite: new content, re-rendered title/body and a matching new binding,
+    # so only the approval-time decision record can tell it was never approved.
+    with repository.sessions.begin() as session:
+        row = session.get(ChangeRequest, change_request_id)
+        assert row is not None
+        row.proposal_json = {**row.proposal_json, "what_changes": ["Something never approved."]}
+        rerendered = ChangeRequestRepository.rendered(row)
+        row.fingerprint = rerendered.fingerprint
+        row.issue_title = rerendered.title
+        row.issue_body = rerendered.body
+        row.approval_binding_sha256 = rerendered.approval_binding
+    gh = FakeGh()
+    with pytest.raises(ChangePublishError, match="approval record"):
+        publish_change_request(OperatorAPI(repository), view["id"], gh=gh)
+    assert gh.calls == []
+    # The dry run refuses too, and an untouched request still verifies.
+    with pytest.raises(ChangePublishError, match="approval record"):
+        publish_change_request(OperatorAPI(repository), view["id"], dry_run=True, gh=gh)
+    other = approved_view(repository)
+    assert (
+        publish_change_request(OperatorAPI(repository), other["id"], dry_run=True, gh=gh)["status"]
+        == "DRY_RUN"
+    )
+    assert other["approval_snapshot"]["approval_binding"] == other["approval_binding"]

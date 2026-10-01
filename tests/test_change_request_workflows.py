@@ -10,7 +10,7 @@ import shutil
 import uuid
 from collections.abc import Callable
 from contextlib import AsyncExitStack
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -26,6 +26,7 @@ from temporalio.worker import Replayer, Worker
 
 from engineering_control.activities.change_requests import ChangeRequestActivityHandler
 from engineering_control.activities.core import ControlActivities
+from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db import models  # noqa: F401
 from engineering_control.db.base import Base
@@ -80,8 +81,11 @@ def scripted_activity(
     handler: ChangeRequestActivityHandler,
     responses: dict[str, list[Callable[[dict[str, Any]], dict[str, Any]]]],
     calls: list[str],
+    metadata: MetadataActivityHandler | None = None,
+    persisted: list[dict[str, Any]] | None = None,
 ) -> Any:
-    """Real controller steps; every other step pops its next scripted response."""
+    """Real controller steps (and, when given, the real provider telemetry handler);
+    every other step pops its next scripted response."""
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
@@ -91,6 +95,10 @@ def scripted_activity(
         if step in handler.supported_steps:
             return await handler.handle(step, payload)
         if step in {"agent.record_start", "agent.persist_result"}:
+            if step == "agent.persist_result" and persisted is not None:
+                persisted.append(payload)
+            if metadata is not None:
+                return await metadata.handle(step, payload)
             return payload
         queue = responses.get(step)
         if not queue:
@@ -105,10 +113,30 @@ def snapshot(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def agent(structured: dict[str, Any]) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """A complete provider result bound to the invocation's own normalized request."""
+
     def respond(payload: dict[str, Any]) -> dict[str, Any]:
-        return {**payload, "status": "SUCCESS", "agent_result": {"structured_result": structured}}
+        key = {"change_request.draft": "draft_request", "change_request.review": "review_request"}
+        request = payload[key[payload["provider_step"]]]
+        now = datetime.now(UTC).isoformat()
+        result = {
+            "run_id": request["run_id"],
+            "provider": request["provider"],
+            "role": request["role"],
+            "status": "SUCCESS",
+            "structured_result": structured,
+            "started_at": now,
+            "finished_at": now,
+        }
+        return {**payload, "status": "SUCCESS", "agent_result": result}
 
     return respond
+
+
+def provider_unavailable(payload: dict[str, Any]) -> dict[str, Any]:
+    raise ApplicationError(
+        "codex needs manual authentication", type="MANUAL_AUTH_REQUIRED_CODEX", non_retryable=True
+    )
 
 
 def schema_violation(payload: dict[str, Any]) -> dict[str, Any]:
@@ -208,6 +236,7 @@ async def test_draft_review_approve_dedupe_persist_reaches_candidate(
         "change_request.record_review",
         "change_request.github_dedupe",
         "change_request.persist",
+        "change_request.finalize_run",
     ]
     view = repository.get_sync(change_request_id)
     assert view is not None
@@ -339,3 +368,120 @@ def test_migration_0014_creates_exactly_the_model_table(
     assert repository.get_sync(created) is not None
     engine.dispose()
     assert uuid.UUID(str(created))
+
+
+def control_runs(repository: ChangeRequestRepository, workflow_id: str) -> list[Any]:
+    from sqlalchemy import select
+
+    from engineering_control.db.models import AgentInvocation, Run
+
+    with repository.sessions() as session:
+        runs = session.scalars(select(Run).where(Run.workflow_id == workflow_id)).all()
+        invocations = session.scalars(
+            select(AgentInvocation).where(AgentInvocation.run_id.in_([run.id for run in runs]))
+        ).all()
+        return [
+            (run.status, run.finished_at is not None, run.error_code, run.run_type) for run in runs
+        ] + sorted((item.role, item.status) for item in invocations)
+
+
+@pytestmark_temporal
+async def test_a_candidate_closes_its_control_run_and_invocations(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id = new_request(repository)
+    handler = ChangeRequestActivityHandler(Settings(), repository=repository)
+    metadata = MetadataActivityHandler(Settings(database_url=str(repository.engine.url)))
+    activity_fn = scripted_activity(
+        handler,
+        {
+            "project.snapshot": [snapshot],
+            "change_request.draft": [agent(PROPOSAL)],
+            "change_request.review": [agent(APPROVE)],
+            "change_request.github_dedupe": [dedupe],
+        },
+        [],
+        metadata,
+    )
+    workflow_id = change_request_workflow_id(str(change_request_id), 1)
+    result, _ = await run_workflow(
+        ChangeRequestWorkflow,
+        ChangeRequestInput(change_request_id=str(change_request_id), revision=1),
+        activity_fn,
+        workflow_id,
+    )
+    assert result["status"] == "CANDIDATE"
+    assert control_runs(repository, workflow_id) == [
+        ("SUCCESS", True, None, "change-request"),
+        ("code-reviewer", "SUCCESS"),
+        ("product-spec-architect", "SUCCESS"),
+    ]
+
+
+@pytestmark_temporal
+async def test_a_review_provider_failure_is_recorded_as_its_own_and_closes_the_run(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id = new_request(repository)
+    handler = ChangeRequestActivityHandler(Settings(), repository=repository)
+    metadata = MetadataActivityHandler(Settings(database_url=str(repository.engine.url)))
+    persisted: list[dict[str, Any]] = []
+    activity_fn = scripted_activity(
+        handler,
+        {
+            "project.snapshot": [snapshot],
+            "change_request.draft": [agent(PROPOSAL)],
+            "change_request.review": [provider_unavailable],
+        },
+        [],
+        metadata,
+        persisted,
+    )
+    workflow_id = change_request_workflow_id(str(change_request_id), 1)
+    result, _ = await run_workflow(
+        ChangeRequestWorkflow,
+        ChangeRequestInput(change_request_id=str(change_request_id), revision=1),
+        activity_fn,
+        workflow_id,
+    )
+    assert result["status"] == "FAILED"
+    assert result["error_code"] == "REVIEW_PROVIDER_UNAVAILABLE"
+    # The Codex failure was persisted without Claude's earlier result.
+    assert "agent_result" not in persisted[-1]
+    assert persisted[-1]["blocker"] == "MANUAL_AUTH_REQUIRED_CODEX"
+    assert control_runs(repository, workflow_id) == [
+        ("FAILED", True, "REVIEW_PROVIDER_UNAVAILABLE", "change-request"),
+        ("code-reviewer", "FAILED"),
+        ("product-spec-architect", "SUCCESS"),
+    ]
+    view = repository.get_sync(change_request_id)
+    assert view is not None and view["error_code"] == "REVIEW_PROVIDER_UNAVAILABLE"
+
+
+def test_each_provider_invocation_starts_without_earlier_results() -> None:
+    from unittest.mock import Mock
+
+    handler = ChangeRequestActivityHandler(Settings(), repository=Mock())
+    stale = {
+        "agent_result": {"structured_result": PROPOSAL},
+        "agent_invocation_id": "x",
+        "agent_invocation_status": "SUCCESS",
+        "instruction_bundle": {"sha256": "a" * 64},
+        "observability": {"execution_id": "x"},
+        "handoff_hashes": {},
+    }
+    base = {
+        "change_request_id": str(uuid.uuid4()),
+        "revision": 1,
+        "project": "falcone",
+        "target_repository": "gntik-ai/falcone",
+        "source_worktree": "/srv/wt/falcone/x",
+        "description_redacted": "Add a CSV export of the tenant audit log for operators.",
+        "review_rounds": [REVISE],
+        "proposal": PROPOSAL,
+    }
+    review = handler._prepare_review({**base, **stale, "draft_attempt": 1})
+    redraft = handler._prepare_draft({**base, **stale, "draft_attempt": 2})
+    assert review["status"] == "REVIEW_READY" and redraft["status"] == "DRAFT_READY"
+    for prepared in (review, redraft):
+        assert not set(stale) & set(prepared)

@@ -217,6 +217,50 @@ def approval_binding(
     )
 
 
+def approval_record(
+    *,
+    project: str,
+    target_repository: str,
+    proposal: Any,
+    review: Any,
+    description_redacted: str,
+    issue_title: str | None,
+    issue_body: str | None,
+    fingerprint: str | None,
+    revision: int,
+    decision_sequence: int,
+    decided_by: str | None,
+    decided_at: str | None,
+    approval_binding: str | None,
+) -> dict[str, Any]:
+    """The decision record written once at approval: who approved what, and a hash of
+    exactly the approved content. Shared by /published and engineering-ctl change-publish
+    so both refuse a post-approval rewrite the same way."""
+    return {
+        "revision": revision,
+        "decision_sequence": decision_sequence,
+        "decided_by": decided_by,
+        "decided_at": decided_at,
+        "approval_binding": approval_binding,
+        "content_sha256": canonical_sha256(
+            {
+                "project": project,
+                "target_repository": target_repository,
+                "proposal": proposal,
+                "review": review,
+                "description_redacted": description_redacted,
+                "issue_title": issue_title,
+                "issue_body": issue_body,
+                "fingerprint": fingerprint,
+            }
+        ),
+    }
+
+
+def approval_record_matches(stored: Any, **fields: Any) -> bool:
+    return isinstance(stored, dict) and stored == approval_record(**fields)
+
+
 def approval_phrase(project: str, binding: str) -> str:
     if not _BINDING.fullmatch(binding):
         raise ValueError("approval binding is invalid")

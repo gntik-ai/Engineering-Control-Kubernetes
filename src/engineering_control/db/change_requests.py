@@ -13,9 +13,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
-from engineering_control.db.models import ChangeRequest
+from engineering_control.db.models import ChangeRequest, Run
 from engineering_control.engineering.backlog import (
-    canonical_sha256,
     is_reauthenticated_backlog_operator,
 )
 from engineering_control.engineering.change_requests import (
@@ -25,6 +24,8 @@ from engineering_control.engineering.change_requests import (
     ChangeReviewRecord,
     RenderedChangeRequest,
     approval_phrase,
+    approval_record,
+    approval_record_matches,
     change_request_workflow_id,
     render_change_request,
     validate_proposal,
@@ -161,7 +162,7 @@ class ChangeRequestRepository:
                 row.decision_reason = None
                 row.error_code = None
                 row.decision_sequence += 1
-                row.approval_snapshot_json = self._approval_snapshot(row)
+                row.approval_snapshot_json = approval_record(**self._approval_fields(row))
                 session.flush()
                 replayed = {**self._view(row), "replayed": False}
         return replayed
@@ -272,7 +273,9 @@ class ChangeRequestRepository:
             if row.status != "APPROVED":
                 raise ValueError("only an APPROVED change request can be published")
             self._verify_stored_content(row)
-            if row.approval_snapshot_json != self._approval_snapshot(row):
+            if not approval_record_matches(
+                row.approval_snapshot_json, **self._approval_fields(row)
+            ):
                 raise ValueError("change request content no longer matches its approval record")
             row.status = "PUBLISHED"
             row.issue_url = issue_url
@@ -364,32 +367,40 @@ class ChangeRequestRepository:
             return {"status": "FAILED", "error_code": code}
 
     @classmethod
-    def _approval_snapshot(cls, row: ChangeRequest) -> dict[str, Any]:
-        """The approval decision record and a hash of exactly the approved content."""
+    def _approval_fields(cls, row: ChangeRequest) -> dict[str, Any]:
         return {
+            "project": row.project,
+            "target_repository": row.target_repository,
+            "proposal": row.proposal_json,
+            "review": row.review_json,
+            "description_redacted": row.description_redacted,
+            "issue_title": row.issue_title,
+            "issue_body": row.issue_body,
+            "fingerprint": row.fingerprint,
             "revision": row.revision,
             "decision_sequence": row.decision_sequence,
             "decided_by": row.decided_by,
             "decided_at": cls._iso(row.decided_at),
             "approval_binding": row.approval_binding_sha256,
-            "content_sha256": canonical_sha256(
-                {
-                    "project": row.project,
-                    "target_repository": row.target_repository,
-                    "proposal": row.proposal_json,
-                    "review": row.review_json,
-                    "description_redacted": row.description_redacted,
-                    "issue_title": row.issue_title,
-                    "issue_body": row.issue_body,
-                    "fingerprint": row.fingerprint,
-                }
-            ),
         }
 
     @staticmethod
     def _decision_open(row: ChangeRequest, statuses: set[str]) -> bool:
         """Revise/reject are open in these statuses, or while APPROVED but unpublished."""
         return row.status in statuses or (row.status == "APPROVED" and row.issue_url is None)
+
+    def finalize_run_sync(self, workflow_id: str, status: str, error_code: str | None) -> bool:
+        """Close the control Run the provider telemetry opened for this workflow."""
+        if not workflow_id.startswith("change-request-"):
+            return False
+        with self.sessions.begin() as session:
+            runs = session.scalars(select(Run).where(Run.workflow_id == workflow_id)).all()
+            now = datetime.now(UTC)
+            for run in runs:
+                run.status = status
+                run.error_code = error_code
+                run.finished_at = run.finished_at or now
+            return bool(runs)
 
     # Helpers --------------------------------------------------------------------------------
 
@@ -484,6 +495,7 @@ class ChangeRequestRepository:
             "issue_body": row.issue_body,
             "approval_binding": binding,
             "confirmation_phrase": phrase,
+            "approval_snapshot": row.approval_snapshot_json,
             "publish_command": (
                 f"engineering-ctl change-publish {row.id}" if row.status == "APPROVED" else None
             ),

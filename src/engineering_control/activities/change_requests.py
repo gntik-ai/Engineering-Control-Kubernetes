@@ -72,6 +72,16 @@ _PROVIDER_UNAVAILABLE = frozenset(
         "AGENT_PACK_INVALID",
     }
 )
+_PROVIDER_RESULT_KEYS = frozenset(
+    {
+        "agent_result",
+        "agent_invocation_id",
+        "agent_invocation_status",
+        "instruction_bundle",
+        "observability",
+        "handoff_hashes",
+    }
+)
 _FAILURE_PHASES = {
     "snapshot": "SNAPSHOT",
     "draft": "DRAFT",
@@ -153,6 +163,7 @@ class ChangeRequestActivityHandler:
             "change_request.record_review",
             "change_request.persist",
             "change_request.record_failure",
+            "change_request.finalize_run",
         }
     )
 
@@ -172,6 +183,7 @@ class ChangeRequestActivityHandler:
             "change_request.record_review": self._record_review,
             "change_request.persist": self._persist,
             "change_request.record_failure": self._record_failure,
+            "change_request.finalize_run": self._finalize_run,
         }
         handler = handlers.get(step)
         if handler is None:
@@ -277,7 +289,7 @@ class ChangeRequestActivityHandler:
             writable=False,
         )
         return {
-            **payload,
+            **self._without_provider_results(payload),
             "status": "DRAFT_READY",
             "provider": Provider.CLAUDE.value,
             "draft_provider": Provider.CLAUDE.value,
@@ -328,7 +340,7 @@ class ChangeRequestActivityHandler:
             writable=False,
         )
         return {
-            **payload,
+            **self._without_provider_results(payload),
             "status": "REVIEW_READY",
             "proposal": proposal.model_dump(mode="json"),
             "provider": Provider.CODEX.value,
@@ -383,6 +395,30 @@ class ChangeRequestActivityHandler:
         change_request_id, revision = self._identity(payload)
         result = self.repository.record_failure_sync(change_request_id, revision, code)
         return {**self._slim(payload), **result}
+
+    def _finalize_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orchestration = payload.get("orchestration")
+        context = orchestration if isinstance(orchestration, dict) else {}
+        workflow_id = str(context.get("workflow_id") or "")
+        status = str(payload.get("terminal_status") or "FAILED")
+        error_code = payload.get("error_code")
+        finalized = self.repository.finalize_run_sync(
+            workflow_id,
+            "SUCCESS"
+            if status == "CANDIDATE"
+            else "CANCELLED"
+            if status == "SUPERSEDED"
+            else "FAILED",
+            str(error_code)[:120] if error_code else None,
+        )
+        return {**self._slim(payload), "status": status, "run_finalized": finalized}
+
+    @staticmethod
+    def _without_provider_results(payload: dict[str, Any]) -> dict[str, Any]:
+        """Drop the previous invocation's result and provenance before preparing the next,
+        so a provider that fails before returning is recorded as its own failure rather
+        than through another provider's stale result."""
+        return {key: value for key, value in payload.items() if key not in _PROVIDER_RESULT_KEYS}
 
     @staticmethod
     def _structured_result(payload: dict[str, Any]) -> Any:
