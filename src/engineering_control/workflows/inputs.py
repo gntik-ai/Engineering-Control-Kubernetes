@@ -208,6 +208,7 @@ class ChangeRequestInput:
 class ChangeRequestPublishInput:
     change_request_id: str
     approval_binding: str
+    revision: int
 
 
 @dataclass

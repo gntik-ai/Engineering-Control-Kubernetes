@@ -32,7 +32,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadOnlyPaths=/home/hermes/.config/gh /home/hermes/.gitconfig /etc/engineering-control/policy/github-issue-write-validation.yaml
+ReadOnlyPaths=/home/hermes/.config/gh /home/hermes/.gitconfig /etc/engineering-control/policy/github-issue-write-validation.yaml -/etc/engineering-control/policy/change-requests
 InaccessiblePaths=-/home/hermes/.codex -/home/hermes/.claude -/home/hermes/.kube -/etc/engineering-control/credentials -/etc/engineering-control/env/release
 # NEW-61: delivery.publish fetches the validated ChangeSet commits from the worker host
 # over SSH (read-only access to its ChangeSet Git metadata). Expose only the worker

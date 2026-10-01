@@ -458,6 +458,8 @@ class ChangeRequest(UUIDPrimaryKey, Timestamps, Base):
     decision_reason: Mapped[str | None] = mapped_column(Text)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set durably before the first GitHub create; a later attempt must look up conclusively.
+    publish_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("revision >= 1", name="revision_positive"),
         CheckConstraint(

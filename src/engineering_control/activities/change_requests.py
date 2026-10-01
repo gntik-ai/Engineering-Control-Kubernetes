@@ -12,6 +12,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -39,11 +40,13 @@ from engineering_control.engineering.change_requests import (
 )
 from engineering_control.models.core import AgentRequest, resolve_agent_effort
 from engineering_control.models.enums import ModelClass, Project, Provider
+from engineering_control.policy.change_request_attestation import load_attestation
 from engineering_control.policy.github_write import (
     CHANGE_REQUEST_ISSUE_CREATE_OPERATION,
     CHANGE_REQUEST_ISSUE_CREATE_STEPS,
     CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS,
     ChangeRequestIssueCreateDenial,
+    ChangeRequestIssueCreateDenialReason,
     ChangeRequestIssueCreatePolicy,
     ChangeRequestIssuePlan,
 )
@@ -54,6 +57,10 @@ _MARKER = re.compile(
     r"<!-- hermes-change-request id=([0-9a-f-]{36}) revision=([0-9]+) "
     r"fingerprint=(sha256:[a-f0-9]{64}) binding=([a-f0-9]{64}) -->"
 )
+# NEW-108: a retried publication pages back conclusively past its durable intent.
+_INTENT_CLOCK_SKEW = timedelta(minutes=10)
+_LOOKUP_PAGE_SIZE = 50
+_LOOKUP_MAXIMUM_PAGES = 20
 _SEARCH_WORD = re.compile(r"[a-z0-9]{3,40}")
 _STOP_WORDS = frozenset(
     {
@@ -142,8 +149,17 @@ def _fenced(label: str, content: str) -> str:
     return f"--- BEGIN {label.upper()} ---\n{content.strip()}\n--- END {label.upper()} ---"
 
 
+_PUBLISH_FAILURES = {
+    "PUBLISH_OUTCOME_UNKNOWN": "PUBLISH_OUTCOME_UNKNOWN",
+    "CHANGE_REQUEST_PUBLICATION_CONFLICT": "PUBLISH_CONFLICT",
+    "CHANGE_REQUEST_ATTESTATION_PENDING": "PUBLISH_NOT_ATTESTED",
+}
+
+
 def _failure_code(phase: str, blocker: str) -> str:
     prefix = _FAILURE_PHASES.get(phase, "CHANGE_REQUEST")
+    if phase == "publish" and blocker in _PUBLISH_FAILURES:
+        return _PUBLISH_FAILURES[blocker]
     if blocker in {"SchemaViolation", f"{prefix}_SCHEMA_INVALID"}:
         return f"{prefix}_SCHEMA_INVALID"
     if blocker in _PROVIDER_UNAVAILABLE:
@@ -169,6 +185,7 @@ class ChangeRequestActivityHandler:
             "change_request.persist",
             "change_request.record_failure",
             "change_request.load_approved",
+            "change_request.record_publish_intent",
             "change_request.persist_publication",
         }
     )
@@ -178,7 +195,8 @@ class ChangeRequestActivityHandler:
     ) -> None:
         self.settings = settings
         self.repository = repository or ChangeRequestRepository(
-            settings.database_url.get_secret_value()
+            settings.database_url.get_secret_value(),
+            attestation_request_root=settings.state_root / "change-request-approvals",
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -190,6 +208,7 @@ class ChangeRequestActivityHandler:
             "change_request.persist": self._persist,
             "change_request.record_failure": self._record_failure,
             "change_request.load_approved": self._load_approved,
+            "change_request.record_publish_intent": self._record_publish_intent,
             "change_request.persist_publication": self._persist_publication,
         }
         handler = handlers.get(step)
@@ -420,7 +439,16 @@ class ChangeRequestActivityHandler:
         loaded = self.repository.load_approved_sync(
             change_request_id, str(payload.get("approval_binding", ""))
         )
+        if loaded["status"] == "APPROVED" and loaded["revision"] != payload.get("revision"):
+            return {**payload, "status": "BLOCKED", "blocker": "CHANGE_REQUEST_REVISION_CHANGED"}
         return {**payload, **loaded}
+
+    def _record_publish_intent(self, payload: dict[str, Any]) -> dict[str, Any]:
+        change_request_id, revision = self._identity(payload)
+        recorded = self.repository.record_publish_intent_sync(
+            change_request_id, str(payload.get("approval_binding", "")), revision
+        )
+        return {**self._slim(payload), **recorded}
 
     def _persist_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
         number = payload.get("issue_number")
@@ -497,6 +525,7 @@ class ChangeRequestGitHubHandler:
             self.root,
             writes_enabled=settings.github_writes_enabled,
             authenticated_home=settings.github_authenticated_home,
+            maximum_json_bytes=16_000_000,
         )
         self.policy = ChangeRequestIssueCreatePolicy(
             writes_enabled=settings.github_writes_enabled and self.broker.writes_enabled
@@ -562,25 +591,45 @@ class ChangeRequestGitHubHandler:
     def _publish(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         orchestration = payload.get("orchestration")
         context = orchestration if isinstance(orchestration, dict) else {}
+        change_request_id = str(payload.get("change_request_id", ""))
+        # Durable authorization: the root-owned attestation derived from the database row,
+        # never the activity payload, decides what (and whether) to publish.
+        attestation = load_attestation(
+            self.settings.change_request_attestation_root,
+            change_request_id,
+            production=self.settings.environment == "production",
+            now=datetime.now(UTC),
+        )
         decision = self.policy.evaluate(
             step=step,
             operation=CHANGE_REQUEST_ISSUE_CREATE_OPERATION,
+            workflow_type=str(context.get("workflow_type", "")),
             workflow_id=str(context.get("workflow_id", "")),
+            change_request_id=change_request_id,
+            revision=payload.get("revision"),
             approval_binding=str(payload.get("approval_binding", "")),
-            publication=payload.get("publication"),
+            attestation=attestation,
         )
         if isinstance(decision, ChangeRequestIssueCreateDenial):
+            pending = decision.reason_code is ChangeRequestIssueCreateDenialReason.NOT_APPROVED
             raise ApplicationError(
                 f"change request issue creation denied: {decision.reason_code.value}",
                 decision.model_dump(mode="json"),
-                type="PolicyViolation",
+                type="CHANGE_REQUEST_ATTESTATION_PENDING" if pending else "PolicyViolation",
                 non_retryable=True,
             )
+        intent_at = self._intent(payload)
+        attempt = context.get("attempt")
+        needs_lookup = payload.get("prior_intent") is not False or (
+            isinstance(attempt, int) and attempt > 1
+        )
         self._ensure_root()
         try:
-            adopted = self._marked_issue(decision)
-            if adopted is not None:
-                return self._published(decision, adopted, adopted=True, labels=())
+            if needs_lookup:
+                login = self.broker.preflight((decision.repository,)).login
+                adopted = self._conclusive_lookup(decision, intent_at, login)
+                if adopted is not None:
+                    return self._published(decision, adopted, adopted=True, labels=())
             labels = self._existing_labels(decision)
             url = self._create(decision, labels)
         except GhCliAuthError as error:
@@ -596,33 +645,96 @@ class ChangeRequestGitHubHandler:
                 non_retryable=True,
             ) from error
         except CommandFailure as error:
-            # Retryable: every retry first adopts an issue carrying this exact marker.
+            # Retryable: a retry is attempt > 1, so it first looks up conclusively.
             raise ApplicationError(
                 "GitHub issue publication failed", type="GITHUB_ISSUE_PUBLICATION_FAILED"
             ) from error
         return self._published(decision, url, adopted=False, labels=labels)
 
-    def _marked_issue(self, plan: ChangeRequestIssuePlan) -> str | None:
-        """An issue already carrying this exact marker (idempotent retry), if any."""
-        candidates: dict[int, str] = {}
-        for item in self.broker.search_issues(plan.repository, f'"{plan.change_request_id}"'):
-            if isinstance(item.get("number"), int):
-                candidates[item["number"]] = str(item.get("url", ""))
-        # Search indexing lags: the newest issues are also checked by their exact title.
-        for item in self.broker.recent_issues(plan.repository):
-            if isinstance(item.get("number"), int) and item.get("title") == plan.title:
-                candidates[item["number"]] = str(item.get("url", ""))
-        for number in sorted(candidates):
-            body = str(self.broker.view_issue_body(plan.repository, number).get("body", ""))
-            if plan.marker in body:
-                return self._issue_url(plan.repository, candidates[number], number)
-            if any(match[0] == plan.change_request_id for match in _MARKER.findall(body)):
-                raise ApplicationError(
-                    "a different publication of this change request already exists",
-                    type="PolicyViolation",
-                    non_retryable=True,
+    @staticmethod
+    def _intent(payload: dict[str, Any]) -> datetime:
+        try:
+            value = datetime.fromisoformat(str(payload["publish_intent_at"]))
+        except (KeyError, ValueError) as error:
+            raise ApplicationError(
+                "change request publication intent was not recorded",
+                type="PolicyViolation",
+                non_retryable=True,
+            ) from error
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    def _conclusive_lookup(
+        self, plan: ChangeRequestIssuePlan, intent_at: datetime, login: str
+    ) -> str | None:
+        """Page every issue newest-first back past the durable intent (not the search index).
+
+        Returns the exact earlier publication to adopt, or None when none exists; anything
+        that cannot be decided fails closed with PUBLISH_OUTCOME_UNKNOWN.
+        """
+        cutoff = intent_at - _INTENT_CLOCK_SKEW
+        adopted: str | None = None
+        try:
+            for page in range(1, _LOOKUP_MAXIMUM_PAGES + 1):
+                items = self.broker.list_issues_page(
+                    plan.repository, page, per_page=_LOOKUP_PAGE_SIZE
                 )
-        return None
+                concluded = len(items) < _LOOKUP_PAGE_SIZE
+                for item in items:
+                    created = datetime.fromisoformat(str(item.get("created_at")))
+                    if created.tzinfo is None:
+                        raise ValueError("issue creation time has no timezone")
+                    if created < cutoff:
+                        concluded = True
+                        break
+                    if "pull_request" in item:
+                        continue
+                    found = self._exact_publication(plan, item, login)
+                    if found is not None:
+                        if adopted is not None and adopted != found:
+                            raise self._conflict("several publications of this change request")
+                        adopted = found
+                if concluded:
+                    return adopted
+        except (CommandFailure, GhCliPolicyError, ValueError, TypeError) as error:
+            raise ApplicationError(
+                "change request publication outcome cannot be determined",
+                type="PUBLISH_OUTCOME_UNKNOWN",
+                non_retryable=True,
+            ) from error
+        raise ApplicationError(
+            "change request publication lookup exceeded its page bound",
+            type="PUBLISH_OUTCOME_UNKNOWN",
+            non_retryable=True,
+        )
+
+    def _exact_publication(
+        self, plan: ChangeRequestIssuePlan, item: dict[str, Any], login: str
+    ) -> str | None:
+        """The issue's URL if it is exactly this approved publication; a conflict if it only
+        claims this change request; None if it is unrelated."""
+        raw_body = item.get("body")
+        body = raw_body if isinstance(raw_body, str) else ""
+        if not any(match[0] == plan.change_request_id for match in _MARKER.findall(body)):
+            return None
+        normalized = body.replace("\r\n", "\n").rstrip("\n")
+        user = item.get("user")
+        number = item.get("number")
+        if (
+            item.get("title") != plan.title
+            or normalized != plan.body.rstrip("\n")
+            or normalized.splitlines()[-1] != plan.marker
+            or not isinstance(user, dict)
+            or user.get("login") != login
+            or not isinstance(number, int)
+        ):
+            raise self._conflict("an issue claims this change request but is not its publication")
+        return self._issue_url(plan.repository, str(item.get("html_url", "")), number)
+
+    @staticmethod
+    def _conflict(message: str) -> ApplicationError:
+        return ApplicationError(
+            message, type="CHANGE_REQUEST_PUBLICATION_CONFLICT", non_retryable=True
+        )
 
     def _existing_labels(self, plan: ChangeRequestIssuePlan) -> tuple[str, ...]:
         """Only labels the repository already has; labels are never created."""

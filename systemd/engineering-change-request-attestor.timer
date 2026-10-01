@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically revoke expired or superseded change-request attestations
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=engineering-change-request-attestor.service
+
+[Install]
+WantedBy=timers.target

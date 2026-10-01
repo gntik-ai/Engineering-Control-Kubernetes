@@ -204,6 +204,7 @@ class ControlActivities:
         "change_request.persist",
         "change_request.record_failure",
         "change_request.load_approved",
+        "change_request.record_publish_intent",
         "change_request.publish",
         "change_request.persist_publication",
         "llmwiki.bootstrap.plan",
@@ -655,6 +656,7 @@ class ControlActivities:
             "orchestration": {
                 "workflow_id": info.workflow_id,
                 "workflow_run_id": info.workflow_run_id,
+                "workflow_type": info.workflow_type,
                 "activity_run_id": info.activity_run_id,
                 "activity_id": info.activity_id,
                 "attempt": info.attempt,

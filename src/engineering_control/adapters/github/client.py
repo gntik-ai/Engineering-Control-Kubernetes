@@ -471,29 +471,30 @@ class GhCliBroker:
             if isinstance(item.get("name"), str)
         ]
 
-    def recent_issues(self, repository: str, *, limit: int = 30) -> list[dict[str, Any]]:
-        """NEW-108: the newest issues in any state, which search indexing may not show yet."""
+    def list_issues_page(
+        self, repository: str, page: int, *, per_page: int = 50
+    ) -> list[dict[str, Any]]:
+        """NEW-108: one page of every issue, newest first, from the REST list endpoint.
+
+        Read-only and independent of the search index, so a caller can page back
+        conclusively to a point in time.
+        """
         repository = self._batch(repository)
-        if not 1 <= limit <= 100:
-            raise GhCliPolicyError("recent issue limit is out of bounds")
+        if not 1 <= page <= 100 or not 1 <= per_page <= 100:
+            raise GhCliPolicyError("issue page is out of bounds")
         value = self._json(
             self._run(
                 [
-                    "issue",
-                    "list",
-                    "--repo",
-                    repository,
-                    "--state",
-                    "all",
-                    "--json",
-                    "number,title,url,state",
-                    "--limit",
-                    str(limit),
+                    "api",
+                    "--method",
+                    "GET",
+                    f"repos/{repository}/issues?state=all&sort=created&direction=desc"
+                    f"&per_page={per_page}&page={page}",
                 ]
             ).stdout,
-            "recent issues",
+            "issue page",
         )
-        return self._list(value, "recent issues")
+        return self._list(value, "issue page", maximum=per_page)
 
     def create_pull_request(
         self,

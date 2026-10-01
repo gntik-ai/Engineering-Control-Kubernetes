@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     worktree_metadata_root: Path = Path("/srv/engineering/cache/scan/worktree-git")
     run_root: Path = Path("/srv/engineering/runs")
     state_root: Path = Path("/var/lib/engineering-control")
+    # NEW-108: root-owned approvals the GitHub worker reads (it has no database credential).
+    change_request_attestation_root: Path = Path("/etc/engineering-control/policy/change-requests")
     deployment_target_root: Path = Path("/etc/engineering-control/targets")
     runtime_target_root: Path = Path("/etc/engineering-control/runtime")
     temporary_root: Path = Path("/srv/engineering/tmp")

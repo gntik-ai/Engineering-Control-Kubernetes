@@ -266,7 +266,7 @@ def render_change_request(
         "",
         "## Why",
         "",
-        _line(proposal.why),
+        f"- {_line(proposal.why)}",
         "",
         "## What changes",
         "",
@@ -322,7 +322,7 @@ def render_change_request(
             "",
             "## Operator description",
             "",
-            *(f"> {line}".rstrip() for line in description_redacted.strip().splitlines()),
+            *(f"> {_line(line)}".rstrip() for line in description_redacted.strip().splitlines()),
             "",
             "Drafted by Hermes from the operator description above and published only after "
             "a typed operator approval bound to this exact content.",
@@ -438,9 +438,35 @@ def change_review_schema() -> dict[str, Any]:
     }
 
 
+_MARKDOWN_ESCAPES = str.maketrans(
+    {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "`": "&#96;",
+        "\\": "\\\\",
+        "[": "\\[",
+        "]": "\\]",
+    }
+)
+# A leading character that could start Markdown block structure once a line is unprefixed.
+_BLOCK_START = re.compile(r"^(?:[#+*=|~>_-]|\d+[.)])")
+
+
 def _line(value: str) -> str:
-    """One rendered line: LLM text never spans lines, so it cannot forge kind/Risk lines."""
-    return " ".join(value.split())
+    """One inert rendered line of untrusted text (LLM output or operator description).
+
+    The text never spans lines, so it cannot start a kind/Risk line, heading, checkbox or
+    marker; HTML (comments, tags), code spans, links and images are escaped, so it cannot
+    hide or imitate the control-plane sections either.
+    """
+    flattened = (
+        " ".join(value.split())
+        .translate(_MARKDOWN_ESCAPES)
+        # Keep redaction placeholders literal so re-redaction stays a no-op.
+        .replace("\\[REDACTED\\]", "[REDACTED]")
+    )
+    return f"\\{flattened}" if _BLOCK_START.match(flattened) else flattened
 
 
 def _bullets(values: tuple[str, ...], *, empty: str) -> list[str]:

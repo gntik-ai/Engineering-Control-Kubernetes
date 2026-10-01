@@ -87,6 +87,11 @@ install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy"
 install -d -o engineering-control -g engineering-control -m 0700 \
   "${STATE_ROOT}/github-policy-requests"
 install -d -o root -g root -m 0700 "${STATE_ROOT}/github-policy-backups"
+# NEW-108: change-request approval requests (API/controller) and root attestations
+# (read by the GitHub worker through its engineering-control supplementary group).
+install -d -o engineering-control -g engineering-control -m 0700 \
+  "${STATE_ROOT}/change-request-approvals"
+install -d -o root -g engineering-control -m 0750 "${CONFIG_ROOT}/policy/change-requests"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials"
 install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/github"
 install -d -o root -g engineering-control -m 0751 "${CONFIG_ROOT}/env"
@@ -365,7 +370,8 @@ for unit in engineering-infrastructure.service engineering-migrate.service \
   engineering-dashboard.service \
   engineering-github-worker.service engineering-github-policy-reconciler.service \
   engineering-github-policy-reconciler.path engineering-github-policy-expiry.service \
-  engineering-github-policy-expiry.timer; do
+  engineering-github-policy-expiry.timer engineering-change-request-attestor.service \
+  engineering-change-request-attestor.path engineering-change-request-attestor.timer; do
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/systemd/${unit}" "${CONFIG_ROOT}/systemd/${unit}"
   install -o root -g root -m 0644 \
@@ -388,7 +394,10 @@ systemd-analyze verify \
   /etc/systemd/system/engineering-github-policy-reconciler.service \
   /etc/systemd/system/engineering-github-policy-reconciler.path \
   /etc/systemd/system/engineering-github-policy-expiry.service \
-  /etc/systemd/system/engineering-github-policy-expiry.timer
+  /etc/systemd/system/engineering-github-policy-expiry.timer \
+  /etc/systemd/system/engineering-change-request-attestor.service \
+  /etc/systemd/system/engineering-change-request-attestor.path \
+  /etc/systemd/system/engineering-change-request-attestor.timer
 "${INSTALL_ROOT}/venv/bin/python" \
   "${RELEASE_ROOT}/source/scripts/verify-worker-registry.py" --host controller \
   --write-policy "${CONFIG_ROOT}/policy/github-issue-write-validation.yaml"
@@ -400,12 +409,15 @@ systemctl restart engineering-migrate.service
 systemctl enable engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
   engineering-acceptance-worker.service engineering-github-worker.service \
-  engineering-github-policy-reconciler.path engineering-github-policy-expiry.timer
+  engineering-github-policy-reconciler.path engineering-github-policy-expiry.timer \
+  engineering-change-request-attestor.path engineering-change-request-attestor.timer
 systemctl restart engineering-api.service engineering-evidence-ingest.service \
   engineering-temporal-worker.service engineering-scheduler.service engineering-notifier.service \
   engineering-acceptance-worker.service engineering-github-worker.service
 systemctl restart engineering-github-policy-reconciler.path
 systemctl restart engineering-github-policy-expiry.timer
+systemctl restart engineering-change-request-attestor.path
+systemctl restart engineering-change-request-attestor.timer
 
 "${RELEASE_ROOT}/source/scripts/verify-no-omniroute.sh" --scope controller
 

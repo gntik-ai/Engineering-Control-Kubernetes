@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for operator change-request approval changes to attest
+
+[Path]
+DirectoryNotEmpty=/var/lib/engineering-control/change-request-approvals
+Unit=engineering-change-request-attestor.service
+
+[Install]
+WantedBy=multi-user.target

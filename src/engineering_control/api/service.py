@@ -587,7 +587,9 @@ class TemporalControlService:
         return await self._start_once(
             WorkflowName.CHANGE_REQUEST_PUBLISH.value,
             ChangeRequestPublishInput(
-                change_request_id=str(change_request_id), approval_binding=approval_binding
+                change_request_id=str(change_request_id),
+                approval_binding=approval_binding,
+                revision=revision,
             ),
             change_request_publish_workflow_id(str(change_request_id), revision),
         )

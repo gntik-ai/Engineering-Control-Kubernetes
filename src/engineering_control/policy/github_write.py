@@ -21,6 +21,7 @@ from engineering_control.engineering.change_requests import (
     target_repository_allowed,
     validate_proposal,
 )
+from engineering_control.policy.change_request_attestation import ChangeRequestAttestation
 
 GITHUB_WRITE_POLICY_PATH = Path(
     "/etc/engineering-control/policy/github-issue-write-validation.yaml"
@@ -242,9 +243,11 @@ class GitHubWritePolicyEvaluator:
 class ChangeRequestIssueCreateDenialReason(StrEnum):
     STEP_NOT_ALLOWED = "STEP_NOT_ALLOWED"
     OPERATION_NOT_ALLOWED = "OPERATION_NOT_ALLOWED"
+    WORKFLOW_TYPE_NOT_ALLOWED = "WORKFLOW_TYPE_NOT_ALLOWED"
     WORKFLOW_NOT_BOUND = "WORKFLOW_NOT_BOUND"
     WRITES_DISABLED = "WRITES_DISABLED"
     NOT_APPROVED = "NOT_APPROVED"
+    REVISION_MISMATCH = "REVISION_MISMATCH"
     BINDING_MISMATCH = "BINDING_MISMATCH"
     REPOSITORY_NOT_ALLOWLISTED = "REPOSITORY_NOT_ALLOWLISTED"
     CONTENT_TAMPERED = "CONTENT_TAMPERED"
@@ -277,12 +280,16 @@ class ChangeRequestIssuePlan(BaseModel):
 
 
 class ChangeRequestIssueCreatePolicy:
-    """Authorize exactly one issue creation for one approved, untampered change request.
+    """Authorize exactly one issue creation for one durably approved change request.
 
-    Independent of GitHubWritePolicyEvaluator and backlog write-policy ownership: the
-    operator's typed approval of the exact rendered content is the authorization. Only the
-    global GitHub write switch still applies.
+    Authorization comes only from the root-owned attestation the reconciler derived from
+    the PostgreSQL row (the GitHub worker has no database credential) and from the
+    activity's own Temporal identity -- never from activity payload content. It is
+    independent of GitHubWritePolicyEvaluator and backlog write-policy ownership; only
+    the global GitHub write switch still applies.
     """
+
+    workflow_type = "ChangeRequestPublishWorkflow"
 
     def __init__(self, *, writes_enabled: bool) -> None:
         self.writes_enabled = writes_enabled
@@ -292,66 +299,66 @@ class ChangeRequestIssueCreatePolicy:
         *,
         step: str,
         operation: str,
+        workflow_type: str,
         workflow_id: str,
+        change_request_id: str,
+        revision: object,
         approval_binding: str,
-        publication: object,
+        attestation: ChangeRequestAttestation | None,
     ) -> ChangeRequestIssuePlan | ChangeRequestIssueCreateDenial:
         reason = ChangeRequestIssueCreateDenialReason
         if step not in CHANGE_REQUEST_ISSUE_CREATE_STEPS:
             return ChangeRequestIssueCreateDenial(reason_code=reason.STEP_NOT_ALLOWED)
         if operation != CHANGE_REQUEST_ISSUE_CREATE_OPERATION:
             return ChangeRequestIssueCreateDenial(reason_code=reason.OPERATION_NOT_ALLOWED)
-        if not isinstance(publication, dict):
+        if workflow_type != self.workflow_type:
+            return ChangeRequestIssueCreateDenial(reason_code=reason.WORKFLOW_TYPE_NOT_ALLOWED)
+        if attestation is None or attestation.change_request_id != change_request_id:
             return ChangeRequestIssueCreateDenial(reason_code=reason.NOT_APPROVED)
-        change_request_id = str(publication.get("change_request_id", ""))
-        revision = publication.get("revision")
-        if not isinstance(revision, int) or workflow_id != change_request_publish_workflow_id(
-            change_request_id, revision
+        if workflow_id != change_request_publish_workflow_id(
+            attestation.change_request_id, attestation.revision
         ):
             return ChangeRequestIssueCreateDenial(reason_code=reason.WORKFLOW_NOT_BOUND)
+        if revision != attestation.revision:
+            return ChangeRequestIssueCreateDenial(reason_code=reason.REVISION_MISMATCH)
         if not self.writes_enabled:
             return ChangeRequestIssueCreateDenial(reason_code=reason.WRITES_DISABLED)
-        if publication.get("status") != "APPROVED":
-            return ChangeRequestIssueCreateDenial(reason_code=reason.NOT_APPROVED)
-        stored = str(publication.get("approval_binding_sha256", ""))
-        if (
-            not re.fullmatch(r"[a-f0-9]{64}", approval_binding)
-            or not stored
-            or not hmac.compare_digest(stored, approval_binding)
+        if not re.fullmatch(r"[a-f0-9]{64}", approval_binding) or not hmac.compare_digest(
+            attestation.approval_binding, approval_binding
         ):
             return ChangeRequestIssueCreateDenial(reason_code=reason.BINDING_MISMATCH)
-        project = str(publication.get("project", ""))
-        repository = str(publication.get("target_repository", ""))
+        repository = attestation.target_repository
         if repository not in WRITE_REPOSITORIES or not target_repository_allowed(
-            project, repository
+            attestation.project, repository
         ):
             return ChangeRequestIssueCreateDenial(reason_code=reason.REPOSITORY_NOT_ALLOWLISTED)
         try:
-            proposal = validate_proposal(publication.get("proposal"), project)
+            proposal = validate_proposal(attestation.proposal, attestation.project)
             rendered = render_change_request(
-                change_request_id=change_request_id,
-                revision=revision,
-                project=project,
+                change_request_id=attestation.change_request_id,
+                revision=attestation.revision,
+                project=attestation.project,
                 target_repository=repository,
                 proposal=proposal,
-                review=ChangeReviewRecord.model_validate(publication.get("review")),
-                description_redacted=str(publication.get("description_redacted", "")),
+                review=ChangeReviewRecord.model_validate(attestation.review),
+                description_redacted=attestation.description_redacted,
             )
         except ValueError:
             return ChangeRequestIssueCreateDenial(reason_code=reason.CONTENT_TAMPERED)
         if (
-            not hmac.compare_digest(rendered.approval_binding, stored)
-            or rendered.title != publication.get("issue_title")
-            or rendered.body != publication.get("issue_body")
+            not hmac.compare_digest(rendered.approval_binding, attestation.approval_binding)
+            or rendered.fingerprint != attestation.fingerprint
+            or rendered.title != attestation.issue_title
+            or rendered.body != attestation.issue_body
         ):
             return ChangeRequestIssueCreateDenial(reason_code=reason.CONTENT_TAMPERED)
         return ChangeRequestIssuePlan(
-            change_request_id=change_request_id,
-            revision=revision,
+            change_request_id=attestation.change_request_id,
+            revision=attestation.revision,
             repository=repository,
-            title=rendered.title,
-            body=rendered.body,
+            title=attestation.issue_title,
+            body=attestation.issue_body,
             marker=rendered.marker,
-            approval_binding=stored,
+            approval_binding=attestation.approval_binding,
             wanted_labels=(CHANGE_REQUEST_LABEL, proposal.kind),
         )

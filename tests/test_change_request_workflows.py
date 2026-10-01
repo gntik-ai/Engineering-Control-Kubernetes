@@ -20,16 +20,19 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect
 from temporalio import activity
+from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from engineering_control.activities.change_requests import ChangeRequestActivityHandler
 from engineering_control.activities.core import ControlActivities
+from engineering_control.api.service import TemporalControlService
 from engineering_control.config import Settings
 from engineering_control.db import models  # noqa: F401
 from engineering_control.db.base import Base
 from engineering_control.db.change_requests import ChangeRequestRepository
+from engineering_control.db.repository import EmptyMetadataRepository
 from engineering_control.engineering.change_requests import (
     approval_phrase,
     change_request_publish_workflow_id,
@@ -318,10 +321,7 @@ async def test_invalid_draft_repository_fails_closed_before_review(
     assert "change_request.review" not in calls
 
 
-@pytestmark_temporal
-async def test_publish_workflow_publishes_once_and_records_the_issue(
-    repository: ChangeRequestRepository,
-) -> None:
+async def drafted_and_approved(repository: ChangeRequestRepository) -> tuple[UUID, str]:
     change_request_id = new_request(repository)
     handler = ChangeRequestActivityHandler(Settings(), repository=repository)
     seed = scripted_activity(
@@ -344,24 +344,37 @@ async def test_publish_workflow_publishes_once_and_records_the_issue(
     repository.approve_sync(
         change_request_id, binding, approval_phrase("falcone", binding), "telegram:42"
     )
-    published_payloads: list[dict[str, Any]] = []
+    return change_request_id, binding
+
+
+def published(change_request_id: UUID, binding: str) -> dict[str, Any]:
+    return {
+        "change_request_id": str(change_request_id),
+        "approval_binding": binding,
+        "status": "PUBLISHED",
+        "issue_url": "https://github.com/gntik-ai/falcone/issues/41",
+        "issue_number": 41,
+        "adopted": False,
+    }
+
+
+@pytestmark_temporal
+async def test_publish_workflow_records_intent_then_publishes_and_records_the_issue(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id, binding = await drafted_and_approved(repository)
+    handler = ChangeRequestActivityHandler(Settings(), repository=repository)
+    payloads: list[dict[str, Any]] = []
 
     def publish(payload: dict[str, Any]) -> dict[str, Any]:
-        published_payloads.append(payload)
-        return {
-            "change_request_id": str(change_request_id),
-            "approval_binding": binding,
-            "status": "PUBLISHED",
-            "issue_url": "https://github.com/gntik-ai/falcone/issues/41",
-            "issue_number": 41,
-            "adopted": False,
-        }
+        payloads.append(payload)
+        return published(change_request_id, binding)
 
     calls: list[str] = []
     result, _ = await run_workflow(
         ChangeRequestPublishWorkflow,
         ChangeRequestPublishInput(
-            change_request_id=str(change_request_id), approval_binding=binding
+            change_request_id=str(change_request_id), approval_binding=binding, revision=1
         ),
         scripted_activity(handler, {"change_request.publish": [publish]}, calls),
         change_request_publish_workflow_id(str(change_request_id), 1),
@@ -370,13 +383,74 @@ async def test_publish_workflow_publishes_once_and_records_the_issue(
     assert result["issue_number"] == 41
     assert calls == [
         "change_request.load_approved",
+        "change_request.record_publish_intent",
         "change_request.publish",
         "change_request.persist_publication",
     ]
-    assert published_payloads[0]["publication"]["status"] == "APPROVED"
+    # Only identity and the durable intent reach the GitHub worker -- no content.
+    assert payloads[0]["prior_intent"] is False and payloads[0]["publish_intent_at"]
+    assert payloads[0]["orchestration"]["workflow_type"] == "ChangeRequestPublishWorkflow"
+    assert not {"publication", "issue_body", "issue_title", "proposal"} & set(payloads[0])
     view = repository.get_sync(change_request_id)
     assert view is not None and view["status"] == "PUBLISHED"
     assert view["issue_url"] == "https://github.com/gntik-ai/falcone/issues/41"
+
+
+@pytestmark_temporal
+async def test_a_failed_publish_fails_the_run_so_a_reapproval_can_retry(
+    repository: ChangeRequestRepository,
+) -> None:
+    change_request_id, binding = await drafted_and_approved(repository)
+    handler = ChangeRequestActivityHandler(Settings(), repository=repository)
+    payloads: list[dict[str, Any]] = []
+
+    def auth_lost(payload: dict[str, Any]) -> dict[str, Any]:
+        payloads.append(payload)
+        raise ApplicationError("auth", type="BLOCKED_BY_GH_AUTH", non_retryable=True)
+
+    def restored(payload: dict[str, Any]) -> dict[str, Any]:
+        payloads.append(payload)
+        return published(change_request_id, binding)
+
+    script: dict[str, list[Callable[[dict[str, Any]], dict[str, Any]]]] = {
+        "change_request.publish": [auth_lost, restored]
+    }
+    activity_fn = scripted_activity(handler, script, [])
+    assert _TEMPORAL_CLI is not None
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        async with AsyncExitStack() as stack:
+            for queue in (CONTROL_TASK_QUEUE, GITHUB_TASK_QUEUE):
+                await stack.enter_async_context(
+                    Worker(
+                        env.client,
+                        task_queue=queue,
+                        workflows=[ChangeRequestPublishWorkflow],
+                        activities=[activity_fn],
+                    )
+                )
+            service = TemporalControlService(
+                env.client, CONTROL_TASK_QUEUE, EmptyMetadataRepository()
+            )
+            first = await service.start_change_request_publish(change_request_id, 1, binding)
+            with pytest.raises(WorkflowFailureError):
+                await env.client.get_workflow_handle(first.workflow_id).result()
+            failed = repository.get_sync(change_request_id)
+            assert failed is not None
+            assert failed["status"] == "APPROVED"
+            assert failed["error_code"] == "PUBLISH_GITHUB_AUTH_REQUIRED"
+            assert failed["publish_attempted_at"] is not None
+            # The documented re-approval replay starts a fresh run under the same id.
+            replay = repository.approve_sync(
+                change_request_id, binding, approval_phrase("falcone", binding), "telegram:42"
+            )
+            assert replay["replayed"] is True
+            second = await service.start_change_request_publish(change_request_id, 1, binding)
+            assert second.workflow_id == first.workflow_id and second.run_id != first.run_id
+            result = await env.client.get_workflow_handle(second.workflow_id).result()
+    assert result["status"] == "PUBLISHED"
+    assert [payload["prior_intent"] for payload in payloads] == [False, True]
+    view = repository.get_sync(change_request_id)
+    assert view is not None and view["status"] == "PUBLISHED" and view["error_code"] is None
 
 
 def test_migration_0014_creates_exactly_the_model_table(

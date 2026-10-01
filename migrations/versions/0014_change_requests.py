@@ -54,6 +54,7 @@ def _current_bootstrap_schema_present() -> bool:
         "decision_reason",
         "decided_at",
         "published_at",
+        "publish_attempted_at",
         "created_at",
         "updated_at",
     }
@@ -98,6 +99,7 @@ def upgrade() -> None:
         sa.Column("decision_reason", sa.Text(), nullable=True),
         sa.Column("decided_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("publish_attempted_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("revision >= 1", name="ck_change_requests_revision_positive"),

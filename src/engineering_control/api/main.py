@@ -133,7 +133,8 @@ def create_app(
         resolved_change_requests = change_request_repository
         if resolved_change_requests is None and service is None:
             resolved_change_requests = ChangeRequestRepository(
-                resolved.database_url.get_secret_value()
+                resolved.database_url.get_secret_value(),
+                attestation_request_root=resolved.state_root / "change-request-approvals",
             )
         app.state.change_request_repository = resolved_change_requests
         stop = asyncio.Event()
@@ -1034,6 +1035,11 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except OSError as error:
+            # The decision is durable; repeating the same command re-requests attestation.
+            raise HTTPException(
+                status_code=503, detail="change request attestation request failed"
+            ) from error
         try:
             accepted = await service.start_change_request_publish(
                 change_request_id, int(approved["revision"]), body.approval_binding
@@ -1063,6 +1069,11 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except OSError as error:
+            # The decision is durable; repeating the same command re-requests attestation.
+            raise HTTPException(
+                status_code=503, detail="change request attestation request failed"
+            ) from error
         revision = int(revised["revision"])
         try:
             accepted = await service.start_change_request(change_request_id, revision)
@@ -1094,6 +1105,11 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except OSError as error:
+            # The decision is durable; repeating the same command re-requests attestation.
+            raise HTTPException(
+                status_code=503, detail="change request attestation request failed"
+            ) from error
 
     @app.get("/v1/findings/{finding_id}")
     async def finding_get(

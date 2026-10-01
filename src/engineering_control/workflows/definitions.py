@@ -3885,6 +3885,10 @@ class ChangeRequestPublishWorkflow(ControlledWorkflow):
     the existing backlog path.
     """
 
+    # The root reconciler attests an approval within seconds of its request file.
+    _attestation_waits = 10
+    _attestation_wait = timedelta(seconds=30)
+
     @workflow.run
     async def run(self, request: ChangeRequestPublishInput) -> dict[str, Any]:
         context = await self._step("change_request.load_approved", asdict(request))
@@ -3896,34 +3900,61 @@ class ChangeRequestPublishWorkflow(ControlledWorkflow):
                 "issue_number": context.get("issue_number"),
             }
         if context.get("status") != "APPROVED":
-            return {
-                "status": "BLOCKED",
-                "change_request_id": request.change_request_id,
-                "blocker": str(context.get("blocker", "CHANGE_REQUEST_APPROVAL_REQUIRED")),
-            }
-        try:
-            published = await self._step("change_request.publish", context)
-        except ActivityError as error:
-            cause = error.cause
-            blocker = (
-                cause.type
-                if isinstance(cause, ApplicationError) and cause.type
-                else "PUBLISH_ACTIVITY_FAILED"
+            raise ApplicationError(
+                "change request is not publishable: "
+                + str(context.get("blocker", "CHANGE_REQUEST_APPROVAL_REQUIRED")),
+                type="ApprovalMismatch",
+                non_retryable=True,
             )
-            recorded = await self._step(
-                "change_request.record_failure",
-                {
-                    "change_request_id": request.change_request_id,
-                    "approval_binding": request.approval_binding,
-                    "failure_phase": "publish",
-                    "blocker": blocker,
-                },
+        intent = await self._step("change_request.record_publish_intent", asdict(request))
+        if intent.get("status") != "INTENT_RECORDED":
+            raise ApplicationError(
+                "change request publication intent was refused",
+                type="ApprovalMismatch",
+                non_retryable=True,
             )
-            return {
-                "status": "PUBLISH_FAILED",
-                "change_request_id": request.change_request_id,
-                "error_code": recorded.get("error_code"),
-            }
+        # Only identity and the durable intent travel to the GitHub worker; what it may
+        # publish comes from the root-attested durable approval.
+        payload = {
+            **asdict(request),
+            "publish_intent_at": intent.get("publish_intent_at"),
+            "prior_intent": intent.get("prior_intent") is True,
+        }
+        published: dict[str, Any] = {}
+        for wait in range(self._attestation_waits + 1):
+            try:
+                published = await self._step("change_request.publish", payload)
+                break
+            except ActivityError as error:
+                cause = error.cause
+                blocker = (
+                    cause.type
+                    if isinstance(cause, ApplicationError) and cause.type
+                    else "PUBLISH_ACTIVITY_FAILED"
+                )
+                if (
+                    blocker == "CHANGE_REQUEST_ATTESTATION_PENDING"
+                    and wait < self._attestation_waits
+                ):
+                    self._phase = "AWAITING_APPROVAL_ATTESTATION"
+                    await workflow.sleep(self._attestation_wait)
+                    continue
+                recorded = await self._step(
+                    "change_request.record_failure",
+                    {
+                        "change_request_id": request.change_request_id,
+                        "approval_binding": request.approval_binding,
+                        "failure_phase": "publish",
+                        "blocker": blocker,
+                    },
+                )
+                # A failed execution lets the operator's re-approval start a fresh run
+                # under the same deterministic workflow id.
+                raise ApplicationError(
+                    f"change request publication failed: {recorded.get('error_code')}",
+                    type="ChangeRequestPublishFailed",
+                    non_retryable=True,
+                ) from error
         persisted = await self._step("change_request.persist_publication", published)
         return {
             "status": persisted.get("status", "PUBLISHED"),

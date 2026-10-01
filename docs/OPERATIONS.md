@@ -141,12 +141,26 @@ revision or edit invalidates it. Approval accepts only the CLI operator and allo
 (`change-request-publish-<id>-r<revision>`). Its `change_request.publish` step is a separate,
 narrow capability that can only create an issue. It is not one of the backlog write-capable
 steps and does not need backlog write-policy ownership. Only the global
-`ENGINEERING_GITHUB_WRITES_ENABLED` switch applies. Before creating an issue it re-renders the
-stored content to check the binding, and it adopts an existing issue that already carries the
-hidden `hermes-change-request` marker. It applies the `hermes:change-request` and kind labels only
-if they already exist and never creates labels. If publication fails, the request stays
-`APPROVED` with an `error_code`. Repeating the same `change-approve` command replays the publish
-idempotently.
+`ENGINEERING_GITHUB_WRITES_ENABLED` switch applies.
+
+The GitHub worker has no database credential, so its authorization does not come from the
+workflow payload. Every approval change drops an id-only request in
+`/var/lib/engineering-control/change-request-approvals`. The root
+`engineering-change-request-attestor` (a path unit plus a 15-minute timer) reads the row from
+PostgreSQL. For an `APPROVED`, unpublished, re-verified row it writes a 24-hour attestation to
+`/etc/engineering-control/policy/change-requests` (`root:engineering-control 0640`); otherwise it
+revokes it. The worker re-renders that attestation and checks the binding, revision, workflow type
+and workflow id before it publishes the attested title and body. Before the first create, the
+publish intent is recorded durably. Every later attempt first pages the repository's issues
+newest-first through the REST API back past that intent. It adopts only an issue whose title and
+body exactly match the approved ones, whose last line is the marker and whose author is the Hermes
+identity. Any other issue that claims the request is a conflict. A lookup that cannot finish
+fails as `PUBLISH_OUTCOME_UNKNOWN` without creating anything. Labels (`hermes:change-request` and
+the kind) are applied only if they already exist and are never created.
+
+A failed publication fails the workflow run and leaves the request `APPROVED` with an
+`error_code`. Repeating the same `change-approve` command starts a fresh run. An `APPROVED` request
+that is not yet published can still be revised or rejected, which revokes its attestation.
 
 Backlog import reads a `Change request:` issue's `kind:` line. A `feature`, `bug` or `chore`
 request is classified like the same hand-written issue without that metadata, so it is eligible
