@@ -430,6 +430,47 @@ class Enhancement(UUIDPrimaryKey, Timestamps, Base):
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class ChangeRequest(UUIDPrimaryKey, Timestamps, Base):
+    """NEW-108: one operator change request, drafted, reviewed and approved as an issue."""
+
+    __tablename__ = "change_requests"
+    request_key: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    description_redacted: Mapped[str] = mapped_column(Text)
+    description_sha256: Mapped[str] = mapped_column(String(64))
+    redacted: Mapped[bool] = mapped_column(Boolean, default=False)
+    revision_note: Mapped[str | None] = mapped_column(Text)
+    proposal_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    review_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    dedupe_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    fingerprint: Mapped[str | None] = mapped_column(String(80), index=True)
+    issue_title: Mapped[str | None] = mapped_column(String(240))
+    issue_body: Mapped[str | None] = mapped_column(Text)
+    approval_binding_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    target_repository: Mapped[str] = mapped_column(String(200))
+    issue_url: Mapped[str | None] = mapped_column(Text)
+    issue_number: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    requested_by: Mapped[str] = mapped_column(String(128))
+    decided_by: Mapped[str | None] = mapped_column(String(128))
+    decision_reason: Mapped[str | None] = mapped_column(Text)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Incremented by every operator decision; publication is bound to the approved one.
+    decision_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    # Written only at approval: the decision record and a hash of the approved content.
+    approval_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        CheckConstraint(
+            "status IN ('DRAFTING', 'CANDIDATE', 'APPROVED', 'PUBLISHED', 'REJECTED', 'FAILED')",
+            name="status_known",
+        ),
+    )
+
+
 class GitHubBacklogCampaign(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "github_backlog_campaigns"
     project: Mapped[str] = mapped_column(String(32), index=True)

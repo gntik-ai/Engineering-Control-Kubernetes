@@ -103,3 +103,62 @@ kubeconfig, then idempotent PostgreSQL lease release/evidence/deployment tombsto
 generic shell/kubectl arguments, active work, and protected evidence have no override path. Partial
 completion is safe to retry from fresh discovery. This retention workflow is distinct from the
 bootstrap software cleanup plan gated by `APPROVE CLEANUP`.
+
+## Operator change requests (NEW-108)
+
+An operator can turn a free-text description of a wanted change into one reviewed, approved
+GitHub issue. Hermes drafts and reviews the request but never publishes it: the operator
+publishes it on the controller with their own `gh` login. Delivery then uses the normal
+`backlog-import`, `backlog-approve` and `backlog-start` path.
+
+```bash
+engineering-ctl change-draft --project falcone --text "Add a CSV export of the tenant audit log"
+engineering-ctl change-draft --project musematic --file request.md --repository musematic-deploy
+engineering-ctl changes --project falcone --status CANDIDATE
+engineering-ctl change-show <id>      # rendered title/body, binding, findings, approve command
+engineering-ctl change-approve <id> <binding> APPROVE_CHANGE_<PROJECT>_<FIRST16HEX>
+engineering-ctl change-publish <id> --dry-run   # exact title, body and gh command; no writes
+engineering-ctl change-publish <id>             # publish with the operator's own gh login
+engineering-ctl change-revise <id> --note "Only administrators may export"
+engineering-ctl change-reject <id> --reason "Superseded by the reporting epic"
+```
+
+The description must be 20 characters to 8 KiB of UTF-8. Credentials are redacted before the
+description is stored, and only the redacted text is kept (`redacted: true`). The target
+repository defaults to the project's source repository and must be one of the project's two
+allowlisted repositories. `ChangeRequestWorkflow` (`change-request-<id>-r<revision>`) allocates a
+read-only audit snapshot of the current main branch. The Claude spec architect drafts a proposal
+(the `create-openspec` skill and the pinned spec model), and the Codex checker reviews it (the
+`code-reviewer` role with the `review-change` skill). A `REVISE` verdict gets one automatic
+redraft and re-review. If the re-review still says `REVISE`, the request becomes a `CANDIDATE`
+anyway, and its unresolved findings appear in `change-show` and in the issue body. Nothing is
+ever approved automatically. Similar open issues in the target repository are attached as
+warnings only. Draft or review failures end in `FAILED` with a safe error code, and
+`change-revise` retries them. All model-written and operator-written text is escaped, so it can't
+hide or imitate the issue's `kind:`/`Risk:` lines, headings, checkboxes, review or hidden marker.
+
+`change-show` prints the exact approve command. The typed phrase binds the project and the
+first 16 hex digits of the approval binding. The binding covers the request, its revision,
+the proposal fingerprint, the target repository, the issue title and the body hash, so any
+revision or edit invalidates it. Approve, revise, reject and publish accept only the CLI operator
+and allowlisted `telegram:<id>` actors. Approval records a decision record and bumps the
+request's decision sequence.
+
+`change-publish` runs on the controller as the operator. It fetches the `APPROVED` request,
+re-renders the title and body locally from the stored proposal, and recomputes the binding. It
+refuses on any mismatch or on a repository outside the allowlist. With the operator's `gh` (an
+argument list, never a shell), it searches the repository for an issue that already carries this
+request's hidden marker, from any revision. It adopts an issue only if the title, body and final
+marker line match exactly; any other claimant stops the command. Otherwise it runs `gh issue
+create`. The `hermes:change-request` and kind labels are added only if they already exist and are
+never created. Finally it calls `POST /v1/change-requests/<id>/published` with the URL, binding and
+decision sequence. That moves the request to `PUBLISHED` (final) only if all of them still match.
+It is idempotent for the same URL, so rerunning `change-publish` adopts the issue instead of
+creating another. An `APPROVED` request that is not yet published can still be revised or
+rejected.
+
+Backlog import reads a `Change request:` issue's `kind:` line. A `feature`, `bug` or `chore`
+request is classified like the same hand-written issue without that metadata, so it is eligible
+under the bug filters. An `enhancement` request follows the existing enhancement rules. Its
+`Risk: R<n>` line is a floor: the imported risk is the higher of the declared risk and the
+keyword-detected risk.

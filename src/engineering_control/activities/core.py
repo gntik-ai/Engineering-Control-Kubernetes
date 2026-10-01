@@ -13,6 +13,7 @@ from engineering_control.config import Settings
 from engineering_control.security.redaction import SecretRedactor
 
 from .browser import BrowserActivityHandler
+from .change_requests import ChangeRequestActivityHandler, ChangeRequestGitHubHandler
 from .connections import ConnectionsActivityHandler
 from .delivery import DeliveryActivityHandler
 from .engineering import EngineeringActivityHandler
@@ -192,6 +193,17 @@ class ControlActivities:
         "enhancement.publish",
         "enhancement.persist_publication",
         "enhancement.prepare_solution",
+        # NEW-108 operator change requests.
+        "change_request.load",
+        "change_request.prepare_draft",
+        "change_request.draft",
+        "change_request.prepare_review",
+        "change_request.review",
+        "change_request.record_review",
+        "change_request.github_dedupe",
+        "change_request.persist",
+        "change_request.record_failure",
+        "change_request.finalize_run",
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",
@@ -343,6 +355,9 @@ class ControlActivities:
             "observability.invoke_claude_maker",
             "observability.invoke_codex_checker",
             "observability.cleanup_workspace",
+            "change_request.draft",
+            "change_request.review",
+            "change_request.github_dedupe",
         }
         - GITOPS_GITHUB_STEPS,
         "scan": {
@@ -385,6 +400,7 @@ class ControlActivities:
             "enhancement.product_review",
             "observability.invoke_codex",
             "observability.invoke_codex_checker",
+            "change_request.review",
         },
         "claude": {
             "audit.agent_cell",
@@ -400,6 +416,7 @@ class ControlActivities:
             "enhancement.product_review",
             "observability.invoke_claude",
             "observability.invoke_claude_maker",
+            "change_request.draft",
         },
         "browser": {
             "runtime.browser_checks",
@@ -434,6 +451,7 @@ class ControlActivities:
             "enhancement.publish",
             "enhancement.github_dedupe",
             "finding.publish",
+            "change_request.github_dedupe",
             *GITOPS_GITHUB_STEPS,
         },
         "release": {
@@ -504,6 +522,12 @@ class ControlActivities:
         self.gitops_handler = (
             GitOpsControllerHandler(settings) if self.worker_kind == "controller" else None
         )
+        self.change_request_handler = (
+            ChangeRequestActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
+        self.change_request_github_handler = (
+            ChangeRequestGitHubHandler(settings) if self.worker_kind == "github" else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -527,6 +551,16 @@ class ControlActivities:
             and self.delivery_handler is not None
         ):
             return await self.delivery_handler.handle(step, safe_payload)
+        if (
+            self.change_request_github_handler is not None
+            and step in self.change_request_github_handler.supported_steps
+        ):
+            return await self.change_request_github_handler.handle(step, safe_payload)
+        if (
+            self.change_request_handler is not None
+            and step in self.change_request_handler.supported_steps
+        ):
+            return await self.change_request_handler.handle(step, safe_payload)
         if step in self._mutation_steps:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:

@@ -69,6 +69,8 @@ class ProviderActivityHandler:
         "observability.invoke_claude": "checker_request",
         "observability.invoke_claude_maker": "maker_request",
         "observability.invoke_codex_checker": "checker_request",
+        "change_request.draft": "draft_request",
+        "change_request.review": "review_request",
     }
 
     def __init__(

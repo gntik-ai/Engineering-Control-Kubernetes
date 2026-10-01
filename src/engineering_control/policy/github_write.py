@@ -60,11 +60,15 @@ GITOPS_WRITE_CAPABLE_GITHUB_STEPS = frozenset(
         "gitops.close_issue",
     }
 )
+# NEW-108 operator change requests only search GitHub; the operator publishes the issue
+# with their own gh login (engineering-ctl change-publish), never a Hermes worker.
+CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS = frozenset({"change_request.github_dedupe"})
 GITHUB_ACTIVITY_STEPS = (
     READ_ONLY_GITHUB_STEPS
     | WRITE_CAPABLE_GITHUB_STEPS
     | GITOPS_READ_ONLY_GITHUB_STEPS
     | GITOPS_WRITE_CAPABLE_GITHUB_STEPS
+    | CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS
 )
 WRITE_REPOSITORIES = ALLOWED_REPOSITORIES - READ_ONLY_REPOSITORIES
 

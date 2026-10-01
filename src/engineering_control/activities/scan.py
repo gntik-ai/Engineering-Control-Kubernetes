@@ -2296,9 +2296,7 @@ class ScanActivityHandler:
                 counts["secrets"][key(finding.get("RuleID"), relative(finding.get("File")))] += 1
         for finding in semgrep.get("results") or []:
             if isinstance(finding, dict):
-                counts["semgrep"][
-                    key(finding.get("check_id"), relative(finding.get("path")))
-                ] += 1
+                counts["semgrep"][key(finding.get("check_id"), relative(finding.get("path")))] += 1
         for result in trivy.get("Results") or []:
             if not isinstance(result, dict):
                 continue
@@ -2309,12 +2307,11 @@ class ScanActivityHandler:
                 ("Secrets", ("RuleID",)),
             ):
                 for finding in result.get(category) or []:
-                    if isinstance(finding, dict) and str(
-                        finding.get("Severity", "")
-                    ).upper() in {"HIGH", "CRITICAL"}:
-                        identity = key(
-                            category, target, *(finding.get(field) for field in fields)
-                        )
+                    if isinstance(finding, dict) and str(finding.get("Severity", "")).upper() in {
+                        "HIGH",
+                        "CRITICAL",
+                    }:
+                        identity = key(category, target, *(finding.get(field) for field in fields))
                         counts["vulnerabilities"][identity] += 1
         return {name: dict(counter) for name, counter in counts.items()}
 
@@ -2329,8 +2326,7 @@ class ScanActivityHandler:
             before = baseline.get(category) if isinstance(baseline, dict) else None
             before = before if isinstance(before, dict) else {}
             introduced[category] = sum(
-                max(0, count - int(before.get(identity, 0)))
-                for identity, count in findings.items()
+                max(0, count - int(before.get(identity, 0))) for identity, count in findings.items()
             )
         return introduced
 

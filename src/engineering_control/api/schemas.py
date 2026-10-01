@@ -296,6 +296,51 @@ class EnhancementRun(APIModel):
         return self
 
 
+class ChangeRequestCreate(APIModel):
+    """NEW-108: one operator change request; the byte bound is enforced at intake."""
+
+    project: Literal["falcone", "musematic", "llmwiki"]
+    description: str = Field(min_length=1, max_length=8192)
+    target_repository: (
+        Literal[
+            "gntik-ai/falcone",
+            "gntik-ai/falcone-charts",
+            "gntik-ai/musematic",
+            "gntik-ai/musematic-deploy",
+            "gntik-ai/llmwiki",
+        ]
+        | None
+    ) = None
+
+
+class ChangeRequestApproval(APIModel):
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    typed_confirmation: str = Field(
+        pattern=r"^APPROVE_CHANGE_(FALCONE|MUSEMATIC|LLMWIKI)_[A-F0-9]{16}$"
+    )
+
+
+class ChangeRequestRevision(APIModel):
+    note: str = Field(min_length=3, max_length=2000)
+
+
+class ChangeRequestRejection(APIModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class ChangeRequestPublication(APIModel):
+    """NEW-108: the issue the operator published with their own gh login."""
+
+    issue_url: str = Field(
+        pattern=(
+            r"^https://github\.com/gntik-ai/"
+            r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)/issues/[1-9][0-9]*$"
+        )
+    )
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    decision_sequence: int = Field(ge=1)
+
+
 class DeliveryStart(APIModel):
     finding_id: UUID
     risk_class: RiskClass
@@ -343,6 +388,13 @@ class OperationAccepted(APIModel):
 
 class BacklogImportAccepted(OperationAccepted):
     backlog_campaign_id: UUID
+
+
+class ChangeRequestAccepted(OperationAccepted):
+    change_request_id: UUID
+    request_key: str
+    revision: int = Field(ge=1)
+    redacted: bool = False
 
 
 class RecordList(APIModel):

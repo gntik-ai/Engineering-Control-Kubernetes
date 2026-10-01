@@ -59,6 +59,19 @@ class APIClient:
         return SecretRedactor().redact(response.json()).value
 
 
+_CHANGE_REPOSITORIES = ("falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki")
+_CHANGE_DESCRIPTION_MAX_BYTES = 8 * 1024
+
+
+def _change_description(arguments: argparse.Namespace) -> str:
+    if arguments.text is not None:
+        return str(arguments.text)
+    path = Path(arguments.file)
+    if path.stat().st_size > _CHANGE_DESCRIPTION_MAX_BYTES:
+        raise ValueError("change description file exceeds 8 KiB")
+    return path.read_text(encoding="utf-8")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="engineering-ctl")
     root.add_argument(
@@ -302,6 +315,37 @@ def parser() -> argparse.ArgumentParser:
                     "ENHANCEMENT_DEFERRED",
                 ),
             )
+    # NEW-108 operator change requests: draft -> review -> approve -> publish one issue.
+    change_draft = commands.add_parser("change-draft")
+    change_draft.add_argument(
+        "--project", choices=("falcone", "musematic", "llmwiki"), required=True
+    )
+    change_source = change_draft.add_mutually_exclusive_group(required=True)
+    change_source.add_argument("--file", type=Path)
+    change_source.add_argument("--text")
+    change_draft.add_argument("--repository", choices=_CHANGE_REPOSITORIES)
+    changes = commands.add_parser("changes")
+    changes.add_argument("--project", choices=("falcone", "musematic", "llmwiki"))
+    changes.add_argument(
+        "--status",
+        choices=("DRAFTING", "CANDIDATE", "APPROVED", "PUBLISHED", "REJECTED", "FAILED"),
+    )
+    changes.add_argument("--limit", type=_bounded_integer(1, 200), default=20, metavar="1-200")
+    commands.add_parser("change-show").add_argument("change_request_id")
+    change_approve = commands.add_parser("change-approve")
+    change_approve.add_argument("change_request_id")
+    change_approve.add_argument("approval_binding")
+    change_approve.add_argument("typed_confirmation")
+    change_revise = commands.add_parser("change-revise")
+    change_revise.add_argument("change_request_id")
+    change_revise.add_argument("--note", required=True)
+    # Hermes never publishes: the operator does, with their own gh login on the controller.
+    change_publish = commands.add_parser("change-publish")
+    change_publish.add_argument("change_request_id")
+    change_publish.add_argument("--dry-run", action="store_true")
+    change_reject = commands.add_parser("change-reject")
+    change_reject.add_argument("change_request_id")
+    change_reject.add_argument("--reason", required=True)
     dashboard = commands.add_parser("dashboard")
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
     for name in ("init-password", "reset-password"):
@@ -675,6 +719,58 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         if action == "skip":
             payload["reason_code"] = arguments.reason_code
         return client.request("POST", "/v1/commands", payload)
+    if command == "change-draft":
+        draft: dict[str, Any] = {
+            "project": arguments.project,
+            "description": _change_description(arguments),
+        }
+        if arguments.repository is not None:
+            draft["target_repository"] = f"gntik-ai/{arguments.repository}"
+        return client.request("POST", "/v1/change-requests", draft)
+    if command == "changes":
+        query = httpx.QueryParams(
+            {
+                key: value
+                for key, value in (
+                    ("project", arguments.project),
+                    ("status", arguments.status),
+                    ("limit", arguments.limit),
+                )
+                if value is not None
+            }
+        )
+        return client.request("GET", f"/v1/change-requests?{query}")
+    if command == "change-show":
+        return client.request("GET", f"/v1/change-requests/{arguments.change_request_id}")
+    if command == "change-approve":
+        return client.request(
+            "POST",
+            f"/v1/change-requests/{arguments.change_request_id}/approve",
+            {
+                "approval_binding": arguments.approval_binding,
+                "typed_confirmation": arguments.typed_confirmation,
+            },
+        )
+    if command == "change-revise":
+        return client.request(
+            "POST",
+            f"/v1/change-requests/{arguments.change_request_id}/revise",
+            {"note": arguments.note},
+        )
+    if command == "change-publish":
+        from engineering_control.engineering.change_request_publisher import (
+            publish_change_request,
+        )
+
+        return publish_change_request(
+            client, arguments.change_request_id, dry_run=arguments.dry_run
+        )
+    if command == "change-reject":
+        return client.request(
+            "POST",
+            f"/v1/change-requests/{arguments.change_request_id}/reject",
+            {"reason": arguments.reason},
+        )
     raise ValueError(f"unsupported command: {command}")
 
 

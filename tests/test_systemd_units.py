@@ -330,3 +330,38 @@ def test_worker_auth_probes_use_subscription_only_minimal_environments() -> None
         assert "PATH=/usr/local/bin:/usr/bin:/bin" in script
         assert "/identities/codex-runner" in script
         assert "/identities/claude-runner" in script
+
+
+def test_github_worker_cannot_read_database_or_other_identity_credentials() -> None:
+    """NEW-108: the GitHub worker keeps the engineering-control group (write policy,
+    change-request attestations, its own evidence token) but every file carrying the
+    database credential or another identity's token is masked."""
+    unit = (REPOSITORY_ROOT / "systemd" / "engineering-github-worker.service").read_text(
+        encoding="utf-8"
+    )
+    inaccessible = {
+        path.lstrip("-")
+        for line in unit.splitlines()
+        if line.startswith("InaccessiblePaths=")
+        for path in line.removeprefix("InaccessiblePaths=").split()
+    }
+    for credential in (
+        "/etc/engineering-control/env/control.env",
+        "/etc/engineering-control/env/infrastructure.env",
+        "/etc/engineering-control/env/evidence-ingest.env",
+        "/etc/engineering-control/env/release",
+        "/etc/engineering-control/credentials",
+        *(
+            f"/etc/engineering-control/env/evidence-uploaders/{identity}.token"
+            for identity in ("codex-runner", "claude-runner", "browser-runner", "scan-runner")
+        ),
+        "/etc/engineering-control/env/evidence-uploaders/delivery-runner.token",
+        "/etc/engineering-control/env/evidence-uploaders/release-runner.token",
+    ):
+        assert credential in inaccessible, credential
+    assert "/etc/engineering-control/env/evidence-uploaders/github-runner.token" not in (
+        inaccessible
+    )
+    assert "EnvironmentFile=/etc/engineering-control/env/github-worker.env" in unit
+    assert "EnvironmentFile=/etc/engineering-control/env/control.env" not in unit
+    assert "DATABASE_URL" not in unit

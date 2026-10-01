@@ -199,6 +199,12 @@ class EnhancementSolutionLoopInput:
 
 
 @dataclass
+class ChangeRequestInput:
+    change_request_id: str
+    revision: int
+
+
+@dataclass
 class LLMWikiStagingBootstrapInput:
     project: str = "llmwiki"
     environment: str = "staging"

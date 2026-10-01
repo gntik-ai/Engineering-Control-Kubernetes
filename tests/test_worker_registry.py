@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from engineering_control.activities.change_requests import ChangeRequestGitHubHandler
 from engineering_control.activities.core import ControlActivities
 from engineering_control.activities.delivery import DeliveryActivityHandler
 from engineering_control.activities.github import GitHubActivityHandler
@@ -53,6 +54,7 @@ GITHUB_STEPS = frozenset(
         "gitops.image_pin",
         "gitops.environment_issue",
         "gitops.close_issue",
+        "change_request.github_dedupe",
     }
 )
 
@@ -115,7 +117,9 @@ def test_github_activity_set_is_typed_reachable_and_exclusive() -> None:
     registered = ControlActivities.steps_for_worker("github")
     assert registered == GITHUB_STEPS
     assert registered == (
-        GitHubActivityHandler.supported_steps | DeliveryActivityHandler.supported_steps
+        GitHubActivityHandler.supported_steps
+        | DeliveryActivityHandler.supported_steps
+        | ChangeRequestGitHubHandler.supported_steps
     )
     assert all(
         ControlledWorkflow._activity_queue(step, {}) == GITHUB_TASK_QUEUE for step in registered
@@ -160,9 +164,7 @@ def _literal_workflow_step_calls() -> set[str]:
     names, which are the caller's own responsibility to get right at the literal
     call site that supplies them.
     """
-    source = (ROOT / "src/engineering_control/workflows/definitions.py").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "src/engineering_control/workflows/definitions.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     steps: set[str] = set()
     for node in ast.walk(tree):
@@ -193,9 +195,7 @@ def test_every_literal_step_a_workflow_calls_is_a_registered_activity() -> None:
     called_steps = _literal_workflow_step_calls()
     assert len(called_steps) > 50  # sanity: the AST walk actually found calls
     worker_kinds = ("controller", *ROLE_WORKER_REGISTRY)
-    registered = set().union(
-        *(ControlActivities.steps_for_worker(kind) for kind in worker_kinds)
-    )
+    registered = set().union(*(ControlActivities.steps_for_worker(kind) for kind in worker_kinds))
     missing = called_steps - registered
     assert not missing, (
         f"workflows/definitions.py calls step(s) never registered in any "

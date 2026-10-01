@@ -12,6 +12,7 @@ from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
     AutonomousBacklogCampaignInput,
+    ChangeRequestInput,
     CleanupInput,
     ConnectionsRefreshInput,
     DeliveryReconciliationInput,
@@ -177,8 +178,7 @@ class ControlledWorkflow:
                         "notify.write_policy_required",
                         {
                             **self._write_notice,
-                            "project": self._write_notice.get("project")
-                            or payload.get("project"),
+                            "project": self._write_notice.get("project") or payload.get("project"),
                             "workflow_id": workflow.info().workflow_id,
                             "step": step,
                             "reason_code": self._write_policy_reason,
@@ -193,9 +193,7 @@ class ControlledWorkflow:
                 except TimeoutError:
                     continue
             else:
-                await workflow.wait_condition(
-                    lambda: self._cancelled or self._retry_step == step
-                )
+                await workflow.wait_condition(lambda: self._cancelled or self._retry_step == step)
             if self._cancelled:
                 return {**result, "status": "CANCELLED", "workflow_state": "CANCELLED"}
             self._retry_step = None
@@ -320,6 +318,13 @@ class ControlledWorkflow:
             return GITHUB_TASK_QUEUE
         if step == "llmwiki.bootstrap.execute":
             return task_queue_for("release")
+        if step == "change_request.github_dedupe":
+            return GITHUB_TASK_QUEUE
+        # NEW-108: fixed opposite providers -- Claude drafts, Codex independently reviews.
+        if step == "change_request.draft":
+            return provider_task_queue("claude", default="claude")
+        if step == "change_request.review":
+            return provider_task_queue("codex", default="codex")
         if step in {"enhancement.discover", "enhancement.product_review"}:
             return provider_task_queue(
                 cls._nested_value(payload, "provider", "codex"), default="codex"
@@ -2158,9 +2163,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
 
         # 1b. NEW-103: the deployment PR's CI must also pass before either PR merges,
         # so a deployment failure can no longer leave the source merged on its own.
-        if plan.get("deployment_pr_number") and workflow.patched(
-            "gitops-deployment-ci-gate-v1"
-        ):
+        if plan.get("deployment_pr_number") and workflow.patched("gitops-deployment-ci-gate-v1"):
             deployment_checks = await self._poll(
                 "gitops.deployment_pr_checks",
                 base,
@@ -2176,9 +2179,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     evidence["ci_regression_reason"] = deployment_checks.get("reason")
                     evidence["ci_regression_target"] = "deployment"
                     if deployment_checks.get("failure_excerpts"):
-                        evidence["ci_failure_excerpts"] = deployment_checks.get(
-                            "failure_excerpts"
-                        )
+                        evidence["ci_failure_excerpts"] = deployment_checks.get("failure_excerpts")
                 return self._blocked(deployment_checks, "DEPLOYMENT_PR_CI_FAILED")
 
         # 2. Ready + merge (source first, then the deployment PR when one exists).
@@ -3776,6 +3777,142 @@ class LLMWikiStagingBootstrapWorkflow(ControlledWorkflow):
         )
 
 
+@workflow.defn(name="ChangeRequestWorkflow")
+class ChangeRequestWorkflow(ControlledWorkflow):
+    """NEW-108: draft, independently review and persist one change request as a candidate.
+
+    It never approves: a REVISE verdict gets one automatic redraft and re-review, and an
+    unresolved verdict is still persisted as a CANDIDATE with its findings visible.
+    """
+
+    @workflow.run
+    async def run(self, request: ChangeRequestInput) -> dict[str, Any]:
+        try:
+            result = await self._draft_and_review(request)
+        except ActivityError:
+            await self._finalize_change_request_run(request, "FAILED", "CHANGE_REQUEST_FAILED")
+            raise
+        await self._finalize_change_request_run(
+            request, str(result.get("status", "FAILED")), result.get("error_code")
+        )
+        return result
+
+    async def _finalize_change_request_run(
+        self, request: ChangeRequestInput, status: str, error_code: Any
+    ) -> None:
+        """Close the control Run that the provider invocations opened (if any).
+
+        Best effort: a finalization failure (e.g. the same database outage) must never
+        replace the request's own outcome or the original exception, so it is logged and
+        the Run is left for the operator to see as still running.
+        """
+        try:
+            await self._step(
+                "change_request.finalize_run",
+                {
+                    "change_request_id": request.change_request_id,
+                    "revision": request.revision,
+                    "terminal_status": status,
+                    "error_code": error_code,
+                },
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "change request %s revision %s: control Run finalization failed",
+                request.change_request_id,
+                request.revision,
+            )
+
+    async def _draft_and_review(self, request: ChangeRequestInput) -> dict[str, Any]:
+        context = await self._step("change_request.load", asdict(request))
+        if context.get("status") != "DRAFTING":
+            return {
+                "status": "SUPERSEDED",
+                "change_request_id": request.change_request_id,
+                "revision": request.revision,
+            }
+        try:
+            if not await self._checkpoint("CHANGE_REQUEST_SNAPSHOT"):
+                return await self._change_request_failure(context, "internal", "CANCELLED")
+            try:
+                context = await self._step("project.snapshot", context, timeout_minutes=60)
+            except ActivityError:
+                return await self._change_request_failure(context, "snapshot", "UNAVAILABLE")
+            for attempt in (1, 2):
+                if not await self._checkpoint("CHANGE_REQUEST_DRAFT"):
+                    return await self._change_request_failure(context, "internal", "CANCELLED")
+                context = await self._step(
+                    "change_request.prepare_draft", {**context, "draft_attempt": attempt}
+                )
+                if context.get("status") != "DRAFT_READY":
+                    return await self._change_request_failure(
+                        context, "draft", str(context.get("blocker", "DRAFT_INPUT_INVALID"))
+                    )
+                context = await self._agent_step(
+                    "change_request.draft", context, timeout_minutes=120
+                )
+                if context.get("status") != "SUCCESS":
+                    return await self._change_request_failure(
+                        context, "draft", str(context.get("blocker") or context.get("status"))
+                    )
+                context = await self._step("change_request.prepare_review", context)
+                if context.get("status") != "REVIEW_READY":
+                    return await self._change_request_failure(
+                        context, "draft", str(context.get("blocker", "DRAFT_SCHEMA_INVALID"))
+                    )
+                if not await self._checkpoint("CHANGE_REQUEST_REVIEW"):
+                    return await self._change_request_failure(context, "internal", "CANCELLED")
+                context = await self._agent_step(
+                    "change_request.review", context, timeout_minutes=120
+                )
+                if context.get("status") != "SUCCESS":
+                    return await self._change_request_failure(
+                        context, "review", str(context.get("blocker") or context.get("status"))
+                    )
+                context = await self._step("change_request.record_review", context)
+                if context.get("status") == "REVIEW_APPROVED":
+                    break
+                if context.get("status") != "REVIEW_REVISE":
+                    return await self._change_request_failure(
+                        context, "review", str(context.get("blocker", "REVIEW_SCHEMA_INVALID"))
+                    )
+        except ActivityError:
+            return await self._change_request_failure(context, "internal", "STEP_FAILED")
+        try:
+            context = await self._step("change_request.github_dedupe", context)
+        except ActivityError:
+            # Deduplication only warns; an unavailable search never blocks the candidate.
+            context = {**context, "dedupe": {"status": "UNAVAILABLE", "matches": []}}
+        persisted = await self._step("change_request.persist", context)
+        return {
+            "status": persisted.get("status", "FAILED"),
+            "change_request_id": request.change_request_id,
+            "revision": request.revision,
+            "error_code": persisted.get("error_code"),
+            "approval_binding": persisted.get("approval_binding"),
+            "review_decision": persisted.get("review_decision"),
+        }
+
+    async def _change_request_failure(
+        self, context: dict[str, Any], phase: str, blocker: str
+    ) -> dict[str, Any]:
+        recorded = await self._step(
+            "change_request.record_failure",
+            {
+                "change_request_id": context.get("change_request_id"),
+                "revision": context.get("revision"),
+                "failure_phase": phase,
+                "blocker": blocker,
+            },
+        )
+        return {
+            "status": recorded.get("status", "FAILED"),
+            "change_request_id": context.get("change_request_id"),
+            "revision": context.get("revision"),
+            "error_code": recorded.get("error_code"),
+        }
+
+
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     MultiProjectAuditWorkflow,
@@ -3802,4 +3939,5 @@ ALL_WORKFLOWS = [
     EnhancementSolutionLoopWorkflow,
     LLMWikiStagingBootstrapWorkflow,
     StagingGitOpsDeliveryWorkflow,
+    ChangeRequestWorkflow,
 ]

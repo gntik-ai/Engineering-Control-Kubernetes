@@ -27,3 +27,4 @@ class WorkflowName(StrEnum):
     ENHANCEMENT_SOLUTION_LOOP = "EnhancementSolutionLoopWorkflow"
     LLMWIKI_STAGING_BOOTSTRAP = "LLMWikiStagingBootstrapWorkflow"
     STAGING_GITOPS_DELIVERY = "StagingGitOpsDeliveryWorkflow"
+    CHANGE_REQUEST = "ChangeRequestWorkflow"
