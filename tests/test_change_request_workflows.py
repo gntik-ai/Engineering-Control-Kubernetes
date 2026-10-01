@@ -344,7 +344,7 @@ async def test_invalid_draft_repository_fails_closed_before_review(
     assert "change_request.review" not in calls
 
 
-def test_migration_0014_creates_exactly_the_model_table(
+def test_migration_0019_creates_exactly_the_model_table(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database_url = f"sqlite+pysqlite:///{tmp_path / 'migration.sqlite3'}"
@@ -352,10 +352,10 @@ def test_migration_0014_creates_exactly_the_model_table(
     config = Config(ROOT / "alembic.ini")
     config.set_main_option("script_location", str(ROOT / "migrations"))
     command.upgrade(config, "head")
-    command.downgrade(config, "0013")
+    command.downgrade(config, "0018")
     engine = create_engine(database_url)
     assert "change_requests" not in inspect(engine).get_table_names()
-    command.upgrade(config, "0014")  # the explicit (non-bootstrap) migration path
+    command.upgrade(config, "0019")  # the explicit (non-bootstrap) migration path
     inspector = inspect(engine)
     columns = {column["name"] for column in inspector.get_columns("change_requests")}
     assert columns == set(Base.metadata.tables["change_requests"].columns.keys())

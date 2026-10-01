@@ -1,7 +1,7 @@
 """Add operator change requests.
 
-Revision ID: 0014
-Revises: 0013
+Revision ID: 0019
+Revises: 0018
 """
 
 from collections.abc import Sequence
@@ -9,8 +9,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0014"
-down_revision: str | None = "0013"
+revision: str = "0019"
+down_revision: str | None = "0018"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -66,7 +66,7 @@ def _current_bootstrap_schema_present() -> bool:
         if index.get("name")
     }
     if not required_columns.issubset(actual_columns) or not set(_INDEXES).issubset(actual_indexes):
-        raise RuntimeError("revision 0014 found a partial bootstrap schema")
+        raise RuntimeError("revision 0019 found a partial bootstrap schema")
     return True
 
 
