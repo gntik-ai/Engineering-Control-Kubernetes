@@ -1893,7 +1893,10 @@ async def test_recovery_requires_new_bound_approval_and_preserves_open_incident(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(tmp_path: Path) -> None:
+@pytest.mark.parametrize("outcome", ["absent", "protected", "both"])
+async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(
+    tmp_path: Path, outcome: str
+) -> None:
     worktree_root = tmp_path / "worktrees"
     handler = MetadataActivityHandler(
         Settings(
@@ -1990,19 +1993,31 @@ async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(tmp_path
             "absent_preview_namespace_candidate_ids": [],
         },
     )
-    finalized = await handler.handle(
-        "cleanup.finalize",
-        {
-            **metadata_executed,
-            "removed_lease_ids": [],
-            "already_absent_lease_ids": [str(lease_id)],
-            "terminal_status": "COMPLETE",
-        },
-    )
+    # NEW-105: a worktree cleanup.execute could not remove (protected) is retained and
+    # reported; it no longer fails the run. A lease cannot be both completed and protected.
+    protected = [{"lease_id": str(lease_id), "reason": "Permission denied"}]
+    request = {
+        **metadata_executed,
+        "removed_lease_ids": [],
+        "already_absent_lease_ids": [] if outcome == "protected" else [str(lease_id)],
+        "protected_cleanup_candidates": [] if outcome == "absent" else protected,
+        "terminal_status": "COMPLETE",
+    }
+    if outcome == "both":
+        with pytest.raises(Exception, match="invalid metadata activity input"):
+            await handler.handle("cleanup.finalize", request)
+        return
+    finalized = await handler.handle("cleanup.finalize", request)
     assert finalized["status"] == "COMPLETE"
     with handler.sessions() as session:
         cleanup_run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
         assert cleanup_run is not None and cleanup_run.status == "SUCCESS"
+        if outcome == "protected":
+            assert cleanup_run.error_code == "CLEANUP_PROTECTED_WORKTREES_RETAINED"
+            assert "1 protected worktrees retained" in (cleanup_run.summary or "")
+            assert f"{lease_id}: Permission denied" in (cleanup_run.summary or "")
+        else:
+            assert cleanup_run.error_code is None
 
 
 @pytest.mark.asyncio
