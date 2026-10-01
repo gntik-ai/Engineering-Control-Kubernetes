@@ -269,7 +269,7 @@ def test_worker_verification_uses_a_neutral_non_home_directory() -> None:
     assert "/scripts/browser-runtime-smoke.py" in verification
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers" in verification
     for version in (
-        "codex-cli 0.149.0",
+        "codex-cli 0.159.3",
         "2.1.239 (Claude Code)",
         "8.30.0",
         "0.74.0",

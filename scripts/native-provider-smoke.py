@@ -17,6 +17,7 @@ from jsonschema import Draft202012Validator
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
 from engineering_control.agents.instructions import AgentInstructionPack
+from engineering_control.config import Settings
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import ModelClass, Project, Provider, RunStatus
 from engineering_control.security.redaction import SecretRedactor
@@ -136,7 +137,12 @@ async def run_one(
         "delivery.invoke_maker" if mode == "maker" else "delivery.invoke_checker",
     )
     adapter = (
-        CodexCLIAdapter(executable="/usr/local/bin/codex", temp_root=str(result_file.parent))
+        CodexCLIAdapter(
+            executable="/usr/local/bin/codex",
+            temp_root=str(result_file.parent),
+            # NEW-106: exercise the model the workers are configured with, not the CLI default.
+            default_model=Settings().codex_model,
+        )
         if provider is Provider.CODEX
         else ClaudeCLIAdapter(executable="/usr/local/bin/claude")
     )
