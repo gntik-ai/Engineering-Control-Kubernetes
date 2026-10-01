@@ -113,9 +113,8 @@ def verified_backlog_approval(
         datetime.fromisoformat(str(approval_record.get("approved_at")))
     except ValueError:
         return None
-    if (
-        approval_record.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE
-        or not isinstance(approval_record.get("approved_by"), str)
+    if approval_record.get("typed_confirmation") != BACKLOG_APPROVAL_PHRASE or not isinstance(
+        approval_record.get("approved_by"), str
     ):
         return None
     try:
@@ -2279,9 +2278,7 @@ class EngineeringActivityHandler:
             change_set.state = "SOURCE_MERGED" if source_merged else "SOURCE_PR"
             change_set.source_head_sha = str(published[str(change_set.source_pr_url)])
             if change_set.deployment_pr_url:
-                change_set.deployment_head_sha = str(
-                    published[str(change_set.deployment_pr_url)]
-                )
+                change_set.deployment_head_sha = str(published[str(change_set.deployment_pr_url)])
             change_set.version += 1
         return self._envelope(step, payload, "RESTORED")
 

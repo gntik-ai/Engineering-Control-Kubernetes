@@ -177,8 +177,7 @@ class ControlledWorkflow:
                         "notify.write_policy_required",
                         {
                             **self._write_notice,
-                            "project": self._write_notice.get("project")
-                            or payload.get("project"),
+                            "project": self._write_notice.get("project") or payload.get("project"),
                             "workflow_id": workflow.info().workflow_id,
                             "step": step,
                             "reason_code": self._write_policy_reason,
@@ -193,9 +192,7 @@ class ControlledWorkflow:
                 except TimeoutError:
                     continue
             else:
-                await workflow.wait_condition(
-                    lambda: self._cancelled or self._retry_step == step
-                )
+                await workflow.wait_condition(lambda: self._cancelled or self._retry_step == step)
             if self._cancelled:
                 return {**result, "status": "CANCELLED", "workflow_state": "CANCELLED"}
             self._retry_step = None
@@ -2158,9 +2155,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
 
         # 1b. NEW-103: the deployment PR's CI must also pass before either PR merges,
         # so a deployment failure can no longer leave the source merged on its own.
-        if plan.get("deployment_pr_number") and workflow.patched(
-            "gitops-deployment-ci-gate-v1"
-        ):
+        if plan.get("deployment_pr_number") and workflow.patched("gitops-deployment-ci-gate-v1"):
             deployment_checks = await self._poll(
                 "gitops.deployment_pr_checks",
                 base,
@@ -2176,9 +2171,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     evidence["ci_regression_reason"] = deployment_checks.get("reason")
                     evidence["ci_regression_target"] = "deployment"
                     if deployment_checks.get("failure_excerpts"):
-                        evidence["ci_failure_excerpts"] = deployment_checks.get(
-                            "failure_excerpts"
-                        )
+                        evidence["ci_failure_excerpts"] = deployment_checks.get("failure_excerpts")
                 return self._blocked(deployment_checks, "DEPLOYMENT_PR_CI_FAILED")
 
         # 2. Ready + merge (source first, then the deployment PR when one exists).

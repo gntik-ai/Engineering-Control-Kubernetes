@@ -2324,9 +2324,7 @@ def test_selection_rechecks_the_import_filter_for_legacy_deferred_r3_rows() -> N
 
     from engineering_control.activities.engineering import _deferred_r3_row_in_filter
 
-    def row(
-        issue_type: str, status: str = "DEFERRED", body: object = "Tenant login fails."
-    ) -> Any:
+    def row(issue_type: str, status: str = "DEFERRED", body: object = "Tenant login fails.") -> Any:
         return SimpleNamespace(
             eligibility_status=status,
             issue_type=issue_type,
@@ -2420,9 +2418,7 @@ async def test_a_runless_started_operation_is_released_only_once_temporal_report
     bus._runless_cursor = None
     assert await bus.reconcile_runless_operations() == 1
     with repository.sessions() as session:
-        stored = {
-            row.workflow_id: row.status for row in session.scalars(select(OperationRequest))
-        }
+        stored = {row.workflow_id: row.status for row in session.scalars(select(OperationRequest))}
     assert stored == {
         "backlog-loop-falcone-a": "COMPLETED",
         "backlog-loop-falcone-b": "STARTED",

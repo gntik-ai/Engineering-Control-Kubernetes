@@ -140,9 +140,10 @@ async def test_provider_activity_does_not_echo_prompt_text_back_into_its_result(
 
     result = await handler.handle(
         "delivery.invoke_maker",
-        {"maker_request": request_for(worktree).model_dump(mode="json") | {
-            "prompt": original_prompt
-        }},
+        {
+            "maker_request": request_for(worktree).model_dump(mode="json")
+            | {"prompt": original_prompt}
+        },
     )
 
     assert result["status"] == "SUCCESS"

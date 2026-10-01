@@ -1520,9 +1520,7 @@ class GitOpsGitHubHandler:
         pattern = re.compile(rf"{re.escape(prefix)}([0-9]+)\.([0-9]+)\.([0-9]+)")
         own = self._tag_at(plan.source_repository, prefix, merge_sha)
         own_match = pattern.fullmatch(own) if own else None
-        floor = (
-            (int(own_match[1]), int(own_match[2]), int(own_match[3])) if own_match else None
-        )
+        floor = (int(own_match[1]), int(own_match[2]), int(own_match[3])) if own_match else None
         candidates: list[tuple[tuple[int, int, int], str, str]] = []
         for ref in self.broker.list_tag_refs(plan.source_repository, prefix):
             name = ref["ref"].removeprefix("refs/tags/")

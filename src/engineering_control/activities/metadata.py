@@ -3398,8 +3398,7 @@ class MetadataActivityHandler:
         ranges = [
             f"{target} worktree: git diff {base}..HEAD"
             for target in ("source", "deployment")
-            if isinstance(base := payload.get(f"{target}_base_sha"), str)
-            and self._is_git_sha(base)
+            if isinstance(base := payload.get(f"{target}_base_sha"), str) and self._is_git_sha(base)
         ]
         if not ranges:
             return ""

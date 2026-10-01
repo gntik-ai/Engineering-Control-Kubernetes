@@ -127,9 +127,7 @@ class GitHubActivityHandler:
                 self.settings.mirror_root.resolve()
             ):
                 raise ApplicationError("canonical mirror is unavailable", type="NotConfigured")
-            remote = self.git.run(
-                "git", ["remote", "get-url", "origin"], cwd=mirror
-            ).stdout.strip()
+            remote = self.git.run("git", ["remote", "get-url", "origin"], cwd=mirror).stdout.strip()
             if remote != f"https://github.com/{repository}.git":
                 raise ApplicationError("canonical mirror origin changed", type="PolicyViolation")
             self.git.run(

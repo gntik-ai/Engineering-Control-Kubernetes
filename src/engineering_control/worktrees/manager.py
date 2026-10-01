@@ -806,10 +806,7 @@ class GitWorktreeManager:
             self._run(["git", "update-ref", f"{prefix}-worktree", stash], target)
         self._run(["git", "reset", "--hard", destination], target)
         self._run(["git", "clean", "-ffdx"], target)
-        if (
-            self.is_dirty(target)
-            or self._run(["git", "rev-parse", "HEAD"], target) != destination
-        ):
+        if self.is_dirty(target) or self._run(["git", "rev-parse", "HEAD"], target) != destination:
             raise WorktreeError(f"could not reset the archived worktree to its base: {target}")
 
     def is_dirty(self, path: Path) -> bool:

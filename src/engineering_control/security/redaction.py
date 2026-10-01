@@ -84,7 +84,9 @@ class SecretRedactor:
         ),
         (
             "kubeconfig_credential",
-            re.compile(rf"(?im)^(\s*(?:token|client-key-data|password)\s*:\s*){_NOT_REDACTED}[^\r\n]+$"),
+            re.compile(
+                rf"(?im)^(\s*(?:token|client-key-data|password)\s*:\s*){_NOT_REDACTED}[^\r\n]+$"
+            ),
             rf"\1{REDACTED}",
         ),
     )

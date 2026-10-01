@@ -160,9 +160,7 @@ def _literal_workflow_step_calls() -> set[str]:
     names, which are the caller's own responsibility to get right at the literal
     call site that supplies them.
     """
-    source = (ROOT / "src/engineering_control/workflows/definitions.py").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "src/engineering_control/workflows/definitions.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     steps: set[str] = set()
     for node in ast.walk(tree):
@@ -193,9 +191,7 @@ def test_every_literal_step_a_workflow_calls_is_a_registered_activity() -> None:
     called_steps = _literal_workflow_step_calls()
     assert len(called_steps) > 50  # sanity: the AST walk actually found calls
     worker_kinds = ("controller", *ROLE_WORKER_REGISTRY)
-    registered = set().union(
-        *(ControlActivities.steps_for_worker(kind) for kind in worker_kinds)
-    )
+    registered = set().union(*(ControlActivities.steps_for_worker(kind) for kind in worker_kinds))
     missing = called_steps - registered
     assert not missing, (
         f"workflows/definitions.py calls step(s) never registered in any "
