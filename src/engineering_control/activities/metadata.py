@@ -7844,10 +7844,12 @@ class MetadataActivityHandler:
                         for value in sorted(raw_protected, key=lambda item: item["lease_id"])
                     )
                     run.error_code = "CLEANUP_PROTECTED_WORKTREES_RETAINED"
+                    # Every protected lease stays identifiable (summary is unbounded Text;
+                    # each entry is bounded above).
                     run.summary = (
                         f"{run.summary}; {len(protected_ids)} protected worktrees retained "
                         f"for the operator: {details}"
-                    )[:4000]
+                    )
             elif terminal == "DRY_RUN":
                 run.status = "SUCCESS"
                 run.summary = "cleanup dry run completed without mutation"
