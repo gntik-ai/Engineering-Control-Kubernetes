@@ -387,6 +387,11 @@ SYNC_REMEDIATION_ACTIONS: dict[str, tuple[str, tuple[str, ...], bool]] = {
 REMEDIATION_INFO = "hermes-remediation"
 REMEDIATION_PREVIOUS_INFO = "hermes-previous-started-at"
 _REMEDIATION_ID = re.compile(r"[A-Za-z0-9._:/-]{1,240}")
+# The JSON-patch "test" on metadata.resourceVersion failed: the write provably did not
+# apply (evanphx/json-patch: "testing value /metadata/resourceVersion failed").
+_CONDITIONAL_WRITE_CONFLICT = re.compile(
+    r"testing value\b.*\bfailed|\btest failed\b", re.IGNORECASE
+)
 
 
 def classify_sync_failure(kind: str, message: str) -> str:
@@ -928,6 +933,14 @@ class GitOpsControllerHandler:
             if _nested(after, "metadata", "resourceVersion") == version:
                 # Nothing moved, so the write itself failed (e.g. RBAC): fail closed.
                 raise CommandFailure("Argo CD operation patch was rejected")
+            if landed is not None and not _CONDITIONAL_WRITE_CONFLICT.search(
+                f"{written.stdout}\n{written.stderr}"
+            ):
+                # NEW-113 review: a remediation write may have landed even though its
+                # response was lost, and a later operation may already have replaced its
+                # identity. Only a confirmed failed resourceVersion test justifies writing
+                # again; any other failure is an unknown outcome for the operator.
+                return "OUTCOME_UNKNOWN"
         # The Application kept changing under us: report busy and let the flow poll.
         return "BUSY"
 
@@ -1475,6 +1488,12 @@ class GitOpsControllerHandler:
         )
         if started == "BUSY":
             return {"status": "SYNC_BUSY", "action": action}
+        if started == "OUTCOME_UNKNOWN":
+            return {
+                "status": "REMEDIATION_OUTCOME_UNKNOWN",
+                "blocker": "ARGO_REMEDIATION_OUTCOME_UNKNOWN",
+                "action": action,
+            }
         if started != "STARTED":
             return refused(started)
         return triggered(selected, previous_started)

@@ -2959,3 +2959,32 @@ async def test_a_landed_write_with_a_lost_response_is_never_written_twice(
     result = await _controller(tmp_path, kubectl).handle("gitops.remediate_sync", _remediate())
     assert result["status"] == "REMEDIATION_TRIGGERED"
     assert len(_operation_patches(kubectl)) == 1
+
+
+class _LostResponseThenOperatorSyncKubectl(FakeKubectl):
+    """The patch lands, its response is lost, and an operator sync then replaces the
+    operation (so the remediation identity is gone) and moves the resourceVersion."""
+
+    def _answer(self, namespace: str | None, args: list[str]) -> CommandResult:
+        result = super()._answer(namespace, args)
+        if args[0] == "patch" and not result.return_code:
+            self.application.pop("operation", None)
+            self.application["status"]["operationState"] = {
+                "phase": "Running",
+                "startedAt": "2026-10-02T09:05:00Z",
+                "operation": {"initiatedBy": {"username": "admin"}, "sync": {}},
+            }
+            self._bump()
+            return CommandResult(1, "", "connection reset by peer")
+        return result
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_remediation_write_is_not_repeated(tmp_path: Path) -> None:
+    # NEW-113 review: only a confirmed failed resourceVersion test justifies another
+    # write; a lost response whose evidence was overwritten is an unknown outcome.
+    kubectl = _LostResponseThenOperatorSyncKubectl(application=_failed_application(EXECUTOR))
+    result = await _controller(tmp_path, kubectl).handle("gitops.remediate_sync", _remediate())
+    assert result["status"] == "REMEDIATION_OUTCOME_UNKNOWN"
+    assert result["blocker"] == "ARGO_REMEDIATION_OUTCOME_UNKNOWN"
+    assert len(_operation_patches(kubectl)) == 1
