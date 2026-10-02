@@ -43,6 +43,11 @@ from engineering_control.workflows.worker_registry import (
     task_queue_for,
 )
 
+# NEW-113 review fallback: an Argo remediation write is never retried automatically. A
+# failed or lost attempt may already have written its operation, and a later operator sync
+# can erase the evidence of it, so an unknown outcome is escalated to the operator.
+SINGLE_ATTEMPT = RetryPolicy(maximum_attempts=1)
+
 ACTIVITY_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
     backoff_coefficient=2.0,
@@ -141,7 +146,12 @@ class ControlledWorkflow:
         return not self._cancelled
 
     async def _step(
-        self, step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
+        self,
+        step: str,
+        payload: dict[str, Any],
+        *,
+        timeout_minutes: int = 30,
+        retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
         result = await workflow.execute_activity(
             "execute_control_step",
@@ -149,7 +159,7 @@ class ControlledWorkflow:
             task_queue=self._activity_queue(step, payload),
             start_to_close_timeout=timedelta(minutes=timeout_minutes),
             heartbeat_timeout=timedelta(minutes=2),
-            retry_policy=ACTIVITY_RETRY,
+            retry_policy=retry_policy,
         )
         if not isinstance(result, dict):
             raise TypeError(f"activity {step} returned a non-object result")
@@ -2113,6 +2123,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         attempts: int,
         interval: timedelta,
         write: bool = False,
+        retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
         """Call a short activity until it leaves ``pending``; TIMED_OUT when bounded out."""
         result: dict[str, Any] = {}
@@ -2124,7 +2135,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             if write:
                 result = await self._github_write_step(step, payload)
             else:
-                result = await self._step(step, payload)
+                result = await self._step(step, payload, retry_policy=retry_policy)
             if result.get("status") not in pending:
                 return result
         return {**result, "status": "TIMED_OUT"}
@@ -2444,7 +2455,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 "failure_class": failure_class,
                 "resources": [self._sync_resource_key(item) for item in resources],
             }
-            triggered = await self._poll(
+            triggered = await self._remediation_call(
                 "gitops.remediate_sync",
                 {
                     **deployed_base,
@@ -2485,7 +2496,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 )
                 if synced.get("status") == "SYNC_PARTIAL":
                     # The replaced resources applied; one normal sync applies the rest.
-                    completed = await self._poll(
+                    completed = await self._remediation_call(
                         "gitops.remediate_sync",
                         {
                             **deployed_base,
@@ -2509,6 +2520,12 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                             pending=frozenset({"SYNC_PENDING"}),
                             attempts=40,
                             interval=half_minute,
+                        )
+                    elif completed.get("status") == "REMEDIATION_OUTCOME_UNKNOWN":
+                        record["result"] = "ARGO_REMEDIATION_OUTCOME_UNKNOWN"
+                        attempts.append(record)
+                        return await self._escalate_sync(
+                            deployed_base, completed, failure_class, diagnosis, attempts, evidence
                         )
                     else:
                         synced = {**completed, "status": "SYNC_FAILED"}
@@ -2536,6 +2553,35 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 return synced
             if synced.get("status") not in {"SYNC_FAILED", "TIMED_OUT"}:
                 return self._blocked(synced, "ARGO_SYNC_FAILED")
+
+    async def _remediation_call(
+        self,
+        step: str,
+        payload: dict[str, Any],
+        *,
+        pending: frozenset[str],
+        attempts: int,
+        interval: timedelta,
+    ) -> dict[str, Any]:
+        """Poll the mutating remediation step with single-attempt activities.
+
+        A failed activity (including a timed-out one whose write may have landed) is not
+        retried: its outcome is unknown, so the flow escalates instead of writing again.
+        """
+        try:
+            return await self._poll(
+                step,
+                payload,
+                pending=pending,
+                attempts=attempts,
+                interval=interval,
+                retry_policy=SINGLE_ATTEMPT,
+            )
+        except ActivityError:
+            return {
+                "status": "REMEDIATION_OUTCOME_UNKNOWN",
+                "blocker": "ARGO_REMEDIATION_OUTCOME_UNKNOWN",
+            }
 
     async def _escalate_sync(
         self,

@@ -2937,3 +2937,25 @@ async def test_sync_failure_issue_is_opened_then_commented(tmp_path: Path) -> No
     assert again["issue_url"] == "https://github.com/gntik-ai/musematic/issues/500"
     invalid = await handler.handle("gitops.environment_issue", {**payload, "failure_class": "NOPE"})
     assert invalid["blocker"] == "ENVIRONMENT_ISSUE_CLASS_INVALID"
+
+
+class _LostResponseKubectl(FakeKubectl):
+    """Applies the JSON patch but reports failure: the response was lost in transit."""
+
+    def _answer(self, namespace: str | None, args: list[str]) -> CommandResult:
+        result = super()._answer(namespace, args)
+        if args[0] == "patch" and not result.return_code:
+            return CommandResult(1, "", "connection reset by peer")
+        return result
+
+
+@pytest.mark.asyncio
+async def test_a_landed_write_with_a_lost_response_is_never_written_twice(
+    tmp_path: Path,
+) -> None:
+    # NEW-113 review fallback: after a failed patch the re-read finds this remediation's
+    # identity on the Application, so the attempt reports STARTED without a second write.
+    kubectl = _LostResponseKubectl(application=_failed_application(EXECUTOR))
+    result = await _controller(tmp_path, kubectl).handle("gitops.remediate_sync", _remediate())
+    assert result["status"] == "REMEDIATION_TRIGGERED"
+    assert len(_operation_patches(kubectl)) == 1

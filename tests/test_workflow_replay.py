@@ -2353,3 +2353,52 @@ async def test_an_execution_mid_sync_poll_upgrades_into_the_new_path() -> None:
     )
     assert marker_index > timer_index
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_a_failed_remediation_activity_is_not_retried_and_escalates() -> None:
+    # NEW-113 review fallback: the mutating step runs as a single attempt; a failed (or
+    # lost) attempt may already have written its operation, so the flow escalates
+    # (ARGO_REMEDIATION_OUTCOME_UNKNOWN) instead of retrying and syncing twice.
+    script = _sync_recovery_script(
+        **{
+            "gitops.diagnose_sync": _diagnosed(
+                "PATCH_CONFLICT",
+                failed_resources=[
+                    {
+                        **_EXECUTOR,
+                        "status": "SyncFailed",
+                        "message": _MESSAGE_980,
+                        "failure_class": "PATCH_CONFLICT",
+                        "managed": True,
+                        "eligible": True,
+                    }
+                ],
+            ),
+        }
+    )
+    base = _sequenced_step(script, {"gitops.sync_status": [_SYNC_FAILED]})
+    calls: list[str] = []
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        if request["step"] == "gitops.remediate_sync":
+            calls.append(request["step"])
+            raise ApplicationError("kubectl patch response lost", type="CommandFailure")
+        result: dict[str, Any] = await base(request)
+        return result
+
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow, _gitops_input(), execute_control_step
+    )
+
+    assert calls == ["gitops.remediate_sync"]  # exactly one attempt, never retried
+    assert result is not None
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_FAILED",
+        "PATCH_CONFLICT",
+    )
+    (issue,) = _payloads(history, "gitops.environment_issue")
+    assert issue["action"] == "report_sync"
+    notices = [notice["event"] for notice in _payloads(history, "gitops.notify_sync")]
+    assert notices[0] == "detected" and notices[-1] == "escalated"

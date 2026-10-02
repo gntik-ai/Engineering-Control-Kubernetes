@@ -877,6 +877,7 @@ class GitOpsControllerHandler:
         self,
         flow: StagingFlowPolicy,
         build: Callable[[dict[str, Any]], dict[str, Any] | str],
+        landed: Callable[[dict[str, Any]], bool] | None = None,
     ) -> str:
         """Write the COMPLETE operation only if none is in flight, atomically.
 
@@ -888,6 +889,10 @@ class GitOpsControllerHandler:
         """
         for _ in range(3):
             application = self._application(flow)
+            # NEW-113 review fallback: a write whose response was lost may already have
+            # landed; recognise it by its identity on every read and never write twice.
+            if landed is not None and landed(application):
+                return "STARTED"
             if self._operation_running(application):
                 return "BUSY"
             version = _nested(application, "metadata", "resourceVersion")
@@ -918,6 +923,8 @@ class GitOpsControllerHandler:
             if not written.return_code:
                 return "STARTED"
             after = self._application(flow)
+            if landed is not None and landed(after):
+                return "STARTED"
             if _nested(after, "metadata", "resourceVersion") == version:
                 # Nothing moved, so the write itself failed (e.g. RBAC): fail closed.
                 raise CommandFailure("Argo CD operation patch was rejected")
@@ -1459,7 +1466,13 @@ class GitOpsControllerHandler:
             }
 
         self._refresh(flow)
-        started = self._start_operation(flow, build)
+        started = self._start_operation(
+            flow,
+            build,
+            landed=lambda application: (
+                self._remediation_operation(application, remediation_id) is not None
+            ),
+        )
         if started == "BUSY":
             return {"status": "SYNC_BUSY", "action": action}
         if started != "STARTED":
