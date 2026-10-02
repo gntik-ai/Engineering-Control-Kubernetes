@@ -246,6 +246,9 @@ class ControlActivities:
         "gitops.remediate",
         "gitops.trigger_sync",
         "gitops.sync_status",
+        "gitops.diagnose_sync",
+        "gitops.remediate_sync",
+        "gitops.notify_sync",
         "gitops.verify_workloads",
         "gitops.persist_result",
         # ... and GitHub-worker steps (GitOpsGitHubHandler via GitHubActivityHandler).

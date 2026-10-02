@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, replace
 from datetime import timedelta
 from typing import Any
@@ -41,6 +42,11 @@ from engineering_control.workflows.worker_registry import (
     provider_task_queue,
     task_queue_for,
 )
+
+# NEW-113 review fallback: an Argo remediation write is never retried automatically. A
+# failed or lost attempt may already have written its operation, and a later operator sync
+# can erase the evidence of it, so an unknown outcome is escalated to the operator.
+SINGLE_ATTEMPT = RetryPolicy(maximum_attempts=1)
 
 ACTIVITY_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
@@ -140,7 +146,12 @@ class ControlledWorkflow:
         return not self._cancelled
 
     async def _step(
-        self, step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
+        self,
+        step: str,
+        payload: dict[str, Any],
+        *,
+        timeout_minutes: int = 30,
+        retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
         result = await workflow.execute_activity(
             "execute_control_step",
@@ -148,7 +159,7 @@ class ControlledWorkflow:
             task_queue=self._activity_queue(step, payload),
             start_to_close_timeout=timedelta(minutes=timeout_minutes),
             heartbeat_timeout=timedelta(minutes=2),
-            retry_policy=ACTIVITY_RETRY,
+            retry_policy=retry_policy,
         )
         if not isinstance(result, dict):
             raise TypeError(f"activity {step} returned a non-object result")
@@ -2064,6 +2075,13 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
 
     _MERGE_ROUNDS = 20
     _REMEDIATION_ROUNDS = 3
+    # NEW-113: Argo CD sync remediation bounds (mirrored by activities/gitops.py).
+    _SYNC_REMEDIATION_ROUNDS = 3
+    _TRANSIENT_RESYNCS = 3
+    _SYNC_PATCH = "gitops-argo-sync-remediation-v1"
+    # Tests run the real flow with short timers. Production keeps 1.0, and _timer then
+    # returns the very same timedelta, so every timer command stays byte-identical.
+    _TIMER_SCALE = 1.0
 
     @workflow.run
     async def run(self, request: StagingGitOpsDeliveryInput) -> dict[str, Any]:
@@ -2105,18 +2123,19 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         attempts: int,
         interval: timedelta,
         write: bool = False,
+        retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
         """Call a short activity until it leaves ``pending``; TIMED_OUT when bounded out."""
         result: dict[str, Any] = {}
         for attempt in range(attempts):
             if attempt:
-                await workflow.sleep(interval)
+                await workflow.sleep(self._timer(interval))
             if not await self._checkpoint(step.upper().replace(".", "_")):
                 return {"status": "CANCELLED", "blocker": "CANCELLED"}
             if write:
                 result = await self._github_write_step(step, payload)
             else:
-                result = await self._step(step, payload)
+                result = await self._step(step, payload, retry_policy=retry_policy)
             if result.get("status") not in pending:
                 return result
         return {**result, "status": "TIMED_OUT"}
@@ -2285,6 +2304,12 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             attempts=40,
             interval=half_minute,
         )
+        if synced.get("status") in {"SYNC_FAILED", "TIMED_OUT"} and self._sync_recovery_patched():
+            # NEW-113: diagnose, remediate within bounds, notify, and escalate the rest
+            # (gntik-ai/falcone#980: a patch-incompatible env change failed the sync).
+            synced = await self._recover_sync(deployed_base, synced, evidence)
+            if synced.get("status") != "SYNCED":
+                return synced
         if synced.get("status") == "TIMED_OUT":
             return {"status": "BLOCKED", "blocker": "ARGO_SYNC_TIMEOUT"}
         if synced.get("status") != "SYNCED":
@@ -2319,6 +2344,292 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         if closed.get("status") != "ISSUE_CLOSED":
             return self._blocked(closed, "DELIVERED_ISSUE_CLOSE_FAILED")
         return {"status": "STAGING_VERIFIED"}
+
+    def _timer(self, interval: timedelta) -> timedelta:
+        return interval if self._TIMER_SCALE == 1.0 else interval * self._TIMER_SCALE
+
+    def _sync_recovery_patched(self) -> bool:
+        # Checked only where a sync failed or timed out, so a history recorded before
+        # NEW-113 (no marker there) replays its old BLOCKED return unchanged.
+        return workflow.patched(self._SYNC_PATCH)
+
+    @staticmethod
+    def _remediation_id(rounds: int, action: str) -> str:
+        workflow_id = re.sub(r"[^A-Za-z0-9._:/-]", "-", workflow.info().workflow_id)[:200]
+        return f"{workflow_id}:round-{rounds}:{action}"
+
+    @staticmethod
+    def _sync_resource_key(entry: dict[str, Any]) -> str:
+        return "/".join(
+            str(entry.get(field) or "") for field in ("group", "kind", "namespace", "name")
+        )
+
+    @classmethod
+    def _sync_remediation_plan(
+        cls,
+        failure_class: str,
+        diagnosis: dict[str, Any],
+        remediated: list[str],
+        *,
+        timed_out: bool,
+        transient: int,
+    ) -> tuple[str | None, list[dict[str, str]]]:
+        """Pick the next bounded remediation, or None to escalate to the operator."""
+        if failure_class == "TRANSIENT":
+            return ("resync", []) if transient < cls._TRANSIENT_RESYNCS else (None, [])
+        if timed_out or failure_class not in {"PATCH_CONFLICT", "JOB_IMMUTABLE"}:
+            # Degraded health and everything unclassified go to the operator.
+            return None, []
+        raw = diagnosis.get("failed_resources")
+        targets = [
+            {field: str(entry.get(field) or "") for field in ("group", "kind", "namespace", "name")}
+            for entry in (raw if isinstance(raw, list) else [])
+            if isinstance(entry, dict)
+            and entry.get("failure_class") == failure_class
+            and entry.get("eligible") is True
+            and cls._sync_resource_key(entry) not in remediated
+        ][:10]
+        if not targets:
+            return None, []
+        return ("replace" if failure_class == "PATCH_CONFLICT" else "replace_force"), targets
+
+    async def _notify_sync(self, deployed_base: dict[str, Any], event: str, **details: Any) -> None:
+        try:
+            await self._step("gitops.notify_sync", {**deployed_base, "event": event, **details})
+        except ActivityError:
+            # A lost operator notification never changes the delivery outcome.
+            pass
+
+    async def _recover_sync(
+        self,
+        deployed_base: dict[str, Any],
+        synced: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """NEW-113: bounded Argo CD sync remediation; returns SYNCED or a final outcome."""
+        half_minute = timedelta(seconds=30)
+        remediated: list[str] = []
+        attempts: list[dict[str, Any]] = []
+        transient = 0
+        rounds = 0
+        detected = False
+        while True:
+            timed_out = synced.get("status") == "TIMED_OUT"
+            diagnosed = await self._step("gitops.diagnose_sync", deployed_base)
+            raw = diagnosed.get("diagnosis")
+            diagnosis: dict[str, Any] = (
+                raw
+                if isinstance(raw, dict)
+                else {"message": str(synced.get("message") or "")[:300]}
+            )
+            failure_class = (
+                str(diagnosed.get("failure_class") or "OTHER")
+                if diagnosed.get("status") == "DIAGNOSED"
+                else "OTHER"
+            )
+            if not detected:
+                detected = True
+                await self._notify_sync(
+                    deployed_base,
+                    "detected",
+                    failure_class=failure_class,
+                    blocker="ARGO_SYNC_TIMEOUT" if timed_out else "ARGO_SYNC_FAILED",
+                    diagnosis=diagnosis,
+                )
+            action, resources = self._sync_remediation_plan(
+                failure_class, diagnosis, remediated, timed_out=timed_out, transient=transient
+            )
+            if action is None or rounds >= self._SYNC_REMEDIATION_ROUNDS:
+                return await self._escalate_sync(
+                    deployed_base, synced, failure_class, diagnosis, attempts, evidence
+                )
+            rounds += 1
+            if not await self._checkpoint(f"GITOPS_SYNC_REMEDIATION_{rounds}"):
+                return {"status": "CANCELLED", "blocker": "CANCELLED"}
+            if action == "resync":
+                transient += 1
+                await workflow.sleep(self._timer(timedelta(seconds=30 * 2 ** (transient - 1))))
+            record: dict[str, Any] = {
+                "round": rounds,
+                "action": action,
+                "failure_class": failure_class,
+                "resources": [self._sync_resource_key(item) for item in resources],
+            }
+            triggered = await self._remediation_call(
+                "gitops.remediate_sync",
+                {
+                    **deployed_base,
+                    "action": action,
+                    "resources": resources,
+                    "round": rounds,
+                    "attempt": transient,
+                    "already_remediated": remediated,
+                    # Stable per remediation, so a retried activity cannot sync twice.
+                    "remediation_id": self._remediation_id(rounds, action),
+                    # The failed operation this diagnosis describes (None for health).
+                    "failed_operation_started_at": (
+                        synced.get("operation_started_at")
+                        if synced.get("status") == "SYNC_FAILED"
+                        else None
+                    ),
+                },
+                pending=frozenset({"SYNC_BUSY"}),
+                attempts=10,
+                interval=half_minute,
+            )
+            if triggered.get("status") == "CANCELLED":
+                return {"status": "CANCELLED", "blocker": "CANCELLED"}
+            if triggered.get("status") == "REMEDIATION_TRIGGERED":
+                remediated.extend(str(key) for key in triggered.get("remediated_keys") or [])
+                synced = await self._poll(
+                    "gitops.sync_status",
+                    {
+                        **deployed_base,
+                        "previous_operation_started_at": triggered.get(
+                            "previous_operation_started_at"
+                        ),
+                        "selective": bool(resources),
+                    },
+                    pending=frozenset({"SYNC_PENDING"}),
+                    attempts=40,
+                    interval=half_minute,
+                )
+                if synced.get("status") == "SYNC_PARTIAL":
+                    # The replaced resources applied; one normal sync applies the rest.
+                    completed = await self._remediation_call(
+                        "gitops.remediate_sync",
+                        {
+                            **deployed_base,
+                            "action": "complete",
+                            "round": rounds,
+                            "remediation_id": self._remediation_id(rounds, "complete"),
+                        },
+                        pending=frozenset({"SYNC_BUSY"}),
+                        attempts=10,
+                        interval=half_minute,
+                    )
+                    if completed.get("status") == "REMEDIATION_TRIGGERED":
+                        synced = await self._poll(
+                            "gitops.sync_status",
+                            {
+                                **deployed_base,
+                                "previous_operation_started_at": completed.get(
+                                    "previous_operation_started_at"
+                                ),
+                            },
+                            pending=frozenset({"SYNC_PENDING"}),
+                            attempts=40,
+                            interval=half_minute,
+                        )
+                    elif completed.get("status") == "REMEDIATION_OUTCOME_UNKNOWN":
+                        record["result"] = "ARGO_REMEDIATION_OUTCOME_UNKNOWN"
+                        attempts.append(record)
+                        return await self._escalate_sync(
+                            deployed_base, completed, failure_class, diagnosis, attempts, evidence
+                        )
+                    else:
+                        synced = {**completed, "status": "SYNC_FAILED"}
+                result = str(synced.get("status") or "UNKNOWN")
+            else:
+                result = str(triggered.get("blocker") or triggered.get("status") or "UNKNOWN")
+            record["result"] = result[:80]
+            attempts.append(record)
+            evidence["argo_sync_remediations"] = attempts
+            await self._notify_sync(
+                deployed_base,
+                "remediation",
+                failure_class=failure_class,
+                action=action,
+                round=rounds,
+                result=record["result"],
+                resources=resources,
+            )
+            if triggered.get("status") != "REMEDIATION_TRIGGERED":
+                return await self._escalate_sync(
+                    deployed_base, synced, failure_class, diagnosis, attempts, evidence
+                )
+            if synced.get("status") == "SYNCED":
+                evidence["argo_sync_failure_class"] = failure_class
+                return synced
+            if synced.get("status") not in {"SYNC_FAILED", "TIMED_OUT"}:
+                return self._blocked(synced, "ARGO_SYNC_FAILED")
+
+    async def _remediation_call(
+        self,
+        step: str,
+        payload: dict[str, Any],
+        *,
+        pending: frozenset[str],
+        attempts: int,
+        interval: timedelta,
+    ) -> dict[str, Any]:
+        """Poll the mutating remediation step with single-attempt activities.
+
+        A failed activity (including a timed-out one whose write may have landed) is not
+        retried: its outcome is unknown, so the flow escalates instead of writing again.
+        """
+        try:
+            return await self._poll(
+                step,
+                payload,
+                pending=pending,
+                attempts=attempts,
+                interval=interval,
+                retry_policy=SINGLE_ATTEMPT,
+            )
+        except ActivityError:
+            return {
+                "status": "REMEDIATION_OUTCOME_UNKNOWN",
+                "blocker": "ARGO_REMEDIATION_OUTCOME_UNKNOWN",
+            }
+
+    async def _escalate_sync(
+        self,
+        deployed_base: dict[str, Any],
+        synced: dict[str, Any],
+        failure_class: str,
+        diagnosis: dict[str, Any],
+        attempts: list[dict[str, Any]],
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """NEW-113: one issue + one notification with the diagnosis, then BLOCKED."""
+        blocker = "ARGO_SYNC_TIMEOUT" if synced.get("status") == "TIMED_OUT" else "ARGO_SYNC_FAILED"
+        evidence["argo_sync_failure_class"] = failure_class
+        evidence["argo_sync_remediations"] = attempts
+        if not await self._checkpoint("GITOPS_SYNC_ESCALATION"):
+            return {"status": "CANCELLED", "blocker": "CANCELLED"}
+        issue = await self._github_write_step(
+            "gitops.environment_issue",
+            {
+                **deployed_base,
+                "action": "report_sync",
+                "failure_class": failure_class,
+                "blocker": blocker,
+                "diagnosis": diagnosis,
+                "attempts": attempts,
+            },
+        )
+        if issue.get("status") == "CANCELLED":
+            return {"status": "CANCELLED", "blocker": "CANCELLED"}
+        issue_url: str | None = None
+        if issue.get("status") in {"ISSUE_OPENED", "ISSUE_COMMENTED"} and isinstance(
+            issue.get("issue_number"), int
+        ):
+            evidence["argo_sync_issue_number"] = issue["issue_number"]
+            issue_url = str(issue.get("issue_url") or "") or None
+        else:
+            evidence["argo_sync_issue_blocker"] = str(
+                issue.get("blocker") or "ENVIRONMENT_ISSUE_FAILED"
+            )[:120]
+        await self._notify_sync(
+            deployed_base,
+            "escalated",
+            failure_class=failure_class,
+            blocker=blocker,
+            issue_url=issue_url,
+            diagnosis=diagnosis,
+        )
+        return {"status": "BLOCKED", "blocker": blocker, "failure_class": failure_class}
 
     async def _environment_gate(
         self, base: dict[str, Any], evidence: dict[str, Any]

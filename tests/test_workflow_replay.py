@@ -26,6 +26,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
+from pre_new_113_gitops_workflow import ParentStagingGitOpsDeliveryWorkflow
 from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
@@ -1931,3 +1932,473 @@ async def test_a_deployment_ci_regression_is_repaired_like_a_source_one() -> Non
     ]
     assert paused == ["DEPLOYMENT_PR_CI_REGRESSION"]
     await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+# -- NEW-113: Argo CD sync failure diagnosis, remediation and escalation ---------------
+
+_MESSAGE_980 = (
+    'Deployment.apps "falcone-control-plane-executor" is invalid: '
+    'spec.template.spec.containers[0].env[1].valueFrom: Invalid value: "": '
+    "may not be specified when value is not empty"
+)
+_EXECUTOR = {
+    "group": "apps",
+    "kind": "Deployment",
+    "namespace": "musematic-platform",
+    "name": "falcone-control-plane-executor",
+}
+_EXECUTOR_KEY = "apps/Deployment/musematic-platform/falcone-control-plane-executor"
+_SYNC_FAILED = {
+    "status": "SYNC_FAILED",
+    "blocker": "ARGO_SYNC_FAILED",
+    "message": "one or more objects failed to apply",
+    "phase": "Failed",
+    "operation_started_at": "2026-10-02T09:00:00Z",
+}
+
+
+def _diagnosed(failure_class: str, **diagnosis: Any) -> dict[str, Any]:
+    return {
+        "status": "DIAGNOSED",
+        "failure_class": failure_class,
+        "diagnosis": {
+            "application": "musematic-platform",
+            "message": "one or more objects failed to apply",
+            "failed_resources": [],
+            "degraded_resources": [],
+            "failure_class": failure_class,
+            **diagnosis,
+        },
+    }
+
+
+def _sync_recovery_script(**overrides: Any) -> dict[str, dict[str, Any]]:
+    return _gitops_script(
+        **{
+            "gitops.sync_status": _SYNC_FAILED,
+            "gitops.notify_sync": {"status": "NOTIFIED"},
+            "gitops.environment_issue": {
+                "status": "ISSUE_OPENED",
+                "issue_number": 501,
+                "issue_url": "https://github.com/gntik-ai/musematic/issues/501",
+            },
+            **overrides,
+        }
+    )
+
+
+def _sequenced_step(
+    script: dict[str, dict[str, Any]], sequences: dict[str, list[dict[str, Any]]]
+) -> Any:
+    """Like _scripted_execute_control_step; a sequenced step answers in order, then repeats
+    its last answer."""
+    remaining = {step: list(answers) for step, answers in sequences.items()}
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        answers = remaining.get(step)
+        if answers:
+            return answers.pop(0) if len(answers) > 1 else answers[0]
+        if step not in script:
+            raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
+        return script[step]
+
+    return execute_control_step
+
+
+@workflow.defn(name="StagingGitOpsDeliveryWorkflow", sandboxed=False)
+class _FastStagingGitOpsWorkflow(StagingGitOpsDeliveryWorkflow):
+    """The real flow with millisecond durable timers, so polls and back-off finish here."""
+
+    _TIMER_SCALE = 0.001
+
+    @workflow.run
+    async def run(self, request: StagingGitOpsDeliveryInput) -> dict[str, Any]:
+        return await super().run(request)
+
+
+def _markers(history: Any) -> list[bytes]:
+    return [
+        event.marker_recorded_event_attributes.SerializeToString()
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+    ]
+
+
+def _payloads(history: Any, step: str) -> list[dict[str, Any]]:
+    return [request["payload"] for request in _scheduled_steps(history) if request["step"] == step]
+
+
+_BEFORE_SYNC = [
+    "gitops.prepare",
+    "gitops.pr_checks",
+    "gitops.merge",
+    "gitops.release_tag",
+    "gitops.workflow_run",
+    "gitops.environment_check",
+    "gitops.image_pin",
+    "gitops.trigger_sync",
+]
+
+
+async def test_a_patch_conflict_is_replaced_then_verified() -> None:
+    # falcone#980: SYNC_FAILED -> PATCH_CONFLICT -> Replace=true sync of only the failed
+    # Deployment -> SYNCED -> the unchanged verification and issue close.
+    script = _sync_recovery_script(
+        **{
+            "gitops.diagnose_sync": _diagnosed(
+                "PATCH_CONFLICT",
+                failed_resources=[
+                    {
+                        **_EXECUTOR,
+                        "status": "SyncFailed",
+                        "message": _MESSAGE_980,
+                        "failure_class": "PATCH_CONFLICT",
+                        "managed": True,
+                        "eligible": True,
+                    }
+                ],
+            ),
+            "gitops.remediate_sync": {
+                "status": "REMEDIATION_TRIGGERED",
+                "action": "replace",
+                "resources": [_EXECUTOR],
+                "remediated_keys": [_EXECUTOR_KEY],
+                "previous_operation_started_at": "2026-10-02T09:00:00Z",
+            },
+        }
+    )
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _sequenced_step(
+            script,
+            {"gitops.sync_status": [_SYNC_FAILED, {"status": "SYNCED", "argo_revision": "r1"}]},
+        ),
+    )
+
+    assert result is not None and result["status"] == "STAGING_VERIFIED"
+    assert [request["step"] for request in _scheduled_steps(history)] == [
+        *_BEFORE_SYNC,
+        "gitops.sync_status",
+        "gitops.diagnose_sync",
+        "gitops.notify_sync",
+        "gitops.remediate_sync",
+        "gitops.sync_status",
+        "gitops.notify_sync",
+        "gitops.verify_workloads",
+        "gitops.close_issue",
+        "gitops.persist_result",
+    ]
+    (remediation,) = _payloads(history, "gitops.remediate_sync")
+    assert remediation["action"] == "replace" and remediation["resources"] == [_EXECUTOR]
+    assert (remediation["round"], remediation["already_remediated"]) == (1, [])
+    # Finding 2/4: a stable identity and the failed operation the diagnosis describes.
+    assert remediation["remediation_id"].endswith(":round-1:replace")
+    assert remediation["remediation_id"].startswith("replay-test-StagingGitOpsDeliveryWorkflow-")
+    assert remediation["failed_operation_started_at"] == "2026-10-02T09:00:00Z"
+    assert _payloads(history, "gitops.sync_status")[1]["selective"] is True
+    notices = _payloads(history, "gitops.notify_sync")
+    assert [notice["event"] for notice in notices] == ["detected", "remediation"]
+    assert notices[1]["result"] == "SYNCED"
+    persisted = _payloads(history, "gitops.persist_result")[0]
+    assert persisted["argo_revision"] == "r1"
+    assert persisted["argo_sync_failure_class"] == "PATCH_CONFLICT"
+    assert persisted["argo_sync_remediations"][0]["resources"] == [_EXECUTOR_KEY]
+    assert any(b"gitops-argo-sync-remediation-v1" in marker for marker in _markers(history))
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_an_unremediable_sync_failure_opens_an_issue_and_notifies() -> None:
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _sync_recovery_script(**{"gitops.diagnose_sync": _diagnosed("OTHER")})
+        ),
+    )
+
+    assert result is not None
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_FAILED",
+        "OTHER",
+    )
+    assert result["evidence"]["argo_sync_issue_number"] == 501
+    assert [request["step"] for request in _scheduled_steps(history)][len(_BEFORE_SYNC) :] == [
+        "gitops.sync_status",
+        "gitops.diagnose_sync",
+        "gitops.notify_sync",
+        "gitops.environment_issue",
+        "gitops.notify_sync",
+        "gitops.persist_result",
+    ]
+    (issue,) = _payloads(history, "gitops.environment_issue")
+    assert (issue["action"], issue["failure_class"], issue["blocker"]) == (
+        "report_sync",
+        "OTHER",
+        "ARGO_SYNC_FAILED",
+    )
+    assert issue["attempts"] == []
+    escalated = _payloads(history, "gitops.notify_sync")[-1]
+    assert escalated["event"] == "escalated"
+    assert escalated["issue_url"] == "https://github.com/gntik-ai/musematic/issues/501"
+    persisted = _payloads(history, "gitops.persist_result")[0]
+    assert (persisted["outcome"], persisted["blocker"]) == ("BLOCKED", "ARGO_SYNC_FAILED")
+    assert persisted["argo_sync_failure_class"] == "OTHER"
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_a_transient_failure_is_resynced_at_most_three_times_then_escalated() -> None:
+    history, result = await _run_to_history(
+        _FastStagingGitOpsWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _sync_recovery_script(
+                **{
+                    "gitops.diagnose_sync": _diagnosed("TRANSIENT"),
+                    "gitops.remediate_sync": {
+                        "status": "REMEDIATION_TRIGGERED",
+                        "action": "resync",
+                        "resources": [],
+                        "remediated_keys": [],
+                        "previous_operation_started_at": "2026-10-02T09:00:00Z",
+                    },
+                }
+            )
+        ),
+    )
+
+    assert result is not None
+    assert (result["blocker"], result["failure_class"]) == ("ARGO_SYNC_FAILED", "TRANSIENT")
+    remediations = _payloads(history, "gitops.remediate_sync")
+    assert [(item["action"], item["attempt"], item["round"]) for item in remediations] == [
+        ("resync", 1, 1),
+        ("resync", 2, 2),
+        ("resync", 3, 3),
+    ]
+    assert all(item["resources"] == [] for item in remediations)
+    assert len(_payloads(history, "gitops.sync_status")) == 4
+    assert [notice["event"] for notice in _payloads(history, "gitops.notify_sync")] == [
+        "detected",
+        "remediation",
+        "remediation",
+        "remediation",
+        "escalated",
+    ]
+    (issue,) = _payloads(history, "gitops.environment_issue")
+    assert [attempt["result"] for attempt in issue["attempts"]] == ["SYNC_FAILED"] * 3
+    # Exponential back-off before each re-sync (scaled for the test).
+    timers = [
+        event.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
+        for event in history.events
+        if event.HasField("timer_started_event_attributes")
+    ]
+    assert timers == [timedelta(milliseconds=ms) for ms in (30, 60, 120)]
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_a_synced_but_unhealthy_timeout_is_diagnosed_and_escalated() -> None:
+    degraded = [
+        {
+            **_EXECUTOR,
+            "health": "Degraded",
+            "failure_class": "OTHER",
+            "pod_reasons": [{"pod": "x-1", "container": "main", "reason": "CrashLoopBackOff"}],
+        }
+    ]
+    pending = {
+        "status": "SYNC_PENDING",
+        "phase": "Succeeded",
+        "sync": "Synced",
+        "health": "Degraded",
+    }
+    history, result = await _run_to_history(
+        _FastStagingGitOpsWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _sync_recovery_script(
+                **{
+                    "gitops.sync_status": pending,
+                    "gitops.diagnose_sync": _diagnosed("OTHER", degraded_resources=degraded),
+                }
+            )
+        ),
+    )
+
+    assert result is not None
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_TIMEOUT",
+        "OTHER",
+    )
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert steps.count("gitops.sync_status") == 40
+    assert "gitops.remediate_sync" not in steps
+    assert steps[-5:] == [
+        "gitops.diagnose_sync",
+        "gitops.notify_sync",
+        "gitops.environment_issue",
+        "gitops.notify_sync",
+        "gitops.persist_result",
+    ]
+    (issue,) = _payloads(history, "gitops.environment_issue")
+    assert issue["blocker"] == "ARGO_SYNC_TIMEOUT"
+    assert issue["diagnosis"]["degraded_resources"] == degraded
+    assert _payloads(history, "gitops.notify_sync")[0]["blocker"] == "ARGO_SYNC_TIMEOUT"
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_a_pre_new_113_sync_failure_history_replays_unchanged() -> None:
+    """A sync failure recorded by the PARENT implementation (origin/main, before NEW-113)
+    replays against the current code with its old BLOCKED return."""
+    history, result = await _run_to_history(
+        ParentStagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(_sync_recovery_script()),
+    )
+
+    assert result is not None
+    assert (result["status"], result["blocker"]) == ("BLOCKED", "ARGO_SYNC_FAILED")
+    assert "failure_class" not in result
+    assert [request["step"] for request in _scheduled_steps(history)] == [
+        *_BEFORE_SYNC,
+        "gitops.sync_status",
+        "gitops.persist_result",
+    ]
+    assert not _markers(history)
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+def _timer_durations(history: Any) -> list[timedelta]:
+    return [
+        event.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
+        for event in history.events
+        if event.HasField("timer_started_event_attributes")
+    ]
+
+
+def test_production_timers_are_not_rescaled() -> None:
+    interval = timedelta(seconds=30)
+    assert StagingGitOpsDeliveryWorkflow._TIMER_SCALE == 1.0
+    assert StagingGitOpsDeliveryWorkflow()._timer(interval) is interval
+
+
+async def test_an_execution_mid_sync_poll_upgrades_into_the_new_path() -> None:
+    """The parent implementation records a sync poll and its 30 s timer; the worker is
+    then upgraded. The new code replays that prefix, records its own identical 30 s poll
+    timer, and the next failure takes the NEW-113 path (marker after the old prefix)."""
+    pending = {"status": "SYNC_PENDING", "phase": "Running", "sync": "OutOfSync"}
+    activity_fn = _sequenced_step(
+        _sync_recovery_script(**{"gitops.diagnose_sync": _diagnosed("OTHER")}),
+        {"gitops.sync_status": [pending, pending, _SYNC_FAILED]},
+    )
+
+    def workers(client: Any, workflow_cls: type) -> list[Worker]:
+        return [
+            Worker(client, task_queue=queue, workflows=[workflow_cls], activities=[activity_fn])
+            for queue in (CONTROL_TASK_QUEUE, GITHUB_TASK_QUEUE)
+        ]
+
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        old = workers(env.client, ParentStagingGitOpsDeliveryWorkflow)
+        async with old[0], old[1]:
+            handle = await env.client.start_workflow(
+                StagingGitOpsDeliveryWorkflow.run,
+                _gitops_input(),
+                id=f"replay-test-mid-poll-upgrade-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=3),
+            )
+            for _ in range(300):
+                prefix = await handle.fetch_history()
+                if _timer_durations(prefix):
+                    break
+                await asyncio.sleep(0.1)
+        assert _timer_durations(prefix) == [timedelta(seconds=30)]
+        assert not _markers(prefix)
+        new = workers(env.client, StagingGitOpsDeliveryWorkflow)
+        async with new[0], new[1]:
+            result = await handle.result()
+            history = await handle.fetch_history()
+
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_FAILED",
+        "OTHER",
+    )
+    # Old timer and the upgraded code's timer are the same production command.
+    assert _timer_durations(history) == [timedelta(seconds=30)] * 2
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert steps[len(_BEFORE_SYNC) :] == [
+        "gitops.sync_status",
+        "gitops.sync_status",
+        "gitops.sync_status",
+        "gitops.diagnose_sync",
+        "gitops.notify_sync",
+        "gitops.environment_issue",
+        "gitops.notify_sync",
+        "gitops.persist_result",
+    ]
+    marker_index = next(
+        index
+        for index, event in enumerate(history.events)
+        if event.HasField("marker_recorded_event_attributes")
+    )
+    timer_index = next(
+        index
+        for index, event in enumerate(history.events)
+        if event.HasField("timer_started_event_attributes")
+    )
+    assert marker_index > timer_index
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_a_failed_remediation_activity_is_not_retried_and_escalates() -> None:
+    # NEW-113 review fallback: the mutating step runs as a single attempt; a failed (or
+    # lost) attempt may already have written its operation, so the flow escalates
+    # (ARGO_REMEDIATION_OUTCOME_UNKNOWN) instead of retrying and syncing twice.
+    script = _sync_recovery_script(
+        **{
+            "gitops.diagnose_sync": _diagnosed(
+                "PATCH_CONFLICT",
+                failed_resources=[
+                    {
+                        **_EXECUTOR,
+                        "status": "SyncFailed",
+                        "message": _MESSAGE_980,
+                        "failure_class": "PATCH_CONFLICT",
+                        "managed": True,
+                        "eligible": True,
+                    }
+                ],
+            ),
+        }
+    )
+    base = _sequenced_step(script, {"gitops.sync_status": [_SYNC_FAILED]})
+    calls: list[str] = []
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        if request["step"] == "gitops.remediate_sync":
+            calls.append(request["step"])
+            raise ApplicationError("kubectl patch response lost", type="CommandFailure")
+        result: dict[str, Any] = await base(request)
+        return result
+
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow, _gitops_input(), execute_control_step
+    )
+
+    assert calls == ["gitops.remediate_sync"]  # exactly one attempt, never retried
+    assert result is not None
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_FAILED",
+        "PATCH_CONFLICT",
+    )
+    (issue,) = _payloads(history, "gitops.environment_issue")
+    assert issue["action"] == "report_sync"
+    notices = [notice["event"] for notice in _payloads(history, "gitops.notify_sync")]
+    assert notices[0] == "detected" and notices[-1] == "escalated"
