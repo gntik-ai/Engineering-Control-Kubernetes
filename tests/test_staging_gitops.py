@@ -2988,3 +2988,27 @@ async def test_an_ambiguous_remediation_write_is_not_repeated(tmp_path: Path) ->
     assert result["status"] == "REMEDIATION_OUTCOME_UNKNOWN"
     assert result["blocker"] == "ARGO_REMEDIATION_OUTCOME_UNKNOWN"
     assert len(_operation_patches(kubectl)) == 1
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "testing value /metadata/resourceVersion failed: test failed",
+        "The request is invalid: the server rejected our request due to an error in our request",
+        "Error from server (Invalid): the server rejected our request due to an error"
+        " in our request",
+    ],
+)
+def test_a_rejected_conditional_write_is_recognised(output: str) -> None:
+    from engineering_control.activities.gitops import _CONDITIONAL_WRITE_CONFLICT
+
+    assert _CONDITIONAL_WRITE_CONFLICT.search(output)
+
+
+@pytest.mark.parametrize(
+    "output", ["connection reset by peer", "i/o timeout", "error: unexpected EOF", ""]
+)
+def test_an_ambiguous_write_failure_is_not_a_conflict(output: str) -> None:
+    from engineering_control.activities.gitops import _CONDITIONAL_WRITE_CONFLICT
+
+    assert not _CONDITIONAL_WRITE_CONFLICT.search(output)

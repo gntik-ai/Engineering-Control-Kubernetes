@@ -387,10 +387,15 @@ SYNC_REMEDIATION_ACTIONS: dict[str, tuple[str, tuple[str, ...], bool]] = {
 REMEDIATION_INFO = "hermes-remediation"
 REMEDIATION_PREVIOUS_INFO = "hermes-previous-started-at"
 _REMEDIATION_ID = re.compile(r"[A-Za-z0-9._:/-]{1,240}")
-# The JSON-patch "test" on metadata.resourceVersion failed: the write provably did not
-# apply (evanphx/json-patch: "testing value /metadata/resourceVersion failed").
+# The JSON-patch "test" on metadata.resourceVersion failed, so the write provably did not
+# apply. The API server turns the evanphx/json-patch error ("testing value ... failed") into
+# a generic 422 ("The request is invalid: the server rejected our request due to an error
+# in our request"); a 422 is always a rejected, unapplied request.
 _CONDITIONAL_WRITE_CONFLICT = re.compile(
-    r"testing value\b.*\bfailed|\btest failed\b", re.IGNORECASE
+    r"testing value\b.*\bfailed|\btest failed\b"
+    r"|the server rejected our request due to an error in our request"
+    r"|\(Invalid\)|\b422\b",
+    re.IGNORECASE,
 )
 
 
