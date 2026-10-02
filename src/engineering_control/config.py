@@ -4,6 +4,7 @@ import os
 import stat
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -151,6 +152,9 @@ class Settings(BaseSettings):
     build_id: str | None = None
     notification_sink_url: str | None = None
     notification_token_file: Path | None = None
+    # NEW-112a: the Hermes gateway webhook (loopback :8644) authenticates HMAC-SHA256 V2
+    # signatures, not bearer tokens. Restored from the 2026-09-16 release (2b678d9).
+    notification_auth_mode: Literal["bearer", "hmac-sha256-v2"] = "hmac-sha256-v2"
     notification_poll_seconds: int = Field(default=10, ge=2, le=300)
     cleanup_execution_enabled: bool = False
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
