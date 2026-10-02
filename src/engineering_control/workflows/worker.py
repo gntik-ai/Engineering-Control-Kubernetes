@@ -9,6 +9,7 @@ from engineering_control.activities.core import ControlActivities
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
 from engineering_control.workflows.definitions import ALL_WORKFLOWS
+from engineering_control.workflows.supervision import run_worker_until_signal
 from engineering_control.workflows.worker_registry import worker_deployment_kwargs
 
 
@@ -26,7 +27,7 @@ async def serve() -> None:
         max_concurrent_activities=8,
         **worker_deployment_kwargs(settings.build_id),
     )
-    await worker.run()
+    await run_worker_until_signal(worker)
 
 
 def run() -> None:

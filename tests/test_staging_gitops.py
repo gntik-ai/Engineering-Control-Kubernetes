@@ -1337,14 +1337,21 @@ async def test_close_issue_comments_delivery_evidence_and_closes(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_gitops_controller_step_is_wired_to_a_production_handler(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binding_activity_environment: Any
 ) -> None:
     monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
+    from engineering_control.db.base import Base
+
+    # Merged with 2b678d9: controller production steps run inside a verified Run binding.
     activities = ControlActivities(_settings(tmp_path), "controller")
-    result = await activities.execute_control_step(
-        {"step": "gitops.flow_for_project", "payload": {"project": "musematic"}}
+    assert activities.metadata_handler is not None
+    Base.metadata.create_all(activities.metadata_handler.engine)
+    result = await binding_activity_environment.run(
+        activities.execute_control_step,
+        {"step": "gitops.flow_for_project", "payload": {"project": "musematic"}},
     )
     assert result["status"] == "ENABLED" and result["enabled"] is True
+    activities.metadata_handler.engine.dispose()
 
 
 @pytest.mark.asyncio

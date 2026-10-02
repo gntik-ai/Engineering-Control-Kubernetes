@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -34,6 +35,7 @@ class MultiProjectAuditInput:
     publish_findings: bool = False
     campaign_ids: dict[str, str] = field(default_factory=dict)
     child_workflow_ids: dict[str, str] = field(default_factory=dict)
+    application_run_id: str | None = None
 
 
 @dataclass
@@ -48,6 +50,14 @@ class IssueDeliveryInput:
     finding_id: str
     risk_class: str
     dry_run: bool = True
+    issue_approval_id: str | None = None
+
+    def payload(self) -> dict[str, Any]:
+        """Preserve legacy command bytes when no child approval was supplied."""
+        value = asdict(self)
+        if self.issue_approval_id is None:
+            value.pop("issue_approval_id")
+        return value
 
 
 @dataclass
@@ -159,6 +169,8 @@ class ExistingGitHubBacklogLoopInput:
     global_campaign_id: str | None = None
     r3_approval_binding: str | None = None
     runtime_proof: str = "runtime"
+    issue_operation_id: str | None = None
+    issue_approval_binding: str | None = None
 
 
 @dataclass

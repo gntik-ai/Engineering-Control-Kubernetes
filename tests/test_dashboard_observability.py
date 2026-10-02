@@ -23,6 +23,36 @@ def _repository(tmp_path: Path) -> DashboardRepository:
     return repository
 
 
+def test_old_unstarted_queue_is_rendered_as_orphaned_not_active(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    old = datetime.now(UTC) - timedelta(minutes=20)
+    with repository.sessions.begin() as session:
+        session.add(
+            Run(
+                workflow_id="orphaned-start-intent",
+                run_type="synthetic-observability",
+                status="QUEUED",
+                project="falcone",
+                worker="controller",
+                started_at=None,
+                finished_at=None,
+                error_code=None,
+                summary=None,
+                created_at=old,
+                updated_at=old,
+            )
+        )
+
+    item = repository.observability.workflow("orphaned-start-intent")
+    assert item is not None
+    assert item["projection_state"] == "ORPHANED_START_INTENT"
+    assert item["normalized_status"] == "blocked"
+    assert item["blocker_code"] == "ORPHANED_START_INTENT"
+    assert item["expected_next_step"] == (
+        "Reconcile the durable start intent against Temporal before retrying."
+    )
+
+
 def test_overview_workflow_projection_filtering_cursor_and_detail(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     now = datetime.now(UTC)
@@ -85,8 +115,9 @@ def test_overview_workflow_projection_filtering_cursor_and_detail(tmp_path: Path
 
     overview = repository.observability.overview()
     assert overview["summary"] == {
-        "active_workflows": 3,
-        "queued_issues": 0,
+        "active_workflows": 2,
+        "pending_inventory_count": 0,
+        "ambiguous_inventory_count": 0,
         "blocked_workflows": 1,
         "failed_24h": 1,
         "active_audits": 0,
@@ -101,6 +132,13 @@ def test_overview_workflow_projection_filtering_cursor_and_detail(tmp_path: Path
     assert active["source"] == "runs/steps/agent_executions/dashboard_events"
     assert active["freshness"] == "fresh"
     assert "updated_datetime" not in active
+    blocked = repository.observability.workflow("workflow-blocked")
+    assert blocked is not None
+    assert blocked["blocker_code"] == "DEPENDENCY_BLOCKED"
+    assert blocked["freshness"] == "fresh"
+    assert blocked["expected_next_step"] == (
+        "Resolve DEPENDENCY_BLOCKED and emit the expected retry event"
+    )
     json.dumps(overview)
     assert isinstance(overview["services"], list)
     assert {item["provider"] for item in overview["providers"]} == {"codex", "claude"}

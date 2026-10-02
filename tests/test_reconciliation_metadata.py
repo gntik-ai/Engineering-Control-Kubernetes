@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 import yaml
 from sqlalchemy import select
+from test_metadata_activity import add_changeset_finding
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
@@ -58,6 +59,7 @@ def seed_reconciliation(
                 project="falcone",
             )
         )
+    add_changeset_finding(handler, change_set_id)
     return change_set_id, run_id, workflow_id
 
 

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
+import json
 import socket
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import create_engine, delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.config import Settings
@@ -101,6 +104,8 @@ class GatewayEventInput(ObservabilityModel):
         "engineering.api_request_started",
         "engineering.api_response_completed",
         "engineering.workflow_returned",
+        "engineering.request_failed",
+        "telegram.response_prepared",
         "telegram.response_delivered",
         "telegram.response_delivery_failed",
     ]
@@ -110,6 +115,60 @@ class GatewayEventInput(ObservabilityModel):
     issue_number: int | None = Field(default=None, ge=1)
     mode: str | None = Field(default=None, max_length=40, pattern=r"^[a-z0-9-]+$")
     workflow_id: str | None = Field(default=None, max_length=240)
+    platform_update_id: int | None = Field(default=None, strict=True, ge=0, le=2**53 - 1)
+    delivery_correlation_id: UUID | None = None
+    event_observed_at: AwareDatetime | None = None
+    delivery_status: (
+        Literal[
+            "ACKNOWLEDGED", "UNACKNOWLEDGED", "UNKNOWN", "UNAVAILABLE", "EMPTY", "REJECTED_OVERSIZE"
+        ]
+        | None
+    ) = None
+    acknowledged_message_ids: list[Annotated[str, Field(pattern=r"^[0-9]{1,20}$")]] = Field(
+        default_factory=list, max_length=64
+    )
+
+    @model_validator(mode="after")
+    def validate_delivery_receipt(self) -> Self:
+        if (self.delivery_correlation_id is None) != (self.platform_update_id is None):
+            raise ValueError("gateway event requires a complete correlation identity")
+        if self.event_observed_at is not None:
+            if self.delivery_correlation_id is None:
+                raise ValueError("observed gateway event time requires correlation identity")
+            if self.event_observed_at > datetime.now(UTC) + timedelta(seconds=5):
+                raise ValueError("gateway event observation is in the future")
+        if self.event_type == "telegram.response_delivered":
+            if (
+                self.delivery_status != "ACKNOWLEDGED"
+                or self.delivery_correlation_id is None
+                or self.platform_update_id is None
+                or not self.acknowledged_message_ids
+                or len(set(self.acknowledged_message_ids)) != len(self.acknowledged_message_ids)
+            ):
+                raise ValueError(
+                    "delivery success requires a correlated complete transport receipt"
+                )
+        elif self.delivery_status == "ACKNOWLEDGED" or self.acknowledged_message_ids:
+            raise ValueError("only a delivery-success event may carry acknowledgement IDs")
+        return self
+
+
+class GatewayEventConflict(ValueError):
+    """One correlated event identity was presented with different content."""
+
+
+def _gateway_key_violation(error: IntegrityError) -> bool:
+    original = error.orig
+    diagnostic = getattr(original, "diag", None)
+    if getattr(original, "sqlstate", None) == "23505":
+        return (
+            getattr(diagnostic, "constraint_name", None)
+            == "uq_dashboard_events_gateway_ingestion_key"
+        )
+    return (
+        getattr(original, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE"
+        and str(original) == "UNIQUE constraint failed: dashboard_events.gateway_ingestion_key"
+    )
 
 
 @dataclass(frozen=True)
@@ -455,6 +514,19 @@ class AgentObservabilityRepository:
         if subject != "hermes-gateway":
             raise ValueError("gateway event identity is not authorized")
         now = datetime.now(UTC)
+        canonical = values.model_dump(mode="json")
+        if values.event_observed_at is not None:
+            canonical["event_observed_at"] = values.event_observed_at.astimezone(UTC).isoformat()
+        payload_digest = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        key = (
+            hashlib.sha256(
+                f"gateway-event-v1:{subject}:{values.delivery_correlation_id}:{values.event_type}".encode()
+            ).hexdigest()
+            if values.delivery_correlation_id is not None
+            else None
+        )
         labels = {
             "telegram.command_received": "Telegram command received",
             "telegram.command_recognized": "Telegram command route recognized",
@@ -463,17 +535,21 @@ class AgentObservabilityRepository:
             "engineering.api_request_started": "Engineering Control API request started",
             "engineering.api_response_completed": "Engineering Control API response completed",
             "engineering.workflow_returned": "Engineering Control workflow identifier returned",
+            "engineering.request_failed": "Engineering Control request failed",
+            "telegram.response_prepared": "Telegram response prepared; delivery not acknowledged",
             "telegram.response_delivered": "Telegram response delivered",
             "telegram.response_delivery_failed": "Telegram response delivery failed",
         }
         with self.sessions.begin() as session:
             row = DashboardEvent(
-                occurred_at=now,
+                occurred_at=values.event_observed_at or now,
+                gateway_ingestion_key=key,
                 level=(
                     "WARNING"
                     if values.event_type
                     in {
                         "telegram.command_rejected",
+                        "engineering.request_failed",
                         "telegram.response_delivery_failed",
                     }
                     else "INFO"
@@ -492,11 +568,49 @@ class AgentObservabilityRepository:
                     "mode": values.mode,
                     "outcome": values.outcome,
                     "gateway": "hermes-gateway",
+                    "event_contract": "correlated-v1" if key else "legacy-unattested",
+                    "event_received_at": now.isoformat(),
+                    "ingestion_payload_sha256": payload_digest,
+                    **(
+                        {"platform_update_id": values.platform_update_id}
+                        if values.platform_update_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"delivery_correlation_id": str(values.delivery_correlation_id)}
+                        if values.delivery_correlation_id
+                        else {}
+                    ),
+                    **(
+                        {
+                            "delivery_status": values.delivery_status,
+                            "acknowledged_message_ids": values.acknowledged_message_ids,
+                        }
+                        if values.delivery_status is not None
+                        else {}
+                    ),
                 },
             )
-            session.add(row)
-            session.flush()
-            return {"status": "ACCEPTED", "event_id": row.id}
+            try:
+                with session.begin_nested():
+                    session.add(row)
+                    session.flush()
+            except IntegrityError as error:
+                if key is None or not _gateway_key_violation(error):
+                    raise
+                existing = session.scalar(
+                    select(DashboardEvent).where(DashboardEvent.gateway_ingestion_key == key)
+                )
+                if existing is None:
+                    raise
+                if existing.metadata_json.get("ingestion_payload_sha256") != payload_digest:
+                    raise GatewayEventConflict(
+                        "gateway event identity has different content"
+                    ) from None
+                # Never update the original event, its observation/receipt time,
+                # or freshness evidence when an HTTP acknowledgement was lost.
+                return {"status": "ACCEPTED", "event_id": existing.id, "duplicate": True}
+            return {"status": "ACCEPTED", "event_id": row.id, "duplicate": False}
 
     def _cleanup(self, log_days: int, execution_days: int, limit: int) -> dict[str, int]:
         now = datetime.now(UTC)

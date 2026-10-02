@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import create_engine, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.coverage_outcome import coverage_outcome, normalized_coverage_status
 from engineering_control.dashboard.auth import PasswordService
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.schemas import ActivityEventInput
+from engineering_control.dashboard.session_store import (
+    SessionAuthorization,
+    lock_authentication,
+    retire_session,
+)
 from engineering_control.dashboard.status_mapping import (
     TERMINAL_STATUSES,
     map_status,
 )
+from engineering_control.dashboard.time_projection import project_duration
 from engineering_control.db.models import (
     AgentExecution,
     BacklogIssueRecord,
@@ -23,6 +31,7 @@ from engineering_control.db.models import (
     CoverageCell,
     DashboardAuthentication,
     DashboardEvent,
+    DashboardSessionRevocation,
     Deployment,
     Enhancement,
     Finding,
@@ -32,6 +41,7 @@ from engineering_control.db.models import (
     Step,
     VerificationResult,
 )
+from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
 from engineering_control.security.redaction import SecretRedactor
 
 _EVENT_METADATA_KEYS = frozenset(
@@ -53,6 +63,7 @@ _EVENT_METADATA_KEYS = frozenset(
         "worker_identity",
     }
 )
+_SESSION_BINDING_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _utc_iso(value: datetime | None) -> str | None:
@@ -96,6 +107,10 @@ class DashboardRepository:
             max_overflow=5,
             connect_args={"connect_timeout": 5} if database_url.startswith("postgresql") else {},
         )
+        self._session_revocation_dialect = self.engine.dialect.name
+        if self._session_revocation_dialect not in {"postgresql", "sqlite"}:
+            self.engine.dispose()
+            raise ValueError("dashboard session revocation database is unsupported")
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         self.passwords = password_service or PasswordService()
         self.redactor = SecretRedactor()
@@ -108,6 +123,19 @@ class DashboardRepository:
         with self.sessions() as session:
             return bool(session.scalar(select(1)) == 1)
 
+    async def ready(self) -> bool:
+        return await asyncio.to_thread(self._ready)
+
+    def _ready(self) -> bool:
+        with self.sessions() as session:
+            initialized = session.get(DashboardAuthentication, 1) is not None
+            # Touch the revocation relation even when it is empty so a code-before-
+            # migration rollout cannot return a false-green readiness response.
+            session.execute(
+                select(DashboardSessionRevocation.session_binding_hash).limit(1)
+            ).first()
+            return initialized
+
     async def authentication_version(self) -> int | None:
         return await asyncio.to_thread(self._authentication_version)
 
@@ -115,6 +143,83 @@ class DashboardRepository:
         with self.sessions() as session:
             row = session.get(DashboardAuthentication, 1)
             return row.password_version if row else None
+
+    async def session_authorized(self, session_binding_hash: str, *, password_version: int) -> bool:
+        return await asyncio.to_thread(
+            self._session_authorized,
+            session_binding_hash,
+            password_version,
+        )
+
+    def _session_authorized(self, session_binding_hash: str, password_version: int) -> bool:
+        if _SESSION_BINDING_DIGEST.fullmatch(session_binding_hash) is None:
+            return False
+        now = datetime.now(UTC)
+        revoked = (
+            select(DashboardSessionRevocation.session_binding_hash)
+            .where(
+                DashboardSessionRevocation.session_binding_hash == session_binding_hash,
+                DashboardSessionRevocation.password_version == password_version,
+                DashboardSessionRevocation.expires_at > now,
+            )
+            .exists()
+        )
+        with self.sessions() as session:
+            return (
+                session.scalar(
+                    select(DashboardAuthentication.id).where(
+                        DashboardAuthentication.id == 1,
+                        DashboardAuthentication.password_version == password_version,
+                        ~revoked,
+                    )
+                )
+                is not None
+            )
+
+    async def revoke_session(
+        self,
+        session_binding_hash: str,
+        *,
+        password_version: int,
+        expires_at: datetime,
+    ) -> None:
+        await asyncio.to_thread(
+            self._revoke_session,
+            session_binding_hash,
+            password_version,
+            expires_at,
+        )
+
+    def _revoke_session(
+        self,
+        session_binding_hash: str,
+        password_version: int,
+        expires_at: datetime,
+    ) -> None:
+        if _SESSION_BINDING_DIGEST.fullmatch(session_binding_hash) is None:
+            raise ValueError("dashboard session binding is invalid")
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        with self.sessions.begin() as session:
+            lock_authentication(session)
+            retire_session(
+                session, SessionAuthorization(session_binding_hash, password_version, expires_at)
+            )
+
+    async def confirm_login(
+        self, password_version: int, previous: SessionAuthorization | None
+    ) -> None:
+        await asyncio.to_thread(self._confirm_login, password_version, previous)
+
+    def _confirm_login(self, password_version: int, previous: SessionAuthorization | None) -> None:
+        with self.sessions.begin() as session:
+            row = lock_authentication(session)
+            if row.password_version != password_version:
+                raise ValueError("dashboard authentication changed; sign in again")
+            # A valid password can recover from a lost rotation response even if
+            # the presented old cookie was already revoked. Other sessions stay.
+            if previous is not None:
+                retire_session(session, previous)
 
     async def verify_password(self, password: str) -> int | None:
         return await asyncio.to_thread(self._verify_password, password)
@@ -154,9 +259,7 @@ class DashboardRepository:
         password_hash = self.passwords.hash(password)
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
-            row = session.get(DashboardAuthentication, 1, with_for_update=True)
-            if row is None:
-                raise ValueError("dashboard password is not initialized")
+            row = lock_authentication(session)
             row.password_hash = password_hash
             row.password_version += 1
             row.password_changed_at = now
@@ -174,8 +277,8 @@ class DashboardRepository:
     ) -> int | None:
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
-            row = session.get(DashboardAuthentication, 1, with_for_update=True)
-            if row is None or not self.passwords.verify(row.password_hash, current_password):
+            row = lock_authentication(session)
+            if not self.passwords.verify(row.password_hash, current_password):
                 return None
             if self.passwords.verify(row.password_hash, new_password):
                 raise ValueError("new password must differ from current password")
@@ -454,9 +557,16 @@ class DashboardRepository:
         start = execution.started_at if execution else run.started_at if run else None
         end = execution.ended_at if execution else run.finished_at if run else None
         now = datetime.now(UTC)
-        start_utc = start if start is None or start.tzinfo else start.replace(tzinfo=UTC)
-        end_utc = end if end is None or end.tzinfo else end.replace(tzinfo=UTC)
-        duration = int(((end_utc or now) - start_utc).total_seconds()) if start_utc else None
+        selected_status = execution.status if execution else run.status if run else "UNKNOWN"
+        timing = project_duration(
+            start,
+            end,
+            running=(
+                selected_status.upper() not in TERMINAL_RUN_OUTCOMES
+                and map_status(selected_status).normalized not in TERMINAL_STATUSES
+            ),
+            now=now,
+        )
         recovery = change_set.recovery_json if change_set else {}
         recovery = recovery if isinstance(recovery, dict) else {}
         return {
@@ -464,7 +574,7 @@ class DashboardRepository:
             "provider_role": execution.role if execution else None,
             "worker": execution.worker_kind if execution else run.worker if run else None,
             "last_heartbeat": _utc_iso(execution.last_heartbeat_at if execution else None),
-            "duration_seconds": max(0, duration) if duration is not None else None,
+            **timing,
             "attempt": execution.attempt if execution else 1,
             "max_attempts": execution.max_attempts if execution else 1,
             "execution_id": str(execution.id) if execution else None,
@@ -508,8 +618,6 @@ class DashboardRepository:
             for campaign in session.scalars(query).all():
                 campaign_mapping = map_status(campaign.status, entity_type="campaign")
                 normalized = campaign_mapping.normalized
-                if status and normalized != status:
-                    continue
                 cells = session.scalars(
                     select(CoverageCell)
                     .where(CoverageCell.campaign_id == campaign.id)
@@ -524,6 +632,10 @@ class DashboardRepository:
                     select(Finding).where(Finding.campaign_id == campaign.id)
                 ).all()
                 statuses = [cell.status.upper() for cell in cells]
+                outcome = coverage_outcome(statuses)
+                normalized = normalized_coverage_status(normalized, outcome)
+                if status and normalized != status:
+                    continue
                 passed = sum(
                     value in {"NO_FINDING", "VERIFIED_FIXED", "PASS", "PASSED"}
                     for value in statuses
@@ -615,6 +727,8 @@ class DashboardRepository:
                         "environment": metadata.get("environment")
                         or (current.environment if current else None),
                         "raw_status": campaign.status,
+                        "execution_status": campaign_mapping.normalized,
+                        "coverage_outcome": outcome,
                         "normalized_status": normalized,
                         "created_at": _utc_iso(campaign.created_at),
                         "queued_at": _utc_iso(run.created_at if run else campaign.created_at),

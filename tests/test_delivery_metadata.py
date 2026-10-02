@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from jsonschema import Draft202012Validator
+from publication_fixture import approved_publication
 from sqlalchemy import select
 
 from engineering_control.activities.metadata import MetadataActivityHandler
@@ -105,43 +106,20 @@ def checker_result() -> dict[str, object]:
 async def test_publication_plan_defers_unchanged_deployment_repository(
     tmp_path: Path,
 ) -> None:
-    handler = MetadataActivityHandler(
-        Settings(database_url=f"sqlite:///{tmp_path / 'plan.sqlite'}")
-    )
-    change_set_id = uuid4()
-    branch = f"agent/falcone/123/{change_set_id}"
-    result = await handler.handle(
-        "delivery.prepare_publication",
-        {
-            "change_set_id": str(change_set_id),
-            "change_evidence": {
-                "source": {"head_sha": "b" * 40, "changed_file_count": 1},
-                "deployment": {"head_sha": "c" * 40, "changed_file_count": 0},
-            },
-            "source_base_sha": "a" * 40,
-            "deployment_base_sha": "c" * 40,
-            "source_repository": "falcone",
-            "deployment_repository": "falcone-charts",
-            "source_worktree": str(tmp_path / "source"),
-            "deployment_worktree": str(tmp_path / "deployment"),
-            "source_branch": branch,
-            "deployment_branch": branch,
-            "issue_url": "https://github.com/gntik-ai/falcone/issues/123",
-            "openspec_identifier": f"engineering/{change_set_id}",
-            "risk_class": "R1",
-            "domain": "gateway",
-        },
-    )
-
-    plan = result["publication_plan"]
-    assert [item["repository_slug"] for item in plan["publications"]] == ["falcone"]
-    assert plan["deferred_deployment"] == {
-        "repository_slug": "falcone-charts",
-        "branch": branch,
-        "head_sha": "c" * 40,
-        "base_sha": "c" * 40,
-        "reason": "AWAITING_IMMUTABLE_ARTIFACT",
-    }
+    async with approved_publication(tmp_path, deployment_changed=False) as fixture:
+        result = await fixture.metadata.handle("delivery.prepare_publication", fixture.input)
+        assert result["status"] == "PUBLICATION_READY"
+        assert result["publication_intent"] == fixture.prepared["publication_intent"]
+        plan = result["publication_plan"]
+        assert [item["repository_slug"] for item in plan["publications"]] == ["falcone"]
+        assert plan["deferred_deployment"] == {
+            "repository_slug": "falcone-charts",
+            "branch": fixture.branch,
+            "head_sha": fixture.heads["falcone-charts"],
+            "base_sha": fixture.input["deployment_base_sha"],
+            "reason": "AWAITING_IMMUTABLE_ARTIFACT",
+        }
+        assert fixture.receipts() == []
 
 
 @pytest.mark.asyncio
@@ -153,34 +131,13 @@ async def test_every_publication_title_passes_the_gh_broker_value_policy(
     # GhCliBroker._value (no parentheses), failing publication after the source PR.
     from engineering_control.adapters.github.client import GhCliBroker
 
-    handler = MetadataActivityHandler(
-        Settings(database_url=f"sqlite:///{tmp_path / 'plan.sqlite'}")
-    )
-    change_set_id = uuid4()
-    branch = f"agent/falcone/1001/{change_set_id}"
-    result = await handler.handle(
-        "delivery.prepare_publication",
-        {
-            "change_set_id": str(change_set_id),
-            "change_evidence": {
-                "source": {"head_sha": "b" * 40, "changed_file_count": 1},
-                "deployment": {"head_sha": "d" * 40, "changed_file_count": 1},
-            },
-            "source_base_sha": "a" * 40,
-            "deployment_base_sha": "c" * 40,
-            "source_repository": "falcone",
-            "deployment_repository": "falcone-charts",
-            "source_worktree": str(tmp_path / "source"),
-            "deployment_worktree": str(tmp_path / "deployment"),
-            "source_branch": branch,
-            "deployment_branch": branch,
-            "issue_url": "https://github.com/gntik-ai/falcone/issues/1001",
-            "openspec_identifier": f"engineering/{change_set_id}",
-            "risk_class": "R3",
-            "domain": domain,
-        },
-    )
-
+    # Merged with 2b678d9: publication is prepared only for an approved, leased
+    # delivery, so the title policy is exercised through the approved fixture.
+    async with approved_publication(tmp_path) as fixture:
+        result = await fixture.metadata.handle(
+            "delivery.prepare_publication", {**fixture.input, "domain": domain}
+        )
+    assert result["status"] == "PUBLICATION_READY", result.get("blocker")
     publications = result["publication_plan"]["publications"]
     assert [item["repository_slug"] for item in publications] == ["falcone", "falcone-charts"]
     for item in publications:
@@ -1078,6 +1035,10 @@ def _spec_fixture(
 ) -> tuple[MetadataActivityHandler, dict[str, object]]:
     """A ChangeSet bound to a GitHub issue plus a delivery.prepare_spec payload."""
     handler, allocation = _lease_fixture(tmp_path, **settings)
+    # Merged with 2b678d9: delivery preparation steps first re-verify the durable issue
+    # approval (covered by the approved-publication and issue-approval tests); these
+    # NEW-53 cases exercise only spec reuse, so that gate admits the fixture as-is.
+    handler._issue_approval_preparation = lambda payload: payload  # type: ignore[method-assign]
     issue_id = uuid4()
     with handler.sessions.begin() as session:
         session.add(

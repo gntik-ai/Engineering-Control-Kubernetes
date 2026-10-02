@@ -196,14 +196,40 @@ chmod -R a+rX "${CLI_ROOT}"
 ln -sfn "${CLI_ROOT}/node_modules/.bin/codex" /usr/local/bin/codex
 ln -sfn "${CLI_ROOT}/node_modules/.bin/claude" /usr/local/bin/claude
 
-install -d -o browser-runner -g browser-runner -m 0750 /opt/engineering-browser
-cp -a "${RELEASE_ROOT}/source/browser/." /opt/engineering-browser/
-cd /opt/engineering-browser
-"/usr/local/bin/node" "${NPM_CLI}" install --omit=dev
-"${NODE_BIN}" node_modules/@playwright/test/cli.js install-deps chromium firefox
+install -d -o root -g root -m 0755 \
+  /opt/engineering-browser /opt/engineering-browser-runtimes
+BROWSER_RELEASE_ROOT=/opt/engineering-browser-runtimes/${RELEASE_ID}
+if [[ ! -f ${BROWSER_RELEASE_ROOT}/.release-complete ]]; then
+  [[ ! -e ${BROWSER_RELEASE_ROOT} ]] || {
+    echo "Refusing incomplete browser runtime: ${BROWSER_RELEASE_ROOT}" >&2
+    exit 1
+  }
+  (
+    BROWSER_STAGING=$(mktemp -d "/opt/engineering-browser-runtimes/.${RELEASE_ID}.XXXXXX")
+    trap 'rm -rf -- "${BROWSER_STAGING}"' EXIT
+    cp -a "${RELEASE_ROOT}/source/browser/." "${BROWSER_STAGING}/"
+    cd "${BROWSER_STAGING}"
+    "/usr/local/bin/node" "${NPM_CLI}" ci --omit=dev --ignore-scripts --no-audit --no-fund
+    [[ $("/usr/local/bin/node" node_modules/pnpm/bin/pnpm.cjs --version) == 10.34.5 ]]
+    [[ $(env -i PATH=/usr/local/bin:/usr/bin:/bin \
+      node_modules/.bin/pnpm --version) == 10.34.5 ]]
+    printf '%s\n' "${RELEASE_ID}" >.release-complete
+    chmod -R a+rX,go-w "${BROWSER_STAGING}"
+    chown -R root:root "${BROWSER_STAGING}"
+    mv -T -- "${BROWSER_STAGING}" "${BROWSER_RELEASE_ROOT}"
+    trap - EXIT
+  )
+fi
+[[ $(<"${BROWSER_RELEASE_ROOT}/.release-complete") == "${RELEASE_ID}" ]]
+"${NODE_BIN}" "${BROWSER_RELEASE_ROOT}/node_modules/@playwright/test/cli.js" \
+  install-deps chromium firefox
 PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers \
-  "${NODE_BIN}" node_modules/@playwright/test/cli.js install chromium firefox
-chown -R browser-runner:browser-runner /opt/engineering-browser
+  "${NODE_BIN}" "${BROWSER_RELEASE_ROOT}/node_modules/@playwright/test/cli.js" \
+  install chromium firefox
+ln -sfn "${BROWSER_RELEASE_ROOT}" /opt/engineering-browser/.runtime.new
+mv -Tf -- /opt/engineering-browser/.runtime.new /opt/engineering-browser/runtime
+chmod -R a+rX,go-w /opt/engineering-browser
+chown -R root:root /opt/engineering-browser
 
 if [[ ! -f "${CONFIG_ROOT}/env/worker-common.env" ]]; then
   {

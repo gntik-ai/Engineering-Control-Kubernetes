@@ -24,6 +24,7 @@ import shutil
 import uuid
 from datetime import timedelta
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from pre_new_113_gitops_workflow import ParentStagingGitOpsDeliveryWorkflow
@@ -63,6 +64,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _registered_child(step: str, request: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
+    """Complete a scripted child Run registration the way the real activity does.
+
+    Merged with 2b678d9 (child-run-start-memo-v1): the workflow validates that a
+    registration echoes its child workflow ID and returns the Run's UUID.
+    """
+    if (
+        step != "backlog.register_child_run"
+        or value.get("status") != "REGISTERED"
+        or "child_workflow_id" in value
+    ):
+        return value
+    child = request["payload"].get("child_workflow_id")
+    return {**value, "child_workflow_id": child, "run_id": str(uuid5(NAMESPACE_URL, str(child)))}
+
+
 def _scripted_execute_control_step(script: dict[str, dict[str, Any]]) -> Any:
     """Build an execute_control_step double keyed by step name.
 
@@ -78,7 +95,7 @@ def _scripted_execute_control_step(script: dict[str, dict[str, Any]]) -> Any:
             return {"status": "PASS"}  # NEW-71: every loop issue refreshes the mirrors
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     return execute_control_step
 
@@ -101,7 +118,7 @@ def _scripted_execute_control_step_with_failure(
             return {"status": "PASS"}  # NEW-71
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     return execute_control_step
 
@@ -951,7 +968,7 @@ async def test_a_failed_loop_bookkeeping_step_pauses_and_retries_instead_of_fail
             )
         if step == "github.refresh_mirrors" and step not in script:
             return {"status": "PASS"}
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     history, result, children = await _run_loop(
         script, [("retry", "gntik-ai/musematic#1026")], activity_fn=flaky
@@ -2002,7 +2019,7 @@ def _sequenced_step(
             return answers.pop(0) if len(answers) > 1 else answers[0]
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     return execute_control_step
 

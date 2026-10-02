@@ -9,6 +9,7 @@ from temporalio.worker import Worker
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
 from engineering_control.validation.lifecycle import AcceptanceActivities
+from engineering_control.workflows.supervision import run_worker_until_signal
 
 
 async def serve() -> None:
@@ -35,7 +36,7 @@ async def serve() -> None:
         max_concurrent_activities=1,
     )
     try:
-        await worker.run()
+        await run_worker_until_signal(worker)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 

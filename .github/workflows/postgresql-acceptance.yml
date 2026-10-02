@@ -1,0 +1,48 @@
+name: PostgreSQL acceptance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgresql-17:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+        env:
+          POSTGRES_USER: engineering_ci
+          POSTGRES_PASSWORD: synthetic_ci_only
+          POSTGRES_DB: engineering_control_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U engineering_ci -d engineering_control_ci"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+          --memory 768m
+          --pids-limit 256
+    env:
+      ENGINEERING_TEST_POSTGRES_URL: postgresql+psycopg://engineering_ci:synthetic_ci_only@127.0.0.1:5432/engineering_control_ci
+    steps:
+      - name: Checkout immutable workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install constrained project and test dependencies
+        run: python -m pip install --constraint requirements.lock --editable ".[dev]"
+      - name: Run real PostgreSQL migration and concurrency acceptance
+        run: python -m pytest -q -m postgresql tests/test_postgresql_acceptance.py

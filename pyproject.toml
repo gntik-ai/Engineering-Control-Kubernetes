@@ -45,6 +45,7 @@ engineering-worker = "engineering_control.workflows.worker:run"
 engineering-role-worker = "engineering_control.workflows.role_worker:run"
 engineering-scheduler = "engineering_control.scheduler:run"
 engineering-notifier = "engineering_control.notifier:run"
+engineering-watchdog = "engineering_control.watchdog:run"
 engineering-evidence-ingest = "engineering_control.evidence.ingest:run"
 engineering-acceptance-worker = "engineering_control.validation.worker:run"
 engineering-ctl = "engineering_control.cli:main"
@@ -56,6 +57,9 @@ packages = ["src/engineering_control"]
 addopts = "-ra --strict-markers"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+  "postgresql: requires an explicitly supplied disposable PostgreSQL database",
+]
 
 [tool.ruff]
 line-length = 100

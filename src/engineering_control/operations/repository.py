@@ -12,12 +12,19 @@ from typing import Any, cast
 from uuid import UUID
 
 import yaml
-from sqlalchemy import and_, create_engine, desc, func, or_, select
+from sqlalchemy import and_, create_engine, desc, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from engineering_control.api.schemas import ExistingBacklogLoopStart, OperationAccepted
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
+from engineering_control.dashboard.session_store import (
+    SessionAuthorization,
+    require_authorization,
+    retire_session,
+)
 from engineering_control.db.models import (
+    ACTIVE_OPERATION_STATUSES,
     ActionCandidate,
     Artifact,
     BacklogIssueRecord,
@@ -28,7 +35,6 @@ from engineering_control.db.models import (
     Enhancement,
     Finding,
     GitHubBacklogCampaign,
-    NotificationOutbox,
     OperationExport,
     OperationRequest,
     ProjectSnapshot,
@@ -47,6 +53,22 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
+from engineering_control.operations.connection_budget import (
+    install_diagnostic_sql_budget,
+    joined_diagnostic_thread,
+)
+from engineering_control.operations.connection_status import (
+    effective_connection_status,
+    provider_connection_status,
+    provider_observation_current,
+)
+from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
+from engineering_control.operations.issue_approval import current_issue_approval_binding
+from engineering_control.operations.issue_start import (
+    ISSUE_START_UNCONFIRMED,
+    issue_request_from_operation,
+    issue_workflow_id,
+)
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditAllProjectsCommand,
@@ -73,10 +95,18 @@ from engineering_control.operations.models import (
     WorkflowControlCommand,
     parse_command,
 )
+from engineering_control.operations.projection_health import projection_connection_status
+from engineering_control.operations.reconciliation import (
+    decide_reconciliation,
+    safe_execution_binding,
+    snapshot_token,
+    utc_text,
+)
+from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.workflows.schedule_intervals import QUOTA_REFRESH_INTERVAL
 
-_ACTIVE_OPERATION_STATES = frozenset({"PENDING", "DISPATCHING", "STARTED", "RUNNING"})
+_ACTIVE_OPERATION_STATES = frozenset(ACTIVE_OPERATION_STATUSES)
 # NEW-16, 2026-09-22: this must stay comfortably above QUOTA_REFRESH_INTERVAL, not an
 # independent literal -- a hardcoded 300s (5 min) here against a schedule that only
 # refreshes every 30 min made solve_backlog/solve_issue's preflight fail ~83% of the
@@ -96,6 +126,29 @@ _TERMINAL_WORKFLOW_STATES = frozenset(
         "TIMED_OUT",
     }
 )
+
+
+def _operation_integrity_conflict(error: IntegrityError) -> str | None:
+    """Classify only the two uniqueness failures that are safe to deduplicate."""
+    diagnostic = getattr(error.orig, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    if constraint_name == "uq_operation_requests_active_target":
+        return "active_owner"
+    if constraint_name in {
+        "uq_operation_requests_idempotency_key",
+        "operation_requests_idempotency_key_key",
+        "ix_operation_requests_idempotency_key",
+    }:
+        return "idempotency"
+    message = str(error.orig).lower()
+    if (
+        "unique constraint failed: operation_requests.action, operation_requests.target_id"
+        in message
+    ):
+        return "active_owner"
+    if "unique constraint failed: operation_requests.idempotency_key" in message:
+        return "idempotency"
+    return None
 
 
 def _global_inventory_approval_current(
@@ -275,6 +328,10 @@ class OperationsRepository:
         export_retention_days: int = 7,
         export_max_bytes: int = 1024 * 1024,
         project_config_root: Path | None = None,
+        projection_reconciliation_enabled: bool = False,
+        projection_reconciliation_interval_seconds: int = 30,
+        projection_reconciliation_cycle_seconds: int = 30,
+        projection_reconciliation_max_sweep_age_seconds: int = 300,
     ) -> None:
         if not 1 <= export_retention_days <= 30:
             raise ValueError("operation export retention is outside its safety bound")
@@ -288,12 +345,27 @@ class OperationsRepository:
             connect_args={"connect_timeout": 5} if database_url.startswith("postgresql") else {},
         )
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+        install_diagnostic_sql_budget(self.engine)
         self.redactor = SecretRedactor()
         self.observability = DashboardObservabilityProjection(self.sessions, self.redactor)
         self.export_retention_days = export_retention_days
         self.export_max_bytes = export_max_bytes
         self.project_config_root = (
             project_config_root.absolute() if project_config_root is not None else None
+        )
+        self.projection_reconciliation_enabled = projection_reconciliation_enabled
+        self.projection_policy = {
+            "interval_seconds": projection_reconciliation_interval_seconds,
+            "cycle_seconds": projection_reconciliation_cycle_seconds,
+            "max_sweep_age_seconds": projection_reconciliation_max_sweep_age_seconds,
+        }
+        projection_connection_status(
+            status="DEGRADED",
+            checked_at=None,
+            last_success_at=None,
+            detail=None,
+            now=datetime.now(UTC),
+            **self.projection_policy,
         )
 
     async def candidate(self, command: Command, session_binding_hash: str) -> CandidateView:
@@ -743,7 +815,6 @@ class OperationsRepository:
                     "issue_state": issue.state,
                     "issue_body_sha256": issue.body_sha256,
                     "risk": issue.calculated_risk,
-                    "eligibility": issue.eligibility_status,
                 }
                 if issue.state.upper() != "OPEN":
                     blockers.append("GITHUB_ISSUE_NOT_OPEN")
@@ -1257,7 +1328,7 @@ class OperationsRepository:
                 OperationRequest.target_id == target_id,
                 OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
             )
-            .order_by(desc(OperationRequest.created_at))
+            .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
         )
         if exclude_operation_id is not None:
             statement = statement.where(OperationRequest.id != exclude_operation_id)
@@ -1333,9 +1404,81 @@ class OperationsRepository:
                 return False
             if self._workflow_state(session, row.workflow_id) is not None:
                 return False
+            now = datetime.now(UTC)
             row.status = "COMPLETED"
-            row.completed_at = row.completed_at or datetime.now(UTC)
+            row.completed_at = row.completed_at or now
+            # The completion and its dashboard event commit together (2b678d9 receipts).
+            session.add(
+                DashboardEvent(
+                    occurred_at=now,
+                    level="INFO",
+                    event_type="operation.completed",
+                    source="controller",
+                    host=None,
+                    worker_kind="controller",
+                    project=row.project,
+                    workflow_id=row.workflow_id,
+                    temporal_run_id=row.temporal_run_id,
+                    issue_number=(
+                        int(row.target_id.rsplit("#", 1)[1])
+                        if row.target_type == "github_issue"
+                        and row.target_id.rsplit("#", 1)[-1].isdigit()
+                        else None
+                    ),
+                    campaign_id=(
+                        row.target_id
+                        if row.target_type in {"backlog_campaign", "audit", "audit_campaign"}
+                        else None
+                    ),
+                    entity_type="operation",
+                    entity_id=str(row.id),
+                    current_phase="COMPLETED",
+                    message="Typed operation workflow closed before recording a run",
+                    metadata_json={
+                        "action": row.action,
+                        "status": "COMPLETED",
+                        "operation": str(row.id),
+                    },
+                )
+            )
             return True
+
+    def _operation_after_insert_conflict(
+        self,
+        session: Session,
+        *,
+        action: str,
+        target_id: str,
+        idempotency_key: str,
+        conflict_kind: str,
+    ) -> OperationRequest | None:
+        """Resolve an idempotency or active-owner race after the loser rolls back."""
+        existing = session.scalar(
+            select(OperationRequest).where(OperationRequest.idempotency_key == idempotency_key)
+        )
+        if existing is not None or conflict_kind == "idempotency":
+            return existing
+        active = session.scalar(
+            select(OperationRequest)
+            .where(
+                OperationRequest.action == action,
+                OperationRequest.target_id == target_id,
+                OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
+            )
+            .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
+            .limit(1)
+        )
+        if active is not None:
+            return active
+        return session.scalar(
+            select(OperationRequest)
+            .where(
+                OperationRequest.action == action,
+                OperationRequest.target_id == target_id,
+            )
+            .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
+            .limit(1)
+        )
 
     async def capability(
         self,
@@ -1360,25 +1503,44 @@ class OperationsRepository:
             )
             return capability
 
-    async def create_reauthentication(self, candidate_id: UUID, session_binding_hash: str) -> str:
+    async def rotate_reauthentication(
+        self,
+        candidate_id: UUID,
+        authorization: SessionAuthorization,
+        new_session_binding_hash: str,
+    ) -> tuple[str, datetime]:
         return await asyncio.to_thread(
-            self._create_reauthentication, candidate_id, session_binding_hash
+            self._rotate_reauthentication, candidate_id, authorization, new_session_binding_hash
         )
 
-    def _create_reauthentication(self, candidate_id: UUID, session_binding_hash: str) -> str:
-        now = datetime.now(UTC)
+    def _rotate_reauthentication(
+        self,
+        candidate_id: UUID,
+        authorization: SessionAuthorization,
+        new_session_binding_hash: str,
+    ) -> tuple[str, datetime]:
+        if (
+            len(new_session_binding_hash) != 64
+            or any(char not in "0123456789abcdef" for char in new_session_binding_hash)
+            or hmac.compare_digest(authorization.binding_hash, new_session_binding_hash)
+        ):
+            raise ValueError("replacement session binding is invalid")
         token = secrets.token_urlsafe(32)
-        digest = hashlib.sha256(token.encode()).hexdigest()
         with self.sessions.begin() as session:
+            require_authorization(session, authorization)
             candidate = session.get(ActionCandidate, candidate_id, with_for_update=True)
+            now = datetime.now(UTC)
             if (
                 candidate is None
                 or candidate.used_at is not None
                 or _utc(candidate.expires_at) <= now
-                or not hmac.compare_digest(candidate.session_binding_hash, session_binding_hash)
+                or not hmac.compare_digest(
+                    candidate.session_binding_hash, authorization.binding_hash
+                )
                 or candidate.capability_status != "AVAILABLE"
             ):
                 raise ValueError("action candidate is unavailable")
+            self._validate_current_candidate(session, candidate, now)
             prior = session.scalar(
                 select(ReauthenticationBinding).where(
                     ReauthenticationBinding.candidate_id == candidate_id
@@ -1387,17 +1549,79 @@ class OperationsRepository:
             if prior is not None:
                 session.delete(prior)
                 session.flush()
+            # These writes and the revocation commit together. No operation or
+            # external effect is created during reauthentication.
+            candidate.session_binding_hash = new_session_binding_hash
+            expires_at = min(_utc(candidate.expires_at), now + timedelta(minutes=5))
             session.add(
                 ReauthenticationBinding(
                     candidate_id=candidate_id,
-                    token_digest=digest,
-                    session_binding_hash=session_binding_hash,
+                    token_digest=hashlib.sha256(token.encode()).hexdigest(),
+                    session_binding_hash=new_session_binding_hash,
                     created_at=now,
-                    expires_at=now + timedelta(minutes=5),
+                    expires_at=expires_at,
                     used_at=None,
                 )
             )
-        return token
+            retire_session(session, authorization)
+        return token, expires_at
+
+    def _validate_current_candidate(
+        self, session: Session, candidate: ActionCandidate, now: datetime
+    ) -> Command:
+        command = parse_command(candidate.payload_json)
+        if isinstance(command, SolveIssueCommand):
+            self._require_current_issue_approval(session, command, candidate.binding_hash)
+        capability, resolved = self._capability(session, command, now)
+        if capability.status != "AVAILABLE":
+            raise ValueError("action capability changed; prepare a new action")
+        target_type, target_id, project = command_target(command)
+        immutable = {
+            "action": command.action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "project": project or capability.project,
+            "payload": candidate.payload_json,
+            "resolved": resolved,
+            "production": False,
+        }
+        # Refresh has a random candidate nonce. Its typed read-only target still
+        # must match; every other action retains the exact approved snapshot.
+        if (
+            candidate.action != command.action
+            or candidate.target_type != target_type
+            or candidate.target_id != target_id
+            or candidate.project != immutable["project"]
+            or (
+                not isinstance(command, RefreshConnectionsCommand)
+                and not hmac.compare_digest(candidate.binding_hash, canonical_sha256(immutable))
+            )
+        ):
+            raise ValueError("action snapshot changed; prepare a new action")
+        return command
+
+    def _require_current_issue_approval(
+        self,
+        session: Session,
+        command: SolveIssueCommand,
+        expected_binding_hash: str,
+    ) -> None:
+        """Recheck the issue snapshot without making ownership revision-dependent."""
+        current_binding = current_issue_approval_binding(session, command)
+        if not hmac.compare_digest(expected_binding_hash, current_binding):
+            raise ValueError("issue approval snapshot changed; prepare and confirm a new action")
+
+    async def validate_issue_approval(self, operation_id: UUID, command: SolveIssueCommand) -> None:
+        await asyncio.to_thread(self._validate_issue_approval, operation_id, command)
+
+    def _validate_issue_approval(self, operation_id: UUID, command: SolveIssueCommand) -> None:
+        with self.sessions.begin() as session:
+            operation = session.get(OperationRequest, operation_id)
+            if operation is None:
+                raise ValueError("operation disappeared before approval validation")
+            if operation.payload_json != command.model_dump(mode="json"):
+                raise ValueError("issue operation command changed before approval validation")
+            self._require_current_issue_approval(session, command, operation.binding_hash)
 
     async def queue_candidate(
         self,
@@ -1405,6 +1629,8 @@ class OperationsRepository:
         reauthentication_token: str,
         session_binding_hash: str,
         confirmation_phrase: str | None,
+        *,
+        authorization: SessionAuthorization,
     ) -> OperationView:
         return await asyncio.to_thread(
             self._queue_candidate,
@@ -1412,6 +1638,7 @@ class OperationsRepository:
             reauthentication_token,
             session_binding_hash,
             confirmation_phrase,
+            authorization,
         )
 
     def _queue_candidate(
@@ -1420,32 +1647,22 @@ class OperationsRepository:
         reauthentication_token: str,
         session_binding_hash: str,
         confirmation_phrase: str | None,
+        authorization: SessionAuthorization,
     ) -> OperationView:
-        now = datetime.now(UTC)
         token_digest = hashlib.sha256(reauthentication_token.encode()).hexdigest()
         try:
             with self.sessions.begin() as session:
-                candidate = session.get(ActionCandidate, candidate_id, with_for_update=True)
-                binding = session.scalar(
-                    select(ReauthenticationBinding)
-                    .where(ReauthenticationBinding.candidate_id == candidate_id)
-                    .with_for_update()
+                candidate, binding, now = self._authorized_candidate(
+                    session,
+                    candidate_id,
+                    token_digest,
+                    session_binding_hash,
+                    confirmation_phrase,
+                    authorization,
                 )
-                if candidate is None or binding is None:
-                    raise ValueError("reauthentication binding is unavailable")
-                if candidate.used_at is not None or _utc(candidate.expires_at) <= now:
-                    raise ValueError("action candidate expired or was already used")
-                if binding.used_at is not None or _utc(binding.expires_at) <= now:
-                    raise ValueError("reauthentication expired or was already used")
-                if not hmac.compare_digest(candidate.session_binding_hash, session_binding_hash):
-                    raise ValueError("action candidate session binding changed")
-                if not hmac.compare_digest(binding.session_binding_hash, session_binding_hash):
-                    raise ValueError("reauthentication session binding changed")
-                if not hmac.compare_digest(binding.token_digest, token_digest):
-                    raise ValueError("reauthentication token is invalid")
-                expected_phrase = candidate.confirmation_phrase or ""
-                if not hmac.compare_digest(expected_phrase, confirmation_phrase or ""):
-                    raise ValueError("typed confirmation does not match the operation binding")
+                receipt = self._accepted_candidate_operation(session, candidate, binding)
+                if receipt is not None:
+                    return self._operation_result_view(session, receipt)
                 existing = session.scalar(
                     select(OperationRequest).where(
                         OperationRequest.idempotency_key == candidate.binding_hash
@@ -1461,10 +1678,11 @@ class OperationsRepository:
                             OperationRequest.target_id == candidate.target_id,
                             OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
                         )
-                        .order_by(desc(OperationRequest.created_at))
+                        .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
                         .limit(1)
                     )
                 if existing is None:
+                    self._validate_current_candidate(session, candidate, now)
                     existing = OperationRequest(
                         action=candidate.action,
                         project=candidate.project,
@@ -1486,22 +1704,115 @@ class OperationsRepository:
                     )
                     session.add(existing)
                     session.flush()
+                self._require_candidate_operation_target(candidate, existing)
                 candidate.used_at = now
                 binding.used_at = now
-                return self._operation_view(existing)
-        except IntegrityError:
-            with self.sessions() as session:
-                candidate = session.get(ActionCandidate, candidate_id)
-                if candidate is None:
-                    raise
-                existing = session.scalar(
-                    select(OperationRequest).where(
-                        OperationRequest.idempotency_key == candidate.binding_hash
-                    )
+                candidate.accepted_operation_id = existing.id
+                return self._operation_result_view(session, existing)
+        except IntegrityError as error:
+            conflict_kind = _operation_integrity_conflict(error)
+            if conflict_kind is None:
+                raise
+            with self.sessions.begin() as session:
+                # A conflicting insert rolled back the entire first attempt.
+                # Reacquire locks and recheck every authority field, including
+                # expiry after the wait. Never reuse the pre-conflict decision.
+                candidate, binding, now = self._authorized_candidate(
+                    session,
+                    candidate_id,
+                    token_digest,
+                    session_binding_hash,
+                    confirmation_phrase,
+                    authorization,
+                )
+                receipt = self._accepted_candidate_operation(session, candidate, binding)
+                if receipt is not None:
+                    return self._operation_result_view(session, receipt)
+                existing = self._operation_after_insert_conflict(
+                    session,
+                    action=candidate.action,
+                    target_id=candidate.target_id,
+                    idempotency_key=candidate.binding_hash,
+                    conflict_kind=conflict_kind,
                 )
                 if existing is None:
                     raise
-                return self._operation_view(existing)
+                self._require_candidate_operation_target(candidate, existing)
+                candidate.used_at = now
+                binding.used_at = now
+                candidate.accepted_operation_id = existing.id
+                return self._operation_result_view(session, existing)
+
+    def _authorized_candidate(
+        self,
+        session: Session,
+        candidate_id: UUID,
+        token_digest: str,
+        session_binding_hash: str,
+        confirmation_phrase: str | None,
+        authorization: SessionAuthorization,
+    ) -> tuple[ActionCandidate, ReauthenticationBinding, datetime]:
+        if not hmac.compare_digest(authorization.binding_hash, session_binding_hash):
+            raise ValueError("dashboard session binding changed")
+        require_authorization(session, authorization)
+        candidate = session.get(ActionCandidate, candidate_id, with_for_update=True)
+        binding = session.scalar(
+            select(ReauthenticationBinding)
+            .where(ReauthenticationBinding.candidate_id == candidate_id)
+            .with_for_update()
+        )
+        # Candidate/binding locks may also have waited. A session that expired
+        # during that wait must not admit or disclose an acceptance receipt.
+        require_authorization(session, authorization)
+        now = datetime.now(UTC)
+        if candidate is None or binding is None:
+            raise ValueError("reauthentication binding is unavailable")
+        if _utc(candidate.expires_at) <= now:
+            raise ValueError("action candidate expired")
+        if _utc(binding.expires_at) <= now:
+            raise ValueError("reauthentication expired")
+        if not hmac.compare_digest(candidate.session_binding_hash, session_binding_hash):
+            raise ValueError("action candidate session binding changed")
+        if not hmac.compare_digest(binding.session_binding_hash, session_binding_hash):
+            raise ValueError("reauthentication session binding changed")
+        if not hmac.compare_digest(binding.token_digest, token_digest):
+            raise ValueError("reauthentication token is invalid")
+        if not hmac.compare_digest(candidate.confirmation_phrase or "", confirmation_phrase or ""):
+            raise ValueError("typed confirmation does not match the operation binding")
+        return candidate, binding, now
+
+    @staticmethod
+    def _require_candidate_operation_target(
+        candidate: ActionCandidate, operation: OperationRequest
+    ) -> None:
+        if (candidate.action, candidate.target_type, candidate.target_id, candidate.project) != (
+            operation.action,
+            operation.target_type,
+            operation.target_id,
+            operation.project,
+        ):
+            raise ValueError("accepted operation target does not match candidate")
+
+    def _accepted_candidate_operation(
+        self, session: Session, candidate: ActionCandidate, binding: ReauthenticationBinding
+    ) -> OperationRequest | None:
+        if candidate.used_at is None and binding.used_at is None:
+            if candidate.accepted_operation_id is not None:
+                raise ValueError("action receipt has inconsistent consumption state")
+            return None
+        if (
+            candidate.used_at is None
+            or binding.used_at is None
+            or candidate.accepted_operation_id is None
+        ):
+            raise ValueError("action was already used without a recoverable acceptance receipt")
+        accepted = session.get(OperationRequest, candidate.accepted_operation_id)
+        if accepted is None:
+            raise ValueError("accepted operation is no longer available")
+        self._require_candidate_operation_target(candidate, accepted)
+        # This is a read of a prior acceptance, not permission to repeat any
+        # external effect. Never look up a newer active owner on this path.
+        return accepted
 
     async def operation(self, operation_id: UUID) -> OperationView | None:
         return await asyncio.to_thread(self._operation, operation_id)
@@ -1511,21 +1822,30 @@ class OperationsRepository:
             row = session.get(OperationRequest, operation_id)
             if row is None:
                 return None
-            result_available = False
-            if row.status == "COMPLETED" and row.action in {
-                "evidence_export_campaign",
-                "evidence_export_workflow",
-            }:
-                operation_export = session.scalar(
-                    select(OperationExport).where(OperationExport.operation_id == row.id)
-                )
-                result_available = self._valid_export(operation_export, datetime.now(UTC))
-            return self._operation_view(row, result_available=result_available)
+            return self._operation_result_view(session, row)
 
-    async def claim_pending(self) -> tuple[UUID, Command, SourceChannel, str] | None:
-        return await asyncio.to_thread(self._claim_pending)
+    def _operation_result_view(self, session: Session, row: OperationRequest) -> OperationView:
+        result_available = False
+        if row.status == "COMPLETED" and row.action in {
+            "evidence_export_campaign",
+            "evidence_export_workflow",
+        }:
+            operation_export = session.scalar(
+                select(OperationExport).where(OperationExport.operation_id == row.id)
+            )
+            result_available = self._valid_export(operation_export, datetime.now(UTC))
+        return self._operation_view(row, result_available=result_available)
 
-    def _claim_pending(self) -> tuple[UUID, Command, SourceChannel, str] | None:
+    async def claim_pending(
+        self, *, diagnostics_only: bool = False
+    ) -> tuple[UUID, Command, SourceChannel, str] | None:
+        return await asyncio.to_thread(self._claim_pending, diagnostics_only)
+
+    def _claim_pending(
+        self, diagnostics_only: bool = False
+    ) -> tuple[UUID, Command, SourceChannel, str] | None:
+        if type(diagnostics_only) is not bool:
+            raise ValueError("invalid dispatcher scope")
         with self.sessions.begin() as session:
             statement = (
                 select(OperationRequest)
@@ -1533,16 +1853,34 @@ class OperationsRepository:
                 .order_by(OperationRequest.created_at)
                 .limit(1)
             )
+            if diagnostics_only:
+                statement = statement.where(OperationRequest.action == "refresh_connections")
             if self.engine.dialect.name == "postgresql":
                 statement = statement.with_for_update(skip_locked=True)
             row = session.scalar(statement)
             if row is None:
                 return None
+            try:
+                command = parse_command(row.payload_json)
+            except ValueError:
+                if not diagnostics_only:
+                    raise
+                row.status = "BLOCKED"
+                row.safe_error = "invalid diagnostic command payload"
+                row.completed_at = datetime.now(UTC)
+                return None
+            if diagnostics_only and not isinstance(command, RefreshConnectionsCommand):
+                # Preserve a corrupt/inconsistent diagnostic record truthfully; do not
+                # execute a product payload merely because its projection says refresh.
+                row.status = "BLOCKED"
+                row.safe_error = "diagnostic action and payload disagree"
+                row.completed_at = datetime.now(UTC)
+                return None
             row.status = "DISPATCHING"
             row.started_at = datetime.now(UTC)
             return (
                 row.id,
-                parse_command(row.payload_json),
+                command,
                 cast(SourceChannel, row.source_channel),
                 row.operator_class,
             )
@@ -1564,6 +1902,124 @@ class OperationsRepository:
                 row.operator_class,
             )
 
+    async def mark_issue_start_unconfirmed(self, operation_id: UUID, workflow_id: str) -> bool:
+        return await asyncio.to_thread(
+            self._mark_issue_start_unconfirmed, operation_id, workflow_id
+        )
+
+    def _mark_issue_start_unconfirmed(self, operation_id: UUID, workflow_id: str) -> bool:
+        with self.sessions.begin() as session:
+            row = self._lock_issue_dispatch(session, operation_id)
+            if row is None or row.status != "DISPATCHING" or row.workflow_id is not None:
+                return False
+            request = issue_request_from_operation(row)
+            if workflow_id != issue_workflow_id(request):
+                raise ValueError("uncertain issue start does not match its operation")
+            if row.temporal_run_id is not None or row.completed_at is not None:
+                return False
+            if row.safe_error == ISSUE_START_UNCONFIRMED:
+                return False
+            row.safe_error = ISSUE_START_UNCONFIRMED
+            session.add(
+                DashboardEvent(
+                    occurred_at=datetime.now(UTC),
+                    level="WARNING",
+                    event_type="operation.start_unconfirmed",
+                    source="controller",
+                    host=None,
+                    worker_kind="controller",
+                    project=row.project,
+                    workflow_id=None,
+                    temporal_run_id=None,
+                    entity_type="operation",
+                    entity_id=str(row.id),
+                    current_phase="DISPATCHING",
+                    message=ISSUE_START_UNCONFIRMED,
+                    metadata_json={"expected_workflow_id": workflow_id, "operation": str(row.id)},
+                )
+            )
+            return True
+
+    @staticmethod
+    def _lock_issue_dispatch(session: Session, operation_id: UUID) -> OperationRequest | None:
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            session.execute(text("SET LOCAL statement_timeout = '10s'"))
+        return session.get(
+            OperationRequest, operation_id, with_for_update=True, populate_existing=True
+        )
+
+    async def next_issue_start_recovery(
+        self,
+        after_id: UUID | None,
+    ) -> tuple[UUID, ExistingBacklogLoopStart | None] | None:
+        return await asyncio.to_thread(self._next_issue_start_recovery, after_id)
+
+    def _next_issue_start_recovery(
+        self,
+        after_id: UUID | None,
+    ) -> tuple[UUID, ExistingBacklogLoopStart | None] | None:
+        with self.sessions.begin() as session:
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            query = (
+                select(OperationRequest)
+                .where(
+                    OperationRequest.action == "solve_issue",
+                    OperationRequest.status == "DISPATCHING",
+                    OperationRequest.workflow_id.is_(None),
+                    OperationRequest.temporal_run_id.is_(None),
+                    OperationRequest.completed_at.is_(None),
+                    or_(
+                        OperationRequest.safe_error == ISSUE_START_UNCONFIRMED,
+                        OperationRequest.started_at <= datetime.now(UTC) - timedelta(seconds=60),
+                    ),
+                )
+                .order_by(OperationRequest.id)
+                .limit(1)
+            )
+            if after_id is not None:
+                query = query.where(OperationRequest.id > after_id)
+            row = session.scalar(query)
+            if row is None:
+                return None
+            try:
+                request = issue_request_from_operation(row)
+            except ValueError:
+                # Return its cursor even for malformed stored input, so one bad
+                # record cannot indefinitely starve other read-only observations.
+                request = None
+            return row.id, request
+
+    async def record_issue_start_recovery(
+        self,
+        request: ExistingBacklogLoopStart,
+        accepted: OperationAccepted,
+    ) -> bool:
+        return await asyncio.to_thread(self._record_issue_start_recovery, request, accepted)
+
+    def _record_issue_start_recovery(
+        self,
+        request: ExistingBacklogLoopStart,
+        accepted: OperationAccepted,
+    ) -> bool:
+        if request.issue_operation_id is None or accepted.workflow_id != issue_workflow_id(request):
+            raise ValueError("observed issue workflow does not match the attempted operation")
+        with self.sessions.begin() as session:
+            row = self._lock_issue_dispatch(session, request.issue_operation_id)
+            if row is None or row.status != "DISPATCHING":
+                return False
+            if issue_request_from_operation(row) != request:
+                raise ValueError("stored issue attempt changed during read-only observation")
+            return record_dispatch_receipt(
+                session,
+                row.id,
+                status="STARTED",
+                workflow_id=accepted.workflow_id,
+                run_id=accepted.run_id,
+                linked=True,
+            )
+
     async def finish(
         self,
         operation_id: UUID,
@@ -1572,14 +2028,19 @@ class OperationsRepository:
         workflow_id: str | None = None,
         run_id: str | None = None,
         safe_error: str | None = None,
-    ) -> None:
-        await asyncio.to_thread(
+        linked: bool = False,
+        signal_receipt: bool = False,
+    ) -> bool:
+        """Commit the first dispatch receipt, dashboard event and outbox together."""
+        return await asyncio.to_thread(
             self._finish,
             operation_id,
             status,
             workflow_id,
             run_id,
             safe_error,
+            linked,
+            signal_receipt,
         )
 
     def _finish(
@@ -1589,107 +2050,20 @@ class OperationsRepository:
         workflow_id: str | None,
         run_id: str | None,
         safe_error: str | None,
-    ) -> None:
-        if status not in {"STARTED", "COMPLETED", "FAILED", "BLOCKED"}:
-            raise ValueError("operation terminal dispatch status is invalid")
+        linked: bool = False,
+        signal_receipt: bool = False,
+    ) -> bool:
         with self.sessions.begin() as session:
-            row = session.get(OperationRequest, operation_id, with_for_update=True)
-            if row is None:
-                raise ValueError("operation disappeared during dispatch")
-            row.status = status
-            row.workflow_id = workflow_id
-            row.temporal_run_id = run_id
-            row.safe_error = (
-                str(self.redactor.redact(safe_error[:2000]).value)[:500] if safe_error else None
+            return record_dispatch_receipt(
+                session,
+                operation_id,
+                status=status,
+                workflow_id=workflow_id,
+                run_id=run_id,
+                safe_error=safe_error,
+                linked=linked,
+                signal_receipt=signal_receipt,
             )
-            if status in {"COMPLETED", "FAILED", "BLOCKED"}:
-                row.completed_at = datetime.now(UTC)
-
-    async def record_dispatch_event(
-        self,
-        operation_id: UUID,
-        *,
-        event_type: str,
-        level: str,
-        message: str,
-        workflow_id: str | None = None,
-    ) -> None:
-        await asyncio.to_thread(
-            self._record_dispatch_event,
-            operation_id,
-            event_type,
-            level,
-            message,
-            workflow_id,
-        )
-
-    def _record_dispatch_event(
-        self,
-        operation_id: UUID,
-        event_type: str,
-        level: str,
-        message: str,
-        workflow_id: str | None,
-    ) -> None:
-        with self.sessions.begin() as session:
-            operation = session.get(OperationRequest, operation_id)
-            if operation is None:
-                return
-            redacted = str(self.redactor.redact(message).value)[:500]
-            session.add(
-                DashboardEvent(
-                    occurred_at=datetime.now(UTC),
-                    level=level,
-                    event_type=event_type,
-                    source="controller",
-                    host=None,
-                    worker_kind="controller",
-                    project=operation.project,
-                    workflow_id=(
-                        workflow_id
-                        or (operation.target_id if operation.target_type == "workflow" else None)
-                    ),
-                    temporal_run_id=operation.temporal_run_id,
-                    issue_number=(
-                        int(operation.target_id.rsplit("#", 1)[1])
-                        if operation.target_type == "github_issue"
-                        and operation.target_id.rsplit("#", 1)[-1].isdigit()
-                        else None
-                    ),
-                    campaign_id=(
-                        operation.target_id
-                        if operation.target_type in {"backlog_campaign", "audit", "audit_campaign"}
-                        else None
-                    ),
-                    entity_type="operation",
-                    entity_id=str(operation.id),
-                    current_phase=operation.status,
-                    message=redacted,
-                    metadata_json={
-                        "action": operation.action,
-                        "status": operation.status,
-                        "operation": str(operation.id),
-                    },
-                )
-            )
-            if event_type == "operation.started" and workflow_id:
-                session.add(
-                    NotificationOutbox(
-                        topic="telegram.engineering-operation-started",
-                        status="PENDING",
-                        payload_json={
-                            "operation_id": str(operation.id),
-                            "project": operation.project,
-                            "target": operation.target_id,
-                            "workflow_id": workflow_id,
-                            "phase": "QUEUED",
-                        },
-                        attempts=0,
-                        next_attempt_at=datetime.now(UTC),
-                        delivered_at=None,
-                        last_error_code=None,
-                    )
-                )
 
     async def create_external(
         self,
@@ -1719,75 +2093,106 @@ class OperationsRepository:
         target_type, target_id, project = command_target(command)
         payload = command.model_dump(mode="json")
         digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
-        with self.sessions.begin() as session:
-            resolved_binding: dict[str, Any] = {}
-            if isinstance(command, (EvidenceExportCampaignCommand, EvidenceExportWorkflowCommand)):
-                capability, resolved_binding = self._capability(session, command, datetime.now(UTC))
-                project = project or capability.project
-            if (
-                isinstance(
+        try:
+            with self.sessions.begin() as session:
+                resolved_binding: dict[str, Any] = {}
+                if isinstance(
                     command,
-                    (EnhancementApproveCommand, EnhancementRejectCommand, EnhancementRunCommand),
-                )
-                and command.approval_binding is None
-            ):
-                enhancement = session.scalar(
-                    select(Enhancement).where(Enhancement.enhancement_key == command.enhancement_id)
-                )
-                if enhancement is not None and isinstance(enhancement.approval_binding_sha256, str):
-                    payload["approval_binding"] = enhancement.approval_binding_sha256
-            binding_hash = canonical_sha256(
-                {
-                    "payload": payload,
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "project": project,
-                    "resolved": resolved_binding,
-                    "production": False,
-                }
-                if resolved_binding
-                else payload
-            )
-            existing = session.scalar(
-                select(OperationRequest).where(OperationRequest.idempotency_key == digest)
-            )
-            if existing is None and self._active_target(session, command.action, target_id):
-                existing = session.scalar(
-                    select(OperationRequest)
-                    .where(
-                        OperationRequest.action == command.action,
-                        OperationRequest.target_id == target_id,
-                        OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
+                    (EvidenceExportCampaignCommand, EvidenceExportWorkflowCommand),
+                ):
+                    capability, resolved_binding = self._capability(
+                        session, command, datetime.now(UTC)
                     )
-                    .order_by(desc(OperationRequest.created_at))
-                    .limit(1)
+                    project = project or capability.project
+                if (
+                    isinstance(
+                        command,
+                        (
+                            EnhancementApproveCommand,
+                            EnhancementRejectCommand,
+                            EnhancementRunCommand,
+                        ),
+                    )
+                    and command.approval_binding is None
+                ):
+                    enhancement = session.scalar(
+                        select(Enhancement).where(
+                            Enhancement.enhancement_key == command.enhancement_id
+                        )
+                    )
+                    if enhancement is not None and isinstance(
+                        enhancement.approval_binding_sha256, str
+                    ):
+                        payload["approval_binding"] = enhancement.approval_binding_sha256
+                binding_hash = canonical_sha256(
+                    {
+                        "payload": payload,
+                        "target_type": target_type,
+                        "target_id": target_id,
+                        "project": project,
+                        "resolved": resolved_binding,
+                        "production": False,
+                    }
+                    if resolved_binding
+                    else payload
                 )
-            if existing is None:
-                existing = OperationRequest(
+                existing = session.scalar(
+                    select(OperationRequest).where(OperationRequest.idempotency_key == digest)
+                )
+                if existing is None and self._active_target(session, command.action, target_id):
+                    existing = session.scalar(
+                        select(OperationRequest)
+                        .where(
+                            OperationRequest.action == command.action,
+                            OperationRequest.target_id == target_id,
+                            OperationRequest.status.in_(_ACTIVE_OPERATION_STATES),
+                        )
+                        .order_by(desc(OperationRequest.created_at), desc(OperationRequest.id))
+                        .limit(1)
+                    )
+                if existing is None:
+                    if isinstance(command, SolveIssueCommand):
+                        binding_hash = current_issue_approval_binding(session, command)
+                    existing = OperationRequest(
+                        action=command.action,
+                        project=project,
+                        target_type=target_type,
+                        target_id=target_id,
+                        payload_json=payload,
+                        source_channel=source_channel,
+                        operator_class=operator_class[:80],
+                        idempotency_key=digest,
+                        binding_hash=binding_hash,
+                        workflow_id=None,
+                        temporal_run_id=None,
+                        status="PENDING",
+                        safe_error=None,
+                        created_at=datetime.now(UTC),
+                        confirmed_at=datetime.now(UTC),
+                        started_at=None,
+                        completed_at=None,
+                    )
+                    session.add(existing)
+                    session.flush()
+                return self._operation_view(existing)
+        except IntegrityError as error:
+            conflict_kind = _operation_integrity_conflict(error)
+            if conflict_kind is None:
+                raise
+            with self.sessions() as session:
+                existing = self._operation_after_insert_conflict(
+                    session,
                     action=command.action,
-                    project=project,
-                    target_type=target_type,
                     target_id=target_id,
-                    payload_json=payload,
-                    source_channel=source_channel,
-                    operator_class=operator_class[:80],
                     idempotency_key=digest,
-                    binding_hash=binding_hash,
-                    workflow_id=None,
-                    temporal_run_id=None,
-                    status="PENDING",
-                    safe_error=None,
-                    created_at=datetime.now(UTC),
-                    confirmed_at=datetime.now(UTC),
-                    started_at=None,
-                    completed_at=None,
+                    conflict_kind=conflict_kind,
                 )
-                session.add(existing)
-                session.flush()
-            return self._operation_view(existing)
+                if existing is None:
+                    raise
+                return self._operation_view(existing)
 
     async def upsert_connection(self, value: dict[str, Any]) -> None:
-        await asyncio.to_thread(self._upsert_connection, value)
+        await joined_diagnostic_thread(self._upsert_connection, value)
 
     def _upsert_connection(self, value: dict[str, Any]) -> None:
         now = datetime.now(UTC)
@@ -1811,12 +2216,21 @@ class OperationsRepository:
                 )
                 session.add(row)
             else:
+                for timestamp in ("last_success_at", "last_failure_at"):
+                    incoming = value.get(timestamp)
+                    previous = getattr(row, timestamp)
+                    if incoming is not None and (
+                        previous is None or _utc(incoming) > _utc(previous)
+                    ):
+                        setattr(row, timestamp, incoming)
+                if _utc(value.get("checked_at", now)) < _utc(row.checked_at):
+                    # Preserve historical success/failure, never regress current state
+                    # because a delayed diagnostic finished after a newer observation.
+                    return
                 for key, target in (
                     ("logical_target", "logical_target"),
                     ("status", "status"),
                     ("checked_at", "checked_at"),
-                    ("last_success_at", "last_success_at"),
-                    ("last_failure_at", "last_failure_at"),
                     ("latency_ms", "latency_ms"),
                     ("safe_error", "safe_error"),
                     ("source", "source"),
@@ -1887,46 +2301,91 @@ class OperationsRepository:
                 ],
             }
         if surface == "providers":
+            freshness_seconds: dict[str, int | None] = {}
+            provider_current: dict[str, bool] = {}
+            for provider, quota_row in quotas.items():
+                age = (
+                    int((now - _utc(quota_row.captured_at)).total_seconds())
+                    if quota_row is not None
+                    else None
+                )
+                freshness_seconds[provider] = max(0, age) if age is not None else None
+                provider_current[provider] = quota_row is not None and provider_observation_current(
+                    quota_row.captured_at, now
+                )
             return {
                 "status": "READY"
                 if all(
                     value is not None
+                    and provider_current[provider]
                     and value.authenticated is True
                     and value.cli_present is True
                     and not value.rate_limited
-                    for value in quotas.values()
+                    for provider, value in quotas.items()
                 )
                 else "DEGRADED",
                 "providers": {
                     provider: (
                         {
                             "provider_id": f"{provider}_cli",
-                            "authenticated": row.authenticated,
-                            "cli_present": row.cli_present,
-                            "rate_limited": row.rate_limited,
-                            "running_jobs": row.running_jobs,
-                            "status": row.status,
-                            "captured_at": row.captured_at.isoformat(),
-                            "source": row.source,
+                            "authenticated": quota_row.authenticated,
+                            "cli_present": quota_row.cli_present,
+                            "rate_limited": quota_row.rate_limited,
+                            "running_jobs": quota_row.running_jobs,
+                            "status": (
+                                "STALE" if not provider_current[provider] else quota_row.status
+                            ),
+                            "captured_at": quota_row.captured_at.isoformat(),
+                            "raw_status": quota_row.status,
+                            "capacity_status": "UNKNOWN"
+                            if quota_row.total_capacity is None
+                            else "STALE"
+                            if not provider_current[provider]
+                            else quota_row.status,
+                            "freshness_seconds": freshness_seconds[provider],
+                            "source": quota_row.source,
                         }
-                        if row is not None
+                        if quota_row is not None
                         else {"provider_id": f"{provider}_cli", "status": "NOT_REPORTED"}
                     )
-                    for provider, row in quotas.items()
+                    for provider, quota_row in quotas.items()
                 },
                 "permitted_provider_ids": ["codex_cli", "claude_cli"],
             }
         if surface == "channel":
             latest: dict[str, DashboardEvent] = {}
-            for row in events:
-                latest.setdefault(row.event_type, row)
+            for event_row in events:
+                latest.setdefault(event_row.event_type, event_row)
 
             def event_time(name: str) -> str | None:
-                row = latest.get(name)
-                return row.occurred_at.isoformat() if row is not None else None
+                event_row = latest.get(name)
+                return event_row.occurred_at.isoformat() if event_row is not None else None
 
             outbound = latest.get("telegram.response_delivered")
             inbound = latest.get("telegram.command_received")
+            failure = latest.get("telegram.response_delivery_failed")
+            observed_rows = [row for row in (outbound, inbound, failure) if row is not None]
+            observed_at = max((_utc(row.occurred_at) for row in observed_rows), default=None)
+            observed_age = (
+                max(0, int((now - observed_at).total_seconds()))
+                if observed_at is not None
+                else None
+            )
+            failure_is_latest = failure is not None and (
+                outbound is None or _utc(failure.occurred_at) >= _utc(outbound.occurred_at)
+            )
+            reply_follows_inbound = outbound is not None and (
+                inbound is None or _utc(outbound.occurred_at) >= _utc(inbound.occurred_at)
+            )
+            channel_status = (
+                "STALE"
+                if observed_age is not None and observed_age > 600
+                else "CONNECTED"
+                if outbound is not None and reply_follows_inbound and not failure_is_latest
+                else "DEGRADED"
+                if observed_rows
+                else "NOT_CONFIGURED"
+            )
             latency_ms = None
             if (
                 outbound is not None
@@ -1936,10 +2395,15 @@ class OperationsRepository:
                 latency_ms = int(
                     (_utc(outbound.occurred_at) - _utc(inbound.occurred_at)).total_seconds() * 1000
                 )
-            last_error = latest.get("telegram.response_delivery_failed")
             return {
-                "status": "CONNECTED" if outbound is not None else "STALE",
-                "gateway_state": "RUNNING" if events else "NOT_REPORTED",
+                "status": channel_status,
+                "gateway_state": (
+                    "RUNNING"
+                    if channel_status in {"CONNECTED", "DEGRADED"}
+                    else "STALE"
+                    if observed_rows
+                    else "NOT_REPORTED"
+                ),
                 "transport_mode": "telegram",
                 "last_inbound_update": event_time("telegram.command_received"),
                 "last_recognized_command": event_time("telegram.command_recognized"),
@@ -1947,22 +2411,40 @@ class OperationsRepository:
                 "last_outbound_reply": event_time("telegram.response_delivered"),
                 "latency_ms": latency_ms,
                 "hook_profile": "engineering-control-fixed-commands",
-                "last_safe_error": last_error.message if last_error is not None else None,
+                "last_safe_error": (
+                    failure.message if failure is not None and failure_is_latest else None
+                ),
             }
         if surface == "temporal":
             temporal = next(
                 (row for row in connections if row.component.lower() == "temporal"), None
             )
-            active = [
-                row
+            projection_states = [
+                classify_run_projection(
+                    status=row.status,
+                    started_at=row.started_at,
+                    finished_at=row.finished_at,
+                    updated_at=row.updated_at,
+                    now=now,
+                )
                 for row in runs
-                if row.status not in {"COMPLETE", "COMPLETED", "SUCCESS", "FAILED", "CANCELLED"}
             ]
             return {
-                "status": temporal.status if temporal is not None else "NOT_REPORTED",
+                "status": (
+                    effective_connection_status(
+                        temporal.component, temporal.status, temporal.checked_at, now
+                    )
+                    if temporal is not None
+                    else "NOT_REPORTED"
+                ),
                 "target": temporal.logical_target if temporal is not None else None,
                 "checked_at": temporal.checked_at.isoformat() if temporal is not None else None,
-                "active_workflow_projections": len(active),
+                "active_workflow_projections": projection_states.count(
+                    "ACTIVE_REQUIRES_TEMPORAL_CORRELATION"
+                ),
+                "durable_wait_projections": projection_states.count("DURABLE_WAIT"),
+                "orphaned_start_intents": projection_states.count("ORPHANED_START_INTENT"),
+                "terminal_workflow_projections": projection_states.count("TERMINAL"),
                 "recent_workflow_projections": len(runs),
                 "worker_heartbeat_count": len(heartbeats),
             }
@@ -1970,14 +2452,19 @@ class OperationsRepository:
             row
             for row in connections
             if row.component != "worker-controller"
+            and row.component != "engineering-cli"
             and (surface != "readiness-core" or not row.component.startswith("project-"))
         ]
-        statuses = [row.status for row in required_connections]
+        statuses = [self._connection_status(row, now) for row in required_connections]
+        if self.projection_reconciliation_enabled and not any(
+            row.component == "projection-reconciler" for row in required_connections
+        ):
+            statuses.append("DEGRADED")
         return {
             "status": "READY"
             if statuses and all(value == "CONNECTED" for value in statuses)
             else "DEGRADED",
-            "connection_count": len(required_connections),
+            "connection_count": len(statuses),
             "connected_count": sum(value == "CONNECTED" for value in statuses),
             "worker_count": len(heartbeats),
             "checked_at": now.isoformat(),
@@ -2349,29 +2836,175 @@ class OperationsRepository:
             hashlib.sha256(encoded).hexdigest(),
         )
 
+    def _connection_status(self, row: ConnectionSnapshot, now: datetime) -> str:
+        if row.component == "projection-reconciler":
+            if not self.projection_reconciliation_enabled:
+                return "NOT_CONFIGURED"
+            return projection_connection_status(
+                status=row.status,
+                checked_at=row.checked_at,
+                last_success_at=row.last_success_at,
+                detail=row.detail_json,
+                now=now,
+                **self.projection_policy,
+            )
+        return effective_connection_status(row.component, row.status, row.checked_at, now)
+
     def _connections(self) -> list[ConnectionView]:
         now = datetime.now(UTC)
         with self.sessions() as session:
             rows = session.scalars(
                 select(ConnectionSnapshot).order_by(ConnectionSnapshot.component)
             ).all()
-            return [
-                ConnectionView(
-                    component=row.component,
-                    logical_target=row.logical_target,
-                    status=cast(Any, row.status),
-                    checked_at=row.checked_at,
-                    last_success_at=row.last_success_at,
-                    last_failure_at=row.last_failure_at,
-                    latency_ms=row.latency_ms,
-                    freshness_seconds=max(0, int((now - _utc(row.checked_at)).total_seconds())),
-                    safe_error=row.safe_error,
-                    source=row.source,
-                    next_action=row.next_action,
-                    details=row.detail_json,
+            values: list[ConnectionView] = []
+            for row in rows:
+                if row.component in {"provider-codex", "provider-claude"}:
+                    # These cards derive from the durable auth observations, not an
+                    # independently timed cache that can lag a successful refresh.
+                    continue
+                effective = self._connection_status(row, now)
+                projection_not_ready = (
+                    row.component == "projection-reconciler" and effective != "CONNECTED"
                 )
-                for row in rows
-            ]
+                became_stale = effective == "STALE" and row.status != "STALE"
+                values.append(
+                    ConnectionView(
+                        component=row.component,
+                        logical_target=row.logical_target,
+                        status=cast(Any, effective),
+                        checked_at=row.checked_at,
+                        last_success_at=row.last_success_at,
+                        last_failure_at=row.last_failure_at,
+                        latency_ms=row.latency_ms,
+                        freshness_seconds=max(0, int((now - _utc(row.checked_at)).total_seconds())),
+                        safe_error=(
+                            "Projection reconciliation is disabled, stale, inconsistent, "
+                            "or has unresolved rows."
+                            if projection_not_ready
+                            else "persisted connection snapshot exceeded its freshness limit"
+                            if became_stale
+                            else row.safe_error
+                        ),
+                        source=row.source,
+                        next_action=(
+                            "Inspect the fixed reconciler configuration and execution bindings; "
+                            "do not start replacement runs."
+                            if projection_not_ready
+                            else "Refresh the owning fixed probe or persisted publisher."
+                            if became_stale
+                            else row.next_action
+                        ),
+                        details=row.detail_json,
+                    )
+                )
+            if self.projection_reconciliation_enabled and not any(
+                row.component == "projection-reconciler" for row in rows
+            ):
+                values.append(
+                    ConnectionView(
+                        component="projection-reconciler",
+                        logical_target="engineering_control.runs",
+                        status="DEGRADED",
+                        checked_at=now,
+                        last_success_at=None,
+                        last_failure_at=None,
+                        latency_ms=None,
+                        freshness_seconds=0,
+                        safe_error="Enabled reconciler has no persisted observation.",
+                        source="configuration/expected-component",
+                        next_action="Inspect the fixed reconciler before admitting dependent work.",
+                        details={"observation_present": False},
+                    )
+                )
+            for provider in ("codex", "claude"):
+                snapshot = session.scalar(
+                    select(QuotaSnapshot)
+                    .where(QuotaSnapshot.provider == provider)
+                    .order_by(QuotaSnapshot.captured_at.desc())
+                    .limit(1)
+                )
+                if snapshot is None:
+                    values.append(
+                        ConnectionView(
+                            component=f"provider-{provider}",
+                            logical_target=f"native-{provider}-cli",
+                            status="NOT_CONFIGURED",
+                            checked_at=now,
+                            last_success_at=None,
+                            last_failure_at=None,
+                            latency_ms=None,
+                            freshness_seconds=0,
+                            safe_error="no persisted native auth observation",
+                            source="quota-snapshots",
+                            next_action="Inspect the native provider worker.",
+                            details={},
+                        )
+                    )
+                    continue
+                successful = session.scalar(
+                    select(QuotaSnapshot.captured_at)
+                    .where(
+                        QuotaSnapshot.provider == provider,
+                        QuotaSnapshot.authenticated.is_(True),
+                        QuotaSnapshot.cli_present.is_(True),
+                        QuotaSnapshot.rate_limited.is_(False),
+                    )
+                    .order_by(QuotaSnapshot.captured_at.desc())
+                    .limit(1)
+                )
+                failed = session.scalar(
+                    select(QuotaSnapshot.captured_at)
+                    .where(
+                        QuotaSnapshot.provider == provider,
+                        or_(
+                            QuotaSnapshot.authenticated.is_(False),
+                            QuotaSnapshot.cli_present.is_(False),
+                            QuotaSnapshot.rate_limited.is_(True),
+                        ),
+                    )
+                    .order_by(QuotaSnapshot.captured_at.desc())
+                    .limit(1)
+                )
+                status = provider_connection_status(
+                    captured_at=snapshot.captured_at,
+                    authenticated=snapshot.authenticated,
+                    cli_present=snapshot.cli_present,
+                    rate_limited=snapshot.rate_limited,
+                    now=now,
+                )
+                values.append(
+                    ConnectionView(
+                        component=f"provider-{provider}",
+                        logical_target=f"native-{provider}-cli",
+                        status=cast(Any, status),
+                        checked_at=snapshot.captured_at,
+                        last_success_at=successful,
+                        last_failure_at=failed,
+                        latency_ms=None,
+                        freshness_seconds=max(
+                            0, int((now - _utc(snapshot.captured_at)).total_seconds())
+                        ),
+                        safe_error=None
+                        if status == "CONNECTED"
+                        else "native auth observation is stale or not ready",
+                        source="quota-snapshots",
+                        next_action=None
+                        if status == "CONNECTED"
+                        else "Inspect the native provider worker.",
+                        details={
+                            "authentication_status": "READY" if status == "CONNECTED" else status,
+                            "capacity_status": "UNKNOWN"
+                            if snapshot.total_capacity is None
+                            else "STALE"
+                            if status == "STALE"
+                            else snapshot.status,
+                            "remaining_capacity": snapshot.remaining_capacity,
+                            "total_capacity": snapshot.total_capacity,
+                            "readiness_scope": "native_cli_authentication_only",
+                        },
+                    )
+                )
+            return sorted(values, key=lambda value: value.component)
 
     @staticmethod
     def _operation_view(
@@ -2448,12 +3081,12 @@ class OperationsRepository:
                 metadata = (
                     campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
                 )
-                run = session.scalar(
-                    select(Run)
-                    .where(Run.campaign_id == campaign.id)
-                    .order_by(desc(Run.updated_at))
-                    .limit(1)
+                runs = list(
+                    session.scalars(
+                        select(Run).where(Run.campaign_id == campaign.id).order_by(Run.id).limit(2)
+                    )
                 )
+                run = runs[0] if len(runs) == 1 else None
                 workflow_id = metadata.get("workflow_id")
                 if not isinstance(workflow_id, str) or not workflow_id:
                     workflow_id = run.workflow_id if run is not None else None
@@ -2466,6 +3099,12 @@ class OperationsRepository:
                         "workflow_id": workflow_id,
                         "run_type": run.run_type if run is not None else None,
                         "run_status": run.status if run is not None else None,
+                        "run_count": len(runs),
+                        "application_run_id": str(run.id) if run is not None else None,
+                        "run_error_code": run.error_code if run is not None else None,
+                        "run_finished_at": utc_text(run.finished_at) if run is not None else None,
+                        "execution_binding": safe_execution_binding(metadata),
+                        "snapshot_token": snapshot_token(campaign, runs),
                         "blocker": metadata.get("blocker"),
                         "age_seconds": max(
                             0,
@@ -2525,41 +3164,84 @@ class OperationsRepository:
             ]
 
     async def reconcile_terminal_campaign(
-        self, campaign_id: UUID, workflow_id: str, temporal_status: str
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        temporal_status: str,
+        *,
+        expected_snapshot: str | None = None,
+        observed: dict[str, Any] | None = None,
     ) -> bool:
         return await asyncio.to_thread(
-            self._reconcile_terminal_campaign, campaign_id, workflow_id, temporal_status
+            self._reconcile_terminal_campaign,
+            campaign_id,
+            workflow_id,
+            temporal_status,
+            expected_snapshot,
+            observed,
         )
 
     def _reconcile_terminal_campaign(
-        self, campaign_id: UUID, workflow_id: str, temporal_status: str
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        temporal_status: str,
+        expected_snapshot: str | None = None,
+        observed: dict[str, Any] | None = None,
     ) -> bool:
-        terminal = {
-            "COMPLETED": "COMPLETE",
-            "FAILED": "FAILED",
-            "CANCELED": "CANCELLED",
-            "TERMINATED": "FAILED",
-            "TIMED_OUT": "FAILED",
-        }.get(temporal_status)
-        if terminal is None:
+        # Historical callers with only a workflow ID/raw status cannot authorize a write.
+        if (
+            expected_snapshot is None
+            or observed is None
+            or observed.get("status") != temporal_status
+        ):
             return False
         with self.sessions.begin() as session:
-            campaign = session.get(Campaign, campaign_id)
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+                session.execute(text("SET LOCAL lock_timeout = '1s'"))
+            campaign = session.scalar(
+                select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+            )
             if campaign is None:
                 return False
             metadata = campaign.metadata_json if isinstance(campaign.metadata_json, dict) else {}
-            run = session.scalar(
-                select(Run)
-                .where(Run.campaign_id == campaign_id, Run.workflow_id == workflow_id)
-                .limit(1)
+            runs = list(
+                session.scalars(
+                    select(Run)
+                    .where(Run.campaign_id == campaign_id)
+                    .order_by(Run.id)
+                    .limit(2)
+                    .with_for_update()
+                )
             )
+            if len(runs) != 1 or snapshot_token(campaign, runs) != expected_snapshot:
+                raise ValueError("campaign reconciliation snapshot changed")
+            run = runs[0]
             bound_workflow = metadata.get("workflow_id") or (run.workflow_id if run else None)
-            if bound_workflow != workflow_id:
+            if bound_workflow != workflow_id or run.workflow_id != workflow_id:
                 raise ValueError("campaign workflow binding changed during reconciliation")
-            changed = campaign.status != terminal
-            campaign.status = terminal
-            if run is not None:
-                changed = changed or run.status != terminal
-                run.status = terminal
-                run.finished_at = run.finished_at or datetime.now(UTC)
-            return changed
+            candidate = {
+                "campaign_id": str(campaign_id),
+                "workflow_id": workflow_id,
+                "status": campaign.status,
+                "run_status": run.status,
+                "run_count": 1,
+                "application_run_id": str(run.id),
+                "run_error_code": run.error_code,
+                "run_finished_at": utc_text(run.finished_at),
+                "execution_binding": safe_execution_binding(metadata),
+            }
+            decision = decide_reconciliation(candidate, observed)
+            if decision.classification != "TERMINAL_REPAIR_AVAILABLE":
+                return False
+            assert (
+                decision.target_campaign_status is not None
+                and decision.target_run_status is not None
+            )
+            campaign.status = decision.target_campaign_status
+            run.status = decision.target_run_status
+            # Orchestration close time is not a business completion timestamp.
+            # Keep the actual persisted finished_at (including None) unchanged.
+            return True

@@ -11,12 +11,16 @@ from temporalio.client import (
     ScheduleOverlapPolicy,
     SchedulePolicy,
     ScheduleSpec,
+    ScheduleState,
     ScheduleUpdate,
 )
 from temporalio.service import RPCError, RPCStatusCode
 
 from engineering_control.config import get_settings
 from engineering_control.logging import configure_logging
+from engineering_control.operations.connection_status import (
+    PROVIDER_REFRESH_EXECUTION_TIMEOUT_SECONDS,
+)
 from engineering_control.workflows.inputs import (
     CleanupInput,
     ConnectionsRefreshInput,
@@ -39,9 +43,11 @@ def schedules(task_queue: str, *, cleanup_execution_enabled: bool = False) -> di
                 QuotaRefreshInput(),
                 id="quota-refresh-scheduled",
                 task_queue=task_queue,
+                execution_timeout=timedelta(seconds=PROVIDER_REFRESH_EXECUTION_TIMEOUT_SECONDS),
             ),
             spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=QUOTA_REFRESH_INTERVAL)]),
-            policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP, pause_on_failure=True),
+            policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP, pause_on_failure=False),
+            state=ScheduleState(paused=False, note="managed provider readiness refresh"),
         ),
         "engineering-connections-refresh": Schedule(
             action=ScheduleActionStartWorkflow(

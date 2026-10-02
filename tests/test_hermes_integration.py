@@ -2,14 +2,36 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+import yaml
 
 
-def load_handler() -> ModuleType:
+@pytest.fixture(autouse=True)
+def deny_hermes_hook_network_egress(monkeypatch: pytest.MonkeyPatch) -> Any:
+    attempted: list[str] = []
+
+    def deny_urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        attempted.append("urllib.request.urlopen")
+        raise AssertionError("Hermes integration test attempted network access")
+
+    def deny_socket(*_args: Any, **_kwargs: Any) -> Any:
+        attempted.append("socket connection")
+        raise AssertionError("Hermes integration test attempted socket access")
+
+    monkeypatch.setattr("urllib.request.urlopen", deny_urlopen)
+    monkeypatch.setattr("socket.create_connection", deny_socket)
+    monkeypatch.setattr("socket.socket.connect", deny_socket)
+    yield
+    assert attempted == []
+
+
+def load_handler(*, replace_gateway_event: bool = True) -> ModuleType:
     path = (
         Path(__file__).parents[1]
         / "integrations"
@@ -20,7 +42,51 @@ def load_handler() -> ModuleType:
     spec = importlib.util.spec_from_file_location("engineering_control_hermes_hook", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "ENGINEERING_API_URL": "http://127.0.0.1:9",
+                "ENGINEERING_API_TOKEN_FILE": "/nonexistent/engineering-control-test-token",
+            },
+            clear=True,
+        ),
+        patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("Hermes hook import attempted network access"),
+        ),
+    ):
+        spec.loader.exec_module(module)
+    gateway_events: list[dict[str, Any]] = []
+
+    def record_gateway_event(
+        event_type: str,
+        command: str,
+        *,
+        raw_args: str = "",
+        result: Any = None,
+        outcome: str | None = None,
+    ) -> None:
+        gateway_events.append(
+            {
+                "event_type": event_type,
+                "command": command,
+                "raw_args": raw_args,
+                "result": result,
+                "outcome": outcome,
+            }
+        )
+
+    # The hook's default event sink targets the installed live gateway. Tests load
+    # the hook from source, so they must replace that sink before invoking handle().
+    # Keeping events in memory preserves behavioral assertions without allowing a
+    # unit test to read the installed API token or contact a shared service.
+    if replace_gateway_event:
+        module._gateway_event = record_gateway_event
+    module._test_gateway_events = gateway_events
+    assert module.API_URL == "http://127.0.0.1:9"
+    assert str(module.TOKEN_FILE) == "/nonexistent/engineering-control-test-token"
+    assert not module.TOKEN_FILE.exists()
     return module
 
 
@@ -68,6 +134,17 @@ def test_non_telegram_command_is_denied() -> None:
     }
 
 
+def test_hook_manifest_owns_exact_typed_command_catalog() -> None:
+    path = Path(__file__).parents[1] / "integrations/hermes-engineering-control/hook/HOOK.yaml"
+    manifest = yaml.safe_load(path.read_text())
+    routes = manifest["command_routes"]
+    assert len(routes) == len(set(routes))
+    assert set(routes) == load_handler().COMMANDS
+    assert manifest["execution"] == "threaded"
+    assert manifest["command_delivery"] == "durable"
+    assert set(manifest["events"]) >= {"command:*", "command-reply:completed"}
+
+
 def test_authorized_command_records_telegram_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = load_handler()
     observed: dict[str, Any] = {}
@@ -88,10 +165,77 @@ def test_authorized_command_records_telegram_actor(monkeypatch: pytest.MonkeyPat
 
 
 def test_unknown_command_is_denied() -> None:
-    assert load_handler().handle("command:help", {}) == {
+    handler = load_handler()
+    assert handler.handle("command:help", {}) == {
         "decision": "deny",
         "message": "Unknown engineering command denied.",
     }
+    assert handler._test_gateway_events == [
+        {
+            "event_type": "telegram.command_rejected",
+            "command": "unknown",
+            "raw_args": "",
+            "result": None,
+            "outcome": "UNKNOWN_COMMAND",
+        }
+    ]
+
+
+def test_gateway_event_persists_minimized_payload_without_loading_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = load_handler(replace_gateway_event=False)
+    handler.TOKEN_FILE = tmp_path / "absent-token"
+    captured: dict[str, Any] = {}
+
+    class Outbox:
+        def enqueue(self, identity: str, payload: dict[str, Any]) -> None:
+            captured.update(identity=identity, payload=payload)
+
+    handler.bind_event_outbox(Outbox())
+    correlation = "711efd27-79e1-45af-92ee-3f7790c1e8ba"
+    token = handler._RECEIPT_CONTEXT.set(
+        {"platform_update_id": 42, "delivery_correlation_id": correlation}
+    )
+    try:
+        handler._gateway_event(
+            "engineering.api_response_completed",
+            "status",
+            raw_args="musematic 1119 staging ignored-extra-data",
+            result={"workflow_id": "synthetic-workflow-123", "secret": "must-not-leave-memory"},
+            outcome="COMPLETED",
+        )
+    finally:
+        handler._RECEIPT_CONTEXT.reset(token)
+    assert captured["identity"] == correlation + ":engineering.api_response_completed"
+    assert captured["payload"] == {
+        "event_type": "engineering.api_response_completed",
+        "command": "status",
+        "outcome": "COMPLETED",
+        "project": "musematic",
+        "issue_number": 1119,
+        "mode": "staging",
+        "workflow_id": "synthetic-workflow-123",
+        "platform_update_id": 42,
+        "delivery_correlation_id": correlation,
+        "delivery_status": None,
+        "acknowledged_message_ids": [],
+    }
+    assert "must-not-leave-memory" not in json.dumps(captured)
+
+
+def test_missing_outbox_denies_before_config_or_network_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = load_handler(replace_gateway_event=False)
+    handler.TOKEN_FILE = tmp_path / "absent-token"
+    monkeypatch.setattr(
+        handler, "_read_protected", lambda *_args: pytest.fail("no config fallback")
+    )
+    with pytest.raises(RuntimeError, match="durable gateway event storage"):
+        handler.handle("command:help", {})
 
 
 def test_validate_command_starts_only_bounded_synthetic_lifecycle(

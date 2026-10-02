@@ -4,24 +4,13 @@ from typing import Any
 
 import pytest
 
+from engineering_control.adapters.auth_probe import AuthProbeResult
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
 from engineering_control.adapters.process import (
     run_jsonl_process,
     subscription_only_environment,
 )
-
-
-class _FakeProcess:
-    def __init__(self, stdout: bytes = b"") -> None:
-        self.returncode = 0
-        self.stdout = stdout
-
-    async def wait(self) -> int:
-        return 0
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        return self.stdout, b""
 
 
 def test_subscription_environment_removes_api_paid_credentials(
@@ -79,25 +68,28 @@ def test_subscription_environment_rejects_every_forbidden_override() -> None:
         (ClaudeCLIAdapter(), b'{"loggedIn":true}'),
     ),
 )
-async def test_authentication_probe_removes_api_paid_credentials(
+async def test_authentication_adapter_uses_owned_probe(
     adapter: CodexCLIAdapter | ClaudeCLIAdapter,
     stdout: bytes,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _FakeProcess:
+    async def fake_probe(command: list[str], **kwargs: Any) -> AuthProbeResult:
+        captured["command"] = command
         captured.update(kwargs)
-        return _FakeProcess(stdout)
+        return AuthProbeResult(0, stdout)
 
-    monkeypatch.setenv("OPENAI_API_KEY", "fake")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    module = type(adapter).__module__
+    monkeypatch.setattr(f"{module}.run_auth_probe", fake_probe)
 
     assert await adapter.authenticated() is True
-    environment = captured["env"]
-    assert "OPENAI_API_KEY" not in environment
-    assert "ANTHROPIC_API_KEY" not in environment
+    assert captured["provider"] == adapter.provider.value
+    assert captured["command"] == [
+        adapter.executable,
+        "auth" if adapter.provider.value == "claude" else "login",
+        "status",
+    ]
 
 
 @pytest.mark.asyncio

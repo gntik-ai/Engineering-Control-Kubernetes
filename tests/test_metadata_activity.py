@@ -28,6 +28,7 @@ from engineering_control.db.models import (
     FindingVerification,
     Incident,
     Issue,
+    NotificationOutbox,
     QuotaSnapshot,
     Run,
     WorktreeLease,
@@ -98,6 +99,55 @@ def audit_cell() -> dict[str, str]:
         "lens": "correctness",
         "environment": "snapshot",
     }
+
+
+def add_changeset_finding(handler: MetadataActivityHandler, change_set_id: UUID) -> None:
+    """Give standalone staging fixtures the real finding their ChangeSet references."""
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        project = change_set.project
+    campaign = add_campaign(handler, project)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        assert change_set is not None
+        coverage = CoverageCell(
+            id=uuid4(),
+            campaign_id=campaign.id,
+            domain="api",
+            persona="operator",
+            lens="correctness",
+            environment="staging",
+            status="CONFIRMED_FINDING",
+            evidence_json=[],
+            result_json={},
+        )
+        session.add(coverage)
+        session.flush()
+        session.add(
+            Finding(
+                id=change_set.finding_id,
+                campaign_id=campaign.id,
+                coverage_cell_id=coverage.id,
+                fingerprint=uuid4().hex * 2,
+                project=project,
+                domain="api",
+                persona="operator",
+                severity="medium",
+                confidence=0.9,
+                risk_class=change_set.risk_class,
+                disposition="CONFIRMED",
+                expected_behavior="fixture contract",
+                actual_behavior="fixture mismatch",
+                evidence_json=[],
+                minimal_reproduction=["fixture only"],
+                affected_source_sha=change_set.source_base_sha,
+                affected_deployment_sha=change_set.deployment_base_sha,
+                affected_component="api",
+                impact_json={},
+                recommended_action="fixture repair",
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -936,6 +986,7 @@ configuration: {}
     with handler.sessions.begin() as session:
         session.add_all([change_set, run])
 
+    add_changeset_finding(handler, change_set_id)
     result = await handler.handle(
         "staging.prepare",
         {
@@ -1231,6 +1282,7 @@ configuration:
     with handler.sessions.begin() as session:
         session.add_all([change_set, run, lease])
 
+    add_changeset_finding(handler, change_set_id)
     prepared = await handler.handle(
         "staging.prepare",
         {
@@ -1397,6 +1449,7 @@ configuration:
             )
         )
 
+    add_changeset_finding(handler, change_set_id)
     result = await handler.handle(
         "staging.prepare",
         {
@@ -2018,6 +2071,43 @@ async def test_cleanup_authorizes_only_terminal_retained_worktree_lease(
             assert f"{lease_id}: Permission denied" in (cleanup_run.summary or "")
         else:
             assert cleanup_run.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_blocked_enqueues_one_idempotent_failure_notification(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'cleanup-blocked.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    workflow_id = "cleanup-blocked-notification-test"
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=uuid4(),
+                change_set_id=None,
+                workflow_id=workflow_id,
+                run_type="cleanup",
+                status="RUNNING",
+                project="platform",
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    payload = {
+        "orchestration": {"workflow_id": workflow_id},
+        "terminal_status": "BLOCKED",
+        "blocker": "CLEANUP_ACTIVITY_FAILED",
+    }
+    first = await handler.handle("cleanup.finalize", payload)
+    second = await handler.handle("cleanup.finalize", payload)
+    assert first["status"] == second["status"] == "BLOCKED"
+    with handler.sessions() as session:
+        rows = list(session.scalars(select(NotificationOutbox)).all())
+        run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+    assert len(rows) == 1
+    assert rows[0].topic == "telegram.engineering-cleanup-failed"
+    assert rows[0].payload_json["error_code"] == "CLEANUP_ACTIVITY_FAILED"
+    assert run is not None and run.status == "BLOCKED"
 
 
 @pytest.mark.asyncio

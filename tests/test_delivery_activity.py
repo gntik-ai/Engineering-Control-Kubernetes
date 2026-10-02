@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from publication_fixture import approved_publication
+from sqlalchemy import select
 
 import engineering_control.activities.delivery as delivery_module
 from engineering_control.activities.delivery import DeliveryActivityHandler
 from engineering_control.adapters.command import CommandResult
 from engineering_control.config import Settings
+from engineering_control.db.models import BacklogIssueRecord, ComponentLease, OperationRequest
 
 
 class FakePublicationRunner:
-    def __init__(self, branch: str, heads: dict[str, str]) -> None:
+    def __init__(
+        self, branch: str, heads: dict[str, str], *, issue_snapshot: dict[str, Any] | None = None
+    ) -> None:
         self.branch = branch
         self.heads = heads
         self.created: set[str] = set()
@@ -24,6 +31,8 @@ class FakePublicationRunner:
         self.fetched: dict[Path, str] = {}
         self.pushed_refspecs: list[str] = []
         self.fetched_heads: dict[str, str] = {}
+        self.issue_snapshot = issue_snapshot
+        self.issue_reads = 0
 
     def run(
         self,
@@ -47,6 +56,19 @@ class FakePublicationRunner:
             slug = url.rsplit("/", 2)[-2]
             self.fetched[cwd] = slug
             return CommandResult(0, "", "")
+        if executable == "gh" and arguments[:2] == ["issue", "view"]:
+            assert self.issue_snapshot is not None
+            assert arguments == [
+                "issue",
+                "view",
+                "42",
+                "--repo",
+                "gntik-ai/falcone",
+                "--json",
+                "number,url,state,title,body,updatedAt",
+            ]
+            self.issue_reads += 1
+            return CommandResult(0, json.dumps(self.issue_snapshot), "")
         if executable == "git" and "branch" in arguments:
             return CommandResult(0, self.branch + "\n", "")
         if executable == "git" and "rev-parse" in arguments:
@@ -58,9 +80,10 @@ class FakePublicationRunner:
             return CommandResult(0, "", "")
         if executable == "git" and "push" in arguments:
             url = arguments[arguments.index("--porcelain") + 1]
-            self.pushes.append(
-                url.removeprefix("https://github.com/gntik-ai/").removesuffix(".git")
-            )
+            name = url.removeprefix("https://github.com/gntik-ai/").removesuffix(".git")
+            # 2b678d9: only the exact validated head is pushed, never a symbolic HEAD.
+            assert arguments[-1] == f"{self.heads[name]}:refs/heads/{self.branch}"
+            self.pushes.append(name)
             self.pushed_refspecs.append(arguments[-1])
             environment = kwargs.get("environment")
             assert isinstance(environment, dict)
@@ -163,28 +186,35 @@ async def test_delivery_publishes_exact_heads_as_draft_prs_without_merging(
     tmp_path: Path,
 ) -> None:
     worktree_root = tmp_path / "worktrees"
-    payload, branch, heads = publication_payload(worktree_root)
-    runner = FakePublicationRunner(branch, heads)
     project_root, policy = enabled_write_policy(
         tmp_path, ("gntik-ai/falcone", "gntik-ai/falcone-charts")
     )
-    handler = DeliveryActivityHandler(
-        Settings(
+    async with approved_publication(tmp_path) as fixture:
+        runner = FakePublicationRunner(
+            fixture.branch, fixture.heads, issue_snapshot=fixture.issue_snapshot
+        )
+        settings = Settings(
+            _env_file=None,
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             github_writes_enabled=True,
             project_config_root=project_root,
             github_issue_write_validation_file=policy,
-        ),
-        runner,  # type: ignore[arg-type]
-    )
-
-    result = await handler.handle("delivery.publish", payload)
-
-    assert result["status"] == "SOURCE_PRS_CREATED"
-    assert len(result["publication_results"]) == 2
-    assert runner.pushes == ["falcone", "falcone-charts"]
-    assert all(item["draft"] is True for item in result["publication_results"])
+        )
+        with fixture.worker(runner, settings) as handler:
+            result = await handler.handle("delivery.publish", fixture.prepared)
+            assert result["status"] == "SOURCE_PRS_CREATED"
+            assert len(result["publication_results"]) == 2
+            assert runner.pushes == ["falcone", "falcone-charts"]
+            assert all(item["draft"] is True for item in result["publication_results"])
+            assert runner.issue_reads == 4
+            assert len(fixture.receipts()) == 4
+            assert all(row["status"] == "COMPLETE" for row in fixture.receipts())
+            again = await handler.handle("delivery.publish", fixture.prepared)
+            assert again["status"] == "SOURCE_PRS_CREATED"
+            assert runner.pushes == ["falcone", "falcone-charts"]
+            assert len(runner.created) == 2
+        assert not (tmp_path / "publication-fixture.token").exists()
 
 
 @pytest.mark.asyncio
@@ -245,34 +275,113 @@ async def test_delivery_write_policy_blocks_before_git_push(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_source_only_publication_binds_deferred_deployment(tmp_path: Path) -> None:
     worktree_root = tmp_path / "worktrees"
-    payload, branch, heads = publication_payload(worktree_root)
-    plan = payload["publication_plan"]
-    deployment = plan["publications"].pop()
-    plan["deferred_deployment"] = {
-        "repository_slug": "falcone-charts",
-        "branch": branch,
-        "head_sha": deployment["head_sha"],
-        "base_sha": deployment["head_sha"],
-        "reason": "AWAITING_IMMUTABLE_ARTIFACT",
-    }
-    runner = FakePublicationRunner(branch, heads)
     project_root, policy = enabled_write_policy(tmp_path, ("gntik-ai/falcone",))
-    handler = DeliveryActivityHandler(
-        Settings(
+    async with approved_publication(tmp_path, deployment_changed=False) as fixture:
+        runner = FakePublicationRunner(
+            fixture.branch, fixture.heads, issue_snapshot=fixture.issue_snapshot
+        )
+        settings = Settings(
+            _env_file=None,
             worktree_root=worktree_root,
             run_root=tmp_path / "runs",
             github_writes_enabled=True,
             project_config_root=project_root,
             github_issue_write_validation_file=policy,
-        ),
-        runner,  # type: ignore[arg-type]
+        )
+        with fixture.worker(runner, settings) as handler:
+            result = await handler.handle("delivery.publish", fixture.prepared)
+        assert result["status"] == "SOURCE_PRS_CREATED"
+        assert [item["repository_slug"] for item in result["publication_results"]] == ["falcone"]
+        assert runner.pushes == ["falcone"]
+        assert runner.created == {"gntik-ai/falcone"}
+        assert runner.issue_reads == 2
+        assert len(fixture.receipts()) == 2
+        assert all(row["status"] == "COMPLETE" for row in fixture.receipts())
+        assert (
+            result["publication_plan"]["deferred_deployment"]["reason"]
+            == "AWAITING_IMMUTABLE_ARTIFACT"
+        )
+        assert not (tmp_path / "publication-fixture.token").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "missing_intent",
+        "database_revision",
+        "remote_revision",
+        "workflow_run",
+        "lease",
+        "operation",
+        "plan",
+    ],
+)
+async def test_approved_publication_rechecks_authority_before_any_effect(
+    tmp_path: Path, changed: str
+) -> None:
+    project_root, policy = enabled_write_policy(
+        tmp_path, ("gntik-ai/falcone", "gntik-ai/falcone-charts")
     )
+    async with approved_publication(tmp_path) as fixture:
+        payload = deepcopy(fixture.prepared)
+        snapshot = deepcopy(fixture.issue_snapshot)
+        if changed == "missing_intent":
+            payload.pop("publication_intent")
+        elif changed == "remote_revision":
+            snapshot["body"] = "A different inert issue revision."
+        elif changed == "workflow_run":
+            payload["orchestration"]["workflow_run_id"] = str(uuid4())
+        elif changed == "plan":
+            payload["publication_plan"]["publications"][0]["body"] += " Changed after approval."
+        else:
+            with fixture.metadata.sessions.begin() as session:
+                if changed == "database_revision":
+                    session.scalar(select(BacklogIssueRecord)).body_sha256 = "9" * 64
+                elif changed == "lease":
+                    session.get(ComponentLease, UUID(payload["component_lease_id"])).expires_at = (
+                        datetime.now(UTC) - timedelta(seconds=1)
+                    )
+                elif changed == "operation":
+                    session.scalar(select(OperationRequest)).status = "BLOCKED"
+        runner = FakePublicationRunner(fixture.branch, fixture.heads, issue_snapshot=snapshot)
+        settings = Settings(
+            _env_file=None,
+            worktree_root=tmp_path / "worktrees",
+            run_root=tmp_path / "runs",
+            github_writes_enabled=True,
+            project_config_root=project_root,
+            github_issue_write_validation_file=policy,
+        )
+        with fixture.worker(runner, settings) as handler:
+            result = await handler.handle("delivery.publish", payload)
+        assert result["status"] == "BLOCKED"
+        assert result["blocker"] == "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED"
+        assert runner.pushes == [] and runner.created == set()
+        assert fixture.receipts() == []
+        assert not (tmp_path / "publication-fixture.token").exists()
 
-    result = await handler.handle("delivery.publish", payload)
 
-    assert result["status"] == "SOURCE_PRS_CREATED"
-    assert [item["repository_slug"] for item in result["publication_results"]] == ["falcone"]
-    assert runner.pushes == ["falcone"]
+class _PassThroughAuthority:
+    """Publication-authority double for the NEW-61/NEW-103 transport tests.
+
+    Merged with 2b678d9: every publish effect runs under durable publication custody.
+    These tests exercise the transport paths, so the double admits each effect and
+    records it; the real authority is covered by the approved_publication tests.
+    """
+
+    def __init__(self) -> None:
+        self.effects: list[tuple[str, str]] = []
+
+    def execute(self, *, payload: Any, plan: Any, repository: str, action: str, operation: Any):
+        assert payload.get("publication_intent")
+        self.effects.append((repository, action))
+        return operation()
+
+
+def _with_intent(payload: dict[str, Any]) -> dict[str, Any]:
+    payload["publication_intent"] = {"intent_id": "fixture-intent"}
+    return payload
 
 
 def _controller_publisher(
@@ -291,7 +400,11 @@ def _controller_publisher(
         "github_issue_write_validation_file": policy,
     }
     values.update(overrides)
-    return DeliveryActivityHandler(Settings(**values), runner)  # type: ignore[arg-type]
+    return DeliveryActivityHandler(
+        Settings(**values),
+        runner,  # type: ignore[arg-type]
+        publication_authority=_PassThroughAuthority(),  # type: ignore[arg-type]
+    )
 
 
 def _remove_local_worktrees(payload: dict[str, Any]) -> None:
@@ -305,6 +418,7 @@ async def test_controller_publish_fetches_the_validated_branch_from_the_worker(
     tmp_path: Path,
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
+    _with_intent(payload)
     _remove_local_worktrees(payload)
     change_set_id = payload["publication_plan"]["change_set_id"]
     (tmp_path / "mirrors/falcone.git/objects").mkdir(parents=True)
@@ -335,6 +449,7 @@ async def test_controller_publish_borrows_objects_from_the_canonical_mirror(
     tmp_path: Path,
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
+    _with_intent(payload)
     (tmp_path / "mirrors/falcone.git/objects").mkdir(parents=True)
     runner = FakePublicationRunner(branch, heads)
     environments: list[dict[str, str]] = []
@@ -363,6 +478,7 @@ async def test_controller_publish_fails_closed_when_the_fetched_head_differs(
     tmp_path: Path,
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
+    _with_intent(payload)
     runner = FakePublicationRunner(branch, heads)
     runner.fetched_heads["falcone"] = "c" * 40
     handler = _controller_publisher(tmp_path, runner)
@@ -381,6 +497,7 @@ async def test_controller_publish_derives_the_metadata_path_from_settings_only(
     tmp_path: Path,
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
+    _with_intent(payload)
     runner = FakePublicationRunner(branch, heads)
     handler = _controller_publisher(tmp_path, runner)
     # A payload naming any other working directory is refused before any fetch.
@@ -414,6 +531,7 @@ async def test_local_worktree_publication_remains_available_behind_the_setting(
     tmp_path: Path,
 ) -> None:
     payload, branch, heads = publication_payload(tmp_path / "worktrees")
+    _with_intent(payload)
     runner = FakePublicationRunner(branch, heads)
     handler = _controller_publisher(tmp_path, runner, publication_fetch_from_worker=False)
 
@@ -421,7 +539,10 @@ async def test_local_worktree_publication_remains_available_behind_the_setting(
 
     assert result["status"] == "SOURCE_PRS_CREATED"
     assert runner.fetches == []
-    assert runner.pushed_refspecs == [f"HEAD:refs/heads/{branch}"] * 2
+    # Merged with 2b678d9: the local path also pushes the exact validated head.
+    assert sorted(runner.pushed_refspecs) == sorted(
+        f"{head}:refs/heads/{branch}" for head in heads.values()
+    )
 
 
 @pytest.mark.asyncio
@@ -603,6 +724,7 @@ async def test_a_merged_source_branch_is_never_republished(tmp_path: Path, same_
     # NEW-103: a deployment-PR CI repair re-publishes a ChangeSet whose source PR merged.
     worktree_root = tmp_path / "worktrees"
     payload, branch, heads = publication_payload(worktree_root)
+    _with_intent(payload)
     runner = MergedSourceRunner(branch, heads, heads["falcone"] if same_head else "9" * 40)
     project_root, policy = enabled_write_policy(
         tmp_path, ("gntik-ai/falcone", "gntik-ai/falcone-charts")
@@ -616,6 +738,7 @@ async def test_a_merged_source_branch_is_never_republished(tmp_path: Path, same_
             github_issue_write_validation_file=policy,
         ),
         runner,  # type: ignore[arg-type]
+        publication_authority=_PassThroughAuthority(),  # type: ignore[arg-type]
     )
 
     result = await handler.handle("delivery.publish", payload)

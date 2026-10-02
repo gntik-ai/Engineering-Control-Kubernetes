@@ -22,6 +22,7 @@ PASSWORD_MIN_LENGTH = 14
 PASSWORD_MAX_LENGTH = 128
 SESSION_COOKIE = "engineering_dashboard_session"
 LOGIN_CSRF_COOKIE = "engineering_dashboard_login_csrf"
+SESSION_CLOCK_SKEW_SECONDS = 60
 
 
 class PasswordService:
@@ -96,7 +97,12 @@ class SignedSessionManager:
             csrf = str(payload["csrf"])
         except (KeyError, TypeError, ValueError):
             return None
-        if version < 1 or issued > current + 60 or expires <= current or expires <= issued:
+        if (
+            version < 1
+            or issued > current + SESSION_CLOCK_SKEW_SECONDS
+            or expires <= current
+            or expires <= issued
+        ):
             return None
         if expires - issued > self.lifetime_seconds or len(csrf) < 20:
             return None
@@ -116,7 +122,7 @@ class SignedSessionManager:
             nonce = str(payload["nonce"])
         except (KeyError, TypeError, ValueError):
             return False
-        return current - 900 <= issued <= current + 60 and len(nonce) >= 20
+        return current - 900 <= issued <= current + SESSION_CLOCK_SKEW_SECONDS and len(nonce) >= 20
 
     def binding_digest(self, token: str) -> str:
         """Return a non-reversible session binding without persisting cookie material."""

@@ -29,7 +29,9 @@ class SmokeHandler(BaseHTTPRequestHandler):
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run credential-free Playwright runtime checks")
-    parser.add_argument("--browser-root", type=Path, default=Path("/opt/engineering-browser"))
+    parser.add_argument(
+        "--browser-root", type=Path, default=Path("/opt/engineering-browser/runtime")
+    )
     parser.add_argument("--temp-root", type=Path, default=Path("/srv/engineering/tmp/browser"))
     parser.add_argument("--node", type=Path, default=Path("/usr/local/bin/node"))
     parser.add_argument(

@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 from temporalio.client import Client
 from temporalio.service import RPCError, RPCStatusCode
 
+from engineering_control.api.admission import MaintenanceAdmission
 from engineering_control.api.auth import bearer_auth
 from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
@@ -21,6 +25,7 @@ from engineering_control.api.schemas import (
     BacklogImportAccepted,
     BacklogIssueAction,
     BacklogOwnershipReleaseRequest,
+    CampaignReconciliationApply,
     CampaignStart,
     ChangeRequestAccepted,
     ChangeRequestApproval,
@@ -67,11 +72,17 @@ from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project, RiskClass
 from engineering_control.observability.agent import (
     AgentObservabilityRepository,
+    GatewayEventConflict,
     GatewayEventInput,
 )
 from engineering_control.observability.metrics import ControlPlaneMetrics
+from engineering_control.operations.connection_status import provider_observation_current
+from engineering_control.operations.issue_start import IssueStartUnconfirmedError
 from engineering_control.operations.models import parse_command
+from engineering_control.operations.reconciliation import decide_reconciliation, observation_token
+from engineering_control.operations.recurring_reconciliation import RecurringRunReconciler
 from engineering_control.operations.repository import OperationsRepository
+from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
 
 
@@ -87,6 +98,7 @@ def create_app(
     change_request_repository: ChangeRequestRepository | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
+    admission_mode = resolved.api_admission_mode
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -121,6 +133,10 @@ def create_app(
                 export_retention_days=resolved.dashboard_operation_export_retention_days,
                 export_max_bytes=resolved.dashboard_operation_export_max_bytes,
                 project_config_root=resolved.project_config_root,
+                projection_reconciliation_enabled=resolved.projection_reconciliation_enabled,
+                projection_reconciliation_interval_seconds=resolved.projection_reconciliation_interval_seconds,
+                projection_reconciliation_cycle_seconds=resolved.projection_reconciliation_cycle_seconds,
+                projection_reconciliation_max_sweep_age_seconds=resolved.projection_reconciliation_max_sweep_age_seconds,
             )
         app.state.operations_repository = resolved_operations
         resolved_bus = command_bus
@@ -129,7 +145,11 @@ def create_app(
                 cast(ControlService, app.state.control_service),
                 resolved_repository,
                 resolved_operations,
+                diagnostics_only=admission_mode == "diagnostics-only",
             )
+        if resolved_bus is not None:
+            # The startup boundary also applies to an explicitly supplied bus.
+            resolved_bus.diagnostics_only = admission_mode == "diagnostics-only"
         app.state.command_bus = resolved_bus
         resolved_change_requests = change_request_repository
         if resolved_change_requests is None and service is None:
@@ -138,21 +158,49 @@ def create_app(
             )
         app.state.change_request_repository = resolved_change_requests
         stop = asyncio.Event()
+        reconciler = None
+        if resolved.projection_reconciliation_enabled and admission_mode in {
+            "normal",
+            "diagnostics-only",
+        }:
+            if resolved_operations is None:
+                raise RuntimeError("enabled reconciliation requires an operations repository")
+            reconciler = RecurringRunReconciler(
+                app.state.control_service,
+                resolved_operations,
+                resolved.temporal_namespace,
+                interval_seconds=resolved.projection_reconciliation_interval_seconds,
+                batch_size=resolved.projection_reconciliation_batch_size,
+                cycle_seconds=resolved.projection_reconciliation_cycle_seconds,
+                max_sweep_age_seconds=resolved.projection_reconciliation_max_sweep_age_seconds,
+            )
         dispatcher = (
             asyncio.create_task(operation_dispatch_loop(resolved_bus, stop))
-            if resolved_bus is not None
+            if resolved_bus is not None and admission_mode in {"normal", "diagnostics-only"}
             else None
         )
-        yield
-        stop.set()
-        if dispatcher is not None:
-            await dispatcher
-        if gateway_repository is None:
-            cast(AgentObservabilityRepository, app.state.gateway_repository).engine.dispose()
-        if operations_repository is None and resolved_operations is not None:
-            resolved_operations.engine.dispose()
-        if change_request_repository is None and resolved_change_requests is not None:
-            resolved_change_requests.engine.dispose()
+        app.state.operation_dispatcher = dispatcher
+        reconciliation = (
+            asyncio.create_task(reconciler.serve(stop), name="projection-reconciliation")
+            if reconciler is not None
+            else None
+        )
+        app.state.projection_reconciler = reconciliation
+        try:
+            yield
+        finally:
+            stop.set()
+            # Every SQL operation is joined before the reconciler releases its
+            # leadership lock; engines remain alive until all owned tasks stop.
+            tasks = [task for task in (dispatcher, reconciliation) if task is not None]
+            if tasks:
+                await asyncio.gather(*tasks)
+            if gateway_repository is None:
+                cast(AgentObservabilityRepository, app.state.gateway_repository).engine.dispose()
+            if operations_repository is None and resolved_operations is not None:
+                resolved_operations.engine.dispose()
+            if change_request_repository is None and resolved_change_requests is not None:
+                resolved_change_requests.engine.dispose()
 
     app = FastAPI(
         title="Engineering Control API",
@@ -165,6 +213,42 @@ def create_app(
     expected_token = token if token is not None else resolved.read_api_token()
     authenticated = bearer_auth(expected_token)
     auth_dependency = Depends(authenticated)
+    app.add_middleware(MaintenanceAdmission, mode=admission_mode, authenticate=authenticated)
+
+    @app.exception_handler(IssueStartUnconfirmedError)
+    async def issue_start_unconfirmed(
+        _request: Request, error: IssueStartUnconfirmedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "START_UNCONFIRMED",
+                "operation_id": str(error.operation_id),
+                "expected_workflow_id": error.workflow_id,
+                "detail": (
+                    "Start acknowledgement is unconfirmed; preserve this operation and inspect "
+                    "its status. Do not start a replacement issue run."
+                ),
+            },
+        )
+
+    @app.exception_handler(RecordedRunStartUnconfirmedError)
+    async def recorded_run_start_unconfirmed(
+        _request: Request, error: RecordedRunStartUnconfirmedError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            headers={"Cache-Control": "no-store"},
+            content={
+                "status": "START_UNCONFIRMED",
+                "application_run_id": str(error.application_run_id),
+                "expected_workflow_id": error.workflow_id,
+                "detail": (
+                    "Start acknowledgement is unconfirmed; preserve this Run and inspect "
+                    "its status. Do not start a replacement workflow."
+                ),
+            },
+        )
 
     def control(request: Request) -> ControlService:
         return cast(ControlService, request.app.state.control_service)
@@ -258,11 +342,32 @@ def create_app(
     async def live() -> dict[str, str]:
         return {"status": "ok"}
 
+    def admission_snapshot(request: Request) -> dict[str, str | bool]:
+        dispatcher = request.app.state.operation_dispatcher
+        return {
+            "scope": "private-api-only",
+            "mode": admission_mode,
+            "pending_operation_dispatcher_running": dispatcher is not None
+            and not dispatcher.done(),
+        }
+
+    @app.get("/v1/admission")
+    async def admission_get(
+        request: Request,
+        _subject: str = auth_dependency,
+    ) -> dict[str, str | bool]:
+        return admission_snapshot(request)
+
     @app.get("/health/ready")
-    async def ready(request: Request) -> dict[str, str]:
+    async def ready(request: Request) -> JSONResponse:
         if not hasattr(request.app.state, "control_service"):
             raise HTTPException(status_code=503, detail="control service unavailable")
-        return {"status": "ready"}
+        # Value-free process state on the existing private health surface, not
+        # approval or project readiness. The dashboard never needs the API token.
+        return JSONResponse(
+            {"status": "ready", "admission": admission_snapshot(request)},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/v1/readiness/{scope}")
     async def readiness_get(
@@ -316,14 +421,29 @@ def create_app(
     ) -> dict[str, Any]:
         return await repository.operator_snapshot("temporal")
 
+    @app.get("/v1/campaigns/reconcile")
     @app.post("/v1/campaigns/reconcile")
     async def campaigns_reconcile(
+        request: Request,
+        confirmation: CampaignReconciliationApply | None = None,
         limit: int = Query(default=100, ge=1, le=200),
         offset: int = Query(default=0, ge=0, le=10_000),
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
         repository: OperationsRepository = operations_dependency,
     ) -> dict[str, Any]:
+        if request.method == "POST" and confirmation is None:
+            raise HTTPException(
+                status_code=400, detail="Preview and confirm exact reconciliation rows first"
+            )
+        selected = (
+            {
+                str(row.campaign_id): (row.snapshot_token, row.observation_token)
+                for row in confirmation.rows
+            }
+            if request.method == "POST" and confirmation is not None
+            else {}
+        )
         results: list[dict[str, Any]] = []
         terminal = {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
         awaiting = {"AWAITING_APPROVAL", "AWAITING_HUMAN", "PAUSED"}
@@ -368,9 +488,13 @@ def create_app(
             for candidate in candidates
             if isinstance((workflow_id := candidate.get("workflow_id")), str)
         }
+        deadline = asyncio.get_running_loop().time() + 20
         for workflow_id in workflow_ids:
             try:
-                observed_by_workflow[workflow_id] = await service.get_workflow(workflow_id)
+                async with asyncio.timeout_at(deadline):
+                    observed_by_workflow[
+                        workflow_id
+                    ] = await service.get_reconciliation_observation(workflow_id)
             except RPCError as error:
                 if error.status == RPCStatusCode.NOT_FOUND:
                     missing_workflows.add(workflow_id)
@@ -419,16 +543,40 @@ def create_app(
             if workflow_binding_counts.get(workflow_id, 0) > 1:
                 changed = False
                 classification = "INCONSISTENT_STATE"
-            elif temporal_status in terminal and not projected_terminal:
-                try:
-                    changed = await repository.reconcile_terminal_campaign(
-                        UUID(str(candidate["campaign_id"])), workflow_id, temporal_status
-                    )
-                except ValueError:
-                    changed = False
-                    classification = "INCONSISTENT_STATE"
-                else:
-                    classification = "TERMINAL_NOT_RECONCILED"
+            elif temporal_status in terminal:
+                decision = decide_reconciliation(candidate, observed)
+                changed = False
+                classification = decision.classification
+                campaign_key = str(candidate["campaign_id"])
+                if campaign_key in selected:
+                    if selected[campaign_key] != (
+                        candidate.get("snapshot_token"),
+                        observation_token(observed),
+                    ):
+                        classification = "PREVIEW_STALE"
+                    elif decision.classification == "TERMINAL_REPAIR_AVAILABLE":
+                        try:
+                            changed = await repository.reconcile_terminal_campaign(
+                                UUID(campaign_key),
+                                workflow_id,
+                                temporal_status,
+                                expected_snapshot=selected[campaign_key][0],
+                                observed=observed,
+                            )
+                        except ValueError:
+                            classification = "PREVIEW_STALE"
+                        except SQLAlchemyError as error:
+                            raise HTTPException(
+                                status_code=503,
+                                detail=(
+                                    "Reconciliation transaction was not accepted; "
+                                    "refresh the preview"
+                                ),
+                            ) from error
+                        else:
+                            classification = (
+                                "TERMINAL_RECONCILED" if changed else "REPAIR_NOT_APPLIED"
+                            )
             elif temporal_status in {"RUNNING", "CONTINUED_AS_NEW"} and projected_terminal:
                 changed = False
                 classification = "INCONSISTENT_STATE"
@@ -470,14 +618,19 @@ def create_app(
                 {
                     **candidate,
                     "temporal_status": temporal_status,
+                    "observation_token": observation_token(observed),
+                    "observed_run_id": observed.get("run_id"),
                     "classification": classification,
                     "projection_repaired": changed,
                 }
             )
         return {
-            "status": "COMPLETE",
+            "status": "PREVIEW" if request.method == "GET" else "RECONCILIATION_EVALUATED",
             "items": results,
             "deleted": 0,
+            "unobserved_targets": sorted(
+                set(selected) - {str(row["campaign_id"]) for row in candidates}
+            ),
             "classification_scope": {
                 "kind": "BOUNDED_PAGE",
                 "offset": offset,
@@ -1137,7 +1290,13 @@ def create_app(
         _subject: str = auth_dependency,
         service: ControlService = control_dependency,
     ) -> OperationAccepted:
-        return await service.start_delivery(body)
+        try:
+            return await service.start_delivery(body)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="delivery approval or finding target is unavailable or changed",
+            ) from error
 
     @app.post("/v1/deliveries/reconcile", response_model=OperationAccepted, status_code=202)
     async def delivery_reconcile(
@@ -1271,6 +1430,26 @@ def create_app(
                 int(value.get("running_jobs") or 0), int(provider_history["running_jobs"])
             )
             value["history"] = provider_history
+            value["raw_status"] = value["status"]
+            observed = value.get("captured_at")
+            try:
+                captured = (
+                    observed
+                    if isinstance(observed, datetime)
+                    else datetime.fromisoformat(str(observed))
+                )
+                current = provider_observation_current(captured, datetime.now(UTC))
+            except (TypeError, ValueError, OverflowError):
+                current = False
+            if provider in snapshots and not current:
+                value["status"] = "STALE"
+            value["capacity_status"] = (
+                "UNKNOWN"
+                if value.get("total_capacity") is None
+                else "STALE"
+                if not current
+                else value["raw_status"]
+            )
             response[provider] = value
         return response
 
@@ -1282,7 +1461,12 @@ def create_app(
     ) -> dict[str, object]:
         if subject != "hermes-gateway":
             raise HTTPException(status_code=403, detail="gateway event identity required")
-        return await gateway_events(request).gateway_event(subject, body)
+        try:
+            return await gateway_events(request).gateway_event(subject, body)
+        except GatewayEventConflict as error:
+            raise HTTPException(
+                status_code=409, detail="gateway event identity conflict"
+            ) from error
 
     @app.get("/v1/evidence/{artifact_id}")
     async def evidence_get(

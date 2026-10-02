@@ -1286,6 +1286,10 @@ def test_source_pr_runtime_proof_waiver_is_per_issue_and_revalidates_source_firs
         project_config_root=ROOT / "config/projects",
     )
     handler = EngineeringActivityHandler(settings)
+    # Merged with 2b678d9: a direct issue gate first re-verifies its durable issue
+    # operation (covered by the issue-approval tests); this NEW-88 case exercises only
+    # the runtime-proof waiver, so that check admits the fixture.
+    handler._require_direct_issue_operation = lambda _session, _payload: None  # type: ignore[method-assign]
     item = {
         "repository": "gntik-ai/falcone-charts",
         "issue_number": 46,

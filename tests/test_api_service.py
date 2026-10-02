@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -52,7 +53,7 @@ class _Client:
 
 
 class _StartedHandle:
-    first_execution_run_id = "started-run-id"
+    first_execution_run_id = "11111111-1111-4111-8111-111111111111"
 
 
 class _StartClient:
@@ -85,10 +86,21 @@ class _MultiProjectRepository(EmptyMetadataRepository):
         workflow_id: str,
         campaigns: dict[Any, tuple[Any, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
+        assert application_run_id is not None
+        self.application_run_id = application_run_id
         self.parent_workflow_id = workflow_id
         self.campaigns = campaigns
         self.request = request
+
+    async def bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        assert application_run_id == self.application_run_id
+        assert workflow_id == self.parent_workflow_id
+        assert first_run_id == _StartedHandle.first_execution_run_id
 
 
 @pytest.mark.asyncio
@@ -139,7 +151,7 @@ async def test_acceptance_service_binds_private_activity_and_control_queues() ->
         "/home/hermes/engineering-bootstrap/acceptance-runs/bounded",
     )
 
-    assert accepted.run_id == "started-run-id"
+    assert accepted.run_id == _StartedHandle.first_execution_run_id
     assert client.task_queue == "engineering-acceptance-control-validation-bounded"
     assert client.workflow_input.activity_task_queue == activity_queue
 
@@ -158,7 +170,7 @@ async def test_observability_acceptance_binds_native_canary_to_control_queue() -
     )
 
     assert accepted.workflow_id.startswith("observability-acceptance-")
-    assert accepted.run_id == "started-run-id"
+    assert accepted.run_id == _StartedHandle.first_execution_run_id
     assert client.task_queue == "engineering-control"
     assert client.workflow_input.workspace_id in accepted.workflow_id
 
@@ -190,7 +202,7 @@ async def test_reverse_observability_acceptance_binds_claude_maker_workflow() ->
     )
 
     assert accepted.workflow_id.startswith("reverse-observability-acceptance-")
-    assert accepted.run_id == "started-run-id"
+    assert accepted.run_id == _StartedHandle.first_execution_run_id
     assert client.workflow_name == "ReverseObservabilityAcceptanceWorkflow"
     assert client.task_queue == "engineering-control"
 
@@ -205,7 +217,7 @@ async def test_multi_project_audit_service_creates_one_parent_and_three_bound_ch
 
     assert accepted.workflow_id == repository.parent_workflow_id == client.workflow_id
     assert accepted.workflow_id.startswith("audit-all-")
-    assert accepted.run_id == "started-run-id"
+    assert accepted.run_id == _StartedHandle.first_execution_run_id
     assert client.workflow_type == "MultiProjectAuditWorkflow"
     assert client.task_queue == "engineering-control"
     assert {project.value for project in repository.campaigns} == {

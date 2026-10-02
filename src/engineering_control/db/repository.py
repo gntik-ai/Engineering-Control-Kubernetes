@@ -7,7 +7,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4, uuid5
 
 from sqlalchemy import case, create_engine, func, or_, select, text
 from sqlalchemy.orm import sessionmaker
@@ -19,10 +19,13 @@ from engineering_control.api.schemas import (
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
+    ExistingBacklogLoopStart,
     MultiProjectAuditStart,
+    OperationAccepted,
     RollbackRequest,
     RuntimeVerificationStart,
 )
+from engineering_control.coverage_outcome import coverage_outcome, truthful_campaign_status
 from engineering_control.db.models import (
     AgentInvocation,
     Approval,
@@ -31,25 +34,44 @@ from engineering_control.db.models import (
     BacklogIssueRecord,
     Campaign,
     ChangeSet,
+    CoverageCell,
+    DashboardSessionRevocation,
     Deployment,
     Enhancement,
     Finding,
     GitHubBacklogCampaign,
+    NotificationOutbox,
+    OperationRequest,
     ProviderUsage,
     QuotaSnapshot,
     Run,
     VerificationResult,
     WorkerHeartbeat,
 )
+from engineering_control.db.run_binding import bind_run_execution as bind_run_row
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_RELEASE_OWNERSHIP_PHRASE,
+    BacklogApprovalBinding,
     approval_binding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
 )
+from engineering_control.engineering.backlog_authority import require_alternative_issue_authority
 from engineering_control.models.core import ArtifactMetadata
 from engineering_control.models.enums import Project
+from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
+from engineering_control.operations.issue_approval import (
+    require_backlog_issue_approval,
+    require_issue_request_approval,
+)
+from engineering_control.retention_limits import (
+    DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
+    NOTIFICATION_OUTBOX_METRIC_STATUSES,
+    NOTIFICATION_OUTBOX_PENDING_STATUS,
+    NOTIFICATION_OUTBOX_UNKNOWN_STATUS,
+)
+from engineering_control.workflow_outcome import RunOutcomeRow
 
 
 def serialize_row(row: Any) -> dict[str, Any]:
@@ -67,7 +89,18 @@ def serialize_row(row: Any) -> dict[str, Any]:
 
 class MetadataRepository(Protocol):
     async def create_campaign(
-        self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> None: ...
+
+    async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]: ...
+
+    async def bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
     ) -> None: ...
 
     async def create_multi_project_audit(
@@ -75,22 +108,44 @@ class MetadataRepository(Protocol):
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None: ...
 
-    async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None: ...
+    async def create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None: ...
+    async def validate_delivery_issue_request(self, request: DeliveryStart) -> None: ...
+    async def record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None: ...
     async def create_finding_verification_run(
-        self, workflow_id: str, finding_id: UUID
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
     ) -> Project: ...
     async def create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None: ...
     async def create_deployment_run(
-        self, workflow_id: str, request: DeploymentPrepare
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project: ...
     async def create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project: ...
-    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project: ...
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project: ...
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]: ...
     async def list_backlog_campaigns(
@@ -105,7 +160,11 @@ class MetadataRepository(Protocol):
         self, project: str, surface: str, issue_number: int
     ) -> dict[str, Any] | None: ...
     async def prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]: ...
     async def approve_backlog_campaign(
         self, campaign_id: UUID, project: str, binding: str, actor: str
@@ -113,6 +172,9 @@ class MetadataRepository(Protocol):
     async def release_backlog_ownership(
         self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
     ) -> dict[str, Any]: ...
+    async def validate_issue_operation_approval(
+        self, request: ExistingBacklogLoopStart
+    ) -> None: ...
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None: ...
     async def list_findings(self, limit: int) -> list[dict[str, Any]]: ...
     async def list_enhancements(
@@ -148,6 +210,9 @@ class MetadataRepository(Protocol):
     async def persist_artifact(self, metadata: ArtifactMetadata) -> dict[str, Any]: ...
     async def persist_worker_heartbeat(self, identity: str, hostname: str) -> dict[str, Any]: ...
     async def metrics_snapshot(self) -> dict[str, Any]: ...
+    async def bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None: ...
 
 
 class SQLMetadataRepository:
@@ -170,21 +235,102 @@ class SQLMetadataRepository:
         self.github_policy_request_root = github_policy_request_root
 
     async def create_campaign(
-        self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
-        await asyncio.to_thread(self._create_campaign, campaign_id, workflow_id, request)
+        await asyncio.to_thread(
+            self._create_campaign,
+            campaign_id,
+            workflow_id,
+            request,
+            application_run_id=application_run_id,
+        )
+
+    async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
+        return await asyncio.to_thread(self._get_workflow_projection, workflow_id)
+
+    async def bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._bind_campaign_execution, campaign_id, workflow_id, first_run_id
+        )
+
+    def _bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        UUID(first_run_id)
+        with self.sessions.begin() as session:
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '3s'"))
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            campaign = session.scalar(
+                select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+            )
+            runs = list(
+                session.scalars(select(Run).where(Run.campaign_id == campaign_id).with_for_update())
+            )
+            if campaign is None or len(runs) != 1 or runs[0].workflow_id != workflow_id:
+                raise ValueError("campaign execution binding is ambiguous")
+            binding = {
+                "version": 1,
+                "workflow_id": workflow_id,
+                "first_execution_run_id": first_run_id,
+                "application_run_id": str(runs[0].id),
+            }
+            metadata = dict(campaign.metadata_json or {})
+            previous = metadata.get("reconciliation_binding")
+            if previous is not None and previous != binding:
+                raise ValueError("campaign execution binding is immutable")
+            if previous is None:
+                metadata["reconciliation_binding"] = binding
+                campaign.metadata_json = metadata
+
+    def _get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
+        with self.sessions() as session:
+            if self.engine.dialect.name == "postgresql":
+                session.execute(text("SET TRANSACTION READ ONLY"))
+                session.execute(text("SET LOCAL statement_timeout = '3000ms'"))
+            rows = session.execute(
+                select(
+                    Run.status,
+                    Run.error_code,
+                    Run.started_at,
+                    Run.finished_at,
+                    Run.updated_at,
+                )
+                .where(Run.workflow_id == workflow_id)
+                .limit(2)
+            ).all()
+        return [
+            RunOutcomeRow(
+                status=row.status,
+                error_code=row.error_code,
+                started_at=row.started_at,
+                finished_at=row.finished_at,
+                updated_at=row.updated_at,
+            )
+            for row in rows
+        ]
 
     async def create_multi_project_audit(
         self,
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._create_multi_project_audit,
             workflow_id,
             campaigns,
             request,
+            application_run_id=application_run_id,
         )
 
     def _create_multi_project_audit(
@@ -192,13 +338,17 @@ class SQLMetadataRepository:
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
         expected = {Project.FALCONE, Project.MUSEMATIC, Project.LLMWIKI}
         if set(campaigns) != expected:
             raise ValueError("all-project audit requires the exact project catalog")
+        parent_run_id = _application_run_id(application_run_id)
         with self.sessions.begin() as session:
             session.add(
                 Run(
+                    id=parent_run_id,
                     workflow_id=workflow_id,
                     run_type="multi-project-audit",
                     status="QUEUED",
@@ -232,6 +382,7 @@ class SQLMetadataRepository:
                 )
                 session.add(
                     Run(
+                        id=uuid5(parent_run_id, project.value),
                         campaign_id=campaign_id,
                         workflow_id=child_workflow_id,
                         run_type="audit-campaign",
@@ -240,7 +391,14 @@ class SQLMetadataRepository:
                     )
                 )
 
-    def _create_campaign(self, campaign_id: UUID, workflow_id: str, request: CampaignStart) -> None:
+    def _create_campaign(
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> None:
         with self.sessions.begin() as session:
             session.add(
                 Campaign(
@@ -269,6 +427,7 @@ class SQLMetadataRepository:
             )
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     campaign_id=campaign_id,
                     workflow_id=workflow_id,
                     run_type="audit-campaign",
@@ -277,15 +436,108 @@ class SQLMetadataRepository:
                 )
             )
 
-    async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
-        await asyncio.to_thread(self._create_delivery_run, workflow_id, request)
-
-    async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
-        return await asyncio.to_thread(
-            self._create_finding_verification_run, workflow_id, finding_id
+    async def create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None:
+        await asyncio.to_thread(
+            self._create_delivery_run, workflow_id, request, application_run_id=application_run_id
         )
 
-    def _create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+    async def validate_delivery_issue_request(self, request: DeliveryStart) -> None:
+        await asyncio.to_thread(self._validate_delivery_issue_request, request)
+
+    def _validate_delivery_issue_request(self, request: DeliveryStart) -> None:
+        request = DeliveryStart.model_validate(request.model_dump(mode="json"))
+        approved = request.approved_issue
+        if request.dry_run or approved is None:
+            raise ValueError("real delivery requires an approved issue request")
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            require_issue_request_approval(session, approved)
+            operation = session.get(OperationRequest, approved.issue_operation_id)
+            expected = (
+                f"backlog-loop-{approved.project}-{approved.backlog_campaign_id}"
+                f"-operation-{approved.issue_operation_id}"
+            )
+            if operation is None or operation.workflow_id not in {None, expected}:
+                raise ValueError("delivery operation is already bound to another workflow")
+            finding = session.get(Finding, request.finding_id)
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(
+                    BacklogIssueRecord.backlog_campaign_id == approved.backlog_campaign_id,
+                    BacklogIssueRecord.repository == approved.target_repository,
+                    BacklogIssueRecord.issue_number == approved.target_issue_number,
+                )
+            )
+            ranks = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+            if (
+                finding is None
+                or finding.disposition != "CONFIRMED"
+                or finding.project != approved.project
+                or finding.risk_class != request.risk_class.value
+                or issue is None
+                or issue.finding_id != finding.id
+                or issue.state != "OPEN"
+                or issue.eligibility_status == "DEFERRED"
+                or issue.calculated_risk != finding.risk_class
+                or ranks[finding.risk_class] > ranks[approved.maximum_risk.value]
+            ):
+                raise ValueError("delivery finding differs from its approved issue target")
+
+    async def record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None:
+        await asyncio.to_thread(self._record_delivery_issue_start, request, accepted)
+
+    def _record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None:
+        request = DeliveryStart.model_validate(request.model_dump(mode="json"))
+        approved = request.approved_issue
+        if request.dry_run or approved is None or approved.issue_operation_id is None:
+            raise ValueError("delivery start receipt requires its exact approved operation")
+        expected = (
+            f"backlog-loop-{approved.project}-{approved.backlog_campaign_id}"
+            f"-operation-{approved.issue_operation_id}"
+        )
+        if accepted.workflow_id != expected or accepted.status not in {"ACCEPTED", "EXISTING"}:
+            raise ValueError("delivery start receipt does not identify the approved workflow")
+        run_id = str(UUID(accepted.run_id))
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                session.execute(text("SET LOCAL statement_timeout = '10s'"))
+            operation = session.get(
+                OperationRequest, approved.issue_operation_id, with_for_update=True
+            )
+            require_issue_request_approval(session, approved)
+            if operation is None or operation.workflow_id not in {None, expected}:
+                raise ValueError("delivery operation changed before start acknowledgement")
+            # Approval validation, receipt, dashboard event and notification
+            # intent share this transaction. A retry cannot emit them twice.
+            record_dispatch_receipt(
+                session,
+                approved.issue_operation_id,
+                status="STARTED",
+                workflow_id=expected,
+                run_id=run_id,
+                linked=accepted.status == "EXISTING",
+            )
+
+    async def create_finding_verification_run(
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
+    ) -> Project:
+        return await asyncio.to_thread(
+            self._create_finding_verification_run,
+            workflow_id,
+            finding_id,
+            application_run_id=application_run_id,
+        )
+
+    def _create_finding_verification_run(
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
+    ) -> Project:
         with self.sessions.begin() as session:
             finding = session.get(Finding, finding_id)
             if finding is None or finding.disposition not in {"CANDIDATE", "FLAKY", "BLOCKED"}:
@@ -303,6 +555,7 @@ class SQLMetadataRepository:
             project = Project(finding.project)
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     campaign_id=finding.campaign_id,
                     workflow_id=workflow_id,
                     run_type="finding-verification",
@@ -313,13 +566,16 @@ class SQLMetadataRepository:
             )
             return project
 
-    def _create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
+    def _create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None:
         with self.sessions.begin() as session:
             finding = session.get(Finding, request.finding_id)
             if finding is None or finding.disposition != "CONFIRMED":
                 raise ValueError("delivery requires a CONFIRMED finding")
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     workflow_id=workflow_id,
                     run_type="issue-delivery",
                     status="QUEUED",
@@ -328,12 +584,25 @@ class SQLMetadataRepository:
             )
 
     async def create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
-        await asyncio.to_thread(self._create_delivery_reconciliation_run, workflow_id, request)
+        await asyncio.to_thread(
+            self._create_delivery_reconciliation_run,
+            workflow_id,
+            request,
+            application_run_id=application_run_id,
+        )
 
     def _create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
         allowed_states = {"SOURCE_PR", "CI_VALIDATED", "CANDIDATE_BUILT"}
         with self.sessions.begin() as session:
@@ -353,6 +622,7 @@ class SQLMetadataRepository:
                 raise ValueError("an active reconciliation already owns this ChangeSet")
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=change_set.id,
                     workflow_id=workflow_id,
                     run_type="delivery-reconciliation",
@@ -366,10 +636,24 @@ class SQLMetadataRepository:
                 )
             )
 
-    async def create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
-        return await asyncio.to_thread(self._create_deployment_run, workflow_id, request)
+    async def create_deployment_run(
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> Project:
+        return await asyncio.to_thread(
+            self._create_deployment_run, workflow_id, request, application_run_id=application_run_id
+        )
 
-    def _create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
+    def _create_deployment_run(
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> Project:
         deployable_states = {
             "preview": {
                 "CANDIDATE_BUILT",
@@ -405,6 +689,7 @@ class SQLMetadataRepository:
                 raise ValueError("LLMWiki is staging-only")
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=change_set.id,
                     workflow_id=workflow_id,
                     run_type=f"{request.environment}-deployment",
@@ -415,12 +700,25 @@ class SQLMetadataRepository:
             return project
 
     async def create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project:
-        return await asyncio.to_thread(self._create_runtime_verification_run, workflow_id, request)
+        return await asyncio.to_thread(
+            self._create_runtime_verification_run,
+            workflow_id,
+            request,
+            application_run_id=application_run_id,
+        )
 
     def _create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project:
         with self.sessions.begin() as session:
             deployment = session.get(Deployment, request.deployment_id)
@@ -440,6 +738,7 @@ class SQLMetadataRepository:
             project = Project(deployment.project)
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=deployment.change_set_id,
                     workflow_id=workflow_id,
                     run_type="runtime-verification",
@@ -450,10 +749,16 @@ class SQLMetadataRepository:
             )
             return project
 
-    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
-        return await asyncio.to_thread(self._create_recovery_run, workflow_id, request)
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project:
+        return await asyncio.to_thread(
+            self._create_recovery_run, workflow_id, request, application_run_id=application_run_id
+        )
 
-    def _create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
+    def _create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project:
         with self.sessions.begin() as session:
             deployment = session.get(Deployment, request.deployment_id)
             if deployment is None:
@@ -478,6 +783,7 @@ class SQLMetadataRepository:
             project = Project(deployment.project)
             session.add(
                 Run(
+                    id=_application_run_id(application_run_id),
                     change_set_id=deployment.change_set_id,
                     workflow_id=workflow_id,
                     run_type="recovery",
@@ -496,7 +802,20 @@ class SQLMetadataRepository:
             rows = session.scalars(
                 select(Campaign).order_by(Campaign.created_at.desc()).limit(limit)
             ).all()
-            return [serialize_row(row) for row in rows]
+            values: list[dict[str, Any]] = []
+            for row in rows:
+                statuses = list(
+                    session.scalars(
+                        select(CoverageCell.status).where(CoverageCell.campaign_id == row.id)
+                    ).all()
+                )
+                outcome = coverage_outcome(statuses)
+                value = serialize_row(row)
+                value["execution_status"] = row.status
+                value["coverage_outcome"] = outcome
+                value["status"] = truthful_campaign_status(row.status, outcome)
+                values.append(value)
+            return values
 
     async def list_backlog_campaigns(self, project: str | None, limit: int) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_backlog_campaigns, project, limit)
@@ -592,14 +911,59 @@ class SQLMetadataRepository:
             }
 
     async def prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self._prepare_backlog_approval, campaign_id, request)
+        return await asyncio.to_thread(
+            self._prepare_backlog_approval, campaign_id, request, issue_request=issue_request
+        )
+
+    async def validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:
+        await asyncio.to_thread(self._validate_issue_operation_approval, request)
+
+    def _validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:
+        with self.sessions() as session:
+            if request.issue_operation_id is None:
+                require_alternative_issue_authority(session, request)
+                return
+            require_issue_request_approval(session, request)
+            campaign = session.get(GitHubBacklogCampaign, request.backlog_campaign_id)
+            raw = campaign.approval_json.get("binding") if campaign is not None else None
+            if not isinstance(raw, dict):
+                raise ValueError("direct issue campaign approval is unavailable")
+            binding = BacklogApprovalBinding.model_validate(raw)
+            reference = binding.issue_approval
+            if (
+                reference is None
+                or reference.operation_id != str(request.issue_operation_id)
+                or reference.binding_sha256 != request.issue_approval_binding
+                or campaign is None
+                or binding.sha256() != campaign.approval_binding
+            ):
+                raise ValueError("direct issue campaign approval binding changed")
+            require_backlog_issue_approval(session, binding)
 
     def _prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
         with self.sessions.begin() as session:
+            if issue_request is not None:
+                require_issue_request_approval(session, issue_request)
+                if (
+                    campaign_id != issue_request.backlog_campaign_id
+                    or request.project != issue_request.project
+                    or request.delivery_mode != issue_request.delivery_mode
+                    or request.maximum_risk != issue_request.maximum_risk
+                    or request.maximum_items != 1
+                ):
+                    raise ValueError("issue approval campaign request changed scope")
             campaign = session.get(GitHubBacklogCampaign, campaign_id)
             if campaign is None or campaign.project != request.project:
                 raise ValueError("backlog approval campaign does not exist")
@@ -615,6 +979,16 @@ class SQLMetadataRepository:
                 delivery_mode=request.delivery_mode,
                 include_enhancements=campaign.import_filter == "enhancements",
             )
+            if issue_request is not None:
+                binding = BacklogApprovalBinding.model_validate(
+                    {
+                        **binding.model_dump(mode="json"),
+                        "issue_approval": {
+                            "operation_id": str(issue_request.issue_operation_id),
+                            "binding_sha256": issue_request.issue_approval_binding,
+                        },
+                    }
+                )
             digest = binding.sha256()
             campaign.approval_binding = digest
             campaign.approval_json = {"binding": binding.model_dump(mode="json")}
@@ -724,6 +1098,9 @@ class SQLMetadataRepository:
             raw_binding = campaign.approval_json.get("binding")
             if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
                 raise ValueError("existing-backlog approval candidate changed")
+            require_backlog_issue_approval(
+                session, BacklogApprovalBinding.model_validate(raw_binding)
+            )
             expires_at = datetime.fromisoformat(str(raw_binding["expires_at"]))
             if expires_at <= now:
                 raise ValueError("existing-backlog approval candidate expired")
@@ -1144,6 +1521,7 @@ class SQLMetadataRepository:
             "STAGING_APPROVED",
             "STAGING_DEPLOYED",
         }
+        now = datetime.now(UTC)
         with self.sessions() as session:
             active_campaigns = session.execute(
                 select(Campaign.project, func.count())
@@ -1195,6 +1573,30 @@ class SQLMetadataRepository:
                 .where(Artifact.purged_at.is_(None))
                 .group_by(Artifact.project, Artifact.retention_class)
             ).all()
+            active_dashboard_session_revocations = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at >= now
+                    )
+                )
+                or 0
+            )
+            expired_dashboard_session_revocations = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at < now
+                    )
+                )
+                or 0
+            )
+            notification_outbox = session.execute(
+                select(NotificationOutbox.status, func.count()).group_by(NotificationOutbox.status)
+            ).all()
+            oldest_pending_notification = session.scalar(
+                select(func.min(NotificationOutbox.created_at)).where(
+                    NotificationOutbox.status == NOTIFICATION_OUTBOX_PENDING_STATUS
+                )
+            )
         deployment_durations: dict[tuple[str, str], list[float]] = {}
         deployment_failures: dict[tuple[str, str], int] = {}
         for deployment in deployments:
@@ -1224,7 +1626,50 @@ class SQLMetadataRepository:
             "evidence_storage": [
                 [project, retention, int(size or 0)] for project, retention, size in evidence
             ],
+            "dashboard_session_revocations": [
+                ["active", active_dashboard_session_revocations],
+                ["expired", expired_dashboard_session_revocations],
+            ],
+            "dashboard_session_revocation_cleanup_truncated": [
+                [
+                    1
+                    if expired_dashboard_session_revocations
+                    > DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT
+                    else 0
+                ]
+            ],
+            "notification_outbox": self._notification_status_metrics(notification_outbox),
+            "notification_oldest_pending_age_seconds": [
+                [
+                    max(
+                        0.0,
+                        (
+                            now
+                            - (
+                                oldest_pending_notification
+                                if oldest_pending_notification.tzinfo is not None
+                                else oldest_pending_notification.replace(tzinfo=UTC)
+                            )
+                        ).total_seconds(),
+                    )
+                    if oldest_pending_notification is not None
+                    else 0.0
+                ]
+            ],
         }
+
+    @staticmethod
+    def _notification_status_metrics(rows: Any) -> list[list[str | int]]:
+        counts = {status: 0 for status in NOTIFICATION_OUTBOX_METRIC_STATUSES}
+        for raw_status, raw_count in rows:
+            status = str(raw_status)
+            key = (
+                status
+                if status in counts and status != NOTIFICATION_OUTBOX_UNKNOWN_STATUS
+                else NOTIFICATION_OUTBOX_UNKNOWN_STATUS
+            )
+            counts[key] += int(raw_count)
+        return [[status, counts[status]] for status in NOTIFICATION_OUTBOX_METRIC_STATUSES]
 
     async def get_deployment(self, deployment_id: UUID) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._get_deployment, deployment_id)
@@ -1409,11 +1854,42 @@ class SQLMetadataRepository:
                 )
             )
 
+    async def bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._bind_recorded_run, application_run_id, workflow_id, first_run_id
+        )
+
+    def _bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        with self.sessions.begin() as session:
+            bind = session.get_bind()
+            if bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '3s'"))
+                session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            elif bind.dialect.name != "sqlite":
+                raise ValueError("unsupported run binding database")
+            bind_run_row(session, application_run_id, workflow_id, first_run_id)
+
 
 class EmptyMetadataRepository:
-    async def create_campaign(
-        self, campaign_id: UUID, workflow_id: str, request: CampaignStart
+    async def bind_campaign_execution(
+        self, campaign_id: UUID, workflow_id: str, first_run_id: str
     ) -> None:
+        return None
+
+    async def create_campaign(
+        self,
+        campaign_id: UUID,
+        workflow_id: str,
+        request: CampaignStart,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
     async def create_multi_project_audit(
@@ -1421,29 +1897,76 @@ class EmptyMetadataRepository:
         workflow_id: str,
         campaigns: dict[Project, tuple[UUID, str]],
         request: MultiProjectAuditStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
-    async def create_delivery_run(self, workflow_id: str, request: DeliveryStart) -> None:
+    async def create_delivery_run(
+        self, workflow_id: str, request: DeliveryStart, *, application_run_id: UUID | None = None
+    ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
-    async def create_finding_verification_run(self, workflow_id: str, finding_id: UUID) -> Project:
+    async def get_workflow_projection(self, workflow_id: str) -> list[RunOutcomeRow]:
+        raise ValueError("durable run metadata store is unavailable")
+
+    async def validate_delivery_issue_request(self, request: DeliveryStart) -> None:
+        raise ValueError("durable delivery approval store is unavailable")
+
+    async def record_delivery_issue_start(
+        self, request: DeliveryStart, accepted: OperationAccepted
+    ) -> None:
+        raise ValueError("durable delivery approval store is unavailable")
+
+    async def create_finding_verification_run(
+        self, workflow_id: str, finding_id: UUID, *, application_run_id: UUID | None = None
+    ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("finding verification metadata store is unavailable")
 
     async def create_delivery_reconciliation_run(
-        self, workflow_id: str, request: DeliveryReconcile
+        self,
+        workflow_id: str,
+        request: DeliveryReconcile,
+        *,
+        application_run_id: UUID | None = None,
     ) -> None:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         return None
 
-    async def create_deployment_run(self, workflow_id: str, request: DeploymentPrepare) -> Project:
+    async def create_deployment_run(
+        self,
+        workflow_id: str,
+        request: DeploymentPrepare,
+        *,
+        application_run_id: UUID | None = None,
+    ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("deployment metadata store is unavailable")
 
     async def create_runtime_verification_run(
-        self, workflow_id: str, request: RuntimeVerificationStart
+        self,
+        workflow_id: str,
+        request: RuntimeVerificationStart,
+        *,
+        application_run_id: UUID | None = None,
     ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("runtime verification metadata store is unavailable")
 
-    async def create_recovery_run(self, workflow_id: str, request: RollbackRequest) -> Project:
+    async def create_recovery_run(
+        self, workflow_id: str, request: RollbackRequest, *, application_run_id: UUID | None = None
+    ) -> Project:
+        if application_run_id is not None:
+            raise ValueError("durable run metadata store is unavailable")
         raise ValueError("recovery metadata store is unavailable")
 
     async def list_campaigns(self, limit: int) -> list[dict[str, Any]]:
@@ -1469,7 +1992,11 @@ class EmptyMetadataRepository:
         return None
 
     async def prepare_backlog_approval(
-        self, campaign_id: UUID, request: BacklogApprovalCandidateRequest
+        self,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
         raise ValueError("backlog metadata store is unavailable")
 
@@ -1482,6 +2009,9 @@ class EmptyMetadataRepository:
         self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
     ) -> dict[str, Any]:
         raise ValueError("backlog metadata store is unavailable")
+
+    async def validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:
+        raise ValueError("issue approval metadata store is unavailable")
 
     async def get_finding(self, finding_id: UUID) -> dict[str, Any] | None:
         return None
@@ -1550,3 +2080,16 @@ class EmptyMetadataRepository:
 
     async def metrics_snapshot(self) -> dict[str, Any]:
         return {}
+
+    async def bind_recorded_run(
+        self, application_run_id: UUID, workflow_id: str, first_run_id: str
+    ) -> None:
+        raise ValueError("durable run metadata store is unavailable")
+
+
+def _application_run_id(value: UUID | None) -> UUID:
+    if value is None:
+        return uuid4()
+    if type(value) is not UUID or value.int == 0:
+        raise ValueError("application_run_id must be a non-nil UUID")
+    return value

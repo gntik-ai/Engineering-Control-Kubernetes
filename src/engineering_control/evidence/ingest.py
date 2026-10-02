@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -9,6 +10,7 @@ from uuid import UUID
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from engineering_control.api.auth import identity_bearer_auth
 from engineering_control.config import Settings, get_settings
@@ -16,6 +18,10 @@ from engineering_control.db.repository import MetadataRepository, SQLMetadataRep
 from engineering_control.evidence.store import LocalEvidenceStore
 from engineering_control.evidence.transfer import EvidenceEnvelope, EvidenceIngestService
 from engineering_control.logging import configure_logging
+from engineering_control.models.publication_authority import (
+    PublicationEffectClaim,
+    PublicationEffectReceipt,
+)
 from engineering_control.observability.agent import (
     AgentObservabilityRepository,
     ExecutionFinishInput,
@@ -24,6 +30,10 @@ from engineering_control.observability.agent import (
     GatewayEventInput,
     LogBatchInput,
     ObservabilityModel,
+)
+from engineering_control.operations.publication_authority import (
+    PublicationAuthorityRepository,
+    PublicationEffectUnresolved,
 )
 
 ObservabilityValue = TypeVar("ObservabilityValue", bound=ObservabilityModel)
@@ -35,6 +45,7 @@ def create_evidence_ingest_app(
     repository: MetadataRepository | None = None,
     observability_repository: AgentObservabilityRepository | None = None,
     tokens: dict[str, str] | None = None,
+    publication_authority: PublicationAuthorityRepository | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
 
@@ -50,7 +61,15 @@ def create_evidence_ingest_app(
                 maximum_transcript_bytes=resolved.dashboard_transcript_max_bytes,
             )
         )
-        yield
+        authority = publication_authority or PublicationAuthorityRepository(
+            resolved.database_url.get_secret_value()
+        )
+        app.state.publication_authority = authority
+        try:
+            yield
+        finally:
+            if publication_authority is None:
+                authority.engine.dispose()
 
     app = FastAPI(
         title="Engineering Evidence Ingest",
@@ -62,6 +81,62 @@ def create_evidence_ingest_app(
     )
     expected_tokens = tokens if tokens is not None else resolved.read_evidence_ingest_tokens()
     authenticated = identity_bearer_auth(expected_tokens)
+
+    async def publication_body(request: Request, subject: str) -> bytes:
+        if subject not in {"delivery-runner", "github-runner"}:
+            raise HTTPException(status_code=403, detail="publication identity denied")
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 16384:
+                raise HTTPException(status_code=413, detail="publication request exceeds bound")
+        return bytes(body)
+
+    @app.post("/v1/publications/claim")
+    async def claim_publication(
+        request: Request, subject: str = Depends(authenticated)
+    ) -> dict[str, Any]:
+        body = await publication_body(request, subject)
+        try:
+            values = PublicationEffectClaim.model_validate_json(body)
+            authority = cast(
+                PublicationAuthorityRepository, request.app.state.publication_authority
+            )
+            return await asyncio.to_thread(authority.claim, subject, values)
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail="invalid publication request") from error
+        except PublicationEffectUnresolved as error:
+            raise HTTPException(
+                status_code=409, detail={"code": "PUBLICATION_EFFECT_UNRESOLVED"}
+            ) from error
+        except (ValueError, KeyError, TypeError) as error:
+            raise HTTPException(
+                status_code=409, detail="publication authority denied or unresolved"
+            ) from error
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="publication authority unavailable"
+            ) from error
+
+    @app.post("/v1/publications/receipt")
+    async def receipt_publication(
+        request: Request, subject: str = Depends(authenticated)
+    ) -> dict[str, str]:
+        body = await publication_body(request, subject)
+        try:
+            values = PublicationEffectReceipt.model_validate_json(body)
+            authority = cast(
+                PublicationAuthorityRepository, request.app.state.publication_authority
+            )
+            return await asyncio.to_thread(authority.receipt, subject, values)
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail="invalid publication receipt") from error
+        except (ValueError, KeyError, TypeError) as error:
+            raise HTTPException(status_code=409, detail="publication receipt denied") from error
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="publication authority unavailable"
+            ) from error
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:

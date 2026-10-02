@@ -10,7 +10,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from engineering_control.db.models import ComponentLease
+from engineering_control.db.models import ComponentLease, Run, Step
 
 
 class ComponentLeaseConflict(RuntimeError):
@@ -46,11 +46,30 @@ class ComponentLeaseManager:
             if mode == "deployment"
             else f"implementation:{project}"
         )
-        self._serialize_scope(session, scope)
+        # Publication admission uses this project lock. Every lease mode must
+        # share it before changing an owner's row or checking unresolved effects.
+        self._serialize_scope(session, f"implementation:{project}")
+        if scope != f"implementation:{project}":
+            self._serialize_scope(session, scope)
         now = datetime.now(UTC)
+        unresolved = session.scalar(
+            select(Step.id)
+            .join(Run, Run.id == Step.run_id)
+            .where(
+                Run.project == project,
+                Step.name == "delivery.publication_effect",
+                Step.status.in_(("STARTED", "UNKNOWN")),
+            )
+            .limit(1)
+        )
+        if unresolved is not None:
+            raise ComponentLeaseConflict("unresolved publication effect requires reconciliation")
         session.execute(
             update(ComponentLease)
             .where(
+                # Do not expire unrelated owners while holding only this scope's
+                # advisory lock. Publication admission serializes with this key.
+                ComponentLease.component_key == component_key,
                 ComponentLease.released_at.is_(None),
                 ComponentLease.expires_at <= now,
             )
@@ -74,6 +93,7 @@ class ComponentLeaseManager:
                     ComponentLease.mode == mode,
                     ComponentLease.component_key.startswith(f"{project}:"),
                     ComponentLease.released_at.is_(None),
+                    ComponentLease.expires_at > now,
                 )
             )
             if int(active or 0) >= self.max_implementation_per_project:
@@ -110,6 +130,21 @@ class ComponentLeaseManager:
         return lease
 
     def release(self, session: Session, *, component_key: str, owner_run_id: UUID) -> bool:
+        match = self._component_pattern.fullmatch(component_key)
+        if match is None:
+            raise ValueError("component key is outside the bounded project catalog")
+        self._serialize_scope(session, f"implementation:{match.group(1)}")
+        unresolved = session.scalar(
+            select(Step.id)
+            .where(
+                Step.run_id == owner_run_id,
+                Step.name == "delivery.publication_effect",
+                Step.status.in_(("STARTED", "UNKNOWN")),
+            )
+            .limit(1)
+        )
+        if unresolved is not None:
+            return False
         result = session.execute(
             update(ComponentLease)
             .where(
@@ -134,6 +169,9 @@ class ComponentLeaseManager:
         conditions = [
             ComponentLease.mode == mode,
             ComponentLease.released_at.is_(None),
+            # Expired rows are retained unless their exact key is reacquired.
+            # Do not make another scope's historical row a permanent singleton.
+            ComponentLease.expires_at > datetime.now(UTC),
         ]
         if key_suffix is not None:
             conditions.append(ComponentLease.component_key.endswith(key_suffix))

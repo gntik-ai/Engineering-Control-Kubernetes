@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -164,6 +164,9 @@ def parser() -> argparse.ArgumentParser:
     campaign_reconcile.add_argument(
         "--offset", type=_bounded_integer(0, 10_000), default=0, metavar="0-10000"
     )
+    campaign_reconcile.add_argument("--apply-campaign", type=UUID)
+    campaign_reconcile.add_argument("--snapshot-token")
+    campaign_reconcile.add_argument("--observation-token")
     for action in ("locate", "start"):
         issue = commands.add_parser(f"issue-{action}")
         issue.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
@@ -437,7 +440,31 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         )
     if command == "campaign-reconcile":
         query = httpx.QueryParams({"limit": arguments.limit, "offset": arguments.offset})
-        return client.request("POST", f"/v1/campaigns/reconcile?{query}", {})
+        supplied = [
+            bool(arguments.apply_campaign),
+            bool(arguments.snapshot_token),
+            bool(arguments.observation_token),
+        ]
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "apply-campaign, snapshot-token and observation-token are required together"
+            )
+        if arguments.apply_campaign:
+            return client.request(
+                "POST",
+                f"/v1/campaigns/reconcile?{query}",
+                {
+                    "confirmation": "APPLY_EXACT_RECONCILIATION_ROWS",
+                    "rows": [
+                        {
+                            "campaign_id": str(arguments.apply_campaign),
+                            "snapshot_token": arguments.snapshot_token,
+                            "observation_token": arguments.observation_token,
+                        }
+                    ],
+                },
+            )
+        return client.request("GET", f"/v1/campaigns/reconcile?{query}")
     if command in {"issue-locate", "issue-start"}:
         query = httpx.QueryParams(
             {

@@ -30,6 +30,7 @@ def test_dashboard_is_loopback_only_and_cannot_read_operator_homes() -> None:
     assert "ENGINEERING_DASHBOARD_HOST=127.0.0.1" in unit
     assert "ENGINEERING_DASHBOARD_PORT=8750" in unit
     assert "NoNewPrivileges=true" in unit
+    assert "UMask=0077" in unit
     assert "ProtectSystem=strict" in unit
     assert "ProtectHome=true" in unit
     assert "IPAddressDeny=any" in unit
@@ -58,6 +59,20 @@ def test_acceptance_worker_is_bounded_to_synthetic_temporary_root() -> None:
     assert "/srv/engineering/worktrees" not in unit
     assert "engineering-acceptance-worker.service" in bootstrap
     assert "ENGINEERING_ACCEPTANCE_ENABLED=true" in bootstrap
+
+
+def test_notifier_is_confined_to_loopback_delivery() -> None:
+    unit = (REPOSITORY_ROOT / "systemd/engineering-notifier.service").read_text(encoding="utf-8")
+
+    assert "User=engineering-control" in unit
+    assert "NoNewPrivileges=true" in unit
+    assert "ProtectSystem=strict" in unit
+    assert "ProtectHome=true" in unit
+    assert "IPAddressDeny=any" in unit
+    assert "IPAddressAllow=localhost" in unit
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in unit
+    assert "CapabilityBoundingSet=" in unit
+    assert "TasksMax=64" in unit
 
 
 def test_temporal_lifecycle_verifier_explicitly_enables_only_its_bounded_root() -> None:
@@ -178,6 +193,20 @@ def test_worker_shared_tool_runtimes_are_traversable_but_not_made_writable() -> 
     assert "a+w" not in scanners
 
 
+def test_worker_browser_runtime_is_lock_bound_root_owned_and_atomically_selected() -> None:
+    worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
+
+    assert "/opt/engineering-browser-runtimes/${RELEASE_ID}" in worker
+    assert "ci --omit=dev --ignore-scripts --no-audit --no-fund" in worker
+    assert 'chown -R root:root "${BROWSER_STAGING}"' in worker
+    assert 'mv -T -- "${BROWSER_STAGING}" "${BROWSER_RELEASE_ROOT}"' in worker
+    assert "mv -Tf -- /opt/engineering-browser/.runtime.new" in worker
+    assert worker.index("install chromium firefox") < worker.index(
+        'ln -sfn "${BROWSER_RELEASE_ROOT}" /opt/engineering-browser/.runtime.new'
+    )
+    assert "trap 'rm -rf -- \"${BROWSER_STAGING}\"' EXIT" in worker
+
+
 def test_worker_parent_state_and_platform_roots_are_identity_traversable() -> None:
     worker = (REPOSITORY_ROOT / "scripts" / "bootstrap-worker.sh").read_text(encoding="utf-8")
 
@@ -268,6 +297,9 @@ def test_worker_verification_uses_a_neutral_non_home_directory() -> None:
     assert "all credential-independent checks passed" in verification
     assert "/scripts/browser-runtime-smoke.py" in verification
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/engineering-browser/browsers" in verification
+    assert "/opt/engineering-browser/runtime/node_modules" in verification
+    assert "10.34.5" in verification
+    assert "env -i" in verification
     for version in (
         "codex-cli 0.159.3",
         "2.1.239 (Claude Code)",

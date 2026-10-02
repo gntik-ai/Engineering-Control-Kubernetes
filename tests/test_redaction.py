@@ -69,6 +69,34 @@ def test_preserves_numeric_usage_counters_but_redacts_token_strings() -> None:
     assert report.value["auth_token"] == REDACTED
 
 
+def test_preserves_only_typed_session_revocation_cleanup_aggregates() -> None:
+    report = SecretRedactor().redact(
+        {
+            "dashboard_session_revocation_cleanup_count": 28,
+            "deleted_dashboard_session_revocation_count": 10,
+            "remaining_dashboard_session_revocation_count": 18,
+            "dashboard_session_revocation_cleanup_truncated": True,
+            "nested": {
+                "dashboard_session_revocation_cleanup_count": "28",
+                "deleted_dashboard_session_revocation_count": -1,
+                "remaining_dashboard_session_revocation_count": "secret-value",
+                "dashboard_session_revocation_cleanup_truncated": "true",
+            },
+        }
+    )
+
+    assert report.value["dashboard_session_revocation_cleanup_count"] == 28
+    assert report.value["deleted_dashboard_session_revocation_count"] == 10
+    assert report.value["remaining_dashboard_session_revocation_count"] == 18
+    assert report.value["dashboard_session_revocation_cleanup_truncated"] is True
+    assert report.value["nested"] == {
+        "dashboard_session_revocation_cleanup_count": REDACTED,
+        "deleted_dashboard_session_revocation_count": REDACTED,
+        "remaining_dashboard_session_revocation_count": REDACTED,
+        "dashboard_session_revocation_cleanup_truncated": REDACTED,
+    }
+
+
 @pytest.mark.parametrize(
     "value",
     [

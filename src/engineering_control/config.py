@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     environment: str = "development"
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8740, ge=1024, le=65535)
+    api_admission_mode: Literal["normal", "synthetic-only", "diagnostics-only"] = "normal"
+    projection_reconciliation_enabled: bool = False
+    projection_reconciliation_interval_seconds: int = Field(default=30, ge=5, le=300)
+    projection_reconciliation_batch_size: int = Field(default=25, ge=1, le=100)
+    projection_reconciliation_cycle_seconds: int = Field(default=30, ge=10, le=120)
+    projection_reconciliation_max_sweep_age_seconds: int = Field(default=300, ge=30, le=3600)
     api_token_file: Path = Path("/etc/engineering-control/env/api.token")
     temporal_target: str = "127.0.0.1:7233"
     temporal_namespace: str = "engineering-control"
@@ -76,7 +82,8 @@ class Settings(BaseSettings):
     release_credential_root: Path = Path("/etc/engineering-control/env/release")
     observer_credential_root: Path = Path("/etc/engineering-control/credentials")
     node_executable: Path = Path("/usr/local/bin/node")
-    pnpm_executable: Path = Path("/opt/engineering-browser/node_modules/.bin/pnpm")
+    # 2b678d9 (31ee08e): the browser runtime is versioned per release behind runtime/.
+    pnpm_executable: Path = Path("/opt/engineering-browser/runtime/node_modules/.bin/pnpm")
     # Delivery toolchain preparation (scan worker, delivery.prepare_toolchain). The
     # browser worker's pnpm above is a different, pinned consumer-suite install.
     uv_executable: Path = Path("/usr/local/bin/uv")
@@ -96,7 +103,7 @@ class Settings(BaseSettings):
     # attempt when the issue content it was generated from is unchanged, instead of
     # re-running the spec architect (whose structured output fails ~13% of runs).
     delivery_reuse_spec: bool = True
-    browser_script: Path = Path("/opt/engineering-browser/run-journey.mjs")
+    browser_script: Path = Path("/opt/engineering-browser/runtime/run-journey.mjs")
     journey_schema: Path = Path("/opt/engineering-control/source/schemas/journey-plan.schema.json")
     journey_plan_root: Path = Path("/etc/engineering-control/journeys")
     project_config_root: Path = Path("/etc/engineering-control/projects.d")
@@ -156,12 +163,34 @@ class Settings(BaseSettings):
     # signatures, not bearer tokens. Restored from the 2026-09-16 release (2b678d9).
     notification_auth_mode: Literal["bearer", "hmac-sha256-v2"] = "hmac-sha256-v2"
     notification_poll_seconds: int = Field(default=10, ge=2, le=300)
+    watchdog_state_file: Path = Path("/var/lib/engineering-watchdog/state.json")
+    watchdog_backup_status_file: Path = Path("/var/lib/engineering-backup/status.json")
+    watchdog_probe_seconds: int = Field(default=60, ge=30, le=120)
+    watchdog_repeat_seconds: int = Field(default=3900, ge=300, le=86400)
+    watchdog_backup_max_age_seconds: int = Field(default=3600, ge=3600, le=86400)
+    watchdog_restore_max_age_seconds: int = Field(default=691200, ge=86400, le=2678400)
+    watchdog_cleanup_max_age_seconds: int = Field(default=93600, ge=3600, le=172800)
+    watchdog_cleanup_running_max_age_seconds: int = Field(default=3600, ge=300, le=86400)
+    watchdog_heartbeat_max_age_seconds: int = Field(default=180, ge=60, le=900)
+    watchdog_notification_max_age_seconds: int = Field(default=900, ge=60, le=86400)
+    watchdog_gateway_required: bool = False
     cleanup_execution_enabled: bool = False
     cleanup_retention_days: int = Field(default=14, ge=1, le=3650)
     cleanup_expiry_grace_hours: int = Field(default=24, ge=1, le=720)
     worker_heartbeat_seconds: int = Field(default=30, ge=10, le=300)
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = Field(default=8750, ge=1024, le=65535)
+    dashboard_allowed_hosts: tuple[str, ...] = (
+        "ade.musematic.ai",
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    )
+    dashboard_allowed_origins: tuple[str, ...] = (
+        "https://ade.musematic.ai",
+        "http://127.0.0.1:8750",
+        "http://localhost:8750",
+    )
     dashboard_session_key_file: Path = Path("/etc/engineering-control/dashboard/session.key")
     dashboard_session_hours: int = Field(default=12, ge=1, le=24)
     dashboard_event_retention_days: int = Field(default=30, ge=1, le=365)
@@ -208,6 +237,34 @@ class Settings(BaseSettings):
         if value not in {"127.0.0.1", "::1", "localhost"}:
             raise ValueError("the dashboard must bind only to loopback")
         return value
+
+    @field_validator("dashboard_allowed_hosts")
+    @classmethod
+    def bounded_dashboard_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(dict.fromkeys(item.strip().lower() for item in value if item.strip()))
+        if not normalized or len(normalized) > 16:
+            raise ValueError("dashboard allowed hosts must contain between 1 and 16 entries")
+        if any("/" in item or "@" in item or len(item) > 253 for item in normalized):
+            raise ValueError("dashboard allowed host is invalid")
+        return normalized
+
+    @field_validator("dashboard_allowed_origins")
+    @classmethod
+    def bounded_dashboard_origins(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(
+            dict.fromkeys(item.strip().lower().rstrip("/") for item in value if item.strip())
+        )
+        if not normalized or len(normalized) > 16:
+            raise ValueError("dashboard allowed origins must contain between 1 and 16 entries")
+        if any(
+            not item.startswith(("https://", "http://"))
+            or "/" in item.split("://", 1)[1]
+            or "@" in item
+            or len(item) > 300
+            for item in normalized
+        ):
+            raise ValueError("dashboard allowed origin is invalid")
+        return normalized
 
     @field_validator("evidence_ingest_host")
     @classmethod

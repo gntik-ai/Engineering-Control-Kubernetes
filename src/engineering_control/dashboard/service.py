@@ -4,14 +4,18 @@ import asyncio
 from datetime import datetime
 from uuid import UUID
 
+from engineering_control.dashboard.admission import AdmissionReader, unknown_admission
 from engineering_control.dashboard.repository import DashboardRepository
 
 
 class DashboardService:
     """Bounded read facade kept separate from HTTP and persistence details."""
 
-    def __init__(self, repository: DashboardRepository) -> None:
+    def __init__(
+        self, repository: DashboardRepository, admission_reader: AdmissionReader | None = None
+    ) -> None:
         self.repository = repository
+        self.admission_reader = admission_reader
 
     async def backlog(
         self,
@@ -34,7 +38,31 @@ class DashboardService:
         return await self.repository.list_audits(project=project, status=status)
 
     async def overview(self) -> dict[str, object]:
-        return await asyncio.to_thread(self.repository.observability.overview)
+        value = await asyncio.to_thread(self.repository.observability.overview)
+        value["admission"] = (
+            await self.admission_reader.read() if self.admission_reader else unknown_admission()
+        )
+        return value
+
+    async def operation_response(self, value: dict[str, object]) -> dict[str, object]:
+        """Keep the durable receipt authoritative when dispatcher observation fails.
+
+        This is observational, not authorization. Never change an operation's
+        status or turn an already accepted write into an apparent failed submit.
+        """
+        result = dict(value)
+        if value.get("status") in {"PENDING", "DISPATCHING"}:
+            try:
+                async with asyncio.timeout(2):
+                    observation = (
+                        await self.admission_reader.read()
+                        if self.admission_reader
+                        else unknown_admission()
+                    )
+            except Exception:  # noqa: BLE001 - receipt must survive observation failure
+                observation = unknown_admission()
+            result["dispatch_observation"] = observation
+        return result
 
     async def workflows(
         self,

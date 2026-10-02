@@ -17,5 +17,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-QUOTA_REFRESH_INTERVAL = timedelta(minutes=30)
+from engineering_control.operations.connection_status import PROVIDER_REFRESH_INTERVAL_SECONDS
+
+# 2b678d9 (fd90545/33a1404): provider readiness is refreshed inside its 300 s freshness
+# window, so the quota/provider refresh runs every PROVIDER_REFRESH_INTERVAL_SECONDS.
+QUOTA_REFRESH_INTERVAL = timedelta(seconds=PROVIDER_REFRESH_INTERVAL_SECONDS)
 CONNECTIONS_REFRESH_INTERVAL = timedelta(minutes=15)

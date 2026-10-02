@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import pwd
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from engineering_control.adapters.command import CommandFailure, CommandResult, SafeCommandRunner
+from engineering_control.models.publication_authority import IssueRevisionObservation
 
 ALLOWED_REPOSITORIES = frozenset(
     {
@@ -30,6 +33,7 @@ _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'-]{1,500}$")
 STAGING_GITOPS_MARKER = re.compile(
     r"<!-- engineering-control-staging-gitops:[a-z-]{1,40}:[a-f0-9-]{36}(?::[a-z0-9-]{1,40})? -->"
 )
+_SAFE_PULL_REQUEST_TITLE = re.compile(r"^[A-Za-z0-9._:/@+ =,\"'()-]{1,240}$")
 
 
 class GhCliAuthError(RuntimeError):
@@ -266,6 +270,49 @@ class GhCliBroker:
             raise GhCliPolicyError("issue body response is invalid")
         return value
 
+    def observe_issue_revision(self, repository: str, number: int) -> IssueRevisionObservation:
+        """One fixed allowlisted read; only revision digests leave this method."""
+        if type(number) is not int or not 1 <= number <= 2_147_483_647:
+            raise GhCliPolicyError("issue observation number is invalid")
+        repository = self._batch(repository)
+        value = self._json(
+            self._run(
+                [
+                    "issue",
+                    "view",
+                    str(number),
+                    "--repo",
+                    repository,
+                    "--json",
+                    "number,url,state,title,body,updatedAt",
+                ]
+            ).stdout,
+            "issue revision",
+        )
+        if (
+            not isinstance(value, dict)
+            or type(value.get("number")) is not int
+            or value["number"] != number
+            or value.get("url") != f"https://github.com/{repository}/issues/{number}"
+            or not isinstance(value.get("title"), str)
+            or not isinstance(value.get("body"), str)
+            or len(value["title"]) > 300
+            or len(value["body"].encode()) > 262144
+            or not isinstance(value.get("updatedAt"), str)
+        ):
+            raise GhCliPolicyError("issue observation does not match its bounded target")
+        return IssueRevisionObservation.model_validate(
+            {
+                "repository": repository,
+                "number": number,
+                "state": value.get("state"),
+                "title_sha256": hashlib.sha256(value["title"].encode()).hexdigest(),
+                "body_sha256": hashlib.sha256(value["body"].encode()).hexdigest(),
+                "updated_at": value["updatedAt"],
+                "observed_at": datetime.now(UTC),
+            }
+        )
+
     def list_workflow_runs(
         self,
         repository: str,
@@ -464,7 +511,7 @@ class GhCliBroker:
             "--base",
             self._value(base, "pull request base"),
             "--title",
-            self._value(title, "pull request title", maximum=240),
+            self._pull_request_title(title),
             "--body-file",
             str(self._bounded_file(body_file)),
         ]
@@ -1102,6 +1149,14 @@ class GhCliBroker:
         if repository not in ALLOWED_REPOSITORIES:
             raise GhCliPolicyError("repository is outside the GitHub allowlist")
         return repository
+
+    @staticmethod
+    def _pull_request_title(value: str) -> str:
+        # Metadata emits the fixed " (deployment)" suffix. Permit parentheses only
+        # in this display field, not in branch, query, route, or authority inputs.
+        if value.startswith("-") or not _SAFE_PULL_REQUEST_TITLE.fullmatch(value):
+            raise GhCliPolicyError("pull request title contains unsupported characters")
+        return value
 
     @staticmethod
     def _value(value: str, label: str, *, maximum: int = 500) -> str:

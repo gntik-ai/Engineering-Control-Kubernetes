@@ -13,6 +13,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from engineering_control.adapters.auth_probe import AuthProbeError
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
 from engineering_control.adapters.process import subscription_only_environment
@@ -139,6 +140,10 @@ class ProviderActivityHandler:
         except FileNotFoundError:
             return self._blocked(
                 runtime_payload, f"PROVIDER_CLI_MISSING_{self.provider.value.upper()}"
+            )
+        except AuthProbeError as error:
+            return self._blocked(
+                runtime_payload, f"AUTH_STATUS_{error.reason}_{self.provider.value.upper()}"
             )
         if not authenticated:
             blocked = self._blocked(
@@ -350,12 +355,18 @@ class ProviderActivityHandler:
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        probe_failure = None
+        authenticated: bool | None
         try:
             authenticated = await self.adapter.authenticated()
             cli_present = True
         except FileNotFoundError:
             authenticated = False
             cli_present = False
+        except AuthProbeError as error:
+            authenticated = None
+            cli_present = True
+            probe_failure = f"AUTH_STATUS_{error.reason}_{self.provider.value.upper()}"
         return {
             "provider": self.provider.value,
             "captured_at": datetime.now(UTC).isoformat(),
@@ -367,7 +378,9 @@ class ProviderActivityHandler:
             "authenticated": authenticated,
             "cli_present": cli_present,
             "status": (
-                "AVAILABLE"
+                probe_failure
+                if probe_failure is not None
+                else "AVAILABLE"
                 if authenticated
                 else f"MANUAL_AUTH_REQUIRED_{self.provider.value.upper()}"
                 if cli_present
