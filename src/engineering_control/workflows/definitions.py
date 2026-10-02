@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, replace
 from datetime import timedelta
 from typing import Any
@@ -2068,7 +2069,8 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
     _SYNC_REMEDIATION_ROUNDS = 3
     _TRANSIENT_RESYNCS = 3
     _SYNC_PATCH = "gitops-argo-sync-remediation-v1"
-    # Scales every polling/back-off timer; tests run the real flow with short timers.
+    # Tests run the real flow with short timers. Production keeps 1.0, and _timer then
+    # returns the very same timedelta, so every timer command stays byte-identical.
     _TIMER_SCALE = 1.0
 
     @workflow.run
@@ -2116,7 +2118,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         result: dict[str, Any] = {}
         for attempt in range(attempts):
             if attempt:
-                await workflow.sleep(interval * self._TIMER_SCALE)
+                await workflow.sleep(self._timer(interval))
             if not await self._checkpoint(step.upper().replace(".", "_")):
                 return {"status": "CANCELLED", "blocker": "CANCELLED"}
             if write:
@@ -2332,10 +2334,18 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             return self._blocked(closed, "DELIVERED_ISSUE_CLOSE_FAILED")
         return {"status": "STAGING_VERIFIED"}
 
+    def _timer(self, interval: timedelta) -> timedelta:
+        return interval if self._TIMER_SCALE == 1.0 else interval * self._TIMER_SCALE
+
     def _sync_recovery_patched(self) -> bool:
         # Checked only where a sync failed or timed out, so a history recorded before
         # NEW-113 (no marker there) replays its old BLOCKED return unchanged.
         return workflow.patched(self._SYNC_PATCH)
+
+    @staticmethod
+    def _remediation_id(rounds: int, action: str) -> str:
+        workflow_id = re.sub(r"[^A-Za-z0-9._:/-]", "-", workflow.info().workflow_id)[:200]
+        return f"{workflow_id}:round-{rounds}:{action}"
 
     @staticmethod
     def _sync_resource_key(entry: dict[str, Any]) -> str:
@@ -2427,9 +2437,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 return {"status": "CANCELLED", "blocker": "CANCELLED"}
             if action == "resync":
                 transient += 1
-                await workflow.sleep(
-                    timedelta(seconds=30 * 2 ** (transient - 1)) * self._TIMER_SCALE
-                )
+                await workflow.sleep(self._timer(timedelta(seconds=30 * 2 ** (transient - 1))))
             record: dict[str, Any] = {
                 "round": rounds,
                 "action": action,
@@ -2445,6 +2453,14 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     "round": rounds,
                     "attempt": transient,
                     "already_remediated": remediated,
+                    # Stable per remediation, so a retried activity cannot sync twice.
+                    "remediation_id": self._remediation_id(rounds, action),
+                    # The failed operation this diagnosis describes (None for health).
+                    "failed_operation_started_at": (
+                        synced.get("operation_started_at")
+                        if synced.get("status") == "SYNC_FAILED"
+                        else None
+                    ),
                 },
                 pending=frozenset({"SYNC_BUSY"}),
                 attempts=10,
@@ -2471,7 +2487,12 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     # The replaced resources applied; one normal sync applies the rest.
                     completed = await self._poll(
                         "gitops.remediate_sync",
-                        {**deployed_base, "action": "complete", "round": rounds},
+                        {
+                            **deployed_base,
+                            "action": "complete",
+                            "round": rounds,
+                            "remediation_id": self._remediation_id(rounds, "complete"),
+                        },
                         pending=frozenset({"SYNC_BUSY"}),
                         attempts=10,
                         interval=half_minute,

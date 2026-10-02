@@ -25,6 +25,7 @@ from engineering_control.activities.gitops import (
     next_release_tag,
     overall_failure_class,
     pod_failure_reason,
+    render_sync_failure,
     split_image,
 )
 from engineering_control.adapters.command import CommandFailure, CommandResult
@@ -157,7 +158,7 @@ def _workload(
 
 def _application(**status: Any) -> dict[str, Any]:
     return {
-        "metadata": {"name": "musematic-platform", "namespace": "argocd"},
+        "metadata": {"name": "musematic-platform", "namespace": "argocd", "resourceVersion": "100"},
         "spec": {
             "sources": [
                 {
@@ -207,6 +208,13 @@ class FakeKubectl:
         self.application = application or _application()
         self.calls: list[list[str]] = []
         self.cwds: list[Path] = []
+        # Called before a JSON patch applies: lets a test move the Application under us.
+        self.before_patch: Any = None
+        self.reject_patches = False
+
+    def _bump(self) -> None:
+        metadata = self.application.setdefault("metadata", {})
+        metadata["resourceVersion"] = str(int(metadata.get("resourceVersion") or "0") + 1)
 
     def run(
         self,
@@ -260,20 +268,37 @@ class FakeKubectl:
         if verb == "patch":
             patch_type = args[args.index("--type") + 1]
             patch = json.loads(args[args.index("--patch") + 1])
+            if self.before_patch is not None:
+                self.before_patch(self)
+            if self.reject_patches:
+                return CommandResult(1, "", "forbidden")
             if patch_type == "json":
+                for operation in patch:
+                    if operation["op"] != "test":
+                        continue
+                    parts = operation["path"].strip("/").split("/")
+                    target = self.application
+                    for part in parts:
+                        if isinstance(target, list) and part.isdigit():
+                            target = target[int(part)] if int(part) < len(target) else None
+                        else:
+                            target = target.get(part) if isinstance(target, dict) else None
+                    if target != operation["value"]:
+                        return CommandResult(1, "", "test failed")
                 for operation in patch:
                     parts = operation["path"].strip("/").split("/")
                     target = self.application
                     for part in parts[:-1]:
                         target = target[int(part)] if isinstance(target, list) else target[part]
-                    if operation["op"] == "test":
-                        assert target[parts[-1]] == operation["value"]
-                    else:
+                    if operation["op"] != "test":
                         target[parts[-1]] = operation["value"]
+                self._bump()
             else:
                 self.application.update(patch)
             return CommandResult(0, "patched", "")
         if verb in {"annotate", "delete", "rollout"}:
+            if verb == "annotate":
+                self._bump()
             return CommandResult(0, "ok", "")
         raise AssertionError(f"unexpected kubectl call {args}")
 
@@ -684,7 +709,20 @@ async def test_trigger_sync_pins_the_chart_source_and_requests_a_sync(tmp_path: 
                 "value": "https://github.com/gntik-ai/musematic.git",
             },
             {"op": "replace", "path": "/spec/sources/0/targetRevision", "value": MERGE_SHA},
-        ]
+        ],
+        # NEW-113: the complete operation, conditioned on the resourceVersion read after
+        # the chart pin and the hard-refresh annotation.
+        [
+            {"op": "test", "path": "/metadata/resourceVersion", "value": "102"},
+            {
+                "op": "add",
+                "path": "/operation",
+                "value": {
+                    "initiatedBy": {"username": "hermes-engineering"},
+                    "sync": {"prune": False},
+                },
+            },
+        ],
     ]
     assert kubectl.application["operation"]["initiatedBy"]["username"] == "hermes-engineering"
 
@@ -693,7 +731,7 @@ async def test_trigger_sync_pins_the_chart_source_and_requests_a_sync(tmp_path: 
     kubectl.calls.clear()
     again = await handler.handle("gitops.trigger_sync", {"plan": _plan(), "merge_sha": MERGE_SHA})
     assert again["chart_pin"]["changed"] is False
-    assert not [call for call in kubectl.calls if "--type" in call and "json" in call]
+    assert not [call for call in kubectl.calls if "--patch" in call and "/spec/" in call[-1]]
 
 
 @pytest.mark.asyncio
@@ -2092,6 +2130,60 @@ WEBHOOK_TIMEOUT = (
             "OTHER",
         ),
         ("Deployment", "", "OTHER"),
+        # Finding 6: a permanent error in the same message wins over a recoverable match.
+        ("Deployment", MESSAGE_980 + ", " + SELECTOR_IMMUTABLE.split(": ", 1)[1], "OTHER"),
+        (
+            "Deployment",
+            MESSAGE_980 + ", spec.replicas: Invalid value: -1: must be greater than or equal to 0",
+            "OTHER",
+        ),
+        ("Deployment", MESSAGE_980 + '; unknown field "containerz"', "OTHER"),
+        ("Job", JOB_TEMPLATE_IMMUTABLE + '; namespaces "x" not found', "OTHER"),
+        (
+            "Deployment",
+            'the object has been modified; deployments.apps "web" is forbidden: User "x" '
+            'cannot patch resource "deployments"',
+            "OTHER",
+        ),
+        ("ConfigMap", 'ConfigMap "x" is invalid: data: connection refused', "OTHER"),
+        (
+            "Deployment",
+            "may not specify more than 1 handler type; context deadline exceeded",
+            "PATCH_CONFLICT",
+        ),
+        # Finding 7: a webhook failure is TRANSIENT only for a transport failure.
+        (
+            "Ingress",
+            'Internal error occurred: failed calling webhook "validate.nginx.ingress.io": '
+            'failed to call webhook: Post "https://admission.svc:443/x": tls: failed to verify '
+            "certificate: x509: certificate signed by unknown authority",
+            "OTHER",
+        ),
+        (
+            "Ingress",
+            'admission webhook "validate.nginx.ingress.kubernetes.io" denied the request: '
+            "host already defined",
+            "OTHER",
+        ),
+        ("Ingress", 'Internal error occurred: failed calling webhook "x.io"', "OTHER"),
+        (
+            "Ingress",
+            'Internal error occurred: failed calling webhook "x.io": failed to call webhook: '
+            'Post "https://x.svc:443/v": no endpoints available for service "x"',
+            "TRANSIENT",
+        ),
+        (
+            "Ingress",
+            'Internal error occurred: failed calling webhook "x.io": failed to call webhook: '
+            'Post "https://x.svc:443/v": EOF',
+            "TRANSIENT",
+        ),
+        (
+            "Ingress",
+            'Internal error occurred: failed calling webhook "x.io": failed to call webhook: '
+            'Post "https://x.svc:443/v": read tcp 10.0.0.1:443: connection reset by peer',
+            "TRANSIENT",
+        ),
     ],
 )
 def test_sync_failures_are_classified_from_argo_messages(
@@ -2159,13 +2251,14 @@ def _sync_result(*entries: tuple[str, str, str, str]) -> dict[str, Any]:
 def _failed_application(*entries: tuple[str, str, str, str], **extra: Any) -> dict[str, Any]:
     managed = [_managed(kind, name, group=group) for group, kind, name, _ in entries]
     managed.append(_managed("Service", "web", group=""))
-    return _application(
-        operationState=_sync_result(*entries),
-        sync={"status": "OutOfSync"},
-        health={"status": "Healthy"},
-        resources=managed,
-        **extra,
-    )
+    status: dict[str, Any] = {
+        "operationState": _sync_result(*entries),
+        "sync": {"status": "OutOfSync"},
+        "health": {"status": "Healthy"},
+        "resources": managed,
+    }
+    status.update(extra)
+    return _application(**status)
 
 
 EXECUTOR = ("apps", "Deployment", "falcone-control-plane-executor", MESSAGE_980)
@@ -2195,6 +2288,7 @@ async def test_diagnose_sync_parses_failed_results_bounded_and_redacted(tmp_path
         "failure_class": "PATCH_CONFLICT",
         "managed": True,
         "eligible": True,
+        "current": True,
     }
     assert "may not be specified when value is not empty" in failed[0]["message"]
     assert len(failed[1]["message"]) <= 300 and secret not in json.dumps(result)
@@ -2253,6 +2347,16 @@ async def test_diagnose_sync_reports_degraded_workloads_with_pod_reasons(tmp_pat
     assert again["failure_class"] == "OTHER"
 
 
+FAILED_AT = "2026-10-02T09:00:00Z"
+EXECUTOR_TARGET = {
+    "group": "apps",
+    "kind": "Deployment",
+    "namespace": "musematic-platform",
+    "name": "falcone-control-plane-executor",
+}
+EXECUTOR_KEY = "apps/Deployment/musematic-platform/falcone-control-plane-executor"
+
+
 def _remediate(**changes: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "plan": _plan(),
@@ -2261,68 +2365,151 @@ def _remediate(**changes: Any) -> dict[str, Any]:
         "round": 1,
         "attempt": 0,
         "already_remediated": [],
-        "resources": [
-            {
-                "group": "apps",
-                "kind": "Deployment",
-                "namespace": "musematic-platform",
-                "name": "falcone-control-plane-executor",
-            }
-        ],
+        "remediation_id": "wf-1:round-1:replace",
+        "failed_operation_started_at": FAILED_AT,
+        "resources": [EXECUTOR_TARGET],
     }
     payload.update(changes)
     return payload
 
 
-def _merge_patches(kubectl: FakeKubectl) -> list[dict[str, Any]]:
+def _operation_patches(kubectl: FakeKubectl) -> list[list[dict[str, Any]]]:
     return [
-        json.loads(call[call.index("--patch") + 1])
-        for call in kubectl.calls
-        if "--type" in call and call[call.index("--type") + 1] == "merge"
+        patch
+        for patch in (
+            json.loads(call[call.index("--patch") + 1])
+            for call in kubectl.calls
+            if "--type" in call and call[call.index("--type") + 1] == "json"
+        )
+        if any(operation["path"] == "/operation" for operation in patch)
     ]
 
 
+def _written_operation(kubectl: FakeKubectl) -> dict[str, Any]:
+    patch = _operation_patches(kubectl)[-1]
+    assert patch[0]["op"] == "test" and patch[0]["path"] == "/metadata/resourceVersion"
+    assert patch[1]["op"] == "add" and patch[1]["path"] == "/operation"
+    value: dict[str, Any] = patch[1]["value"]
+    return value
+
+
 @pytest.mark.asyncio
-async def test_replace_remediation_syncs_only_the_failed_resources(tmp_path: Path) -> None:
+async def test_replace_remediation_writes_one_complete_operation(tmp_path: Path) -> None:
     kubectl = FakeKubectl(application=_failed_application(EXECUTOR))
     handler = _controller(tmp_path, kubectl)
     result = await handler.handle("gitops.remediate_sync", _remediate())
     assert result == {
         "status": "REMEDIATION_TRIGGERED",
         "action": "replace",
-        "sync_options": ["Replace=true"],
-        "resources": _remediate()["resources"],
-        "remediated_keys": ["apps/Deployment/musematic-platform/falcone-control-plane-executor"],
-        "previous_operation_started_at": "2026-10-02T09:00:00Z",
+        "remediation_id": "wf-1:round-1:replace",
+        "replayed": False,
+        "resources": [EXECUTOR_TARGET],
+        "remediated_keys": [EXECUTOR_KEY],
+        "previous_operation_started_at": FAILED_AT,
     }
-    assert _merge_patches(kubectl) == [
-        {
-            "operation": {
-                "initiatedBy": {"username": "hermes-engineering"},
-                "sync": {
-                    "prune": False,
-                    "resources": _remediate()["resources"],
-                    "syncOptions": ["Replace=true"],
-                },
-            }
-        }
-    ]
+    assert _written_operation(kubectl) == {
+        "initiatedBy": {"username": "hermes-engineering"},
+        "info": [
+            {"name": "hermes-remediation", "value": "wf-1:round-1:replace"},
+            {"name": "hermes-previous-started-at", "value": FAILED_AT},
+        ],
+        "sync": {"resources": [EXECUTOR_TARGET], "syncOptions": ["Replace=true"], "prune": False},
+    }
+    assert kubectl.application["operation"] == _written_operation(kubectl)
     verbs = {call[2] for call in kubectl.calls if call[0] == "--namespace"}
     assert verbs <= {"get", "annotate", "patch"}
 
-    # At most once per resource per delivery.
-    kubectl.application.pop("operation")
-    kubectl.calls.clear()
-    done = _remediate(
-        already_remediated=["apps/Deployment/musematic-platform/falcone-control-plane-executor"]
+
+@pytest.mark.asyncio
+async def test_finding_1_busy_check_and_write_are_atomic_and_complete(tmp_path: Path) -> None:
+    # An operator-set operation (here with a forced apply) is never merged into: busy.
+    application = _failed_application(EXECUTOR)
+    application["operation"] = {"sync": {"syncStrategy": {"apply": {"force": True}}}}
+    kubectl = FakeKubectl(application=application)
+    handler = _controller(tmp_path, kubectl)
+    assert await handler.handle("gitops.remediate_sync", _remediate()) == {
+        "status": "SYNC_BUSY",
+        "action": "replace",
+    }
+    assert _operation_patches(kubectl) == []
+    assert kubectl.application["operation"] == {
+        "sync": {"syncStrategy": {"apply": {"force": True}}}
+    }
+
+    # Someone writes an operation between the read and the patch: the resourceVersion
+    # test fails, the re-read sees the operation, and Hermes reports busy.
+    racing = FakeKubectl(application=_failed_application(EXECUTOR))
+
+    def operator_sync(fake: FakeKubectl) -> None:
+        fake.before_patch = None
+        fake.application["operation"] = {"sync": {"syncStrategy": {"apply": {"force": True}}}}
+        fake._bump()
+
+    racing.before_patch = operator_sync
+    raced = await _controller(tmp_path / "b", racing).handle("gitops.remediate_sync", _remediate())
+    assert raced["status"] == "SYNC_BUSY"
+    assert racing.application["operation"] == {"sync": {"syncStrategy": {"apply": {"force": True}}}}
+
+    # A plain status update moves the version: the write is retried on a fresh read.
+    moving = FakeKubectl(application=_failed_application(EXECUTOR))
+
+    def status_update(fake: FakeKubectl) -> None:
+        fake.before_patch = None
+        fake._bump()
+
+    moving.before_patch = status_update
+    moved = await _controller(tmp_path / "c", moving).handle("gitops.remediate_sync", _remediate())
+    assert moved["status"] == "REMEDIATION_TRIGGERED"
+    first, second = _operation_patches(moving)
+    assert int(second[0]["value"]) == int(first[0]["value"]) + 1
+
+    # A rejected write with nothing moving (e.g. RBAC) fails closed, never "busy".
+    rejected = FakeKubectl(application=_failed_application(EXECUTOR))
+    rejected.reject_patches = True
+    blocked = await _controller(tmp_path / "d", rejected).handle(
+        "gitops.remediate_sync", _remediate()
     )
-    refused = await handler.handle("gitops.remediate_sync", done)
-    assert refused["blocker"] == "ARGO_REMEDIATION_ALREADY_APPLIED"
-    assert _merge_patches(kubectl) == []
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["blocker"] == "STAGING_GITOPS_REMEDIATE_SYNC_FAILED"
 
 
 @pytest.mark.asyncio
-async def test_immutable_job_is_recreated_with_replace_and_force(tmp_path: Path) -> None:
+async def test_finding_2_a_retried_remediation_does_not_sync_again(tmp_path: Path) -> None:
+    kubectl = FakeKubectl(application=_failed_application(EXECUTOR))
+    handler = _controller(tmp_path, kubectl)
+    first = await handler.handle("gitops.remediate_sync", _remediate())
+    assert first["status"] == "REMEDIATION_TRIGGERED" and first["replayed"] is False
+    # The activity completion is lost; Argo has meanwhile started the operation.
+    operation = kubectl.application.pop("operation")
+    kubectl.application["status"]["operationState"] = {
+        "phase": "Running",
+        "startedAt": "2026-10-02T09:01:00Z",
+        "operation": operation,
+    }
+    kubectl.calls.clear()
+    retried = await handler.handle("gitops.remediate_sync", _remediate())
+    assert retried == {**first, "replayed": True}
+    assert retried["previous_operation_started_at"] == FAILED_AT
+    assert _operation_patches(kubectl) == []
+    assert not [call for call in kubectl.calls if "annotate" in call]
+
+    # Still pending (not yet picked up by Argo): also recognised.
+    pending = FakeKubectl(application=_failed_application(EXECUTOR))
+    pending_handler = _controller(tmp_path / "b", pending)
+    await pending_handler.handle("gitops.remediate_sync", _remediate())
+    pending.calls.clear()
+    again = await pending_handler.handle("gitops.remediate_sync", _remediate())
+    assert again["replayed"] is True and _operation_patches(pending) == []
+
+    # Another round is another identity.
+    next_round = await pending_handler.handle(
+        "gitops.remediate_sync", _remediate(remediation_id="wf-1:round-2:replace", round=2)
+    )
+    assert next_round["status"] == "SYNC_BUSY"
+
+
+@pytest.mark.asyncio
+async def test_finding_3_immutable_job_force_uses_the_apply_sync_strategy(tmp_path: Path) -> None:
     job = ("batch", "Job", "db-migrate", JOB_TEMPLATE_IMMUTABLE)
     kubectl = FakeKubectl(application=_failed_application(job))
     handler = _controller(tmp_path, kubectl)
@@ -2333,21 +2520,93 @@ async def test_immutable_job_is_recreated_with_replace_and_force(tmp_path: Path)
         "name": "db-migrate",
     }
     result = await handler.handle(
-        "gitops.remediate_sync", _remediate(action="replace_force", resources=[target])
+        "gitops.remediate_sync",
+        _remediate(action="replace_force", resources=[target], remediation_id="wf:r1:force"),
     )
     assert result["status"] == "REMEDIATION_TRIGGERED"
-    assert _merge_patches(kubectl)[0]["operation"]["sync"] == {
-        "prune": False,
+    assert _written_operation(kubectl)["sync"] == {
         "resources": [target],
-        "syncOptions": ["Replace=true", "Force=true"],
+        "syncOptions": ["Replace=true"],
+        "syncStrategy": {"apply": {"force": True}},
+        "prune": False,
     }
+    # Never Force for anything but a batch/Job, and never via syncOptions.
+    deployment = await _controller(
+        tmp_path / "b", FakeKubectl(application=_failed_application(EXECUTOR))
+    ).handle("gitops.remediate_sync", _remediate(action="replace_force"))
+    assert deployment["blocker"] == "ARGO_REMEDIATION_FORCE_REQUIRES_JOB"
+
+
+def _drift(application: dict[str, Any], **live: Any) -> dict[str, Any]:
+    for item in application["status"]["resources"]:
+        if item["name"] == "falcone-control-plane-executor":
+            item.update(live)
+    return application
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("application", "changes", "blocker"),
+    [
+        # a newer operation replaced the failure the flow diagnosed
+        (
+            _failed_application(EXECUTOR),
+            {"failed_operation_started_at": "2026-10-02T08:00:00Z"},
+            "ARGO_REMEDIATION_STALE_DIAGNOSIS",
+        ),
+        (
+            (_failed_application(EXECUTOR)),
+            {"failed_operation_started_at": None},
+            "ARGO_REMEDIATION_STALE_DIAGNOSIS",
+        ),
+        # the application recovered on its own
+        (
+            _failed_application(EXECUTOR, sync={"status": "Synced"}, health={"status": "Healthy"}),
+            {},
+            "ARGO_REMEDIATION_NOT_NEEDED",
+        ),
+        # an OTHER failure appeared next to the conflict
+        (
+            _failed_application(EXECUTOR, ("apps", "Deployment", "web", SELECTOR_IMMUTABLE)),
+            {},
+            "ARGO_REMEDIATION_CLASS_MISMATCH",
+        ),
+        # the selected resource is no longer drifting
+        (
+            _drift(_failed_application(EXECUTOR), status="Synced"),
+            {},
+            "ARGO_REMEDIATION_STALE_DIAGNOSIS",
+        ),
+        # the latest failed operation is not Hermes's
+        (
+            _failed_application(EXECUTOR)
+            | {
+                "status": _failed_application(EXECUTOR)["status"]
+                | {
+                    "operationState": _sync_result(EXECUTOR)
+                    | {"operation": {"initiatedBy": {"username": "admin"}}}
+                }
+            },
+            {},
+            "ARGO_REMEDIATION_STALE_DIAGNOSIS",
+        ),
+    ],
+)
+async def test_finding_4_remediation_revalidates_the_current_application(
+    tmp_path: Path, application: dict[str, Any], changes: dict[str, Any], blocker: str
+) -> None:
+    kubectl = FakeKubectl(application=json.loads(json.dumps(application)))
+    result = await _controller(tmp_path, kubectl).handle(
+        "gitops.remediate_sync", _remediate(**changes)
+    )
+    assert result == {"status": "REMEDIATION_REFUSED", "blocker": blocker, "action": "replace"}
+    assert _operation_patches(kubectl) == [] and "operation" not in kubectl.application
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("entries", "changes", "blocker"),
     [
-        # outside the flow namespaces
         (
             (EXECUTOR,),
             {
@@ -2357,36 +2616,23 @@ async def test_immutable_job_is_recreated_with_replace_and_force(tmp_path: Path)
             },
             "ARGO_REMEDIATION_OUTSIDE_NAMESPACES",
         ),
-        # in a flow namespace but not managed by the Application
         (
             (EXECUTOR,),
-            {
-                "resources": [
-                    {
-                        "group": "apps",
-                        "kind": "Deployment",
-                        "namespace": "platform-data",
-                        "name": "falcone-control-plane-executor",
-                    }
-                ]
-            },
+            {"resources": [{**EXECUTOR_TARGET, "namespace": "platform-data"}]},
             "ARGO_REMEDIATION_RESOURCE_NOT_MANAGED",
         ),
-        # an immutable Deployment selector is never replaced
         (
             (("apps", "Deployment", "falcone-control-plane-executor", SELECTOR_IMMUTABLE),),
             {},
             "ARGO_REMEDIATION_CLASS_MISMATCH",
         ),
-        # Force=true is for Jobs only
-        ((EXECUTOR,), {"action": "replace_force"}, "ARGO_REMEDIATION_FORCE_REQUIRES_JOB"),
+        ((EXECUTOR,), {"already_remediated": [EXECUTOR_KEY]}, "ARGO_REMEDIATION_ALREADY_APPLIED"),
         ((EXECUTOR,), {"resources": []}, "ARGO_REMEDIATION_NO_RESOURCES"),
         (
             (EXECUTOR,),
-            {"resources": [_remediate()["resources"][0]] * 11},
+            {"resources": [EXECUTOR_TARGET] * 11},
             "ARGO_REMEDIATION_TOO_MANY_RESOURCES",
         ),
-        # a transient re-sync needs a transient diagnosis and a bounded attempt
         ((EXECUTOR,), {"action": "resync", "attempt": 1}, "ARGO_REMEDIATION_CLASS_MISMATCH"),
         (
             (("apps", "Deployment", "web", WEBHOOK_TIMEOUT),),
@@ -2407,7 +2653,7 @@ async def test_sync_remediation_refuses_unsafe_requests(
         "gitops.remediate_sync", _remediate(**changes)
     )
     assert result["status"] == "REMEDIATION_REFUSED" and result["blocker"] == blocker
-    assert _merge_patches(kubectl) == [] and "operation" not in kubectl.application
+    assert _operation_patches(kubectl) == [] and "operation" not in kubectl.application
 
 
 @pytest.mark.asyncio
@@ -2420,6 +2666,8 @@ async def test_sync_remediation_bounds_rounds_and_refuses_production(
     assert exhausted == {"status": "BLOCKED", "blocker": "ARGO_REMEDIATION_ROUNDS_EXHAUSTED"}
     invalid = await handler.handle("gitops.remediate_sync", _remediate(action="prune"))
     assert invalid == {"status": "BLOCKED", "blocker": "ARGO_REMEDIATION_ACTION_INVALID"}
+    no_id = await handler.handle("gitops.remediate_sync", _remediate(remediation_id="a b"))
+    assert no_id == {"status": "BLOCKED", "blocker": "ARGO_REMEDIATION_ID_INVALID"}
 
     from engineering_control.activities import gitops
 
@@ -2434,7 +2682,7 @@ async def test_sync_remediation_bounds_rounds_and_refuses_production(
     monkeypatch.setattr(gitops, "enabled_staging_flow", production)
     refused = await handler.handle("gitops.remediate_sync", _remediate())
     assert refused == {"status": "BLOCKED", "blocker": "ARGO_REMEDIATION_PRODUCTION_REFUSED"}
-    assert _merge_patches(kubectl) == []
+    assert _operation_patches(kubectl) == []
 
 
 @pytest.mark.asyncio
@@ -2444,7 +2692,7 @@ async def test_sync_remediation_waits_for_a_running_operation(tmp_path: Path) ->
     kubectl = FakeKubectl(application=application)
     result = await _controller(tmp_path, kubectl).handle("gitops.remediate_sync", _remediate())
     assert result == {"status": "SYNC_BUSY", "action": "replace"}
-    assert _merge_patches(kubectl) == []
+    assert _operation_patches(kubectl) == []
 
 
 @pytest.mark.asyncio
@@ -2453,10 +2701,32 @@ async def test_transient_resync_and_completion_use_a_normal_sync(tmp_path: Path)
     kubectl = FakeKubectl(application=_failed_application(transient))
     handler = _controller(tmp_path, kubectl)
     resynced = await handler.handle(
-        "gitops.remediate_sync", _remediate(action="resync", attempt=3, resources=[])
+        "gitops.remediate_sync",
+        _remediate(action="resync", attempt=3, resources=[], remediation_id="wf:r1:resync"),
     )
     assert resynced["status"] == "REMEDIATION_TRIGGERED" and resynced["resources"] == []
-    assert _merge_patches(kubectl)[-1]["operation"]["sync"] == {"prune": False}
+    assert _written_operation(kubectl)["sync"] == {"prune": False}
+
+    # Degraded health (no failed operation): a transient re-sync needs Synced + unhealthy.
+    degraded = _application(
+        operationState={"phase": "Succeeded", "startedAt": "2026-10-02T09:00:00Z"},
+        sync={"status": "Synced"},
+        health={"status": "Degraded"},
+        resources=[_managed("Deployment", "web", health="Degraded")],
+    )
+    pods = {"musematic-platform": [_owned_pod("web-5d9c7-a", "web-5d9c7", "ImagePullBackOff")]}
+    health_kubectl = FakeKubectl(application=degraded, pods=pods)
+    health = await _controller(tmp_path / "h", health_kubectl).handle(
+        "gitops.remediate_sync",
+        _remediate(
+            action="resync",
+            attempt=1,
+            resources=[],
+            failed_operation_started_at=None,
+            remediation_id="wf:r1:resync",
+        ),
+    )
+    assert health["status"] == "REMEDIATION_TRIGGERED"
 
     # A succeeded selective replace with the rest still OutOfSync is completed once.
     selective = _failed_application(EXECUTOR)
@@ -2465,16 +2735,17 @@ async def test_transient_resync_and_completion_use_a_normal_sync(tmp_path: Path)
         "startedAt": "2026-10-02T09:05:00Z",
         "operation": {
             "initiatedBy": {"username": "hermes-engineering"},
-            "sync": {"resources": _remediate()["resources"], "syncOptions": ["Replace=true"]},
+            "sync": {"resources": [EXECUTOR_TARGET], "syncOptions": ["Replace=true"]},
         },
     }
     completing = FakeKubectl(application=json.loads(json.dumps(selective)))
     completed = await _controller(tmp_path / "b", completing).handle(
-        "gitops.remediate_sync", _remediate(action="complete", resources=None)
+        "gitops.remediate_sync",
+        _remediate(action="complete", resources=None, remediation_id="wf:r1:complete"),
     )
     assert completed["status"] == "REMEDIATION_TRIGGERED"
     assert completed["previous_operation_started_at"] == "2026-10-02T09:05:00Z"
-    assert _merge_patches(completing)[-1]["operation"]["sync"] == {"prune": False}
+    assert _written_operation(completing)["sync"] == {"prune": False}
 
     payload = {
         "plan": _plan(),
@@ -2490,6 +2761,94 @@ async def test_transient_resync_and_completion_use_a_normal_sync(tmp_path: Path)
         "gitops.sync_status", {**payload, "selective": None}
     )
     assert pending["status"] == "SYNC_PENDING"
+
+
+@pytest.mark.asyncio
+async def test_finding_5_classification_sees_every_failure_and_pod_reason(
+    tmp_path: Path,
+) -> None:
+    conflicts = [("apps", "Deployment", f"svc-{index}", MESSAGE_980) for index in range(30)] + [
+        ("apps", "Deployment", "web", SELECTOR_IMMUTABLE)
+    ]
+    kubectl = FakeKubectl(application=_failed_application(*conflicts))
+    result = await _controller(tmp_path, kubectl).handle("gitops.diagnose_sync", {"plan": _plan()})
+    diagnosis = result["diagnosis"]
+    assert len(diagnosis["failed_resources"]) == 25
+    assert diagnosis["failed_resources_total"] == 31
+    assert all(item["failure_class"] == "PATCH_CONFLICT" for item in diagnosis["failed_resources"])
+    assert result["failure_class"] == "OTHER"  # the 31st failure is past the export bound
+
+    pods = [_owned_pod(f"web-5d9c7-{index}", "web-5d9c7", "ImagePullBackOff") for index in range(6)]
+    pods.append(_owned_pod("web-5d9c7-z", "web-5d9c7", "CrashLoopBackOff"))
+    degraded = _application(
+        operationState={"phase": "Succeeded", "startedAt": "2026-10-02T09:00:00Z"},
+        sync={"status": "Synced"},
+        health={"status": "Degraded"},
+        resources=[_managed("Deployment", "web", health="Degraded")],
+    )
+    health = await _controller(
+        tmp_path / "b", FakeKubectl(application=degraded, pods={"musematic-platform": pods})
+    ).handle("gitops.diagnose_sync", {"plan": _plan()})
+    (entry,) = health["diagnosis"]["degraded_resources"]
+    assert len(entry["pod_reasons"]) == 5 and entry["pod_reasons_total"] == 7
+    assert entry["failure_class"] == "OTHER" and health["failure_class"] == "OTHER"
+
+    # A pod listing beyond the observation bound fails closed (blocked -> escalated).
+    many = {
+        "musematic-platform": [
+            _owned_pod(f"p-{i}", "web-5d9c7", "ImagePullBackOff") for i in range(2001)
+        ]
+    }
+    capped = await _controller(tmp_path / "c", FakeKubectl(application=degraded, pods=many)).handle(
+        "gitops.diagnose_sync", {"plan": _plan()}
+    )
+    assert capped["status"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_finding_8_multiline_credentials_are_redacted_before_flattening(
+    tmp_path: Path,
+) -> None:
+    leaked = "rejected the object\npassword: hunter2-s3cret-value"
+    entry = ("apps", "Deployment", "falcone-control-plane-executor", leaked)
+    application = _failed_application(entry)
+    application["status"]["operationState"]["message"] = leaked
+    handler = _controller(tmp_path, FakeKubectl(application=application))
+    result = await handler.handle("gitops.diagnose_sync", {"plan": _plan()})
+    assert "hunter2" not in json.dumps(result)
+    assert "rejected the object password: [REDACTED]" in json.dumps(result)
+
+    status = await handler.handle(
+        "gitops.sync_status", {"plan": _plan(), "previous_operation_started_at": ""}
+    )
+    assert status["status"] == "SYNC_FAILED" and "hunter2" not in status["message"]
+
+    await handler.handle(
+        "gitops.notify_sync",
+        {
+            "plan": _plan(),
+            "event": "detected",
+            "failure_class": "OTHER",
+            "diagnosis": {"message": leaked, "failed_resources": []},
+        },
+    )
+    with handler.sessions() as session:
+        (row,) = session.query(db.NotificationOutbox).all()
+    assert "hunter2" not in json.dumps(row.payload_json)
+
+    body = render_sync_failure(
+        StagingGitOpsPlan.model_validate(_plan()),
+        StagingFlowPolicy.model_validate(_musematic_manifest()["delivery_control"]["staging_flow"]),
+        merge_sha=MERGE_SHA,
+        failure_class="OTHER",
+        blocker="ARGO_SYNC_FAILED",
+        diagnosis={
+            "message": leaked,
+            "failed_resources": [{"kind": "Deployment", "name": "x", "message": leaked}],
+        },
+        attempts=[],
+    )
+    assert "hunter2" not in body and "[REDACTED]" in body
 
 
 @pytest.mark.asyncio

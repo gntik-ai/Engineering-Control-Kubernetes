@@ -27,7 +27,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -331,41 +331,83 @@ _PATCH_CONFLICT_PATTERNS = tuple(
         r"may not specify more than 1 volume type",
     )
 )
-_TRANSIENT_SYNC_PATTERNS = tuple(
+# Within one message a permanent error wins over any recoverable match (finding 6).
+_PERMANENT_SYNC_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bis forbidden\b",
+        r"\bcannot (?:get|list|watch|create|update|patch|delete) resource\b",
+        r"\bnot found\b",
+        r"\bunknown field\b",
+        r"\bcould not find\b",
+        r"\bno matches for kind\b",
+        r"\bValidationError\b",
+        r"\bx509\b",
+        r"\bcertificate\b",
+        r"\bunknown authority\b",
+        r"\bdenied the request\b",
+        r"\bexceeded quota\b",
+    )
+)
+# Kubernetes field errors ("<path>: Invalid value: ..."); each must be explained by a
+# replaceable conflict or a Job's immutable field, otherwise the message is OTHER.
+_FIELD_ERROR = re.compile(
+    r"(?:Invalid value|Forbidden|Required value|Unsupported value|Duplicate value|"
+    r"Too long|Too many):",
+    re.IGNORECASE,
+)
+_RECOVERABLE_SYNC_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"the object has been modified",
-        r"connection refused",
-        r"i/o timeout",
-        r"context deadline exceeded",
         r"etcdserver: request timed out",
         r"TooManyRequests|too many requests",
-        r"Internal error occurred: failed calling webhook",
     )
+)
+# Transport failures only; a webhook that answered (e.g. denied, x509) is not transient.
+_TRANSPORT_FAILURE = re.compile(
+    r"context deadline exceeded|i/o timeout|connection refused|connection reset|"
+    r"no endpoints available|\bEOF\b|Client\.Timeout exceeded",
+    re.IGNORECASE,
 )
 _IMMUTABLE_FIELD = re.compile(r"field is immutable", re.IGNORECASE)
 _DEGRADED_HEALTH = frozenset({"Degraded", "Missing", "Progressing"})
 _WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"})
 _BENIGN_WAITING = frozenset({"ContainerCreating", "PodInitializing"})
-# action -> (failure class it repairs, Argo syncOptions). "complete" finishes a selective
-# replace with one normal sync when the rest of the application is still OutOfSync.
-SYNC_REMEDIATION_ACTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "replace": ("PATCH_CONFLICT", ("Replace=true",)),
-    "replace_force": ("JOB_IMMUTABLE", ("Replace=true", "Force=true")),
-    "resync": ("TRANSIENT", ()),
-    "complete": ("", ()),
+# action -> (failure class it repairs, Argo syncOptions, apply force). Argo reads force
+# from operation.sync.syncStrategy.apply.force, not from syncOptions (finding 3).
+# "complete" finishes a selective replace with one normal sync when the rest of the
+# application is still OutOfSync.
+SYNC_REMEDIATION_ACTIONS: dict[str, tuple[str, tuple[str, ...], bool]] = {
+    "replace": ("PATCH_CONFLICT", ("Replace=true",), False),
+    "replace_force": ("JOB_IMMUTABLE", ("Replace=true",), True),
+    "resync": ("TRANSIENT", (), False),
+    "complete": ("", (), False),
 }
+REMEDIATION_INFO = "hermes-remediation"
+REMEDIATION_PREVIOUS_INFO = "hermes-previous-started-at"
+_REMEDIATION_ID = re.compile(r"[A-Za-z0-9._:/-]{1,240}")
 
 
 def classify_sync_failure(kind: str, message: str) -> str:
-    """Classify one failed Argo CD resource result by its Kubernetes error message."""
+    """Classify one failed Argo CD resource result by its whole Kubernetes error message."""
     text = message or ""
-    if any(pattern.search(text) for pattern in _PATCH_CONFLICT_PATTERNS):
-        return "PATCH_CONFLICT"
-    if _IMMUTABLE_FIELD.search(text):
+    if any(pattern.search(text) for pattern in _PERMANENT_SYNC_PATTERNS):
+        return "OTHER"
+    conflicts = sum(len(pattern.findall(text)) for pattern in _PATCH_CONFLICT_PATTERNS)
+    immutable = len(_IMMUTABLE_FIELD.findall(text))
+    field_errors = len(_FIELD_ERROR.findall(text))
+    if immutable:
         # Jobs are disposable; any other immutable field (e.g. a selector) needs a human.
-        return "JOB_IMMUTABLE" if kind == "Job" else "OTHER"
-    if any(pattern.search(text) for pattern in _TRANSIENT_SYNC_PATTERNS):
+        explained = kind == "Job" and field_errors <= conflicts + immutable
+        return "JOB_IMMUTABLE" if explained else "OTHER"
+    if conflicts:
+        return "PATCH_CONFLICT" if field_errors <= conflicts else "OTHER"
+    if field_errors or re.search(r"\bis invalid\b", text, re.IGNORECASE):
+        return "OTHER"
+    if _TRANSPORT_FAILURE.search(text) or any(
+        pattern.search(text) for pattern in _RECOVERABLE_SYNC_PATTERNS
+    ):
         return "TRANSIENT"
     return "OTHER"
 
@@ -806,19 +848,13 @@ class GitOpsControllerHandler:
             "diagnosis": diagnosis,
         }
 
-    def _refresh_and_sync(
-        self,
-        flow: StagingFlowPolicy,
-        application: dict[str, Any],
-        *,
-        resources: list[dict[str, str]] | None = None,
-        sync_options: tuple[str, ...] = (),
-    ) -> bool:
-        """Hard-refresh the Application and request a sync unless one is in flight.
+    @staticmethod
+    def _operation_running(application: dict[str, Any]) -> bool:
+        return application.get("operation") is not None or (
+            _nested(application, "status", "operationState", "phase") in {"Running", "Terminating"}
+        )
 
-        NEW-113: a remediation narrows the sync to named resources and adds syncOptions;
-        it never prunes.
-        """
+    def _refresh(self, flow: StagingFlowPolicy) -> None:
         self._kubectl(
             [
                 "--namespace",
@@ -830,36 +866,63 @@ class GitOpsControllerHandler:
                 "--overwrite",
             ]
         )
-        running = application.get("operation") is not None or (
-            _nested(application, "status", "operationState", "phase") in {"Running", "Terminating"}
-        )
-        if running:
-            return False
-        sync: dict[str, Any] = {"prune": False}
-        if resources:
-            sync["resources"] = resources
-        if sync_options:
-            sync["syncOptions"] = list(sync_options)
-        operation = {
-            "operation": {
-                "initiatedBy": {"username": ARGO_SYNC_USERNAME},
-                "sync": sync,
-            }
-        }
-        self._kubectl(
-            [
-                "--namespace",
-                flow.argo_namespace,
-                "patch",
-                "applications.argoproj.io",
-                flow.argo_application,
-                "--type",
-                "merge",
-                "--patch",
-                json.dumps(operation, separators=(",", ":")),
+
+    def _refresh_and_sync(self, flow: StagingFlowPolicy) -> bool:
+        """Hard-refresh the Application and request a sync unless one is in flight."""
+        self._refresh(flow)
+        operation = {"initiatedBy": {"username": ARGO_SYNC_USERNAME}, "sync": {"prune": False}}
+        return self._start_operation(flow, lambda _: operation) == "STARTED"
+
+    def _start_operation(
+        self,
+        flow: StagingFlowPolicy,
+        build: Callable[[dict[str, Any]], dict[str, Any] | str],
+    ) -> str:
+        """Write the COMPLETE operation only if none is in flight, atomically.
+
+        NEW-113: ``build`` sees the very read whose resourceVersion the JSON patch
+        ``test``s, so the busy check, any revalidation and the write are one step; and
+        ``add /operation`` writes the whole object, so no operator-set field (e.g.
+        syncStrategy.apply.force) survives into it. Returns STARTED, BUSY or the refusal
+        blocker ``build`` returned.
+        """
+        for _ in range(3):
+            application = self._application(flow)
+            if self._operation_running(application):
+                return "BUSY"
+            version = _nested(application, "metadata", "resourceVersion")
+            if not isinstance(version, str) or not version:
+                raise ValueError("Argo CD Application has no resourceVersion")
+            operation = build(application)
+            if isinstance(operation, str):
+                return operation
+            operation = {**operation, "sync": {**operation.get("sync", {}), "prune": False}}
+            patch = [
+                {"op": "test", "path": "/metadata/resourceVersion", "value": version},
+                {"op": "add", "path": "/operation", "value": operation},
             ]
-        )
-        return True
+            written = self._kubectl(
+                [
+                    "--namespace",
+                    flow.argo_namespace,
+                    "patch",
+                    "applications.argoproj.io",
+                    flow.argo_application,
+                    "--type",
+                    "json",
+                    "--patch",
+                    json.dumps(patch, separators=(",", ":")),
+                ],
+                check=False,
+            )
+            if not written.return_code:
+                return "STARTED"
+            after = self._application(flow)
+            if _nested(after, "metadata", "resourceVersion") == version:
+                # Nothing moved, so the write itself failed (e.g. RBAC): fail closed.
+                raise CommandFailure("Argo CD operation patch was rejected")
+        # The Application kept changing under us: report busy and let the flow poll.
+        return "BUSY"
 
     def _remediate(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
@@ -867,7 +930,7 @@ class GitOpsControllerHandler:
         # Never trust the payload's diagnosis for mutations: observe again.
         diagnosis = self._observe(flow)
         actions: list[str] = []
-        synced = self._refresh_and_sync(flow, self._application(flow))
+        synced = self._refresh_and_sync(flow)
         actions.append("argo-hard-refresh")
         if synced:
             actions.append("argo-sync")
@@ -973,7 +1036,7 @@ class GitOpsControllerHandler:
             if flow.pin_chart_to_merge
             else None
         )
-        if not self._refresh_and_sync(flow, application):
+        if not self._refresh_and_sync(flow):
             return {"status": "SYNC_BUSY", "chart_pin": chart_pin}
         return {
             "status": "SYNC_TRIGGERED",
@@ -1002,11 +1065,12 @@ class GitOpsControllerHandler:
         ):
             return {"status": "SYNC_PENDING", **observed}
         if phase in {"Failed", "Error"}:
-            message = str(operation_state.get("message") or "")[:300]
             return {
                 "status": "SYNC_FAILED",
                 "blocker": "ARGO_SYNC_FAILED",
-                "message": message,
+                "message": self._bounded_message(operation_state.get("message")),
+                # NEW-113: names the failed operation a remediation may act on.
+                "operation_started_at": started[:80],
                 **observed,
             }
         if phase == "Succeeded" and sync != "Synced" and payload.get("selective") is True:
@@ -1025,8 +1089,10 @@ class GitOpsControllerHandler:
     # -- NEW-113: sync failure diagnosis, remediation and notification --------------------
 
     def _bounded_message(self, value: object, limit: int = SYNC_MESSAGE_LIMIT) -> str:
-        text = " ".join(str(value or "")[:4000].split())
-        return str(self.redactor.redact_text(text).value)[:limit]
+        # Redact the ORIGINAL text first: the line-anchored credential patterns need its
+        # line breaks. Only then flatten and truncate (finding 8).
+        redacted = str(self.redactor.redact_text(str(value or "")).value)
+        return " ".join(redacted.split())[:limit]
 
     def _pod_reasons(
         self,
@@ -1035,7 +1101,10 @@ class GitOpsControllerHandler:
         name: str,
         cache: dict[str, list[dict[str, Any]]],
     ) -> list[dict[str, str]]:
+        """Every non-benign container reason of the workload's pods (unbounded here;
+        only the exported evidence is bounded, so classification sees all of them)."""
         if namespace not in cache:
+            # _items fails closed (ValueError -> blocked -> OTHER) on an oversized list.
             cache[namespace] = _items(
                 self._kubectl_json(["--namespace", namespace, "get", "pods"]), "pods"
             )
@@ -1066,14 +1135,16 @@ class GitOpsControllerHandler:
                         "message": self._bounded_message(state.get("message"), 200),
                     }
                 )
-                if len(reasons) >= MAXIMUM_POD_REASONS:
-                    return reasons
         return reasons
 
     def _sync_diagnosis(
         self, flow: StagingFlowPolicy, application: dict[str, Any]
     ) -> dict[str, Any]:
-        """Read-only: failed sync results and degraded managed resources, classified."""
+        """Read-only: failed sync results and degraded managed resources, classified.
+
+        Classification covers EVERY failed result and pod reason; only the exported
+        evidence is bounded (finding 5).
+        """
         status = application.get("status")
         status = status if isinstance(status, dict) else {}
         operation_state = status.get("operationState")
@@ -1083,8 +1154,10 @@ class GitOpsControllerHandler:
         health = str(_nested(status, "health", "status") or "Unknown")
         managed_items = status.get("resources")
         managed_items = managed_items if isinstance(managed_items, list) else []
-        managed = {resource_key(item) for item in managed_items if isinstance(item, dict)}
+        managed = {resource_key(item): item for item in managed_items if isinstance(item, dict)}
+        classes: list[str] = []
         failed: list[dict[str, Any]] = []
+        failed_total = 0
         results = _nested(operation_state, "syncResult", "resources")
         for item in results if isinstance(results, list) else []:
             if not isinstance(item, dict) or (
@@ -1093,25 +1166,41 @@ class GitOpsControllerHandler:
             ):
                 continue
             identity = resource_identity(item)
-            full_message = self._bounded_message(item.get("message"), 4000)
-            failure_class = classify_sync_failure(identity["kind"], full_message)
+            failure_class = classify_sync_failure(identity["kind"], str(item.get("message") or ""))
             key = resource_key(identity)
-            in_namespaces = identity["namespace"] in flow.namespaces
+            live = managed.get(key)
+            eligible = (
+                live is not None
+                and identity["namespace"] in flow.namespaces
+                and bool(_KUBERNETES_NAME.fullmatch(identity["name"]))
+            )
+            # A replaceable conflict Hermes may not touch is the operator's to fix.
+            classes.append(
+                "OTHER"
+                if failure_class in {"PATCH_CONFLICT", "JOB_IMMUTABLE"} and not eligible
+                else failure_class
+            )
+            failed_total += 1
+            if len(failed) >= MAXIMUM_DIAGNOSED_RESOURCES:
+                continue
             failed.append(
                 {
                     **identity,
                     "status": str(item.get("status") or item.get("hookPhase") or "")[:40],
-                    "message": full_message[:SYNC_MESSAGE_LIMIT],
+                    "message": self._bounded_message(item.get("message")),
                     "failure_class": failure_class,
-                    "managed": key in managed,
-                    "eligible": key in managed
-                    and in_namespaces
-                    and bool(_KUBERNETES_NAME.fullmatch(identity["name"])),
+                    "managed": live is not None,
+                    "eligible": eligible,
+                    # Still drifting: OutOfSync or not Healthy in the live status.
+                    "current": live is not None
+                    and (
+                        live.get("status") != "Synced"
+                        or _nested(live, "health", "status") in _DEGRADED_HEALTH
+                    ),
                 }
             )
-            if len(failed) >= MAXIMUM_DIAGNOSED_RESOURCES:
-                break
         degraded: list[dict[str, Any]] = []
+        degraded_total = 0
         if sync == "Synced" and health != "Healthy":
             pods: dict[str, list[dict[str, Any]]] = {}
             for item in managed_items:
@@ -1119,46 +1208,45 @@ class GitOpsControllerHandler:
                 if not isinstance(item, dict) or item_health not in _DEGRADED_HEALTH:
                     continue
                 identity = resource_identity(item)
-                entry: dict[str, Any] = {
-                    **identity,
-                    "health": str(item_health)[:40],
-                    "message": self._bounded_message(_nested(item, "health", "message")),
-                    "pod_reasons": [],
-                }
+                reasons: list[dict[str, str]] = []
                 if (
                     identity["kind"] in _WORKLOAD_KINDS
                     and identity["namespace"] in flow.namespaces
                     and _KUBERNETES_NAME.fullmatch(identity["name"])
                 ):
-                    entry["pod_reasons"] = self._pod_reasons(
+                    reasons = self._pod_reasons(
                         identity["namespace"], identity["kind"], identity["name"], pods
                     )
-                entry["failure_class"] = classify_degraded(
-                    reason["reason"] for reason in entry["pod_reasons"]
-                )
-                degraded.append(entry)
+                failure_class = classify_degraded(reason["reason"] for reason in reasons)
+                classes.append(failure_class)
+                degraded_total += 1
                 if len(degraded) >= MAXIMUM_DIAGNOSED_RESOURCES:
-                    break
-        operation_message = self._bounded_message(operation_state.get("message"), 4000)
-        classes: list[str] = []
-        for entry in failed:
-            value = entry["failure_class"]
-            # A replaceable conflict Hermes may not touch is the operator's to fix.
-            if value in {"PATCH_CONFLICT", "JOB_IMMUTABLE"} and not entry["eligible"]:
-                value = "OTHER"
-            classes.append(value)
-        classes.extend(entry["failure_class"] for entry in degraded)
+                    continue
+                degraded.append(
+                    {
+                        **identity,
+                        "health": str(item_health)[:40],
+                        "message": self._bounded_message(_nested(item, "health", "message")),
+                        "pod_reasons": reasons[:MAXIMUM_POD_REASONS],
+                        "pod_reasons_total": len(reasons),
+                        "failure_class": failure_class,
+                    }
+                )
+        raw_message = str(operation_state.get("message") or "")
         if not classes and phase in {"Failed", "Error"}:
-            operation_class = classify_sync_failure("", operation_message)
+            operation_class = classify_sync_failure("", raw_message)
             classes.append("TRANSIENT" if operation_class == "TRANSIENT" else "OTHER")
         return {
             "application": flow.argo_application,
             "phase": phase[:40],
             "sync": sync[:40],
             "health": health[:40],
-            "message": operation_message[:SYNC_MESSAGE_LIMIT],
+            "operation_started_at": str(operation_state.get("startedAt") or "")[:80],
+            "message": self._bounded_message(raw_message),
             "failed_resources": failed,
+            "failed_resources_total": failed_total,
             "degraded_resources": degraded,
+            "degraded_resources_total": degraded_total,
             "classes": sorted(set(classes)),
             "failure_class": overall_failure_class(classes),
         }
@@ -1196,12 +1284,34 @@ class GitOpsControllerHandler:
             and _nested(application, "status", "sync", "status") != "Synced"
         )
 
+    @staticmethod
+    def _remediation_operation(
+        application: dict[str, Any], remediation_id: str
+    ) -> dict[str, Any] | None:
+        """The pending or last operation carrying this remediation identity, if any."""
+        for operation in (
+            application.get("operation"),
+            _nested(application, "status", "operationState", "operation"),
+        ):
+            info = _nested(operation, "info")
+            for item in info if isinstance(info, list) else []:
+                if (
+                    isinstance(item, dict)
+                    and item.get("name") == REMEDIATION_INFO
+                    and item.get("value") == remediation_id
+                ):
+                    return operation if isinstance(operation, dict) else None
+        return None
+
     def _remediate_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Bounded staging-only Argo CD sync remediation; never prunes.
 
-        The diagnosis is read again here: the payload only names what to repair, and each
-        named resource must still be failing with the matching class, be managed by the
-        Application, sit in the flow's namespaces and not have been repaired before.
+        Idempotent per ``remediation_id`` (workflow id, round, action): a retried attempt
+        whose write already landed returns that operation instead of syncing again. The
+        CURRENT Application is re-diagnosed on the same read the write is conditioned
+        on: the failed operation must still be the one the flow diagnosed, the overall
+        class must still be the remediable class (no OTHER), and every named resource
+        must still be failing, drifting, managed, in the flow's namespaces and unrepaired.
         """
         plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
         manifest, flow = enabled_staging_flow(self.settings.project_config_root, plan.project)
@@ -1214,81 +1324,147 @@ class GitOpsControllerHandler:
             1 <= round_number <= MAXIMUM_SYNC_REMEDIATION_ROUNDS
         ):
             raise StagingFlowBlocked("ARGO_REMEDIATION_ROUNDS_EXHAUSTED")
-        expected_class, sync_options = SYNC_REMEDIATION_ACTIONS[action]
-        application = self._application(flow)
-        previous_started = str(_nested(application, "status", "operationState", "startedAt") or "")
+        remediation_id = str(payload.get("remediation_id") or "")
+        if not _REMEDIATION_ID.fullmatch(remediation_id):
+            raise StagingFlowBlocked("ARGO_REMEDIATION_ID_INVALID")
+        expected_class, sync_options, force = SYNC_REMEDIATION_ACTIONS[action]
 
         def refused(blocker: str) -> dict[str, Any]:
             return {"status": "REMEDIATION_REFUSED", "blocker": blocker, "action": action}
 
-        def triggered(resources: list[dict[str, str]]) -> dict[str, Any]:
+        def triggered(
+            resources: list[dict[str, str]], previous: str, *, replayed: bool = False
+        ) -> dict[str, Any]:
             return {
                 "status": "REMEDIATION_TRIGGERED",
                 "action": action,
-                "sync_options": list(sync_options),
+                "remediation_id": remediation_id,
+                "replayed": replayed,
                 "resources": resources,
                 "remediated_keys": [resource_key(item) for item in resources],
-                "previous_operation_started_at": previous_started,
+                "previous_operation_started_at": previous,
             }
 
-        if action == "complete":
-            if not self._selective_sync_completed(application):
-                return refused("ARGO_REMEDIATION_NOTHING_TO_COMPLETE")
-            if not self._refresh_and_sync(flow, application):
-                return {"status": "SYNC_BUSY", "action": action}
-            return triggered([])
-        diagnosis = self._sync_diagnosis(flow, application)
-        if action == "resync":
-            attempt = payload.get("attempt")
-            if not isinstance(attempt, int) or not 1 <= attempt <= MAXIMUM_TRANSIENT_RESYNCS:
-                return refused("ARGO_REMEDIATION_TRANSIENT_RETRIES_EXHAUSTED")
-            if diagnosis["failure_class"] != "TRANSIENT":
-                return refused("ARGO_REMEDIATION_CLASS_MISMATCH")
-            if not self._refresh_and_sync(flow, application):
-                return {"status": "SYNC_BUSY", "action": action}
-            return triggered([])
-        raw_resources = payload.get("resources")
-        if not isinstance(raw_resources, list) or not raw_resources:
-            return refused("ARGO_REMEDIATION_NO_RESOURCES")
-        if len(raw_resources) > MAXIMUM_REMEDIATED_RESOURCES:
-            return refused("ARGO_REMEDIATION_TOO_MANY_RESOURCES")
+        existing = self._remediation_operation(self._application(flow), remediation_id)
+        if existing is not None:
+            info = existing.get("info")
+            previous = next(
+                (
+                    str(item.get("value") or "")
+                    for item in (info if isinstance(info, list) else [])
+                    if isinstance(item, dict) and item.get("name") == REMEDIATION_PREVIOUS_INFO
+                ),
+                "",
+            )
+            raw = _nested(existing, "sync", "resources")
+            resources = [
+                resource_identity(item)
+                for item in (raw if isinstance(raw, list) else [])
+                if isinstance(item, dict)
+            ]
+            return triggered(resources, "" if previous == "-" else previous, replayed=True)
+
+        attempt = payload.get("attempt")
+        if action == "resync" and (
+            not isinstance(attempt, int) or not 1 <= attempt <= MAXIMUM_TRANSIENT_RESYNCS
+        ):
+            return refused("ARGO_REMEDIATION_TRANSIENT_RETRIES_EXHAUSTED")
+        selected: list[dict[str, str]] = []
+        if action in {"replace", "replace_force"}:
+            raw_resources = payload.get("resources")
+            if not isinstance(raw_resources, list) or not raw_resources:
+                return refused("ARGO_REMEDIATION_NO_RESOURCES")
+            if len(raw_resources) > MAXIMUM_REMEDIATED_RESOURCES:
+                return refused("ARGO_REMEDIATION_TOO_MANY_RESOURCES")
+            for raw in raw_resources:
+                if not isinstance(raw, dict):
+                    return refused("ARGO_REMEDIATION_RESOURCE_INVALID")
+                identity = resource_identity(raw)
+                if identity["namespace"] not in flow.namespaces:
+                    return refused("ARGO_REMEDIATION_OUTSIDE_NAMESPACES")
+                if not _KUBERNETES_NAME.fullmatch(identity["name"]) or not identity["kind"]:
+                    return refused("ARGO_REMEDIATION_RESOURCE_INVALID")
+                if action == "replace_force" and (
+                    identity["kind"] != "Job" or identity["group"] != "batch"
+                ):
+                    return refused("ARGO_REMEDIATION_FORCE_REQUIRES_JOB")
+                if identity not in selected:
+                    selected.append(identity)
         raw_done = payload.get("already_remediated")
         done = {str(value) for value in raw_done} if isinstance(raw_done, list) else set()
-        managed_items = _nested(application, "status", "resources")
-        managed = {
-            resource_key(item)
-            for item in (managed_items if isinstance(managed_items, list) else [])
-            if isinstance(item, dict)
-        }
-        failing = {resource_key(entry): entry for entry in diagnosis["failed_resources"]}
-        selected: list[dict[str, str]] = []
-        for raw in raw_resources:
-            if not isinstance(raw, dict):
-                return refused("ARGO_REMEDIATION_RESOURCE_INVALID")
-            identity = resource_identity(raw)
-            key = resource_key(identity)
-            if identity["namespace"] not in flow.namespaces:
-                return refused("ARGO_REMEDIATION_OUTSIDE_NAMESPACES")
-            if not _KUBERNETES_NAME.fullmatch(identity["name"]) or not identity["kind"]:
-                return refused("ARGO_REMEDIATION_RESOURCE_INVALID")
-            if key not in managed:
-                return refused("ARGO_REMEDIATION_RESOURCE_NOT_MANAGED")
-            if key in done:
-                return refused("ARGO_REMEDIATION_ALREADY_APPLIED")
-            if action == "replace_force" and (
-                identity["kind"] != "Job" or identity["group"] != "batch"
-            ):
-                return refused("ARGO_REMEDIATION_FORCE_REQUIRES_JOB")
-            entry = failing.get(key)
-            if entry is None or entry["failure_class"] != expected_class:
-                return refused("ARGO_REMEDIATION_CLASS_MISMATCH")
-            if identity not in selected:
-                selected.append(identity)
-        if not self._refresh_and_sync(
-            flow, application, resources=selected, sync_options=sync_options
-        ):
+        failed_started = str(payload.get("failed_operation_started_at") or "")
+        previous_started = ""
+
+        def build(application: dict[str, Any]) -> dict[str, Any] | str:
+            nonlocal previous_started
+            operation_state = _nested(application, "status", "operationState")
+            operation_state = operation_state if isinstance(operation_state, dict) else {}
+            previous_started = str(operation_state.get("startedAt") or "")
+            if action == "complete":
+                if not self._selective_sync_completed(application):
+                    return "ARGO_REMEDIATION_NOTHING_TO_COMPLETE"
+            else:
+                diagnosis = self._sync_diagnosis(flow, application)
+                if diagnosis["sync"] == "Synced" and diagnosis["health"] == "Healthy":
+                    return "ARGO_REMEDIATION_NOT_NEEDED"
+                failed_phase = diagnosis["phase"] in {"Failed", "Error"}
+                if failed_started or action != "resync":
+                    # The failed operation the flow diagnosed must still be the latest.
+                    if (
+                        not failed_phase
+                        or not failed_started
+                        or previous_started != failed_started
+                        or _nested(operation_state, "operation", "initiatedBy", "username")
+                        != ARGO_SYNC_USERNAME
+                    ):
+                        return "ARGO_REMEDIATION_STALE_DIAGNOSIS"
+                elif diagnosis["sync"] != "Synced":
+                    # A transient re-sync of degraded health needs a Synced application.
+                    return "ARGO_REMEDIATION_STALE_DIAGNOSIS"
+                if diagnosis["failure_class"] != expected_class:
+                    return "ARGO_REMEDIATION_CLASS_MISMATCH"
+                managed_items = _nested(application, "status", "resources")
+                managed = {
+                    resource_key(item)
+                    for item in (managed_items if isinstance(managed_items, list) else [])
+                    if isinstance(item, dict)
+                }
+                failing = {resource_key(entry): entry for entry in diagnosis["failed_resources"]}
+                for identity in selected:
+                    key = resource_key(identity)
+                    if key not in managed:
+                        return "ARGO_REMEDIATION_RESOURCE_NOT_MANAGED"
+                    if key in done:
+                        return "ARGO_REMEDIATION_ALREADY_APPLIED"
+                    entry = failing.get(key)
+                    if entry is None or entry["failure_class"] != expected_class:
+                        return "ARGO_REMEDIATION_CLASS_MISMATCH"
+                    if not entry["current"]:
+                        return "ARGO_REMEDIATION_STALE_DIAGNOSIS"
+            sync: dict[str, Any] = {}
+            if selected:
+                sync["resources"] = selected
+            if sync_options:
+                sync["syncOptions"] = list(sync_options)
+            if force:
+                # Argo CD reads force from the sync strategy, never from syncOptions.
+                sync["syncStrategy"] = {"apply": {"force": True}}
+            return {
+                "initiatedBy": {"username": ARGO_SYNC_USERNAME},
+                "info": [
+                    {"name": REMEDIATION_INFO, "value": remediation_id},
+                    {"name": REMEDIATION_PREVIOUS_INFO, "value": previous_started or "-"},
+                ],
+                "sync": sync,
+            }
+
+        self._refresh(flow)
+        started = self._start_operation(flow, build)
+        if started == "BUSY":
             return {"status": "SYNC_BUSY", "action": action}
-        return triggered(selected)
+        if started != "STARTED":
+            return refused(started)
+        return triggered(selected, previous_started)
 
     def _notify_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Queue one bounded, redacted operator notification (Telegram via the outbox)."""
@@ -2526,9 +2702,16 @@ def _sync_attempts(value: Any) -> list[dict[str, Any]]:
     return attempts
 
 
+_RENDER_REDACTOR = SecretRedactor()
+
+
 def _code(value: Any, limit: int) -> str:
-    """Inline-code-safe, single-line, bounded text for an issue body."""
-    return "`" + " ".join(str(value or "").split()).replace("`", "'")[:limit] + "`"
+    """Inline-code-safe, single-line, bounded text for an issue body.
+
+    NEW-113: redact the original text before flattening it (line-anchored patterns).
+    """
+    redacted = str(_RENDER_REDACTOR.redact_text(str(value or "")).value)
+    return "`" + " ".join(redacted.split()).replace("`", "'")[:limit] + "`"
 
 
 def render_sync_failure(

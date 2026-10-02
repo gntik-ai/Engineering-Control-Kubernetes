@@ -26,6 +26,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
+from pre_new_113_gitops_workflow import ParentStagingGitOpsDeliveryWorkflow
 from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
@@ -1952,6 +1953,7 @@ _SYNC_FAILED = {
     "blocker": "ARGO_SYNC_FAILED",
     "message": "one or more objects failed to apply",
     "phase": "Failed",
+    "operation_started_at": "2026-10-02T09:00:00Z",
 }
 
 
@@ -2014,18 +2016,6 @@ class _FastStagingGitOpsWorkflow(StagingGitOpsDeliveryWorkflow):
     @workflow.run
     async def run(self, request: StagingGitOpsDeliveryInput) -> dict[str, Any]:
         return await super().run(request)
-
-
-@workflow.defn(name="StagingGitOpsDeliveryWorkflow", sandboxed=False)
-class _PreSyncRecoveryWorkflow(StagingGitOpsDeliveryWorkflow):
-    """StagingGitOpsDeliveryWorkflow exactly as it ran before NEW-113."""
-
-    @workflow.run
-    async def run(self, request: StagingGitOpsDeliveryInput) -> dict[str, Any]:
-        return await super().run(request)
-
-    def _sync_recovery_patched(self) -> bool:
-        return False
 
 
 def _markers(history: Any) -> list[bytes]:
@@ -2104,6 +2094,10 @@ async def test_a_patch_conflict_is_replaced_then_verified() -> None:
     (remediation,) = _payloads(history, "gitops.remediate_sync")
     assert remediation["action"] == "replace" and remediation["resources"] == [_EXECUTOR]
     assert (remediation["round"], remediation["already_remediated"]) == (1, [])
+    # Finding 2/4: a stable identity and the failed operation the diagnosis describes.
+    assert remediation["remediation_id"].endswith(":round-1:replace")
+    assert remediation["remediation_id"].startswith("replay-test-StagingGitOpsDeliveryWorkflow-")
+    assert remediation["failed_operation_started_at"] == "2026-10-02T09:00:00Z"
     assert _payloads(history, "gitops.sync_status")[1]["selective"] is True
     notices = _payloads(history, "gitops.notify_sync")
     assert [notice["event"] for notice in notices] == ["detected", "remediation"]
@@ -2257,10 +2251,10 @@ async def test_a_synced_but_unhealthy_timeout_is_diagnosed_and_escalated() -> No
 
 
 async def test_a_pre_new_113_sync_failure_history_replays_unchanged() -> None:
-    """A sync failure recorded before NEW-113 (no marker) replays against the current code
-    with its old BLOCKED return: no diagnosis, remediation, issue or notification."""
+    """A sync failure recorded by the PARENT implementation (origin/main, before NEW-113)
+    replays against the current code with its old BLOCKED return."""
     history, result = await _run_to_history(
-        _PreSyncRecoveryWorkflow,
+        ParentStagingGitOpsDeliveryWorkflow,
         _gitops_input(),
         _scripted_execute_control_step(_sync_recovery_script()),
     )
@@ -2273,5 +2267,89 @@ async def test_a_pre_new_113_sync_failure_history_replays_unchanged() -> None:
         "gitops.sync_status",
         "gitops.persist_result",
     ]
-    assert not any(b"argo-sync-remediation" in marker for marker in _markers(history))
+    assert not _markers(history)
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+def _timer_durations(history: Any) -> list[timedelta]:
+    return [
+        event.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta()
+        for event in history.events
+        if event.HasField("timer_started_event_attributes")
+    ]
+
+
+def test_production_timers_are_not_rescaled() -> None:
+    interval = timedelta(seconds=30)
+    assert StagingGitOpsDeliveryWorkflow._TIMER_SCALE == 1.0
+    assert StagingGitOpsDeliveryWorkflow()._timer(interval) is interval
+
+
+async def test_an_execution_mid_sync_poll_upgrades_into_the_new_path() -> None:
+    """The parent implementation records a sync poll and its 30 s timer; the worker is
+    then upgraded. The new code replays that prefix, records its own identical 30 s poll
+    timer, and the next failure takes the NEW-113 path (marker after the old prefix)."""
+    pending = {"status": "SYNC_PENDING", "phase": "Running", "sync": "OutOfSync"}
+    activity_fn = _sequenced_step(
+        _sync_recovery_script(**{"gitops.diagnose_sync": _diagnosed("OTHER")}),
+        {"gitops.sync_status": [pending, pending, _SYNC_FAILED]},
+    )
+
+    def workers(client: Any, workflow_cls: type) -> list[Worker]:
+        return [
+            Worker(client, task_queue=queue, workflows=[workflow_cls], activities=[activity_fn])
+            for queue in (CONTROL_TASK_QUEUE, GITHUB_TASK_QUEUE)
+        ]
+
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        old = workers(env.client, ParentStagingGitOpsDeliveryWorkflow)
+        async with old[0], old[1]:
+            handle = await env.client.start_workflow(
+                StagingGitOpsDeliveryWorkflow.run,
+                _gitops_input(),
+                id=f"replay-test-mid-poll-upgrade-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=3),
+            )
+            for _ in range(300):
+                prefix = await handle.fetch_history()
+                if _timer_durations(prefix):
+                    break
+                await asyncio.sleep(0.1)
+        assert _timer_durations(prefix) == [timedelta(seconds=30)]
+        assert not _markers(prefix)
+        new = workers(env.client, StagingGitOpsDeliveryWorkflow)
+        async with new[0], new[1]:
+            result = await handle.result()
+            history = await handle.fetch_history()
+
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_FAILED",
+        "OTHER",
+    )
+    # Old timer and the upgraded code's timer are the same production command.
+    assert _timer_durations(history) == [timedelta(seconds=30)] * 2
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert steps[len(_BEFORE_SYNC) :] == [
+        "gitops.sync_status",
+        "gitops.sync_status",
+        "gitops.sync_status",
+        "gitops.diagnose_sync",
+        "gitops.notify_sync",
+        "gitops.environment_issue",
+        "gitops.notify_sync",
+        "gitops.persist_result",
+    ]
+    marker_index = next(
+        index
+        for index, event in enumerate(history.events)
+        if event.HasField("marker_recorded_event_attributes")
+    )
+    timer_index = next(
+        index
+        for index, event in enumerate(history.events)
+        if event.HasField("timer_started_event_attributes")
+    )
+    assert marker_index > timer_index
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
