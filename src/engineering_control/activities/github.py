@@ -29,7 +29,30 @@ from .gitops import GitOpsGitHubHandler
 
 # The backlog import keeps 4000 chars; operator decisions are usually appended at the
 # end of the body, so the refresh keeps more (Finding.actual_behavior allows 20000).
-ISSUE_BODY_REFRESH_LIMIT = 8000
+# NEW-111: 8000 silently dropped every decision past that offset (falcone #980 lost
+# addenda 13-15). A longer body now keeps its opening and its END, the newest decisions,
+# with an explicit omission marker in between.
+ISSUE_BODY_REFRESH_LIMIT = 20_000
+ISSUE_BODY_REFRESH_HEAD = 6_000
+
+
+def bounded_issue_body(body: str, limit: int = ISSUE_BODY_REFRESH_LIMIT) -> tuple[str, bool]:
+    """Return at most ``limit`` chars: the whole body, or its head and tail with a marker."""
+    if len(body) <= limit:
+        return body, False
+    head = body[:ISSUE_BODY_REFRESH_HEAD]
+    marker_template = (
+        "\n\n[Hermes omitted {omitted} characters from the middle of this issue; "
+        "the opening and the most recent text, where operator decisions are appended, "
+        "are kept in full.]\n\n"
+    )
+    # The omitted count can change the marker's length by a few digits; size it with the
+    # widest possible count so the result never exceeds the limit.
+    reserve = len(marker_template.format(omitted=len(body)))
+    tail_length = limit - len(head) - reserve
+    tail = body[-tail_length:]
+    marker = marker_template.format(omitted=len(body) - len(head) - len(tail))
+    return head + marker + tail, True
 
 
 class GitHubActivityHandler:
@@ -100,11 +123,13 @@ class GitHubActivityHandler:
         body = str(SecretRedactor().redact_text(str(value["body"])).value).strip()
         if not body:
             return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": "ISSUE_BODY_EMPTY"}
-        excerpt = body[:ISSUE_BODY_REFRESH_LIMIT]
+        excerpt, truncated = bounded_issue_body(body)
         return {
             "status": "ISSUE_BODY_REFRESHED",
             "body_excerpt": excerpt,
             "body_sha256": hashlib.sha256(excerpt.encode()).hexdigest(),
+            "body_chars": len(body),
+            "body_truncated": truncated,
             "issue_state": str(value.get("state") or "")[:20],
         }
 

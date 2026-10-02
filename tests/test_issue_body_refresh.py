@@ -56,8 +56,45 @@ async def test_refresh_truncates_and_redacts(tmp_path: Any) -> None:
     )
 
     assert result["status"] == "ISSUE_BODY_REFRESHED"
-    assert len(result["body_excerpt"]) == github_activity.ISSUE_BODY_REFRESH_LIMIT
+    assert len(result["body_excerpt"]) <= github_activity.ISSUE_BODY_REFRESH_LIMIT
+    assert result["body_truncated"] is True
     assert token not in result["body_excerpt"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_the_latest_operator_decisions_of_a_long_body(tmp_path: Any) -> None:
+    # NEW-111: falcone #980 grew to 11 250 chars and its last addenda (offset > 8000) were
+    # silently dropped, so CI-repair makers never saw the operator's latest decisions.
+    body = "## Original issue\n" + "context line\n" * 2_500 + "## Addendum 15: remove the trigger\n"
+    assert len(body) > github_activity.ISSUE_BODY_REFRESH_LIMIT
+    result = await _handler(tmp_path, _Broker({"state": "OPEN", "body": body})).handle(
+        "delivery.refresh_issue_body",
+        {"issue_repository": "gntik-ai/falcone", "issue_number": 980},
+    )
+
+    excerpt = result["body_excerpt"]
+    assert len(excerpt) <= github_activity.ISSUE_BODY_REFRESH_LIMIT
+    assert excerpt.startswith("## Original issue")
+    assert excerpt.endswith("## Addendum 15: remove the trigger")
+    assert "Hermes omitted" in excerpt
+    assert result["body_truncated"] is True
+    assert result["body_chars"] == len(body.strip())
+
+
+def test_a_body_within_the_limit_is_kept_whole() -> None:
+    body = "a" * 11_250  # the size that lost #980's addenda under the old 8000 limit
+    excerpt, truncated = github_activity.bounded_issue_body(body)
+    assert excerpt == body and truncated is False
+
+
+@pytest.mark.parametrize("length", [20_001, 25_000, 1_000_000])
+def test_a_bounded_body_never_exceeds_the_limit(length: int) -> None:
+    excerpt, truncated = github_activity.bounded_issue_body("b" * length)
+    assert truncated is True
+    assert len(excerpt) <= github_activity.ISSUE_BODY_REFRESH_LIMIT
+    omitted = int(excerpt.split("Hermes omitted ", 1)[1].split(" ", 1)[0])
+    kept = excerpt.count("b")
+    assert kept + omitted == length
 
 
 @pytest.mark.asyncio
