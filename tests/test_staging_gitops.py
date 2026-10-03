@@ -290,7 +290,12 @@ class FakeKubectl:
                     target = self.application
                     for part in parts[:-1]:
                         target = target[int(part)] if isinstance(target, list) else target[part]
-                    if operation["op"] != "test":
+                    if operation["op"] == "remove":
+                        # RFC 6902: removing an absent member fails the whole patch.
+                        if parts[-1] not in target:
+                            return CommandResult(1, "", "Unprocessable Entity")
+                        del target[parts[-1]]
+                    elif operation["op"] != "test":
                         target[parts[-1]] = operation["value"]
                 self._bump()
             else:
@@ -673,7 +678,7 @@ async def test_remediation_is_bounded_to_project_resources(tmp_path: Path) -> No
     ]
     assert kubectl.application["operation"] == {
         "initiatedBy": {"username": "hermes-engineering"},
-        "sync": {"prune": False},
+        "sync": {"prune": False, "syncStrategy": {"hook": {}}},
     }
 
 
@@ -719,9 +724,12 @@ async def test_trigger_sync_pins_the_chart_source_and_requests_a_sync(tmp_path: 
                 "path": "/operation",
                 "value": {
                     "initiatedBy": {"username": "hermes-engineering"},
-                    "sync": {"prune": False},
+                    "sync": {"prune": False, "syncStrategy": {"hook": {}}},
                 },
             },
+            # NEW-116: the previous operation state is cleared with the write, so the
+            # controller cannot merge the new operation into it.
+            {"op": "remove", "path": "/status/operationState"},
         ],
     ]
     assert kubectl.application["operation"]["initiatedBy"]["username"] == "hermes-engineering"
@@ -770,6 +778,10 @@ async def test_sync_status_requires_a_new_hermes_operation(tmp_path: Path) -> No
     failed = await handler.handle("gitops.sync_status", payload)
     assert failed["status"] == "SYNC_FAILED" and failed["blocker"] == "ARGO_SYNC_FAILED"
     kubectl.application["status"]["operationState"]["phase"] = "Succeeded"
+    # NEW-116: SYNCED needs the operation to have synced the pinned chart revision.
+    kubectl.application["status"]["operationState"]["syncResult"] = {
+        "revisions": [OLD_CHART_REVISION, "e" * 40]
+    }
     synced = await handler.handle("gitops.sync_status", payload)
     assert synced["status"] == "SYNCED"
     assert synced["argo_revision"] == f"{OLD_CHART_REVISION},{'e' * 40}"
@@ -2765,7 +2777,7 @@ async def test_transient_resync_and_completion_use_a_normal_sync(tmp_path: Path)
         _remediate(action="resync", attempt=3, resources=[], remediation_id="wf:r1:resync"),
     )
     assert resynced["status"] == "REMEDIATION_TRIGGERED" and resynced["resources"] == []
-    assert _written_operation(kubectl)["sync"] == {"prune": False}
+    assert _written_operation(kubectl)["sync"] == {"prune": False, "syncStrategy": {"hook": {}}}
 
     # Degraded health (no failed operation): a transient re-sync needs Synced + unhealthy.
     degraded = _application(
@@ -2805,7 +2817,16 @@ async def test_transient_resync_and_completion_use_a_normal_sync(tmp_path: Path)
     )
     assert completed["status"] == "REMEDIATION_TRIGGERED"
     assert completed["previous_operation_started_at"] == "2026-10-02T09:05:00Z"
-    assert _written_operation(completing)["sync"] == {"prune": False}
+    # NEW-116: the follow-up is a TRUE full sync, never the replace's inherited scope.
+    assert _written_operation(completing)["sync"] == {
+        "prune": False,
+        "syncStrategy": {"hook": {}},
+    }
+    assert _operation_patches(completing)[-1][-1] == {
+        "op": "remove",
+        "path": "/status/operationState",
+    }
+    assert "operationState" not in completing.application["status"]
 
     payload = {
         "plan": _plan(),
@@ -2816,11 +2837,13 @@ async def test_transient_resync_and_completion_use_a_normal_sync(tmp_path: Path)
         "gitops.sync_status", payload
     )
     assert partial["status"] == "SYNC_PARTIAL"
-    # Without the flag (every pre-NEW-113 caller) the same state stays SYNC_PENDING.
-    pending = await _controller(tmp_path / "d", FakeKubectl(application=selective)).handle(
+    # NEW-116: without the flag a full sync was requested, so a completed selective
+    # operation is an inherited scope, never a pending or synced full sync.
+    inherited = await _controller(tmp_path / "d", FakeKubectl(application=selective)).handle(
         "gitops.sync_status", {**payload, "selective": None}
     )
-    assert pending["status"] == "SYNC_PENDING"
+    assert inherited["status"] == "SYNC_SCOPE_INHERITED"
+    assert inherited["scope_violations"][:2] == ["resources", "sync_options"]
 
 
 @pytest.mark.asyncio
@@ -3072,3 +3095,276 @@ def test_an_ambiguous_write_failure_is_not_a_conflict(output: str) -> None:
     from engineering_control.activities.gitops import _CONDITIONAL_WRITE_CONFLICT
 
     assert not _CONDITIONAL_WRITE_CONFLICT.search(output)
+
+
+# -- NEW-116: a full sync must never inherit a previous selective scope -----------------
+
+OPERATOR_SELECTIVE = {
+    "phase": "Succeeded",
+    "startedAt": "2026-10-02T08:00:00Z",
+    "finishedAt": "2026-10-02T08:01:00Z",
+    "message": "successfully synced (all tasks run)",
+    "operation": {
+        "initiatedBy": {"username": "operator"},
+        "sync": {
+            "revision": "e5a9e49",
+            "resources": [EXECUTOR_TARGET],
+            "syncOptions": ["Replace=true"],
+        },
+    },
+    "syncResult": {"revisions": [OLD_CHART_REVISION, "e" * 40]},
+}
+
+
+def _merge_patch(target: Any, patch: Any) -> Any:
+    """RFC 7386 JSON merge patch, as the API server applies it."""
+    if not isinstance(patch, dict):
+        return patch
+    merged = dict(target) if isinstance(target, dict) else {}
+    for key, value in patch.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = _merge_patch(merged.get(key), value)
+    return merged
+
+
+def _omitempty(value: Any) -> Any:
+    """Go encoding/json ``omitempty``: drops "", false, nil and empty lists (not {})."""
+    if isinstance(value, dict):
+        return {
+            key: _omitempty(item)
+            for key, item in value.items()
+            if item not in (None, "", False, [])
+        }
+    if isinstance(value, list):
+        return [_omitempty(item) for item in value]
+    return value
+
+
+def _argo_v342_initialises(application: dict[str, Any], started_at: str) -> None:
+    """Argo CD v3.4.2 processRequestedAppOperation -> NewOperationState -> setOperationState:
+    a JSON MERGE patch of status.operationState with the omitempty-encoded new state."""
+    state = {
+        "operation": _omitempty(application["operation"]),
+        "phase": "Running",
+        "startedAt": started_at,
+    }
+    status = application["status"]
+    status["operationState"] = _merge_patch(status.get("operationState"), state)
+
+
+@pytest.mark.asyncio
+async def test_new_116_a_plain_trigger_after_a_selective_sync_writes_a_true_full_sync(
+    tmp_path: Path,
+) -> None:
+    # The live falcone-staging case: an operator's selective Replace=true sync of the
+    # executor at e5a9e49 is the last operation; Hermes then triggers its normal sync.
+    application = _application(
+        operationState=json.loads(json.dumps(OPERATOR_SELECTIVE)),
+        sync={"status": "OutOfSync", "revisions": [OLD_CHART_REVISION, "e" * 40]},
+    )
+    kubectl = FakeKubectl(application=application)
+    handler = _controller(tmp_path, kubectl)
+    result = await handler.handle("gitops.trigger_sync", {"plan": _plan(), "merge_sha": MERGE_SHA})
+    assert result["status"] == "SYNC_TRIGGERED"
+    assert result["previous_operation_started_at"] == "2026-10-02T08:00:00Z"
+    (patch,) = _operation_patches(kubectl)
+    assert patch[1:] == [
+        {
+            "op": "add",
+            "path": "/operation",
+            "value": {
+                "initiatedBy": {"username": "hermes-engineering"},
+                "sync": {"prune": False, "syncStrategy": {"hook": {}}},
+            },
+        },
+        {"op": "remove", "path": "/status/operationState"},
+    ]
+    assert patch[0]["op"] == "test" and patch[0]["path"] == "/metadata/resourceVersion"
+
+    # The controller's merge now starts from nothing: no resources, syncOptions or
+    # revision of the operator's selective sync survive into the new operation.
+    _argo_v342_initialises(kubectl.application, "2026-10-03T10:00:00Z")
+    sync = kubectl.application["status"]["operationState"]["operation"]["sync"]
+    assert sync == {"syncStrategy": {"hook": {}}}
+
+    # Control: the pre-NEW-116 write (operation only) inherits the selective scope.
+    inherited = _application(operationState=json.loads(json.dumps(OPERATOR_SELECTIVE)))
+    inherited["operation"] = {
+        "initiatedBy": {"username": "hermes-engineering"},
+        "sync": {"prune": False},
+    }
+    _argo_v342_initialises(inherited, "2026-10-03T10:00:00Z")
+    assert inherited["status"]["operationState"]["operation"]["sync"] == {
+        "revision": "e5a9e49",
+        "resources": [EXECUTOR_TARGET],
+        "syncOptions": ["Replace=true"],
+    }
+
+    # The completed TRUE full sync of the pinned revision is SYNCED.
+    kubectl.application.pop("operation")
+    state = kubectl.application["status"]["operationState"]
+    state.update(phase="Succeeded", syncResult={"revisions": [MERGE_SHA, "e" * 40]})
+    kubectl.application["status"]["sync"] = {
+        "status": "Synced",
+        "revisions": [MERGE_SHA, "e" * 40],
+    }
+    synced = await handler.handle(
+        "gitops.sync_status",
+        {**_plan_payload(), "previous_operation_started_at": "2026-10-02T08:00:00Z"},
+    )
+    assert synced["status"] == "SYNCED"
+
+
+def _plan_payload() -> dict[str, Any]:
+    return {"plan": _plan(), "merge_sha": MERGE_SHA}
+
+
+@pytest.mark.asyncio
+async def test_new_116_an_inherited_selective_operation_is_never_synced(tmp_path: Path) -> None:
+    # What falcone-staging showed after every Hermes trigger since 2026-10-02: Hermes's
+    # operation, merged into the operator's selective one. Even Synced+Healthy is refused.
+    merged = json.loads(json.dumps(OPERATOR_SELECTIVE))
+    merged["operation"]["initiatedBy"] = {"username": "hermes-engineering"}
+    merged["startedAt"] = "2026-10-03T10:00:00Z"
+    kubectl = FakeKubectl(application=_application(operationState=merged))
+    handler = _controller(tmp_path, kubectl)
+    payload = {**_plan_payload(), "previous_operation_started_at": "2026-10-02T08:00:00Z"}
+    result = await handler.handle("gitops.sync_status", payload)
+    assert result["status"] == "SYNC_SCOPE_INHERITED"
+    assert result["blocker"] == "ARGO_SYNC_SCOPE_INHERITED"
+    assert result["scope_violations"] == ["resources", "sync_options", "explicit_revision"]
+    assert result["operation_started_at"] == "2026-10-03T10:00:00Z"
+    assert (result["sync"], result["health"]) == ("Synced", "Healthy")
+
+    # Inherited even when the selective sync itself failed: reported apart from SYNC_FAILED.
+    kubectl.application["status"]["operationState"]["phase"] = "Failed"
+    failed = await handler.handle("gitops.sync_status", payload)
+    assert failed["status"] == "SYNC_SCOPE_INHERITED"
+
+    # A full sync that did not sync the pinned chart revision is not SYNCED either.
+    kubectl.application["spec"]["sources"][0]["targetRevision"] = MERGE_SHA
+    kubectl.application["status"]["operationState"] = {
+        "phase": "Succeeded",
+        "startedAt": "2026-10-03T10:00:00Z",
+        "operation": {
+            "initiatedBy": {"username": "hermes-engineering"},
+            "sync": {"syncStrategy": {"hook": {}}},
+        },
+        "syncResult": {"revisions": [OLD_CHART_REVISION, "e" * 40]},
+    }
+    stale = await handler.handle("gitops.sync_status", payload)
+    assert stale["status"] == "SYNC_SCOPE_INHERITED"
+    assert stale["scope_violations"] == ["revision"]
+    # An apply strategy (skips hooks) is not a full sync.
+    state = kubectl.application["status"]["operationState"]
+    state["syncResult"] = {"revisions": [MERGE_SHA, "e" * 40]}
+    state["operation"]["sync"] = {"syncStrategy": {"apply": {"force": True}}}
+    applied = await handler.handle("gitops.sync_status", payload)
+    assert applied["scope_violations"] == ["apply_strategy"]
+    # A selective replace remediation keeps its selective semantics.
+    state["operation"]["sync"] = {"resources": [EXECUTOR_TARGET]}
+    kubectl.application["status"]["sync"]["status"] = "OutOfSync"
+    partial = await handler.handle("gitops.sync_status", {**payload, "selective": True})
+    assert partial["status"] == "SYNC_PARTIAL"
+
+
+@pytest.mark.asyncio
+async def test_new_116_full_resync_remediation_is_one_true_full_sync(tmp_path: Path) -> None:
+    merged = json.loads(json.dumps(OPERATOR_SELECTIVE))
+    merged["operation"]["initiatedBy"] = {"username": "hermes-engineering"}
+    merged["startedAt"] = FAILED_AT
+    application = _application(operationState=merged)
+    application["status"]["sync"]["status"] = "OutOfSync"
+    original = json.dumps(application)
+    kubectl = FakeKubectl(application=json.loads(original))
+    handler = _controller(tmp_path, kubectl)
+    payload = _remediate(
+        action="full_resync", attempt=1, resources=[], remediation_id="wf:r1:full_resync"
+    )
+    triggered = await handler.handle("gitops.remediate_sync", payload)
+    assert triggered["status"] == "REMEDIATION_TRIGGERED"
+    assert triggered["previous_operation_started_at"] == FAILED_AT
+    (patch,) = _operation_patches(kubectl)
+    assert patch[1]["value"]["sync"] == {"prune": False, "syncStrategy": {"hook": {}}}
+    assert patch[2] == {"op": "remove", "path": "/status/operationState"}
+
+    # At most once, and only for the diagnosed inherited operation.
+    again = await _controller(tmp_path / "b", FakeKubectl(application=json.loads(original))).handle(
+        "gitops.remediate_sync", {**payload, "attempt": 2}
+    )
+    assert again["blocker"] == "ARGO_REMEDIATION_SCOPE_RETRIES_EXHAUSTED"
+    stale = await _controller(tmp_path / "c", FakeKubectl(application=json.loads(original))).handle(
+        "gitops.remediate_sync", {**payload, "failed_operation_started_at": "2026-10-01T00:00Z"}
+    )
+    assert stale["blocker"] == "ARGO_REMEDIATION_STALE_DIAGNOSIS"
+    full = json.loads(original)
+    full["status"]["operationState"]["operation"]["sync"] = {}
+    clean = await _controller(tmp_path / "d", FakeKubectl(application=full)).handle(
+        "gitops.remediate_sync", payload
+    )
+    assert clean["blocker"] == "ARGO_REMEDIATION_STALE_DIAGNOSIS"
+
+
+@pytest.mark.asyncio
+async def test_new_116_escalation_lists_out_of_sync_resources(tmp_path: Path) -> None:
+    # The sync "succeeded" (selectively) but the application is OutOfSync: the issue must
+    # name what is OutOfSync instead of "Failed resources: none / Degraded: none".
+    merged = json.loads(json.dumps(OPERATOR_SELECTIVE))
+    merged["operation"]["initiatedBy"] = {"username": "hermes-engineering"}
+    application = _application(
+        operationState=merged,
+        sync={"status": "OutOfSync"},
+        resources=[
+            {**_managed("Deployment", "falcone-control-plane-executor"), "status": "Synced"},
+            _managed("Job", "falcone-migrate", group="batch"),
+            _managed("Deployment", "falcone-web"),
+        ],
+    )
+    kubectl = FakeKubectl(application=application)
+    diagnosed = await _controller(tmp_path, kubectl).handle(
+        "gitops.diagnose_sync", {"plan": _plan()}
+    )
+    diagnosis = diagnosed["diagnosis"]
+    assert diagnosis["failed_resources"] == [] and diagnosis["degraded_resources"] == []
+    assert [item["name"] for item in diagnosis["out_of_sync_resources"]] == [
+        "falcone-migrate",
+        "falcone-web",
+    ]
+    assert diagnosis["out_of_sync_resources_total"] == 2
+    assert diagnosis["operation_scope"] == {
+        "resources_total": 1,
+        "sync_options": ["Replace=true"],
+        "strategy": "hook",
+    }
+
+    handler, fake = _github(tmp_path / "gh")
+    opened = await handler.handle(
+        "gitops.environment_issue",
+        {
+            "plan": _plan(),
+            "merge_sha": MERGE_SHA,
+            "action": "report_sync",
+            "failure_class": "SCOPE_INHERITED",
+            "blocker": "ARGO_SYNC_FAILED",
+            "diagnosis": diagnosis,
+            "attempts": [
+                {
+                    "round": 1,
+                    "action": "full_resync",
+                    "failure_class": "SCOPE_INHERITED",
+                    "resources": [],
+                    "result": "SYNC_SCOPE_INHERITED",
+                }
+            ],
+        },
+    )
+    assert opened["status"] == "ISSUE_OPENED"
+    body = fake.issues[("gntik-ai/musematic", opened["issue_number"])]["body"]
+    section = body.split("### OutOfSync resources", 1)[1]
+    assert "`falcone-migrate` status=`OutOfSync`" in section
+    assert "`falcone-web` status=`OutOfSync`" in section
+    assert "executor" not in section
+    assert "Last operation scope: selective (1 resource(s))" in body
+    assert "`SCOPE_INHERITED`" in body and "`full_resync`" in body
