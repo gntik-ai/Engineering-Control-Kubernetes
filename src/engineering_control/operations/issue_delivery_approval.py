@@ -230,9 +230,14 @@ def _approval_scope(value: dict[str, Any]) -> dict[str, Any]:
 
 
 # Main's backlog loop (NEW-99/101/102/103) re-delivers a published ChangeSet after a
-# source or deployment PR CI regression, at most this many repair rounds per issue
-# (ExistingGitHubBacklogLoopWorkflow._CI_REPAIR_ROUNDS), each with the correction bound.
-CI_REPAIR_ROUNDS = 2
+# source or deployment PR CI regression: two automatic repair rounds, then one more round
+# per operator retry. Every round is durably recorded by the loop (no fixed ceiling on
+# operator rounds), but a ChangeSet may record at most this many rounds in total, a
+# runaway guard only: falcone #980 needed seven rounds (3-7 operator-started), and each
+# round beyond the automatic two needs a separate operator retry, so 20 is about three
+# times the worst observed case while still bounding the correction lineage
+# (20 x (correction_limit + 1) children at most).
+MAX_CI_REPAIR_ROUNDS = 20
 # Published states a CI-repair child may start from (it reuses the published branch).
 _CI_REPAIR_START_STATES = frozenset({"SOURCE_PR", "SOURCE_MERGED"})
 # Durable record the parent loop writes when it decides to start one CI-repair round.
@@ -320,14 +325,26 @@ def _verify_ci_repair_child(
         or record.result_json.get("regression") not in CI_REPAIR_REGRESSIONS
     ):
         raise ValueError("CI-repair round was not recorded by its parent loop")
-    if repair_round > CI_REPAIR_ROUNDS or attempt > origin_request.correction_limit + 1:
+    if repair_round > MAX_CI_REPAIR_ROUNDS or attempt > origin_request.correction_limit + 1:
+        raise ValueError("CI-repair child exceeds the approved repair bound")
+    recorded_rounds = [
+        item
+        for item in session.scalars(
+            select(Step)
+            .where(Step.run_id == parent_run.id, Step.name == CI_REPAIR_AUTHORIZATION_STEP)
+            .limit(10 * MAX_CI_REPAIR_ROUNDS)
+        )
+        if isinstance(item.result_json, dict)
+        and item.result_json.get("change_set_id") == str(change_set.id)
+    ]
+    if not recorded_rounds or len(recorded_rounds) > MAX_CI_REPAIR_ROUNDS:
         raise ValueError("CI-repair child exceeds the approved repair bound")
 
 
 def _lineage_within_bounds(records: list[Step], request: ExistingBacklogLoopStart) -> bool:
     attempts = request.correction_limit + 1
     repairs = sum(1 for record in records if _claims_ci_repair(record.result_json))
-    return len(records) - repairs <= attempts and repairs <= CI_REPAIR_ROUNDS * attempts
+    return len(records) - repairs <= attempts and repairs <= MAX_CI_REPAIR_ROUNDS * attempts
 
 
 def bind_change_set_issue_approval(
@@ -424,7 +441,7 @@ def validate_change_set_issue_approval(
         not isinstance(children, list)
         or not children
         or children[0] != reference
-        or len(children) > (CI_REPAIR_ROUNDS + 1) * (request.correction_limit + 1)
+        or len(children) > (MAX_CI_REPAIR_ROUNDS + 1) * (request.correction_limit + 1)
     ):
         raise ValueError("ChangeSet correction approval lineage is malformed")
     seen = set()

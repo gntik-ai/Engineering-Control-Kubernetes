@@ -23,6 +23,8 @@ from engineering_control.db.models import (
     Step,
 )
 from engineering_control.operations.issue_delivery_approval import (
+    CI_REPAIR_AUTHORIZATION_STEP,
+    ci_repair_authorization_id,
     validate_change_set_issue_approval,
 )
 from engineering_control.workflows.inputs import IssueDeliveryInput
@@ -342,6 +344,7 @@ async def _ci_repair_load(
     regression: str | None = "SOURCE_PR_CI_REGRESSION",
     record: tuple[int, int] | None = (1, 1),
     record_campaign: str | None = None,
+    direct_record: bool = False,
 ):
     """Load a CI-repair child after the parent loop durably records its repair round."""
     operations, metadata, engineering, handler, payload, registered, child_payload = values
@@ -365,7 +368,39 @@ async def _ci_repair_load(
                     ),
                 )
             )
-    if record is not None:
+    if record is not None and direct_record:
+        # A record written straight into the database, bypassing the loop's own guard.
+        ordinal, repair_round = record
+        with handler.sessions.begin() as session:
+            loop = session.scalar(select(Run).where(Run.workflow_id == PARENT))
+            origin_id = first["issue_execution_approval"]["approval_id"]
+            identifier = ci_repair_authorization_id(
+                loop.id, UUID(first["change_set_id"]), ordinal, repair_round
+            )
+            session.add(
+                Step(
+                    id=identifier,
+                    run_id=loop.id,
+                    name=CI_REPAIR_AUTHORIZATION_STEP,
+                    ordinal=repair_round,
+                    status="COMPLETE",
+                    idempotency_key=f"ci-repair-authorization:{identifier}",
+                    attempt=1,
+                    result_json={
+                        "version": 1,
+                        "parent_workflow_id": PARENT,
+                        "parent_run_id": str(loop.id),
+                        "parent_first_execution_run_id": loop.temporal_first_execution_run_id,
+                        "backlog_campaign_id": str(payload["backlog_campaign_id"]),
+                        "change_set_id": first["change_set_id"],
+                        "origin_approval_id": origin_id,
+                        "ordinal": ordinal,
+                        "repair_round": repair_round,
+                        "regression": regression,
+                    },
+                )
+            )
+    elif record is not None:
         ordinal, repair_round = record
         authorized = engineering._record_backlog_ci_repair(
             {
@@ -394,14 +429,17 @@ async def _ci_repair_load(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("state", "regression"),
+    ("state", "regression", "repair_round"),
     [
-        ("SOURCE_PR", "SOURCE_PR_CI_REGRESSION"),  # NEW-99/102
-        ("SOURCE_MERGED", "DEPLOYMENT_PR_CI_REGRESSION"),  # NEW-103, source already merged
+        ("SOURCE_PR", "SOURCE_PR_CI_REGRESSION", 1),  # NEW-99/102
+        ("SOURCE_MERGED", "DEPLOYMENT_PR_CI_REGRESSION", 1),  # NEW-103, source merged
+        # Operator-retry rounds after the two automatic ones (falcone #980 used 3-7).
+        ("SOURCE_PR", "SOURCE_PR_CI_REGRESSION", 3),
+        ("SOURCE_MERGED", "DEPLOYMENT_PR_CI_REGRESSION", 7),
     ],
 )
 async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_state(
-    tmp_path: Path, state: str, regression: str
+    tmp_path: Path, state: str, regression: str, repair_round: int
 ):
     # NEW-112 review: main's CI repair re-delivers a published ChangeSet; the restored
     # 2b678d9 approval lineage admits that child against its parent loop's durable record.
@@ -410,8 +448,9 @@ async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_sta
     first, loaded = await _ci_repair_load(
         values,
         state,
-        child_id=f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+        child_id=f"{PARENT}-issue-1-ci-repair-{repair_round}-attempt-1",
         regression=regression,
+        record=(1, repair_round),
     )
     assert loaded["status"] == "CONFIRMED_LOADED"
     assert loaded["issue_execution_approval"] == first["issue_execution_approval"]
@@ -494,11 +533,25 @@ async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_sta
             {},
         ),
         (
-            "round-over-limit",
+            "round-21",
+            "CI_REPAIR_ROUND_LIMIT_REACHED",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-21-attempt-1",
+            {"record": (1, 21)},
+        ),
+        (
+            "round-21-forged-record",
             "exceeds the approved repair bound",
             "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-21-attempt-1",
+            {"record": (1, 21), "direct_record": True},
+        ),
+        (
+            "unrecorded-operator-round",
+            "not recorded by its parent loop",
+            "SOURCE_PR",
             f"{PARENT}-issue-1-ci-repair-3-attempt-1",
-            {"record": (1, 3)},
+            {"record": (1, 2)},
         ),
         # An ordinary correction child still needs REQUEST_CHANGES.
         (
@@ -542,10 +595,3 @@ async def test_unproven_or_unrelated_child_of_a_published_change_set_is_rejected
     with pytest.raises(ValueError, match=reason):
         await _ci_repair_load(values, state, child_id=child_id, **options)
     _dispose(values)
-
-
-def test_ci_repair_lineage_bound_mirrors_the_backlog_loop() -> None:
-    from engineering_control.operations.issue_delivery_approval import CI_REPAIR_ROUNDS
-    from engineering_control.workflows.definitions import ExistingGitHubBacklogLoopWorkflow
-
-    assert CI_REPAIR_ROUNDS == ExistingGitHubBacklogLoopWorkflow._CI_REPAIR_ROUNDS

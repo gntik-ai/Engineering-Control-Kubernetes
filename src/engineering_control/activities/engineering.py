@@ -53,6 +53,7 @@ from engineering_control.operations.issue_approval import (
 from engineering_control.operations.issue_delivery_approval import (
     CI_REPAIR_AUTHORIZATION_STEP,
     CI_REPAIR_REGRESSIONS,
+    MAX_CI_REPAIR_ROUNDS,
     ci_repair_authorization_id,
     register_child_issue_approval,
 )
@@ -2134,6 +2135,13 @@ class EngineeringActivityHandler:
             or not 1 <= repair_round <= 999
         ):
             raise ValueError("CI-repair authorization request is invalid")
+        if repair_round > MAX_CI_REPAIR_ROUNDS:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "CI_REPAIR_ROUND_LIMIT_REACHED",
+                "last_step": "backlog.record_ci_repair",
+            }
         change_set_id = UUID(str(payload["change_set_id"]))
         campaign_id = UUID(str(payload["backlog_campaign_id"]))
 

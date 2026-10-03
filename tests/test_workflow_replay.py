@@ -1145,6 +1145,46 @@ async def test_ci_regression_redelivers_twice_then_waits_for_the_operator() -> N
     await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
 
 
+async def test_an_operator_retried_ci_repair_round_is_recorded_like_an_automatic_one() -> None:
+    # NEW-112 review: after the two automatic repair rounds, each operator retry from the
+    # CI regression starts another round (falcone #980 used rounds 3-7); every round is
+    # durably recorded by the loop right before its repair child.
+    regression = {
+        "status": "BLOCKED",
+        "blocker": "SOURCE_PR_CI_REGRESSION",
+        "failed_checks": ["Lint Frontend"],
+        "preexisting_checks": ["CI gate"],
+        "baseline_pr": "https://github.com/gntik-ai/musematic/pull/900",
+    }
+    history, result, children = await _run_loop(
+        _full_delivery_loop_script(**{"gitops.pr_checks": regression}),
+        [("retry", "gntik-ai/musematic#1026"), ("skip", "gntik-ai/musematic#1026|OPERATOR")],
+    )
+
+    assert result["status"] == "COMPLETE"
+    repairs = [child.rsplit("-issue-", 1)[1] for child in children if "-ci-repair-" in child]
+    assert repairs == [
+        "1-ci-repair-1-attempt-1",
+        "1-ci-repair-2-attempt-1",
+        "1-ci-repair-3-attempt-1",
+    ]
+    steps = _scheduled_steps(history)
+    names = [request["step"] for request in steps]
+    authorizations = [
+        (request["payload"]["ordinal"], request["payload"]["repair_round"])
+        for request in steps
+        if request["step"] == "backlog.record_ci_repair"
+    ]
+    assert authorizations == [(1, 1), (1, 2), (1, 3)]
+    for position in [
+        index for index, name in enumerate(names) if name == "backlog.record_ci_repair"
+    ]:
+        following = steps[position + 1]
+        assert following["step"] == "backlog.register_child_run"
+        assert "-ci-repair-" in following["payload"]["child_workflow_id"]
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
 _DELIVERY_TO_SPEC_SCRIPT: dict[str, dict[str, Any]] = {
     "delivery.load_confirmed_finding": {"status": "OK", "run_id": "run-1"},
     "delivery.ensure_issue": {"status": "OK", "run_id": "run-1"},
