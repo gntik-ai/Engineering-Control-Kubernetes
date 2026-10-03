@@ -262,7 +262,15 @@ class GhCliBroker:
             raise GhCliPolicyError("issue number is invalid")
         value = self._json(
             self._run(
-                ["issue", "view", str(number), "--repo", repository, "--json", "number,state,body"]
+                [
+                    "issue",
+                    "view",
+                    str(number),
+                    "--repo",
+                    repository,
+                    "--json",
+                    "number,state,title,body,updatedAt",
+                ]
             ).stdout,
             "issue",
         )

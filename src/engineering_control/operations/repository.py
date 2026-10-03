@@ -66,6 +66,7 @@ from engineering_control.operations.connection_status import (
     provider_observation_current,
 )
 from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
+from engineering_control.operations.issue_amend import amend_issue, resolve_amend_target
 from engineering_control.operations.issue_approval import current_issue_approval_binding
 from engineering_control.operations.issue_start import (
     ISSUE_START_UNCONFIRMED,
@@ -653,6 +654,57 @@ class OperationsRepository:
             "approved_by": approved_by,
             "production": False,
         }
+
+    async def issue_amend_precheck(self, project: str, repository: str, issue_number: int) -> None:
+        """NEW-115: refuse an amendment from durable state before reading GitHub."""
+        await asyncio.to_thread(self._issue_amend_precheck, project, repository, issue_number)
+
+    def _issue_amend_precheck(self, project: str, repository: str, issue_number: int) -> None:
+        with self.sessions.begin() as session:
+            resolve_amend_target(session, project, repository, issue_number)
+
+    async def amend_issue(
+        self,
+        project: str,
+        repository: str,
+        issue_number: int,
+        observation: dict[str, Any],
+        confirmation: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._amend_issue,
+            project,
+            repository,
+            issue_number,
+            observation,
+            confirmation,
+            actor,
+        )
+
+    def _amend_issue(
+        self,
+        project: str,
+        repository: str,
+        issue_number: int,
+        observation: dict[str, Any],
+        confirmation: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("issue amendment requires an allowlisted operator channel")
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            return amend_issue(
+                session,
+                project=project,
+                repository=repository,
+                issue_number=issue_number,
+                observation=observation,
+                confirmation=confirmation,
+                actor=actor,
+            )
 
     def _candidate(self, command: Command, session_binding_hash: str) -> CandidateView:
         if len(session_binding_hash) != 64:

@@ -156,6 +156,14 @@ class GitHubBacklogImportInput:
 
 
 @dataclass
+class IssueAmendObservationInput:
+    """NEW-115: one backlog issue whose current GitHub body an operator amendment reads."""
+
+    issue_repository: str
+    issue_number: int
+
+
+@dataclass
 class ExistingGitHubBacklogLoopInput:
     project: str
     backlog_campaign_id: str

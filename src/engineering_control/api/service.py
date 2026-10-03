@@ -53,6 +53,7 @@ from engineering_control.workflows.inputs import (
     ExistingGitHubBacklogLoopInput,
     FindingVerificationInput,
     GitHubBacklogImportInput,
+    IssueAmendObservationInput,
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
@@ -77,6 +78,7 @@ class ControlService(Protocol):
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
+    async def observe_issue_body(self, repository: str, issue_number: int) -> dict[str, Any]: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
     async def start_runtime_verification(
@@ -157,6 +159,22 @@ class TemporalControlService:
         return CampaignPlan.model_validate({field: value[field] for field in fields}).model_dump(
             mode="json"
         )
+
+    async def observe_issue_body(self, repository: str, issue_number: int) -> dict[str, Any]:
+        """NEW-115: read one issue's current body through the GitHub worker (read-only)."""
+        value = await self.client.execute_workflow(
+            WorkflowName.ISSUE_AMEND_OBSERVATION.value,
+            IssueAmendObservationInput(issue_repository=repository, issue_number=issue_number),
+            id=(
+                f"issue-amend-observe-{repository.removeprefix('gntik-ai/')}-"
+                f"{issue_number}-{uuid4()}"
+            ),
+            task_queue=self.task_queue,
+            execution_timeout=timedelta(seconds=90),
+        )
+        if not isinstance(value, dict):
+            raise RuntimeError("issue body observation returned an invalid result")
+        return value
 
     async def _start_recorded_workflow(
         self,

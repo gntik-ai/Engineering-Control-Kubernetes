@@ -100,6 +100,7 @@ from engineering_control.models.reconciliation import (
     PromotionPublication,
 )
 from engineering_control.observability.agent import normalize_agent_role
+from engineering_control.operations.issue_amend import effective_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     bind_change_set_issue_approval,
     validate_change_set_issue_approval,
@@ -2746,7 +2747,8 @@ class MetadataActivityHandler:
                 )
                 if approved_issue is None:
                     raise ValueError("approved backlog issue snapshot is unavailable")
-                approved_body_sha256 = approved_issue.body_sha256
+                # NEW-115: an operator amendment (/loop amend) re-approves a later body.
+                approved_body_sha256, _approved_at = effective_issue_revision(approved_issue)
             run.change_set_id = change_set_id
             run.status = "RUNNING"
             run.project = project.value

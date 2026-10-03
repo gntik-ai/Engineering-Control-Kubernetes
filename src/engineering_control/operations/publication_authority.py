@@ -29,6 +29,7 @@ from engineering_control.models.publication_authority import (
     PublicationEffectClaim,
     PublicationEffectReceipt,
 )
+from engineering_control.operations.issue_amend import effective_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     approval_reference,
     validate_change_set_issue_approval,
@@ -268,6 +269,8 @@ class PublicationAuthorityRepository:
             # already expired lease. Re-evaluate against post-lock wall time.
             now = datetime.now(UTC)
             run, issue = _current_authority(session, change_set, value, now)
+            # NEW-115: the approved issue revision, including an operator amendment.
+            approved_body_sha256, approved_updated_at = effective_issue_revision(issue)
             observation = request.observation
             if (
                 not -2 <= (now - observation.observed_at).total_seconds() <= 10
@@ -275,9 +278,9 @@ class PublicationAuthorityRepository:
                 or observation.number != issue.issue_number
                 or observation.state != issue.state
                 or issue.state != "OPEN"
-                or observation.body_sha256 != issue.body_sha256
+                or observation.body_sha256 != approved_body_sha256
                 or observation.title_sha256 != hashlib.sha256(issue.title.encode()).hexdigest()
-                or _utc(observation.updated_at) != _utc(issue.github_updated_at)
+                or _utc(observation.updated_at) != _utc(approved_updated_at)
             ):
                 raise ValueError("fresh GitHub issue observation differs from approval")
             admission_number = 1

@@ -20,6 +20,7 @@ class WorkflowName(StrEnum):
     REVERSE_OBSERVABILITY_ACCEPTANCE = "ReverseObservabilityAcceptanceWorkflow"
     ISSUE_SOLUTION_LOOP = "IssueSolutionLoopWorkflow"
     GITHUB_BACKLOG_IMPORT = "GitHubBacklogImportWorkflow"
+    ISSUE_AMEND_OBSERVATION = "IssueAmendObservationWorkflow"
     EXISTING_GITHUB_BACKLOG_LOOP = "ExistingGitHubBacklogLoopWorkflow"
     AUTONOMOUS_BACKLOG_CAMPAIGN = "AutonomousBacklogCampaignWorkflow"
     ENHANCEMENT_DISCOVERY = "EnhancementDiscoveryWorkflow"

@@ -1467,6 +1467,61 @@ commands:
   example: /loop retry-issue <loop-id> musematic source 1125
   evidence: H:843-871
   last_observed_use: UNVERIFIED (gateway logs/session store unreadable)
+- name: /loop amend
+  group: issue loop
+  type: deterministic · write
+  status: ACTIVE
+  syntax: /loop amend <project> <repository> <issue-number> [sha-prefix] [retry]
+  description: 'NEW-115: re-approve an issue body edited on GitHub after delivery approval
+    (ISSUE_BODY_CHANGED_SINCE_APPROVAL). Without a prefix it previews; with the shown hash prefix it confirms.'
+  args:
+  - name: project
+    type: enum
+    required: 'yes'
+    allowed: falcone | musematic | llmwiki
+    default: '-'
+    error: 'usage: /loop amend <project> <repository> <issue-number> [sha-prefix (12-64 hex from the
+      preview)] [retry]'
+  - name: repository
+    type: enum
+    required: 'yes'
+    allowed: the project's source or deployment repository short name (falcone | falcone-charts | musematic
+      | musematic-deploy | llmwiki)
+    default: '-'
+    error: same usage
+  - name: issue-number
+    type: int ≥1
+    required: 'yes'
+    allowed: ''
+    default: '-'
+    error: same usage
+  - name: sha-prefix
+    type: 12-64 hex
+    required: 'no'
+    allowed: the `confirm_with` prefix of the current body sha256 shown by the preview
+    default: '- (preview)'
+    error: same usage
+  - name: retry
+    type: literal
+    required: 'no'
+    allowed: retry (only after a sha-prefix)
+    default: '-'
+    error: same usage
+  backend: POST /v1/issues/amend (reads the body through IssueAmendObservationWorkflow on the GitHub worker)
+  preconditions: Telegram platform, sender in the allowlist file; canonical operator actor (else 403).
+    Refused (409) for R3 issues (use /loop r3-candidate + /loop approve-r3), issues without an approved
+    backlog delivery, delivered/closed issues, a running delivery, an empty body or a changed title.
+  reply: 'Preview: `status` PREVIEW (approved/current body sha256 and lengths, `diff` of at most 60 redacted
+    lines, `confirm_with`, `telegram_command`) or NO_CHANGE. Confirm: `status` AMENDED (`previous_body_sha256`,
+    `current_body_sha256`, `audit_event_id`) after re-reading the body (a different hash is refused:
+    ISSUE_AMEND_CONFIRMATION_MISMATCH); with `retry`, `retry` holds the OperationView of the typed backlog
+    retry (same preflight as /loop retry, e.g. BACKLOG_ISSUE_NOT_IN_LOOP) or RETRY_NOT_SENT.'
+  side_effects: 'Confirm: the backlog record''s approved-body amendment, imported excerpt and Finding text,
+    one `issue_body_amended` audit event; with retry, a Temporal `retry` signal'
+  related: /loop retry, /loop r3-candidate, /loop approve-r3
+  example: /loop amend falcone falcone 980 3f2a9c1d0b7e retry
+  evidence: hook /loop amend; src/engineering_control/operations/issue_amend.py
+  last_observed_use: NEW (not yet deployed)
 - name: /loop global-start
   group: issue loop
   type: deterministic · write

@@ -791,6 +791,27 @@ Example:        /loop retry-issue <loop-id> musematic source 1125
 Evidence:       integrations/hermes-engineering-control/hook/handler.py:843-871; last observed use: UNVERIFIED (gateway logs/session store unreadable)
 ```
 
+#### /loop amend
+
+```
+Purpose:        NEW-115: re-approve an issue body edited on GitHub after delivery approval (ISSUE_BODY_CHANGED_SINCE_APPROVAL).
+Type:           deterministic · write
+Syntax:         /loop amend <project> <repository> <issue-number> [sha-prefix] [retry]
+Arguments:
+  - project · enum · required: yes · falcone | musematic | llmwiki · default: -
+  - repository · enum · required: yes · the project's source or deployment repository short name · default: -
+  - issue-number · int ≥1 · required: yes · - · default: -
+  - sha-prefix · 12-64 hex · required: no · the preview's `confirm_with` · default: preview
+  - retry · literal · required: no · only after a sha-prefix · default: -
+Backend:        POST /v1/issues/amend (body read by IssueAmendObservationWorkflow on the GitHub worker)
+Preconditions:  Telegram platform, allowlisted sender, canonical operator actor (else 403). Refused (409): R3 issues (use /loop r3-candidate + /loop approve-r3), no approved backlog delivery, delivered/closed issue, running delivery, empty body, changed title.
+Reply:          Preview: PREVIEW (approved/current sha256 and lengths, at most 60 redacted diff lines, confirm_with, telegram_command) or NO_CHANGE. Confirm: AMENDED after re-reading the body (another hash: ISSUE_AMEND_CONFIRMATION_MISMATCH); with retry, `retry` is the typed backlog retry's OperationView (same preflight as /loop retry) or RETRY_NOT_SENT.
+Side effects:   Confirm: the backlog record's approved-body amendment, imported excerpt and Finding text, one `issue_body_amended` audit event; retry: Temporal `retry` signal
+Related:        /loop retry, /loop r3-candidate, /loop approve-r3
+Example:        /loop amend falcone falcone 980 3f2a9c1d0b7e retry
+Evidence:       hook /loop amend; src/engineering_control/operations/issue_amend.py; last observed use: NEW (not yet deployed)
+```
+
 #### /loop global-start
 
 ```
@@ -1179,6 +1200,7 @@ All Hermes built-in slash commands (`/help`, `/whoami`, `/new`, `/model`, `/rese
 | `/loop skip` | write | Skip the issue a paused loop is waiting on, with an allowlisted reason. | /loop retry |
 | `/loop retry` | write | Retry the issue a paused loop is waiting on (`retry` signal with `<repo>#<n>`). | /loop tail |
 | `/loop retry-issue` | write | Retry by product issue number (locates the repository first). | - |
+| `/loop amend` | write | Re-approve an issue body edited after delivery approval: preview, then confirm with the shown hash prefix (optionally retry). | /loop retry |
 | `/loop global-start` | write | Start the global autonomous selector over the three product backlogs (staging, R2, one issue at a time). | - |
 | `/loop r3-candidate` | write | Prepare an R3 (operator-approved) issue binding. | /loop approve-r3 |
 | `/loop approve-r3` | write | Approve an R3 issue with its binding and generated confirmation phrase. | /loop issue-start |
