@@ -2110,6 +2110,98 @@ async def test_a_patch_conflict_is_replaced_then_verified() -> None:
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
 
 
+_SCOPE_INHERITED = {
+    "status": "SYNC_SCOPE_INHERITED",
+    "blocker": "ARGO_SYNC_SCOPE_INHERITED",
+    "scope_violations": ["resources", "sync_options", "explicit_revision"],
+    "phase": "Succeeded",
+    "sync": "OutOfSync",
+    "operation_started_at": "2026-10-03T10:00:00Z",
+}
+_FULL_RESYNC = {
+    "status": "REMEDIATION_TRIGGERED",
+    "action": "full_resync",
+    "resources": [],
+    "remediated_keys": [],
+    "previous_operation_started_at": "2026-10-03T10:00:00Z",
+}
+
+
+async def test_new_116_an_inherited_scope_is_resynced_once_as_a_full_sync() -> None:
+    # falcone-staging 2026-10-03: Hermes's full sync ran with the operator's selective
+    # scope. It is never SYNCED; one TRUE full sync is requested, then verified.
+    script = _sync_recovery_script(
+        **{
+            "gitops.diagnose_sync": _diagnosed("OTHER"),
+            "gitops.remediate_sync": _FULL_RESYNC,
+        }
+    )
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _sequenced_step(
+            script,
+            {"gitops.sync_status": [_SCOPE_INHERITED, {"status": "SYNCED", "argo_revision": "r1"}]},
+        ),
+    )
+
+    assert result is not None and result["status"] == "STAGING_VERIFIED"
+    assert [request["step"] for request in _scheduled_steps(history)][len(_BEFORE_SYNC) :] == [
+        "gitops.sync_status",
+        "gitops.diagnose_sync",
+        "gitops.notify_sync",
+        "gitops.remediate_sync",
+        "gitops.sync_status",
+        "gitops.notify_sync",
+        "gitops.verify_workloads",
+        "gitops.close_issue",
+        "gitops.persist_result",
+    ]
+    (remediation,) = _payloads(history, "gitops.remediate_sync")
+    assert (remediation["action"], remediation["resources"], remediation["attempt"]) == (
+        "full_resync",
+        [],
+        1,
+    )
+    assert remediation["remediation_id"].endswith(":round-1:full_resync")
+    assert remediation["failed_operation_started_at"] == "2026-10-03T10:00:00Z"
+    # The follow-up poll expects a full sync (no selective flag).
+    assert _payloads(history, "gitops.sync_status")[1]["selective"] is False
+    detected = _payloads(history, "gitops.notify_sync")[0]
+    assert (detected["event"], detected["failure_class"]) == ("detected", "SCOPE_INHERITED")
+    persisted = _payloads(history, "gitops.persist_result")[0]
+    assert persisted["argo_sync_failure_class"] == "SCOPE_INHERITED"
+    markers = _markers(history)
+    assert any(b"gitops-argo-sync-scope-inherited-v1" in marker for marker in markers)
+    assert any(b"gitops-argo-sync-remediation-v1" in marker for marker in markers)
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_new_116_a_scope_inherited_again_escalates_after_one_full_resync() -> None:
+    script = _sync_recovery_script(
+        **{
+            "gitops.sync_status": _SCOPE_INHERITED,
+            "gitops.diagnose_sync": _diagnosed("OTHER"),
+            "gitops.remediate_sync": _FULL_RESYNC,
+        }
+    )
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow, _gitops_input(), _scripted_execute_control_step(script)
+    )
+
+    assert result is not None
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_FAILED",
+        "SCOPE_INHERITED",
+    )
+    assert len(_payloads(history, "gitops.remediate_sync")) == 1
+    (issue,) = _payloads(history, "gitops.environment_issue")
+    assert (issue["failure_class"], issue["blocker"]) == ("SCOPE_INHERITED", "ARGO_SYNC_FAILED")
+    assert [attempt["result"] for attempt in issue["attempts"]] == ["SYNC_SCOPE_INHERITED"]
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
 async def test_an_unremediable_sync_failure_opens_an_issue_and_notifies() -> None:
     history, result = await _run_to_history(
         StagingGitOpsDeliveryWorkflow,
