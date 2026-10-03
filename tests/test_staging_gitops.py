@@ -3605,8 +3605,10 @@ async def test_new_118_a_recorded_source_merge_survives_rechecks_and_skips_pin_c
 
 
 async def test_new_118_a_stale_source_pr_binding_never_counts_as_merged(tmp_path: Path) -> None:
-    # Codex round 3: after the ChangeSet is rebound to a new source PR, replaying a
-    # persist for the old PR neither restores its merge SHA nor makes the new PR merged.
+    # Codex rounds 3-4: after the ChangeSet is rebound to a new source PR, a replayed
+    # persist for the old PR (even one carrying a merge SHA or STAGING_VERIFIED) moves
+    # neither the heads, the state nor the staging record, and never makes the new PR
+    # merged.
     from engineering_control.activities.metadata import MetadataActivityHandler
 
     handler = _controller(tmp_path, FakeKubectl())
@@ -3621,20 +3623,67 @@ async def test_new_118_a_stale_source_pr_binding_never_counts_as_merged(tmp_path
         change_set = session.get(db.ChangeSet, change_set_id)
         assert change_set is not None
         change_set.source_pr_url = new_url
+        change_set.source_head_sha = "c" * 40
         change_set.state = "PLANNED"
-    stale = await handler.handle(
-        "gitops.persist_result",
-        {"plan": plan, "outcome": "BLOCKED", "blocker": "DEPLOYMENT_PR_CI_REGRESSION"},
-    )
-    assert stale["status"] == "PERSISTED"
+        before = dict(change_set.recovery_json["staging_gitops"])
+    for payload in (
+        {"outcome": "BLOCKED", "blocker": "DEPLOYMENT_PR_CI_REGRESSION"},
+        {"outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": "f" * 40},
+        {"outcome": "STAGING_VERIFIED", "merge_sha": "f" * 40},
+    ):
+        stale = await handler.handle("gitops.persist_result", {"plan": plan, **payload})
+        assert stale["status"] == "PERSISTED"
+        assert stale["change_set_state"] == "PLANNED"
     with handler.sessions.begin() as session:
         change_set = session.get(db.ChangeSet, change_set_id)
         assert change_set is not None
-        record = change_set.recovery_json["staging_gitops"]
-        assert record["source_pr_url"] == plan["source_pr_url"]
-        assert record["merge_sha"] is None
+        assert change_set.state == "PLANNED"
+        assert change_set.source_head_sha == "c" * 40
+        assert change_set.recovery_json["staging_gitops"] == before
     metadata = MetadataActivityHandler(handler.settings)
     try:
         assert metadata._source_pr_merged(change_set_id) is False
+    finally:
+        metadata.engine.dispose()
+
+
+async def test_new_118_the_merge_record_is_write_once_per_bound_source_pr(tmp_path: Path) -> None:
+    # Codex round 4: #77's merge record must not block recording #78's merge once the
+    # ChangeSet is rebound to #78 and #78 merges.
+    from engineering_control.activities.metadata import MetadataActivityHandler
+
+    handler = _controller(tmp_path, FakeKubectl())
+    change_set_id = _seed_change_set(handler)
+    old_plan = _plan(change_set_id=str(change_set_id))
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": old_plan, "outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": MERGE_SHA},
+    )
+    new_url = old_plan["source_pr_url"].rsplit("/", 1)[0] + "/78"
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        change_set.source_pr_url = new_url
+        change_set.state = "SOURCE_PR"
+    new_plan = {**old_plan, "source_pr_url": new_url, "source_pr_number": 78}
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": new_plan, "outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": "f" * 40},
+    )
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": new_plan, "outcome": "BLOCKED", "blocker": "DEPLOYMENT_PR_CI_REGRESSION"},
+    )
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        durable = change_set.recovery_json["source_merge"]
+        assert durable["source_pr_url"] == new_url
+        assert durable["merge_sha"] == "f" * 40
+        assert change_set.recovery_json["staging_gitops"]["merge_sha"] == "f" * 40
+        change_set.state = "PLANNED"
+    metadata = MetadataActivityHandler(handler.settings)
+    try:
+        assert metadata._source_pr_merged(change_set_id) is True
     finally:
         metadata.engine.dispose()

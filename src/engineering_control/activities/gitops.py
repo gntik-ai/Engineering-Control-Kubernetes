@@ -769,6 +769,9 @@ class GitOpsControllerHandler:
             # a new PR) neither creates nor restores a merge record.
             bound_url = change_set.source_pr_url
             plan_bound = bool(bound_url) and plan.source_pr_url == bound_url
+            # A plan for a different source PR than the one bound now is stale: it never
+            # moves the heads, the state or the current staging record.
+            stale = bool(bound_url) and plan.source_pr_url != bound_url
             record["source_pr_url"] = plan.source_pr_url
             # NEW-118 review: a merged source PR stays merged. The first recorded merge is
             # durable (``source_merge``, bound to the source PR) and a later recheck that
@@ -781,8 +784,12 @@ class GitOpsControllerHandler:
                 else None
             )
             durable = recovery.get("source_merge")
+            # Write-once per source PR: a record for a previously bound PR is replaced
+            # when the PR bound now merges.
             if plan_bound and not (
-                isinstance(durable, dict) and _SHA.fullmatch(str(durable.get("merge_sha")))
+                isinstance(durable, dict)
+                and _SHA.fullmatch(str(durable.get("merge_sha")))
+                and durable.get("source_pr_url") == bound_url
             ):
                 first_sha = merge_sha if merge_sha is not None else previous_sha
                 if first_sha is not None and _SHA.fullmatch(str(first_sha)):
@@ -800,25 +807,31 @@ class GitOpsControllerHandler:
                 and durable.get("source_pr_url") == bound_url
             ):
                 record["merge_sha"] = durable.get("merge_sha")
-            recovery["staging_gitops"] = record
+            if not stale:
+                recovery["staging_gitops"] = record
             change_set.recovery_json = recovery
-            if merge_sha is not None:
+            if merge_sha is not None and not stale:
                 # NEW-102: the merged PR heads are what was delivered; a stale write (e.g. a
                 # repair's unpublished local head) never survives on a merged ChangeSet.
                 change_set.source_head_sha = plan.source_head_sha
                 if plan.deployment_pr_number is not None and plan.deployment_head_sha:
                     change_set.deployment_head_sha = plan.deployment_head_sha
-            if outcome == "STAGING_VERIFIED":
+            if not stale and outcome == "STAGING_VERIFIED":
                 change_set.state = ChangeSetState.RUNTIME_VERIFIED.value
-            elif merge_sha is not None and change_set.state in {
-                ChangeSetState.SOURCE_PR.value,
-                ChangeSetState.CI_VALIDATED.value,
-                # NEW-102: a late repair write may have reset the state after prepare;
-                # the merge is what happened, so the ChangeSet is SOURCE_MERGED.
-                ChangeSetState.PLANNED.value,
-                ChangeSetState.IMPLEMENTING.value,
-                ChangeSetState.REQUEST_CHANGES.value,
-            }:
+            elif (
+                not stale
+                and merge_sha is not None
+                and change_set.state
+                in {
+                    ChangeSetState.SOURCE_PR.value,
+                    ChangeSetState.CI_VALIDATED.value,
+                    # NEW-102: a late repair write may have reset the state after prepare;
+                    # the merge is what happened, so the ChangeSet is SOURCE_MERGED.
+                    ChangeSetState.PLANNED.value,
+                    ChangeSetState.IMPLEMENTING.value,
+                    ChangeSetState.REQUEST_CHANGES.value,
+                }
+            ):
                 change_set.state = ChangeSetState.SOURCE_MERGED.value
             change_set.version += 1
             if workflow_id:
