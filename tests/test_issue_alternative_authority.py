@@ -224,3 +224,78 @@ async def test_r3_approval_must_be_current_exact_and_used(tmp_path: Path, change
     assert handler._load_backlog_execution(request.model_dump(mode="json"))["status"] == "BLOCKED"
     assert handler._backlog_revalidate_gate(request.model_dump(mode="json"))["status"] == "BLOCKED"
     _dispose(operations, metadata, handler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "expired", "body", "unused"])
+async def test_operation_bound_r3_binding_revalidates_its_exact_candidate(
+    tmp_path: Path, change: str | None
+):
+    # NEW-112 review: an approved R3 solve_issue that started before its candidate expired
+    # must not still pass the delivery/publication boundary after it expired or changed.
+    from test_controlled_operations import _idempotency_fixture
+
+    from engineering_control.operations.issue_approval import require_issue_operation_approval
+    from engineering_control.operations.models import SolveIssueCommand
+
+    operations, metadata, handler, _client, _control, request = await _fixture(tmp_path, risk="R3")
+    assert request.r3_approval_binding is not None
+    command = SolveIssueCommand(
+        project="musematic",
+        backlog_campaign_id=MUSEMATIC_ID,
+        repository="gntik-ai/musematic",
+        issue_number=1119,
+        maximum_risk="R3",
+        delivery_mode="full-delivery",
+        r3_approval_binding=request.r3_approval_binding,
+        correction_limit=5,
+    )
+    operation = await operations.create_external(
+        command,
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("r3-bound", 61),
+    )
+    assert await operations.claim(operation.operation_id) is not None
+    with operations.sessions.begin() as session:
+        candidate = session.scalar(
+            select(ActionCandidate).where(
+                ActionCandidate.binding_hash == request.r3_approval_binding
+            )
+        )
+        assert candidate is not None
+        if change == "expired":
+            candidate.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        elif change == "unused":
+            candidate.used_at = None
+        elif change == "body":
+            issue = session.scalar(
+                select(BacklogIssueRecord).where(BacklogIssueRecord.issue_number == 1119)
+            )
+            assert issue is not None
+            issue.body_sha256 = "9" * 64
+
+    def check() -> None:
+        with operations.sessions() as session:
+            require_issue_operation_approval(
+                session,
+                operation.operation_id,
+                operation.binding_hash,
+                project="musematic",
+                campaign_id=MUSEMATIC_ID,
+                repository="gntik-ai/musematic",
+                issue_number=1119,
+                delivery_mode="full-delivery",
+                maximum_risk="R3",
+                correction_limit=5,
+                execution_options=("runtime", request.r3_approval_binding),
+            )
+
+    if change is None:
+        check()
+    else:
+        # A body edit already changes the operation's snapshot binding; an expired or
+        # unused candidate is caught only by the exact-candidate re-check.
+        with pytest.raises(ValueError, match=None if change == "body" else "R3 approval"):
+            check()
+    _dispose(operations, metadata, handler)

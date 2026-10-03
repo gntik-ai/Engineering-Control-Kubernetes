@@ -18,6 +18,7 @@ from engineering_control.engineering.backlog import (
     BacklogApprovalBinding,
     canonical_sha256,
 )
+from engineering_control.engineering.backlog_authority import _valid_r3_candidate
 from engineering_control.operations.models import SolveIssueCommand, parse_command
 
 
@@ -110,6 +111,23 @@ def require_issue_operation_approval(
         raise ValueError("durable issue approval execution options changed")
     if not hmac.compare_digest(current_issue_approval_binding(session, command), expected_binding):
         raise ValueError("issue approval snapshot changed; prepare and confirm a new action")
+    if command.r3_approval_binding is not None:
+        # NEW-112 review: an operation-bound R3 binding is re-verified at every boundary
+        # (delivery approval and publication custody), not just compared as a string: the
+        # exact used candidate must still be unexpired and bound to this issue's current
+        # body and the campaign's imported heads.
+        issue = session.scalar(
+            select(BacklogIssueRecord).where(
+                BacklogIssueRecord.backlog_campaign_id == command.backlog_campaign_id,
+                BacklogIssueRecord.repository == command.repository,
+                BacklogIssueRecord.issue_number == command.issue_number,
+            )
+        )
+        if (
+            issue is None
+            or _valid_r3_candidate(session, issue, command.r3_approval_binding) is None
+        ):
+            raise ValueError("R3 approval candidate expired or changed; approve it again")
     return {"issue_operation_id": str(operation.id), "issue_approval_binding": expected_binding}
 
 
