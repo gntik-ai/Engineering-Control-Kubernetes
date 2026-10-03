@@ -396,6 +396,9 @@ async def test_existing_backlog_loop_continues_when_a_delivery_child_crashes() -
     delivery result (blocker DELIVERY_CHILD_WORKFLOW_FAILED), so
     continue_after_blocked_issue applies. This test makes the delivery child
     crash and asserts the loop finishes with that blocker recorded.
+
+    NEW-114: such a FAILED child now pauses the loop instead; this history is recorded
+    with the NEW-114 markers off and must replay against the current code unchanged.
     """
     activity_fn = _scripted_execute_control_step_with_failure(
         {
@@ -422,15 +425,20 @@ async def test_existing_backlog_loop_continues_when_a_delivery_child_crashes() -
         delivery_mode="source-pr",
     )
     history, result = await _run_to_history(
-        ExistingGitHubBacklogLoopWorkflow,
+        _PreNew114BacklogLoopWorkflow,
         run_arg,
         activity_fn,
         child_workflows=(IssueDeliveryWorkflow,),
     )
     assert result is not None, "the backlog loop crashed on a failed delivery child"
-    assert {"status": "FAILED", "blocker": "DELIVERY_CHILD_WORKFLOW_FAILED", "attempt": 1} in (
-        result["results"]
+    assert any(
+        entry.get("status") == "FAILED"
+        and entry.get("blocker") == "DELIVERY_CHILD_WORKFLOW_FAILED"
+        and entry.get("attempt") == 1
+        for entry in result["results"]
     )
+    assert result.get("completion") is None
+    assert not _new_114_markers(history)
 
     await Replayer(
         workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
@@ -1035,7 +1043,8 @@ async def test_a_failed_revalidation_child_pauses_the_loop_instead_of_failing_it
         if request["step"] == "backlog.record_loop_state"
         and request["payload"].get("loop_status") == "PAUSED"
     ]
-    assert [state["blocker"] for state in paused] == ["CURRENT_REVALIDATION_CHILD_FAILED"] * 2
+    # NEW-114: the failed child pauses with its own blocker (retryable).
+    assert [state["blocker"] for state in paused] == ["REVALIDATION_FAILED"] * 2
     assert all(state.get("workflow_id") for state in paused)
     await Replayer(workflows=[*_LOOP_WORKFLOWS, _FailingVerificationStub]).replay_workflow(history)
 
@@ -2606,3 +2615,637 @@ async def test_a_failed_remediation_activity_is_not_retried_and_escalates() -> N
     assert issue["action"] == "report_sync"
     notices = [notice["event"] for notice in _payloads(history, "gitops.notify_sync")]
     assert notices[0] == "detected" and notices[-1] == "escalated"
+
+
+# -- NEW-114: failures pause, free slots refill, nothing-delivered is reported --------
+
+
+@workflow.defn(name="ExistingGitHubBacklogLoopWorkflow", sandboxed=False)
+class _PreNew114BacklogLoopWorkflow(ExistingGitHubBacklogLoopWorkflow):
+    """ExistingGitHubBacklogLoopWorkflow as it ran before the NEW-114 markers existed."""
+
+    @workflow.run
+    async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+        return await super().run(request)
+
+    @staticmethod
+    def _child_failure_pauses_patched(ordinal: int) -> bool:
+        return False
+
+    @staticmethod
+    def _free_slots_patched(ordinal: int) -> bool:
+        return False
+
+    @staticmethod
+    def _nothing_delivered_patched() -> bool:
+        return False
+
+
+def _new_114_markers(history: Any) -> list[bytes]:
+    return [
+        marker
+        for marker in _markers(history)
+        if any(
+            name in marker
+            for name in (b"child-failure-pauses", b"free-slots", b"nothing-delivered")
+        )
+    ]
+
+
+@workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
+class _DeliveredIssueStub:
+    """Stands in for IssueDeliveryWorkflow: the issue's source PR is published."""
+
+    @workflow.run
+    async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
+        return {"status": "SOURCE_PR", "source_pr_url": "https://example.invalid/pr/1"}
+
+
+@workflow.defn(name="FindingVerificationWorkflow", sandboxed=False)
+class _VerdictVerificationStub:
+    """FindingVerificationWorkflow returning the verdict encoded in its finding id."""
+
+    @workflow.run
+    async def run(self, request: Any) -> dict[str, Any]:
+        finding = request["finding_id"] if isinstance(request, dict) else request.finding_id
+        return {"status": str(finding).rsplit("-", 1)[1]}
+
+
+async def _run_new_114_loop(
+    run_arg: ExistingGitHubBacklogLoopInput,
+    activity_fn: Any,
+    signals: list[tuple[str, Any]],
+    workflows: list[type],
+) -> tuple[Any, Any, list[str], list[dict[str, Any]]]:
+    """Run the loop; at each operator pause send the next signal and keep the status
+    the loop reported half a second after it."""
+    statuses: list[dict[str, Any]] = []
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        async with (
+            Worker(
+                env.client,
+                task_queue=CONTROL_TASK_QUEUE,
+                workflows=workflows,
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=GITHUB_TASK_QUEUE,
+                workflows=workflows,
+                activities=[activity_fn],
+            ),
+            Worker(
+                env.client,
+                task_queue=ROLE_TASK_QUEUES["scan"],
+                workflows=workflows,
+                activities=[activity_fn],
+            ),
+        ):
+            handle = await env.client.start_workflow(
+                ExistingGitHubBacklogLoopWorkflow.run,
+                run_arg,
+                id=f"replay-test-new-114-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=2),
+            )
+            for name, argument in signals:
+                for _ in range(200):
+                    state = await handle.query("status")
+                    if str(state.get("phase", "")).startswith("AWAITING_OPERATOR"):
+                        break
+                    description = await handle.describe()
+                    assert (
+                        description.status is not None and description.status.name == "RUNNING"
+                    ), "the loop ended instead of pausing for the operator"
+                    await asyncio.sleep(0.1)
+                await handle.signal(name, argument)
+                await asyncio.sleep(0.5)
+                statuses.append(await handle.query("status"))
+            result = await handle.result()
+            history = await handle.fetch_history()
+    children = [
+        event.start_child_workflow_execution_initiated_event_attributes.workflow_id
+        for event in history.events
+        if event.HasField("start_child_workflow_execution_initiated_event_attributes")
+    ]
+    return history, result, children, statuses
+
+
+def _loop_states(history: Any, loop_status: str) -> list[dict[str, Any]]:
+    return [
+        request["payload"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        and request["payload"].get("loop_status") == loop_status
+    ]
+
+
+def _item(number: int, repository: str = "gntik-ai/musematic") -> dict[str, Any]:
+    return {"repository": repository, "issue_number": number}
+
+
+async def test_new_114_a_failed_delivery_child_pauses_with_its_code_even_when_continuing() -> None:
+    # Live 2026-10-02: an IssueDeliveryWorkflow child FAILED with a non-retryable
+    # PolicyViolation ("base SHA mismatch") and the loop recorded COMPLETE.
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        if step == "delivery.load_confirmed_finding":
+            raise ApplicationError(
+                "base SHA mismatch for falcone-charts: expected aaaa, got bbbb",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        script: dict[str, dict[str, Any]] = {
+            "backlog.load_execution": {"status": "SELECTED", "items": [_item(1026)]},
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.revalidate_gate": {
+                "status": "READY",
+                "finding_id": "finding-1",
+                "risk_class": "R1",
+            },
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "delivery.release_leases": {"status": "LEASES_RELEASED"},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+            "backlog.record_skip": {
+                "status": "SKIPPED",
+                "reason_code": "OPERATOR",
+                "repository": "gntik-ai/musematic",
+                "issue_number": 1026,
+            },
+            "github.refresh_mirrors": {"status": "PASS"},
+        }
+        return _registered_child(step, request, script[step])
+
+    history, result, children, statuses = await _run_new_114_loop(
+        ExistingGitHubBacklogLoopInput(
+            project="musematic",
+            backlog_campaign_id="camp-1",
+            maximum_risk="R1",
+            delivery_mode="source-pr",
+            continue_after_blocked_issue=True,
+        ),
+        execute_control_step,
+        [
+            # A retry for an issue the loop is not waiting on is ignored, but recorded.
+            ("retry", "gntik-ai/falcone#45"),
+            ("retry", "gntik-ai/musematic#1026"),
+            ("skip", "gntik-ai/musematic#1026|OPERATOR"),
+        ],
+        [ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow],
+    )
+
+    paused = _loop_states(history, "PAUSED")
+    assert [state["blocker"] for state in paused] == ["DELIVERY_FAILED:BASE_SHA_MISMATCH"] * 2
+    assert all(state.get("workflow_id") for state in paused)
+    assert statuses[0]["ignored_signals"] == [
+        {"signal": "retry", "value": "gntik-ai/falcone#45", "awaited": "gntik-ai/musematic#1026"}
+    ]
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-retry-1-attempt-1",
+    ]
+    # The skipped issue frees its slot; nothing else is eligible, so the loop says so.
+    assert result["status"] == "COMPLETE"
+    assert result["completion"] == "COMPLETE_NOTHING_DELIVERED"
+    (complete,) = _loop_states(history, "COMPLETE")
+    assert complete["completion"] == "COMPLETE_NOTHING_DELIVERED"
+    assert complete["outcomes"] == ["gntik-ai/musematic#1026:SKIPPED:OPERATOR"]
+    refills = [
+        request["payload"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.load_execution"
+        and "exclude_issue_refs" in request["payload"]
+    ]
+    assert [refill["exclude_issue_refs"] for refill in refills] == [["gntik-ai/musematic#1026"]]
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, IssueDeliveryWorkflow]
+    ).replay_workflow(history)
+
+
+async def test_new_114_a_failed_revalidation_pauses_even_when_continuing() -> None:
+    # Live 2026-10-02: a FindingVerificationWorkflow child FAILED (provider error) and the
+    # loop moved on and recorded COMPLETE.
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step = request["step"]
+        script: dict[str, dict[str, Any]] = {
+            "backlog.load_execution": {"status": "SELECTED", "items": [_item(7)]},
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.revalidate_gate": {
+                "status": "BLOCKED",
+                "blocker": "CURRENT_SOURCE_REVALIDATION_REQUIRED",
+            },
+            "backlog.materialize_candidate": {"status": "READY", "finding_id": "finding-FAILED"},
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "backlog.record_revalidation": {"status": "REVALIDATION_RECORDED"},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+            "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
+            "github.refresh_mirrors": {"status": "PASS"},
+        }
+        return _registered_child(step, request, script[step])
+
+    history, result, children, _ = await _run_new_114_loop(
+        ExistingGitHubBacklogLoopInput(
+            project="musematic",
+            backlog_campaign_id="camp-1",
+            maximum_risk="R1",
+            delivery_mode="source-pr",
+            continue_after_blocked_issue=True,
+        ),
+        execute_control_step,
+        [("retry", "gntik-ai/musematic#7"), ("skip", "gntik-ai/musematic#7|OPERATOR")],
+        [ExistingGitHubBacklogLoopWorkflow, _VerdictVerificationStub],
+    )
+
+    assert [state["blocker"] for state in _loop_states(history, "PAUSED")] == [
+        "REVALIDATION_FAILED"
+    ] * 2
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-revalidate-7",
+        "1-revalidate-7-r1",
+    ]
+    assert result["completion"] == "COMPLETE_NOTHING_DELIVERED"
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, _VerdictVerificationStub]
+    ).replay_workflow(history)
+
+
+def _free_slot_activity(
+    gates: dict[int, dict[str, Any]], selectable: list[int]
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Activity double whose backlog.load_execution honours exclude_issue_refs and, like
+    the real approval check, selects nothing while the campaign is not RUNNING."""
+    loads: list[dict[str, Any]] = []
+    campaign = {"status": "RUNNING"}
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step, payload = request["step"], request["payload"]
+        if step == "backlog.record_loop_state":
+            campaign["status"] = payload["loop_status"]
+            return {"status": "RECORDED"}
+        if step == "backlog.load_execution":
+            loads.append(payload)
+            if campaign["status"] != "RUNNING":
+                return {"status": "BLOCKED", "blocker": "CURRENT_BACKLOG_APPROVAL_REQUIRED"}
+            excluded = set(payload.get("exclude_issue_refs") or ())
+            items = [
+                _item(number)
+                for number in selectable
+                if f"gntik-ai/musematic#{number}" not in excluded
+            ][: payload["maximum_items"]]
+            return {"status": "SELECTED", "items": items}
+        if step == "backlog.revalidate_gate":
+            return gates[int(payload["item"]["issue_number"])]
+        if step == "backlog.materialize_candidate":
+            number = payload["item"]["issue_number"]
+            return {"status": "READY", "finding_id": f"finding-{number}-REJECTED"}
+        script: dict[str, dict[str, Any]] = {
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "backlog.record_revalidation": {"status": "REVALIDATION_RECORDED"},
+            "backlog.record_loop_state": {"status": "RECORDED"},
+            "backlog.record_skip": {"status": "SKIPPED", "reason_code": "NEEDS_PRODUCT_DECISION"},
+            "github.refresh_mirrors": {"status": "PASS"},
+        }
+        return _registered_child(step, request, script[step])
+
+    return execute_control_step, loads
+
+
+_READY = {"status": "READY", "finding_id": "finding-ready", "risk_class": "R1"}
+_REVALIDATE = {"status": "BLOCKED", "blocker": "CURRENT_SOURCE_REVALIDATION_REQUIRED"}
+
+
+async def test_new_114_a_rejected_issue_frees_its_slot_for_the_next_eligible_one() -> None:
+    # Live 2026-10-03: the only item was REJECTED and the loop recorded COMPLETE although
+    # #2 was eligible within the same approval.
+    activity_fn, loads = _free_slot_activity({1: _REVALIDATE, 2: _READY}, [1, 2])
+    history, result, children, _ = await _run_new_114_loop(
+        ExistingGitHubBacklogLoopInput(
+            project="musematic",
+            backlog_campaign_id="camp-1",
+            maximum_risk="R1",
+            delivery_mode="source-pr",
+            maximum_items=1,
+        ),
+        activity_fn,
+        [],
+        [ExistingGitHubBacklogLoopWorkflow, _VerdictVerificationStub, _DeliveredIssueStub],
+    )
+
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-revalidate-1",
+        "2-attempt-1",
+    ]
+    assert result["status"] == "COMPLETE" and "completion" not in result
+    assert {"status": "BLOCKED", "blocker": "CURRENT_REVALIDATION_REJECTED"}.items() <= (
+        result["results"][0].items()
+    )
+    assert [load.get("exclude_issue_refs") for load in loads] == [
+        None,
+        None,
+        ["gntik-ai/musematic#1"],
+    ]
+    assert all(load["maximum_items"] == 1 for load in loads)
+    await Replayer(
+        workflows=[ExistingGitHubBacklogLoopWorkflow, _VerdictVerificationStub, _DeliveredIssueStub]
+    ).replay_workflow(history)
+
+
+async def test_new_114_a_skip_no_longer_leaks_into_the_next_issue() -> None:
+    # Before NEW-114 the "skipped" check read the last result of any issue, so the issue
+    # after a skipped one was skipped too, without a delivery.
+    blocked = {"status": "BLOCKED", "blocker": "R3_REQUIRES_OPERATOR"}
+    activity_fn, _ = _free_slot_activity({1: blocked, 2: _READY}, [1, 2])
+    run_arg = ExistingGitHubBacklogLoopInput(
+        project="musematic",
+        backlog_campaign_id="camp-1",
+        maximum_risk="R1",
+        delivery_mode="source-pr",
+        maximum_items=2,
+    )
+    workflows = [ExistingGitHubBacklogLoopWorkflow, _DeliveredIssueStub]
+    history, result, children, _ = await _run_new_114_loop(
+        run_arg, activity_fn, [("skip", "gntik-ai/musematic#1|NEEDS_PRODUCT_DECISION")], workflows
+    )
+
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == ["2-attempt-1"]
+    assert result["status"] == "COMPLETE" and "completion" not in result
+    await Replayer(workflows=workflows).replay_workflow(history)
+
+    # The same run recorded before NEW-114 skipped #2 and replays unchanged.
+    activity_fn, _ = _free_slot_activity({1: blocked, 2: _READY}, [1, 2])
+    old_workflows = [_PreNew114BacklogLoopWorkflow, _DeliveredIssueStub]
+    old_history, old_result, old_children, _ = await _run_new_114_loop(
+        run_arg,
+        activity_fn,
+        [("skip", "gntik-ai/musematic#1|NEEDS_PRODUCT_DECISION")],
+        old_workflows,
+    )
+    assert old_children == []
+    assert old_result["status"] == "COMPLETE" and "completion" not in old_result
+    assert not _new_114_markers(old_history)
+    await Replayer(workflows=workflows).replay_workflow(old_history)
+
+
+async def test_new_114_a_gate_skip_reactivates_the_campaign_before_refilling() -> None:
+    # Review of 1f16012: the gate pause left the campaign PAUSED, so the refill's approval
+    # check refused selection and the loop reported nothing delivered with #2 eligible.
+    blocked = {"status": "BLOCKED", "blocker": "R3_REQUIRES_OPERATOR"}
+    activity_fn, loads = _free_slot_activity({1: blocked, 2: _READY}, [1, 2])
+    workflows = [ExistingGitHubBacklogLoopWorkflow, _DeliveredIssueStub]
+    history, result, children, _ = await _run_new_114_loop(
+        ExistingGitHubBacklogLoopInput(
+            project="musematic",
+            backlog_campaign_id="camp-1",
+            maximum_risk="R1",
+            delivery_mode="source-pr",
+            maximum_items=1,
+        ),
+        activity_fn,
+        [("skip", "gntik-ai/musematic#1|NEEDS_PRODUCT_DECISION")],
+        workflows,
+    )
+
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == ["2-attempt-1"]
+    assert result["status"] == "COMPLETE" and "completion" not in result
+    order = [
+        request["payload"].get("loop_status") or "REFILL"
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+        or "exclude_issue_refs" in request["payload"]
+    ]
+    assert order == ["PAUSED", "RUNNING", "REFILL", "COMPLETE"]
+    assert [load.get("exclude_issue_refs") for load in loads] == [None, ["gntik-ai/musematic#1"]]
+    await Replayer(workflows=workflows).replay_workflow(history)
+
+
+async def test_new_114_a_gitops_skip_frees_the_slot_in_full_delivery() -> None:
+    # Review of 1f16012: skipping a blocked GitOps stage completed a maximum_items=1 loop
+    # although another issue was eligible.
+    script = _full_delivery_loop_script()
+    prepares = {"count": 0}
+    campaign = {"status": "RUNNING"}
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step, payload = request["step"], request["payload"]
+        if step == "backlog.record_loop_state":
+            campaign["status"] = payload["loop_status"]
+            return {"status": "RECORDED"}
+        if step == "backlog.load_execution":
+            if campaign["status"] != "RUNNING":
+                return {"status": "BLOCKED", "blocker": "CURRENT_BACKLOG_APPROVAL_REQUIRED"}
+            excluded = set(payload.get("exclude_issue_refs") or ())
+            items = [
+                _item(number)
+                for number in (1026, 1027)
+                if f"gntik-ai/musematic#{number}" not in excluded
+            ]
+            return {"status": "SELECTED", "items": items[: payload["maximum_items"]]}
+        if step == "gitops.prepare":
+            prepares["count"] += 1
+            if prepares["count"] == 1:
+                return {"status": "BLOCKED", "blocker": "ENVIRONMENT_UNHEALTHY"}
+        if step == "github.refresh_mirrors":
+            return {"status": "PASS"}
+        return _registered_child(step, request, script[step])
+
+    history, result, children = await _run_loop(
+        script,
+        [("skip", "gntik-ai/musematic#1026|OPERATOR")],
+        activity_fn=execute_control_step,
+    )
+
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == [
+        "1-attempt-1",
+        "1-staging-gitops",
+        "2-attempt-1",
+        "2-staging-gitops",
+    ]
+    assert result["status"] == "COMPLETE" and "completion" not in result
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+def _approved_backlog(tmp_path: Any) -> tuple[Any, str]:
+    """A real EngineeringActivityHandler over a RUNNING, genuinely approved campaign with
+    three eligible issues (#1, #2, #3)."""
+    from datetime import UTC, datetime
+    from datetime import timedelta as delta
+
+    from engineering_control.activities.engineering import EngineeringActivityHandler
+    from engineering_control.config import Settings
+    from engineering_control.db.base import Base
+    from engineering_control.db.models import BacklogIssueRecord, GitHubBacklogCampaign
+    from engineering_control.engineering.backlog import (
+        BACKLOG_APPROVAL_PHRASE,
+        BacklogApprovalBinding,
+    )
+
+    campaign_id = "11411411-4114-4114-8114-000000000001"
+    state_root = tmp_path / "state"
+    (state_root / "github-policy-requests").mkdir(parents=True, mode=0o700)
+    handler = EngineeringActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'approved.sqlite'}", state_root=state_root)
+    )
+    Base.metadata.create_all(handler.engine)
+    now = datetime.now(UTC)
+    binding = BacklogApprovalBinding(
+        backlog_campaign_id=campaign_id,
+        project="musematic",
+        paired_repositories=("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
+        source_head="a" * 40,
+        deployment_head="b" * 40,
+        issue_filter="all",
+        dependency_plan_hash="d" * 64,
+        maximum_risk="R1",
+        maximum_items=1,
+        delivery_mode="source-pr",
+        allowed_github_operations=(),
+        allowed_build_workflows=(),
+        staging_targets=(),
+        include_enhancements=False,
+        merge_policy="no-merge",
+        issue_close_policy="never",
+        expires_at=now + delta(hours=4),
+    )
+    with handler.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=uuid.UUID(campaign_id),
+                project="musematic",
+                source_repository="gntik-ai/musematic",
+                deployment_repository="gntik-ai/musematic-deploy",
+                imported_at=now,
+                issue_query="state:open",
+                import_filter="all",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=3,
+                eligible_count=3,
+                deferred_count=0,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                approval_binding=binding.sha256(),
+                approval_json={
+                    "binding": binding.model_dump(mode="json"),
+                    "approval": {
+                        "approved_by": "cli:engineering-ctl",
+                        "approved_at": now.isoformat(),
+                        "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+                    },
+                },
+                maximum_risk="R1",
+                maximum_items=1,
+                maximum_concurrency=1,
+                delivery_mode="source-pr",
+                include_enhancements=False,
+                status="RUNNING",
+                workflow_id=f"backlog-import-musematic-{campaign_id}",
+            )
+        )
+        for number in (1, 2, 3):
+            session.add(
+                BacklogIssueRecord(
+                    backlog_campaign_id=uuid.UUID(campaign_id),
+                    repository="gntik-ai/musematic",
+                    issue_number=number,
+                    issue_url_reference=f"https://github.com/gntik-ai/musematic/issues/{number}",
+                    title=f"Bounded issue {number}",
+                    state="OPEN",
+                    labels_json=["bug"],
+                    milestone=None,
+                    issue_type="PRODUCT_BUG",
+                    openspec_kind=None,
+                    severity="MEDIUM",
+                    calculated_risk="R1",
+                    component="general",
+                    source_or_deployment_owner="source",
+                    documentation_levels_json=[],
+                    dependencies_json=[],
+                    blocking_issues_json=[],
+                    issues_blocked_json=[],
+                    linked_prs_json=[],
+                    linked_branches_json=[],
+                    linked_commits_json=[],
+                    duplicate_candidates_json=[],
+                    current_source_reproduction="PENDING_CURRENT_STATE_REVALIDATION",
+                    current_runtime_reproduction="NOT_REQUIRED",
+                    current_runtime_required=False,
+                    reproduction_mode="SOURCE_ONLY",
+                    candidate_status="IMPORTED",
+                    eligibility_status="ELIGIBLE_FOR_REVALIDATION",
+                    eligibility_reason="FILTER_MATCH_PENDING_REVALIDATION",
+                    planned_wave="W0",
+                    planned_order=number,
+                    finding_id=None,
+                    change_set_id=None,
+                    delivery_status="NOT_STARTED",
+                    final_closure_status="OPEN",
+                    documentation_impact="DOCUMENTATION_REQUIRED",
+                    body_sha256=str(number) * 64,
+                    github_updated_at=now,
+                    github_snapshot_json={"body_excerpt": f"bounded body {number}"},
+                )
+            )
+    return handler, campaign_id
+
+
+async def test_new_114_refill_after_a_gate_skip_passes_the_real_approval_check(
+    tmp_path: Any,
+) -> None:
+    # The real backlog.load_execution/record_loop_state: the gate pause sets the campaign
+    # PAUSED (voiding its approval for selection); the refill reactivates it first.
+    handler, campaign_id = _approved_backlog(tmp_path)
+    gates = {
+        1: {"status": "BLOCKED", "blocker": "R3_REQUIRES_OPERATOR"},
+        2: _READY,
+        3: _READY,
+    }
+
+    @activity.defn(name="execute_control_step")
+    async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
+        step, payload = request["step"], request["payload"]
+        if step == "backlog.load_execution":
+            return handler._load_backlog_execution(payload)
+        if step == "backlog.record_loop_state":
+            for pending in (tmp_path / "state" / "github-policy-requests").iterdir():
+                pending.unlink()  # the root policy bridge consumes each request
+            return handler._record_backlog_loop_state(payload)
+        if step == "backlog.revalidate_gate":
+            return gates[int(payload["item"]["issue_number"])]
+        script: dict[str, dict[str, Any]] = {
+            "backlog.register_run": {"status": "REGISTERED"},
+            "backlog.register_child_run": {"status": "REGISTERED"},
+            "backlog.record_skip": {"status": "SKIPPED", "reason_code": "NEEDS_PRODUCT_DECISION"},
+            "github.refresh_mirrors": {"status": "PASS"},
+        }
+        return _registered_child(step, request, script[step])
+
+    workflows = [ExistingGitHubBacklogLoopWorkflow, _DeliveredIssueStub]
+    history, result, children, _ = await _run_new_114_loop(
+        ExistingGitHubBacklogLoopInput(
+            project="musematic",
+            backlog_campaign_id=campaign_id,
+            maximum_risk="R1",
+            delivery_mode="source-pr",
+            maximum_items=1,
+        ),
+        execute_control_step,
+        [("skip", "gntik-ai/musematic#1|NEEDS_PRODUCT_DECISION")],
+        workflows,
+    )
+
+    # One slot: #1 was skipped (freed), #2 delivered, #3 never started.
+    assert [child.rsplit("-issue-", 1)[1] for child in children] == ["2-attempt-1"]
+    assert result["status"] == "COMPLETE" and "completion" not in result
+    await Replayer(workflows=workflows).replay_workflow(history)

@@ -1002,6 +1002,14 @@ def create_app(
         if action in {"pause", "resume", "cancel"}:
             await service.signal(workflow_id, action)
             return {"status": "ACCEPTED"}
+        if action in {"skip", "retry"} and body is not None:
+            # NEW-114: an issue the loop is not waiting on is refused, not silently ignored.
+            try:
+                await service.validate_backlog_issue_signal(
+                    workflow_id, f"gntik-ai/{body.repository}#{body.issue_number}"
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
         if action == "skip" and body is not None and body.reason_code is not None:
             await service.signal(
                 workflow_id,

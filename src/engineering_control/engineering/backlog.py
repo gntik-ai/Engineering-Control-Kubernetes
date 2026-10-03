@@ -388,6 +388,24 @@ def canonical_sha256(value: Any) -> str:
     ).hexdigest()
 
 
+# NEW-114 (fix 5): issues Hermes itself opens about its own staging environment
+# (activities/gitops.py: NEW-113 Argo CD sync escalations, environment diagnoses, delivery
+# notes). They are operator work, never backlog work for a delivery loop.
+HERMES_OPERATIONAL_BODY_MARKERS = ("<!-- engineering-control-staging-gitops:",)
+HERMES_OPERATIONAL_TITLE_PREFIXES = (
+    "Hermes staging Argo CD sync failed for change ",
+    "Hermes staging environment unhealthy for change ",
+)
+HERMES_OPERATIONAL_ISSUE = "HERMES_OPERATIONAL_ISSUE"
+
+
+def is_hermes_operational_issue(title: str, body: str) -> bool:
+    """True for an issue carrying one of Hermes's own operational markers."""
+    return title.startswith(HERMES_OPERATIONAL_TITLE_PREFIXES) or any(
+        marker in body for marker in HERMES_OPERATIONAL_BODY_MARKERS
+    )
+
+
 def classify_issue(
     issue: GitHubIssueSnapshot,
     pull_requests: tuple[GitHubPullRequestSnapshot, ...],
@@ -419,6 +437,8 @@ def classify_issue(
     component = _component(labels, issue.repository)
     wave = _wave(issue_type, severity, dependencies, text)
     eligible, reason = _eligibility(issue_type, import_filter, risk, text)
+    if is_hermes_operational_issue(issue.title, issue.body_excerpt):
+        eligible, reason = False, HERMES_OPERATIONAL_ISSUE
     openspec = _openspec_kind(labels, text)
     documentation_levels = _documentation_levels(issue_type, labels, text)
     branches = tuple(sorted({pr.head_ref for pr in pull_requests if _pr_links_issue(pr, issue)}))

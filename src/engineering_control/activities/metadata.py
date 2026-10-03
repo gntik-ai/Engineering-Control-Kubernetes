@@ -2322,6 +2322,11 @@ class MetadataActivityHandler:
                 raise ValueError("finding is no longer independently verifiable")
             finding.disposition = disposition
             finding.evidence_json = [*finding.evidence_json, *evidence]
+            revalidated = self._revalidated_heads(finding, controls, workflow_id)
+            if disposition == "CONFIRMED" and revalidated is not None:
+                # NEW-117: the confirmation happened at these current heads; the delivery
+                # starts from them (the approved import heads stay recorded beside them).
+                finding.impact_json = {**finding.impact_json, "revalidated_heads": revalidated}
             coverage = session.get(CoverageCell, finding.coverage_cell_id)
             if coverage is None:
                 raise ValueError("finding coverage metadata is missing")
@@ -2363,6 +2368,41 @@ class MetadataActivityHandler:
             "finding_id": str(finding_id),
             "duplicate_issue_url": duplicate.get("duplicate_issue_url"),
         }
+
+    @staticmethod
+    def _revalidated_heads(
+        finding: Finding, controls: dict[str, Any], workflow_id: str
+    ) -> dict[str, str] | None:
+        """NEW-117: the current heads an existing-issue revalidation reproduced at.
+
+        Only a snapshot taken for this finding's own import heads counts (the scan worker
+        verified there that the current heads fast-forward from them)."""
+        snapshot = controls.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        heads = {
+            key: snapshot.get(key)
+            for key in (
+                "source_sha",
+                "deployment_sha",
+                "import_source_sha",
+                "import_deployment_sha",
+                "snapshot_evidence_sha256",
+            )
+        }
+        if not all(isinstance(value, str) for value in heads.values()):
+            return None
+        if (
+            snapshot.get("finding_id") != str(finding.id)
+            or heads["import_source_sha"] != finding.affected_source_sha
+            or heads["import_deployment_sha"] != finding.affected_deployment_sha
+            or not all(
+                re.fullmatch(r"[a-f0-9]{40}", str(heads[key]))
+                for key in ("source_sha", "deployment_sha")
+            )
+        ):
+            return None
+        return {**{key: str(value) for key, value in heads.items()}, "workflow_id": workflow_id}
 
     def _prepare_finding_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
         finding_id = UUID(str(payload["finding_id"]))
@@ -2647,6 +2687,7 @@ class MetadataActivityHandler:
             change_set = session.scalar(
                 select(ChangeSet).where(ChangeSet.id == change_set_id).with_for_update()
             )
+            base_source_sha, base_deployment_sha = self._delivery_base_heads(finding)
             if change_set is None:
                 change_set = ChangeSet(
                     id=change_set_id,
@@ -2658,12 +2699,12 @@ class MetadataActivityHandler:
                     version=1,
                     source_repository=source_repository,
                     source_branch=None,
-                    source_base_sha=finding.affected_source_sha,
+                    source_base_sha=base_source_sha,
                     source_head_sha=None,
                     source_pr_url=None,
                     deployment_repository=deployment_repository,
                     deployment_branch=None,
-                    deployment_base_sha=finding.affected_deployment_sha,
+                    deployment_base_sha=base_deployment_sha,
                     deployment_head_sha=None,
                     deployment_pr_url=None,
                     image_digests={},
@@ -2671,6 +2712,21 @@ class MetadataActivityHandler:
                     recovery_json={},
                 )
                 session.add(change_set)
+            elif (
+                (change_set.source_base_sha, change_set.deployment_base_sha)
+                != (base_source_sha, base_deployment_sha)
+                and change_set.state == "CONFIRMED"
+                and change_set.source_branch is None
+                and change_set.deployment_branch is None
+                and change_set.source_head_sha is None
+                and change_set.source_pr_url is None
+                and change_set.deployment_pr_url is None
+            ):
+                # NEW-117: a ChangeSet that never got a worktree (e.g. its allocation was
+                # refused with "base SHA mismatch") moves to the revalidated heads. Any
+                # ChangeSet with work keeps its base (NEW-64 resumes stay on it).
+                change_set.source_base_sha = base_source_sha
+                change_set.deployment_base_sha = base_deployment_sha
             issue_reference = (
                 bind_change_set_issue_approval(session, change_set, issue_approval)
                 if issue_approval is not None
@@ -2722,15 +2778,28 @@ class MetadataActivityHandler:
                 "repository_surface": surface,
                 "issue_repository": issue_repository,
                 "source_repository": source_repository,
-                "source_base_sha": finding.affected_source_sha,
+                "source_base_sha": change_set.source_base_sha,
                 "source_base_ref": (
                     "refs/heads/master" if project is Project.LLMWIKI else "refs/heads/main"
                 ),
                 "deployment_repository": deployment_repository,
-                "deployment_base_sha": finding.affected_deployment_sha,
+                "deployment_base_sha": change_set.deployment_base_sha,
                 "deployment_base_ref": (
                     "refs/heads/master" if project is Project.LLMWIKI else "refs/heads/main"
                 ),
+                # NEW-117: both the approved import heads and the heads this delivery
+                # starts from; allocation refuses a base not fast-forward from the former.
+                "base_heads": {
+                    "import_source_sha": finding.affected_source_sha,
+                    "import_deployment_sha": finding.affected_deployment_sha,
+                    "delivery_source_sha": change_set.source_base_sha,
+                    "delivery_deployment_sha": change_set.deployment_base_sha,
+                    "moved_from_import": (
+                        change_set.source_base_sha,
+                        change_set.deployment_base_sha,
+                    )
+                    != (finding.affected_source_sha, finding.affected_deployment_sha),
+                },
                 "issue_number": issue.number if issue else None,
                 "issue_url": issue.url if issue else None,
                 **(
@@ -2744,6 +2813,27 @@ class MetadataActivityHandler:
                     else {}
                 ),
             }
+
+    @staticmethod
+    def _delivery_base_heads(finding: Finding) -> tuple[str, str]:
+        """NEW-117: the heads a delivery starts from.
+
+        A backlog issue confirmed by its revalidation at current heads starts there (the
+        approval still binds: those heads fast-forward from the import heads, which stay
+        the finding's affected SHAs). Anything else starts from the import heads."""
+        heads = finding.impact_json.get("revalidated_heads")
+        if (
+            isinstance(heads, dict)
+            and heads.get("import_source_sha") == finding.affected_source_sha
+            and heads.get("import_deployment_sha") == finding.affected_deployment_sha
+            and isinstance(heads.get("source_sha"), str)
+            and isinstance(heads.get("deployment_sha"), str)
+            and re.fullmatch(r"[a-f0-9]{40}", heads["source_sha"])
+            and re.fullmatch(r"[a-f0-9]{40}", heads["deployment_sha"])
+        ):
+            return str(heads["source_sha"]), str(heads["deployment_sha"])
+        # load_confirmed_finding refuses a finding without its deployment SHA first.
+        return finding.affected_source_sha, str(finding.affected_deployment_sha)
 
     def _ensure_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("dry_run") is not False:
@@ -2854,6 +2944,11 @@ class MetadataActivityHandler:
             "maker_provider": maker.primary.value,
             "checker_provider": maker.checker.value,
         }
+        base_heads = payload.get("base_heads")
+        if isinstance(base_heads, dict):
+            # NEW-117: the approved import heads the delivery base must fast-forward from.
+            allocation["source_approved_base_sha"] = base_heads.get("import_source_sha")
+            allocation["deployment_approved_base_sha"] = base_heads.get("import_deployment_sha")
         return {
             **payload,
             "status": "ROUTED",

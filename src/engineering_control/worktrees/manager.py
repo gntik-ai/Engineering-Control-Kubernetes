@@ -221,6 +221,14 @@ class GitWorktreeManager:
             raise WorktreeError(f"resolved Git head is not immutable for {repository}")
         return actual
 
+    def is_fast_forward(self, repository: str, ancestor: str, head: str) -> bool:
+        """NEW-117: True when head equals ancestor or strictly descends from it."""
+        if not re.fullmatch(r"[a-f0-9]{40}", ancestor) or not re.fullmatch(r"[a-f0-9]{40}", head):
+            return False
+        if ancestor == head:
+            return True
+        return self._descends_from(self.verify_mirror(repository), ancestor, head)
+
     def allocate(
         self,
         *,

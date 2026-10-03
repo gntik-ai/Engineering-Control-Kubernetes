@@ -408,11 +408,17 @@ class TypedCommandBus:
                 if command.repository and command.issue_number
                 else "operator-nudge"
             )
+            if command.action == "retry" and issue != "operator-nudge":
+                # NEW-114: refuse a retry for an issue the loop is not waiting on.
+                await self.control.validate_backlog_issue_signal(command.workflow_id, issue)
             await self.control.signal(command.workflow_id, "retry", issue)
             return OperationAccepted(workflow_id=command.workflow_id, run_id="")
         if isinstance(command, WorkflowControlCommand) and command.action == "skip":
             if not command.repository or not command.issue_number or not command.reason_code:
                 raise ValueError("skip requires an exact issue and reason")
+            await self.control.validate_backlog_issue_signal(
+                command.workflow_id, f"gntik-ai/{command.repository}#{command.issue_number}"
+            )
             await self.control.signal(
                 command.workflow_id,
                 "skip",

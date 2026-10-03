@@ -87,6 +87,11 @@ class ControlledWorkflow:
         self._write_policy_reason: str | None = None
         # NEW-84: ids a write-policy alert names (set by workflows that know them).
         self._write_notice: dict[str, Any] = {}
+        # NEW-114: retry/skip signals a backlog loop received for an issue it was not
+        # waiting on; kept (bounded) so the status query shows they were ignored.
+        self._ignored_signals: list[dict[str, str]] = []
+        # NEW-114: why the last free-slot refill selected nothing (selection refused).
+        self._refill_blocker: str | None = None
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -139,7 +144,16 @@ class ControlledWorkflow:
             "skip_reason": self._skip_reason,
             "retry_step": self._retry_step,
             "write_policy_reason": self._write_policy_reason,
+            "ignored_signals": list(self._ignored_signals),
         }
+
+    def _note_ignored_signal(self, signal: str, value: str | None, awaited: str) -> None:
+        """NEW-114: record (never act on) a signal naming an issue the loop does not await.
+
+        Only workflow state and a replay-safe log line: no command, so no patch marker."""
+        entry = {"signal": signal, "value": str(value or "")[:200], "awaited": awaited[:200]}
+        self._ignored_signals = [*self._ignored_signals, entry][-20:]
+        workflow.logger.warning("backlog loop ignored a signal for another issue: %s", entry)
 
     async def _checkpoint(self, phase: str) -> bool:
         self._phase = phase
@@ -2970,6 +2984,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
 _LOOP_RESULT_KEYS = (
     "status",
     "blocker",
+    "failure_code",
     "reason_code",
     "attempt",
     "stage",
@@ -3015,6 +3030,70 @@ def _backlog_execution_payload(request: ExistingGitHubBacklogLoopInput) -> dict[
         if value[key] is None:
             value.pop(key)
     return value
+
+
+# NEW-114: outcomes decided on the issue itself that say nothing was wrong with the loop
+# and nothing was attempted: they never consume one of the approved maximum_items slots.
+_SLOT_FREEING_BLOCKERS = frozenset(
+    {"CURRENT_REVALIDATION_REJECTED", "CURRENT_REVALIDATION_DUPLICATE"}
+)
+_SLOT_FREEING_MARKERS = ("ALREADY_FIXED", "ISSUE_CLOSED", "NOT_REPRODUCIBLE")
+# Bounds the refill: one loop never walks more than this many issues in total.
+_LOOP_REFILL_LIMIT = 100
+# Child statuses that mean the child itself failed, not that the issue is blocked.
+_REVALIDATION_FAILURE_STATUSES = frozenset({"CHILD_FAILED", "FAILED"})
+
+
+def _frees_slot(result: dict[str, Any]) -> bool:
+    """NEW-114: a REJECTED/duplicate/already-fixed/closed or skipped item frees its slot."""
+    if result.get("status") == "SKIPPED":
+        return True
+    blocker = str(result.get("blocker") or "")
+    return blocker in _SLOT_FREEING_BLOCKERS or any(
+        marker in blocker for marker in _SLOT_FREEING_MARKERS
+    )
+
+
+def _issue_ref(item: dict[str, Any]) -> str:
+    return f"{item.get('repository')}#{item.get('issue_number')}"
+
+
+def _failure_code(value: str) -> str:
+    """Upper-snake, bounded failure code (PolicyViolation -> POLICY_VIOLATION)."""
+    snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    return (re.sub(r"[^A-Z0-9]+", "_", snake.upper()).strip("_") or "UNKNOWN")[:60]
+
+
+def _child_failure_code(error: BaseException) -> str:
+    """NEW-114: the most specific code of a failed child (e.g. BASE_SHA_MISMATCH)."""
+    current: BaseException | None = error
+    for _ in range(8):
+        if current is None:
+            break
+        if isinstance(current, ApplicationError):
+            if "base sha mismatch" in str(current).lower():
+                return "BASE_SHA_MISMATCH"
+            if current.type:
+                return _failure_code(current.type)
+        current = current.__cause__
+    return "CHILD_WORKFLOW_FAILED"
+
+
+def _delivery_failure_blocker(delivery: dict[str, Any]) -> str:
+    code = delivery.get("failure_code") or delivery.get("blocker") or "FAILED"
+    return f"DELIVERY_FAILED:{_failure_code(str(code))}"
+
+
+def _loop_outcomes(results: list[dict[str, Any]]) -> list[str]:
+    """Bounded per-issue outcome lines for the nothing-delivered notification."""
+    outcomes: list[str] = []
+    for result in results:
+        if not isinstance(result, dict) or "issue_number" not in result:
+            continue
+        line = f"{result.get('repository')}#{result.get('issue_number')}:{result.get('status')}"
+        reason = result.get("blocker") or result.get("reason_code")
+        outcomes.append(f"{line}:{reason}"[:160] if reason else line[:160])
+    return outcomes[-20:]
 
 
 @workflow.defn(name="ExistingGitHubBacklogLoopWorkflow")
@@ -3130,10 +3209,15 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         if not isinstance(raw_items, list):
             raise TypeError("existing backlog selection must be a list")
         results: list[dict[str, Any]] = []
+        # NEW-114: issues actually delivered; a loop ending with none says so.
+        delivered = 0
+        # raw_items may grow while iterating: an issue that frees its slot (REJECTED,
+        # duplicate, skipped...) is replaced by the next eligible one (_refill_free_slot).
         for ordinal, item in enumerate(raw_items, start=1):
             if not isinstance(item, dict):
                 raise TypeError("existing backlog issue must be an object")
             continue_to_next_issue = False
+            gate_skipped = False
             revalidation_round = 0
             # NEW-91: a reload that returns no items (for example the campaign approval no
             # longer current) pauses on its blocker instead of reusing the stale item.
@@ -3170,6 +3254,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if gate.get("status") == "READY":
                     break
                 blocker = str(gate.get("blocker") or gate.get("status") or "BLOCKED")
+                # NEW-114: a failed revalidation child pauses the loop (never moves on).
+                revalidation_failed = False
                 if blocker in {
                     "CURRENT_SOURCE_REVALIDATION_REQUIRED",
                     "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED",
@@ -3261,6 +3347,15 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     blocker = stale_reload or (
                         f"CURRENT_REVALIDATION_{verification.get('status', 'FAILED')}"
                     )
+                    if (
+                        stale_reload is None
+                        and verification.get("status", "FAILED") in _REVALIDATION_FAILURE_STATUSES
+                        and self._child_failure_pauses_patched(ordinal)
+                    ):
+                        # NEW-114: a provider error is not a verdict on the issue; the
+                        # loop pauses and the operator's retry revalidates it again.
+                        revalidation_failed = True
+                        blocker = "REVALIDATION_FAILED"
                 issue_ref = f"{item['repository']}#{item['issue_number']}"
                 if global_child_blocker_return and request.global_campaign_id is not None:
                     results.append(
@@ -3284,6 +3379,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     sequential_source_pr
                     and request.continue_after_blocked_issue
                     and not self._requires_operator_pause(blocker)
+                    and not revalidation_failed
                 ):
                     results.append(
                         {
@@ -3328,6 +3424,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     skip_value = self._skip_reason
                     reference, separator, reason = skip_value.rpartition("|")
                     if not separator or reference != issue_ref:
+                        self._note_ignored_signal("skip", skip_value, issue_ref)
                         self._skip_reason = None
                         continue
                     skipped = await self._step(
@@ -3341,8 +3438,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                     results.append(skipped)
                     self._skip_reason = None
+                    gate_skipped = True
                     break
                 if self._retry_step != issue_ref:
+                    self._note_ignored_signal("retry", self._retry_step, issue_ref)
                     self._retry_step = None
                     continue
                 self._retry_step = None
@@ -3378,7 +3477,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         or refreshed.get("status")
                         or "BACKLOG_RELOAD_FAILED"
                     )
-            if continue_to_next_issue or (results and results[-1].get("status") == "SKIPPED"):
+            # NEW-114: the "skipped" check used to read whichever result came last, so an
+            # issue following a skipped one was itself skipped without any delivery.
+            stale_skip = (
+                not continue_to_next_issue
+                and not gate_skipped
+                and bool(results)
+                and results[-1].get("status") == "SKIPPED"
+            )
+            if (
+                continue_to_next_issue
+                or gate_skipped
+                or (stale_skip and not self._free_slots_patched(ordinal))
+            ):
+                if _frees_slot(results[-1]) and self._free_slots_patched(ordinal):
+                    await self._refill_free_slot(request, raw_items, register_run=register_run)
                 boundary = await self._after_issue_boundary(
                     request,
                     results,
@@ -3395,6 +3508,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             operator_pause = workflow.patched("existing-backlog-delivery-operator-pause-v1")
             delivery_round = 0
             advance_to_next_issue = False
+            delivery_skipped = False
             while True:
                 issue_prefix = f"{workflow.info().workflow_id}-issue-{ordinal}"
                 if delivery_round:
@@ -3448,6 +3562,13 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 pause_blocker: str | None = None
                 if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
                     blocker = str(delivery.get("blocker") or delivery.get("status"))
+                    # NEW-114: a FAILED child (e.g. a non-retryable PolicyViolation) is not
+                    # a verdict on the issue: pause with its code instead of moving on.
+                    delivery_failed = delivery.get(
+                        "status"
+                    ) == "FAILED" and self._child_failure_pauses_patched(ordinal)
+                    if delivery_failed:
+                        blocker = _delivery_failure_blocker(delivery)
                     if global_child_blocker_return and request.global_campaign_id is not None:
                         await self._step(
                             "backlog.record_loop_state",
@@ -3462,6 +3583,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         sequential_source_pr
                         and request.continue_after_blocked_issue
                         and not self._requires_operator_pause(blocker)
+                        and not delivery_failed
                     ):
                         advance_to_next_issue = True
                         break
@@ -3511,8 +3633,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 results.append(skipped)
                 await self._step("backlog.record_loop_state", resumed_state)
                 advance_to_next_issue = True
+                delivery_skipped = True
                 break
             if advance_to_next_issue:
+                if delivery_skipped and self._free_slots_patched(ordinal):
+                    await self._refill_free_slot(request, raw_items, register_run=register_run)
                 boundary = await self._after_issue_boundary(
                     request,
                     results,
@@ -3524,6 +3649,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 continue
             if request.delivery_mode == "source-pr":
                 if sequential_source_pr:
+                    delivered += 1
                     boundary = await self._after_issue_boundary(
                         request,
                         results,
@@ -3563,6 +3689,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         return {"status": "CANCELLED", "results": results}
                     if staged == "BLOCKED":
                         return {"status": "BLOCKED", "blocker": staged_blocker, "results": results}
+                    if staged == "DONE":
+                        delivered += 1
+                    elif staged == "SKIPPED" and self._free_slots_patched(ordinal):
+                        # NEW-114 review: an operator skip of the GitOps stage frees the
+                        # issue's slot like any other skip.
+                        await self._refill_free_slot(request, raw_items, register_run=register_run)
                     boundary = await self._after_issue_boundary(
                         request,
                         results,
@@ -3638,6 +3770,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     },
                 )
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
+            delivered += 1
             boundary = await self._after_issue_boundary(
                 request,
                 results,
@@ -3649,7 +3782,27 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         complete_state = {**_backlog_execution_payload(request), "loop_status": "COMPLETE"}
         if register_run:
             complete_state["workflow_id"] = workflow.info().workflow_id
+        nothing_delivered = (
+            delivered == 0
+            and request.global_campaign_id is None
+            and self._nothing_delivered_patched()
+        )
+        if nothing_delivered:
+            # NEW-114: a loop whose every issue was rejected, skipped or blocked used to
+            # read COMPLETE like a successful one; it now says so and alerts the operator.
+            self._phase = "COMPLETE_NOTHING_DELIVERED"
+            complete_state["completion"] = "COMPLETE_NOTHING_DELIVERED"
+            complete_state["outcomes"] = _loop_outcomes(results)
+            if self._refill_blocker is not None:
+                complete_state["refill_blocker"] = self._refill_blocker
         await self._step("backlog.record_loop_state", complete_state)
+        if nothing_delivered:
+            return {
+                "status": "COMPLETE",
+                "completion": "COMPLETE_NOTHING_DELIVERED",
+                "delivered": 0,
+                "results": results,
+            }
         return {"status": "COMPLETE", "results": results}
 
     async def _execute_full_delivery(
@@ -4220,9 +4373,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step("backlog.record_loop_state", cancel_state)
                 return "CANCELLED", {}
             if self._skip_reason is not None:
-                reference, separator, reason = self._skip_reason.rpartition("|")
+                skip_value = self._skip_reason
+                reference, separator, reason = skip_value.rpartition("|")
                 self._skip_reason = None
                 if not separator or reference != issue_ref:
+                    self._note_ignored_signal("skip", skip_value, issue_ref)
                     continue
                 self._phase = f"RESUMED:{issue_ref}"
                 skipped = await self._step(
@@ -4239,6 +4394,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if retry_ref == issue_ref:
                 self._phase = f"RESUMED:{issue_ref}"
                 return "RETRY", {}
+            self._note_ignored_signal("retry", retry_ref, issue_ref)
 
     async def _issue_delivery(
         self,
@@ -4262,9 +4418,70 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 execution_timeout=timedelta(hours=12),
                 **self._child_run_options(delivery_workflow_id),
             )
-        except ChildWorkflowError:
-            return {"status": "FAILED", "blocker": "DELIVERY_CHILD_WORKFLOW_FAILED"}
+        except ChildWorkflowError as error:
+            # NEW-114: keep the child's own failure code; the loop pauses on it.
+            return {
+                "status": "FAILED",
+                "blocker": "DELIVERY_CHILD_WORKFLOW_FAILED",
+                "failure_code": _child_failure_code(error),
+            }
         return result
+
+    @staticmethod
+    def _child_failure_pauses_patched(ordinal: int) -> bool:
+        # NEW-114: a FAILED revalidation or delivery child pauses the loop (per issue
+        # ordinal, so an execution in flight upgrades at its next issue).
+        return workflow.patched(f"existing-backlog-child-failure-pauses-v1-{ordinal}")
+
+    @staticmethod
+    def _free_slots_patched(ordinal: int) -> bool:
+        # NEW-114: a rejected/duplicate/skipped issue frees its maximum_items slot, and
+        # a skip no longer leaks into the next issue.
+        return workflow.patched(f"existing-backlog-free-slots-v1-{ordinal}")
+
+    @staticmethod
+    def _nothing_delivered_patched() -> bool:
+        # NEW-114: a loop that delivered nothing completes as COMPLETE_NOTHING_DELIVERED.
+        return workflow.patched("existing-backlog-nothing-delivered-v1")
+
+    async def _refill_free_slot(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        raw_items: list[Any],
+        *,
+        register_run: bool,
+    ) -> None:
+        """NEW-114: replace an issue that freed its slot with the next eligible one.
+
+        backlog.load_execution re-checks the campaign approval and the item bounds and
+        excludes every issue this loop already holds, so the loop never works on more
+        than maximum_items issues that consume a slot, and stays within its approval."""
+        if request.target_repository is not None or request.global_campaign_id is not None:
+            return
+        queued = [_issue_ref(value) for value in raw_items if isinstance(value, dict)]
+        if len(queued) >= _LOOP_REFILL_LIMIT:
+            return
+        # An operator pause (e.g. before a gate skip) left the campaign PAUSED, which
+        # voids its approval for selection; the loop is running again before it selects.
+        resumed: dict[str, Any] = {**_backlog_execution_payload(request), "loop_status": "RUNNING"}
+        if register_run:
+            resumed["workflow_id"] = workflow.info().workflow_id
+        await self._step("backlog.record_loop_state", resumed)
+        refreshed = await self._step(
+            "backlog.load_execution",
+            {**_backlog_execution_payload(request), "exclude_issue_refs": queued},
+        )
+        candidates = refreshed.get("items")
+        if not isinstance(candidates, list):
+            # Kept for the completion record: no refill because selection was refused.
+            self._refill_blocker = str(
+                refreshed.get("blocker") or refreshed.get("status") or "BACKLOG_RELOAD_FAILED"
+            )[:120]
+            return
+        for candidate in candidates:
+            if isinstance(candidate, dict) and _issue_ref(candidate) not in queued:
+                raw_items.append(candidate)
+                return
 
     @staticmethod
     def _requires_operator_pause(blocker: str) -> bool:

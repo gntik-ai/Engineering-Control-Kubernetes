@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -77,6 +77,9 @@ class WorktreeAllocationRequest(BaseModel):
     deployment_base_ref: str = "refs/heads/main"
     maker_provider: Provider
     checker_provider: Provider
+    # NEW-117: approved import heads; a base other than them must fast-forward from them.
+    source_approved_base_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+    deployment_approved_base_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
 
 
 class RuntimeObservationPlan(BaseModel):
@@ -979,9 +982,42 @@ class ScanActivityHandler:
         base_ref = self._base_ref(project)
         if source_repository == deployment_repository and source_sha != deployment_sha:
             raise ValueError("self-contained project snapshot SHAs must match")
+        import_heads: dict[str, str] = {}
+        snapshot_identity = finding_id
+        if payload.get("flow") == "current-state-revalidation":
+            # NEW-117: an existing backlog issue is revalidated at the CURRENT heads of
+            # the same repositories and branches, which must fast-forward from the heads
+            # the approved campaign was imported at; the delivery then starts there.
+            import_heads = {
+                "import_source_sha": source_sha,
+                "import_deployment_sha": deployment_sha,
+            }
+            current_source = self.manager.resolve_head(source_repository, base_ref=base_ref)
+            current_deployment = (
+                current_source
+                if source_repository == deployment_repository
+                else self.manager.resolve_head(deployment_repository, base_ref=base_ref)
+            )
+            for repository, ancestor, head in (
+                (source_repository, source_sha, current_source),
+                (deployment_repository, deployment_sha, current_deployment),
+            ):
+                if not self.manager.is_fast_forward(repository, ancestor, head):
+                    raise ValueError(
+                        f"current head of {repository} does not descend from the approved "
+                        f"import head {ancestor}"
+                    )
+            if (current_source, current_deployment) != (source_sha, deployment_sha):
+                # One immutable snapshot per head pair (an earlier round's snapshot of
+                # other heads is never reused or moved).
+                snapshot_identity = uuid5(
+                    NAMESPACE_URL,
+                    f"revalidation-snapshot:{finding_id}:{current_source}:{current_deployment}",
+                )
+            source_sha, deployment_sha = current_source, current_deployment
         source = self.manager.allocate_audit_snapshot(
             repository=source_repository,
-            campaign_id=finding_id,
+            campaign_id=snapshot_identity,
             base_ref=base_ref,
             expected_base_sha=source_sha,
             require_base_ref_match=False,
@@ -990,7 +1026,7 @@ class ScanActivityHandler:
         if source_repository != deployment_repository:
             deployment = self.manager.allocate_audit_snapshot(
                 repository=deployment_repository,
-                campaign_id=finding_id,
+                campaign_id=snapshot_identity,
                 base_ref=base_ref,
                 expected_base_sha=deployment_sha,
                 require_base_ref_match=False,
@@ -1001,6 +1037,7 @@ class ScanActivityHandler:
             "deployment_sha": deployment.base_sha,
             "source_worktree": str(source.path),
             "deployment_worktree": str(deployment.path),
+            **import_heads,
         }
         canonical = json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode()
         return {
@@ -1319,6 +1356,21 @@ class ScanActivityHandler:
             f"{request.maker_provider.value}-runner",
             f"{request.checker_provider.value}-runner",
         )
+        for repository, approved, base in (
+            (request.source_repository, request.source_approved_base_sha, request.source_base_sha),
+            (
+                request.deployment_repository,
+                request.deployment_approved_base_sha,
+                request.deployment_base_sha,
+            ),
+        ):
+            if approved is not None and not self.manager.is_fast_forward(
+                repository, approved, base
+            ):
+                raise ValueError(
+                    f"delivery base {base} of {repository} does not descend from the "
+                    f"approved import head {approved}"
+                )
         source = self.manager.allocate(
             repository=request.source_repository,
             project=request.project.value,

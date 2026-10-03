@@ -27,6 +27,7 @@ from engineering_control.engineering.backlog import (
     approval_binding,
     canonical_sha256,
     classify_issue,
+    is_hermes_operational_issue,
     is_reauthenticated_backlog_operator,
     plan_records,
 )
@@ -1019,6 +1020,26 @@ class EngineeringActivityHandler:
                 )
                 .order_by(db.BacklogIssueRecord.planned_order)
             ).all()
+            # NEW-114: a loop refilling a freed slot excludes the issues it already holds.
+            raw_excluded = payload.get("exclude_issue_refs")
+            excluded = (
+                {str(value)[:240] for value in raw_excluded[:500]}
+                if isinstance(raw_excluded, list)
+                else set()
+            )
+            rows = [
+                row
+                for row in rows
+                if f"{row.repository}#{row.issue_number}" not in excluded
+                # NEW-114 (fix 5): Hermes's own operational issues are never backlog work,
+                # even in campaigns imported before the classifier excluded them.
+                and not is_hermes_operational_issue(
+                    row.title,
+                    str((row.github_snapshot_json or {}).get("body_excerpt") or "")
+                    if isinstance(row.github_snapshot_json, dict)
+                    else "",
+                )
+            ]
             target_repository = payload.get("target_repository")
             target_issue_number = payload.get("target_issue_number")
             if target_repository is not None or target_issue_number is not None:
@@ -1991,8 +2012,15 @@ class EngineeringActivityHandler:
         status = str(payload.get("loop_status", "PAUSED"))
         if status not in {"PAUSED", "CANCELLED", "COMPLETE", "RUNNING", "STOPPED", "FAILED"}:
             raise ValueError("backlog loop status is not allowlisted")
+        completion = payload.get("completion")
+        if completion is not None and (
+            status != "COMPLETE" or completion != "COMPLETE_NOTHING_DELIVERED"
+        ):
+            raise ValueError("backlog loop completion is not allowlisted")
         run_workflow_id = payload.get("workflow_id")
         deactivation: dict[str, Any] | None = None
+        # An activity retry after a committed attempt must not notify twice.
+        already_notified = False
         with self.sessions.begin() as session:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
@@ -2012,6 +2040,14 @@ class EngineeringActivityHandler:
                         if status in {"CANCELLED", "COMPLETE", "STOPPED", "FAILED"}
                         else None
                     )
+                    if completion is not None:
+                        # NEW-114: COMPLETE stays the terminal status every consumer knows;
+                        # the error code says that nothing was delivered.
+                        already_notified = run.error_code == completion
+                        run.error_code = str(completion)
+                        run.summary = self._nothing_delivered_summary(payload)
+                    elif status == "COMPLETE" and run.error_code == "COMPLETE_NOTHING_DELIVERED":
+                        run.error_code = None
                 if status in {"CANCELLED", "STOPPED", "FAILED"}:
                     # NEW-60: a cancelled loop's child runs never reach their own lease
                     # release; the next loop for the same issue then failed with
@@ -2072,9 +2108,54 @@ class EngineeringActivityHandler:
                     "requested_by": actor,
                     "requested_at": datetime.now(UTC).isoformat(),
                 }
+            if completion is not None and not already_notified:
+                self._enqueue_nothing_delivered(session, payload)
         if deactivation is not None:
             self._write_policy_request(deactivation)
         return self._envelope("backlog.record_loop_state", payload, status)
+
+    @staticmethod
+    def _nothing_delivered_summary(payload: dict[str, Any]) -> str:
+        raw = payload.get("outcomes")
+        outcomes = [str(value)[:160] for value in raw[:20]] if isinstance(raw, list) else []
+        refill_blocker = payload.get("refill_blocker")
+        return (
+            "Backlog loop completed with nothing delivered"
+            + (": " + "; ".join(outcomes) if outcomes else " (no eligible issue)")
+            + (f"; next issue not selected: {str(refill_blocker)[:120]}" if refill_blocker else "")
+        )[:2000]
+
+    def _enqueue_nothing_delivered(self, session: Any, payload: dict[str, Any]) -> None:
+        """NEW-114: tell the operator a loop finished without delivering anything."""
+        workflow_id = str(payload.get("workflow_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,300}", workflow_id):
+            workflow_id = ""
+        project = str(payload.get("project") or "")
+        if project not in {"falcone", "musematic", "llmwiki"}:
+            project = ""
+        summary = self._nothing_delivered_summary(payload)
+        session.add(
+            db.NotificationOutbox(
+                topic="telegram.engineering-backlog-nothing-delivered",
+                status="PENDING",
+                payload_json={
+                    "message": (
+                        f"Hermes backlog loop {workflow_id or '(unknown)'}"
+                        + (f" for {project}" if project else "")
+                        + f" finished with nothing delivered. {summary}"
+                    )[:3000],
+                    "project": project or None,
+                    "backlog_campaign_id": str(payload.get("backlog_campaign_id") or ""),
+                    "workflow_id": workflow_id or None,
+                    "completion": "COMPLETE_NOTHING_DELIVERED",
+                    "commands": [f"{self._CTL} backlog-status {workflow_id or '<workflow id>'}"],
+                },
+                attempts=0,
+                next_attempt_at=datetime.now(UTC),
+                delivered_at=None,
+                last_error_code=None,
+            )
+        )
 
     def _register_backlog_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["backlog_campaign_id"]))

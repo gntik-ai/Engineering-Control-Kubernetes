@@ -2521,6 +2521,7 @@ async def test_a_paused_loop_can_be_retried_more_than_once(tmp_path: Path) -> No
         )
     control = Mock()
     control.signal = AsyncMock(return_value=None)
+    control.validate_backlog_issue_signal = AsyncMock(return_value=None)
     bus = TypedCommandBus(control, Mock(), repository)  # type: ignore[arg-type]
     command = WorkflowControlCommand(
         action="retry",
