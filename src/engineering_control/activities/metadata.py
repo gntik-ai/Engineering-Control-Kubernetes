@@ -3632,7 +3632,15 @@ class MetadataActivityHandler:
             ):
                 return True
             record = recovery.get("staging_gitops")
-            merged_sha = record.get("merge_sha") if isinstance(record, dict) else None
+            merged_sha = (
+                record.get("merge_sha")
+                # NEW-118 review 3: a record persisted for a previously bound source PR
+                # never counts; records from before NEW-118 carry no URL.
+                if isinstance(record, dict)
+                and record.get("source_pr_url", change_set.source_pr_url)
+                == change_set.source_pr_url
+                else None
+            )
             return change_set.state in _DELIVERED_CHANGE_SET_STATES or bool(
                 isinstance(merged_sha, str) and re.fullmatch(r"[a-f0-9]{40}", merged_sha)
             )

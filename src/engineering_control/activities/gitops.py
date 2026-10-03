@@ -759,17 +759,31 @@ class GitOpsControllerHandler:
             str(orchestration.get("workflow_id", "")) if isinstance(orchestration, dict) else ""
         )
         with self.sessions.begin() as session:
-            change_set = session.get(db.ChangeSet, plan.change_set_id)
+            # NEW-118 review 3: lock the row so concurrent persists serialize the
+            # read-modify-write of recovery_json and the write-once ``source_merge``.
+            change_set = session.get(db.ChangeSet, plan.change_set_id, with_for_update=True)
             if change_set is None or change_set.project != plan.project:
                 raise ValueError("staging GitOps ChangeSet binding is missing")
             recovery = dict(change_set.recovery_json or {})
+            # A replayed plan for a source PR the ChangeSet no longer binds (rebinding to
+            # a new PR) neither creates nor restores a merge record.
+            bound_url = change_set.source_pr_url
+            plan_bound = bool(bound_url) and plan.source_pr_url == bound_url
+            record["source_pr_url"] = plan.source_pr_url
             # NEW-118 review: a merged source PR stays merged. The first recorded merge is
             # durable (``source_merge``, bound to the source PR) and a later recheck that
             # stops before the merge step (e.g. deployment CI) never nulls it out.
             previous = recovery.get("staging_gitops")
-            previous_sha = previous.get("merge_sha") if isinstance(previous, dict) else None
+            previous_sha = (
+                previous.get("merge_sha")
+                if isinstance(previous, dict)
+                and previous.get("source_pr_url", plan.source_pr_url) == plan.source_pr_url
+                else None
+            )
             durable = recovery.get("source_merge")
-            if not (isinstance(durable, dict) and _SHA.fullmatch(str(durable.get("merge_sha")))):
+            if plan_bound and not (
+                isinstance(durable, dict) and _SHA.fullmatch(str(durable.get("merge_sha")))
+            ):
                 first_sha = merge_sha if merge_sha is not None else previous_sha
                 if first_sha is not None and _SHA.fullmatch(str(first_sha)):
                     durable = {
@@ -781,8 +795,9 @@ class GitOpsControllerHandler:
                     recovery["source_merge"] = durable
             if (
                 record["merge_sha"] is None
+                and plan_bound
                 and isinstance(durable, dict)
-                and durable.get("source_pr_url") == plan.source_pr_url
+                and durable.get("source_pr_url") == bound_url
             ):
                 record["merge_sha"] = durable.get("merge_sha")
             recovery["staging_gitops"] = record
