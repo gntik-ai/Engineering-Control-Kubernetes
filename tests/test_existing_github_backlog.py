@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -1328,7 +1328,6 @@ def test_source_pr_runtime_proof_waiver_is_per_issue_and_revalidates_source_firs
 
 
 def test_source_revalidation_runtime_proof_is_bound_to_source_pr_issue_operations() -> None:
-    from uuid import uuid4
 
     from pydantic import ValidationError
 
@@ -1544,16 +1543,28 @@ def test_register_run_records_a_start_blocked_at_selection_as_closed(tmp_path: P
                 workflow_id="backlog-import-falcone",
             )
         )
-    handler._register_backlog_run(
-        {
-            "backlog_campaign_id": str(campaign_id),
-            "workflow_id": "backlog-loop-falcone-blocked",
-            "closed_blocker": "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE",
-        }
+    from engineering_control.db import runtime_binding
+
+    # NEW-112 review: the loop registers its own Run from inside its verified execution,
+    # so the Run is bound at once and later activities never need memo enrollment.
+    first_run_id = str(uuid4())
+    token = runtime_binding._current_identity.set(
+        runtime_binding._Identity("backlog-loop-falcone-blocked", first_run_id, first_run_id)
     )
+    try:
+        handler._register_backlog_run(
+            {
+                "backlog_campaign_id": str(campaign_id),
+                "workflow_id": "backlog-loop-falcone-blocked",
+                "closed_blocker": "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE",
+            }
+        )
+    finally:
+        runtime_binding._current_identity.reset(token)
     with handler.sessions() as session:
         run = session.scalar(select(Run).where(Run.workflow_id == "backlog-loop-falcone-blocked"))
         assert run is not None
+        assert run.temporal_first_execution_run_id == first_run_id
         assert run.status == "STOPPED" and run.finished_at is not None
         assert "DIRECT_ISSUE_NOT_CURRENTLY_ELIGIBLE" in (run.summary or "")
         campaign = session.get(GitHubBacklogCampaign, campaign_id)

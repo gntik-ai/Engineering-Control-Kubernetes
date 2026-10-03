@@ -2087,7 +2087,9 @@ class EngineeringActivityHandler:
             # closed, so its operation ends and the issue can be started again.
             closed_blocker = payload.get("closed_blocker")
             now = datetime.now(UTC)
-            run = db.Run(
+            # The loop registers its own Run, so it is bound to this execution at once
+            # (2b678d9 run binding); an unbound row could never be enrolled later.
+            run = new_bound_run(
                 campaign_id=None,
                 workflow_id=workflow_id,
                 run_type="existing-backlog-loop",

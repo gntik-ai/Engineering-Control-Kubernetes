@@ -42,6 +42,8 @@ _WORKFLOW_TYPE_MAP = {
     "staging-deployment": "StagingDeploymentWorkflow",
     "runtime-verification": "RuntimeVerificationWorkflow",
     "recovery": "RecoveryWorkflow",
+    # Main (NEW-87 staging GitOps): the backlog loop pre-registers this child Run.
+    "staging-gitops": "StagingGitOpsDeliveryWorkflow",
 }
 
 

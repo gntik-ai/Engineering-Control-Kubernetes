@@ -1355,6 +1355,59 @@ async def test_gitops_controller_step_is_wired_to_a_production_handler(
 
 
 @pytest.mark.asyncio
+async def test_a_registered_gitops_child_enrolls_its_run_and_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NEW-112 review: the backlog loop pre-registers the staging-gitops child Run without
+    # an execution binding; its first controller step must enroll it from the start memo.
+    from dataclasses import replace
+
+    from temporalio.exceptions import ApplicationError
+    from temporalio.testing import ActivityEnvironment
+    from test_start_proof import NAMESPACE, WORKFLOW_ID, make_fixture
+
+    monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
+    activities = ControlActivities(_settings(tmp_path), "controller")
+    assert activities.metadata_handler is not None
+    Base.metadata.create_all(activities.metadata_handler.engine)
+    run_id = uuid4()
+    with activities.metadata_handler.sessions.begin() as session:
+        session.add(
+            db.Run(
+                id=run_id,
+                workflow_id=WORKFLOW_ID,
+                run_type="staging-gitops",
+                status="QUEUED",
+                project="musematic",
+            )
+        )
+
+    async def run_step(workflow_type: str) -> dict[str, Any]:
+        fixture = await make_fixture(app_id=str(run_id), workflow_type=workflow_type)
+        environment = ActivityEnvironment(client=fixture.client)
+        environment.info = replace(
+            environment.info,
+            namespace=NAMESPACE,
+            workflow_id=WORKFLOW_ID,
+            workflow_run_id=fixture.current,
+        )
+        return await environment.run(
+            activities.execute_control_step,
+            {"step": "gitops.flow_for_project", "payload": {"project": "musematic"}},
+        )
+
+    # The memo must come from the exact child workflow type the Run kind names.
+    with pytest.raises(ApplicationError, match="Existing Run identity is unverifiable"):
+        await run_step("AuditCampaignWorkflow")
+    result = await run_step("StagingGitOpsDeliveryWorkflow")
+    assert result["status"] == "ENABLED" and result["enabled"] is True
+    with activities.metadata_handler.sessions() as session:
+        run = session.get(db.Run, run_id)
+        assert run is not None and run.temporal_first_execution_run_id is not None
+    activities.metadata_handler.engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_gitops_github_step_is_wired_to_a_production_handler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

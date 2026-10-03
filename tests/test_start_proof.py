@@ -24,6 +24,7 @@ async def make_fixture(
     memo_version=1,
     corrupt_memo=None,
     workflow_id=WORKFLOW_ID,
+    workflow_type="AuditCampaignWorkflow",
 ):
     current_run = str(uuid.uuid4())
     first_run = str(uuid.uuid4()) if continued else current_run
@@ -38,13 +39,13 @@ async def make_fixture(
     current_desc = SimpleNamespace(
         id=workflow_id,
         run_id=current_run,
-        workflow_type="AuditCampaignWorkflow",
+        workflow_type=workflow_type,
         raw_description=_raw(workflow_id, current_run, first_run),
     )
     first_desc = SimpleNamespace(
         id=workflow_id,
         run_id=first_run,
-        workflow_type="AuditCampaignWorkflow",
+        workflow_type=workflow_type,
         raw_description=_raw(workflow_id, first_run, first_run),
     )
 
@@ -53,7 +54,7 @@ async def make_fixture(
     event.event_type = EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
     attrs = event.workflow_execution_started_event_attributes
     attrs.workflow_id = workflow_id
-    attrs.workflow_type.name = "AuditCampaignWorkflow"
+    attrs.workflow_type.name = workflow_type
     attrs.first_execution_run_id = first_run
 
     if app_id is not None:
