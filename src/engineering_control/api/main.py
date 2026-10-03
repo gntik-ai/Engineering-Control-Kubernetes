@@ -743,9 +743,26 @@ def create_app(
         # bearer-authenticated channel asserts the actor, which must be a canonical operator.
         actor = approval_actor(subject)
         try:
-            await repository.issue_amend_precheck(body.project, body.repository, body.issue_number)
+            projected = await repository.issue_amend_precheck(
+                body.project, body.repository, body.issue_number
+            )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        # Runs projected RUNNING (e.g. stopped at the body refresh before NEW-115, which
+        # release_leases never terminalized) block unless Temporal proves them closed.
+        closed: set[Any] = set()
+        for run_id, workflow_id in projected:
+            try:
+                if await service.workflow_id_closed(workflow_id):
+                    closed.add(run_id)
+                    continue
+            except Exception:  # noqa: BLE001,S110 - unverifiable stays active (fail closed)
+                pass
+            raise HTTPException(
+                status_code=409,
+                detail="ISSUE_AMEND_DELIVERY_ACTIVE: a delivery of this issue is running "
+                f"({workflow_id}); amend it after it stops",
+            )
         try:
             observation = await service.observe_issue_body(
                 f"gntik-ai/{body.repository}", body.issue_number
@@ -764,6 +781,7 @@ def create_app(
                 observation,
                 body.confirm,
                 actor,
+                frozenset(closed),
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

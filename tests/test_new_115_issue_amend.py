@@ -912,3 +912,102 @@ def test_telegram_amend_timeout_reports_an_unknown_outcome(
     assert "OUTCOME_UNKNOWN" in result["message"]
     assert "run the same /loop amend command again to reconcile" in result["message"]
     assert "rejected" not in result["message"] and "failed" not in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_confirmation_never_retries_another_revision(tmp_path: Path) -> None:
+    # Codex round 2: after revision C is amended, a prefix from an earlier preview (B)
+    # with retry reports NO_CHANGE without any retry information.
+    values = await _approved(tmp_path)
+    operations = values[0]
+    observation = await _refresh(tmp_path, EDITED)
+    amended = await _amend(operations, observation, _sha(EDITED)[:12])
+    assert amended["status"] == "AMENDED"
+    stale = await _amend(operations, observation, _sha("revision B")[:12])
+    assert stale["status"] == "NO_CHANGE"
+    assert "retry_workflow_id" not in stale and "retry_key" not in stale
+    same = await _amend(operations, observation, _sha(EDITED)[:12])
+    assert same["status"] == "NO_CHANGE" and "retry_workflow_id" in same
+    _dispose(values)
+
+
+def _legacy_running(operations: Any) -> Any:
+    """A run stopped at the body refresh before NEW-115 stays projected RUNNING."""
+    with operations.sessions.begin() as session:
+        run = session.scalar(select(Run).where(Run.status == "BLOCKED"))
+        assert run is not None
+        run.status = "RUNNING"
+        return run.id, run.workflow_id
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_running_projection_blocks_unless_temporal_proves_it_closed(
+    tmp_path: Path,
+) -> None:
+    values = await _approved(tmp_path)
+    operations = values[0]
+    run_id, workflow_id = _legacy_running(operations)
+    assert await operations.issue_amend_precheck("falcone", "falcone", 42) == [
+        (run_id, workflow_id)
+    ]
+    observation = await _refresh(tmp_path, EDITED)
+    with pytest.raises(ValueError, match="ISSUE_AMEND_DELIVERY_ACTIVE"):
+        await _amend(operations, observation, _sha(EDITED)[:12])
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    body = {
+        "project": "falcone",
+        "repository": "falcone",
+        "issue_number": 42,
+        "confirm": _sha(EDITED)[:12],
+    }
+    for verdict in (AsyncMock(return_value=False), AsyncMock(side_effect=RuntimeError("rpc"))):
+        service = Mock()
+        service.observe_issue_body = AsyncMock(return_value=observation)
+        service.workflow_id_closed = verdict
+        with _api(service, operations, bus) as client:
+            refused = client.post("/v1/issues/amend", headers=_headers("telegram:42"), json=body)
+        assert refused.status_code == 409
+        assert "ISSUE_AMEND_DELIVERY_ACTIVE" in refused.json()["detail"]
+        service.observe_issue_body.assert_not_awaited()
+    service = Mock()
+    service.observe_issue_body = AsyncMock(return_value=observation)
+    service.workflow_id_closed = AsyncMock(return_value=True)
+    with _api(service, operations, bus) as client:
+        accepted = client.post("/v1/issues/amend", headers=_headers("telegram:42"), json=body)
+    assert accepted.status_code == 200 and accepted.json()["status"] == "AMENDED"
+    service.workflow_id_closed.assert_awaited_once_with(workflow_id)
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_a_run_started_after_the_temporal_check_still_blocks(tmp_path: Path) -> None:
+    # Only the runs verified closed are excused; a RUNNING run that appears between the
+    # precheck and the locked confirm (a new id) still refuses the amendment.
+    values = await _approved(tmp_path)
+    operations = values[0]
+    run_id, _workflow_id = _legacy_running(operations)
+    with operations.sessions.begin() as session:
+        legacy = session.get(Run, run_id)
+        assert legacy is not None
+        session.add(
+            Run(
+                change_set_id=legacy.change_set_id,
+                workflow_id=f"{legacy.workflow_id}-new",
+                run_type=legacy.run_type,
+                status="RUNNING",
+                project=legacy.project,
+            )
+        )
+    observation = await _refresh(tmp_path, EDITED)
+    with pytest.raises(ValueError, match="ISSUE_AMEND_DELIVERY_ACTIVE"):
+        await operations.amend_issue(
+            "falcone",
+            "falcone",
+            42,
+            observation,
+            _sha(EDITED)[:12],
+            "telegram:42",
+            frozenset({run_id}),
+        )
+    _dispose(values)

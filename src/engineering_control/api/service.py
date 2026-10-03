@@ -86,6 +86,7 @@ class ControlService(Protocol):
     ) -> OperationAccepted: ...
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]: ...
     async def workflow_run_status(self, workflow_id: str, run_id: str) -> str: ...
+    async def workflow_id_closed(self, workflow_id: str) -> bool: ...
     async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]: ...
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
     async def start_acceptance(
@@ -449,6 +450,23 @@ class TemporalControlService:
         """Status of one execution, not of whatever later run reused the workflow ID."""
         description = await self.client.get_workflow_handle(workflow_id, run_id=run_id).describe()
         return description.status.name if description.status is not None else "UNKNOWN"
+
+    async def workflow_id_closed(self, workflow_id: str) -> bool:
+        """NEW-115: no execution of this workflow ID is running.
+
+        Temporal runs at most one execution per workflow ID at a time, so the latest
+        execution being closed (or the ID being unknown after retention) proves that no
+        execution of it runs now. Any other failure propagates (fail closed)."""
+        from temporalio.service import RPCError, RPCStatusCode
+
+        async with asyncio.timeout(10):
+            try:
+                description = await self.client.get_workflow_handle(workflow_id).describe()
+            except RPCError as error:
+                if error.status == RPCStatusCode.NOT_FOUND:
+                    return True
+                raise
+        return description.status is not None and description.status.name != "RUNNING"
 
     async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]:
         """Bounded, pinned result read; never follow a different execution implicitly."""

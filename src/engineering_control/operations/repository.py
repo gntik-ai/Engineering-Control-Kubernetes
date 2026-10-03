@@ -655,13 +655,24 @@ class OperationsRepository:
             "production": False,
         }
 
-    async def issue_amend_precheck(self, project: str, repository: str, issue_number: int) -> None:
-        """NEW-115: refuse an amendment from durable state before reading GitHub."""
-        await asyncio.to_thread(self._issue_amend_precheck, project, repository, issue_number)
+    async def issue_amend_precheck(
+        self, project: str, repository: str, issue_number: int
+    ) -> list[tuple[UUID, str]]:
+        """NEW-115: refuse an amendment from durable state before reading GitHub.
 
-    def _issue_amend_precheck(self, project: str, repository: str, issue_number: int) -> None:
+        Returns the runs projected RUNNING for the delivery; the caller verifies in
+        Temporal which of them are closed before the amendment may proceed."""
+        return await asyncio.to_thread(
+            self._issue_amend_precheck, project, repository, issue_number
+        )
+
+    def _issue_amend_precheck(
+        self, project: str, repository: str, issue_number: int
+    ) -> list[tuple[UUID, str]]:
+        running: list[tuple[UUID, str]] = []
         with self.sessions.begin() as session:
-            resolve_amend_target(session, project, repository, issue_number)
+            resolve_amend_target(session, project, repository, issue_number, running_runs=running)
+        return running
 
     async def amend_issue(
         self,
@@ -671,6 +682,7 @@ class OperationsRepository:
         observation: dict[str, Any],
         confirmation: str | None,
         actor: str,
+        closed_run_ids: frozenset[UUID] = frozenset(),
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._amend_issue,
@@ -680,6 +692,7 @@ class OperationsRepository:
             observation,
             confirmation,
             actor,
+            closed_run_ids,
         )
 
     def _amend_issue(
@@ -690,6 +703,7 @@ class OperationsRepository:
         observation: dict[str, Any],
         confirmation: str | None,
         actor: str,
+        closed_run_ids: frozenset[UUID] = frozenset(),
     ) -> dict[str, Any]:
         if not is_reauthenticated_backlog_operator(actor):
             raise ValueError("issue amendment requires an allowlisted operator channel")
@@ -704,6 +718,7 @@ class OperationsRepository:
                 observation=observation,
                 confirmation=confirmation,
                 actor=actor,
+                closed_run_ids=closed_run_ids,
             )
 
     def _candidate(self, command: Command, session_binding_hash: str) -> CandidateView:

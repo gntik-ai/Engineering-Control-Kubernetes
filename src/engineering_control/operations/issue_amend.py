@@ -145,8 +145,15 @@ def resolve_amend_target(
     *,
     lock: bool = False,
     now: datetime | None = None,
+    closed_run_ids: frozenset[UUID] = frozenset(),
+    running_runs: list[tuple[UUID, str]] | None = None,
 ) -> tuple[BacklogIssueRecord, GitHubBacklogCampaign, Finding, ChangeSet | None]:
-    """Find the approved backlog delivery of one issue, or refuse with a blocker."""
+    """Find the approved backlog delivery of one issue, or refuse with a blocker.
+
+    A Run projected RUNNING blocks the amendment unless the caller verified in Temporal
+    that its workflow is closed (``closed_run_ids``): runs stopped at the body refresh
+    before NEW-115 were never terminalized by release_leases. With ``running_runs`` the
+    RUNNING runs are collected for that verification instead of refused."""
     full_repository = f"gntik-ai/{repository}"
     pairs = BACKLOG_PROJECT_PAIRS.get(project)
     if pairs is None or full_repository not in pairs:
@@ -237,11 +244,16 @@ def resolve_amend_target(
                 f"{change_set.state}); re-import the backlog and start the issue again",
             )
         current = now or datetime.now(UTC)
-        running = session.scalar(
-            select(Run.id)
-            .where(Run.change_set_id == change_set.id, Run.status == "RUNNING")
-            .limit(1)
-        )
+        projected = session.execute(
+            select(Run.id, Run.workflow_id).where(
+                Run.change_set_id == change_set.id, Run.status == "RUNNING"
+            )
+        ).all()
+        unverified = [(row[0], row[1]) for row in projected if row[0] not in closed_run_ids]
+        if running_runs is not None:
+            running_runs.extend(unverified)
+            unverified = []
+        running = unverified[0][0] if unverified else None
         leased = session.scalar(
             select(ComponentLease.id)
             .join(Run, Run.id == ComponentLease.owner_run_id)
@@ -311,6 +323,7 @@ def amend_issue(
     confirmation: str | None,
     actor: str | None,
     now: datetime | None = None,
+    closed_run_ids: frozenset[UUID] = frozenset(),
 ) -> dict[str, Any]:
     """Preview (no confirmation) or apply (confirmation) one issue body amendment.
 
@@ -327,6 +340,7 @@ def amend_issue(
         issue_number,
         lock=confirmation is not None,
         now=current_time,
+        closed_run_ids=closed_run_ids,
     )
     target = f"{issue.repository}#{issue.issue_number}"
     observed = _observed(observation, target)
@@ -372,7 +386,15 @@ def amend_issue(
             "status": "NO_CHANGE",
             "detail": "the GitHub issue is the approved revision; nothing to amend",
         }
-        if isinstance(amendment, dict) and amendment.get("body_sha256") == current_sha256:
+        if (
+            isinstance(amendment, dict)
+            and amendment.get("body_sha256") == current_sha256
+            # Only a rerun of a confirmation of this very revision reconciles (round 2): a
+            # stale prefix from an earlier preview never retries another operator's amendment.
+            and confirmation is not None
+            and CONFIRMATION_PATTERN.fullmatch(confirmation) is not None
+            and current_sha256.startswith(confirmation)
+        ):
             # A rerun after an unknown outcome (e.g. a client timeout) reconciles: the
             # recorded amendment is this revision, so a requested retry is still sent.
             result["amended_by"] = amendment.get("amended_by")
