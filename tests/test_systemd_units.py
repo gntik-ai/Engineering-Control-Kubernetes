@@ -73,6 +73,28 @@ def test_notifier_is_confined_to_loopback_delivery() -> None:
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in unit
     assert "CapabilityBoundingSet=" in unit
     assert "TasksMax=64" in unit
+    # NEW-112 review: the default (HMAC loopback) unit allows nothing beyond localhost.
+    assert [line for line in unit.splitlines() if line.startswith("IPAddress")] == [
+        "IPAddressDeny=any",
+        "IPAddressAllow=localhost",
+    ]
+
+
+def test_remote_bearer_sink_allowance_is_an_explicit_narrow_opt_in() -> None:
+    # Main's supported bearer HTTPS sink needs egress; it is granted only by an operator-
+    # installed drop-in that adds exact host addresses and keeps the deny-by-default.
+    directory = REPOSITORY_ROOT / "systemd/engineering-notifier.service.d"
+    assert sorted(path.name for path in directory.iterdir()) == ["remote-bearer-sink.conf.example"]
+    dropin = (directory / "remote-bearer-sink.conf.example").read_text(encoding="utf-8")
+    directives = [line for line in dropin.splitlines() if line and not line.startswith(("#", "["))]
+    assert directives and all(line.startswith("IPAddressAllow=") for line in directives)
+    for directive in directives:
+        for address in directive.removeprefix("IPAddressAllow=").split():
+            assert address.endswith(("/32", "/128")), address
+    assert "ENGINEERING_NOTIFICATION_AUTH_MODE=bearer" in dropin
+    # bootstrap installs only the named unit files, never this example drop-in.
+    bootstrap = (REPOSITORY_ROOT / "scripts/bootstrap-controller.sh").read_text(encoding="utf-8")
+    assert "remote-bearer-sink" not in bootstrap
 
 
 def test_temporal_lifecycle_verifier_explicitly_enables_only_its_bounded_root() -> None:

@@ -134,6 +134,10 @@ failed refresh therefore becomes `STALE` instead of retaining a false-green prov
 Back up PostgreSQL and `/etc/engineering-control` before upgrades. Do not back up provider OAuth or
 SSH private keys into general platform archives. Temporal and PostgreSQL must be healthy before
 starting API/workers. The notifier uses an outbox so an unavailable sink does not lose state.
+The notifier unit is confined to loopback (the default HMAC sink is the gateway webhook on
+127.0.0.1:8644). A remote bearer HTTPS sink is an explicit opt-in: install
+`systemd/engineering-notifier.service.d/remote-bearer-sink.conf.example` as a drop-in with the
+sink's exact addresses; see the instructions in that file.
 The one-shot schedule registrar bounds its complete Temporal RPC transaction to 30 seconds and its
 systemd start to 45 seconds; transient failures restart after 15 seconds instead of holding an
 install indefinitely.
