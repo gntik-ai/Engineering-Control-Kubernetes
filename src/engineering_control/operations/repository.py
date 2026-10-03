@@ -58,6 +58,7 @@ from engineering_control.operations.connection_budget import (
     joined_diagnostic_thread,
 )
 from engineering_control.operations.connection_status import (
+    PROVIDER_FRESHNESS_SECONDS,
     effective_connection_status,
     provider_connection_status,
     provider_observation_current,
@@ -104,14 +105,13 @@ from engineering_control.operations.reconciliation import (
 )
 from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
-from engineering_control.workflows.schedule_intervals import QUOTA_REFRESH_INTERVAL
 
 _ACTIVE_OPERATION_STATES = frozenset(ACTIVE_OPERATION_STATUSES)
-# NEW-16, 2026-09-22: this must stay comfortably above QUOTA_REFRESH_INTERVAL, not an
-# independent literal -- a hardcoded 300s (5 min) here against a schedule that only
-# refreshes every 30 min made solve_backlog/solve_issue's preflight fail ~83% of the
-# time. The buffer absorbs schedule jitter and the refresh workflow's own run time.
-_PROVIDER_HEALTH_STALE_AFTER = QUOTA_REFRESH_INTERVAL + timedelta(minutes=10)
+# 2b678d9 provider freshness contract: a preflight trusts a provider observation for
+# PROVIDER_FRESHNESS_SECONDS (300 s). NEW-16's failure (a 300 s gate against a 30 min
+# schedule) is resolved by the schedule instead: QUOTA_REFRESH_INTERVAL is 240 s and
+# interval + execution timeout stays inside this window (asserted in test_scheduler).
+_PROVIDER_HEALTH_STALE_AFTER = timedelta(seconds=PROVIDER_FRESHNESS_SECONDS)
 _CAMPAIGN_EXPORT_COLLECTIONS = ("root_blockers", "findings", "runs", "artifacts")
 _TERMINAL_WORKFLOW_STATES = frozenset(
     {

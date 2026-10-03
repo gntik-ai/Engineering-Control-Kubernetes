@@ -51,7 +51,10 @@ def test_quota_refresh_schedule_stays_well_under_the_provider_health_staleness_t
     scheduled_interval = entry.spec.intervals[0].every
 
     assert scheduled_interval == QUOTA_REFRESH_INTERVAL
-    assert _PROVIDER_HEALTH_STALE_AFTER > scheduled_interval + timedelta(minutes=5)
+    # Merged with 2b678d9: the preflight keeps the 300 s freshness contract, so a refresh
+    # (interval plus its execution timeout) always lands inside that window.
+    assert _PROVIDER_HEALTH_STALE_AFTER == timedelta(seconds=PROVIDER_FRESHNESS_SECONDS)
+    assert scheduled_interval + entry.action.execution_timeout <= _PROVIDER_HEALTH_STALE_AFTER
     # Merged with 2b678d9: the managed provider refresh never pauses on failure.
     assert entry.policy.pause_on_failure is False
 

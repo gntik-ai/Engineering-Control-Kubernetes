@@ -595,14 +595,32 @@ async def test_completed_connection_refresh_can_be_run_again(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("age_seconds", "stale"), [(290, False), (310, True), (14 * 60, True)])
+async def test_preflight_keeps_the_300_second_provider_freshness_contract(
+    tmp_path: Path, age_seconds: int, stale: bool
+) -> None:
+    # NEW-112 review: the merge had widened the preflight to 14 minutes (NEW-16's buffer
+    # over the old 30 min schedule); 2b678d9's 300 s contract applies again.
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    with repository.sessions.begin() as session:
+        for snapshot in session.scalars(select(QuotaSnapshot)).all():
+            snapshot.captured_at = datetime.now(UTC) - timedelta(seconds=age_seconds)
+    candidate = await repository.candidate(_solve_issue(), SESSION_A)
+    blockers = {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"}
+    assert (blockers <= set(candidate.capability.blockers)) is stale
+    if not stale:
+        assert not blockers & set(candidate.capability.blockers)
+
+
+@pytest.mark.asyncio
 async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     _seed_ready_issue(repository)
     with repository.sessions.begin() as session:
         snapshots = session.scalars(select(QuotaSnapshot)).all()
         for snapshot in snapshots:
-            # Must exceed QUOTA_REFRESH_INTERVAL (30 min) + its staleness buffer,
-            # not an arbitrary short age -- see NEW-16 (2026-09-22).
+            # Well beyond the 300 s provider freshness contract (and NEW-16's old window).
             snapshot.captured_at = datetime.now(UTC) - timedelta(minutes=45)
     stale = await repository.candidate(_solve_issue(), SESSION_A)
     assert stale.capability.status == "BLOCKED"
