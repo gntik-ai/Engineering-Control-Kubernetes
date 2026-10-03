@@ -3545,3 +3545,60 @@ async def test_new_118_escalation_issue_gives_verification_and_operator_commands
         assert "delete" not in entry.replace("do not delete blindly", "")
     # An identifier that is not a valid Kubernetes name gets no command at all.
     assert "kubectl" not in weird and "requires manual review; do not delete blindly." in weird
+
+
+@pytest.mark.asyncio
+async def test_new_118_a_recorded_source_merge_survives_rechecks_and_skips_pin_convergence(
+    tmp_path: Path,
+) -> None:
+    # Codex round 2: merge the source, then the deployment CI fails and a recheck persists
+    # merge_sha=None, then OpenSpec preparation of the repair resets the state to PLANNED.
+    # The source PR is still merged: convergence must not touch the source branch.
+    from engineering_control.activities.metadata import MetadataActivityHandler
+
+    handler = _controller(tmp_path, FakeKubectl())
+    change_set_id = _seed_change_set(handler)
+    plan = _plan(change_set_id=str(change_set_id))
+    await handler.handle(
+        "gitops.persist_result",
+        {
+            "plan": plan,
+            "outcome": "BLOCKED",
+            "blocker": "DEPLOYMENT_PR_MERGE_BLOCKED",
+            "merge_sha": MERGE_SHA,
+        },
+    )
+    recheck = await handler.handle(
+        "gitops.persist_result",
+        {
+            "plan": plan,
+            "outcome": "BLOCKED",
+            "blocker": "DEPLOYMENT_PR_CI_REGRESSION",
+            "ci_regressions": ["Chart release"],
+            "ci_regression_target": "deployment",
+        },
+    )
+    assert recheck["status"] == "PERSISTED"
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        recovery = change_set.recovery_json
+        assert recovery["staging_gitops"]["blocker"] == "DEPLOYMENT_PR_CI_REGRESSION"
+        assert recovery["staging_gitops"]["merge_sha"] == MERGE_SHA
+        assert recovery["source_merge"]["merge_sha"] == MERGE_SHA
+        assert recovery["source_merge"]["source_pr_url"] == plan["source_pr_url"]
+        change_set.state = "PLANNED"  # the repair's OpenSpec preparation
+    metadata = MetadataActivityHandler(handler.settings)
+    try:
+        assert metadata._source_pr_merged(change_set_id) is True
+    finally:
+        metadata.engine.dispose()
+    # A recheck with a different merge SHA never rewrites the first recorded merge.
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": plan, "outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": "f" * 40},
+    )
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.recovery_json["source_merge"]["merge_sha"] == MERGE_SHA

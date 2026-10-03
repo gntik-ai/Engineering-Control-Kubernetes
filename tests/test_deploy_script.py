@@ -106,24 +106,20 @@ def test_the_previous_release_is_recorded_before_the_swap() -> None:
 
 
 def test_a_failed_migration_rolls_back_and_never_leaves_dependents_stopped() -> None:
-    text = _text()
-    recover = text[
-        _index(text, "recover_failed_migration() {") : _index(
-            text,
-            'if [[ "$MIGRATION_NEEDED" == yes ]]; then\n  echo "-- controller: engineering-migrate',
-        )
-    ]
-    # The revision is read again after the failure; an unchanged database rolls back.
+    recover = _function(_text(), "recover_failed_migration")
+    # errexit is off for the whole recovery; every command collects its own failure.
+    assert recover.splitlines()[1].strip() == "set +e"
     assert "after_out=$(new_release_alembic current)" in recover
-    assert 'if [[ "$after" == "$DB_REVISION" ]]; then' in recover
-    rollback = recover[recover.index('if [[ "$after" == "$DB_REVISION" ]]; then') :]
-    assert rollback.index('sudo ln -sfn "$PREVIOUS_SOURCE"') < rollback.index("start_dependents")
-    assert "sudo ln -sfn '$PREVIOUS_WORKER_SOURCE'" in rollback
-    # Either branch starts the dependents (or prints exact recovery) before exiting.
-    assert recover.count("start_dependents") == 2
-    assert "recovery_instructions" in recover and recover.rstrip().endswith("exit 1\n}")
-    starts = text[_index(text, "start_dependents() {") : _index(text, "recovery_instructions() {")]
-    assert 'sudo systemctl start "$unit" || failed=1' in starts
+    assert 'if [[ -n "$after" && "$after" == "$DB_REVISION" ]]; then' in recover
+    rollback = recover[recover.index('if [[ -n "$after"') :]
+    assert rollback.index('sudo ln -sfn "$PREVIOUS_SOURCE"') < rollback.index("systemctl start")
+    for command in (
+        'sudo ln -sfn "$PREVIOUS_SOURCE" /opt/engineering-control/source ||',
+        'sudo ln -sfn "$PREVIOUS_VENV" /opt/engineering-control/venv ||',
+        'sudo systemctl start "$unit" || failures+=',
+    ):
+        assert command in recover
+    assert recover.rstrip().endswith("exit 1\n}")
 
 
 def test_a_migration_counts_only_if_it_really_ran_and_reached_the_release_head() -> None:
@@ -141,3 +137,76 @@ def test_the_final_revision_check_fails_the_deploy_on_mismatch() -> None:
     verify = _text()[_index(_text(), "=== 7/7: verify ===") :]
     check = verify[_index(verify, 'grep -qx -- "${DB_FINAL_REVISION:-unknown}"') :]
     assert check.index("exit 1") < check.index("=== Done.")
+
+
+def _function(text: str, name: str) -> str:
+    start = _index(text, f"\n{name}() {{\n") + 1
+    return text[start : text.index("\n}\n", start) + 3]
+
+
+@pytest.mark.parametrize("database", ["unchanged", "moved"])
+def test_recovery_attempts_every_step_even_when_commands_fail(
+    tmp_path: Path, database: str
+) -> None:
+    # Codex round 2: under `set -e` a failing sudo/ln aborted the rollback before the
+    # worker restore, the dependent starts and the recovery instructions.
+    text = _text()
+    log = tmp_path / "calls.log"
+    revision = "0018" if database == "unchanged" else "0019"
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            f"LOG='{log}'",
+            # Every privileged or remote command fails; alembic reports the revision.
+            'sudo() { echo "sudo $*" >>"$LOG";'
+            f" if [[ $1 == systemd-run ]]; then echo '{revision} (head)'; return 0; fi;"
+            " return 1; }",
+            'ssh() { echo "ssh $*" >>"$LOG"; return 1; }',
+            "RELEASE_DIR=/opt/r/new; VENV_DIR=/opt/v/new; CONTROL_ENV=/e; HASH=abc",
+            "DB_REVISION=0018",
+            "PREVIOUS_SOURCE=/opt/r/old/source; PREVIOUS_VENV=/opt/v/old",
+            "PREVIOUS_WORKER_SOURCE=/opt/r/old/source; PREVIOUS_WORKER_VENV=/opt/v/old",
+            "MIGRATE_DEPENDENTS=(engineering-api.service engineering-watchdog.service)",
+            *(
+                _function(text, name)
+                for name in (
+                    "release_alembic",
+                    "new_release_alembic",
+                    "alembic_revisions",
+                    "recovery_instructions",
+                    "recover_failed_migration",
+                )
+            ),
+            'recover_failed_migration "Result=exit-code"',
+            "echo UNREACHABLE",
+        ]
+    )
+    bash = shutil.which("bash") or "/bin/bash"
+    result = subprocess.run(  # noqa: S603 - fixed interpreter, generated harness
+        [bash, "-c", harness], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 1 and "UNREACHABLE" not in result.stdout
+    calls = log.read_text()
+    starts = [line for line in calls.splitlines() if line.startswith("sudo systemctl start")]
+    assert starts == [
+        "sudo systemctl start engineering-api.service",
+        "sudo systemctl start engineering-watchdog.service",
+    ]
+    if database == "unchanged":
+        # Both controller symlinks and both worker symlinks were attempted despite failures.
+        lines = calls.splitlines()
+        assert sum(line.startswith("sudo ln -sfn") for line in lines) == 2
+        assert sum(line.startswith("ssh -t worker") for line in lines) == 2
+        for expected in (
+            "sudo ln -sfn '/opt/r/old/source' /opt/engineering-control/source",
+            "sudo ln -sfn '/opt/v/old' /opt/engineering-control/venv",
+            "sudo systemctl start engineering-api.service",
+            "sudo systemctl start engineering-watchdog.service",
+        ):
+            assert f"  {expected}\n" in result.stderr
+    else:
+        assert "ln -sfn" not in calls  # never roll code back past a moved database
+        assert "fix forward" in result.stderr
+    assert "RECOVERY: run these on the controller" in result.stderr
+    assert "ROLLED BACK" not in result.stderr

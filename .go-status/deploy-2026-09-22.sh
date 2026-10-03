@@ -279,30 +279,48 @@ recovery_instructions() {
 
 # NEW-118: a failed migration never leaves the controller stopped. With the database
 # still at its old revision (alembic runs each migration in a transaction), both hosts
-# go back to the previous release and every dependent is started on it.
+# go back to the previous release and every dependent is started on it. errexit is off
+# for the whole recovery: every step is attempted, each failure is collected, and the
+# exact commands for what failed are printed before the non-zero exit.
 recover_failed_migration() {
-  local reason="$1" after_out after=""
+  set +e
+  local reason="$1" after_out after="" rc unit
+  local -a failures=()
   echo "MIGRATION FAILED: $reason" >&2
-  if after_out=$(new_release_alembic current); then
+  after_out=$(new_release_alembic current)
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then
     after=$(alembic_revisions <<<"$after_out" | head -n 1)
   fi
   echo "Database revision after the failure: ${after:-unknown} (before: $DB_REVISION)" >&2
-  if [[ "$after" == "$DB_REVISION" ]]; then
+  if [[ -n "$after" && "$after" == "$DB_REVISION" ]]; then
     echo "-- rollback: database unchanged; restoring the previous release on both hosts --" >&2
-    sudo ln -sfn "$PREVIOUS_SOURCE" /opt/engineering-control/source
-    sudo ln -sfn "$PREVIOUS_VENV" /opt/engineering-control/venv
-    ssh -t worker "sudo ln -sfn '$PREVIOUS_WORKER_SOURCE' /opt/engineering-control/source && sudo ln -sfn '$PREVIOUS_WORKER_VENV' /opt/engineering-control/venv" ||
-      echo "WARNING: the worker symlinks were not restored (see RECOVERY below)." >&2
-    if start_dependents; then
-      echo "ROLLED BACK: every dependent runs the previous release again; $HASH is NOT deployed." >&2
-      echo "(Project contracts installed in step 5b were not reverted.)" >&2
-    else
-      echo "ERROR: some dependents did not start on the previous release." >&2
-      recovery_instructions
-    fi
+    sudo ln -sfn "$PREVIOUS_SOURCE" /opt/engineering-control/source ||
+      failures+=("sudo ln -sfn '$PREVIOUS_SOURCE' /opt/engineering-control/source")
+    sudo ln -sfn "$PREVIOUS_VENV" /opt/engineering-control/venv ||
+      failures+=("sudo ln -sfn '$PREVIOUS_VENV' /opt/engineering-control/venv")
+    ssh -t worker "sudo ln -sfn '$PREVIOUS_WORKER_SOURCE' /opt/engineering-control/source" ||
+      failures+=("ssh -t worker \"sudo ln -sfn '$PREVIOUS_WORKER_SOURCE' /opt/engineering-control/source\"")
+    ssh -t worker "sudo ln -sfn '$PREVIOUS_WORKER_VENV' /opt/engineering-control/venv" ||
+      failures+=("ssh -t worker \"sudo ln -sfn '$PREVIOUS_WORKER_VENV' /opt/engineering-control/venv\"")
   else
     echo "The database is not at its previous revision; the new release stays linked." >&2
-    start_dependents || true
+    failures+=("# fix forward: journalctl -u engineering-migrate.service -n 100 --no-pager, then sudo systemctl restart engineering-migrate.service")
+  fi
+  sudo systemctl reset-failed engineering-migrate.service ||
+    failures+=("sudo systemctl reset-failed engineering-migrate.service")
+  for unit in "${MIGRATE_DEPENDENTS[@]}"; do
+    echo "-- controller: start $unit --" >&2
+    sudo systemctl start "$unit" || failures+=("sudo systemctl start $unit")
+  done
+  if [[ "${#failures[@]}" -eq 0 && "$after" == "$DB_REVISION" ]]; then
+    echo "ROLLED BACK: every dependent runs the previous release again; $HASH is NOT deployed." >&2
+    echo "(Project contracts installed in step 5b were not reverted.)" >&2
+  else
+    echo "RECOVERY: run these on the controller (previous release $PREVIOUS_SOURCE):" >&2
+    for unit in "${failures[@]}"; do
+      echo "  $unit" >&2
+    done
     recovery_instructions
   fi
   exit 1

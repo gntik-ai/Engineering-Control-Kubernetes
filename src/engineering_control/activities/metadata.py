@@ -3614,11 +3614,24 @@ class MetadataActivityHandler:
         return response
 
     def _source_pr_merged(self, change_set_id: UUID) -> bool:
+        """The source PR merged: the durable merge record bound to the published source PR
+        (written once by the staging flow, never nulled by a recheck), a merge SHA in the
+        latest staging record, or a delivered state. A later reset of the state (OpenSpec
+        preparation of a CI repair) does not undo a recorded merge."""
         with self.sessions() as session:
             change_set = session.get(ChangeSet, change_set_id)
             if change_set is None:
                 return False
-            record = dict(change_set.recovery_json or {}).get("staging_gitops")
+            recovery = dict(change_set.recovery_json or {})
+            durable = recovery.get("source_merge")
+            if (
+                isinstance(durable, dict)
+                and re.fullmatch(r"[a-f0-9]{40}", str(durable.get("merge_sha")))
+                and bool(change_set.source_pr_url)
+                and durable.get("source_pr_url") == change_set.source_pr_url
+            ):
+                return True
+            record = recovery.get("staging_gitops")
             merged_sha = record.get("merge_sha") if isinstance(record, dict) else None
             return change_set.state in _DELIVERED_CHANGE_SET_STATES or bool(
                 isinstance(merged_sha, str) and re.fullmatch(r"[a-f0-9]{40}", merged_sha)

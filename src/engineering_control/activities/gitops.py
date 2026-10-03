@@ -763,6 +763,28 @@ class GitOpsControllerHandler:
             if change_set is None or change_set.project != plan.project:
                 raise ValueError("staging GitOps ChangeSet binding is missing")
             recovery = dict(change_set.recovery_json or {})
+            # NEW-118 review: a merged source PR stays merged. The first recorded merge is
+            # durable (``source_merge``, bound to the source PR) and a later recheck that
+            # stops before the merge step (e.g. deployment CI) never nulls it out.
+            previous = recovery.get("staging_gitops")
+            previous_sha = previous.get("merge_sha") if isinstance(previous, dict) else None
+            durable = recovery.get("source_merge")
+            if not (isinstance(durable, dict) and _SHA.fullmatch(str(durable.get("merge_sha")))):
+                first_sha = merge_sha if merge_sha is not None else previous_sha
+                if first_sha is not None and _SHA.fullmatch(str(first_sha)):
+                    durable = {
+                        "merge_sha": str(first_sha),
+                        "source_pr_url": plan.source_pr_url,
+                        "source_head_sha": plan.source_head_sha,
+                        "recorded_at": record["recorded_at"],
+                    }
+                    recovery["source_merge"] = durable
+            if (
+                record["merge_sha"] is None
+                and isinstance(durable, dict)
+                and durable.get("source_pr_url") == plan.source_pr_url
+            ):
+                record["merge_sha"] = durable.get("merge_sha")
             recovery["staging_gitops"] = record
             change_set.recovery_json = recovery
             if merge_sha is not None:
