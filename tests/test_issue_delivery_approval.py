@@ -12,6 +12,7 @@ from test_metadata_activity import add_campaign
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
+from engineering_control.db import runtime_binding
 from engineering_control.db.models import (
     BacklogIssueRecord,
     ChangeSet,
@@ -334,6 +335,20 @@ async def test_correction_cannot_expand_or_replace_original_authority(tmp_path: 
 PARENT = "backlog-fixture-parent"
 
 
+def _record(engineering, payload, first, campaign, ordinal: int, repair_round: int):
+    return engineering._record_backlog_ci_repair(
+        {
+            **payload,
+            "backlog_campaign_id": campaign or payload["backlog_campaign_id"],
+            # The payload always names the parent; only the caller identity may authorize.
+            "workflow_id": PARENT,
+            "ordinal": ordinal,
+            "repair_round": repair_round,
+            "change_set_id": first["change_set_id"],
+        }
+    )
+
+
 async def _ci_repair_load(
     values,
     state: str,
@@ -345,10 +360,13 @@ async def _ci_repair_load(
     record: tuple[int, int] | None = (1, 1),
     record_campaign: str | None = None,
     direct_record: bool = False,
+    caller: str = "loop",
+    other_records: int = 0,
 ):
     """Load a CI-repair child after the parent loop durably records its repair round."""
     operations, metadata, engineering, handler, payload, registered, child_payload = values
     first = handler._load_confirmed_finding(child_payload)
+    loop_first_run_id = str(uuid4())
     with handler.sessions.begin() as session:
         change_set = session.get(ChangeSet, UUID(first["change_set_id"]))
         change_set.state = state
@@ -364,10 +382,29 @@ async def _ci_repair_load(
                     status="RUNNING",
                     project="falcone",
                     temporal_first_execution_run_id=(
-                        str(uuid4()) if parent_run == "bound" else None
+                        loop_first_run_id if parent_run == "bound" else None
                     ),
                 )
             )
+    if other_records:
+        # Earlier authorizations of the same loop for other ChangeSets.
+        with handler.sessions.begin() as session:
+            loop = session.scalar(select(Run).where(Run.workflow_id == PARENT))
+            for index in range(other_records):
+                other = uuid4()
+                identifier = ci_repair_authorization_id(loop.id, other, 1, 1)
+                session.add(
+                    Step(
+                        id=identifier,
+                        run_id=loop.id,
+                        name=CI_REPAIR_AUTHORIZATION_STEP,
+                        ordinal=1,
+                        status="COMPLETE",
+                        idempotency_key=f"ci-repair-authorization:{identifier}",
+                        attempt=1,
+                        result_json={"change_set_id": str(other), "ordinal": 1, "index": index},
+                    )
+                )
     if record is not None and direct_record:
         # A record written straight into the database, bypassing the loop's own guard.
         ordinal, repair_round = record
@@ -402,16 +439,19 @@ async def _ci_repair_load(
             )
     elif record is not None:
         ordinal, repair_round = record
-        authorized = engineering._record_backlog_ci_repair(
-            {
-                **payload,
-                "backlog_campaign_id": record_campaign or payload["backlog_campaign_id"],
-                "workflow_id": PARENT,
-                "ordinal": ordinal,
-                "repair_round": repair_round,
-                "change_set_id": first["change_set_id"],
-            }
-        )
+        identity = {
+            "loop": runtime_binding._Identity(PARENT, loop_first_run_id, loop_first_run_id),
+            "unrelated": runtime_binding._Identity("unrelated-workflow", "r-1", "r-1"),
+            "other-execution": runtime_binding._Identity(PARENT, "r-2", "r-2"),
+            "none": None,
+        }[caller]
+        token = runtime_binding._current_identity.set(identity)
+        try:
+            authorized = _record(
+                engineering, payload, first, record_campaign, ordinal, repair_round
+            )
+        finally:
+            runtime_binding._current_identity.reset(token)
         if authorized["status"] != "RECORDED":
             raise ValueError(authorized["blocker"])
     repair_payload = {**payload, "child_workflow_id": child_id}
@@ -468,6 +508,21 @@ async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_sta
             validate_change_set_issue_approval(session, change_set.id)
             == first["issue_execution_approval"]
         )
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_other_change_sets_authorizations_do_not_crowd_out_a_valid_repair(tmp_path: Path):
+    # NEW-112 review: 200+ earlier authorizations of the same loop for other ChangeSets
+    # must not affect this ChangeSet's first recorded repair round.
+    values = await _child(tmp_path)
+    _first, loaded = await _ci_repair_load(
+        values,
+        "SOURCE_PR",
+        child_id=f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+        other_records=205,
+    )
+    assert loaded["status"] == "CONFIRMED_LOADED"
     _dispose(values)
 
 
@@ -545,6 +600,27 @@ async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_sta
             "SOURCE_PR",
             f"{PARENT}-issue-1-ci-repair-21-attempt-1",
             {"record": (1, 21), "direct_record": True},
+        ),
+        (
+            "unrelated-caller",
+            "CI_REPAIR_CALLER_NOT_PARENT_LOOP",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {"caller": "unrelated"},
+        ),
+        (
+            "other-execution-caller",
+            "CI_REPAIR_CALLER_NOT_PARENT_LOOP",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {"caller": "other-execution"},
+        ),
+        (
+            "unverified-caller",
+            "CI_REPAIR_CALLER_UNVERIFIED",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {"caller": "none"},
         ),
         (
             "unrecorded-operator-round",

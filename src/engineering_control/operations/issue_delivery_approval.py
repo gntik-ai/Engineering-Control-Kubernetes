@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from engineering_control.api.schemas import ExistingBacklogLoopStart
@@ -327,17 +327,17 @@ def _verify_ci_repair_child(
         raise ValueError("CI-repair round was not recorded by its parent loop")
     if repair_round > MAX_CI_REPAIR_ROUNDS or attempt > origin_request.correction_limit + 1:
         raise ValueError("CI-repair child exceeds the approved repair bound")
-    recorded_rounds = [
-        item
-        for item in session.scalars(
-            select(Step)
-            .where(Step.run_id == parent_run.id, Step.name == CI_REPAIR_AUTHORIZATION_STEP)
-            .limit(10 * MAX_CI_REPAIR_ROUNDS)
+    recorded_rounds = session.scalar(
+        select(func.count())
+        .select_from(Step)
+        .where(
+            Step.run_id == parent_run.id,
+            Step.name == CI_REPAIR_AUTHORIZATION_STEP,
+            Step.result_json["change_set_id"].as_string() == str(change_set.id),
+            Step.result_json["ordinal"].as_integer() == ordinal,
         )
-        if isinstance(item.result_json, dict)
-        and item.result_json.get("change_set_id") == str(change_set.id)
-    ]
-    if not recorded_rounds or len(recorded_rounds) > MAX_CI_REPAIR_ROUNDS:
+    )
+    if not recorded_rounds or recorded_rounds > MAX_CI_REPAIR_ROUNDS:
         raise ValueError("CI-repair child exceeds the approved repair bound")
 
 

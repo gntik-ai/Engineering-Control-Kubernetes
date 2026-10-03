@@ -15,7 +15,7 @@ from engineering_control.activities.gitops import StagingFlowBlocked, enabled_st
 from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.config import Settings
 from engineering_control.db import models as db
-from engineering_control.db.runtime_binding import new_bound_run
+from engineering_control.db.runtime_binding import _current_identity, new_bound_run
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_PROJECT_PAIRS,
@@ -2148,6 +2148,15 @@ class EngineeringActivityHandler:
         def blocked(blocker: str) -> dict[str, Any]:
             return {**payload, "status": "BLOCKED", "blocker": blocker, "last_step": step}
 
+        # Authority comes only from the verified activity identity (2b678d9 run binding:
+        # workflow id plus first-execution run id), never from the payload: the caller
+        # must be the parent loop execution itself.
+        identity = _current_identity.get()
+        if identity is None:
+            return blocked("CI_REPAIR_CALLER_UNVERIFIED")
+        if identity.workflow_id != workflow_id:
+            return blocked("CI_REPAIR_CALLER_NOT_PARENT_LOOP")
+        workflow_id = identity.workflow_id
         with self.sessions.begin() as session:
             loops = session.scalars(
                 select(db.Run)
@@ -2159,6 +2168,8 @@ class EngineeringActivityHandler:
             if len(loops) != 1 or loops[0].temporal_first_execution_run_id is None:
                 return blocked("CI_REPAIR_PARENT_RUN_UNVERIFIED")
             loop = loops[0]
+            if loop.temporal_first_execution_run_id != identity.first_run_id:
+                return blocked("CI_REPAIR_CALLER_NOT_PARENT_LOOP")
             change_set = session.get(db.ChangeSet, change_set_id, with_for_update=True)
             recovery = (change_set.recovery_json or {}) if change_set is not None else {}
             gitops = recovery.get("staging_gitops")
