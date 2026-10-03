@@ -239,9 +239,54 @@ async def run_jsonl_process(
     return ProcessResult(process.returncode or 0, tuple(events), stderr, timed_out)
 
 
+# Error code of a transient provider-capacity failure ("Selected model is at capacity").
+# The provider activity retries the same invocation (same provider, same model) with a
+# bounded backoff before it reports the failure; nothing ever switches provider or model.
+PROVIDER_CAPACITY_ERROR = "PROVIDER_MODEL_AT_CAPACITY"
+_CAPACITY_MARKERS = (
+    "selected model is at capacity",
+    "model is at capacity",
+    "model is currently at capacity",
+    "overloaded_error",
+)
+
+
+def _error_event_text(events: tuple[dict[str, Any], ...]) -> str:
+    """Text of the provider's own error events only (never agent messages or output)."""
+    parts: list[str] = []
+    for event in events[-50:]:
+        event_type = str(event.get("type", ""))
+        if event_type == "result":
+            # Claude's final envelope: only an explicit error result counts; a successful
+            # result carries agent output and is never inspected.
+            if event.get("is_error") is not True:
+                continue
+            keys: tuple[str, ...] = ("errors", "subtype", "result", "error")
+        elif "error" in event or "error" in event_type or event_type.endswith(".failed"):
+            keys = ("error", "message", "detail")
+        else:
+            continue
+        for key in keys:
+            value = event.get(key)
+            if isinstance(value, list):
+                parts.extend(str(item)[:2000] for item in value[:20])
+            elif value is not None:
+                parts.append(str(value)[:2000])
+    return "\n".join(parts).lower()
+
+
+def is_capacity_failure(result: ProcessResult) -> bool:
+    if result.timed_out or result.exit_code == 0:
+        return False
+    text = f"{result.stderr.lower()}\n{_error_event_text(result.events)}"
+    return any(marker in text for marker in _CAPACITY_MARKERS)
+
+
 def classify_failure(result: ProcessResult) -> tuple[str, str]:
     if result.timed_out:
         return "TIMED_OUT", "PROVIDER_TIMEOUT"
+    if is_capacity_failure(result):
+        return "FAILED", PROVIDER_CAPACITY_ERROR
     combined = result.stderr.lower()
     if any(
         marker in combined

@@ -282,3 +282,46 @@ def test_successful_result_text_is_still_the_summary() -> None:
     )
 
     assert summary == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"errors": ["API Error: 529 Selected model is at capacity"]},
+        {"result": "Selected model is at capacity. Please try again later."},
+        {"errors": [{"type": "overloaded_error", "message": "Overloaded"}]},
+    ],
+    ids=["errors", "result", "overloaded"],
+)
+async def test_a_capacity_error_result_is_a_transient_capacity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, envelope: dict[str, Any]
+) -> None:
+    # NEW-114 review: the capacity message only lived in the error result envelope, so
+    # it reached the summary but was classified PROVIDER_EXIT_NONZERO (no retry).
+    result, _ = await _execute_with_events(
+        tmp_path,
+        monkeypatch,
+        ({"type": "result", "subtype": "error_during_execution", "is_error": True, **envelope},),
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.error_code == "PROVIDER_MODEL_AT_CAPACITY"
+
+
+@pytest.mark.asyncio
+async def test_successful_or_ordinary_failed_results_are_not_capacity_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Agent output mentioning capacity in a non-error result is never inspected.
+    success = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "the selected model is at capacity in this test fixture",
+    }
+    result, _ = await _execute_with_events(tmp_path, monkeypatch, (success,))
+    assert result.error_code == "PROVIDER_EXIT_NONZERO"
+    failed = {"type": "result", "subtype": "error_during_execution", "is_error": True}
+    result, _ = await _execute_with_events(tmp_path, monkeypatch, ({**failed, "errors": ["x"]},))
+    assert result.error_code == "PROVIDER_EXIT_NONZERO"

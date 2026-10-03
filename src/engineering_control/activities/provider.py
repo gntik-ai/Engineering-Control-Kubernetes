@@ -16,7 +16,10 @@ from temporalio.exceptions import ApplicationError
 from engineering_control.adapters.auth_probe import AuthProbeError
 from engineering_control.adapters.claude.client import ClaudeCLIAdapter
 from engineering_control.adapters.codex.client import CodexCLIAdapter
-from engineering_control.adapters.process import subscription_only_environment
+from engineering_control.adapters.process import (
+    PROVIDER_CAPACITY_ERROR,
+    subscription_only_environment,
+)
 from engineering_control.agents.instructions import AgentInstructionPack, InstructionBundle
 from engineering_control.config import Settings
 from engineering_control.handoff.store import HandoffStore
@@ -54,6 +57,11 @@ class ProviderActivityHandler:
     """Execute a normalized native-CLI request within one assigned worktree."""
 
     _heartbeat_interval_seconds = 10.0
+    # "Selected model is at capacity" is transient: the same invocation (same provider,
+    # same model; never a substitute) is retried after 2, 5 and 10 minutes, at most three
+    # times, and only while the activity's own timeout leaves room for real work.
+    _capacity_backoff_seconds: tuple[float, ...] = (120.0, 300.0, 600.0)
+    _capacity_minimum_work_seconds = 600.0
 
     _request_keys = {
         "audit.agent_cell": "agent_request",
@@ -234,6 +242,20 @@ class ProviderActivityHandler:
         keepalive = asyncio.create_task(heartbeat_keepalive())
         try:
             result = await self.adapter.execute(request, heartbeat_event)
+            for retry, delay in enumerate(self._capacity_backoff_seconds, start=1):
+                if not self._capacity_retry_allowed(result, delay):
+                    break
+                # Recorded in the transcript and heartbeat like any provider event.
+                await heartbeat_event(
+                    {
+                        "type": "provider.capacity_retry",
+                        "retry": retry,
+                        "delay_seconds": delay,
+                        "error_code": result.error_code,
+                    }
+                )
+                await asyncio.sleep(delay)
+                result = await self.adapter.execute(request, heartbeat_event)
         except BaseException as error:
             try:
                 await recorder.finish(
@@ -261,7 +283,8 @@ class ProviderActivityHandler:
                     phase=phase,
                     ended_at=result.finished_at,
                     exit_code=result.exit_code,
-                    retryable=result.status is RunStatus.RATE_LIMITED,
+                    retryable=result.status is RunStatus.RATE_LIMITED
+                    or result.error_code == PROVIDER_CAPACITY_ERROR,
                     blocker_code=result.error_code,
                     error_summary=(
                         result.summary if result.status is not RunStatus.SUCCESS else None
@@ -290,6 +313,23 @@ class ProviderActivityHandler:
         if not isinstance(safe, dict):
             raise TypeError("redacted provider response must remain an object")
         return safe
+
+    def _capacity_retry_allowed(self, result: AgentResult, delay: float) -> bool:
+        """Retry only a model-at-capacity failure, and only within the activity budget."""
+        if result.status is not RunStatus.FAILED or result.error_code != PROVIDER_CAPACITY_ERROR:
+            return False
+        try:
+            info = activity.info()
+        except RuntimeError:  # not inside an activity (direct handler use)
+            return True
+        timeout = info.start_to_close_timeout
+        if timeout is None:
+            return True
+        started = info.started_time
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        remaining = (started + timeout - datetime.now(UTC)).total_seconds()
+        return remaining - delay >= self._capacity_minimum_work_seconds
 
     async def _cli_version(self) -> str | None:
         executable = getattr(self.adapter, "executable", None)

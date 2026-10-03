@@ -76,6 +76,7 @@ class ControlService(Protocol):
     async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted: ...
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
+    async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
     async def start_runtime_verification(
@@ -326,6 +327,29 @@ class TemporalControlService:
             raise ValueError("unsupported control signal")
         handle = self.client.get_workflow_handle(workflow_id)
         await handle.signal(signal, argument)
+
+    async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None:
+        """NEW-114: refuse an issue-bound retry/skip the loop would silently ignore.
+
+        A backlog loop waiting for the operator reports AWAITING_OPERATOR:<issue>:<blocker>
+        in its status query; a signal naming any other issue is rejected before it is
+        sent. When the loop cannot be queried the durable checks alone apply."""
+        try:
+            state = await self.client.get_workflow_handle(workflow_id).query("status")
+        except Exception:  # noqa: BLE001 - the durable preflight still applies
+            return
+        phase = str(state.get("phase", "")) if isinstance(state, dict) else ""
+        if not phase.startswith("AWAITING_OPERATOR:"):
+            raise ValueError(
+                f"backlog loop {workflow_id} is not waiting on an issue (phase {phase[:120]}); "
+                f"the signal for {issue_ref} was not sent"
+            )
+        awaited = phase.split(":", 2)[1]
+        if awaited != issue_ref:
+            raise ValueError(
+                f"backlog loop {workflow_id} is waiting on {awaited}, not {issue_ref}; "
+                "the signal was not sent"
+            )
 
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None:
         candidate = await self.repository.current_approval_candidate(request.change_set_id)

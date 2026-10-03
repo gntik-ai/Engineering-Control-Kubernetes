@@ -40,6 +40,9 @@ class FakeService:
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None:
         return None
 
+    async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None:
+        return None
+
     async def prepare_deployment(self, request: Any) -> OperationAccepted:
         return OperationAccepted(workflow_id="deploy-test", run_id="run-test")
 
