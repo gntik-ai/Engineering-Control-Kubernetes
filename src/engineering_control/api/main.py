@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -43,6 +43,7 @@ from engineering_control.api.schemas import (
     ExistingBacklogLoopStart,
     FindingVerificationStart,
     GitHubBacklogImportRequest,
+    IssueAmendRequest,
     IssueLoopStart,
     LLMWikiBootstrapExecuteRequest,
     LLMWikiBootstrapPlanRequest,
@@ -78,7 +79,7 @@ from engineering_control.observability.agent import (
 from engineering_control.observability.metrics import ControlPlaneMetrics
 from engineering_control.operations.connection_status import provider_observation_current
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError
-from engineering_control.operations.models import parse_command
+from engineering_control.operations.models import WorkflowControlCommand, parse_command
 from engineering_control.operations.reconciliation import decide_reconciliation, observation_token
 from engineering_control.operations.recurring_reconciliation import RecurringRunReconciler
 from engineering_control.operations.repository import OperationsRepository
@@ -725,6 +726,112 @@ def create_app(
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/issues/amend")
+    async def issue_amend(
+        body: IssueAmendRequest,
+        subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+        service: ControlService = control_dependency,
+        bus: TypedCommandBus = commands_dependency,
+    ) -> dict[str, Any]:
+        """NEW-115: re-approve an issue body edited after delivery approval.
+
+        Without ``confirm`` this is a read-only preview; with it the freshly read body hash
+        must still start with the confirmation, then the approved binding is updated."""
+        # Same trust model as /v1/r3-issues/approve and the other operator approvals: the
+        # bearer-authenticated channel asserts the actor, which must be a canonical operator.
+        actor = approval_actor(subject)
+        try:
+            projected = await repository.issue_amend_precheck(
+                body.project, body.repository, body.issue_number
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        # Runs projected RUNNING (e.g. stopped at the body refresh before NEW-115, which
+        # release_leases never terminalized) block unless Temporal proves them closed.
+        closed: set[Any] = set()
+        for run_id, workflow_id in projected:
+            try:
+                if await service.workflow_id_closed(workflow_id):
+                    closed.add(run_id)
+                    continue
+            except Exception:  # noqa: BLE001,S110 - unverifiable stays active (fail closed)
+                pass
+            raise HTTPException(
+                status_code=409,
+                detail="ISSUE_AMEND_DELIVERY_ACTIVE: a delivery of this issue is running "
+                f"({workflow_id}); amend it after it stops",
+            )
+        try:
+            observation = await service.observe_issue_body(
+                f"gntik-ai/{body.repository}", body.issue_number
+            )
+        except Exception as error:  # noqa: BLE001 - one bounded operator-facing failure
+            raise HTTPException(
+                status_code=503,
+                detail="ISSUE_AMEND_BODY_UNAVAILABLE: the GitHub issue could not be read; "
+                "try again",
+            ) from error
+        try:
+            result = await repository.amend_issue(
+                body.project,
+                body.repository,
+                body.issue_number,
+                observation,
+                body.confirm,
+                actor,
+                frozenset(closed),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        # The amendment and its audit event are committed before the retry is sent. A rerun
+        # of the same confirmation after an unknown outcome reports NO_CHANGE for the
+        # recorded amendment and still sends the requested (validated) retry.
+        if body.retry and (
+            result.get("status") == "AMENDED"
+            or (result.get("status") == "NO_CHANGE" and "retry_workflow_id" in result)
+        ):
+            result["retry"] = await _amend_retry(bus, body, result, subject, actor)
+        return result
+
+    async def _amend_retry(
+        bus: TypedCommandBus,
+        body: IssueAmendRequest,
+        result: dict[str, Any],
+        subject: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Send the existing typed backlog retry (with its preflight) for the amended issue."""
+        workflow_id = result.get("retry_workflow_id")
+        if not isinstance(workflow_id, str) or not workflow_id:
+            return {
+                "status": "RETRY_NOT_SENT",
+                "blocker": "BACKLOG_LOOP_NOT_FOUND",
+                "detail": "no backlog loop delivery of this issue is recorded; retry it with "
+                "/loop retry <workflow-id> <repository> <issue>",
+            }
+        try:
+            command = WorkflowControlCommand(
+                action="retry",
+                workflow_id=workflow_id,
+                repository=body.repository,
+                issue_number=body.issue_number,
+            )
+            view = await bus.submit(
+                command,
+                source_channel="telegram" if actor.startswith("telegram:") else "cli",
+                operator_class=subject,
+                # One key per request: a rerun may need to resend, and the loop's own
+                # preflight refuses a retry for an issue it is no longer waiting on.
+                idempotency_key=(
+                    f"issue-amend-retry-{str(result.get('retry_key') or '')[:32]}-"
+                    f"{uuid4().hex[:16]}"
+                ),
+            )
+        except ValueError as error:
+            return {"status": "RETRY_NOT_SENT", "detail": str(error)[:500]}
+        return view.model_dump(mode="json")
 
     @app.post("/v1/campaigns", response_model=OperationAccepted, status_code=202)
     async def campaign_start(

@@ -24,6 +24,7 @@ from engineering_control.engineering.backlog_authority import (
     _current_backlog_approval,
     require_alternative_issue_authority,
 )
+from engineering_control.operations.issue_amend import change_set_unstarted
 from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
@@ -393,8 +394,12 @@ def bind_change_set_issue_approval(
         repair = _claims_ci_repair(record.result_json)
         if repair:
             _verify_ci_repair_child(session, change_set, origin, record.result_json)
-        if change_set.state != "REQUEST_CHANGES" and not (
-            repair and change_set.state in _CI_REPAIR_START_STATES
+        # NEW-115: an operator retry child (same approval scope, counted in the bounded
+        # lineage) may also start a ChangeSet whose delivery stopped before any work.
+        if (
+            change_set.state != "REQUEST_CHANGES"
+            and not (repair and change_set.state in _CI_REPAIR_START_STATES)
+            and not (not repair and change_set_unstarted(change_set))
         ):
             raise ValueError("another delivery child requires an explicit correction state")
         children = [*children, reference]

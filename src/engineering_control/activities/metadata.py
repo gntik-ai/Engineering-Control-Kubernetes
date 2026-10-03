@@ -100,6 +100,7 @@ from engineering_control.models.reconciliation import (
     PromotionPublication,
 )
 from engineering_control.observability.agent import normalize_agent_role
+from engineering_control.operations.issue_amend import record_consumed_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     bind_change_set_issue_approval,
     validate_change_set_issue_approval,
@@ -2746,7 +2747,12 @@ class MetadataActivityHandler:
                 )
                 if approved_issue is None:
                     raise ValueError("approved backlog issue snapshot is unavailable")
-                approved_body_sha256 = approved_issue.body_sha256
+                # NEW-115: an operator amendment (/loop amend) re-approves a later body.
+                # The revision this run loads is recorded under the Finding/ChangeSet
+                # locks; publication custody compares against it, not a later amendment.
+                approved_body_sha256 = record_consumed_issue_revision(
+                    change_set, run, approved_issue
+                )
             run.change_set_id = change_set_id
             run.status = "RUNNING"
             run.project = project.value
@@ -2890,6 +2896,16 @@ class MetadataActivityHandler:
             return {**payload, "status": "NO_RUN_TO_RELEASE_LEASES_FOR"}
         with self.sessions.begin() as session:
             run = session.get(Run, UUID(str(raw_run_id)))
+            if (
+                run is not None
+                and payload.get("blocker") == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+                and run.status == "RUNNING"
+            ):
+                # NEW-115: this run stopped at the issue-body refresh, before any work;
+                # record it so /loop amend can tell it from a delivery still running.
+                run.status = "BLOCKED"
+                run.error_code = "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+                run.finished_at = datetime.now(UTC)
             if run is not None:
                 self._release_implementation_leases(session, run)
                 # NEW-32: worktree leases (8h) were never released on these stop

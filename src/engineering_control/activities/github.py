@@ -55,12 +55,15 @@ def bounded_issue_body(body: str, limit: int = ISSUE_BODY_REFRESH_LIMIT) -> tupl
     return head + marker + tail, True
 
 
+# A constant: workflow histories carry it as a payload (blocker_detail), not as code.
 ISSUE_BODY_REAPPROVAL_GUIDANCE = (
     "The GitHub issue text changed after this delivery was approved, so the change was not "
-    "used. To deliver from the new text: re-import the backlog (/loop import <project> "
-    "github-open ...), then approve and start the issue again (/loop issue ... or "
-    "solve_issue; for an R3 issue first /loop r3-candidate and /loop approve-r3). To keep "
-    "the approved text instead, revert the issue edit and retry."
+    "used. To deliver from the new text: /loop amend <project> <repository> <issue> shows "
+    "the change; confirm it with /loop amend <project> <repository> <issue> <hash-prefix> "
+    "retry (the prefix the preview shows). Fallback: re-import the backlog (/loop import "
+    "<project> github-open ...), then approve and start the issue again (/loop issue ... or "
+    "solve_issue); for an R3 issue re-import, then /loop r3-candidate and /loop approve-r3. "
+    "To keep the approved text instead, revert the issue edit and retry."
 )
 
 
@@ -154,6 +157,17 @@ class GitHubActivityHandler:
             "body_chars": len(body),
             "body_truncated": truncated,
             "issue_state": str(value.get("state") or "")[:20],
+            # NEW-115: the revision an operator amendment (/loop amend) binds to.
+            **(
+                {"updated_at": value["updatedAt"][:40]}
+                if isinstance(value.get("updatedAt"), str)
+                else {}
+            ),
+            **(
+                {"title_sha256": hashlib.sha256(value["title"].encode()).hexdigest()}
+                if isinstance(value.get("title"), str)
+                else {}
+            ),
         }
 
     def _refresh_mirrors(self, payload: dict[str, Any]) -> dict[str, Any]:

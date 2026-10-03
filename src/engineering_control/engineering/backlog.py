@@ -17,6 +17,7 @@ from pydantic import (
     model_validator,
 )
 
+type RiskLevel = Literal["R0", "R1", "R2", "R3"]
 BACKLOG_PROJECT_PAIRS: dict[str, tuple[str, str]] = {
     "falcone": ("gntik-ai/falcone", "gntik-ai/falcone-charts"),
     "musematic": ("gntik-ai/musematic", "gntik-ai/musematic-deploy"),
@@ -406,6 +407,32 @@ def is_hermes_operational_issue(title: str, body: str) -> bool:
     )
 
 
+def _classified_risk(
+    repository: str, labels: tuple[str, ...], text: str
+) -> tuple[
+    BacklogIssueType, Literal["critical", "high", "medium", "low", "unspecified"], RiskLevel
+]:
+    change_kind = _change_request_kind(text)
+    issue_type = (
+        _issue_type(repository, labels, text)
+        if change_kind is None
+        else _change_request_issue_type(repository, labels, text, change_kind)
+    )
+    severity = _severity(labels, text)
+    risk = _risk(issue_type, severity, text)
+    if change_kind is not None:
+        risk = _declared_risk_floor(risk, text)
+    return issue_type, severity, risk
+
+
+def calculated_issue_risk(
+    repository: str, labels: tuple[str, ...] | list[str], title: str, body: str
+) -> RiskLevel:
+    """NEW-115: the import's deterministic risk class for an issue text (same rules)."""
+    normalized = tuple(sorted({label.strip().lower() for label in labels if label.strip()}))
+    return _classified_risk(repository, normalized, f"{title}\n{body}".lower())[2]
+
+
 def classify_issue(
     issue: GitHubIssueSnapshot,
     pull_requests: tuple[GitHubPullRequestSnapshot, ...],
@@ -418,16 +445,7 @@ def classify_issue(
         raise ValueError("backlog classification input is not allowlisted")
     labels = tuple(sorted({label.strip().lower() for label in issue.labels if label.strip()}))
     text = f"{issue.title}\n{issue.body_excerpt}".lower()
-    change_kind = _change_request_kind(text)
-    issue_type = (
-        _issue_type(issue.repository, labels, text)
-        if change_kind is None
-        else _change_request_issue_type(issue.repository, labels, text, change_kind)
-    )
-    severity = _severity(labels, text)
-    risk = _risk(issue_type, severity, text)
-    if change_kind is not None:
-        risk = _declared_risk_floor(risk, text)
+    issue_type, severity, risk = _classified_risk(issue.repository, labels, text)
     owner: Literal["source", "deployment"] = (
         "deployment" if issue.repository.endswith(("-charts", "-deploy")) else "source"
     )

@@ -25,6 +25,7 @@ from engineering_control.workflows.inputs import (
     FinalClosureInput,
     FindingVerificationInput,
     GitHubBacklogImportInput,
+    IssueAmendObservationInput,
     IssueDeliveryInput,
     IssueSolutionLoopInput,
     LLMWikiStagingBootstrapInput,
@@ -2362,6 +2363,47 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
             if context.get("status") in {"BLOCKED", "FAILED"}:
                 return context
         return context
+
+
+_AMEND_ISSUE_REPOSITORIES = frozenset(
+    {
+        "gntik-ai/falcone",
+        "gntik-ai/falcone-charts",
+        "gntik-ai/musematic",
+        "gntik-ai/musematic-deploy",
+        "gntik-ai/llmwiki",
+    }
+)
+
+
+@workflow.defn(name="IssueAmendObservationWorkflow")
+class IssueAmendObservationWorkflow(ControlledWorkflow):
+    """NEW-115: read one backlog issue's current GitHub body for an operator amendment.
+
+    Read-only: it runs the delivery's own issue-body read (same broker, same hash), so the
+    hash an operator confirms is exactly the one a later delivery refresh compares."""
+
+    @workflow.run
+    async def run(self, request: IssueAmendObservationInput) -> dict[str, Any]:
+        if (
+            request.issue_repository not in _AMEND_ISSUE_REPOSITORIES
+            or type(request.issue_number) is not int
+            or request.issue_number < 1
+        ):
+            raise ApplicationError(
+                "issue amendment target is not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        self._phase = "ISSUE_AMEND_OBSERVE"
+        return await self._step(
+            "delivery.refresh_issue_body",
+            {
+                "issue_repository": request.issue_repository,
+                "issue_number": request.issue_number,
+            },
+            timeout_minutes=1,
+        )
 
 
 @workflow.defn(name="StagingGitOpsDeliveryWorkflow")
@@ -4915,6 +4957,7 @@ ALL_WORKFLOWS = [
     ReverseObservabilityAcceptanceWorkflow,
     IssueSolutionLoopWorkflow,
     GitHubBacklogImportWorkflow,
+    IssueAmendObservationWorkflow,
     ExistingGitHubBacklogLoopWorkflow,
     AutonomousBacklogCampaignWorkflow,
     EnhancementDiscoveryWorkflow,

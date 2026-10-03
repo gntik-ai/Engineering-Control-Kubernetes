@@ -39,6 +39,7 @@ from engineering_control.workflows.definitions import (
     ExistingGitHubBacklogLoopWorkflow,
     FinalClosureWorkflow,
     FindingVerificationWorkflow,
+    IssueAmendObservationWorkflow,
     IssueDeliveryWorkflow,
     StagingGitOpsDeliveryWorkflow,
 )
@@ -47,6 +48,7 @@ from engineering_control.workflows.inputs import (
     ExistingGitHubBacklogLoopInput,
     FinalClosureInput,
     FindingVerificationInput,
+    IssueAmendObservationInput,
     IssueDeliveryInput,
     StagingGitOpsDeliveryInput,
 )
@@ -3508,3 +3510,38 @@ async def test_new_114_refill_after_a_gate_skip_passes_the_real_approval_check(
     assert [child.rsplit("-issue-", 1)[1] for child in children] == ["2-attempt-1"]
     assert result["status"] == "COMPLETE" and "completion" not in result
     await Replayer(workflows=workflows).replay_workflow(history)
+
+
+async def test_issue_amend_observation_reads_the_body_on_the_github_queue_and_replays() -> None:
+    """NEW-115: /loop amend reads the current issue body with the delivery's own
+    read-only step on the GitHub worker; a new workflow type, so no patch marker."""
+    observed = {
+        "status": "ISSUE_BODY_REFRESHED",
+        "source_body_sha256": "c" * 64,
+        "body_excerpt": "Edited body",
+        "body_sha256": "d" * 64,
+        "body_chars": 11,
+        "issue_state": "OPEN",
+        "updated_at": "2026-10-03T10:00:00Z",
+    }
+    history, result = await _run_to_history(
+        IssueAmendObservationWorkflow,
+        IssueAmendObservationInput(issue_repository="gntik-ai/falcone", issue_number=42),
+        _scripted_execute_control_step({"delivery.refresh_issue_body": observed}),
+    )
+
+    assert result == observed
+    assert _scheduled_steps(history) == [
+        {
+            "step": "delivery.refresh_issue_body",
+            "payload": {"issue_repository": "gntik-ai/falcone", "issue_number": 42},
+        }
+    ]
+    queues = [
+        event.activity_task_scheduled_event_attributes.task_queue.name
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert queues == [GITHUB_TASK_QUEUE]
+    assert _markers(history) == []
+    await Replayer(workflows=[IssueAmendObservationWorkflow]).replay_workflow(history)

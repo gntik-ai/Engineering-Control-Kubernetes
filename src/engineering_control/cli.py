@@ -195,6 +195,13 @@ def parser() -> argparse.ArgumentParser:
     r3_approve.add_argument("issue_number", type=int)
     r3_approve.add_argument("binding")
     r3_approve.add_argument("confirmation_phrase")
+    # NEW-115: re-approve an issue body edited after delivery approval (preview first).
+    issue_amend = commands.add_parser("issue-amend")
+    issue_amend.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    issue_amend.add_argument("repository", choices=_CHANGE_REPOSITORIES)
+    issue_amend.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
+    issue_amend.add_argument("--confirm", metavar="SHA_PREFIX", default=None)
+    issue_amend.add_argument("--retry", action="store_true")
     commands.add_parser("findings").add_argument("--limit", type=int, default=50)
     for name in ("status", "run"):
         commands.add_parser(name).add_argument("workflow_id")
@@ -519,6 +526,18 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "confirmation_phrase": arguments.confirmation_phrase,
             },
         )
+    if command == "issue-amend":
+        if arguments.retry and arguments.confirm is None:
+            raise ValueError("--retry requires --confirm <sha-prefix> from the preview")
+        amend: dict[str, Any] = {
+            "project": arguments.project,
+            "repository": arguments.repository,
+            "issue_number": arguments.issue_number,
+        }
+        if arguments.confirm is not None:
+            amend["confirm"] = arguments.confirm.lower()
+            amend["retry"] = bool(arguments.retry)
+        return client.request("POST", "/v1/issues/amend", amend)
     if command in {"status", "run"}:
         return client.request("GET", f"/v1/runs/{arguments.workflow_id}")
     if command in {"pause", "resume", "cancel"}:

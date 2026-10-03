@@ -88,6 +88,12 @@ _BACKLOG_REPOSITORIES = {
     "musematic-deploy",
     "llmwiki",
 }
+_AMEND_REPOSITORIES = {
+    "falcone": {"falcone", "falcone-charts"},
+    "musematic": {"musematic", "musematic-deploy"},
+    "llmwiki": {"llmwiki"},
+}
+_AMEND_CONFIRMATION = re.compile(r"[a-f0-9]{12,64}")
 _BACKLOG_SKIP_REASONS = {
     "DUPLICATE",
     "ALREADY_FIXED",
@@ -223,6 +229,10 @@ def _safe_error(value: str) -> str:
     )
 
 
+class _APITimeout(RuntimeError):
+    """The request was sent but no answer arrived: its outcome is unknown."""
+
+
 def _request(
     method: str,
     path: str,
@@ -253,7 +263,11 @@ def _request(
         raise RuntimeError(
             f"Engineering API rejected the request ({error.code}): {_redact(detail)}"
         ) from error
+    except TimeoutError as error:
+        raise _APITimeout("Engineering API did not answer in time") from error
     except urllib.error.URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise _APITimeout("Engineering API did not answer in time") from error
         raise RuntimeError("Engineering API is unavailable on loopback") from error
 
 
@@ -860,7 +874,7 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
         if not args:
             raise ValueError(
                 "usage: /loop <import|inventory|plan|queue|issue|approval-candidate|approve|"
-                "start|status|pause|resume|cancel|skip|retry> ..."
+                "start|status|pause|resume|cancel|skip|retry|amend> ..."
             )
         action = args[0]
         if action == "global-start":
@@ -1195,6 +1209,40 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
                     "reason_code": args[4],
                 },
             )
+        if action == "amend":
+            # NEW-115: /loop amend <project> <repository> <issue> [sha-prefix] [retry]
+            confirm = args[4].lower() if len(args) >= 5 else None
+            if (
+                len(args) not in {4, 5, 6}
+                or args[1] not in _BACKLOG_PROJECTS
+                or args[2] not in _AMEND_REPOSITORIES.get(args[1], set())
+                or not args[3].isdigit()
+                or int(args[3]) < 1
+                or (confirm is not None and not _AMEND_CONFIRMATION.fullmatch(confirm))
+                or (len(args) == 6 and args[5] != "retry")
+            ):
+                raise ValueError(
+                    "usage: /loop amend <project> <repository> <issue-number> "
+                    "[sha-prefix (12-64 hex from the preview)] [retry]"
+                )
+            amend: dict[str, Any] = {
+                "project": args[1],
+                "repository": args[2],
+                "issue_number": int(args[3]),
+            }
+            if confirm is not None:
+                amend["confirm"] = confirm
+                amend["retry"] = len(args) == 6
+            try:
+                return _request("POST", "/v1/issues/amend", actor, amend)
+            except _APITimeout:
+                # The API may still commit the amendment (and send the retry); a rerun of
+                # the same command reconciles: NO_CHANGE, plus the retry if requested.
+                return {
+                    "status": "OUTCOME_UNKNOWN",
+                    "detail": "outcome unknown: run the same /loop amend command again to "
+                    "reconcile",
+                }
         if action == "retry":
             if (
                 len(args) != 4

@@ -266,6 +266,22 @@ class R3IssueApprovalRequest(APIModel):
     )
 
 
+class IssueAmendRequest(APIModel):
+    """NEW-115: preview (no confirm) or confirm one backlog issue body amendment."""
+
+    project: Literal["falcone", "musematic", "llmwiki"]
+    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"]
+    issue_number: int = Field(ge=1)
+    confirm: str | None = Field(default=None, pattern=r"^[a-f0-9]{12,64}$")
+    retry: bool = False
+
+    @model_validator(mode="after")
+    def retry_requires_confirmation(self) -> IssueAmendRequest:
+        if self.retry and self.confirm is None:
+            raise ValueError("retry is sent only after a confirmed amendment")
+        return self
+
+
 class LoopPlanDispatch(APIModel):
     project: Project
     campaign_id: UUID
