@@ -311,7 +311,9 @@ def _normalize_repo_url(value: str) -> str:
 
 # -- NEW-113: Argo CD sync failure diagnosis and bounded remediation ------------------
 
-SYNC_FAILURE_CLASSES = ("PATCH_CONFLICT", "JOB_IMMUTABLE", "TRANSIENT", "OTHER")
+# NEW-116: SCOPE_INHERITED is a completed Hermes full-sync request that Argo CD ran with a
+# previous operation's selective scope (resources, syncOptions, strategy or revision).
+SYNC_FAILURE_CLASSES = ("PATCH_CONFLICT", "JOB_IMMUTABLE", "TRANSIENT", "SCOPE_INHERITED", "OTHER")
 MAXIMUM_SYNC_REMEDIATION_ROUNDS = 3
 MAXIMUM_TRANSIENT_RESYNCS = 3
 MAXIMUM_REMEDIATED_RESOURCES = 10
@@ -383,7 +385,14 @@ SYNC_REMEDIATION_ACTIONS: dict[str, tuple[str, tuple[str, ...], bool]] = {
     "replace_force": ("JOB_IMMUTABLE", ("Replace=true",), True),
     "resync": ("TRANSIENT", (), False),
     "complete": ("", (), False),
+    # NEW-116: one TRUE full sync after a full-sync request ran with an inherited scope.
+    "full_resync": ("SCOPE_INHERITED", (), False),
 }
+MAXIMUM_SCOPE_RESYNCS = 1
+# NEW-116: the explicit hook strategy of a full sync (Argo CD's default strategy, and the
+# only one that runs PreSync/Sync/PostSync hooks; an apply strategy or a resource list
+# makes the controller skip hooks: controller/sync.go WithOperationSettings).
+FULL_SYNC_STRATEGY: dict[str, Any] = {"hook": {}}
 REMEDIATION_INFO = "hermes-remediation"
 REMEDIATION_PREVIOUS_INFO = "hermes-previous-started-at"
 _REMEDIATION_ID = re.compile(r"[A-Za-z0-9._:/-]{1,240}")
@@ -435,6 +444,54 @@ def overall_failure_class(classes: Iterable[str]) -> str:
         if value in seen:
             return value
     return "OTHER"
+
+
+def full_sync_scope_violations(
+    application: dict[str, Any], operation_state: dict[str, Any], *, check_result: bool
+) -> list[str]:
+    """NEW-116: why a completed operation is NOT the true full sync Hermes requested.
+
+    Argo CD v3.4.x merges each new operation state into the previous one (JSON merge
+    patch of ``status.operationState`` with ``omitempty`` fields), so an omitted or empty
+    resources/syncOptions/syncStrategy/revision silently keeps the previous operation's
+    value. Hermes's full sync writes none of them except the hook strategy, so any of them
+    here is inherited. ``check_result`` also requires every source pinned to a commit SHA
+    in the spec to be the revision the operation synced (only meaningful on success).
+    """
+    sync = _nested(operation_state, "operation", "sync")
+    sync = sync if isinstance(sync, dict) else {}
+    violations: list[str] = []
+    if sync.get("resources"):
+        violations.append("resources")
+    if sync.get("syncOptions"):
+        violations.append("sync_options")
+    if _nested(sync, "syncStrategy", "apply") is not None:
+        violations.append("apply_strategy")
+    if sync.get("dryRun"):
+        violations.append("dry_run")
+    if sync.get("revision") or sync.get("revisions"):
+        violations.append("explicit_revision")
+    if check_result and not _pinned_revisions_synced(application, operation_state):
+        violations.append("revision")
+    return violations
+
+
+def _pinned_revisions_synced(application: dict[str, Any], operation_state: dict[str, Any]) -> bool:
+    spec = application.get("spec")
+    spec = spec if isinstance(spec, dict) else {}
+    sources = spec.get("sources")
+    if isinstance(sources, list) and sources:
+        synced = _nested(operation_state, "syncResult", "revisions")
+        synced = synced if isinstance(synced, list) else []
+        for index, source in enumerate(sources):
+            target = str(source.get("targetRevision") or "") if isinstance(source, dict) else ""
+            if _SHA.fullmatch(target) and (index >= len(synced) or synced[index] != target):
+                return False
+        return True
+    target = str(_nested(spec, "source", "targetRevision") or "")
+    return not _SHA.fullmatch(target) or (
+        _nested(operation_state, "syncResult", "revision") == target
+    )
 
 
 def resource_identity(item: dict[str, Any]) -> dict[str, str]:
@@ -878,9 +935,17 @@ class GitOpsControllerHandler:
         )
 
     def _refresh_and_sync(self, flow: StagingFlowPolicy) -> bool:
-        """Hard-refresh the Application and request a sync unless one is in flight."""
+        """Hard-refresh the Application and request a TRUE full sync unless one is in flight.
+
+        NEW-116: the full-sync form (no resources, syncOptions or revision; the hook
+        strategy) only stays full because ``_start_operation`` also clears the previous
+        ``status.operationState`` the controller would otherwise merge it into.
+        """
         self._refresh(flow)
-        operation = {"initiatedBy": {"username": ARGO_SYNC_USERNAME}, "sync": {"prune": False}}
+        operation = {
+            "initiatedBy": {"username": ARGO_SYNC_USERNAME},
+            "sync": {"prune": False, "syncStrategy": FULL_SYNC_STRATEGY},
+        }
         return self._start_operation(flow, lambda _: operation) == "STARTED"
 
     def _start_operation(
@@ -896,6 +961,16 @@ class GitOpsControllerHandler:
         ``add /operation`` writes the whole object, so no operator-set field (e.g.
         syncStrategy.apply.force) survives into it. Returns STARTED, BUSY or the refusal
         blocker ``build`` returned.
+
+        NEW-116: ``/operation`` alone is not enough. Argo CD v3.4.x initialises the new
+        operation state with a JSON MERGE patch of ``status.operationState`` (controller
+        ``setOperationState``), and every SyncOperation field is ``omitempty``, so an
+        absent/empty resources, syncOptions, syncStrategy or revision keeps the PREVIOUS
+        operation's value: a full sync after a selective one runs selectively, without
+        hooks. The same patch therefore removes the completed ``status.operationState``,
+        exactly as Argo CD's own API does (util/argo ``SetAppOperation`` sets
+        ``Status.OperationState = nil`` with the operation). A full-sync request (no
+        resources) always carries the explicit hook strategy.
         """
         for _ in range(3):
             application = self._application(flow)
@@ -911,11 +986,17 @@ class GitOpsControllerHandler:
             operation = build(application)
             if isinstance(operation, str):
                 return operation
-            operation = {**operation, "sync": {**operation.get("sync", {}), "prune": False}}
-            patch = [
+            sync = {**operation.get("sync", {}), "prune": False}
+            if not sync.get("resources") and "syncStrategy" not in sync:
+                sync["syncStrategy"] = FULL_SYNC_STRATEGY
+            operation = {**operation, "sync": sync}
+            patch: list[dict[str, Any]] = [
                 {"op": "test", "path": "/metadata/resourceVersion", "value": version},
                 {"op": "add", "path": "/operation", "value": operation},
             ]
+            if _nested(application, "status", "operationState") is not None:
+                # Not running (checked above) and guarded by the resourceVersion test.
+                patch.append({"op": "remove", "path": "/status/operationState"})
             written = self._kubectl(
                 [
                     "--namespace",
@@ -1089,6 +1170,20 @@ class GitOpsControllerHandler:
             or initiated != ARGO_SYNC_USERNAME
         ):
             return {"status": "SYNC_PENDING", **observed}
+        if payload.get("selective") is not True and phase in {"Succeeded", "Failed", "Error"}:
+            # NEW-116: a full sync was requested; a selective (inherited) scope never
+            # counts as SYNCED, and is reported apart from an ordinary failure.
+            violations = full_sync_scope_violations(
+                application, operation_state, check_result=phase == "Succeeded"
+            )
+            if violations:
+                return {
+                    "status": "SYNC_SCOPE_INHERITED",
+                    "blocker": "ARGO_SYNC_SCOPE_INHERITED",
+                    "scope_violations": violations,
+                    "operation_started_at": started[:80],
+                    **observed,
+                }
         if phase in {"Failed", "Error"}:
             return {
                 "status": "SYNC_FAILED",
@@ -1257,6 +1352,31 @@ class GitOpsControllerHandler:
                         "failure_class": failure_class,
                     }
                 )
+        # NEW-116: a successful sync can still leave the application OutOfSync (e.g. it ran
+        # with an inherited selective scope); name those resources instead of "none".
+        out_of_sync: list[dict[str, str]] = []
+        out_of_sync_total = 0
+        for item in managed_items:
+            if not isinstance(item, dict) or item.get("status") in {None, "Synced"}:
+                continue
+            out_of_sync_total += 1
+            if len(out_of_sync) < MAXIMUM_DIAGNOSED_RESOURCES:
+                out_of_sync.append(
+                    {**resource_identity(item), "status": str(item.get("status"))[:40]}
+                )
+        operation_sync = _nested(operation_state, "operation", "sync")
+        operation_sync = operation_sync if isinstance(operation_sync, dict) else {}
+        scoped = operation_sync.get("resources")
+        options = operation_sync.get("syncOptions")
+        operation_scope = {
+            "resources_total": len(scoped) if isinstance(scoped, list) else 0,
+            "sync_options": [
+                str(option)[:60] for option in (options if isinstance(options, list) else [])
+            ][:5],
+            "strategy": (
+                "apply" if _nested(operation_sync, "syncStrategy", "apply") is not None else "hook"
+            ),
+        }
         raw_message = str(operation_state.get("message") or "")
         if not classes and phase in {"Failed", "Error"}:
             operation_class = classify_sync_failure("", raw_message)
@@ -1272,6 +1392,9 @@ class GitOpsControllerHandler:
             "failed_resources_total": failed_total,
             "degraded_resources": degraded,
             "degraded_resources_total": degraded_total,
+            "out_of_sync_resources": out_of_sync,
+            "out_of_sync_resources_total": out_of_sync_total,
+            "operation_scope": operation_scope,
             "classes": sorted(set(classes)),
             "failure_class": overall_failure_class(classes),
         }
@@ -1394,6 +1517,10 @@ class GitOpsControllerHandler:
             not isinstance(attempt, int) or not 1 <= attempt <= MAXIMUM_TRANSIENT_RESYNCS
         ):
             return refused("ARGO_REMEDIATION_TRANSIENT_RETRIES_EXHAUSTED")
+        if action == "full_resync" and (
+            not isinstance(attempt, int) or not 1 <= attempt <= MAXIMUM_SCOPE_RESYNCS
+        ):
+            return refused("ARGO_REMEDIATION_SCOPE_RETRIES_EXHAUSTED")
         selected: list[dict[str, str]] = []
         if action in {"replace", "replace_force"}:
             raw_resources = payload.get("resources")
@@ -1428,6 +1555,21 @@ class GitOpsControllerHandler:
             if action == "complete":
                 if not self._selective_sync_completed(application):
                     return "ARGO_REMEDIATION_NOTHING_TO_COMPLETE"
+            elif action == "full_resync":
+                # NEW-116: the diagnosed Hermes full-sync request must still be the latest
+                # operation, completed, and still show the inherited scope.
+                phase = str(operation_state.get("phase") or "")
+                if (
+                    not failed_started
+                    or previous_started != failed_started
+                    or phase not in {"Succeeded", "Failed", "Error"}
+                    or _nested(operation_state, "operation", "initiatedBy", "username")
+                    != ARGO_SYNC_USERNAME
+                    or not full_sync_scope_violations(
+                        application, operation_state, check_result=phase == "Succeeded"
+                    )
+                ):
+                    return "ARGO_REMEDIATION_STALE_DIAGNOSIS"
             else:
                 diagnosis = self._sync_diagnosis(flow, application)
                 if diagnosis["sync"] == "Synced" and diagnosis["health"] == "Healthy":
@@ -2792,6 +2934,32 @@ def render_sync_failure(
             f"class={_code(item.get('failure_class'), 20)}"
             + (f" pods: {_code(reason_text, 300)}" if reason_text else "")
         )
+    out_of_sync = [
+        f"- {_code(item.get('kind'), 63)} {_code(item.get('namespace'), 63)}/"
+        f"{_code(item.get('name'), 120)} status={_code(item.get('status'), 40)}"
+        for item in entries("out_of_sync_resources")
+    ]
+    out_of_sync_total = diagnosis.get("out_of_sync_resources_total")
+    if isinstance(out_of_sync_total, int) and out_of_sync_total > len(out_of_sync):
+        out_of_sync.append(f"- ... and {out_of_sync_total - len(out_of_sync)} more")
+    scope = diagnosis.get("operation_scope")
+    scope = scope if isinstance(scope, dict) else {}
+    scoped_total = scope.get("resources_total")
+    scope_line = (
+        "- Last operation scope: "
+        + (
+            f"selective ({scoped_total} resource(s))"
+            if isinstance(scoped_total, int) and scoped_total > 0
+            else "full"
+        )
+        + f", strategy={_code(scope.get('strategy'), 10)}, syncOptions="
+        + _code(
+            ",".join(str(option) for option in scope.get("sync_options") or [])
+            if isinstance(scope.get("sync_options"), list)
+            else "",
+            200,
+        )
+    )
     tried = [
         f"- round {item.get('round')}: {_code(item.get('action'), 20)} "
         f"({_code(item.get('failure_class'), 20)}) on "
@@ -2810,20 +2978,25 @@ def render_sync_failure(
         f"- Argo CD: phase={_code(diagnosis.get('phase'), 40)} "
         f"sync={_code(diagnosis.get('sync'), 40)} health={_code(diagnosis.get('health'), 40)}",
         f"- Argo CD message: {_code(diagnosis.get('message'), 300)}",
+        *([scope_line] if scope else []),
         "",
         "### Remediation tried",
         *(tried or ["- none (this failure class is not remediated automatically)"]),
         "",
         "Bounded remediation: a patch-incompatible change is re-synced once per resource with "
         "`Replace=true`, an immutable Job once with `Replace=true,Force=true`, and transient "
-        "API errors are re-synced at most 3 times; nothing is pruned. Everything else needs "
-        "the operator. No secret values are included in this report.",
+        "API errors are re-synced at most 3 times, and a full sync that ran with an inherited "
+        "selective scope is re-synced once as a true full sync; nothing is pruned. Everything "
+        "else needs the operator. No secret values are included in this report.",
         "",
         "### Failed resources",
         *(failed or ["- none"]),
         "",
         "### Degraded resources",
         *(degraded or ["- none"]),
+        "",
+        "### OutOfSync resources",
+        *(out_of_sync or ["- none"]),
     ]
     # gh comments are bounded to 12,000 bytes including the marker.
     return "\n".join(lines).encode()[:11_000].decode(errors="ignore")

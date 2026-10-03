@@ -2079,6 +2079,9 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
     _SYNC_REMEDIATION_ROUNDS = 3
     _TRANSIENT_RESYNCS = 3
     _SYNC_PATCH = "gitops-argo-sync-remediation-v1"
+    # NEW-116: a full sync Argo CD ran with an inherited selective scope (one full resync).
+    _SCOPE_PATCH = "gitops-argo-sync-scope-inherited-v1"
+    _SCOPE_RESYNCS = 1
     # Tests run the real flow with short timers. Production keeps 1.0, and _timer then
     # returns the very same timedelta, so every timer command stays byte-identical.
     _TIMER_SCALE = 1.0
@@ -2304,7 +2307,9 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             attempts=40,
             interval=half_minute,
         )
-        if synced.get("status") in {"SYNC_FAILED", "TIMED_OUT"} and self._sync_recovery_patched():
+        if (
+            synced.get("status") in {"SYNC_FAILED", "TIMED_OUT"} or self._scope_inherited(synced)
+        ) and self._sync_recovery_patched():
             # NEW-113: diagnose, remediate within bounds, notify, and escalate the rest
             # (gntik-ai/falcone#980: a patch-incompatible env change failed the sync).
             synced = await self._recover_sync(deployed_base, synced, evidence)
@@ -2353,6 +2358,13 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         # NEW-113 (no marker there) replays its old BLOCKED return unchanged.
         return workflow.patched(self._SYNC_PATCH)
 
+    def _scope_inherited(self, synced: dict[str, Any]) -> bool:
+        # NEW-116: checked only for the new status, which no earlier history recorded, so
+        # every pre-NEW-116 history replays unchanged.
+        return synced.get("status") == "SYNC_SCOPE_INHERITED" and workflow.patched(
+            self._SCOPE_PATCH
+        )
+
     @staticmethod
     def _remediation_id(rounds: int, action: str) -> str:
         workflow_id = re.sub(r"[^A-Za-z0-9._:/-]", "-", workflow.info().workflow_id)[:200]
@@ -2373,8 +2385,12 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         *,
         timed_out: bool,
         transient: int,
+        scope_resyncs: int = 0,
     ) -> tuple[str | None, list[dict[str, str]]]:
         """Pick the next bounded remediation, or None to escalate to the operator."""
+        if failure_class == "SCOPE_INHERITED":
+            # NEW-116: one TRUE full sync (the activity clears the inherited state).
+            return ("full_resync", []) if scope_resyncs < cls._SCOPE_RESYNCS else (None, [])
         if failure_class == "TRANSIENT":
             return ("resync", []) if transient < cls._TRANSIENT_RESYNCS else (None, [])
         if timed_out or failure_class not in {"PATCH_CONFLICT", "JOB_IMMUTABLE"}:
@@ -2411,6 +2427,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         remediated: list[str] = []
         attempts: list[dict[str, Any]] = []
         transient = 0
+        scope_resyncs = 0
         rounds = 0
         detected = False
         while True:
@@ -2427,6 +2444,9 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 if diagnosed.get("status") == "DIAGNOSED"
                 else "OTHER"
             )
+            scope_inherited = self._scope_inherited(synced)
+            if scope_inherited:
+                failure_class = "SCOPE_INHERITED"
             if not detected:
                 detected = True
                 await self._notify_sync(
@@ -2437,7 +2457,12 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     diagnosis=diagnosis,
                 )
             action, resources = self._sync_remediation_plan(
-                failure_class, diagnosis, remediated, timed_out=timed_out, transient=transient
+                failure_class,
+                diagnosis,
+                remediated,
+                timed_out=timed_out,
+                transient=transient,
+                scope_resyncs=scope_resyncs,
             )
             if action is None or rounds >= self._SYNC_REMEDIATION_ROUNDS:
                 return await self._escalate_sync(
@@ -2449,6 +2474,8 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             if action == "resync":
                 transient += 1
                 await workflow.sleep(self._timer(timedelta(seconds=30 * 2 ** (transient - 1))))
+            if action == "full_resync":
+                scope_resyncs += 1
             record: dict[str, Any] = {
                 "round": rounds,
                 "action": action,
@@ -2462,14 +2489,14 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     "action": action,
                     "resources": resources,
                     "round": rounds,
-                    "attempt": transient,
+                    "attempt": scope_resyncs if action == "full_resync" else transient,
                     "already_remediated": remediated,
                     # Stable per remediation, so a retried activity cannot sync twice.
                     "remediation_id": self._remediation_id(rounds, action),
                     # The failed operation this diagnosis describes (None for health).
                     "failed_operation_started_at": (
                         synced.get("operation_started_at")
-                        if synced.get("status") == "SYNC_FAILED"
+                        if synced.get("status") == "SYNC_FAILED" or scope_inherited
                         else None
                     ),
                 },
@@ -2551,7 +2578,10 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             if synced.get("status") == "SYNCED":
                 evidence["argo_sync_failure_class"] = failure_class
                 return synced
-            if synced.get("status") not in {"SYNC_FAILED", "TIMED_OUT"}:
+            if synced.get("status") not in {
+                "SYNC_FAILED",
+                "TIMED_OUT",
+            } and not self._scope_inherited(synced):
                 return self._blocked(synced, "ARGO_SYNC_FAILED")
 
     async def _remediation_call(
