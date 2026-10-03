@@ -63,6 +63,12 @@ source_test_commands:
 deployment_test_commands:
   - [helm, lint, charts/in-falcone]
   - [helm, template, engineering-render, charts/in-falcone, --namespace, in-falcone-staging]
+# NEW-118: falcone's CI checks out falcone-charts at this pin, and its contract test
+# (tests/blackbox/mongo-gateway-route.test.mjs) requires it to equal the deployment head.
+# Hermes sets it to the paired deployment worktree HEAD after the deployment maker.
+deployment_pin:
+  files: [.github/workflows/ci.yml, .github/workflows/integration.yml]
+  variable: FALCONE_CHARTS_REF
 delivery_control:
   source_ci_workflow: ci
   candidate_build:

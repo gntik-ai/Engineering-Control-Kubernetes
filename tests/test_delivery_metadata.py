@@ -802,6 +802,9 @@ def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
     assert "Do not re-implement" not in reset and resumed_head not in reset
     # Resume is per repository: the deployment worktree was not resumed.
     assert "Do not re-implement" not in deployment
+    # NEW-118: a standing rule for the deployment maker only.
+    standing = "Make no deployment commit beyond what the OpenSpec, the issue or the independent"
+    assert standing in deployment and standing not in resumed
     # The checker reviews the full base..HEAD change, not only the latest commit.
     assert f"git diff {'a' * 40}..HEAD" in checker
     assert "may span several commits" in checker

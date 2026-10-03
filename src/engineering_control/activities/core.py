@@ -88,6 +88,7 @@ class ControlActivities:
         "delivery.deterministic_prechecks",
         "delivery.prepare_toolchain",
         "delivery.resolve_dependencies",
+        "delivery.converge_deployment_pin",
         "delivery.route_providers",
         "delivery.prepare_maker",
         "delivery.invoke_maker",
@@ -254,6 +255,8 @@ class ControlActivities:
         "gitops.notify_sync",
         "gitops.verify_workloads",
         "gitops.persist_result",
+        # NEW-118: scan-worker render comparison for the bounded prune.
+        "gitops.render_removed_resources",
         # ... and GitHub-worker steps (GitOpsGitHubHandler via GitHubActivityHandler).
         "gitops.pr_checks",
         "gitops.pr_heads",
@@ -379,6 +382,8 @@ class ControlActivities:
             "delivery.deterministic_prechecks",
             "delivery.prepare_toolchain",
             "delivery.resolve_dependencies",
+            "delivery.converge_deployment_pin",
+            "gitops.render_removed_resources",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",

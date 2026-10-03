@@ -69,6 +69,7 @@ from engineering_control.engineering.github import FindingPublication
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
+    load_deployment_pin,
     toolchain_test_command_lines,
 )
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
@@ -3561,6 +3562,15 @@ class MetadataActivityHandler:
                 else ""
             )
             + (
+                # NEW-118 (falcone #980/#45): extra deployment commits each moved the
+                # source CI pin and cost a checker round.
+                "Make no deployment commit beyond what the OpenSpec, the issue or the "
+                "independent checker's blocking findings require.\n"
+                if deployment
+                else ""
+            )
+            + self._deployment_pin_prompt(payload, role="deployment" if deployment else "source")
+            + (
                 self._toolchain_prompt(payload, role="maker")
                 if not deployment or payload["source_worktree"] == payload["deployment_worktree"]
                 else ""
@@ -3613,6 +3623,36 @@ class MetadataActivityHandler:
             "Review the complete change relative to the base commit, which may span several "
             "commits and earlier attempts (" + "; ".join(ranges) + "), not only the last "
             "commit.\n"
+        )
+
+    def _deployment_pin_prompt(self, payload: dict[str, Any], *, role: str) -> str:
+        """NEW-118: the source CI pin of the deployment repository is Hermes's to set."""
+        if payload.get("source_worktree") == payload.get("deployment_worktree"):
+            return ""
+        try:
+            pin = load_deployment_pin(self.settings.project_config_root, str(payload["project"]))
+        except (OSError, ValueError):
+            return ""  # advisory only: the convergence step itself fails closed
+        if pin is None:
+            return ""
+        where = f"{pin.variable} in {', '.join(pin.files)}"
+        if role == "checker":
+            return (
+                f"The source repository's CI pin of the deployment repository ({where}) is "
+                "managed by Hermes: after the deployment maker it is set to the deployment "
+                "worktree HEAD in a platform commit 'chore(ci): pin ... (Hermes pin "
+                "convergence)'. That commit is expected; report the pin only if it differs "
+                "from the deployment worktree HEAD.\n"
+            )
+        if role == "deployment":
+            return (
+                f"The source repository's CI pin of this repository ({where}) is managed by "
+                "Hermes, which sets it to this worktree's final HEAD after you finish; never "
+                "make a commit only to move it.\n"
+            )
+        return (
+            f"Never edit {where}: Hermes manages that pin and sets it to the deployment "
+            "worktree HEAD after the deployment maker.\n"
         )
 
     def _toolchain_prompt(self, payload: dict[str, Any], *, role: str) -> str:
@@ -3672,6 +3712,7 @@ class MetadataActivityHandler:
             # is documentation.
             + _TASKS_MD_ADVISORY
             + self._checker_range_prompt(payload)
+            + self._deployment_pin_prompt(payload, role="checker")
             + self._toolchain_prompt(payload, role="checker")
             + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"

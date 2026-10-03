@@ -28,6 +28,9 @@ class YamlCommandSummary:
     stdout_sha256: str
     document_count: int
     kinds: tuple[tuple[str, int], ...]
+    # NEW-118: (apiVersion, kind, metadata.namespace, metadata.name) of every object; names
+    # are structural metadata, never values, so they may leave the command boundary.
+    identities: tuple[tuple[str, str, str, str], ...] = ()
 
 
 class CommandFailure(RuntimeError):
@@ -119,13 +122,26 @@ class SafeCommandRunner:
             raise CommandFailure(f"{executable} failed with {process.returncode}: {stderr[-4000:]}")
         documents = [document for document in yaml.safe_load_all(process.stdout) if document]
         kinds: dict[str, int] = {}
+        identities: list[tuple[str, str, str, str]] = []
         for document in documents:
             kind = str(document.get("kind", "Unknown")) if isinstance(document, dict) else "Unknown"
             kinds[kind] = kinds.get(kind, 0) + 1
+            if isinstance(document, dict):
+                metadata = document.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                identities.append(
+                    (
+                        str(document.get("apiVersion") or "")[:253],
+                        kind[:63],
+                        str(metadata.get("namespace") or "")[:63],
+                        str(metadata.get("name") or "")[:253],
+                    )
+                )
         return YamlCommandSummary(
             stdout_sha256=hashlib.sha256(process.stdout.encode()).hexdigest(),
             document_count=len(documents),
             kinds=tuple(sorted(kinds.items())),
+            identities=tuple(identities),
         )
 
     async def run_yaml_summary_async(

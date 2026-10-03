@@ -1330,6 +1330,10 @@ async def test_validation_findings_are_recorded_for_the_next_correction() -> Non
         "delivery.create_openspec": {"status": "PLANNED", "run_id": "run-1"},
         "delivery.prepare_maker": {"status": "SOURCE_MAKER_READY", "run_id": "run-1"},
         "delivery.prepare_deployment_maker": {"status": "READY", "run_id": "run-1"},
+        "delivery.converge_deployment_pin": {
+            "status": "DEPLOYMENT_PIN_UNCHANGED",
+            "run_id": "run-1",
+        },
         "delivery.prepare_checker": {"status": "CHECKER_READY", "run_id": "run-1"},
         "delivery.validate_changeset": {
             "status": "REQUEST_CHANGES",
@@ -1349,6 +1353,113 @@ async def test_validation_findings_are_recorded_for_the_next_correction() -> Non
     steps = _scheduled_step_names(history)
     validated = steps.index("delivery.validate_changeset")
     assert steps[validated + 1] == "delivery.record_validation_findings"
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+# -- NEW-118: deterministic CI-pin convergence ------------------------------------------
+
+_DELIVERY_TO_CHECKER_SCRIPT: dict[str, dict[str, Any]] = {
+    **_DELIVERY_TO_SPEC_SCRIPT,
+    "delivery.prepare_spec": {"status": "SPEC_READY", "run_id": "run-1"},
+    "agent.record_start": {"status": "STARTED", "run_id": "run-1"},
+    "delivery.invoke_spec": {"status": "SUCCESS", "run_id": "run-1"},
+    "delivery.invoke_maker": {"status": "SUCCESS", "run_id": "run-1"},
+    "delivery.invoke_deployment_maker": {"status": "SUCCESS", "run_id": "run-1"},
+    "delivery.invoke_checker": {"status": "SUCCESS", "run_id": "run-1"},
+    "agent.persist_result": {
+        "status": "SUCCESS",
+        "run_id": "run-1",
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    },
+    "delivery.create_openspec": {"status": "PLANNED", "run_id": "run-1"},
+    "delivery.prepare_maker": {"status": "SOURCE_MAKER_READY", "run_id": "run-1"},
+    "delivery.prepare_deployment_maker": {"status": "READY", "run_id": "run-1"},
+    "delivery.converge_deployment_pin": {
+        "status": "DEPLOYMENT_PIN_CONVERGED",
+        "run_id": "run-1",
+        "deployment_pin_result": {"commit": "c" * 40},
+    },
+    "delivery.prepare_checker": {"status": "CHECKER_READY", "run_id": "run-1"},
+    "delivery.validate_changeset": {"status": "REQUEST_CHANGES", "run_id": "run-1"},
+}
+
+
+@workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
+class _PrePinIssueDeliveryWorkflow(IssueDeliveryWorkflow):
+    """IssueDeliveryWorkflow exactly as it ran before delivery-deployment-pin-convergence-v1."""
+
+    @workflow.run
+    async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
+        return await super().run(request)
+
+    def _pin_convergence_patched(self) -> bool:
+        return False
+
+
+async def test_new_118_pin_converges_after_the_deployment_maker_before_the_checker() -> None:
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(_DELIVERY_TO_CHECKER_SCRIPT)
+    )
+
+    assert result is not None and result["status"] == "REQUEST_CHANGES"
+    steps = _scheduled_step_names(history)
+    deployment_maker = steps.index("delivery.invoke_deployment_maker")
+    assert steps[deployment_maker : deployment_maker + 5] == [
+        "delivery.invoke_deployment_maker",
+        "agent.persist_result",
+        "delivery.converge_deployment_pin",
+        "delivery.prepare_checker",
+        "agent.record_start",
+    ]
+    assert steps.index("delivery.converge_deployment_pin") < steps.index("delivery.invoke_checker")
+    assert steps.count("delivery.converge_deployment_pin") == 1
+    (pin,) = _payloads(history, "delivery.converge_deployment_pin")
+    assert pin["agent_result"] == {"structured_result": {"decision": "COMPLETE"}}
+    assert "delivery_request" in pin
+    assert any(b"delivery-deployment-pin-convergence-v1" in marker for marker in _markers(history))
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_new_118_a_blocked_pin_stops_the_delivery_and_releases_its_leases() -> None:
+    script = {
+        **_DELIVERY_TO_CHECKER_SCRIPT,
+        "delivery.converge_deployment_pin": {
+            "status": "BLOCKED",
+            "blocker": "DEPLOYMENT_PIN_AMBIGUOUS",
+            "run_id": "run-1",
+        },
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "BLOCKED"
+    assert result["context"]["blocker"] == "DEPLOYMENT_PIN_AMBIGUOUS"
+    steps = _scheduled_step_names(history)
+    assert steps[-2:] == ["delivery.converge_deployment_pin", "delivery.release_leases"]
+    assert "delivery.prepare_checker" not in steps
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_new_118_a_pre_pin_delivery_history_replays_without_the_step() -> None:
+    script = dict(_DELIVERY_TO_CHECKER_SCRIPT)
+    del script["delivery.converge_deployment_pin"]
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        _PrePinIssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result is not None and result["status"] == "REQUEST_CHANGES"
+    steps = _scheduled_step_names(history)
+    assert "delivery.converge_deployment_pin" not in steps
+    persisted = steps.index("delivery.invoke_deployment_maker") + 1
+    assert steps[persisted : persisted + 2] == ["agent.persist_result", "delivery.prepare_checker"]
+    assert not any(b"delivery-deployment-pin-convergence-v1" in m for m in _markers(history))
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 
@@ -2320,6 +2431,226 @@ async def test_new_116_a_scope_inherited_again_escalates_after_one_full_resync()
     (issue,) = _payloads(history, "gitops.environment_issue")
     assert (issue["failure_class"], issue["blocker"]) == ("SCOPE_INHERITED", "ARGO_SYNC_FAILED")
     assert [attempt["result"] for attempt in issue["attempts"]] == ["SYNC_SCOPE_INHERITED"]
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+# -- NEW-118: prune what the delivered deployment change removed (staging only) --------
+
+_KEYCLOAK = {
+    "group": "",
+    "kind": "ConfigMap",
+    "namespace": "musematic-platform",
+    "name": "falcone-keycloak-config",
+}
+_KEYCLOAK_KEY = "/ConfigMap/musematic-platform/falcone-keycloak-config"
+_PRUNE_PLAN = {
+    **_GITOPS_PLAN,
+    "deployment_pr_number": 45,
+    "deployment_pr_url": "https://github.com/gntik-ai/musematic-deploy/pull/45",
+    "deployment_head_sha": "e" * 40,
+    "deployment_base_sha": "c" * 40,
+}
+_PRUNE_SOURCE = {
+    "repo_url": "https://github.com/gntik-ai/musematic-deploy.git",
+    "path": "charts/platform",
+    "value_files": ["values/staging.yaml"],
+    "release_name": "platform",
+    "namespace": "musematic-platform",
+}
+_PRUNE_REQUIRED = {
+    "status": "SYNC_PRUNE_REQUIRED",
+    "blocker": "ARGO_SYNC_PRUNE_REQUIRED",
+    "phase": "Succeeded",
+    "sync": "OutOfSync",
+    "operation_started_at": "2026-10-03T12:00:00Z",
+}
+_PRUNED = {
+    "status": "REMEDIATION_TRIGGERED",
+    "action": "prune_removed",
+    "resources": [_KEYCLOAK],
+    "remediated_keys": [_KEYCLOAK_KEY],
+    "previous_operation_started_at": "2026-10-03T12:00:00Z",
+}
+_PRUNE_FULL_SYNC = {
+    "status": "REMEDIATION_TRIGGERED",
+    "action": "prune_full_sync",
+    "resources": [],
+    "remediated_keys": [],
+    "previous_operation_started_at": "2026-10-03T12:05:00Z",
+}
+_RENDERED = {
+    "status": "RENDERED",
+    "removed_resources": [_KEYCLOAK],
+    "removed_total": 1,
+    "render_evidence": {"base_rendered_sha256": "1" * 64, "head_rendered_sha256": "2" * 64},
+}
+
+
+def _prune_script(plan: dict[str, Any] = _PRUNE_PLAN, **overrides: Any) -> dict[str, Any]:
+    return _sync_recovery_script(
+        **{
+            "gitops.prepare": {
+                **_gitops_script()["gitops.prepare"],
+                "plan": plan,
+            },
+            "gitops.deployment_pr_checks": {"status": "CHECKS_PASSED"},
+            "gitops.diagnose_sync": _diagnosed(
+                "PRUNE_REQUIRED",
+                prune_required_resources=[
+                    {**_KEYCLOAK, "status": "OutOfSync", "eligible": True, "refusal": None}
+                ],
+                prune_required_resources_total=1,
+                render_source=_PRUNE_SOURCE,
+            ),
+            "github.refresh_mirrors": {"status": "PASS"},
+            "gitops.render_removed_resources": _RENDERED,
+            **overrides,
+        }
+    )
+
+
+_PRUNE_TAIL = [
+    "gitops.sync_status",
+    "gitops.diagnose_sync",
+    "gitops.notify_sync",
+    "github.refresh_mirrors",
+    "gitops.render_removed_resources",
+]
+
+
+async def test_new_118_a_removed_configmap_is_pruned_then_fully_synced_and_verified() -> None:
+    # falcone-charts #45 removed ConfigMap falcone-keycloak-config; with prune=false the
+    # application stayed OutOfSync until an operator deleted it (ARGO_SYNC_TIMEOUT).
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _sequenced_step(
+            _prune_script(),
+            {
+                "gitops.sync_status": [
+                    _PRUNE_REQUIRED,
+                    {"status": "SYNCED", "argo_revision": "r1"},
+                    {"status": "SYNCED", "argo_revision": "r2"},
+                ],
+                "gitops.remediate_sync": [_PRUNED, _PRUNE_FULL_SYNC],
+            },
+        ),
+    )
+
+    assert result is not None and result["status"] == "STAGING_VERIFIED"
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    first = steps.index("gitops.sync_status")
+    assert steps[first:] == [
+        *_PRUNE_TAIL,
+        "gitops.remediate_sync",
+        "gitops.sync_status",
+        "gitops.remediate_sync",
+        "gitops.sync_status",
+        "gitops.notify_sync",
+        "gitops.verify_workloads",
+        "gitops.close_issue",
+        "gitops.persist_result",
+    ]
+    (render,) = _payloads(history, "gitops.render_removed_resources")
+    assert (render["deployment_base_sha"], render["deployment_merge_sha"]) == ("c" * 40, "d" * 40)
+    assert render["render_source"] == _PRUNE_SOURCE
+    prune, full = _payloads(history, "gitops.remediate_sync")
+    assert (prune["action"], prune["resources"]) == ("prune_removed", [_KEYCLOAK])
+    assert prune["render_removed_keys"] == [_KEYCLOAK_KEY]
+    assert prune["remediation_id"].endswith(":round-1:prune_removed")
+    assert full["action"] == "prune_full_sync" and "resources" not in full
+    assert full["prune_remediation_id"] == prune["remediation_id"]
+    assert full["remediation_id"].endswith(":round-1:prune_full_sync")
+    polls = _payloads(history, "gitops.sync_status")
+    assert polls[1]["selective"] is True and "selective" not in polls[2]
+    notices = _payloads(history, "gitops.notify_sync")
+    assert [notice["event"] for notice in notices] == ["detected", "remediation"]
+    assert (notices[1]["action"], notices[1]["result"]) == ("prune_removed", "SYNCED")
+    persisted = _payloads(history, "gitops.persist_result")[0]
+    assert persisted["argo_sync_failure_class"] == "PRUNE_REQUIRED"
+    assert persisted["argo_sync_remediations"][0]["resources"] == [_KEYCLOAK_KEY]
+    assert persisted["argo_revision"] == "r2"
+    assert any(b"gitops-argo-prune-removed-v1" in marker for marker in _markers(history))
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_new_118_a_timed_out_sync_with_only_prune_drift_is_pruned() -> None:
+    pending = {"status": "SYNC_PENDING", "phase": "Succeeded", "sync": "OutOfSync"}
+    history, result = await _run_to_history(
+        _FastStagingGitOpsWorkflow,
+        _gitops_input(),
+        _sequenced_step(
+            _prune_script(),
+            {
+                "gitops.sync_status": [
+                    *([pending] * 40),
+                    {"status": "SYNCED", "argo_revision": "r1"},
+                    {"status": "SYNCED", "argo_revision": "r2"},
+                ],
+                "gitops.remediate_sync": [_PRUNED, _PRUNE_FULL_SYNC],
+            },
+        ),
+    )
+
+    assert result is not None and result["status"] == "STAGING_VERIFIED"
+    assert [payload["action"] for payload in _payloads(history, "gitops.remediate_sync")] == [
+        "prune_removed",
+        "prune_full_sync",
+    ]
+    await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
+
+
+@pytest.mark.parametrize(
+    ("plan", "rendered", "refusal", "render_calls"),
+    [
+        # The render comparison cannot be done: escalate, never prune.
+        (
+            _PRUNE_PLAN,
+            {"status": "RENDER_UNAVAILABLE", "blocker": "PRUNE_RENDER_FAILED"},
+            "PRUNE_RENDER_FAILED",
+            1,
+        ),
+        # Still rendered at the merged head: not removed by this change.
+        (
+            _PRUNE_PLAN,
+            {**_RENDERED, "removed_resources": [], "removed_total": 0},
+            "PRUNE_NOT_REMOVED_BY_THIS_CHANGE",
+            1,
+        ),
+        # No deployment PR: nothing this delivery merged can have removed it.
+        (_GITOPS_PLAN, _RENDERED, "PRUNE_NO_DEPLOYMENT_PR", 0),
+    ],
+)
+async def test_new_118_an_unproven_removal_is_escalated_with_its_reason(
+    plan: dict[str, Any], rendered: dict[str, Any], refusal: str, render_calls: int
+) -> None:
+    history, result = await _run_to_history(
+        StagingGitOpsDeliveryWorkflow,
+        _gitops_input(),
+        _scripted_execute_control_step(
+            _prune_script(
+                plan,
+                **{
+                    "gitops.sync_status": _PRUNE_REQUIRED,
+                    "gitops.render_removed_resources": rendered,
+                },
+            )
+        ),
+    )
+
+    assert result is not None
+    assert (result["status"], result["blocker"], result["failure_class"]) == (
+        "BLOCKED",
+        "ARGO_SYNC_FAILED",
+        "PRUNE_REQUIRED",
+    )
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert "gitops.remediate_sync" not in steps
+    assert steps.count("gitops.render_removed_resources") == render_calls
+    (issue,) = _payloads(history, "gitops.environment_issue")
+    (entry,) = issue["diagnosis"]["prune_required_resources"]
+    assert (entry["name"], entry["refusal"]) == ("falcone-keycloak-config", refusal)
+    assert steps[-3:] == ["gitops.environment_issue", "gitops.notify_sync", "gitops.persist_result"]
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(history)
 
 

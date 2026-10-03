@@ -153,6 +153,8 @@ class ScanActivityHandler:
             "delivery.deterministic_prechecks",
             "delivery.prepare_toolchain",
             "delivery.resolve_dependencies",
+            "delivery.converge_deployment_pin",
+            "gitops.render_removed_resources",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
@@ -262,6 +264,13 @@ class ScanActivityHandler:
             if step == "delivery.resolve_dependencies":
                 return await self._with_heartbeat(
                     asyncio.to_thread(self._resolve_dependencies, payload)
+                )
+            if step == "delivery.converge_deployment_pin":
+                return await asyncio.to_thread(self._converge_deployment_pin, payload)
+            if step == "gitops.render_removed_resources":
+                return await self._with_heartbeat(
+                    asyncio.to_thread(self._render_removed_resources, payload),
+                    phase="render_removed_resources",
                 )
             if step == "runtime.deterministic_checks":
                 return await asyncio.to_thread(self._runtime_deterministic_checks, payload)
@@ -1763,6 +1772,332 @@ class ScanActivityHandler:
                 "detail": safe,
                 "commands": commands or [],
             },
+        }
+
+    # -- NEW-118: what the delivered deployment change removed from the rendered chart ----
+
+    _RENDER_RELATIVE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,239}")
+    _RENDER_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,51}[a-z0-9])?")
+    _MAXIMUM_REMOVED_RESOURCES = 200
+
+    def _render_removed_resources(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Render the deployment chart at the ChangeSet's deployment base and at the merged
+        deployment head (same ``helm template`` + Argo CD source as deployment.render), and
+        return the objects present at the base and absent at the head.
+
+        Read-only; any doubt returns RENDER_UNAVAILABLE so the flow escalates, never prunes.
+        """
+
+        def unavailable(blocker: str, error: Exception | None = None) -> dict[str, Any]:
+            result: dict[str, Any] = {"status": "RENDER_UNAVAILABLE", "blocker": blocker}
+            if error is not None:
+                result["error_type"] = type(error).__name__
+            return result
+
+        try:
+            project = Project(str(payload.get("project", "")))
+            change_set_id = UUID(str(payload.get("change_set_id", "")))
+            manifest = self.catalog.project(project.value)
+        except (OSError, ValueError, ValidationError) as error:
+            return unavailable("PRUNE_RENDER_CONTRACT_UNAVAILABLE", error)
+        base_sha = str(payload.get("deployment_base_sha") or "")
+        head_sha = str(payload.get("deployment_merge_sha") or "")
+        if not re.fullmatch(r"[a-f0-9]{40}", base_sha) or not re.fullmatch(
+            r"[a-f0-9]{40}", head_sha
+        ):
+            return unavailable("PRUNE_RENDER_REVISIONS_MISSING")
+        if manifest.deployment.chart_repository != "deployment":
+            # The chart lives in the source repository; a deployment PR alone cannot say
+            # what the delivery removed.
+            return unavailable("PRUNE_RENDER_CHART_OUTSIDE_DEPLOYMENT_REPOSITORY")
+        flow = manifest.staging_flow()
+        source = payload.get("render_source")
+        if flow is None or not isinstance(source, dict):
+            return unavailable("PRUNE_RENDER_SOURCE_MISSING")
+        expected_url = str(manifest.repositories.deployment.url).lower().rstrip("/")
+        repo_url = str(source.get("repo_url") or "").lower().rstrip("/")
+        if repo_url.removesuffix(".git") != expected_url.removesuffix(".git"):
+            return unavailable("PRUNE_RENDER_SOURCE_OUTSIDE_PROJECT")
+        chart_path = str(source.get("path") or "")
+        raw_values = source.get("value_files")
+        value_files = [str(value) for value in raw_values] if isinstance(raw_values, list) else []
+        release = str(source.get("release_name") or "")
+        namespace = str(source.get("namespace") or "")
+        if (
+            chart_path != manifest.deployment.chart_path
+            or len(value_files) > 10
+            or any(
+                not self._RENDER_RELATIVE.fullmatch(value) or ".." in value.split("/")
+                for value in value_files
+            )
+            or not self._RENDER_NAME.fullmatch(release)
+            or namespace not in flow.namespaces
+        ):
+            return unavailable("PRUNE_RENDER_SOURCE_INVALID")
+        repository = self._repositories[project][1]
+        renders: dict[str, Any] = {}
+        try:
+            for label, sha in (("base", base_sha), ("head", head_sha)):
+                with self._render_checkout(change_set_id, label, repository, sha) as checkout:
+                    chart = (checkout / chart_path).resolve()
+                    if not chart.is_dir() or not chart.is_relative_to(checkout):
+                        raise ValueError("rendered chart path escaped its checkout")
+                    arguments = ["template", release, str(chart), "--namespace", namespace]
+                    for value in value_files:
+                        path = (chart / value).resolve()
+                        if not path.is_file() or not path.is_relative_to(checkout):
+                            raise ValueError("rendered values file is missing or escaped")
+                        arguments.extend(("--values", str(path)))
+                    renders[label] = self.promotion_runner.run_yaml_summary(
+                        "helm", arguments, cwd=checkout, timeout_seconds=900
+                    )
+        except (
+            OSError,
+            ValueError,
+            CommandFailure,
+            WorktreeError,
+            yaml.YAMLError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            return unavailable("PRUNE_RENDER_FAILED", error)
+        if not renders["base"].document_count or not renders["head"].document_count:
+            return unavailable("PRUNE_RENDER_EMPTY")
+
+        def identities(summary: Any) -> set[tuple[str, str, str, str]]:
+            values: set[tuple[str, str, str, str]] = set()
+            for api_version, kind, object_namespace, name in summary.identities:
+                group = api_version.split("/", 1)[0] if "/" in api_version else ""
+                values.add((group, kind, object_namespace or namespace, name))
+            return values
+
+        removed = sorted(identities(renders["base"]) - identities(renders["head"]))
+        return {
+            "status": "RENDERED",
+            "removed_resources": [
+                {"group": group, "kind": kind, "namespace": object_namespace, "name": name}
+                for group, kind, object_namespace, name in removed[
+                    : self._MAXIMUM_REMOVED_RESOURCES
+                ]
+            ],
+            "removed_total": len(removed),
+            "render_evidence": {
+                "deployment_base_sha": base_sha,
+                "deployment_merge_sha": head_sha,
+                "chart_path": chart_path,
+                "value_files": value_files,
+                "release_name": release,
+                "namespace": namespace,
+                "base_rendered_sha256": renders["base"].stdout_sha256,
+                "head_rendered_sha256": renders["head"].stdout_sha256,
+                "base_documents": renders["base"].document_count,
+                "head_documents": renders["head"].document_count,
+                "rendered_content_persisted": False,
+            },
+        }
+
+    @contextmanager
+    def _render_checkout(
+        self, change_set_id: UUID, label: str, repository: str, sha: str
+    ) -> Iterator[Path]:
+        """A scratch detached checkout of one deployment commit, removed after the render."""
+        root = self.settings.toolchain_cache_root / "baselines" / "render" / str(change_set_id)
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        checkout = root / label
+        if checkout.is_symlink():
+            raise ValueError("render checkout must not be a symlink")
+        if checkout.exists():
+            shutil.rmtree(checkout)  # left behind by an interrupted attempt
+        try:
+            self._clone_detached(repository, sha, checkout, cwd=root)
+            yield checkout.resolve()
+        finally:
+            if checkout.exists():
+                shutil.rmtree(checkout)
+
+    # -- NEW-118: deterministic CI-pin convergence -------------------------------------
+
+    _PIN_MAX_FILE_BYTES = 1024 * 1024
+    _PIN_IDENTITY = ("Engineering Control", "engineering-control@local.invalid")
+
+    def _converge_deployment_pin(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-118: set the source CI pin of the deployment repository to its worktree HEAD.
+
+        Runs after the deployment maker and before the checker (falcone #980/#45: the
+        source maker runs first, so every deployment commit left FALCONE_CHARTS_REF one
+        commit behind). Only the exact ``VARIABLE: '<40-hex>'`` definition lines change,
+        in a clean source worktree, committed as the platform identity the worktree
+        manager configures for maker commits; anything ambiguous blocks instead.
+        """
+        project = str(payload.get("project", ""))
+        source_value = payload.get("source_worktree")
+        deployment_value = payload.get("deployment_worktree")
+        if not source_value or not deployment_value or source_value == deployment_value:
+            return self._pin_result(payload, "DEPLOYMENT_PIN_NOT_APPLICABLE", "NO_PAIRED_WORKTREES")
+        try:
+            manifest = self.catalog.project(Project(project).value)
+        except (OSError, ValueError, ValidationError):
+            return self._pin_blocked(payload, "DEPLOYMENT_PIN_CONTRACT_UNREADABLE", {})
+        policy = manifest.deployment_pin
+        if policy is None:
+            return self._pin_result(payload, "DEPLOYMENT_PIN_NOT_APPLICABLE", "NOT_CONFIGURED")
+        agent = payload.get("agent_result")
+        structured = agent.get("structured_result") if isinstance(agent, dict) else None
+        if not isinstance(structured, dict) or structured.get("decision") != "COMPLETE":
+            # delivery.prepare_checker blocks an incomplete deployment maker itself.
+            return self._pin_result(
+                payload, "DEPLOYMENT_PIN_NOT_APPLICABLE", "DEPLOYMENT_MAKER_NOT_COMPLETE"
+            )
+        source = self._bounded_worktree(source_value)
+        deployment = self._bounded_worktree(deployment_value)
+        deployment_head = self._git(deployment, ["rev-parse", "HEAD"]).strip()
+        if not re.fullmatch(r"[a-f0-9]{40}", deployment_head):
+            return self._pin_blocked(payload, "DEPLOYMENT_PIN_HEAD_INVALID", {})
+        deployment_base = str(payload.get("deployment_base_sha") or "")
+        if deployment_head == deployment_base:
+            # No deployment commit: the source pin is not this ChangeSet's to move (and a
+            # .github change would also forfeit the NEW-63 CI baseline).
+            return self._pin_result(
+                payload,
+                "DEPLOYMENT_PIN_NOT_APPLICABLE",
+                "DEPLOYMENT_UNCHANGED",
+                deployment_head=deployment_head,
+            )
+        definition = re.compile(rf"^[ \t]*[\"']?{re.escape(policy.variable)}[\"']?[ \t]*:")
+        exact = re.compile(
+            rf"^(?P<prefix>[ \t]*{re.escape(policy.variable)}:[ \t]*)(?P<quote>['\"]?)"
+            r"(?P<sha>[0-9a-f]{40})(?P=quote)(?P<suffix>[ \t]*(?:#[^\r\n]*)?)$"
+        )
+        files: list[dict[str, Any]] = []
+        rewrites: dict[str, tuple[Path, str, str]] = {}
+        for relative in policy.files:
+            path = (source / relative).resolve()
+            unresolved = source / relative
+            if (
+                unresolved.is_symlink()
+                or not path.is_relative_to(source)
+                or not path.is_file()
+                or path.stat().st_size > self._PIN_MAX_FILE_BYTES
+            ):
+                return self._pin_blocked(payload, "DEPLOYMENT_PIN_FILE_MISSING", {"file": relative})
+            original = path.read_text(encoding="utf-8")
+            lines = original.splitlines(keepends=True)
+            old: list[str] = []
+            candidates = 0
+            rewritten: list[str] = []
+            for line in lines:
+                body = line.rstrip("\r\n")
+                ending = line[len(body) :]
+                if not definition.match(body):
+                    rewritten.append(line)
+                    continue
+                candidates += 1
+                match = exact.fullmatch(body)
+                if match is None:
+                    return self._pin_blocked(
+                        payload,
+                        "DEPLOYMENT_PIN_MALFORMED",
+                        {"file": relative, "line": len(rewritten) + 1},
+                    )
+                old.append(match.group("sha"))
+                rewritten.append(
+                    f"{match.group('prefix')}{match.group('quote')}{deployment_head}"
+                    f"{match.group('quote')}{match.group('suffix')}{ending}"
+                )
+            if candidates != policy.occurrences:
+                return self._pin_blocked(
+                    payload,
+                    "DEPLOYMENT_PIN_AMBIGUOUS",
+                    {"file": relative, "expected": policy.occurrences, "found": candidates},
+                )
+            files.append({"file": relative, "old": old, "new": deployment_head})
+            updated = "".join(rewritten)
+            if updated != original:
+                rewrites[relative] = (path, original, updated)
+        evidence: dict[str, Any] = {
+            "variable": policy.variable,
+            "deployment_repository": str(manifest.repositories.deployment.full_name),
+            "deployment_head": deployment_head,
+            "files": files,
+            "commit": None,
+        }
+        if not rewrites:
+            self._write_pin_evidence(payload, evidence)
+            return {
+                **payload,
+                "status": "DEPLOYMENT_PIN_UNCHANGED",
+                "deployment_pin_result": evidence,
+            }
+        if self._git_status(source, ignored=False):
+            return self._pin_blocked(
+                payload, "DEPLOYMENT_PIN_SOURCE_DIRTY", {"deployment_head": deployment_head}
+            )
+        before = self._git(source, ["rev-parse", "HEAD"]).strip()
+        changed = sorted(rewrites)
+        try:
+            for path, _, updated in rewrites.values():
+                path.write_text(updated, encoding="utf-8")
+            if sorted(self._git_status(source, ignored=False)) != changed:
+                raise ValueError("pin convergence changed files outside its configured files")
+            name, email = self._PIN_IDENTITY
+            self._git(source, ["add", "--", *changed])
+            self._git(
+                source,
+                [
+                    "-c",
+                    f"user.name={name}",
+                    "-c",
+                    f"user.email={email}",
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "-m",
+                    f"chore(ci): pin {evidence['deployment_repository']} to "
+                    f"{deployment_head[:12]} (Hermes pin convergence)",
+                ],
+            )
+        except (OSError, ValueError, CommandFailure):
+            for path, original, _ in rewrites.values():
+                path.write_text(original, encoding="utf-8")
+            self._git(source, ["reset", "--quiet", "--", *changed])
+            raise
+        commit = self._git(source, ["rev-parse", "HEAD"]).strip()
+        parent = self._git(source, ["rev-parse", "HEAD^"]).strip()
+        committed = sorted(self._git(source, ["diff", "--name-only", "HEAD^", "HEAD"]).split())
+        if parent != before or committed != changed or self._git_status(source, ignored=False):
+            raise ValueError("pin convergence commit is not exactly the configured pin files")
+        evidence["commit"] = commit
+        self._write_pin_evidence(payload, evidence)
+        return {**payload, "status": "DEPLOYMENT_PIN_CONVERGED", "deployment_pin_result": evidence}
+
+    def _write_pin_evidence(self, payload: dict[str, Any], evidence: dict[str, Any]) -> None:
+        try:
+            change_set_id = UUID(str(payload.get("change_set_id")))
+        except ValueError:
+            return
+        directory = self.settings.evidence_root / "scan" / str(change_set_id) / "deployment-pin"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        target = directory / f"{evidence['deployment_head']}.json"
+        target.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _pin_result(
+        payload: dict[str, Any], status: str, reason: str, **details: Any
+    ) -> dict[str, Any]:
+        return {
+            **payload,
+            "status": status,
+            "deployment_pin_result": {"reason": reason, "commit": None, **details},
+        }
+
+    @staticmethod
+    def _pin_blocked(
+        payload: dict[str, Any], blocker: str, details: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            **payload,
+            "status": "BLOCKED",
+            "blocker": blocker,
+            "deployment_pin_result": {"blocker": blocker, "commit": None, **details},
         }
 
     @staticmethod
