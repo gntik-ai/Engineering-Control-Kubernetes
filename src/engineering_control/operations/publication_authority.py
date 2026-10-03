@@ -29,7 +29,7 @@ from engineering_control.models.publication_authority import (
     PublicationEffectClaim,
     PublicationEffectReceipt,
 )
-from engineering_control.operations.issue_amend import effective_issue_revision
+from engineering_control.operations.issue_amend import consumed_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     approval_reference,
     validate_change_set_issue_approval,
@@ -269,8 +269,11 @@ class PublicationAuthorityRepository:
             # already expired lease. Re-evaluate against post-lock wall time.
             now = datetime.now(UTC)
             run, issue = _current_authority(session, change_set, value, now)
-            # NEW-115: the approved issue revision, including an operator amendment.
-            approved_body_sha256, approved_updated_at = effective_issue_revision(issue)
+            # NEW-115: the issue revision this run loaded (an operator amendment applies
+            # only to runs loaded after it).
+            approved_body_sha256, approved_updated_at = consumed_issue_revision(
+                change_set, run, issue
+            )
             observation = request.observation
             if (
                 not -2 <= (now - observation.observed_at).total_seconds() <= 10

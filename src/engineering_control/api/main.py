@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -739,6 +739,8 @@ def create_app(
 
         Without ``confirm`` this is a read-only preview; with it the freshly read body hash
         must still start with the confirmation, then the approved binding is updated."""
+        # Same trust model as /v1/r3-issues/approve and the other operator approvals: the
+        # bearer-authenticated channel asserts the actor, which must be a canonical operator.
         actor = approval_actor(subject)
         try:
             await repository.issue_amend_precheck(body.project, body.repository, body.issue_number)
@@ -765,7 +767,13 @@ def create_app(
             )
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        if body.retry and result.get("status") == "AMENDED":
+        # The amendment and its audit event are committed before the retry is sent. A rerun
+        # of the same confirmation after an unknown outcome reports NO_CHANGE for the
+        # recorded amendment and still sends the requested (validated) retry.
+        if body.retry and (
+            result.get("status") == "AMENDED"
+            or (result.get("status") == "NO_CHANGE" and "retry_workflow_id" in result)
+        ):
             result["retry"] = await _amend_retry(bus, body, result, subject, actor)
         return result
 
@@ -796,7 +804,12 @@ def create_app(
                 command,
                 source_channel="telegram" if actor.startswith("telegram:") else "cli",
                 operator_class=subject,
-                idempotency_key=f"issue-amend-retry-{result['audit_event_id']}",
+                # One key per request: a rerun may need to resend, and the loop's own
+                # preflight refuses a retry for an issue it is no longer waiting on.
+                idempotency_key=(
+                    f"issue-amend-retry-{str(result.get('retry_key') or '')[:32]}-"
+                    f"{uuid4().hex[:16]}"
+                ),
             )
         except ValueError as error:
             return {"status": "RETRY_NOT_SENT", "detail": str(error)[:500]}

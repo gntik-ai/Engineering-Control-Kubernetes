@@ -1510,9 +1510,13 @@ commands:
   backend: POST /v1/issues/amend (reads the body through IssueAmendObservationWorkflow on the GitHub worker)
   preconditions: Telegram platform, sender in the allowlist file; canonical operator actor (else 403).
     Refused (409) for R3 issues (use /loop r3-candidate + /loop approve-r3), issues without an approved
-    backlog delivery, delivered/closed issues, a running delivery, an empty body or a changed title.
+    backlog delivery, delivered/closed issues, a running delivery or a ChangeSet that already produced work,
+    a new text whose import risk class is higher (ISSUE_AMEND_RISK_ESCALATION), an empty body or a changed
+    title.
   reply: 'Preview: `status` PREVIEW (approved/current body sha256 and lengths, `diff` of at most 60 redacted
-    lines, `confirm_with`, `telegram_command`) or NO_CHANGE. Confirm: `status` AMENDED (`previous_body_sha256`,
+    lines, `confirm_with`, `telegram_command`), REVISION_TIME_CHANGED (same text, newer GitHub revision; confirm
+    it the same way) or NO_CHANGE (a confirm rerun with retry still sends the retry). A hook timeout replies
+    OUTCOME_UNKNOWN: run the same command again to reconcile. Confirm: `status` AMENDED (`previous_body_sha256`,
     `current_body_sha256`, `audit_event_id`) after re-reading the body (a different hash is refused:
     ISSUE_AMEND_CONFIRMATION_MISMATCH); with `retry`, `retry` holds the OperationView of the typed backlog
     retry (same preflight as /loop retry, e.g. BACKLOG_ISSUE_NOT_IN_LOOP) or RETRY_NOT_SENT.'

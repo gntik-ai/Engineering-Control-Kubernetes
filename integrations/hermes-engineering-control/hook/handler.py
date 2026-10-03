@@ -229,6 +229,10 @@ def _safe_error(value: str) -> str:
     )
 
 
+class _APITimeout(RuntimeError):
+    """The request was sent but no answer arrived: its outcome is unknown."""
+
+
 def _request(
     method: str,
     path: str,
@@ -259,7 +263,11 @@ def _request(
         raise RuntimeError(
             f"Engineering API rejected the request ({error.code}): {_redact(detail)}"
         ) from error
+    except TimeoutError as error:
+        raise _APITimeout("Engineering API did not answer in time") from error
     except urllib.error.URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise _APITimeout("Engineering API did not answer in time") from error
         raise RuntimeError("Engineering API is unavailable on loopback") from error
 
 
@@ -1225,7 +1233,16 @@ def _dispatch(command: str, raw_args: str, actor: str) -> Any:
             if confirm is not None:
                 amend["confirm"] = confirm
                 amend["retry"] = len(args) == 6
-            return _request("POST", "/v1/issues/amend", actor, amend)
+            try:
+                return _request("POST", "/v1/issues/amend", actor, amend)
+            except _APITimeout:
+                # The API may still commit the amendment (and send the retry); a rerun of
+                # the same command reconciles: NO_CHANGE, plus the retry if requested.
+                return {
+                    "status": "OUTCOME_UNKNOWN",
+                    "detail": "outcome unknown: run the same /loop amend command again to "
+                    "reconcile",
+                }
         if action == "retry":
             if (
                 len(args) != 4

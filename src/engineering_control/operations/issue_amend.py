@@ -33,13 +33,20 @@ from engineering_control.db.models import (
     Run,
     Step,
 )
-from engineering_control.engineering.backlog import BACKLOG_PROJECT_PAIRS, canonical_sha256
+from engineering_control.engineering.backlog import (
+    BACKLOG_PROJECT_PAIRS,
+    calculated_issue_risk,
+    canonical_sha256,
+)
 from engineering_control.models.enums import ChangeSetState
 from engineering_control.security.redaction import SecretRedactor
 
 AMENDMENT_KEY = "approved_body_amendment"
 AMEND_REASON = "issue amended"
 AMEND_EVENT_TYPE = "issue_body_amended"
+# ChangeSet.recovery_json: the issue revision the current delivery run loaded.
+ISSUE_BODY_REVISION_KEY = "issue_body_revision"
+_RISK_RANK = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 CONFIRMATION_PATTERN = re.compile(r"[a-f0-9]{12,64}")
 DIFF_LINE_LIMIT = 60
 DIFF_LINE_CHARS = 200
@@ -164,11 +171,20 @@ def resolve_amend_target(
         .order_by(desc(GitHubBacklogCampaign.imported_at))
         .limit(1)
     )
-    if lock:
-        query = query.with_for_update(of=BacklogIssueRecord)
     issue = session.scalar(query)
+    finding = None
+    if issue is not None and issue.finding_id is not None:
+        # The same lock order as delivery startup (delivery.load_confirmed_finding locks
+        # the Finding, then its ChangeSet): a confirm and a delivery load serialize, so a
+        # delivery consumes either the previous or the amended revision, never a mix.
+        finding = session.get(
+            Finding, issue.finding_id, with_for_update=lock, populate_existing=lock
+        )
+        if lock:
+            issue = session.get(
+                BacklogIssueRecord, issue.id, with_for_update=True, populate_existing=True
+            )
     campaign = session.get(GitHubBacklogCampaign, issue.backlog_campaign_id) if issue else None
-    finding = session.get(Finding, issue.finding_id) if issue and issue.finding_id else None
     if issue is None or campaign is None or finding is None:
         raise IssueAmendBlocked(
             "ISSUE_AMEND_NOT_IN_APPROVED_BACKLOG",
@@ -193,7 +209,14 @@ def resolve_amend_target(
             f"/loop r3-candidate {project} {surface} {issue_number} and /loop approve-r3 "
             f"{project} {surface} {issue_number} <binding> <phrase>",
         )
-    change_set = session.scalar(select(ChangeSet).where(ChangeSet.finding_id == finding.id))
+    change_set = session.scalar(
+        select(ChangeSet)
+        .where(ChangeSet.finding_id == finding.id)
+        .with_for_update(of=ChangeSet)
+        .execution_options(populate_existing=True)
+        if lock
+        else select(ChangeSet).where(ChangeSet.finding_id == finding.id)
+    )
     if (
         issue.state != "OPEN"
         or issue.delivery_status == "COMPLETE"
@@ -205,8 +228,21 @@ def resolve_amend_target(
             f"{target} is already delivered or closed; open a new issue or change request",
         )
     if change_set is not None:
+        if not change_set_unstarted(change_set):
+            # Only a delivery stopped before any work (CONFIRMED, e.g. blocked by
+            # ISSUE_BODY_CHANGED_SINCE_APPROVAL at the body refresh) is amended.
+            raise IssueAmendBlocked(
+                "ISSUE_AMEND_DELIVERY_ACTIVE",
+                f"the delivery of {target} already produced work (ChangeSet "
+                f"{change_set.state}); re-import the backlog and start the issue again",
+            )
         current = now or datetime.now(UTC)
-        active = session.scalar(
+        running = session.scalar(
+            select(Run.id)
+            .where(Run.change_set_id == change_set.id, Run.status == "RUNNING")
+            .limit(1)
+        )
+        leased = session.scalar(
             select(ComponentLease.id)
             .join(Run, Run.id == ComponentLease.owner_run_id)
             .where(
@@ -216,7 +252,7 @@ def resolve_amend_target(
             )
             .limit(1)
         )
-        if active is not None:
+        if running is not None or leased is not None:
             raise IssueAmendBlocked(
                 "ISSUE_AMEND_DELIVERY_ACTIVE",
                 f"a delivery of {target} is running; amend it after it stops",
@@ -278,10 +314,11 @@ def amend_issue(
 ) -> dict[str, Any]:
     """Preview (no confirmation) or apply (confirmation) one issue body amendment.
 
-    Apply runs in the caller's transaction: it re-resolves the target under a row lock,
-    requires the freshly read body hash to start with the operator's confirmation (the
-    hash shown by the preview), and updates the imported excerpt, the Finding's copy and
-    the approved-body binding together with the audit event."""
+    Apply runs in the caller's transaction under the delivery-startup lock order: it
+    re-resolves the target, requires the freshly read body hash to start with the
+    operator's confirmation (the hash the preview showed), and records the amendment, the
+    imported excerpt, the Finding's copy and the audit event together. A body whose
+    import risk class is higher than the approved one is refused (never re-classified)."""
     current_time = now or datetime.now(UTC)
     issue, campaign, finding, change_set = resolve_amend_target(
         session,
@@ -301,7 +338,7 @@ def amend_issue(
             f"the title of {target} changed too; re-import the backlog (/loop import "
             f"{project} github-open ...) and start the issue again",
         )
-    approved_sha256, _approved_at = effective_issue_revision(issue)
+    approved_sha256, approved_at = effective_issue_revision(issue)
     snapshot = dict(issue.github_snapshot_json or {})
     approved_text = str(snapshot.get("body_excerpt") or finding.actual_behavior or "")
     amendment = snapshot.get(AMENDMENT_KEY)
@@ -311,6 +348,7 @@ def amend_issue(
         else len(approved_text)
     )
     current_sha256 = observed["body_sha256"]
+    current_at: datetime = observed["updated_at"]
     surface = _surface(project, issue.repository)
     base = {
         "target": target,
@@ -322,21 +360,48 @@ def amend_issue(
         "current_body_sha256": current_sha256,
         "approved_body_chars": approved_chars,
         "current_body_chars": observed["body_chars"],
+        "approved_updated_at": _utc(approved_at).isoformat(),
+        "current_updated_at": current_at.isoformat(),
+        "risk_class": finding.risk_class,
         "production": False,
     }
-    if approved_sha256 == current_sha256:
-        return {
+    same_body = approved_sha256 == current_sha256
+    if same_body and _utc(approved_at) == current_at:
+        result: dict[str, Any] = {
             **base,
             "status": "NO_CHANGE",
-            "detail": "the GitHub body is the approved text; nothing to amend",
+            "detail": "the GitHub issue is the approved revision; nothing to amend",
         }
+        if isinstance(amendment, dict) and amendment.get("body_sha256") == current_sha256:
+            # A rerun after an unknown outcome (e.g. a client timeout) reconciles: the
+            # recorded amendment is this revision, so a requested retry is still sent.
+            result["amended_by"] = amendment.get("amended_by")
+            result["retry_workflow_id"] = retry_workflow_id(session, change_set)
+            result["retry_key"] = str(amendment.get("binding_sha256", ""))[:32]
+        return result
+    excerpt = str(observed["body_excerpt"])
+    if not same_body:
+        new_risk = calculated_issue_risk(issue.repository, issue.labels_json, issue.title, excerpt)
+        approved_risk = max(
+            (issue.calculated_risk, finding.risk_class), key=lambda value: _RISK_RANK[value]
+        )
+        if _RISK_RANK[new_risk] > _RISK_RANK[approved_risk]:
+            raise IssueAmendBlocked(
+                "ISSUE_AMEND_RISK_ESCALATION",
+                f"the new text of {target} classifies as {new_risk}, above the approved "
+                f"{approved_risk}; re-import the backlog (/loop import {project} github-open "
+                f"...) and, for R3, /loop r3-candidate {project} {surface} {issue_number} "
+                f"and /loop approve-r3",
+            )
+    change = "BODY_CHANGED" if not same_body else "REVISION_TIME_CHANGED"
     short = issue.repository.removeprefix("gntik-ai/")
     if confirmation is None:
-        diff, truncated = diff_summary(approved_text, observed["body_excerpt"])
+        diff, truncated = diff_summary(approved_text, excerpt) if not same_body else ([], False)
         prefix = current_sha256[:12]
         return {
             **base,
-            "status": "PREVIEW",
+            "status": "PREVIEW" if not same_body else "REVISION_TIME_CHANGED",
+            "change": change,
             "diff": diff,
             "diff_truncated": truncated,
             "confirm_with": prefix,
@@ -359,15 +424,16 @@ def amend_issue(
         )
     if actor is None:
         raise IssueAmendBlocked("ISSUE_AMEND_OPERATOR_REQUIRED", "an operator identity is required")
-    excerpt = str(observed["body_excerpt"])
     value: dict[str, Any] = {
         "version": 1,
         "base_body_sha256": issue.body_sha256,
         "previous_body_sha256": approved_sha256,
+        "previous_updated_at": _utc(approved_at).isoformat(),
         "body_sha256": current_sha256,
-        "github_updated_at": observed["updated_at"].isoformat(),
+        "github_updated_at": current_at.isoformat(),
         "body_chars": int(observed["body_chars"]),
         "body_excerpt_sha256": hashlib.sha256(excerpt.encode()).hexdigest(),
+        "change": change,
         "amended_by": actor,
         "amended_at": current_time.isoformat(),
         "reason": AMEND_REASON,
@@ -399,11 +465,14 @@ def amend_issue(
         metadata_json={
             "amended_by": actor,
             "reason": AMEND_REASON,
+            "change": change,
             "repository": issue.repository,
             "finding_id": str(finding.id),
             "change_set_id": str(change_set.id) if change_set is not None else None,
             "previous_body_sha256": approved_sha256,
             "body_sha256": current_sha256,
+            "previous_updated_at": value["previous_updated_at"],
+            "github_updated_at": value["github_updated_at"],
             "base_body_sha256": issue.body_sha256,
             "binding_sha256": value["binding_sha256"],
         },
@@ -413,12 +482,71 @@ def amend_issue(
     return {
         **base,
         "status": "AMENDED",
+        "change": change,
         "amended_by": actor,
         "reason": AMEND_REASON,
         "previous_body_sha256": approved_sha256,
         "audit_event_id": event.id,
         "retry_workflow_id": retry_workflow_id(session, change_set),
+        "retry_key": value["binding_sha256"][:32],
     }
+
+
+def consumed_issue_revision(
+    change_set: ChangeSet, run: Run, issue: BacklogIssueRecord
+) -> tuple[str, datetime]:
+    """The issue revision the publishing delivery run actually loaded (and refreshed to).
+
+    delivery.load_confirmed_finding records it under the delivery-startup lock; a later
+    amendment never re-binds a run that started from the previous text. ChangeSets loaded
+    before this record existed keep the imported revision."""
+    recorded = (change_set.recovery_json or {}).get(ISSUE_BODY_REVISION_KEY)
+    if recorded is None:
+        return issue.body_sha256, issue.github_updated_at
+    if (
+        not isinstance(recorded, dict)
+        or recorded.get("run_id") != str(run.id)
+        or not isinstance(recorded.get("body_sha256"), str)
+        or not _SHA256.fullmatch(recorded["body_sha256"])
+        or not isinstance(recorded.get("updated_at"), str)
+    ):
+        raise ValueError("publication run did not load the approved issue revision")
+    return recorded["body_sha256"], datetime.fromisoformat(recorded["updated_at"])
+
+
+def record_consumed_issue_revision(
+    change_set: ChangeSet, run: Run, issue: BacklogIssueRecord
+) -> str:
+    """Bind this delivery run to the effective approved revision; return its body hash."""
+    body_sha256, updated_at = effective_issue_revision(issue)
+    recovery = dict(change_set.recovery_json or {})
+    recovery[ISSUE_BODY_REVISION_KEY] = {
+        "run_id": str(run.id),
+        "body_sha256": body_sha256,
+        "updated_at": _utc(updated_at).isoformat(),
+    }
+    change_set.recovery_json = recovery
+    return body_sha256
+
+
+def change_set_unstarted(change_set: ChangeSet) -> bool:
+    """A ChangeSet whose delivery stopped before producing anything.
+
+    A delivery blocked before its worktrees (e.g. ISSUE_BODY_CHANGED_SINCE_APPROVAL at the
+    issue-body refresh) leaves it CONFIRMED with no branch, head or PR."""
+    return (
+        change_set.state == "CONFIRMED"
+        and change_set.source_branch is None
+        and change_set.deployment_branch is None
+        and change_set.source_head_sha is None
+        and change_set.deployment_head_sha is None
+        and change_set.source_pr_url is None
+        and change_set.deployment_pr_url is None
+    )
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def retry_workflow_id(session: Session, change_set: ChangeSet | None) -> str | None:

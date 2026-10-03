@@ -24,6 +24,7 @@ from engineering_control.engineering.backlog_authority import (
     _current_backlog_approval,
     require_alternative_issue_authority,
 )
+from engineering_control.operations.issue_amend import change_set_unstarted
 from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
@@ -341,24 +342,6 @@ def _verify_ci_repair_child(
         raise ValueError("CI-repair child exceeds the approved repair bound")
 
 
-def _unstarted(change_set: ChangeSet) -> bool:
-    """NEW-115: a ChangeSet whose delivery stopped before producing anything.
-
-    A delivery blocked before its worktrees (e.g. ISSUE_BODY_CHANGED_SINCE_APPROVAL at the
-    issue-body refresh) leaves it CONFIRMED with no branch, head or PR; the operator's
-    retry child (same approval scope, still counted in the bounded lineage) may start it.
-    """
-    return (
-        change_set.state == "CONFIRMED"
-        and change_set.source_branch is None
-        and change_set.deployment_branch is None
-        and change_set.source_head_sha is None
-        and change_set.deployment_head_sha is None
-        and change_set.source_pr_url is None
-        and change_set.deployment_pr_url is None
-    )
-
-
 def _lineage_within_bounds(records: list[Step], request: ExistingBacklogLoopStart) -> bool:
     attempts = request.correction_limit + 1
     repairs = sum(1 for record in records if _claims_ci_repair(record.result_json))
@@ -411,10 +394,12 @@ def bind_change_set_issue_approval(
         repair = _claims_ci_repair(record.result_json)
         if repair:
             _verify_ci_repair_child(session, change_set, origin, record.result_json)
+        # NEW-115: an operator retry child (same approval scope, counted in the bounded
+        # lineage) may also start a ChangeSet whose delivery stopped before any work.
         if (
             change_set.state != "REQUEST_CHANGES"
             and not (repair and change_set.state in _CI_REPAIR_START_STATES)
-            and not (not repair and _unstarted(change_set))
+            and not (not repair and change_set_unstarted(change_set))
         ):
             raise ValueError("another delivery child requires an explicit correction state")
         children = [*children, reference]

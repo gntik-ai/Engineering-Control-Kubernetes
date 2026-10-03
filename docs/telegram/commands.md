@@ -804,8 +804,8 @@ Arguments:
   - sha-prefix · 12-64 hex · required: no · the preview's `confirm_with` · default: preview
   - retry · literal · required: no · only after a sha-prefix · default: -
 Backend:        POST /v1/issues/amend (body read by IssueAmendObservationWorkflow on the GitHub worker)
-Preconditions:  Telegram platform, allowlisted sender, canonical operator actor (else 403). Refused (409): R3 issues (use /loop r3-candidate + /loop approve-r3), no approved backlog delivery, delivered/closed issue, running delivery, empty body, changed title.
-Reply:          Preview: PREVIEW (approved/current sha256 and lengths, at most 60 redacted diff lines, confirm_with, telegram_command) or NO_CHANGE. Confirm: AMENDED after re-reading the body (another hash: ISSUE_AMEND_CONFIRMATION_MISMATCH); with retry, `retry` is the typed backlog retry's OperationView (same preflight as /loop retry) or RETRY_NOT_SENT.
+Preconditions:  Telegram platform, allowlisted sender, canonical operator actor (else 403). Refused (409): R3 issues (use /loop r3-candidate + /loop approve-r3), no approved backlog delivery, delivered/closed issue, running delivery or a ChangeSet that already produced work, a new text classified above the approved risk (ISSUE_AMEND_RISK_ESCALATION), empty body, changed title.
+Reply:          Preview: PREVIEW (approved/current sha256 and lengths, at most 60 redacted diff lines, confirm_with, telegram_command), REVISION_TIME_CHANGED (same text, newer GitHub revision; confirm it the same way) or NO_CHANGE (a confirm rerun with retry still sends the retry). A hook timeout replies OUTCOME_UNKNOWN: run the same command again to reconcile. Confirm: AMENDED after re-reading the body (another hash: ISSUE_AMEND_CONFIRMATION_MISMATCH); with retry, `retry` is the typed backlog retry's OperationView (same preflight as /loop retry) or RETRY_NOT_SENT.
 Side effects:   Confirm: the backlog record's approved-body amendment, imported excerpt and Finding text, one `issue_body_amended` audit event; retry: Temporal `retry` signal
 Related:        /loop retry, /loop r3-candidate, /loop approve-r3
 Example:        /loop amend falcone falcone 980 3f2a9c1d0b7e retry

@@ -84,6 +84,16 @@ async def _approved(tmp_path: Path):
     loaded = handler._load_confirmed_finding(child_payload)
     assert loaded["status"] == "CONFIRMED_LOADED"
     assert loaded["approved_issue_body_sha256"] == _sha(APPROVED)
+    # The delivery's refresh blocked (ISSUE_BODY_CHANGED_SINCE_APPROVAL) and the workflow
+    # released its leases with that context, which records the run as stopped.
+    released = handler._release_delivery_leases(
+        {
+            "run_id": loaded["run_id"],
+            "status": "BLOCKED",
+            "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+        }
+    )
+    assert released["status"] == "LEASES_RELEASED"
     return values
 
 
@@ -146,6 +156,11 @@ async def test_preview_then_confirm_rebinds_the_delivery_to_the_new_text(tmp_pat
         assert event.metadata_json["previous_body_sha256"] == _sha(APPROVED)
         assert event.metadata_json["body_sha256"] == _sha(EDITED)
 
+    # Amending again with the same text changes nothing.
+    again = await _amend(operations, observation, _sha(EDITED)[:12])
+    assert again["status"] == "NO_CHANGE"
+    with operations.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(DashboardEvent)) == 1
     # The operator's retry child (same approval scope) starts the CONFIRMED, unstarted
     # ChangeSet; its load carries the amended hash, so the refresh uses the new text.
     retry_payload = {**payload, "child_workflow_id": "backlog-fixture-parent-issue-1-retry-1"}
@@ -163,12 +178,10 @@ async def test_preview_then_confirm_rebinds_the_delivery_to_the_new_text(tmp_pat
     refreshed = await _refresh(tmp_path, EDITED, approved=reloaded["approved_issue_body_sha256"])
     assert refreshed["status"] == "ISSUE_BODY_REFRESHED"
     assert refreshed["body_excerpt"] == EDITED
+    # That delivery is now running: no further amendment until it stops.
+    with pytest.raises(IssueAmendBlocked, match="ISSUE_AMEND_DELIVERY_ACTIVE"):
+        await _amend(operations, observation, _sha(EDITED)[:12])
 
-    # Amending again with the same text changes nothing.
-    again = await _amend(operations, observation, _sha(EDITED)[:12])
-    assert again["status"] == "NO_CHANGE"
-    with operations.sessions() as session:
-        assert session.scalar(select(func.count()).select_from(DashboardEvent)) == 1
     _dispose(values)
 
 
@@ -653,34 +666,35 @@ async def test_a_retry_child_starts_only_an_unstarted_confirmed_change_set(
 
 
 @pytest.mark.asyncio
-async def test_publication_custody_accepts_only_the_amended_revision(tmp_path: Path) -> None:
+async def test_publication_custody_binds_the_revision_the_run_loaded(tmp_path: Path) -> None:
+    """An amendment landing after a run loaded never re-binds that run's publication."""
     from copy import deepcopy
 
     from publication_fixture import approved_publication
     from test_delivery_activity import FakePublicationRunner, enabled_write_policy
 
-    from engineering_control.db.models import ComponentLease
-    from engineering_control.operations.issue_amend import amend_issue
+    from engineering_control.operations import issue_amend
 
     project_root, policy = enabled_write_policy(tmp_path, ("gntik-ai/falcone",))
     async with approved_publication(tmp_path, deployment_changed=False) as fixture:
-        observation = await _refresh(tmp_path, EDITED, updated="2026-10-03T11:00:00Z")
         with fixture.metadata.sessions.begin() as session:
-            leases = session.scalars(select(ComponentLease)).all()
-            for lease in leases:
-                lease.released_at = datetime.now(UTC)
-            amended = amend_issue(
-                session,
-                project="falcone",
-                repository="falcone",
-                issue_number=42,
-                observation=observation,
-                confirmation=_sha(EDITED)[:12],
-                actor="cli:engineering-ctl",
-            )
-            assert amended["status"] == "AMENDED"
-            for lease in leases:
-                lease.released_at = None
+            issue = session.scalar(select(BacklogIssueRecord))
+            change_set = session.scalar(select(ChangeSet))
+            recorded = change_set.recovery_json[issue_amend.ISSUE_BODY_REVISION_KEY]
+            assert recorded["body_sha256"] == issue.body_sha256
+            # Forge the interleaving the guard prevents: an amendment to EDITED lands
+            # after this run loaded the previous text.
+            value = {
+                "version": 1,
+                "base_body_sha256": issue.body_sha256,
+                "body_sha256": _sha(EDITED),
+                "github_updated_at": "2026-10-03T11:00:00+00:00",
+            }
+            value["binding_sha256"] = issue_amend._amendment_binding(issue, value)
+            issue.github_snapshot_json = {
+                **issue.github_snapshot_json,
+                issue_amend.AMENDMENT_KEY: value,
+            }
         settings = Settings(
             _env_file=None,
             worktree_root=tmp_path / "worktrees",
@@ -689,16 +703,212 @@ async def test_publication_custody_accepts_only_the_amended_revision(tmp_path: P
             project_config_root=project_root,
             github_issue_write_validation_file=policy,
         )
-        stale = FakePublicationRunner(
-            fixture.branch, fixture.heads, issue_snapshot=fixture.issue_snapshot
-        )
-        with fixture.worker(stale, settings) as handler:
+        edited = {**fixture.issue_snapshot, "body": EDITED, "updatedAt": "2026-10-03T11:00:00Z"}
+        laundering = FakePublicationRunner(fixture.branch, fixture.heads, issue_snapshot=edited)
+        with fixture.worker(laundering, settings) as handler:
             refused = await handler.handle("delivery.publish", deepcopy(fixture.prepared))
         assert refused["status"] == "BLOCKED"
-        assert stale.pushes == []
-        current = {**fixture.issue_snapshot, "body": EDITED, "updatedAt": "2026-10-03T11:00:00Z"}
-        runner = FakePublicationRunner(fixture.branch, fixture.heads, issue_snapshot=current)
-        with fixture.worker(runner, settings) as handler:
+        assert laundering.pushes == []
+        loaded_text = FakePublicationRunner(
+            fixture.branch, fixture.heads, issue_snapshot=fixture.issue_snapshot
+        )
+        with fixture.worker(loaded_text, settings) as handler:
             result = await handler.handle("delivery.publish", deepcopy(fixture.prepared))
         assert result["status"] == "SOURCE_PRS_CREATED", result.get("blocker")
-        assert runner.pushes == ["falcone"]
+        assert loaded_text.pushes == ["falcone"]
+
+
+@pytest.mark.asyncio
+async def test_amend_and_delivery_startup_interleave_safely(tmp_path: Path) -> None:
+    """A running delivery refuses the amendment; once it stopped, the next load records
+    the amended revision as the one it consumes."""
+    values = await _child(tmp_path, issue_body=APPROVED)
+    operations, _metadata, engineering, handler, payload, _registered, child_payload = values
+    loaded = handler._load_confirmed_finding(child_payload)
+    observation = await _refresh(tmp_path, EDITED)
+    # 1. Loaded (RUNNING, between load and refresh): refused, nothing recorded.
+    with pytest.raises(IssueAmendBlocked, match="ISSUE_AMEND_DELIVERY_ACTIVE"):
+        await _amend(operations, observation, _sha(EDITED)[:12])
+    # 2. Any other release (not the body-change stop) does not mark the run stopped.
+    handler._release_delivery_leases({"run_id": loaded["run_id"], "blocker": "OTHER"})
+    with pytest.raises(IssueAmendBlocked, match="ISSUE_AMEND_DELIVERY_ACTIVE"):
+        await _amend(operations, observation, _sha(EDITED)[:12])
+    # 3. The refresh blocked on the edit: the amendment is accepted.
+    handler._release_delivery_leases(
+        {"run_id": loaded["run_id"], "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL"}
+    )
+    assert (await _amend(operations, observation, _sha(EDITED)[:12]))["status"] == "AMENDED"
+    # 4. The next run loads after the amendment and is bound to the amended revision.
+    retry_payload = {**payload, "child_workflow_id": "backlog-fixture-parent-issue-1-retry-1"}
+    retry = engineering._register_backlog_child_run(retry_payload)
+    reloaded = handler._load_confirmed_finding(
+        {
+            **child_payload,
+            "issue_approval_id": retry["issue_approval_id"],
+            "orchestration": {"workflow_id": retry_payload["child_workflow_id"]},
+        }
+    )
+    with operations.sessions() as session:
+        recorded = session.scalar(select(ChangeSet)).recovery_json["issue_body_revision"]
+    assert recorded == {
+        "run_id": reloaded["run_id"],
+        "body_sha256": _sha(EDITED),
+        "updated_at": "2026-10-03T10:00:00+00:00",
+    }
+    # 5. A ChangeSet that produced work is never amended.
+    handler._release_delivery_leases(
+        {"run_id": reloaded["run_id"], "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL"}
+    )
+    with operations.sessions.begin() as session:
+        session.scalar(select(ChangeSet)).state = "PLANNED"
+    with pytest.raises(IssueAmendBlocked, match="already produced work"):
+        await _amend(operations, await _refresh(tmp_path, EDITED + "\nx"), None)
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "addendum",
+    [
+        "Run a data migration that drops the legacy tenant table.",
+        "This is destructive: delete every workspace.",
+        "Rotate the credential rotation keys in production.",
+    ],
+)
+async def test_amendment_raising_the_import_risk_class_is_refused(
+    tmp_path: Path, addendum: str
+) -> None:
+    values = await _approved(tmp_path)
+    operations = values[0]
+    escalated = await _refresh(tmp_path, APPROVED + "\n\n## Addendum\n" + addendum)
+    for confirm in (None, _sha(APPROVED + "\n\n## Addendum\n" + addendum)[:12]):
+        with pytest.raises(IssueAmendBlocked) as raised:
+            await _amend(operations, escalated, confirm)
+        assert raised.value.blocker == "ISSUE_AMEND_RISK_ESCALATION"
+        assert "R3" in raised.value.detail and "approve-r3" in raised.value.detail
+    with operations.sessions() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert AMENDMENT_KEY not in issue.github_snapshot_json
+        assert session.get(Finding, issue.finding_id).risk_class == "R1"
+    # A lower class never lowers the approved one.
+    lowered = await _refresh(tmp_path, "Docs typo only.")
+    amended = await _amend(operations, lowered, _sha("Docs typo only.")[:12])
+    assert amended["status"] == "AMENDED" and amended["risk_class"] == "R1"
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_restored_body_with_a_new_revision_time_is_re_amended(tmp_path: Path) -> None:
+    values = await _approved(tmp_path)
+    operations = values[0]
+    first = await _refresh(tmp_path, EDITED, updated="2026-10-03T10:00:00Z")
+    await _amend(operations, first, _sha(EDITED)[:12])
+    # Edited away and restored: same hash, newer GitHub revision time.
+    restored = await _refresh(tmp_path, EDITED, updated="2026-10-03T12:00:00Z")
+    preview = await _amend(operations, restored, None)
+    assert preview["status"] == "REVISION_TIME_CHANGED"
+    assert preview["approved_body_sha256"] == preview["current_body_sha256"]
+    assert preview["diff"] == []
+    confirmed = await _amend(operations, restored, preview["confirm_with"])
+    assert confirmed["status"] == "AMENDED" and confirmed["change"] == "REVISION_TIME_CHANGED"
+    with operations.sessions() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert effective_issue_revision(issue) == (
+            _sha(EDITED),
+            datetime(2026, 10, 3, 12, tzinfo=UTC),
+        )
+        events = session.scalars(select(DashboardEvent).order_by(DashboardEvent.id)).all()
+        assert [event.metadata_json["change"] for event in events] == [
+            "BODY_CHANGED",
+            "REVISION_TIME_CHANGED",
+        ]
+    assert (await _amend(operations, restored, None))["status"] == "NO_CHANGE"
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_rerun_after_unknown_outcome_reconciles_and_still_retries(tmp_path: Path) -> None:
+    values = await _approved(tmp_path)
+    operations = values[0]
+    observation = await _refresh(tmp_path, EDITED)
+    service = Mock()
+    service.observe_issue_body = AsyncMock(return_value=observation)
+    bus = Mock()
+    bus.dispatch_pending = AsyncMock(return_value=False)
+    # The first confirm commits, then the retry submission fails (as if the caller had
+    # given up): the amendment and its audit event are already recorded.
+    bus.submit = AsyncMock(side_effect=ValueError("operation store unavailable"))
+    body = {
+        "project": "falcone",
+        "repository": "falcone",
+        "issue_number": 42,
+        "confirm": _sha(EDITED)[:12],
+        "retry": True,
+    }
+    with _api(service, operations, bus) as client:
+        first = client.post("/v1/issues/amend", headers=_headers("telegram:42"), json=body).json()
+        assert first["status"] == "AMENDED"
+        assert first["retry"]["status"] == "RETRY_NOT_SENT"
+        with operations.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(DashboardEvent)) == 1
+        view = Mock()
+        view.model_dump = Mock(return_value={"action": "retry", "status": "COMPLETED"})
+        bus.submit = AsyncMock(return_value=view)
+        again = client.post("/v1/issues/amend", headers=_headers("telegram:42"), json=body)
+        no_retry = client.post(
+            "/v1/issues/amend",
+            headers=_headers("telegram:42"),
+            json={**body, "retry": False},
+        ).json()
+    rerun = again.json()
+    assert rerun["status"] == "NO_CHANGE"
+    assert rerun["retry"] == {"action": "retry", "status": "COMPLETED"}
+    command = bus.submit.await_args.args[0]
+    assert (command.action, command.workflow_id, command.issue_number) == (
+        "retry",
+        "backlog-fixture-parent",
+        42,
+    )
+    assert bus.submit.await_args.kwargs["source_channel"] == "telegram"
+    assert no_retry["status"] == "NO_CHANGE" and "retry" not in no_retry
+    assert bus.submit.await_count == 1
+    with operations.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(DashboardEvent)) == 1
+    _dispose(values)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("timed out"),
+        "url-timeout",
+    ],
+)
+def test_telegram_amend_timeout_reports_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch, error: Any
+) -> None:
+    import urllib.error
+
+    handler = load_handler()
+    monkeypatch.setattr(handler, "_authorized", lambda _user_id: True)
+    monkeypatch.setattr(handler, "_record_acceptance", lambda *_args: None)
+    monkeypatch.setattr(handler, "_private_api_url", lambda: None)
+    monkeypatch.setattr(handler, "_read_protected", lambda _path: "t" * 40)
+    raised = urllib.error.URLError(TimeoutError("timed out")) if error == "url-timeout" else error
+
+    def urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        raise raised
+
+    monkeypatch.setattr(handler.urllib.request, "urlopen", urlopen)
+    result = handler.handle(
+        "command:loop",
+        {
+            "platform": "telegram",
+            "user_id": "42",
+            "raw_args": f"amend falcone falcone 42 {'a' * 12} retry",
+        },
+    )
+    assert result is not None and result["decision"] == "handled"
+    assert "OUTCOME_UNKNOWN" in result["message"]
+    assert "run the same /loop amend command again to reconcile" in result["message"]
+    assert "rejected" not in result["message"] and "failed" not in result["message"].lower()
