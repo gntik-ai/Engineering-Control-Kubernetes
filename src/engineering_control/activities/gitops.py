@@ -313,7 +313,32 @@ def _normalize_repo_url(value: str) -> str:
 
 # NEW-116: SCOPE_INHERITED is a completed Hermes full-sync request that Argo CD ran with a
 # previous operation's selective scope (resources, syncOptions, strategy or revision).
-SYNC_FAILURE_CLASSES = ("PATCH_CONFLICT", "JOB_IMMUTABLE", "TRANSIENT", "SCOPE_INHERITED", "OTHER")
+# NEW-118: PRUNE_REQUIRED is a resource Argo CD marks requiresPruning (a delivered change
+# removed it; Hermes syncs with prune=false). Hermes never prunes: it escalates at once.
+SYNC_FAILURE_CLASSES = (
+    "PATCH_CONFLICT",
+    "JOB_IMMUTABLE",
+    "TRANSIENT",
+    "SCOPE_INHERITED",
+    "PRUNE_REQUIRED",
+    "OTHER",
+)
+# NEW-118: kinds an operator may usually delete once verified unused. Informational only:
+# the escalation issue offers the delete command for these, never runs it.
+SAFE_PRUNE_KINDS = frozenset(
+    {
+        ("", "ConfigMap"),
+        ("", "Service"),
+        ("", "ServiceAccount"),
+        ("rbac.authorization.k8s.io", "Role"),
+        ("rbac.authorization.k8s.io", "RoleBinding"),
+        ("networking.k8s.io", "NetworkPolicy"),
+        ("batch", "Job"),
+        ("apps", "Deployment"),
+    }
+)
+_KIND = re.compile(r"[A-Z][A-Za-z0-9]{0,62}")
+_GROUP = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 MAXIMUM_SYNC_REMEDIATION_ROUNDS = 3
 MAXIMUM_TRANSIENT_RESYNCS = 3
 MAXIMUM_REMEDIATED_RESOURCES = 10
@@ -440,7 +465,7 @@ def classify_degraded(reasons: Iterable[str]) -> str:
 def overall_failure_class(classes: Iterable[str]) -> str:
     """OTHER dominates: a partial repair never makes the sync succeed."""
     seen = set(classes)
-    for value in ("OTHER", "PATCH_CONFLICT", "JOB_IMMUTABLE", "TRANSIENT"):
+    for value in ("OTHER", "PATCH_CONFLICT", "JOB_IMMUTABLE", "PRUNE_REQUIRED", "TRANSIENT"):
         if value in seen:
             return value
     return "OTHER"
@@ -734,29 +759,79 @@ class GitOpsControllerHandler:
             str(orchestration.get("workflow_id", "")) if isinstance(orchestration, dict) else ""
         )
         with self.sessions.begin() as session:
-            change_set = session.get(db.ChangeSet, plan.change_set_id)
+            # NEW-118 review 3: lock the row so concurrent persists serialize the
+            # read-modify-write of recovery_json and the write-once ``source_merge``.
+            change_set = session.get(db.ChangeSet, plan.change_set_id, with_for_update=True)
             if change_set is None or change_set.project != plan.project:
                 raise ValueError("staging GitOps ChangeSet binding is missing")
             recovery = dict(change_set.recovery_json or {})
-            recovery["staging_gitops"] = record
+            # A replayed plan for a source PR the ChangeSet no longer binds (rebinding to
+            # a new PR) neither creates nor restores a merge record.
+            bound_url = change_set.source_pr_url
+            plan_bound = bool(bound_url) and plan.source_pr_url == bound_url
+            # A plan for a different source PR than the one bound now is stale: it never
+            # moves the heads, the state or the current staging record.
+            stale = bool(bound_url) and plan.source_pr_url != bound_url
+            record["source_pr_url"] = plan.source_pr_url
+            # NEW-118 review: a merged source PR stays merged. The first recorded merge is
+            # durable (``source_merge``, bound to the source PR) and a later recheck that
+            # stops before the merge step (e.g. deployment CI) never nulls it out.
+            previous = recovery.get("staging_gitops")
+            previous_sha = (
+                previous.get("merge_sha")
+                if isinstance(previous, dict)
+                and previous.get("source_pr_url", plan.source_pr_url) == plan.source_pr_url
+                else None
+            )
+            durable = recovery.get("source_merge")
+            # Write-once per source PR: a record for a previously bound PR is replaced
+            # when the PR bound now merges.
+            if plan_bound and not (
+                isinstance(durable, dict)
+                and _SHA.fullmatch(str(durable.get("merge_sha")))
+                and durable.get("source_pr_url") == bound_url
+            ):
+                first_sha = merge_sha if merge_sha is not None else previous_sha
+                if first_sha is not None and _SHA.fullmatch(str(first_sha)):
+                    durable = {
+                        "merge_sha": str(first_sha),
+                        "source_pr_url": plan.source_pr_url,
+                        "source_head_sha": plan.source_head_sha,
+                        "recorded_at": record["recorded_at"],
+                    }
+                    recovery["source_merge"] = durable
+            if (
+                record["merge_sha"] is None
+                and plan_bound
+                and isinstance(durable, dict)
+                and durable.get("source_pr_url") == bound_url
+            ):
+                record["merge_sha"] = durable.get("merge_sha")
+            if not stale:
+                recovery["staging_gitops"] = record
             change_set.recovery_json = recovery
-            if merge_sha is not None:
+            if merge_sha is not None and not stale:
                 # NEW-102: the merged PR heads are what was delivered; a stale write (e.g. a
                 # repair's unpublished local head) never survives on a merged ChangeSet.
                 change_set.source_head_sha = plan.source_head_sha
                 if plan.deployment_pr_number is not None and plan.deployment_head_sha:
                     change_set.deployment_head_sha = plan.deployment_head_sha
-            if outcome == "STAGING_VERIFIED":
+            if not stale and outcome == "STAGING_VERIFIED":
                 change_set.state = ChangeSetState.RUNTIME_VERIFIED.value
-            elif merge_sha is not None and change_set.state in {
-                ChangeSetState.SOURCE_PR.value,
-                ChangeSetState.CI_VALIDATED.value,
-                # NEW-102: a late repair write may have reset the state after prepare;
-                # the merge is what happened, so the ChangeSet is SOURCE_MERGED.
-                ChangeSetState.PLANNED.value,
-                ChangeSetState.IMPLEMENTING.value,
-                ChangeSetState.REQUEST_CHANGES.value,
-            }:
+            elif (
+                not stale
+                and merge_sha is not None
+                and change_set.state
+                in {
+                    ChangeSetState.SOURCE_PR.value,
+                    ChangeSetState.CI_VALIDATED.value,
+                    # NEW-102: a late repair write may have reset the state after prepare;
+                    # the merge is what happened, so the ChangeSet is SOURCE_MERGED.
+                    ChangeSetState.PLANNED.value,
+                    ChangeSetState.IMPLEMENTING.value,
+                    ChangeSetState.REQUEST_CHANGES.value,
+                }
+            ):
                 change_set.state = ChangeSetState.SOURCE_MERGED.value
             change_set.version += 1
             if workflow_id:
@@ -1184,6 +1259,20 @@ class GitOpsControllerHandler:
                     "operation_started_at": started[:80],
                     **observed,
                 }
+        if (
+            payload.get("selective") is not True
+            and phase == "Succeeded"
+            and sync != "Synced"
+            and self._only_prune_drift(application)
+        ):
+            # NEW-118: the sync applied everything; only resources Argo CD would prune
+            # remain OutOfSync, which no amount of waiting fixes (falcone-charts #45).
+            return {
+                "status": "SYNC_PRUNE_REQUIRED",
+                "blocker": "ARGO_PRUNE_REQUIRED",
+                "operation_started_at": started[:80],
+                **observed,
+            }
         if phase in {"Failed", "Error"}:
             return {
                 "status": "SYNC_FAILED",
@@ -1205,6 +1294,17 @@ class GitOpsControllerHandler:
             )
             return {"status": "SYNCED", "argo_revision": revision[:400], **observed}
         return {"status": "SYNC_PENDING", **observed}
+
+    @staticmethod
+    def _only_prune_drift(application: dict[str, Any]) -> bool:
+        """Some managed resource is OutOfSync and every OutOfSync one requires pruning."""
+        resources = _nested(application, "status", "resources")
+        drifting = [
+            item
+            for item in (resources if isinstance(resources, list) else [])
+            if isinstance(item, dict) and item.get("status") not in {None, "Synced"}
+        ]
+        return bool(drifting) and all(item.get("requiresPruning") is True for item in drifting)
 
     # -- NEW-113: sync failure diagnosis, remediation and notification --------------------
 
@@ -1364,6 +1464,29 @@ class GitOpsControllerHandler:
                 out_of_sync.append(
                     {**resource_identity(item), "status": str(item.get("status"))[:40]}
                 )
+        # NEW-118: resources Argo CD would prune (Hermes syncs with prune=false and never
+        # prunes); each is the operator's, with its Argo CD tracking id for verification.
+        prune_required: list[dict[str, Any]] = []
+        prune_required_total = 0
+        for item in managed_items:
+            if not isinstance(item, dict) or item.get("requiresPruning") is not True:
+                continue
+            identity = resource_identity(item)
+            classes.append("PRUNE_REQUIRED")
+            prune_required_total += 1
+            if len(prune_required) < MAXIMUM_DIAGNOSED_RESOURCES:
+                prune_required.append(
+                    {
+                        **identity,
+                        "status": str(item.get("status") or "")[:40],
+                        "tracking_id": (
+                            f"{flow.argo_application}:{identity['group']}/{identity['kind']}:"
+                            f"{identity['namespace']}/{identity['name']}"
+                        )[:700],
+                        "safe_kind": (identity["group"], identity["kind"]) in SAFE_PRUNE_KINDS,
+                        "in_flow_namespaces": identity["namespace"] in flow.namespaces,
+                    }
+                )
         operation_sync = _nested(operation_state, "operation", "sync")
         operation_sync = operation_sync if isinstance(operation_sync, dict) else {}
         scoped = operation_sync.get("resources")
@@ -1394,6 +1517,8 @@ class GitOpsControllerHandler:
             "degraded_resources_total": degraded_total,
             "out_of_sync_resources": out_of_sync,
             "out_of_sync_resources_total": out_of_sync_total,
+            "prune_required_resources": prune_required,
+            "prune_required_resources_total": prune_required_total,
             "operation_scope": operation_scope,
             "classes": sorted(set(classes)),
             "failure_class": overall_failure_class(classes),
@@ -1670,12 +1795,15 @@ class GitOpsControllerHandler:
         diagnosis = payload.get("diagnosis")
         diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
         resources: list[str] = []
-        for key in ("failed_resources", "degraded_resources"):
+        for key in ("failed_resources", "degraded_resources", "prune_required_resources"):
             entries = diagnosis.get(key)
             for entry in entries if isinstance(entries, list) else []:
                 if isinstance(entry, dict) and len(resources) < 10:
                     identity = resource_identity(entry)
-                    entry_class = str(entry.get("failure_class") or "OTHER")[:20]
+                    entry_class = str(
+                        entry.get("failure_class")
+                        or ("PRUNE_REQUIRED" if key == "prune_required_resources" else "OTHER")
+                    )[:20]
                     resources.append(
                         f"{identity['kind']}/{identity['namespace']}/{identity['name']}"[:200]
                         + f" {entry_class}"
@@ -1694,6 +1822,8 @@ class GitOpsControllerHandler:
             outcome = (
                 "did not become Synced and Healthy in time"
                 if blocker == "ARGO_SYNC_TIMEOUT"
+                else "left resources that require pruning"
+                if blocker == "ARGO_PRUNE_REQUIRED"
                 else "failed"
             )
             message = (
@@ -2546,7 +2676,7 @@ class GitOpsGitHubHandler:
         if failure_class not in SYNC_FAILURE_CLASSES:
             return {"status": "BLOCKED", "blocker": "ENVIRONMENT_ISSUE_CLASS_INVALID"}
         blocker = str(payload.get("blocker") or "")
-        if blocker not in {"ARGO_SYNC_FAILED", "ARGO_SYNC_TIMEOUT"}:
+        if blocker not in {"ARGO_SYNC_FAILED", "ARGO_SYNC_TIMEOUT", "ARGO_PRUNE_REQUIRED"}:
             blocker = "ARGO_SYNC_FAILED"
         diagnosis = payload.get("diagnosis")
         attempts = payload.get("attempts")
@@ -2884,6 +3014,47 @@ def _sync_attempts(value: Any) -> list[dict[str, Any]]:
 _RENDER_REDACTOR = SecretRedactor()
 
 
+def _render_prune_required(items: list[dict[str, Any]]) -> list[str]:
+    """NEW-118: per resource, its identity, read-only verification and operator guidance.
+
+    Commands are built only from validated Kubernetes identifiers; anything else gets no
+    command at all. Hermes runs none of them.
+    """
+    lines: list[str] = []
+    for item in items:
+        identity = resource_identity(item)
+        kind, group = identity["kind"], identity["group"]
+        namespace, name = identity["namespace"], identity["name"]
+        lines.append(
+            f"- {_code(kind, 63)} {_code(namespace, 63)}/{_code(name, 120)} "
+            f"(Argo CD tracking id {_code(item.get('tracking_id'), 400)}); safe-kind "
+            f"allowlist: {'yes' if item.get('safe_kind') is True else 'no'} (informational)"
+        )
+        valid = (
+            _KIND.fullmatch(kind)
+            and (group == "" or _GROUP.fullmatch(group))
+            and _KUBERNETES_NAME.fullmatch(namespace)
+            and _KUBERNETES_NAME.fullmatch(name)
+        )
+        if not valid:
+            lines.append("  - requires manual review; do not delete blindly.")
+            continue
+        resource = f"{kind.lower()}.{group}" if group else kind.lower()
+        lines.append(
+            f"  - verify (read-only): `kubectl -n {namespace} get {resource}/{name} -o yaml` "
+            f"and `kubectl -n {namespace} get deployments,statefulsets,daemonsets,jobs,"
+            f"cronjobs,pods -o yaml | grep -n -F -- '{name}'`"
+        )
+        if item.get("safe_kind") is True and (group, kind) in SAFE_PRUNE_KINDS:
+            lines.append(
+                "  - prune (run only after verifying it is unused): "
+                f"`kubectl -n {namespace} delete {resource}/{name}`"
+            )
+        else:
+            lines.append("  - requires manual review; do not delete blindly.")
+    return lines
+
+
 def _code(value: Any, limit: int) -> str:
     """Inline-code-safe, single-line, bounded text for an issue body.
 
@@ -2939,6 +3110,11 @@ def render_sync_failure(
         f"{_code(item.get('name'), 120)} status={_code(item.get('status'), 40)}"
         for item in entries("out_of_sync_resources")
     ]
+    prune_required = _render_prune_required(entries("prune_required_resources"))
+    prune_total = diagnosis.get("prune_required_resources_total")
+    listed = len(entries("prune_required_resources"))
+    if isinstance(prune_total, int) and prune_total > listed:
+        prune_required.append(f"- ... and {prune_total - listed} more")
     out_of_sync_total = diagnosis.get("out_of_sync_resources_total")
     if isinstance(out_of_sync_total, int) and out_of_sync_total > len(out_of_sync):
         out_of_sync.append(f"- ... and {out_of_sync_total - len(out_of_sync)} more")
@@ -2986,8 +3162,9 @@ def render_sync_failure(
         "Bounded remediation: a patch-incompatible change is re-synced once per resource with "
         "`Replace=true`, an immutable Job once with `Replace=true,Force=true`, and transient "
         "API errors are re-synced at most 3 times, and a full sync that ran with an inherited "
-        "selective scope is re-synced once as a true full sync; nothing is pruned. Everything "
-        "else needs the operator. No secret values are included in this report.",
+        "selective scope is re-synced once as a true full sync; nothing is ever pruned or "
+        "deleted by Hermes. Everything else needs the operator. No secret values are "
+        "included in this report.",
         "",
         "### Failed resources",
         *(failed or ["- none"]),
@@ -2997,6 +3174,18 @@ def render_sync_failure(
         "",
         "### OutOfSync resources",
         *(out_of_sync or ["- none"]),
+        "",
+        "### Requires prune",
+        *(
+            [
+                "Argo CD would prune these resources (the delivered change removed them); "
+                "Hermes never prunes or deletes. Verify each one is unused before acting.",
+                "",
+                *prune_required,
+            ]
+            if prune_required
+            else ["- none"]
+        ),
     ]
     # gh comments are bounded to 12,000 bytes including the marker.
     return "\n".join(lines).encode()[:11_000].decode(errors="ignore")

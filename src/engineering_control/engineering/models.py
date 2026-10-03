@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -259,6 +260,38 @@ class ToolchainPolicy(EngineeringModel):
         return self
 
 
+_PIN_FILE = r"^[A-Za-z0-9_.-][A-Za-z0-9_./-]{0,239}$"
+
+
+class DeploymentPinPolicy(EngineeringModel):
+    """NEW-118: the source repository's CI pin of the deployment repository's commit.
+
+    Each file holds exactly ``occurrences`` lines ``<variable>: '<40-hex sha>'``; Hermes
+    sets them to the deployment worktree HEAD after the deployment maker (pin
+    convergence), so the source CI tests against the paired deployment change.
+    """
+
+    files: tuple[str, ...] = Field(min_length=1, max_length=10)
+    variable: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,63}$")
+    occurrences: int = Field(default=1, ge=1, le=5)
+
+    @field_validator("files")
+    @classmethod
+    def bounded_relative_files(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("deployment pin files must be unique")
+        for value in values:
+            parts = value.split("/")
+            if (
+                not re.fullmatch(_PIN_FILE, value)
+                or value.startswith("/")
+                or any(part in {"", ".", ".."} for part in parts)
+                or parts[0] == ".git"
+            ):
+                raise ValueError("deployment pin files must be bounded repository-relative paths")
+        return values
+
+
 class ProjectManifest(EngineeringModel):
     schema_version: Literal[1]
     project: Literal["falcone", "musematic", "llmwiki"]
@@ -271,6 +304,16 @@ class ProjectManifest(EngineeringModel):
     dependencies: dict[str, object] = Field(default_factory=dict)
     classification: dict[str, bool] = Field(default_factory=dict)
     toolchain: ToolchainPolicy | None = None
+    # NEW-118: paired source/deployment repositories only (see DeploymentPinPolicy).
+    deployment_pin: DeploymentPinPolicy | None = None
+
+    @model_validator(mode="after")
+    def deployment_pin_requires_a_pair(self) -> ProjectManifest:
+        if self.deployment_pin is not None and str(self.repositories.source.full_name) == str(
+            self.repositories.deployment.full_name
+        ):
+            raise ValueError("a deployment pin requires separate source and deployment repos")
+        return self
 
     @field_validator("delivery_control")
     @classmethod

@@ -3368,3 +3368,322 @@ async def test_new_116_escalation_lists_out_of_sync_resources(tmp_path: Path) ->
     assert "executor" not in section
     assert "Last operation scope: selective (1 resource(s))" in body
     assert "`SCOPE_INHERITED`" in body and "`full_resync`" in body
+
+
+# -- NEW-118: resources Argo CD would prune are detected and escalated, never pruned ----
+
+PRUNE_AT = "2026-10-03T12:00:00Z"
+KEYCLOAK_CONFIG = {
+    "group": "",
+    "kind": "ConfigMap",
+    "namespace": "musematic-platform",
+    "name": "falcone-keycloak-config",
+}
+
+
+def _prunable(kind: str, name: str, *, group: str = "", namespace: str = "musematic-platform"):
+    return {
+        "group": group,
+        "version": "v1",
+        "kind": kind,
+        "namespace": namespace,
+        "name": name,
+        "status": "OutOfSync",
+        "requiresPruning": True,
+    }
+
+
+def _prune_application(*extra: dict[str, Any]) -> dict[str, Any]:
+    """falcone-charts #45: the full sync applied, only the removed ConfigMap is left."""
+    return _application(
+        operationState={
+            "phase": "Succeeded",
+            "startedAt": PRUNE_AT,
+            "operation": {
+                "initiatedBy": {"username": "hermes-engineering"},
+                "sync": {"prune": False, "syncStrategy": {"hook": {}}},
+            },
+            "syncResult": {"resources": [], "revisions": [OLD_CHART_REVISION, "e" * 40]},
+        },
+        sync={"status": "OutOfSync"},
+        resources=[
+            {**_managed("Deployment", "web"), "status": "Synced"},
+            _prunable("ConfigMap", "falcone-keycloak-config"),
+            *extra,
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_118_sync_status_reports_drift_that_only_pruning_fixes(tmp_path: Path) -> None:
+    kubectl = FakeKubectl(application=_prune_application())
+    handler = _controller(tmp_path, kubectl)
+    payload = {**_plan_payload(), "previous_operation_started_at": "2026-10-03T11:00:00Z"}
+    result = await handler.handle("gitops.sync_status", payload)
+    assert result["status"] == "SYNC_PRUNE_REQUIRED"
+    assert (result["blocker"], result["operation_started_at"]) == ("ARGO_PRUNE_REQUIRED", PRUNE_AT)
+    # Other drift still waits for the sync to settle (or time out) as before.
+    kubectl.application = _prune_application(_managed("Deployment", "api"))
+    assert (await handler.handle("gitops.sync_status", payload))["status"] == "SYNC_PENDING"
+    # Detection is read-only: no write of any kind reached the cluster.
+    assert {call[2] for call in kubectl.calls if call[0] == "--namespace"} == {"get"}
+
+
+@pytest.mark.asyncio
+async def test_new_118_diagnosis_lists_every_prune_resource_with_its_tracking_id(
+    tmp_path: Path,
+) -> None:
+    kubectl = FakeKubectl(application=_prune_application(_prunable("Secret", "old-credentials")))
+    diagnosed = await _controller(tmp_path, kubectl).handle(
+        "gitops.diagnose_sync", {"plan": _plan()}
+    )
+    assert diagnosed["failure_class"] == "PRUNE_REQUIRED"
+    diagnosis = diagnosed["diagnosis"]
+    assert diagnosis["prune_required_resources_total"] == 2
+    assert diagnosis["prune_required_resources"] == [
+        {
+            **KEYCLOAK_CONFIG,
+            "status": "OutOfSync",
+            "tracking_id": "musematic-platform:/ConfigMap:musematic-platform/"
+            "falcone-keycloak-config",
+            "safe_kind": True,
+            "in_flow_namespaces": True,
+        },
+        {
+            **KEYCLOAK_CONFIG,
+            "kind": "Secret",
+            "name": "old-credentials",
+            "status": "OutOfSync",
+            "tracking_id": "musematic-platform:/Secret:musematic-platform/old-credentials",
+            "safe_kind": False,
+            "in_flow_namespaces": True,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_118_hermes_has_no_prune_remediation(tmp_path: Path) -> None:
+    from engineering_control.activities.gitops import SYNC_REMEDIATION_ACTIONS
+
+    assert not any("prune" in action for action in SYNC_REMEDIATION_ACTIONS)
+    kubectl = FakeKubectl(application=_prune_application())
+    handler = _controller(tmp_path, kubectl)
+    for action in ("prune_removed", "prune_full_sync", "prune"):
+        refused = await handler.handle(
+            "gitops.remediate_sync",
+            {
+                "plan": _plan(),
+                "merge_sha": MERGE_SHA,
+                "action": action,
+                "round": 1,
+                "remediation_id": f"wf-1:round-1:{action}",
+                "resources": [KEYCLOAK_CONFIG],
+            },
+        )
+        assert refused == {"status": "BLOCKED", "blocker": "ARGO_REMEDIATION_ACTION_INVALID"}
+    # Even a full sync Hermes writes keeps prune=false.
+    await handler.handle("gitops.trigger_sync", _plan_payload())
+    assert all(
+        operation["value"]["sync"]["prune"] is False
+        for patch in _operation_patches(kubectl)
+        for operation in patch
+        if operation["path"] == "/operation"
+    )
+    assert not any(call[2] == "delete" for call in kubectl.calls if call[0] == "--namespace")
+
+
+@pytest.mark.asyncio
+async def test_new_118_escalation_issue_gives_verification_and_operator_commands(
+    tmp_path: Path,
+) -> None:
+    kubectl = FakeKubectl(
+        application=_prune_application(
+            _prunable("Secret", "old-credentials"),
+            _prunable("StatefulSet", "old-db", group="apps"),
+            _prunable("Weird", "Bad_Name"),
+        )
+    )
+    diagnosed = await _controller(tmp_path, kubectl).handle(
+        "gitops.diagnose_sync", {"plan": _plan()}
+    )
+    handler, fake = _github(tmp_path / "gh")
+    opened = await handler.handle(
+        "gitops.environment_issue",
+        {
+            "plan": _plan(),
+            "merge_sha": MERGE_SHA,
+            "action": "report_sync",
+            "failure_class": "PRUNE_REQUIRED",
+            "blocker": "ARGO_PRUNE_REQUIRED",
+            "diagnosis": diagnosed["diagnosis"],
+            "attempts": [],
+        },
+    )
+    body = fake.issues[("gntik-ai/musematic", opened["issue_number"])]["body"]
+    assert "(blocker `ARGO_PRUNE_REQUIRED`, failure class `PRUNE_REQUIRED`)" in body
+    section = body.split("### Requires prune", 1)[1]
+    assert "Hermes never prunes or deletes" in section
+    keycloak, secret, statefulset, weird = section.split("\n- ")[1:]
+    assert "(Argo CD tracking id `musematic-platform:/ConfigMap:musematic-platform/" in keycloak
+    assert "safe-kind allowlist: yes (informational)" in keycloak
+    assert (
+        "verify (read-only): `kubectl -n musematic-platform get configmap/falcone-keycloak-config"
+        " -o yaml` and `kubectl -n musematic-platform get deployments,statefulsets,daemonsets,"
+        "jobs,cronjobs,pods -o yaml | grep -n -F -- 'falcone-keycloak-config'`" in keycloak
+    )
+    assert (
+        "prune (run only after verifying it is unused): "
+        "`kubectl -n musematic-platform delete configmap/falcone-keycloak-config`" in keycloak
+    )
+    for entry, resource in (
+        (secret, "secret/old-credentials"),
+        (statefulset, "statefulset.apps/old-db"),
+    ):
+        assert "safe-kind allowlist: no (informational)" in entry
+        assert f"get {resource} -o yaml" in entry
+        assert "requires manual review; do not delete blindly." in entry
+        assert "delete" not in entry.replace("do not delete blindly", "")
+    # An identifier that is not a valid Kubernetes name gets no command at all.
+    assert "kubectl" not in weird and "requires manual review; do not delete blindly." in weird
+
+
+@pytest.mark.asyncio
+async def test_new_118_a_recorded_source_merge_survives_rechecks_and_skips_pin_convergence(
+    tmp_path: Path,
+) -> None:
+    # Codex round 2: merge the source, then the deployment CI fails and a recheck persists
+    # merge_sha=None, then OpenSpec preparation of the repair resets the state to PLANNED.
+    # The source PR is still merged: convergence must not touch the source branch.
+    from engineering_control.activities.metadata import MetadataActivityHandler
+
+    handler = _controller(tmp_path, FakeKubectl())
+    change_set_id = _seed_change_set(handler)
+    plan = _plan(change_set_id=str(change_set_id))
+    await handler.handle(
+        "gitops.persist_result",
+        {
+            "plan": plan,
+            "outcome": "BLOCKED",
+            "blocker": "DEPLOYMENT_PR_MERGE_BLOCKED",
+            "merge_sha": MERGE_SHA,
+        },
+    )
+    recheck = await handler.handle(
+        "gitops.persist_result",
+        {
+            "plan": plan,
+            "outcome": "BLOCKED",
+            "blocker": "DEPLOYMENT_PR_CI_REGRESSION",
+            "ci_regressions": ["Chart release"],
+            "ci_regression_target": "deployment",
+        },
+    )
+    assert recheck["status"] == "PERSISTED"
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        recovery = change_set.recovery_json
+        assert recovery["staging_gitops"]["blocker"] == "DEPLOYMENT_PR_CI_REGRESSION"
+        assert recovery["staging_gitops"]["merge_sha"] == MERGE_SHA
+        assert recovery["source_merge"]["merge_sha"] == MERGE_SHA
+        assert recovery["source_merge"]["source_pr_url"] == plan["source_pr_url"]
+        change_set.state = "PLANNED"  # the repair's OpenSpec preparation
+    metadata = MetadataActivityHandler(handler.settings)
+    try:
+        assert metadata._source_pr_merged(change_set_id) is True
+    finally:
+        metadata.engine.dispose()
+    # A recheck with a different merge SHA never rewrites the first recorded merge.
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": plan, "outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": "f" * 40},
+    )
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.recovery_json["source_merge"]["merge_sha"] == MERGE_SHA
+
+
+async def test_new_118_a_stale_source_pr_binding_never_counts_as_merged(tmp_path: Path) -> None:
+    # Codex rounds 3-4: after the ChangeSet is rebound to a new source PR, a replayed
+    # persist for the old PR (even one carrying a merge SHA or STAGING_VERIFIED) moves
+    # neither the heads, the state nor the staging record, and never makes the new PR
+    # merged.
+    from engineering_control.activities.metadata import MetadataActivityHandler
+
+    handler = _controller(tmp_path, FakeKubectl())
+    change_set_id = _seed_change_set(handler)
+    plan = _plan(change_set_id=str(change_set_id))
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": plan, "outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": MERGE_SHA},
+    )
+    new_url = plan["source_pr_url"].rsplit("/", 1)[0] + "/78"
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        change_set.source_pr_url = new_url
+        change_set.source_head_sha = "c" * 40
+        change_set.state = "PLANNED"
+        before = dict(change_set.recovery_json["staging_gitops"])
+    for payload in (
+        {"outcome": "BLOCKED", "blocker": "DEPLOYMENT_PR_CI_REGRESSION"},
+        {"outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": "f" * 40},
+        {"outcome": "STAGING_VERIFIED", "merge_sha": "f" * 40},
+    ):
+        stale = await handler.handle("gitops.persist_result", {"plan": plan, **payload})
+        assert stale["status"] == "PERSISTED"
+        assert stale["change_set_state"] == "PLANNED"
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.state == "PLANNED"
+        assert change_set.source_head_sha == "c" * 40
+        assert change_set.recovery_json["staging_gitops"] == before
+    metadata = MetadataActivityHandler(handler.settings)
+    try:
+        assert metadata._source_pr_merged(change_set_id) is False
+    finally:
+        metadata.engine.dispose()
+
+
+async def test_new_118_the_merge_record_is_write_once_per_bound_source_pr(tmp_path: Path) -> None:
+    # Codex round 4: #77's merge record must not block recording #78's merge once the
+    # ChangeSet is rebound to #78 and #78 merges.
+    from engineering_control.activities.metadata import MetadataActivityHandler
+
+    handler = _controller(tmp_path, FakeKubectl())
+    change_set_id = _seed_change_set(handler)
+    old_plan = _plan(change_set_id=str(change_set_id))
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": old_plan, "outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": MERGE_SHA},
+    )
+    new_url = old_plan["source_pr_url"].rsplit("/", 1)[0] + "/78"
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        change_set.source_pr_url = new_url
+        change_set.state = "SOURCE_PR"
+    new_plan = {**old_plan, "source_pr_url": new_url, "source_pr_number": 78}
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": new_plan, "outcome": "BLOCKED", "blocker": "X_FAILED", "merge_sha": "f" * 40},
+    )
+    await handler.handle(
+        "gitops.persist_result",
+        {"plan": new_plan, "outcome": "BLOCKED", "blocker": "DEPLOYMENT_PR_CI_REGRESSION"},
+    )
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        durable = change_set.recovery_json["source_merge"]
+        assert durable["source_pr_url"] == new_url
+        assert durable["merge_sha"] == "f" * 40
+        assert change_set.recovery_json["staging_gitops"]["merge_sha"] == "f" * 40
+        change_set.state = "PLANNED"
+    metadata = MetadataActivityHandler(handler.settings)
+    try:
+        assert metadata._source_pr_merged(change_set_id) is True
+    finally:
+        metadata.engine.dispose()

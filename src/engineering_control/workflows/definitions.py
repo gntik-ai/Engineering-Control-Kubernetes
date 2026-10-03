@@ -452,6 +452,7 @@ class ControlledWorkflow:
             "delivery.deterministic_prechecks",
             "delivery.prepare_toolchain",
             "delivery.resolve_dependencies",
+            "delivery.converge_deployment_pin",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
@@ -1250,6 +1251,22 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                     # per attempt. Idempotent no-op if nothing was ever acquired.
                     await self._release_delivery_leases_best_effort(context)
                     return {"status": context["status"], "context": context}
+                if step == "delivery.invoke_deployment_maker" and self._pin_convergence_patched():
+                    # NEW-118: the source maker runs first, so a deployment commit left the
+                    # source CI pin of the deployment repository one commit behind
+                    # (falcone #980/#45: ~6 checker rounds). The scan worker sets it to the
+                    # deployment worktree HEAD before the checker sees the ChangeSet.
+                    if not await self._checkpoint("DELIVERY_CONVERGE_DEPLOYMENT_PIN"):
+                        await self._release_delivery_leases_best_effort(context)
+                        return {"status": "CANCELLED", "context": context}
+                    context = await self._step(
+                        "delivery.converge_deployment_pin",
+                        {**context, "delivery_request": delivery_request},
+                        timeout_minutes=30,
+                    )
+                    if context.get("status") == "BLOCKED":
+                        await self._release_delivery_leases_best_effort(context)
+                        return {"status": "BLOCKED", "context": context}
             return {"status": context.get("status", "SOURCE_PR"), "context": context}
         except Exception:
             # NEW-20, 2026-09-22: an uncaught exception anywhere in this pipeline
@@ -1361,6 +1378,11 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
 
     def _prepare_toolchain_patched(self) -> bool:
         return workflow.patched("delivery-prepare-toolchain-v1")
+
+    def _pin_convergence_patched(self) -> bool:
+        # Checked once, right after the deployment maker; histories recorded before
+        # NEW-118 carry no marker there and replay without the step.
+        return workflow.patched("delivery-deployment-pin-convergence-v1")
 
     async def _release_delivery_leases_best_effort(self, context: dict[str, Any]) -> None:
         # Discards the activity's own response payload deliberately: it returns
@@ -2359,6 +2381,8 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
     # NEW-116: a full sync Argo CD ran with an inherited selective scope (one full resync).
     _SCOPE_PATCH = "gitops-argo-sync-scope-inherited-v1"
     _SCOPE_RESYNCS = 1
+    # NEW-118: resources Argo CD would prune are escalated at once (Hermes never prunes).
+    _PRUNE_PATCH = "gitops-argo-prune-escalation-v1"
     # Tests run the real flow with short timers. Production keeps 1.0, and _timer then
     # returns the very same timedelta, so every timer command stays byte-identical.
     _TIMER_SCALE = 1.0
@@ -2585,7 +2609,9 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             interval=half_minute,
         )
         if (
-            synced.get("status") in {"SYNC_FAILED", "TIMED_OUT"} or self._scope_inherited(synced)
+            synced.get("status") in {"SYNC_FAILED", "TIMED_OUT"}
+            or self._scope_inherited(synced)
+            or self._prune_required(synced)
         ) and self._sync_recovery_patched():
             # NEW-113: diagnose, remediate within bounds, notify, and escalate the rest
             # (gntik-ai/falcone#980: a patch-incompatible env change failed the sync).
@@ -2641,6 +2667,19 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         return synced.get("status") == "SYNC_SCOPE_INHERITED" and workflow.patched(
             self._SCOPE_PATCH
         )
+
+    def _prune_required(self, synced: dict[str, Any]) -> bool:
+        # NEW-118: only the new SYNC_PRUNE_REQUIRED status (never recorded before) reaches
+        # the marker, so every earlier history replays unchanged.
+        return synced.get("status") == "SYNC_PRUNE_REQUIRED" and workflow.patched(self._PRUNE_PATCH)
+
+    @staticmethod
+    def _sync_blocker(synced: dict[str, Any], failure_class: str) -> str:
+        # NEW-118: resources Argo CD would prune are never remediated; the operator
+        # verifies and deletes them (the issue lists each one with commands).
+        if synced.get("status") == "SYNC_PRUNE_REQUIRED" or failure_class == "PRUNE_REQUIRED":
+            return "ARGO_PRUNE_REQUIRED"
+        return "ARGO_SYNC_TIMEOUT" if synced.get("status") == "TIMED_OUT" else "ARGO_SYNC_FAILED"
 
     @staticmethod
     def _remediation_id(rounds: int, action: str) -> str:
@@ -2730,7 +2769,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     deployed_base,
                     "detected",
                     failure_class=failure_class,
-                    blocker="ARGO_SYNC_TIMEOUT" if timed_out else "ARGO_SYNC_FAILED",
+                    blocker=self._sync_blocker(synced, failure_class),
                     diagnosis=diagnosis,
                 )
             action, resources = self._sync_remediation_plan(
@@ -2855,10 +2894,11 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             if synced.get("status") == "SYNCED":
                 evidence["argo_sync_failure_class"] = failure_class
                 return synced
-            if synced.get("status") not in {
-                "SYNC_FAILED",
-                "TIMED_OUT",
-            } and not self._scope_inherited(synced):
+            if (
+                synced.get("status") not in {"SYNC_FAILED", "TIMED_OUT"}
+                and not self._scope_inherited(synced)
+                and not self._prune_required(synced)
+            ):
                 return self._blocked(synced, "ARGO_SYNC_FAILED")
 
     async def _remediation_call(
@@ -2900,7 +2940,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
         """NEW-113: one issue + one notification with the diagnosis, then BLOCKED."""
-        blocker = "ARGO_SYNC_TIMEOUT" if synced.get("status") == "TIMED_OUT" else "ARGO_SYNC_FAILED"
+        blocker = self._sync_blocker(synced, failure_class)
         evidence["argo_sync_failure_class"] = failure_class
         evidence["argo_sync_remediations"] = attempts
         if not await self._checkpoint("GITOPS_SYNC_ESCALATION"):

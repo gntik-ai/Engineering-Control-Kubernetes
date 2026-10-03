@@ -153,6 +153,7 @@ class ScanActivityHandler:
             "delivery.deterministic_prechecks",
             "delivery.prepare_toolchain",
             "delivery.resolve_dependencies",
+            "delivery.converge_deployment_pin",
             "runtime.deterministic_checks",
             "identity.observer_attest",
             "cleanup.protect_active",
@@ -263,6 +264,8 @@ class ScanActivityHandler:
                 return await self._with_heartbeat(
                     asyncio.to_thread(self._resolve_dependencies, payload)
                 )
+            if step == "delivery.converge_deployment_pin":
+                return await asyncio.to_thread(self._converge_deployment_pin, payload)
             if step == "runtime.deterministic_checks":
                 return await asyncio.to_thread(self._runtime_deterministic_checks, payload)
             if step == "identity.observer_attest":
@@ -1763,6 +1766,259 @@ class ScanActivityHandler:
                 "detail": safe,
                 "commands": commands or [],
             },
+        }
+
+    # -- NEW-118: deterministic CI-pin convergence -------------------------------------
+
+    _PIN_MAX_FILE_BYTES = 1024 * 1024
+    _PIN_IDENTITY = ("Engineering Control", "engineering-control@local.invalid")
+
+    def _converge_deployment_pin(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-118: set the source CI pin of the deployment repository to its worktree HEAD.
+
+        Runs after the deployment maker and before the checker (falcone #980/#45: the
+        source maker runs first, so every deployment commit left FALCONE_CHARTS_REF one
+        commit behind). It converges whenever the delivery has a paired deployment worktree,
+        also without new deployment commits (the worktree HEAD is then the deployment main
+        the ChangeSet started from, and a pin left at an earlier PR's authored commit is
+        stale). Only the exact ``VARIABLE: '<40-hex>'`` definition lines change, byte for
+        byte (newlines kept), in a clean source worktree, committed as the platform
+        identity the worktree manager configures for maker commits; anything ambiguous
+        blocks instead. A merged source PR is never moved (NEW-103 repairs): its pin stays
+        at the merged value, recorded with whether that commit is an ancestor of the
+        deployment HEAD.
+        """
+        project = str(payload.get("project", ""))
+        source_value = payload.get("source_worktree")
+        deployment_value = payload.get("deployment_worktree")
+        if not source_value or not deployment_value or source_value == deployment_value:
+            # No paired deployment worktree (llmwiki): consistently exempt, and the
+            # checker prompt carries no pin rule for it either.
+            return self._pin_result(payload, "DEPLOYMENT_PIN_NOT_APPLICABLE", "NO_PAIRED_WORKTREES")
+        try:
+            manifest = self.catalog.project(Project(project).value)
+        except (OSError, ValueError, ValidationError):
+            return self._pin_blocked(payload, "DEPLOYMENT_PIN_CONTRACT_UNREADABLE", {})
+        policy = manifest.deployment_pin
+        if policy is None:
+            return self._pin_result(payload, "DEPLOYMENT_PIN_NOT_APPLICABLE", "NOT_CONFIGURED")
+        agent = payload.get("agent_result")
+        structured = agent.get("structured_result") if isinstance(agent, dict) else None
+        if not isinstance(structured, dict) or structured.get("decision") != "COMPLETE":
+            # delivery.prepare_checker blocks an incomplete deployment maker itself.
+            return self._pin_result(
+                payload, "DEPLOYMENT_PIN_NOT_APPLICABLE", "DEPLOYMENT_MAKER_NOT_COMPLETE"
+            )
+        source = self._bounded_worktree(source_value)
+        deployment = self._bounded_worktree(deployment_value)
+        deployment_head = self._git(deployment, ["rev-parse", "HEAD"]).strip()
+        if not re.fullmatch(r"[a-f0-9]{40}", deployment_head):
+            return self._pin_blocked(payload, "DEPLOYMENT_PIN_HEAD_INVALID", {})
+        parsed = self._parse_pins(source, policy, deployment_head)
+        if payload.get("source_pr_merged") is True:
+            pins = (
+                sorted({sha for item in parsed["files"] for sha in item["old"]})
+                if "files" in parsed
+                else []
+            )
+            return self._pin_result(
+                payload,
+                "DEPLOYMENT_PIN_NOT_APPLICABLE",
+                "SOURCE_PR_MERGED",
+                deployment_head=deployment_head,
+                merged_pins=[
+                    {"pin": pin, "ancestor_of_deployment_head": self._is_ancestor(deployment, pin)}
+                    for pin in pins
+                ],
+            )
+        if "blocker" in parsed:
+            return self._pin_blocked(payload, parsed["blocker"], parsed["details"])
+        files: list[dict[str, Any]] = parsed["files"]
+        rewrites: dict[str, tuple[Path, bytes, bytes]] = parsed["rewrites"]
+        evidence: dict[str, Any] = {
+            "variable": policy.variable,
+            "deployment_repository": str(manifest.repositories.deployment.full_name),
+            "deployment_head": deployment_head,
+            "files": files,
+            "commit": None,
+        }
+        if not rewrites:
+            self._write_pin_evidence(payload, evidence)
+            return {
+                **payload,
+                "status": "DEPLOYMENT_PIN_UNCHANGED",
+                "deployment_pin_result": evidence,
+            }
+        if self._git_status(source, ignored=False):
+            return self._pin_blocked(
+                payload, "DEPLOYMENT_PIN_SOURCE_DIRTY", {"deployment_head": deployment_head}
+            )
+        before = self._git(source, ["rev-parse", "HEAD"]).strip()
+        changed = sorted(rewrites)
+        try:
+            for path, _, updated in rewrites.values():
+                path.write_bytes(updated)
+            if sorted(self._git_status(source, ignored=False)) != changed:
+                raise ValueError("pin convergence changed files outside its configured files")
+            name, email = self._PIN_IDENTITY
+            self._git(source, ["add", "--", *changed])
+            self._git(
+                source,
+                [
+                    "-c",
+                    f"user.name={name}",
+                    "-c",
+                    f"user.email={email}",
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "-m",
+                    f"chore(ci): pin {evidence['deployment_repository']} to "
+                    f"{deployment_head[:12]} (Hermes pin convergence)",
+                ],
+            )
+        except (OSError, ValueError, CommandFailure):
+            for path, original, _ in rewrites.values():
+                path.write_bytes(original)
+            self._git(source, ["reset", "--quiet", "--", *changed])
+            raise
+        commit = self._git(source, ["rev-parse", "HEAD"]).strip()
+        parent = self._git(source, ["rev-parse", "HEAD^"]).strip()
+        # Exactly the pin lines, one removed and one added each, nothing else committed.
+        numstat = sorted(
+            tuple(line.split("\t"))
+            for line in self._git(
+                source, ["diff", "--numstat", "--no-renames", "HEAD^", "HEAD"]
+            ).splitlines()
+            if line
+        )
+        expected = sorted(
+            (str(item["changed_lines"]), str(item["changed_lines"]), item["file"])
+            for item in files
+            if item["file"] in rewrites
+        )
+        if (
+            parent != before
+            or numstat != expected
+            or self._git_status(source, ignored=False)
+            or any(path.read_bytes() != updated for path, _, updated in rewrites.values())
+        ):
+            raise ValueError("pin convergence commit is not exactly the configured pin lines")
+        evidence["commit"] = commit
+        self._write_pin_evidence(payload, evidence)
+        return {**payload, "status": "DEPLOYMENT_PIN_CONVERGED", "deployment_pin_result": evidence}
+
+    def _parse_pins(self, source: Path, policy: Any, deployment_head: str) -> dict[str, Any]:
+        """Validate every configured pin line and compute the byte-exact rewrites."""
+        definition = re.compile(rf"^[ \t]*[\"']?{re.escape(policy.variable)}[\"']?[ \t]*:")
+        exact = re.compile(
+            rf"^(?P<prefix>[ \t]*{re.escape(policy.variable)}:[ \t]*)(?P<quote>['\"]?)"
+            r"(?P<sha>[0-9a-f]{40})(?P=quote)(?P<suffix>[ \t]*(?:#[^\r\n]*)?)$"
+        )
+        files: list[dict[str, Any]] = []
+        rewrites: dict[str, tuple[Path, bytes, bytes]] = {}
+        for relative in policy.files:
+            unresolved = source / relative
+            path = unresolved.resolve()
+            if (
+                unresolved.is_symlink()
+                or not path.is_relative_to(source)
+                or not path.is_file()
+                or path.stat().st_size > self._PIN_MAX_FILE_BYTES
+            ):
+                return {"blocker": "DEPLOYMENT_PIN_FILE_MISSING", "details": {"file": relative}}
+            original = path.read_bytes()
+            try:
+                text = original.decode("utf-8")
+            except UnicodeDecodeError:
+                return {"blocker": "DEPLOYMENT_PIN_MALFORMED", "details": {"file": relative}}
+            # Split on "\n" only, so "\r\n" and every other byte is kept exactly.
+            lines = text.split("\n")
+            old: list[str] = []
+            changed_lines = 0
+            for index, line in enumerate(lines):
+                carriage = "\r" if line.endswith("\r") else ""
+                body = line[: len(line) - len(carriage)]
+                if not definition.match(body):
+                    continue
+                match = exact.fullmatch(body)
+                if match is None:
+                    return {
+                        "blocker": "DEPLOYMENT_PIN_MALFORMED",
+                        "details": {"file": relative, "line": index + 1},
+                    }
+                old.append(match.group("sha"))
+                replaced = (
+                    f"{match.group('prefix')}{match.group('quote')}{deployment_head}"
+                    f"{match.group('quote')}{match.group('suffix')}{carriage}"
+                )
+                if replaced != line:
+                    changed_lines += 1
+                lines[index] = replaced
+            if len(old) != policy.occurrences:
+                return {
+                    "blocker": "DEPLOYMENT_PIN_AMBIGUOUS",
+                    "details": {
+                        "file": relative,
+                        "expected": policy.occurrences,
+                        "found": len(old),
+                    },
+                }
+            files.append(
+                {
+                    "file": relative,
+                    "old": old,
+                    "new": deployment_head,
+                    "changed_lines": changed_lines,
+                }
+            )
+            updated = "\n".join(lines).encode("utf-8")
+            if updated != original:
+                rewrites[relative] = (path, original, updated)
+        return {"files": files, "rewrites": rewrites}
+
+    def _is_ancestor(self, worktree: Path, sha: str) -> bool:
+        if not re.fullmatch(r"[a-f0-9]{40}", sha):
+            return False
+        result = self.git_runner.run(
+            "git",
+            ["-c", f"safe.directory={worktree}", "merge-base", "--is-ancestor", sha, "HEAD"],
+            cwd=worktree,
+            timeout_seconds=300,
+            environment={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
+            check=False,
+        )
+        return result.return_code == 0
+
+    def _write_pin_evidence(self, payload: dict[str, Any], evidence: dict[str, Any]) -> None:
+        try:
+            change_set_id = UUID(str(payload.get("change_set_id")))
+        except ValueError:
+            return
+        directory = self.settings.evidence_root / "scan" / str(change_set_id) / "deployment-pin"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        target = directory / f"{evidence['deployment_head']}.json"
+        target.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _pin_result(
+        payload: dict[str, Any], status: str, reason: str, **details: Any
+    ) -> dict[str, Any]:
+        return {
+            **payload,
+            "status": status,
+            "deployment_pin_result": {"reason": reason, "commit": None, **details},
+        }
+
+    @staticmethod
+    def _pin_blocked(
+        payload: dict[str, Any], blocker: str, details: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            **payload,
+            "status": "BLOCKED",
+            "blocker": blocker,
+            "deployment_pin_result": {"blocker": blocker, "commit": None, **details},
         }
 
     @staticmethod

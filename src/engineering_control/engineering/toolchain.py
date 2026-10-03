@@ -10,6 +10,7 @@ import yaml
 
 from engineering_control.config import Settings
 from engineering_control.engineering.models import (
+    DeploymentPinPolicy,
     ProjectManifest,
     ToolchainPolicy,
     ToolchainTestCommand,
@@ -29,6 +30,16 @@ def load_toolchain_policy(project_config_root: Path, project: str) -> ToolchainP
     Raises OSError when the manifest is unreadable and ValueError when it is invalid, so
     callers choose whether that is fail-closed (prepare) or advisory (prompts).
     """
+    return load_project_manifest(project_config_root, project).toolchain
+
+
+def load_deployment_pin(project_config_root: Path, project: str) -> DeploymentPinPolicy | None:
+    """NEW-118: the project's source CI pin of the deployment repository, if configured."""
+    return load_project_manifest(project_config_root, project).deployment_pin
+
+
+def load_project_manifest(project_config_root: Path, project: str) -> ProjectManifest:
+    """Read one bounded project manifest (no symlinks, size-bounded, identity-checked)."""
     if project not in _PROJECTS:
         raise ValueError("toolchain project is not allowlisted")
     root = project_config_root.resolve()
@@ -43,7 +54,7 @@ def load_toolchain_policy(project_config_root: Path, project: str) -> ToolchainP
     manifest = ProjectManifest.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     if manifest.project != project:
         raise ValueError("project manifest identity is invalid")
-    return manifest.toolchain
+    return manifest
 
 
 def enabled_toolchain(project_config_root: Path, project: str) -> ToolchainPolicy | None:

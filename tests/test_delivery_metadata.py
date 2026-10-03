@@ -802,6 +802,9 @@ def test_resumed_correction_maker_fixes_findings_on_top_of_the_previous_commits(
     assert "Do not re-implement" not in reset and resumed_head not in reset
     # Resume is per repository: the deployment worktree was not resumed.
     assert "Do not re-implement" not in deployment
+    # NEW-118: a standing rule for the deployment maker only.
+    standing = "Make no deployment commit beyond what the OpenSpec, the issue or the independent"
+    assert standing in deployment and standing not in resumed
     # The checker reviews the full base..HEAD change, not only the latest commit.
     assert f"git diff {'a' * 40}..HEAD" in checker
     assert "may span several commits" in checker
@@ -1419,3 +1422,26 @@ def test_a_source_merged_change_set_accepts_repair_writes_until_its_deployment_m
                 handler._persist_delivery_handoff(payload)
             except ValueError as error:
                 assert "already delivered" not in str(error)
+
+
+def test_new_118_the_deployment_maker_step_records_whether_the_source_pr_merged(
+    tmp_path: Path,
+) -> None:
+    handler, allocation = _lease_fixture(tmp_path)
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-ci-repair-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "risk_class": "R1",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "import"},
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+    assert handler._prepare_maker(payload, deployment=True)["source_pr_merged"] is False
+    assert "source_pr_merged" not in handler._prepare_maker(payload, deployment=False)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.state = "SOURCE_MERGED"
+    assert handler._prepare_maker(payload, deployment=True)["source_pr_merged"] is True

@@ -69,6 +69,7 @@ from engineering_control.engineering.github import FindingPublication
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
+    load_deployment_pin,
     toolchain_test_command_lines,
 )
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
@@ -3561,6 +3562,15 @@ class MetadataActivityHandler:
                 else ""
             )
             + (
+                # NEW-118 (falcone #980/#45): extra deployment commits each moved the
+                # source CI pin and cost a checker round.
+                "Make no deployment commit beyond what the OpenSpec, the issue or the "
+                "independent checker's blocking findings require.\n"
+                if deployment
+                else ""
+            )
+            + self._deployment_pin_prompt(payload, role="deployment" if deployment else "source")
+            + (
                 self._toolchain_prompt(payload, role="maker")
                 if not deployment or payload["source_worktree"] == payload["deployment_worktree"]
                 else ""
@@ -3598,7 +3608,42 @@ class MetadataActivityHandler:
         }
         if deployment:
             response["source_maker_result"] = prior
+            # NEW-118: a merged source branch never moves, so the scan worker must not
+            # converge its CI pin (NEW-103 deployment-only repair).
+            response["source_pr_merged"] = self._source_pr_merged(change_set_id)
         return response
+
+    def _source_pr_merged(self, change_set_id: UUID) -> bool:
+        """The source PR merged: the durable merge record bound to the published source PR
+        (written once by the staging flow, never nulled by a recheck), a merge SHA in the
+        latest staging record, or a delivered state. A later reset of the state (OpenSpec
+        preparation of a CI repair) does not undo a recorded merge."""
+        with self.sessions() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                return False
+            recovery = dict(change_set.recovery_json or {})
+            durable = recovery.get("source_merge")
+            if (
+                isinstance(durable, dict)
+                and re.fullmatch(r"[a-f0-9]{40}", str(durable.get("merge_sha")))
+                and bool(change_set.source_pr_url)
+                and durable.get("source_pr_url") == change_set.source_pr_url
+            ):
+                return True
+            record = recovery.get("staging_gitops")
+            merged_sha = (
+                record.get("merge_sha")
+                # NEW-118 review 3: a record persisted for a previously bound source PR
+                # never counts; records from before NEW-118 carry no URL.
+                if isinstance(record, dict)
+                and record.get("source_pr_url", change_set.source_pr_url)
+                == change_set.source_pr_url
+                else None
+            )
+            return change_set.state in _DELIVERED_CHANGE_SET_STATES or bool(
+                isinstance(merged_sha, str) and re.fullmatch(r"[a-f0-9]{40}", merged_sha)
+            )
 
     def _checker_range_prompt(self, payload: dict[str, Any]) -> str:
         """NEW-52: a resumed ChangeSet spans several commits; review all of base..HEAD."""
@@ -3613,6 +3658,54 @@ class MetadataActivityHandler:
             "Review the complete change relative to the base commit, which may span several "
             "commits and earlier attempts (" + "; ".join(ranges) + "), not only the last "
             "commit.\n"
+        )
+
+    def _deployment_pin_prompt(self, payload: dict[str, Any], *, role: str) -> str:
+        """NEW-118: the source CI pin of the deployment repository is Hermes's to set."""
+        if payload.get("source_worktree") == payload.get("deployment_worktree"):
+            return ""
+        try:
+            pin = load_deployment_pin(self.settings.project_config_root, str(payload["project"]))
+        except (OSError, ValueError):
+            return ""  # advisory only: the convergence step itself fails closed
+        if pin is None:
+            return ""
+        where = f"{pin.variable} in {', '.join(pin.files)}"
+        if role == "checker":
+            result = payload.get("deployment_pin_result")
+            if isinstance(result, dict) and result.get("reason") == "SOURCE_PR_MERGED":
+                # NEW-118/NEW-103: a merged source branch never moves.
+                merged = result.get("merged_pins")
+                pins = ", ".join(
+                    f"{item.get('pin')} (ancestor of the deployment HEAD: "
+                    f"{'yes' if item.get('ancestor_of_deployment_head') else 'no'})"
+                    for item in (merged if isinstance(merged, list) else [])
+                    if isinstance(item, dict)
+                )
+                return (
+                    f"The source repository's CI pin of the deployment repository ({where}) "
+                    "is managed by Hermes. The source pull request is already merged, so "
+                    f"its pin stays at the merged value ({pins or 'unknown'}); a pin that is "
+                    "an ancestor of the deployment worktree HEAD is acceptable. Never request "
+                    "a source change for the pin.\n"
+                )
+            return (
+                f"The source repository's CI pin of the deployment repository ({where}) is "
+                "managed by Hermes: after the deployment maker it is set to the deployment "
+                "worktree HEAD (also when the deployment repository has no new commit) in a "
+                "platform commit 'chore(ci): pin ... (Hermes pin convergence)'. That commit "
+                "is expected; report the pin only if it differs from the deployment worktree "
+                "HEAD.\n"
+            )
+        if role == "deployment":
+            return (
+                f"The source repository's CI pin of this repository ({where}) is managed by "
+                "Hermes, which sets it to this worktree's final HEAD after you finish; never "
+                "make a commit only to move it.\n"
+            )
+        return (
+            f"Never edit {where}: Hermes manages that pin and sets it to the deployment "
+            "worktree HEAD after the deployment maker.\n"
         )
 
     def _toolchain_prompt(self, payload: dict[str, Any], *, role: str) -> str:
@@ -3672,6 +3765,7 @@ class MetadataActivityHandler:
             # is documentation.
             + _TASKS_MD_ADVISORY
             + self._checker_range_prompt(payload)
+            + self._deployment_pin_prompt(payload, role="checker")
             + self._toolchain_prompt(payload, role="checker")
             + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"
