@@ -46,7 +46,13 @@ echo ""
 echo "=== Pre-flight: full local verification (refuses to deploy if any of this fails) ==="
 .venv/bin/ruff check src/ tests/ scripts/
 .venv/bin/mypy src/engineering_control
-.venv/bin/pytest tests/ -q
+# /tmp is a RAM-backed tmpfs on the controller. pytest's default basetemp
+# (/tmp/pytest-of-<user>) keeps the last three full runs, about 0.5 GB each, which
+# starved Hermes of memory on 2026-10-02/03. Use a private basetemp and delete it.
+PYTEST_BASETEMP=$(mktemp -d /tmp/engineering-control-preflight.XXXXXX)
+trap 'rm -rf "$PYTEST_BASETEMP"' EXIT
+.venv/bin/pytest tests/ -q -p no:cacheprovider --basetemp="$PYTEST_BASETEMP"
+rm -rf "$PYTEST_BASETEMP"
 
 RELEASE_DIR="$RELEASES_ROOT/$HASH"
 VENV_DIR="$VENVS_ROOT/$HASH"
