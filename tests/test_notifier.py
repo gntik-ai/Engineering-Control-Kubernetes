@@ -243,7 +243,8 @@ def test_hmac_v2_notification_is_signed_idempotent_and_redacted(tmp_path: Path) 
     assert service.run_once() == 0
     assert len(requests) == 1
     request = requests[0]
-    assert request.headers["X-Request-ID"] == str(row_id)
+    # NEW-112 review: main's deployed key format keeps gateway deduplication across deploys.
+    assert request.headers["X-Request-ID"] == f"notification-{row_id}"
     assert "Authorization" not in request.headers
     assert sensitive.encode() not in request.content
     timestamp = request.headers["X-Webhook-Timestamp"]
@@ -460,9 +461,8 @@ def test_outbox_delivery_is_hmac_v2_signed_and_acknowledged(
     ).hexdigest()
     # The gateway's generic V2 check: hex HMAC-SHA256 of "<timestamp>.<body>".
     assert request.headers["X-Webhook-Signature-V2"] == expected
-    # Merged with 2b678d9: the request ID is the outbox row ID (the deployed contract).
     (row,) = _new112a_rows(service)
-    assert request.headers["X-Request-ID"] == str(row.id)
+    assert request.headers["X-Request-ID"] == f"notification-{row.id}"
     body = json.loads(request.content)
     assert body["topic"] == "telegram.engineering-operational-watchdog"
     assert body["payload"]["status"] == "FAILED_OR_MISSED"
@@ -572,3 +572,30 @@ def test_token_symlinks_and_short_hmac_keys_are_refused(tmp_path: Path) -> None:
 
 def test_default_auth_mode_is_hmac() -> None:
     assert Settings().notification_auth_mode == "hmac-sha256-v2"
+
+
+def test_a_retried_delivery_keeps_the_deployed_idempotency_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NEW-112 review: an alert whose acknowledgement was lost is re-sent under the same
+    # notification-<id> key main already used, so the gateway deduplicates it.
+    seen: list[httpx.Request] = []
+    responses = [
+        httpx.Response(200, text="acknowledgement lost"),
+        httpx.Response(200, json={"status": "duplicate"}),
+    ]
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return responses[len(seen) - 1]
+
+    _new112a_patch_transport(monkeypatch, gateway)
+    service = _new112a_service_with_row(tmp_path)
+    assert service.run_once() == 0
+    with Session(service.engine) as session, session.begin():
+        (row,) = session.scalars(select(NotificationOutbox))
+        row.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        row_id = row.id
+    assert service.run_once() == 1
+    assert [request.headers["X-Request-ID"] for request in seen] == [f"notification-{row_id}"] * 2
+    assert [row.status for row in _new112a_rows(service)] == ["DELIVERED"]

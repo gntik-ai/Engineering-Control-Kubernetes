@@ -215,7 +215,9 @@ class NotificationService:
                     try:
                         self.sink.deliver(
                             topic=row.topic,
-                            request_id=str(row.id),
+                            # Main's (NEW-112a) deployed idempotency key: a delivery whose
+                            # acknowledgement was lost is re-sent under the same key.
+                            request_id=f"notification-{row.id}",
                             payload=payload,
                             client=client,
                         )
