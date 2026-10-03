@@ -2676,6 +2676,20 @@ class MetadataActivityHandler:
                 if issue_approval is not None
                 else None
             )
+            # NEW-112 review: the issue text this delivery is approved for. The workflow's
+            # live issue-body refresh (NEW-44) may use a re-read body only if it is this one.
+            approved_body_sha256 = None
+            if issue_approval is not None:
+                approved_issue = session.scalar(
+                    select(BacklogIssueRecord).where(
+                        BacklogIssueRecord.backlog_campaign_id
+                        == UUID(str(issue_approval.result_json["request"]["backlog_campaign_id"])),
+                        BacklogIssueRecord.finding_id == finding.id,
+                    )
+                )
+                if approved_issue is None:
+                    raise ValueError("approved backlog issue snapshot is unavailable")
+                approved_body_sha256 = approved_issue.body_sha256
             run.change_set_id = change_set_id
             run.status = "RUNNING"
             run.project = project.value
@@ -2722,6 +2736,11 @@ class MetadataActivityHandler:
                 **(
                     {"issue_execution_approval": issue_reference}
                     if issue_reference is not None
+                    else {}
+                ),
+                **(
+                    {"approved_issue_body_sha256": approved_body_sha256}
+                    if approved_body_sha256 is not None
                     else {}
                 ),
             }

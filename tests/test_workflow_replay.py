@@ -1389,6 +1389,47 @@ async def test_issue_delivery_refreshes_an_existing_issue_body_and_replays() -> 
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 
+async def test_issue_delivery_stops_when_the_issue_changed_since_approval_and_replays() -> None:
+    """NEW-112 review: an approved delivery may refresh only to its approved issue text; an
+    edit after approval blocks before any lease with the operator's re-approval guidance."""
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "existing-github-issue",
+            "issue_repository": "gntik-ai/musematic",
+            "issue_number": 993,
+            "actual_behavior": "Issue body",
+            "approved_issue_body_sha256": "a" * 64,
+        },
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker_detail": "re-import and re-approve",
+            "approved_body_sha256": "a" * 64,
+            "current_body_sha256": "b" * 64,
+        },
+        "delivery.release_leases": {"status": "NO_RUN_TO_RELEASE_LEASES_FOR"},
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["context"]["blocker"] == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+    assert result["context"]["blocker_detail"] == "re-import and re-approve"
+    assert result["context"]["actual_behavior"] == "Issue body"
+    requests = _scheduled_steps(history)
+    steps = [request["step"] for request in requests]
+    assert "delivery.acquire_leases" not in steps
+    refresh = next(r for r in requests if r["step"] == "delivery.refresh_issue_body")
+    assert refresh["payload"]["approved_issue_body_sha256"] == "a" * 64
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
 async def test_issue_delivery_keeps_the_imported_body_when_the_refresh_fails() -> None:
     script = {
         **_DELIVERY_TO_SPEC_SCRIPT,

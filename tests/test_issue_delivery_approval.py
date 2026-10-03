@@ -368,6 +368,11 @@ async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_sta
     )
     assert loaded["status"] == "CONFIRMED_LOADED"
     assert loaded["issue_execution_approval"] == first["issue_execution_approval"]
+    with handler.sessions() as session:
+        approved_issue = session.scalar(select(BacklogIssueRecord))
+        assert approved_issue is not None
+        # The approved issue text bounds the workflow's live issue-body refresh.
+        assert loaded["approved_issue_body_sha256"] == approved_issue.body_sha256
     # Every later preparation step re-verifies the same lineage and proceeds.
     assert handler._issue_approval_preparation(loaded)["change_set_id"] == first["change_set_id"]
     with handler.sessions() as session:

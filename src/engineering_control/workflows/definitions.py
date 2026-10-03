@@ -1317,13 +1317,27 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             return context
         if not workflow.patched("delivery-refresh-issue-body-v1"):
             return context
-        refreshed = await self._step(
-            "delivery.refresh_issue_body",
-            {
-                "issue_repository": context.get("issue_repository"),
-                "issue_number": context.get("issue_number"),
-            },
-        )
+        refresh_request: dict[str, Any] = {
+            "issue_repository": context.get("issue_repository"),
+            "issue_number": context.get("issue_number"),
+        }
+        if context.get("approved_issue_body_sha256") is not None:
+            refresh_request["approved_issue_body_sha256"] = context["approved_issue_body_sha256"]
+        refreshed = await self._step("delivery.refresh_issue_body", refresh_request)
+        if refreshed.get("status") == "ISSUE_BODY_CHANGED_SINCE_APPROVAL" and workflow.patched(
+            "delivery-refresh-body-approval-scope-v1"
+        ):
+            # NEW-112 review: an issue edited after approval stops this delivery (and
+            # releases its leases) with the operator's re-approval guidance; only the
+            # approved text may reach the spec/maker. Older histories never see this status.
+            return {
+                **context,
+                "status": "BLOCKED",
+                "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+                "blocker_detail": refreshed.get("blocker_detail"),
+                "approved_body_sha256": refreshed.get("approved_body_sha256"),
+                "current_body_sha256": refreshed.get("current_body_sha256"),
+            }
         body = refreshed.get("body_excerpt")
         if refreshed.get("status") != "ISSUE_BODY_REFRESHED" or not isinstance(body, str):
             return context
