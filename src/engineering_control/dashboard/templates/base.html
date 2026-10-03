@@ -42,7 +42,8 @@
       <p id="action-effect" class="mutation-banner"></p>
       <pre id="action-binding" class="operation-binding"></pre>
       <p id="action-blockers" class="alert error hidden" role="alert"></p>
-      <label>Current dashboard password<input id="action-password" type="password" maxlength="128" required></label>
+      <p id="action-progress" class="alert notice hidden" role="status" aria-live="polite"></p>
+      <label>Current dashboard password<input id="action-password" type="password" autocomplete="current-password" maxlength="128" required></label>
       <label id="action-phrase-field" class="hidden">Type confirmation phrase<input id="action-phrase" type="text" maxlength="120"></label>
       <p id="action-phrase-help" class="muted"></p>
       <div class="dialog-actions"><button id="action-cancel" type="button">Cancel</button><button id="action-execute" type="submit">Confirm operation</button></div>

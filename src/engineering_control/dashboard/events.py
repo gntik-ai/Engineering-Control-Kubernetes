@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import UUID
 
@@ -32,6 +32,29 @@ _STEP_EVENTS = {
     "backlog.record_loop_state": "issue_status.changed",
     "cleanup.finalize": "workflow.completed",
 }
+
+AsyncPredicate = Callable[[], Awaitable[bool]]
+
+
+class _AuthorizationWindow:
+    def __init__(self, authorized: AsyncPredicate, seconds: float) -> None:
+        self.authorized = authorized
+        self.seconds = min(5.0, max(0.0, seconds))
+        self.next_check = 0.0
+
+    async def valid(self) -> bool:
+        loop = asyncio.get_running_loop()
+        if loop.time() < self.next_check:
+            return True
+        started = loop.time()
+        try:
+            async with asyncio.timeout(1.0):
+                if await self.authorized() is not True:
+                    return False
+        except Exception:  # noqa: BLE001 - never stream with unverifiable authorization
+            return False
+        self.next_check = started + self.seconds
+        return True
 
 
 def event_for_step(
@@ -93,25 +116,34 @@ async def sse_events(
     repository: DashboardRepository,
     *,
     after_id: int,
-    disconnected: Any,
+    disconnected: AsyncPredicate,
+    authorized: AsyncPredicate,
     poll_seconds: float = 1.0,
     heartbeat_seconds: float = 15.0,
+    authorization_seconds: float = 5.0,
     maximum_iterations: int | None = None,
 ) -> AsyncIterator[str]:
     cursor = max(0, after_id)
     since_heartbeat = 0.0
+    authorization = _AuthorizationWindow(authorized, authorization_seconds)
     iterations = 0
     while maximum_iterations is None or iterations < maximum_iterations:
         if await disconnected():
             return
+        if not await authorization.valid():
+            return
         events = await repository.recent_events(limit=100, after_id=cursor)
         if events:
             for event in events:
+                if not await authorization.valid():
+                    return
                 cursor = int(event["id"])
                 payload = json.dumps(event, separators=(",", ":"), sort_keys=True)
                 yield f"id: {cursor}\nevent: activity\ndata: {payload}\n\n"
             since_heartbeat = 0.0
         elif since_heartbeat >= heartbeat_seconds:
+            if not await authorization.valid():
+                return
             yield ": heartbeat\n\n"
             since_heartbeat = 0.0
         iterations += 1
@@ -124,16 +156,21 @@ async def transcript_sse(
     execution_id: UUID,
     *,
     after_sequence: int,
-    disconnected: Any,
+    disconnected: AsyncPredicate,
+    authorized: AsyncPredicate,
     poll_seconds: float = 1.0,
     heartbeat_seconds: float = 15.0,
+    authorization_seconds: float = 5.0,
     maximum_iterations: int | None = None,
 ) -> AsyncIterator[str]:
     cursor = max(0, after_sequence)
     since_heartbeat = 0.0
+    authorization = _AuthorizationWindow(authorized, authorization_seconds)
     iterations = 0
     while maximum_iterations is None or iterations < maximum_iterations:
         if await disconnected():
+            return
+        if not await authorization.valid():
             return
         result = await asyncio.to_thread(
             projection.execution_logs,
@@ -148,11 +185,15 @@ async def transcript_sse(
             for item in items:
                 if not isinstance(item, dict):
                     continue
+                if not await authorization.valid():
+                    return
                 cursor = int(item["sequence"])
                 payload = json.dumps(item, separators=(",", ":"), sort_keys=True)
                 yield f"id: {cursor}\nevent: transcript\ndata: {payload}\n\n"
             since_heartbeat = 0.0
         elif since_heartbeat >= heartbeat_seconds:
+            if not await authorization.valid():
+                return
             yield ": heartbeat\n\n"
             since_heartbeat = 0.0
         iterations += 1

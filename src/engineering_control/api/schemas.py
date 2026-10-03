@@ -17,6 +17,23 @@ class APIModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CampaignReconciliationRow(APIModel):
+    campaign_id: UUID
+    snapshot_token: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observation_token: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class CampaignReconciliationApply(APIModel):
+    confirmation: Literal["APPLY_EXACT_RECONCILIATION_ROWS"]
+    rows: list[CampaignReconciliationRow] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def unique_rows(self) -> CampaignReconciliationApply:
+        if len({row.campaign_id for row in self.rows}) != len(self.rows):
+            raise ValueError("duplicate reconciliation target")
+        return self
+
+
 class CampaignStart(APIModel):
     project: Project
     name: str = Field(default="audit", min_length=1, max_length=200)
@@ -188,6 +205,8 @@ class ExistingBacklogLoopStart(APIModel):
     global_campaign_id: UUID | None = None
     r3_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     runtime_proof: Literal["runtime", "source-revalidation"] = "runtime"
+    issue_operation_id: UUID | None = None
+    issue_approval_binding: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def exact_issue_binding(self) -> ExistingBacklogLoopStart:
@@ -202,6 +221,16 @@ class ExistingBacklogLoopStart(APIModel):
             raise ValueError(
                 "runtime proof by source revalidation requires one source-pr issue operation"
             )
+        if (self.issue_operation_id is None) != (self.issue_approval_binding is None):
+            raise ValueError("issue operation and approval binding must be supplied together")
+        if self.issue_operation_id is not None and self.target_repository is None:
+            raise ValueError("issue approval must bind one exact issue")
+        # NEW-95 (main): an R3 issue operation carries its exact R3 approval binding; it is
+        # part of the operation's approved payload, so it does not widen the scope.
+        if self.issue_operation_id is not None and (
+            self.global_campaign_id is not None or self.continue_after_blocked_issue
+        ):
+            raise ValueError("direct issue approval cannot widen its execution scope")
         return self
 
 
@@ -345,6 +374,20 @@ class DeliveryStart(APIModel):
     finding_id: UUID
     risk_class: RiskClass
     dry_run: bool = True
+    approved_issue: ExistingBacklogLoopStart | None = None
+
+    @model_validator(mode="after")
+    def real_delivery_has_exact_origin(self) -> DeliveryStart:
+        if self.dry_run:
+            if self.approved_issue is not None:
+                raise ValueError("dry-run delivery must not carry a mutating issue request")
+            return self
+        request = self.approved_issue
+        if request is None or request.issue_operation_id is None:
+            raise ValueError("real delivery requires its approved typed issue operation")
+        if request.delivery_mode != "source-pr":
+            raise ValueError("delivery publishes source PRs; full delivery uses solve-issue")
+        return self
 
 
 class FindingVerificationStart(APIModel):

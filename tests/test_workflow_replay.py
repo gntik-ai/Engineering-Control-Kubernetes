@@ -24,6 +24,7 @@ import shutil
 import uuid
 from datetime import timedelta
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from pre_new_113_gitops_workflow import ParentStagingGitOpsDeliveryWorkflow
@@ -63,6 +64,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _registered_child(step: str, request: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
+    """Complete a scripted child Run registration the way the real activity does.
+
+    Merged with 2b678d9 (child-run-start-memo-v1): the workflow validates that a
+    registration echoes its child workflow ID and returns the Run's UUID.
+    """
+    if (
+        step != "backlog.register_child_run"
+        or value.get("status") != "REGISTERED"
+        or "child_workflow_id" in value
+    ):
+        return value
+    child = request["payload"].get("child_workflow_id")
+    return {**value, "child_workflow_id": child, "run_id": str(uuid5(NAMESPACE_URL, str(child)))}
+
+
 def _scripted_execute_control_step(script: dict[str, dict[str, Any]]) -> Any:
     """Build an execute_control_step double keyed by step name.
 
@@ -78,7 +95,7 @@ def _scripted_execute_control_step(script: dict[str, dict[str, Any]]) -> Any:
             return {"status": "PASS"}  # NEW-71: every loop issue refreshes the mirrors
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     return execute_control_step
 
@@ -101,7 +118,7 @@ def _scripted_execute_control_step_with_failure(
             return {"status": "PASS"}  # NEW-71
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     return execute_control_step
 
@@ -866,6 +883,8 @@ def _full_delivery_loop_script(
             "risk_class": "R1",
         },
         "backlog.register_child_run": {"status": "REGISTERED"},
+        # NEW-112 review: the loop durably records each CI-repair round first.
+        "backlog.record_ci_repair": {"status": "RECORDED"},
         "backlog.record_loop_state": {"status": "RECORDED"},
         "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
         "backlog.restore_published_change_set": {"status": "RESTORED"},
@@ -951,7 +970,7 @@ async def test_a_failed_loop_bookkeeping_step_pauses_and_retries_instead_of_fail
             )
         if step == "github.refresh_mirrors" and step not in script:
             return {"status": "PASS"}
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     history, result, children = await _run_loop(
         script, [("retry", "gntik-ai/musematic#1026")], activity_fn=flaky
@@ -1111,6 +1130,58 @@ async def test_ci_regression_redelivers_twice_then_waits_for_the_operator() -> N
         if request["step"] == "backlog.register_child_run"
     ]
     assert registered.count("issue-delivery") == 3
+    # Each repair round is durably recorded by the loop right before its repair child.
+    names = [request["step"] for request in steps]
+    authorizations = [
+        (request["payload"]["ordinal"], request["payload"]["repair_round"])
+        for request in steps
+        if request["step"] == "backlog.record_ci_repair"
+    ]
+    assert authorizations == [(1, 1), (1, 2)]
+    for position in [
+        index for index, name in enumerate(names) if name == "backlog.record_ci_repair"
+    ]:
+        assert names[position + 1] == "backlog.register_child_run"
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+async def test_an_operator_retried_ci_repair_round_is_recorded_like_an_automatic_one() -> None:
+    # NEW-112 review: after the two automatic repair rounds, each operator retry from the
+    # CI regression starts another round (falcone #980 used rounds 3-7); every round is
+    # durably recorded by the loop right before its repair child.
+    regression = {
+        "status": "BLOCKED",
+        "blocker": "SOURCE_PR_CI_REGRESSION",
+        "failed_checks": ["Lint Frontend"],
+        "preexisting_checks": ["CI gate"],
+        "baseline_pr": "https://github.com/gntik-ai/musematic/pull/900",
+    }
+    history, result, children = await _run_loop(
+        _full_delivery_loop_script(**{"gitops.pr_checks": regression}),
+        [("retry", "gntik-ai/musematic#1026"), ("skip", "gntik-ai/musematic#1026|OPERATOR")],
+    )
+
+    assert result["status"] == "COMPLETE"
+    repairs = [child.rsplit("-issue-", 1)[1] for child in children if "-ci-repair-" in child]
+    assert repairs == [
+        "1-ci-repair-1-attempt-1",
+        "1-ci-repair-2-attempt-1",
+        "1-ci-repair-3-attempt-1",
+    ]
+    steps = _scheduled_steps(history)
+    names = [request["step"] for request in steps]
+    authorizations = [
+        (request["payload"]["ordinal"], request["payload"]["repair_round"])
+        for request in steps
+        if request["step"] == "backlog.record_ci_repair"
+    ]
+    assert authorizations == [(1, 1), (1, 2), (1, 3)]
+    for position in [
+        index for index, name in enumerate(names) if name == "backlog.record_ci_repair"
+    ]:
+        following = steps[position + 1]
+        assert following["step"] == "backlog.register_child_run"
+        assert "-ci-repair-" in following["payload"]["child_workflow_id"]
     await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
 
 
@@ -1369,6 +1440,47 @@ async def test_issue_delivery_refreshes_an_existing_issue_body_and_replays() -> 
     refresh = requests[ensure + 1]["payload"]
     assert refresh == {"issue_repository": "gntik-ai/musematic", "issue_number": 993}
     assert requests[ensure + 2]["payload"]["actual_behavior"] == _REFRESHED_BODY
+    await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
+
+
+async def test_issue_delivery_stops_when_the_issue_changed_since_approval_and_replays() -> None:
+    """NEW-112 review: an approved delivery may refresh only to its approved issue text; an
+    edit after approval blocks before any lease with the operator's re-approval guidance."""
+    script = {
+        **_DELIVERY_TO_SPEC_SCRIPT,
+        "delivery.ensure_issue": {
+            "status": "ISSUE_READY",
+            "run_id": "run-1",
+            "persona": "existing-github-issue",
+            "issue_repository": "gntik-ai/musematic",
+            "issue_number": 993,
+            "actual_behavior": "Issue body",
+            "approved_issue_body_sha256": "a" * 64,
+        },
+        "delivery.refresh_issue_body": {
+            "status": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+            "blocker_detail": "re-import and re-approve",
+            "approved_body_sha256": "a" * 64,
+            "current_body_sha256": "b" * 64,
+        },
+        "delivery.release_leases": {"status": "NO_RUN_TO_RELEASE_LEASES_FOR"},
+    }
+    run_arg = IssueDeliveryInput(finding_id="finding-1", risk_class="R1", dry_run=False)
+
+    history, result = await _run_to_history(
+        IssueDeliveryWorkflow, run_arg, _scripted_execute_control_step(script)
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["context"]["blocker"] == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+    assert result["context"]["blocker_detail"] == "re-import and re-approve"
+    assert result["context"]["actual_behavior"] == "Issue body"
+    requests = _scheduled_steps(history)
+    steps = [request["step"] for request in requests]
+    assert "delivery.acquire_leases" not in steps
+    refresh = next(r for r in requests if r["step"] == "delivery.refresh_issue_body")
+    assert refresh["payload"]["approved_issue_body_sha256"] == "a" * 64
     await Replayer(workflows=[IssueDeliveryWorkflow]).replay_workflow(history)
 
 
@@ -2002,7 +2114,7 @@ def _sequenced_step(
             return answers.pop(0) if len(answers) > 1 else answers[0]
         if step not in script:
             raise AssertionError(f"unscripted step {step!r} invoked with {request['payload']!r}")
-        return script[step]
+        return _registered_child(step, request, script[step])
 
     return execute_control_step
 

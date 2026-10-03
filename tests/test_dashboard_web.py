@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
@@ -19,6 +20,7 @@ from engineering_control.db.models import (
     OperationRequest,
     Run,
 )
+from engineering_control.operations.models import AuditPlanCommand
 from engineering_control.operations.repository import OperationsRepository
 
 PASSWORD = "correct horse battery staple"  # noqa: S105 - deterministic test fixture
@@ -40,7 +42,8 @@ def _authenticated_client(tmp_path: Path) -> tuple[TestClient, DashboardReposito
             repository=repository,
             session_key=b"w" * 48,
         ),
-        base_url="https://testserver",
+        base_url="https://ade.musematic.ai",
+        headers={"Origin": "https://ade.musematic.ai"},
     )
     client.__enter__()
     login = client.get("/login")
@@ -82,9 +85,42 @@ def test_protected_pages_local_assets_and_observational_controls(tmp_path: Path)
         audit_page = client.get("/audits")
         assert 'id="plan-all-audits"' in audit_page.text
         assert 'id="start-all-audits"' in audit_page.text
+        assert 'pattern="[a-z][a-z0-9\\-]{0,119}"' in audit_page.text
+        rendered_pattern = re.search(r'pattern="([^"]+)"', audit_page.text)
+        assert rendered_pattern
+        browser_pattern = re.compile(rendered_pattern.group(1))
+        accepted_environments = [
+            "a",
+            "staging",
+            "prod-eu-1",
+            "a" + ("1" * 119),
+        ]
+        rejected_environments = ["", "Prod", "-x", "1staging", "prod_eu", "a" * 121]
+        for environment in accepted_environments:
+            assert browser_pattern.fullmatch(environment)
+            AuditPlanCommand(project="falcone", preset="snapshot", environment=environment)
+        for environment in rejected_environments:
+            assert browser_pattern.fullmatch(environment) is None
+            try:
+                AuditPlanCommand(project="falcone", preset="snapshot", environment=environment)
+            except ValidationError:
+                pass
+            else:
+                raise AssertionError(f"server accepted invalid environment: {environment!r}")
         assert "Audit all projects unavailable" not in audit_page.text
-        assert client.get("/static/dashboard.css").status_code == 200
-        assert client.get("/static/dashboard.js").status_code == 200
+        stylesheet = client.get("/static/dashboard.css")
+        assert stylesheet.status_code == 200
+        assert ".status-present" in stylesheet.text
+        assert ".audit-summary-label { min-width: 0; overflow-wrap: anywhere; }" in stylesheet.text
+        status_selectors = re.findall(r"\.status-([A-Za-z0-9_-]+)", stylesheet.text)
+        assert status_selectors
+        assert all(value == value.lower() for value in status_selectors)
+        javascript = client.get("/static/dashboard.js")
+        assert javascript.status_code == 200
+        assert "status status-${String(label).toLowerCase()}" in javascript.text
+        assert (
+            'summary.append(node("span", "audit-summary-label", `${item.project}' in javascript.text
+        )
         assert client.get("/robots.txt").text == "User-agent: *\nDisallow: /\n"
     finally:
         client.__exit__(None, None, None)
@@ -100,7 +136,11 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
         repository=repository,
         session_key=b"a" * 48,
     )
-    with TestClient(app, base_url="https://testserver") as client:
+    with TestClient(
+        app,
+        base_url="https://ade.musematic.ai",
+        headers={"Origin": "https://ade.musematic.ai"},
+    ) as client:
         assert client.get("/api/dashboard/backlog").status_code == 401
         assert client.get("/api/dashboard/overview").status_code == 401
         assert client.get("/api/dashboard/workflows").status_code == 401
@@ -110,6 +150,7 @@ def test_dashboard_apis_require_session_and_return_empty_states(tmp_path: Path) 
         assert client.get("/api/dashboard/findings").status_code == 401
         assert client.get("/api/dashboard/enhancements").status_code == 401
         page = client.get("/login")
+        assert 'autocomplete="current-password"' in page.text
         client.post("/login", data={"csrf_token": _csrf(page.text), "password": PASSWORD})
         backlog = client.get("/api/dashboard/backlog").json()
         audits = client.get("/api/dashboard/audits").json()
@@ -239,7 +280,11 @@ def test_dashboard_operation_export_requires_session_and_returns_bounded_attachm
         session_key=b"e" * 48,
     )
     path = f"/api/dashboard/operations/{operation_id}/export"
-    with TestClient(app, base_url="https://testserver") as client:
+    with TestClient(
+        app,
+        base_url="https://ade.musematic.ai",
+        headers={"Origin": "https://ade.musematic.ai"},
+    ) as client:
         assert client.get(path).status_code == 401
         login = client.get("/login")
         client.post("/login", data={"csrf_token": _csrf(login.text), "password": PASSWORD})
@@ -281,7 +326,11 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
     assert not any("journal" in path or "shell" in path or "terminal" in path for path in paths)
     assert not any("codex" in path or "claude" in path for path in paths)
 
-    with TestClient(app, base_url="https://testserver") as client:
+    with TestClient(
+        app,
+        base_url="https://ade.musematic.ai",
+        headers={"Origin": "https://ade.musematic.ai"},
+    ) as client:
         login = client.get("/login")
         client.post("/login", data={"csrf_token": _csrf(login.text), "password": PASSWORD})
         javascript = client.get("/static/dashboard.js").text
@@ -292,3 +341,5 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         assert ".command-group { display: grid; gap: .8rem; min-width: 0; }" in stylesheet
         assert ".command-form .muted" in stylesheet
         assert "overflow-wrap: anywhere" in stylesheet
+        assert "overflow-x: clip" in stylesheet
+        assert "min-width: 0; max-width: 100%" in stylesheet

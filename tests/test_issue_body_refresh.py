@@ -125,3 +125,34 @@ async def test_refresh_fails_soft(
 def test_refresh_runs_on_the_github_worker() -> None:
     queue = ControlledWorkflow._activity_queue("delivery.refresh_issue_body", {})
     assert queue == GITHUB_TASK_QUEUE
+
+
+@pytest.mark.asyncio
+async def test_refresh_refuses_a_body_edited_after_approval(tmp_path: Any) -> None:
+    # NEW-112 review: the approved delivery's body hash travels with the refresh request.
+    import hashlib
+
+    approved = "Approved body A"
+    edited = "Edited body B"
+    approved_sha = hashlib.sha256(approved.encode()).hexdigest()
+    request = {
+        "issue_repository": "gntik-ai/musematic",
+        "issue_number": 993,
+        "approved_issue_body_sha256": approved_sha,
+    }
+
+    changed = await _handler(
+        tmp_path, _Broker({"number": 993, "state": "OPEN", "body": edited})
+    ).handle("delivery.refresh_issue_body", request)
+    assert changed["status"] == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+    assert changed["blocker"] == "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
+    assert "body_excerpt" not in changed
+    assert changed["current_body_sha256"] == hashlib.sha256(edited.encode()).hexdigest()
+    assert "/loop import" in changed["blocker_detail"]
+    assert "approve-r3" in changed["blocker_detail"]
+
+    same = await _handler(
+        tmp_path, _Broker({"number": 993, "state": "OPEN", "body": approved})
+    ).handle("delivery.refresh_issue_body", request)
+    assert same["status"] == "ISSUE_BODY_REFRESHED"
+    assert same["source_body_sha256"] == approved_sha

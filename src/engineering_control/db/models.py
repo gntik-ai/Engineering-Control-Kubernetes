@@ -137,6 +137,8 @@ class ChangeSet(UUIDPrimaryKey, Timestamps, Base):
 
 class Run(UUIDPrimaryKey, Timestamps, Base):
     __tablename__ = "runs"
+    # Trusted Temporal start/registration binding only; no historical backfill.
+    temporal_first_execution_run_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
     campaign_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("campaigns.id"), index=True)
     change_set_id: Mapped[UUID | None] = mapped_column(
         Uuid, ForeignKey("change_sets.id"), index=True
@@ -567,6 +569,14 @@ class DashboardAuthentication(Base):
     __table_args__ = (CheckConstraint("id = 1", name="singleton"),)
 
 
+class DashboardSessionRevocation(Base):
+    __tablename__ = "dashboard_session_revocations"
+    session_binding_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    password_version: Mapped[int] = mapped_column(Integer)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class DashboardEvent(Base):
     __tablename__ = "dashboard_events"
     id: Mapped[int] = mapped_column(
@@ -588,6 +598,12 @@ class DashboardEvent(Base):
     current_phase: Mapped[str | None] = mapped_column(String(120))
     message: Mapped[str] = mapped_column(String(500))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Only correlated gateway-ingest events use this key. Historical rows are
+    # left NULL; no old event or supposed acknowledgement is reconstructed.
+    gateway_ingestion_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    __table_args__ = (
+        Index("uq_dashboard_events_gateway_ingestion_key", "gateway_ingestion_key", unique=True),
+    )
 
 
 class ActionCandidate(UUIDPrimaryKey, Base):
@@ -605,6 +621,15 @@ class ActionCandidate(UUIDPrimaryKey, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_operation_id: Mapped[UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey(
+            "operation_requests.id",
+            name="fk_action_candidates_accepted_operation",
+            ondelete="SET NULL",
+        ),
+        index=True,
+    )
     __table_args__ = (
         UniqueConstraint(
             "binding_hash",
@@ -624,6 +649,9 @@ class ReauthenticationBinding(UUIDPrimaryKey, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+ACTIVE_OPERATION_STATUSES = ("PENDING", "DISPATCHING", "STARTED", "RUNNING")
 
 
 class OperationRequest(UUIDPrimaryKey, Base):
@@ -713,4 +741,12 @@ Index(
     OperationRequest.action,
     OperationRequest.target_id,
     OperationRequest.status,
+)
+Index(
+    "uq_operation_requests_active_target",
+    OperationRequest.action,
+    OperationRequest.target_id,
+    unique=True,
+    postgresql_where=OperationRequest.status.in_(ACTIVE_OPERATION_STATUSES),
+    sqlite_where=OperationRequest.status.in_(ACTIVE_OPERATION_STATUSES),
 )

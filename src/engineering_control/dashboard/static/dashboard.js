@@ -17,14 +17,17 @@ const localTime = (value) => {
     : "—";
 };
 const elapsed = (seconds) => {
-  if (!Number.isFinite(Number(seconds))) return "—";
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "Unknown";
   let rest = Math.max(0, Number(seconds));
   const parts = [[Math.floor(rest / 86400), "d"]]; rest %= 86400;
   parts.push([Math.floor(rest / 3600), "h"]); rest %= 3600;
   parts.push([Math.floor(rest / 60), "m"], [Math.floor(rest % 60), "s"]);
   return parts.filter(([amount]) => amount).slice(0, 2).map(([amount, unit]) => `${amount}${unit}`).join(" ") || "0s";
 };
-const status = (value) => node("span", `status status-${value || "unknown"}`, value || "unknown");
+const status = (value) => {
+  const label = value || "unknown";
+  return node("span", `status status-${String(label).toLowerCase()}`, label);
+};
 const badge = (value, kind = "") => node("span", `badge ${kind}`, value);
 const link = (href, label, external = false) => {
   const value = node("a", "", label); value.href = href;
@@ -62,7 +65,48 @@ const timestampCell = (value) => {
 };
 
 const csrfToken = () => document.body.dataset.csrfToken || "";
+const adoptSessionRotation = (authorized) => {
+  if (authorized.session_rotated !== true || typeof authorized.csrf_token !== "string" || authorized.csrf_token.length < 20) {
+    throw new Error("Session renewal was not confirmed. Reload and sign in before retrying.");
+  }
+  document.body.dataset.csrfToken = authorized.csrf_token;
+  document.querySelectorAll('input[name="csrf_token"]').forEach((field) => { field.value = authorized.csrf_token; });
+};
 let pendingCandidate = null;
+// Exact request proof stays in this tab's memory only, never browser storage.
+// A retry reads the durable acceptance receipt; it does not authorize a new effect.
+let pendingExecution = null;
+let acceptedOperationId = null;
+
+const pendingOperationMessage = (operation) => {
+  const receipt = `Operation ${operation.operation_id}: ${operation.status}. `;
+  if (operation.status === "DISPATCHING") {
+    return receipt + "Execution has been claimed; completion is not yet confirmed. Closing this dialog does not cancel it.";
+  }
+  const observation = operation.dispatch_observation;
+  const explanations = {
+    SYNTHETIC_ONLY: "The private API dispatcher is paused for maintenance; this accepted operation has not started.",
+    DIAGNOSTICS_ONLY: "Only connection diagnostics may execute; product operations remain fenced during acceptance.",
+    DIAGNOSTICS_STOPPED: "The diagnostic dispatcher is stopped; product operations remain fenced.",
+    DISPATCHER_STOPPED: "The private API dispatcher is stopped; this accepted operation has not started.",
+    DISPATCHING: "The dispatcher was observed running, but this operation has not yet been claimed.",
+    UNKNOWN: "Dispatcher availability cannot currently be verified; execution is not confirmed.",
+  };
+  return receipt + (explanations[observation?.status] || explanations.UNKNOWN) +
+    " Check this same operation below; do not submit another. Closing this dialog does not cancel it.";
+};
+
+async function readAcceptedOperation() {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`/api/dashboard/operations/${acceptedOperationId}`, {cache: "no-store", signal: controller.signal});
+    if (!response.ok) throw new Error(`Status for operation ${acceptedOperationId} is unavailable. Its outcome is unknown; do not submit another.`);
+    const operation = await response.json();
+    if (operation.operation_id !== acceptedOperationId) throw new Error("Operation status identity mismatch; execution is not confirmed.");
+    return operation;
+  } finally { clearTimeout(deadline); }
+}
 
 const actionEffect = (action) => {
   if (["refresh_connections", "audit_plan"].includes(action)) return "Read-only probe or metadata plan; no product mutation.";
@@ -72,6 +116,7 @@ const actionEffect = (action) => {
 };
 
 async function prepareAction(command, errorTarget = null) {
+  if (byId("action-execute")?.disabled) return;
   try {
     const response = await fetch("/api/dashboard/actions/candidates", {
       method: "POST", headers: {"Content-Type": "application/json"},
@@ -87,6 +132,12 @@ async function prepareAction(command, errorTarget = null) {
       throw new Error((candidate.capability.blockers || []).join(" · ") || `Capability is ${candidate.capability.status}.`);
     }
     pendingCandidate = candidate;
+    pendingExecution = null;
+    acceptedOperationId = null;
+    setError("action-progress");
+    byId("action-cancel").textContent = "Cancel";
+    byId("action-password").required = true;
+    byId("action-execute").textContent = "Confirm operation";
     byId("action-effect").textContent = actionEffect(command.action);
     byId("action-binding").textContent = JSON.stringify(candidate.operation_binding, null, 2);
     byId("action-password").value = ""; byId("action-phrase").value = "";
@@ -103,52 +154,108 @@ async function prepareAction(command, errorTarget = null) {
 
 async function confirmAction(event) {
   event.preventDefault(); if (!pendingCandidate) return;
-  const execute = byId("action-execute"); execute.disabled = true;
+  const execute = byId("action-execute"); if (execute.disabled) return;
+  execute.disabled = true; byId("action-cancel").disabled = true;
   try {
-    const reauth = await fetch("/api/dashboard/actions/reauthenticate", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, current_password: byId("action-password").value}),
-    });
-    const authorized = await reauth.json();
-    if (!reauth.ok) throw new Error(authorized.detail || "Unable to authorize operation.");
-    byId("action-password").value = "";
+    setError("action-blockers");
+    let operation;
+    if (acceptedOperationId) {
+      operation = await readAcceptedOperation();
+    } else {
+    if (!pendingExecution) {
+      const reauth = await fetch("/api/dashboard/actions/reauthenticate", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, current_password: byId("action-password").value}),
+      });
+      const authorized = await reauth.json();
+      if (!reauth.ok) throw new Error(authorized.detail || "Unable to authorize operation.");
+      byId("action-password").value = "";
+      adoptSessionRotation(authorized);
+      const expiresAt = Date.parse(authorized.expires_at);
+      if (!Number.isFinite(expiresAt) || typeof authorized.reauthentication_token !== "string") {
+        throw new Error("Authorization response was incomplete. Reload and sign in before retrying.");
+      }
+      pendingExecution = Object.freeze({
+        expiresAt,
+        body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, reauthentication_token: authorized.reauthentication_token, confirmation_phrase: byId("action-phrase").value || null}),
+      });
+      byId("action-password").required = false;
+    }
+    if (Date.now() >= pendingExecution.expiresAt) {
+      throw new Error("Confirmation expired. Check operation status before preparing another action.");
+    }
     const response = await fetch("/api/dashboard/actions/execute", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({csrf_token: csrfToken(), candidate_id: pendingCandidate.candidate_id, reauthentication_token: authorized.reauthentication_token, confirmation_phrase: byId("action-phrase").value || null}),
+      body: pendingExecution.body,
     });
-    let operation = await response.json();
+    operation = await response.json();
     if (!response.ok) throw new Error(operation.detail || "Operation was not accepted.");
-    for (let attempt = 0; attempt < 20 && ["PENDING", "DISPATCHING"].includes(operation.status); attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 500));
-      const poll = await fetch(`/api/dashboard/operations/${operation.operation_id}`, {cache: "no-store"});
-      if (poll.ok) operation = await poll.json();
+    if (typeof operation.operation_id !== "string" || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(operation.operation_id)) {
+      throw new Error("Acceptance receipt was incomplete. Retry this same request; do not prepare another operation.");
     }
-    if (["FAILED", "BLOCKED"].includes(operation.status)) throw new Error(operation.safe_error || `Operation ${operation.status.toLowerCase()}.`);
-    byId("action-dialog").close(); pendingCandidate = null;
+    acceptedOperationId = operation.operation_id;
+    pendingExecution = null;
+    byId("action-cancel").textContent = "Close (does not cancel)";
+    }
+    for (let attempt = 0; attempt < 20 && ["PENDING", "DISPATCHING"].includes(operation.status); attempt += 1) {
+      setError("action-progress", pendingOperationMessage(operation));
+      if (operation.status === "PENDING" && (["SYNTHETIC_ONLY", "DISPATCHER_STOPPED", "DIAGNOSTICS_STOPPED"].includes(operation.dispatch_observation?.status) || (operation.dispatch_observation?.status === "DIAGNOSTICS_ONLY" && operation.action !== "refresh_connections"))) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      operation = await readAcceptedOperation();
+    }
+    if (["PENDING", "DISPATCHING"].includes(operation.status)) {
+      setError("action-progress", pendingOperationMessage(operation));
+      return;
+    }
+    setError("action-progress");
+    if (["FAILED", "BLOCKED"].includes(operation.status)) throw new Error(`Operation ${operation.operation_id}: ${operation.status}. ${operation.safe_error || "Inspect its evidence before taking another action."}`);
+    if (!["COMPLETED", "STARTED"].includes(operation.status)) throw new Error(`Operation ${operation.operation_id}: unrecognized state; execution is not confirmed.`);
+    byId("action-dialog").close(); pendingCandidate = null; pendingExecution = null; acceptedOperationId = null;
     if (operation.workflow_id) location.assign(`/workflows/${encodeURIComponent(operation.workflow_id)}`);
     else if (operation.result_available) location.assign(`/api/dashboard/operations/${operation.operation_id}/export`);
     else location.reload();
-  } catch (error) { setError("action-blockers", error.message); }
-  finally { execute.disabled = false; }
+  } catch (error) {
+    const suffix = acceptedOperationId ? ` Checking operation ${acceptedOperationId} is read-only; it will not submit another.` : (pendingExecution ? " Retry checks this same operation; it will not create another." : "");
+    setError("action-blockers", error.message + suffix);
+  }
+  finally {
+    byId("action-password").value = ""; execute.disabled = false;
+    execute.textContent = acceptedOperationId ? "Check operation status" : (pendingExecution ? "Retry same operation" : "Confirm operation");
+    byId("action-cancel").disabled = false;
+  }
 }
 
 function setupActionDialog() {
   const form = byId("action-confirmation"); if (!form) return;
   form.addEventListener("submit", confirmAction);
-  byId("action-cancel").addEventListener("click", () => { pendingCandidate = null; byId("action-password").value = ""; byId("action-dialog").close(); });
+  const clearPending = () => { pendingCandidate = null; pendingExecution = null; acceptedOperationId = null; setError("action-progress"); byId("action-password").value = ""; byId("action-password").required = true; };
+  byId("action-cancel").addEventListener("click", () => { if (byId("action-execute").disabled) return; clearPending(); byId("action-dialog").close(); });
+  byId("action-dialog").addEventListener("cancel", (event) => { if (byId("action-execute").disabled) event.preventDefault(); else clearPending(); });
 }
 
 function setupOverview() {
   if (!byId("summary-cards")) return;
   const load = async () => {
+    const controller = new AbortController();
+    const deadline = window.setTimeout(() => controller.abort(), 4000);
     try {
       const [response, connectionResponse] = await Promise.all([
-        fetch("/api/dashboard/overview", {cache: "no-store"}),
-        fetch("/api/dashboard/connections", {cache: "no-store"}),
+        fetch("/api/dashboard/overview", {cache: "no-store", signal: controller.signal}),
+        fetch("/api/dashboard/connections", {cache: "no-store", signal: controller.signal}),
       ]);
       if (!response.ok || !connectionResponse.ok) throw new Error("Overview data is temporarily unavailable.");
       const data = await response.json(); const connections = await connectionResponse.json();
-      const labels = [["active_workflows", "Active workflows"], ["queued_issues", "Queued issues"], ["blocked_workflows", "Blocked workflows"], ["failed_24h", "Failed in 24h"], ["active_audits", "Active audits"]];
+      const labels = [["active_workflows", "Active workflows"], ["pending_inventory_count", "Pending inventory (not a queue)"], ["ambiguous_inventory_count", "Ambiguous inventory snapshots"], ["blocked_workflows", "Blocked workflows"], ["failed_24h", "Failed in 24h"], ["active_audits", "Active audits"]];
+      const admission = data.admission;
+      const admissionLabels = {
+        SYNTHETIC_ONLY: "SYNTHETIC ONLY — product dispatch is fenced at the private API; pending-operation dispatcher is stopped.",
+        DIAGNOSTICS_ONLY: "DIAGNOSTICS ONLY — telemetry and connection diagnostics are enabled; issue and deployment execution remain fenced.",
+        DIAGNOSTICS_STOPPED: "DIAGNOSTICS STOPPED — diagnostic processing is unavailable; product execution remains fenced.",
+        DISPATCHING: "DISPATCHING — the private API dispatcher is running. This is not an approval or project-readiness verdict.",
+        DISPATCHER_STOPPED: "DISPATCHER STOPPED — private API mode is normal, but queued operations are not being dispatched.",
+        UNKNOWN: "UNKNOWN — private API admission is not currently verified.",
+      };
+      byId("admission-state").textContent = `${admissionLabels[admission?.status] || admissionLabels.UNKNOWN}${admission?.observed_at ? ` Observed ${localTime(admission.observed_at)}.` : ""}`;
       byId("summary-cards").replaceChildren(...labels.map(([key, label]) => {
         const card = node("article", "summary-card"); card.append(node("p", "muted", label), node("strong", "summary-value", show(data.summary[key]))); return card;
       }));
@@ -162,7 +269,8 @@ function setupOverview() {
         return card;
       });
       byId("active-work").replaceChildren(...work); byId("idle-state").classList.toggle("hidden", !data.idle);
-      if (data.idle) byId("idle-details").replaceChildren(...list([["Queue depth", data.summary.queued_issues], ["Next eligible", data.next_eligible_issue ? `${data.next_eligible_issue.project} #${data.next_eligible_issue.issue_number}` : null], ["Active blockers", data.summary.blocked_workflows], ["Provider readiness", (data.providers || []).map((item) => `${item.provider}: ${item.available ? "available" : item.authentication_status}`).join(", ")]], "").children);
+      const candidate = data.next_inventory_candidate;
+      if (data.idle) byId("idle-details").replaceChildren(...list([["Pending inventory (not a queue)", data.summary.pending_inventory_count], ["Inventory candidate (not approved)", candidate ? `${candidate.repository} #${candidate.issue_number}` : "None in latest recorded snapshots"], ["Inventory observed", localTime(candidate?.inventory_observed_at)], ["Candidate status", candidate ? `${candidate.delivery_status} · ${candidate.eligibility_status} · approval not evaluated` : null], ["Active blockers", data.summary.blocked_workflows], ["Provider readiness", (data.providers || []).map((item) => `${item.provider}: authentication ${item.authentication_status || "unknown"}; capacity ${item.capacity_status || "UNKNOWN"}`).join(", ")]], "").children);
       const health = [...(data.services || []), ...(data.providers || [])].map((item) => {
         const card = node("article", `health-card${item.stale ? " stale" : ""}`); card.append(node("h4", "", item.name || item.provider), status(item.status || item.capacity_status || (item.available ? "ready" : "unknown")), list([["Kind", item.kind || "provider"], ["CLI", item.cli_version], ["Authentication", item.authentication_status], ["Active", item.active_executions], ["Queue", item.queue_depth], ["Last success", localTime(item.last_success)], ["Last failure", localTime(item.last_failure)], ["Observed", localTime(item.observed_at)], ["Freshness", item.freshness], ["Source", item.source]])); return card;
       });
@@ -172,7 +280,10 @@ function setupOverview() {
         const card = node("article", `health-card${item.status === "STALE" ? " stale" : ""}`); card.append(node("h4", "", item.component), status(item.status), list([["Checked", localTime(item.checked_at)], ["Freshness", elapsed(item.freshness_seconds)], ["Source", item.source], ["Next action", item.next_action]])); return card;
       });
       byId("overview-connections").replaceChildren(...connectionCards); byId("overview-freshness").textContent = `Observed ${localTime(data.observed_at)} · ${data.source}`; setError("overview-error");
-    } catch (error) { setError("overview-error", error.message); }
+    } catch (error) {
+      byId("admission-state").textContent = "UNKNOWN — overview refresh failed; previous admission is not current evidence.";
+      setError("overview-error", error.message);
+    } finally { window.clearTimeout(deadline); }
   };
   load(); window.setInterval(load, 5000);
 }
@@ -274,7 +385,7 @@ function setupExecution() {
 
 function setupAudits() {
   const form = byId("audit-filters"); if (!form) return; restoreForm(form); const expanded = new Set();
-  const load = async () => { try { const response = await fetch(`/api/dashboard/audits?${queryFrom(form)}`, {cache: "no-store"}); if (!response.ok) throw new Error("Audit data is temporarily unavailable."); const data = await response.json(); const cards = data.items.map((item) => { const details = node("details", "audit"); details.open = expanded.has(item.campaign_id); details.addEventListener("toggle", () => details.open ? expanded.add(item.campaign_id) : expanded.delete(item.campaign_id)); const summary = node("summary"); summary.append(node("span", "", `${item.project} · ${item.preset || item.name} · ${item.campaign_id}`), status(item.normalized_status)); details.append(summary); if (item.total_cells > 0) { const progress = node("progress"); progress.max = 100; progress.value = item.completion_percentage; progress.setAttribute("aria-label", `${item.completion_percentage}% complete`); details.append(progress); } else details.append(node("p", "muted", "Progress is indeterminate: no coverage cells are persisted.")); const discover = node("button", "compact", "Discover enhancements"); discover.type = "button"; discover.addEventListener("click", () => prepareAction({action: "enhancement_discover", project: item.project, campaign_id: item.campaign_id, dry_run: true}, "audit-error")); details.append(node("p", "", `${item.completion_percentage}% · ${item.total_cells} cells · last activity ${localTime(item.last_activity_at)}`), discover, list([["Workflow", item.workflow_id], ["Environment", item.environment], ["Raw status", item.raw_status], ["Freshness", `${item.freshness}${has(item.age_seconds) ? ` · ${elapsed(item.age_seconds)} old` : ""}`], ["Data source", item.source], ["Runnable", item.runnable_cells], ["Queued", item.queued_cells], ["Running", item.running_cells], ["Passed", item.passed_cells], ["Confirmed findings", item.confirmed_findings], ["Blocked by root", item.blocked_by_root], ["Independently blocked", item.independently_blocked], ["Failed", item.failed_cells], ["Skipped", item.skipped_cells], ["Surface", item.repository_surface], ["Domain", item.domain], ["Route / operation", item.route_operation], ["Persona", item.persona], ["Flow", item.flow], ["Lens", item.lens], ["Provider / role", `${show(item.provider)} / ${show(item.provider_role)}`], ["Worker", item.worker], ["Execution", item.execution_id], ["Cell start", localTime(item.cell_started_at)], ["Cell end", localTime(item.cell_ended_at)], ["Result", item.cell_result], ["Blocker", item.blocker], ["Persona lifecycle", item.persona_lifecycle ? JSON.stringify(item.persona_lifecycle) : null], ["Root blockers", (item.root_blockers || []).map((root) => `${root.code}: ${root.dependent_cell_count} dependent cells`).join(" · ")]])); return details; }); byId("audit-list").replaceChildren(...cards); byId("audit-empty").classList.toggle("hidden", cards.length !== 0); byId("audit-refreshed").textContent = `Last refreshed ${localTime(data.refreshed_at)}`; setError("audit-error"); } catch (error) { setError("audit-error", error.message); } };
+  const load = async () => { try { const response = await fetch(`/api/dashboard/audits?${queryFrom(form)}`, {cache: "no-store"}); if (!response.ok) throw new Error("Audit data is temporarily unavailable."); const data = await response.json(); const cards = data.items.map((item) => { const details = node("details", "audit"); details.open = expanded.has(item.campaign_id); details.addEventListener("toggle", () => details.open ? expanded.add(item.campaign_id) : expanded.delete(item.campaign_id)); const summary = node("summary"); summary.append(node("span", "audit-summary-label", `${item.project} · ${item.preset || item.name} · ${item.campaign_id}`), status(item.normalized_status)); details.append(summary); if (item.total_cells > 0) { const progress = node("progress"); progress.max = 100; progress.value = item.completion_percentage; progress.setAttribute("aria-label", `${item.completion_percentage}% complete`); details.append(progress); } else details.append(node("p", "muted", "Progress is indeterminate: no coverage cells are persisted.")); const discover = node("button", "compact", "Discover enhancements"); discover.type = "button"; discover.addEventListener("click", () => prepareAction({action: "enhancement_discover", project: item.project, campaign_id: item.campaign_id, dry_run: true}, "audit-error")); details.append(node("p", "", `${item.completion_percentage}% · ${item.total_cells} cells · last activity ${localTime(item.last_activity_at)}`), discover, list([["Workflow", item.workflow_id], ["Environment", item.environment], ["Raw status", item.raw_status], ["Freshness", `${item.freshness}${has(item.age_seconds) ? ` · ${elapsed(item.age_seconds)} old` : ""}`], ["Data source", item.source], ["Runnable", item.runnable_cells], ["Queued", item.queued_cells], ["Running", item.running_cells], ["Passed", item.passed_cells], ["Confirmed findings", item.confirmed_findings], ["Blocked by root", item.blocked_by_root], ["Independently blocked", item.independently_blocked], ["Failed", item.failed_cells], ["Skipped", item.skipped_cells], ["Surface", item.repository_surface], ["Domain", item.domain], ["Route / operation", item.route_operation], ["Persona", item.persona], ["Flow", item.flow], ["Lens", item.lens], ["Provider / role", `${show(item.provider)} / ${show(item.provider_role)}`], ["Worker", item.worker], ["Execution", item.execution_id], ["Cell start", localTime(item.cell_started_at)], ["Cell end", localTime(item.cell_ended_at)], ["Result", item.cell_result], ["Blocker", item.blocker], ["Persona lifecycle", item.persona_lifecycle ? JSON.stringify(item.persona_lifecycle) : null], ["Root blockers", (item.root_blockers || []).map((root) => `${root.code}: ${root.dependent_cell_count} dependent cells`).join(" · ")]])); return details; }); byId("audit-list").replaceChildren(...cards); byId("audit-empty").classList.toggle("hidden", cards.length !== 0); byId("audit-refreshed").textContent = `Last refreshed ${localTime(data.refreshed_at)}`; setError("audit-error"); } catch (error) { setError("audit-error", error.message); } };
   form.addEventListener("submit", (event) => { event.preventDefault(); persistForm(form); load(); }); load(); window.setInterval(load, 5000);
   const actionForm = byId("audit-action-form");
   const auditCommand = (action, presetOverride = null) => ({action, project: actionForm.elements.action_project.value, preset: presetOverride || actionForm.elements.preset.value, environment: actionForm.elements.environment.value, personas: [], lenses: [], documentation_level: "all", publish_findings: action === "audit_start" ? actionForm.elements.publish_findings.checked : false, ...(action === "audit_start" ? {production: false} : {})});

@@ -5,7 +5,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,26 +21,25 @@ from sqlalchemy.orm import Session
 from engineering_control.config import Settings, get_settings
 from engineering_control.db.models import NotificationOutbox
 from engineering_control.logging import configure_logging
+from engineering_control.retention_limits import (
+    NOTIFICATION_OUTBOX_DELIVERED_STATUS,
+    NOTIFICATION_OUTBOX_PENDING_STATUS,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 logger = structlog.get_logger()
 
 
-class NotificationService:
-    """Deliver the durable notification outbox to the configured sink.
-
-    NEW-112a restores the 2026-09-16 (2b678d9) delivery contract that later deploys from
-    main dropped: the default sink is the gateway webhook on loopback, which accepts only
-    HMAC-SHA256 V2 signatures and acknowledges each delivery; bearer mode is limited to
-    credential-free HTTPS. Token custody accepts an owner-only file (0400/0600, owned by
-    root or this service) or a root-owned group-readable file of this service's group.
-    """
-
-    def __init__(self, settings: Settings) -> None:
+class NotificationSink:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        client_factory: Callable[[], httpx.Client] | None = None,
+    ) -> None:
         self.settings = settings
+        self.client_factory = client_factory or (lambda: httpx.Client(timeout=10, trust_env=False))
         self._validate_sink()
-        self.engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
-        self.redactor = SecretRedactor()
 
     def _validate_sink(self) -> None:
         if not self.settings.notification_sink_url:
@@ -61,7 +62,10 @@ class NotificationService:
             or parsed.hostname not in {"127.0.0.1", "::1"}
             or parsed.port != 8644
             or parsed.path != "/webhooks/engineering-alerts"
-            or not credential_free
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
         ):
             raise ValueError("HMAC notification sink must be a credential-free loopback HTTP URL")
 
@@ -96,7 +100,12 @@ class NotificationService:
         return token
 
     def _request(
-        self, *, topic: str, request_id: str, token: str, payload: dict[str, Any]
+        self,
+        *,
+        topic: str,
+        request_id: str,
+        token: str,
+        payload: dict[str, Any],
     ) -> tuple[bytes, dict[str, str]]:
         body = json.dumps(
             {"topic": topic, "payload": payload},
@@ -112,76 +121,118 @@ class NotificationService:
                 timestamp.encode("ascii") + b"." + body,
                 hashlib.sha256,
             ).hexdigest()
-            headers.update({"X-Webhook-Timestamp": timestamp, "X-Webhook-Signature-V2": signature})
+            headers.update(
+                {
+                    "X-Webhook-Timestamp": timestamp,
+                    "X-Webhook-Signature-V2": signature,
+                }
+            )
         else:
             headers["Authorization"] = f"Bearer {token}"
         return body, headers
 
-    def _deliver(
+    def deliver(
         self,
-        client: httpx.Client,
         *,
         topic: str,
         request_id: str,
-        token: str,
         payload: dict[str, Any],
+        client: httpx.Client | None = None,
     ) -> None:
-        assert self.settings.notification_sink_url
+        if not self.settings.notification_sink_url:
+            raise RuntimeError("notification sink is disabled")
+        if not self.settings.notification_token_file:
+            raise RuntimeError("notification token configuration changed after validation")
+        if not re.fullmatch(r"[a-z][a-z0-9.-]{0,119}", topic):
+            raise ValueError("notification topic is outside its bounded syntax")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id):
+            raise ValueError("notification request ID is outside its bounded syntax")
+        token = self._token(self.settings.notification_token_file)
         body, headers = self._request(
-            topic=topic, request_id=request_id, token=token, payload=payload
+            topic=topic,
+            request_id=request_id,
+            token=token,
+            payload=payload,
         )
-        response = client.post(self.settings.notification_sink_url, headers=headers, content=body)
-        response.raise_for_status()
-        if self.settings.notification_auth_mode == "hmac-sha256-v2":
-            try:
-                acknowledgement = response.json()
-            except ValueError as error:
-                raise httpx.HTTPError(
-                    "notification sink returned a malformed acknowledgement"
-                ) from error
-            if not isinstance(acknowledgement, dict) or acknowledgement.get("status") not in {
-                "delivered",
-                "duplicate",
-            }:
-                raise httpx.HTTPError("notification sink did not acknowledge delivery")
+        owned_client = client is None
+        active_client = client or self.client_factory()
+        try:
+            response = active_client.post(
+                self.settings.notification_sink_url,
+                headers=headers,
+                content=body,
+            )
+            response.raise_for_status()
+            if self.settings.notification_auth_mode == "hmac-sha256-v2":
+                try:
+                    acknowledgement = response.json()
+                except ValueError as error:
+                    raise httpx.HTTPError(
+                        "notification sink returned a malformed acknowledgement"
+                    ) from error
+                if not isinstance(acknowledgement, dict) or acknowledgement.get("status") not in {
+                    "delivered",
+                    "duplicate",
+                }:
+                    raise httpx.HTTPError("notification sink did not acknowledge delivery")
+        finally:
+            if owned_client:
+                active_client.close()
+
+
+class NotificationService:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        client_factory: Callable[[], httpx.Client] | None = None,
+    ) -> None:
+        self.settings = settings
+        self.engine = create_engine(settings.database_url.get_secret_value(), pool_pre_ping=True)
+        self.redactor = SecretRedactor()
+        self.sink = NotificationSink(settings, client_factory=client_factory)
 
     def run_once(self) -> int:
         if not self.settings.notification_sink_url:
             return 0
         if not self.settings.notification_token_file:
-            raise ValueError("notification sink requires a token file")
+            raise RuntimeError("notification token configuration changed after validation")
         delivered = 0
         with Session(self.engine) as session, session.begin():
             rows = session.scalars(
                 select(NotificationOutbox)
                 .where(
-                    NotificationOutbox.status == "PENDING",
+                    NotificationOutbox.status == NOTIFICATION_OUTBOX_PENDING_STATUS,
                     NotificationOutbox.next_attempt_at <= datetime.now(UTC),
                 )
                 .order_by(NotificationOutbox.created_at)
                 .limit(20)
                 .with_for_update(skip_locked=True)
             ).all()
-            token = self._token(self.settings.notification_token_file)
-            with httpx.Client(timeout=10, trust_env=False) as client:
+            with self.sink.client_factory() as client:
                 for row in rows:
                     payload: dict[str, Any] = self.redactor.redact(row.payload_json).value
                     try:
-                        self._deliver(
-                            client,
+                        self.sink.deliver(
                             topic=row.topic,
+                            # Main's (NEW-112a) deployed idempotency key: a delivery whose
+                            # acknowledgement was lost is re-sent under the same key.
                             request_id=f"notification-{row.id}",
-                            token=token,
                             payload=payload,
+                            client=client,
                         )
-                    except httpx.HTTPError:
+                    except httpx.HTTPError as error:
                         row.attempts += 1
-                        row.last_error_code = "SINK_HTTP_ERROR"
+                        row.last_error_code = (
+                            "SINK_HTTP_STATUS_ERROR"
+                            if isinstance(error, httpx.HTTPStatusError)
+                            else "SINK_TRANSPORT_ERROR"
+                        )
                         row.next_attempt_at = datetime.now(UTC) + timedelta(
                             seconds=min(3600, 2 ** min(row.attempts, 10))
                         )
                     else:
-                        row.status = "DELIVERED"
+                        row.status = NOTIFICATION_OUTBOX_DELIVERED_STATUS
                         row.delivered_at = datetime.now(UTC)
                         delivered += 1
         return delivered

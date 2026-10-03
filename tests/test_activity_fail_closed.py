@@ -20,17 +20,33 @@ class FakeReleaseHandler:
         return {**payload, "status": "RELEASE_HANDLER_REACHED", "step": step}
 
 
+class FakeCleanupScanHandler:
+    async def handle(self, step: str, payload: dict[str, object]) -> dict[str, object]:
+        return {**payload, "status": "SCAN_HANDLER_REACHED", "step": step}
+
+
 @pytest.mark.asyncio
 async def test_production_activity_rejects_invalid_authoritative_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    binding_activity_environment,
+    tmp_path,
 ) -> None:
     monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
-    activities = ControlActivities(Settings(synthetic_mode=False), "controller")
+    from engineering_control.db.models import Base
+
+    activities = ControlActivities(
+        Settings(synthetic_mode=False, database_url=f"sqlite:///{tmp_path / 'metadata.db'}"),
+        "controller",
+    )
+    Base.metadata.create_all(activities.metadata_handler.engine)
 
     with pytest.raises(ApplicationError, match="invalid metadata activity input"):
-        await activities.execute_control_step(
-            {"step": "campaign.finalize", "payload": {"campaign_id": "test"}}
+        await binding_activity_environment.run(
+            activities.execute_control_step,
+            {"step": "campaign.finalize", "payload": {"campaign_id": "test"}},
         )
+    activities.metadata_handler.engine.dispose()
+    activities.engineering_handler.engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -45,6 +61,30 @@ async def test_synthetic_activity_is_explicit(monkeypatch: pytest.MonkeyPatch) -
     assert result["status"] == "PASS"
 
 
+@pytest.mark.asyncio
+async def test_cleanup_aggregate_survives_control_activity_redaction_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
+    activities = ControlActivities(Settings(synthetic_mode=False), "scan")
+    activities.scan_handler = FakeCleanupScanHandler()  # type: ignore[assignment]
+
+    result = await activities.execute_control_step(
+        {
+            "step": "cleanup.protect_active",
+            "payload": {
+                "cleanup_candidates": [],
+                "dashboard_session_revocation_cleanup_count": 28,
+                "dashboard_session_revocation_cleanup_truncated": False,
+            },
+        }
+    )
+
+    assert result["status"] == "SCAN_HANDLER_REACHED"
+    assert result["dashboard_session_revocation_cleanup_count"] == 28
+    assert result["dashboard_session_revocation_cleanup_truncated"] is False
+
+
 def test_audit_blocker_persistence_is_controller_only() -> None:
     for step in ("campaign.persist_cell_blocker", "campaign.persist_snapshot_blockers"):
         assert step in ControlActivities._worker_steps["controller"]
@@ -55,6 +95,8 @@ def test_audit_blocker_persistence_is_controller_only() -> None:
 @pytest.mark.asyncio
 async def test_delivery_release_leases_is_wired_to_a_production_handler(
     monkeypatch: pytest.MonkeyPatch,
+    binding_activity_environment,
+    tmp_path,
 ) -> None:
     """NEW-20 regression, 2026-09-22: delivery.release_leases was added to
     ControlActivities._allowed_steps (and so to steps_for_worker('controller'))
@@ -69,13 +111,24 @@ async def test_delivery_release_leases_is_wired_to_a_production_handler(
     through the real execute_control_step path instead.
     """
     monkeypatch.setattr("engineering_control.activities.core.activity.heartbeat", lambda _: None)
-    activities = ControlActivities(Settings(synthetic_mode=False), "controller")
+    from engineering_control.db.models import Base
 
-    result = await activities.execute_control_step(
-        {"step": "delivery.release_leases", "payload": {}}
+    # Merged with 2b678d9: controller production steps run only inside a verified
+    # activity Run binding, so the real dispatch path is exercised inside one.
+    activities = ControlActivities(
+        Settings(synthetic_mode=False, database_url=f"sqlite:///{tmp_path / 'metadata.db'}"),
+        "controller",
+    )
+    Base.metadata.create_all(activities.metadata_handler.engine)
+
+    result = await binding_activity_environment.run(
+        activities.execute_control_step,
+        {"step": "delivery.release_leases", "payload": {}},
     )
 
     assert result["status"] == "NO_RUN_TO_RELEASE_LEASES_FOR"
+    activities.metadata_handler.engine.dispose()
+    activities.engineering_handler.engine.dispose()
 
 
 @pytest.mark.asyncio

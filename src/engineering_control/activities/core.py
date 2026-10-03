@@ -10,6 +10,8 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.config import Settings
+from engineering_control.db.run_enrollment import enroll_activity_run
+from engineering_control.db.runtime_binding import verified_activity_run_binding
 from engineering_control.security.redaction import SecretRedactor
 
 from .browser import BrowserActivityHandler
@@ -223,6 +225,7 @@ class ControlActivities:
         "notify.write_policy_required",
         "backlog.register_child_run",
         "backlog.register_run",
+        "backlog.record_ci_repair",
         "global_backlog.register",
         "global_backlog.select_next",
         "global_backlog.record_result",
@@ -544,6 +547,21 @@ class ControlActivities:
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        if self.worker_kind == "controller" and not self.settings.synthetic_mode:
+            async with verified_activity_run_binding():
+                assert self.metadata_handler is not None
+                try:
+                    await enroll_activity_run(self.metadata_handler.sessions)
+                except ValueError:
+                    raise ApplicationError(
+                        "Existing Run identity is unverifiable",
+                        type="RunIdentityUnverified",
+                        non_retryable=True,
+                    ) from None
+                return await self._dispatch_control_step(step, payload)
+        return await self._dispatch_control_step(step, payload)
+
+    async def _dispatch_control_step(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         safe_payload = self.redactor.redact(payload).value
         safe_payload = self._attach_orchestration_context(safe_payload)
         activity.heartbeat({"step": step, "phase": "validated"})

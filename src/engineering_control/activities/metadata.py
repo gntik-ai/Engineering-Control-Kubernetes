@@ -39,20 +39,24 @@ from engineering_control.db.models import (
     ComponentLease,
     CoverageCell,
     DashboardEvent,
+    DashboardSessionRevocation,
     Deployment,
     Finding,
     FindingVerification,
     GitHubBacklogCampaign,
     Incident,
     Issue,
+    NotificationOutbox,
     OperationExport,
     ProjectSnapshot,
     ProviderUsage,
     QuotaSnapshot,
     Run,
+    Step,
     VerificationResult,
     WorktreeLease,
 )
+from engineering_control.db.runtime_binding import new_bound_run
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BacklogApprovalBinding,
@@ -95,9 +99,19 @@ from engineering_control.models.reconciliation import (
     PromotionPublication,
 )
 from engineering_control.observability.agent import normalize_agent_role
+from engineering_control.operations.issue_delivery_approval import (
+    bind_change_set_issue_approval,
+    validate_change_set_issue_approval,
+    validate_child_issue_approval,
+)
+from engineering_control.operations.publication_authority import persist_publication_intent
 from engineering_control.policy.approvals import ApprovalService
 from engineering_control.quota.broker import QuotaBroker
 from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapshot
+from engineering_control.retention_limits import (
+    DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
+    NOTIFICATION_OUTBOX_PENDING_STATUS,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -522,6 +536,37 @@ class MetadataActivityHandler:
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            # Preparation gates may block, but post-effect persistence must remain truthful.
+            if (
+                step
+                in {
+                    "delivery.ensure_issue",
+                    "delivery.acquire_leases",
+                    "delivery.route_providers",
+                    "delivery.prepare_spec",
+                    "delivery.prepare_maker",
+                    "delivery.prepare_deployment_maker",
+                    "delivery.prepare_checker",
+                    "reconcile.prepare",
+                    "reconcile.prepare_promotion",
+                    "reconcile.prepare_release_review",
+                    "final.prepare",
+                    "final.authorize_deployment_merge",
+                    "final.prepare_issue_close",
+                    "staging.prepare",
+                    "staging.preflight",
+                    "staging.validate_approval",
+                }
+                and payload.get("change_set_id") is not None
+            ):
+                try:
+                    payload = await asyncio.to_thread(self._issue_approval_preparation, payload)
+                except ValueError:
+                    return {
+                        **payload,
+                        "status": "BLOCKED",
+                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                    }
             if step == "audit.prepare_agent_cell":
                 return await asyncio.to_thread(self._prepare_agent_cell, payload)
             if step == "campaign.persist_coverage":
@@ -836,7 +881,7 @@ class MetadataActivityHandler:
                 .limit(1)
             )
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
                     workflow_id=workflow_id,
                     run_type="synthetic-observability",
@@ -1305,7 +1350,7 @@ class MetadataActivityHandler:
             if run.project != request.project.value:
                 raise ValueError("provider telemetry project does not match its control run")
             return run
-        run = Run(
+        run = new_bound_run(
             id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
             campaign_id=request.campaign_id,
             change_set_id=request.change_set_id,
@@ -2027,7 +2072,7 @@ class MetadataActivityHandler:
                 .limit(1)
             )
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=uuid5(NAMESPACE_URL, f"control-run:{workflow_id}"),
                     campaign_id=finding.campaign_id,
                     workflow_id=workflow_id,
@@ -2538,7 +2583,13 @@ class MetadataActivityHandler:
         if not workflow_id:
             raise ValueError("delivery workflow identity is missing")
         with self.sessions.begin() as session:
-            finding = session.get(Finding, finding_id)
+            # Serialize initialization before populating this session's Run/approval
+            # identity map. Locking only the later ChangeSet leaves cached pre-wait
+            # Run state stale when a concurrent correction load commits first.
+            # The Finding also exists before the first ChangeSet can be inserted.
+            finding = session.scalar(
+                select(Finding).where(Finding.id == finding_id).with_for_update()
+            )
             if finding is None or finding.disposition != "CONFIRMED":
                 raise ValueError("delivery requires a CONFIRMED finding")
             if requested_risk.value != finding.risk_class:
@@ -2548,6 +2599,32 @@ class MetadataActivityHandler:
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
                 raise ValueError("delivery run metadata is missing")
+            issue_approval = None
+            if (
+                payload.get("issue_approval_id") is not None
+                or session.scalar(
+                    select(BacklogIssueRecord.id)
+                    .where(BacklogIssueRecord.finding_id == finding.id)
+                    .limit(1)
+                )
+                is not None
+            ):
+                try:
+                    issue_approval = validate_child_issue_approval(
+                        session,
+                        UUID(str(payload.get("issue_approval_id"))),
+                        finding=finding,
+                        run=run,
+                    )
+                except ValueError:
+                    run.status = "BLOCKED"
+                    run.finished_at = datetime.now(UTC)
+                    run.error_code = "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED"
+                    return {
+                        **payload,
+                        "status": "BLOCKED",
+                        "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+                    }
             project = Project(finding.project)
             source_repository, deployment_repository = {
                 Project.FALCONE: ("falcone", "falcone-charts"),
@@ -2567,7 +2644,9 @@ class MetadataActivityHandler:
             if issue_repository is None:
                 raise ValueError("confirmed finding repository surface is invalid")
             change_set_id = uuid5(NAMESPACE_URL, f"changeset:{finding.id}")
-            change_set = session.get(ChangeSet, change_set_id)
+            change_set = session.scalar(
+                select(ChangeSet).where(ChangeSet.id == change_set_id).with_for_update()
+            )
             if change_set is None:
                 change_set = ChangeSet(
                     id=change_set_id,
@@ -2592,6 +2671,25 @@ class MetadataActivityHandler:
                     recovery_json={},
                 )
                 session.add(change_set)
+            issue_reference = (
+                bind_change_set_issue_approval(session, change_set, issue_approval)
+                if issue_approval is not None
+                else None
+            )
+            # NEW-112 review: the issue text this delivery is approved for. The workflow's
+            # live issue-body refresh (NEW-44) may use a re-read body only if it is this one.
+            approved_body_sha256 = None
+            if issue_approval is not None:
+                approved_issue = session.scalar(
+                    select(BacklogIssueRecord).where(
+                        BacklogIssueRecord.backlog_campaign_id
+                        == UUID(str(issue_approval.result_json["request"]["backlog_campaign_id"])),
+                        BacklogIssueRecord.finding_id == finding.id,
+                    )
+                )
+                if approved_issue is None:
+                    raise ValueError("approved backlog issue snapshot is unavailable")
+                approved_body_sha256 = approved_issue.body_sha256
             run.change_set_id = change_set_id
             run.status = "RUNNING"
             run.project = project.value
@@ -2635,6 +2733,16 @@ class MetadataActivityHandler:
                 ),
                 "issue_number": issue.number if issue else None,
                 "issue_url": issue.url if issue else None,
+                **(
+                    {"issue_execution_approval": issue_reference}
+                    if issue_reference is not None
+                    else {}
+                ),
+                **(
+                    {"approved_issue_body_sha256": approved_body_sha256}
+                    if approved_body_sha256 is not None
+                    else {}
+                ),
             }
 
     def _ensure_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3500,7 +3608,25 @@ class MetadataActivityHandler:
             "checker_request": request.model_dump(mode="json"),
         }
 
+    def _issue_approval_preparation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.sessions() as session:
+            reference = validate_change_set_issue_approval(
+                session, UUID(str(payload["change_set_id"]))
+            )
+        supplied = payload.get("issue_execution_approval")
+        if supplied is not None and supplied != reference:
+            raise ValueError("supplied delivery approval differs from durable custody")
+        return {**payload, **({"issue_execution_approval": reference} if reference else {})}
+
     def _prepare_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            payload = self._issue_approval_preparation(payload)
+        except ValueError:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "DELIVERY_ISSUE_APPROVAL_REQUIRED_OR_CHANGED",
+            }
         evidence = self._object(payload.get("change_evidence"), "change_evidence")
         source = self._object(evidence.get("source"), "source change evidence")
         deployment = self._object(evidence.get("deployment"), "deployment change evidence")
@@ -3587,14 +3713,25 @@ class MetadataActivityHandler:
                 "base_sha": str(payload["deployment_base_sha"]),
                 "reason": "AWAITING_IMMUTABLE_ARTIFACT",
             }
+        publication_plan = {
+            "change_set_id": str(change_set_id),
+            "publications": publications,
+            "deferred_deployment": deferred_deployment,
+        }
+        try:
+            with self.sessions.begin() as session:
+                intent = persist_publication_intent(session, payload, publication_plan)
+        except (ValueError, KeyError, TypeError):
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "PUBLICATION_AUTHORITY_REQUIRED_OR_CHANGED",
+            }
         return {
             **payload,
             "status": "PUBLICATION_READY",
-            "publication_plan": {
-                "change_set_id": str(change_set_id),
-                "publications": publications,
-                "deferred_deployment": deferred_deployment,
-            },
+            "publication_plan": publication_plan,
+            "publication_intent": intent,
         }
 
     def _persist_publication(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3941,7 +4078,7 @@ class MetadataActivityHandler:
             run_id = uuid5(NAMESPACE_URL, f"final-closure:{workflow_id}:{change_set.id}")
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=run_id,
                     campaign_id=None,
                     change_set_id=change_set.id,
@@ -7213,7 +7350,7 @@ class MetadataActivityHandler:
         with self.sessions.begin() as session:
             run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
             if run is None:
-                run = Run(
+                run = new_bound_run(
                     id=uuid5(NAMESPACE_URL, f"cleanup-run:{workflow_id}"),
                     campaign_id=None,
                     change_set_id=None,
@@ -7276,6 +7413,14 @@ class MetadataActivityHandler:
                 )
                 or 0
             )
+            dashboard_session_revocation_cleanup_count = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at < now
+                    )
+                )
+                or 0
+            )
             log_cutoff = now - timedelta(days=self.settings.dashboard_agent_log_retention_days)
             execution_cutoff = now - timedelta(
                 days=self.settings.dashboard_agent_execution_retention_days
@@ -7311,6 +7456,13 @@ class MetadataActivityHandler:
             "file_cleanup_candidates": file_candidates,
             "preview_namespace_cleanup_candidates": preview_candidates,
             "dashboard_event_cleanup_count": dashboard_event_cleanup_count,
+            "dashboard_session_revocation_cleanup_count": (
+                dashboard_session_revocation_cleanup_count
+            ),
+            "dashboard_session_revocation_cleanup_truncated": (
+                dashboard_session_revocation_cleanup_count
+                > DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT
+            ),
             "agent_log_cleanup_count": agent_log_cleanup_count,
             "agent_execution_cleanup_count": agent_execution_cleanup_count,
             "operation_export_cleanup_count": operation_export_cleanup_count,
@@ -7514,6 +7666,12 @@ class MetadataActivityHandler:
                 type="SecurityBlocker",
                 non_retryable=True,
             )
+        if payload.get("dry_run") is not False:
+            raise ApplicationError(
+                "metadata cleanup requires explicit dry_run=false",
+                type="SecurityBlocker",
+                non_retryable=True,
+            )
         workflow_id = str(payload["orchestration"]["workflow_id"])
         worktrees = payload.get("authorized_candidates")
         files = payload.get("authorized_file_candidates")
@@ -7571,6 +7729,8 @@ class MetadataActivityHandler:
         purged: list[str] = []
         cleaned_previews: list[str] = []
         deleted_dashboard_events = 0
+        deleted_dashboard_session_revocations = 0
+        remaining_dashboard_session_revocations = 0
         deleted_agent_logs = 0
         deleted_agent_executions = 0
         deleted_operation_exports = 0
@@ -7674,6 +7834,24 @@ class MetadataActivityHandler:
                 session.delete(event)
             deleted_dashboard_events = len(expired_events)
 
+            expired_session_revocations = session.scalars(
+                select(DashboardSessionRevocation)
+                .where(DashboardSessionRevocation.expires_at < now)
+                .order_by(DashboardSessionRevocation.expires_at)
+                .limit(DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT)
+            ).all()
+            for revocation in expired_session_revocations:
+                session.delete(revocation)
+            deleted_dashboard_session_revocations = len(expired_session_revocations)
+            remaining_dashboard_session_revocations = int(
+                session.scalar(
+                    select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
+                        DashboardSessionRevocation.expires_at < now
+                    )
+                )
+                or 0
+            )
+
             log_cutoff = now - timedelta(days=self.settings.dashboard_agent_log_retention_days)
             expired_logs = session.scalars(
                 select(AgentLogChunk)
@@ -7718,6 +7896,14 @@ class MetadataActivityHandler:
             "purged_artifact_ids": sorted(purged),
             "cleaned_preview_deployment_ids": sorted(cleaned_previews),
             "deleted_dashboard_event_count": deleted_dashboard_events,
+            "deleted_dashboard_session_revocation_count": (deleted_dashboard_session_revocations),
+            "remaining_dashboard_session_revocation_count": (
+                remaining_dashboard_session_revocations
+            ),
+            "dashboard_session_revocation_cleanup_truncated": (
+                deleted_dashboard_session_revocations == DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT
+                and remaining_dashboard_session_revocations > 0
+            ),
             "deleted_agent_log_count": deleted_agent_logs,
             "deleted_agent_execution_count": deleted_agent_executions,
             "deleted_operation_export_count": deleted_operation_exports,
@@ -7730,7 +7916,9 @@ class MetadataActivityHandler:
             raise ValueError("cleanup terminal status is not allowlisted")
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
-            run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+            run = session.scalar(
+                select(Run).where(Run.workflow_id == workflow_id).with_for_update()
+            )
             if run is None:
                 raise ValueError("cleanup finalization Run is missing")
             if run.finished_at is not None:
@@ -7860,6 +8048,58 @@ class MetadataActivityHandler:
                 run.status = "BLOCKED"
                 run.error_code = str(payload.get("blocker", "CLEANUP_BLOCKED"))
                 run.summary = "cleanup blocked without mutation"
+                topic = "telegram.engineering-cleanup-failed"
+                alert_id = uuid5(NAMESPACE_URL, f"notification:{topic}:{workflow_id}")
+                if session.get(NotificationOutbox, alert_id) is None:
+                    session.add(
+                        NotificationOutbox(
+                            id=alert_id,
+                            topic=topic,
+                            status=NOTIFICATION_OUTBOX_PENDING_STATUS,
+                            payload_json={
+                                "workflow_id": workflow_id,
+                                "status": "BLOCKED",
+                                "error_code": run.error_code,
+                                "finished_at": now.isoformat(),
+                            },
+                            attempts=0,
+                            next_attempt_at=now,
+                            delivered_at=None,
+                            last_error_code=None,
+                        )
+                    )
+            if payload.get("dashboard_session_revocation_cleanup_truncated") is True:
+                topic = "alerts.dashboard-session-revocation-cleanup-truncated"
+                alert_id = uuid5(NAMESPACE_URL, f"notification:{topic}:{workflow_id}")
+                observed_count = int(payload.get("dashboard_session_revocation_cleanup_count", 0))
+                deleted_count = int(payload.get("deleted_dashboard_session_revocation_count", 0))
+                remaining_count = int(
+                    payload.get(
+                        "remaining_dashboard_session_revocation_count",
+                        max(0, observed_count - deleted_count),
+                    )
+                )
+                if session.get(NotificationOutbox, alert_id) is None:
+                    session.add(
+                        NotificationOutbox(
+                            id=alert_id,
+                            topic=topic,
+                            status=NOTIFICATION_OUTBOX_PENDING_STATUS,
+                            payload_json={
+                                "workflow_id": workflow_id,
+                                "severity": "warning",
+                                "reason": "SESSION_REVOCATION_CLEANUP_LIMIT_EXCEEDED",
+                                "observed_expired_count": observed_count,
+                                "cleanup_limit": DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
+                                "deleted_count": deleted_count,
+                                "remaining_count": remaining_count,
+                            },
+                            attempts=0,
+                            next_attempt_at=now,
+                            delivered_at=None,
+                            last_error_code=None,
+                        )
+                    )
             run.finished_at = now
         return {**payload, "status": terminal}
 
@@ -8266,6 +8506,20 @@ class MetadataActivityHandler:
 
     @staticmethod
     def _release_implementation_leases(session: Any, run: Run) -> None:
+        ComponentLeaseManager()._serialize_scope(session, f"implementation:{run.project}")
+        if (
+            session.scalar(
+                select(Step.id)
+                .where(
+                    Step.run_id == run.id,
+                    Step.name == "delivery.publication_effect",
+                    Step.status.in_(("STARTED", "UNKNOWN")),
+                )
+                .limit(1)
+            )
+            is not None
+        ):
+            return
         now = datetime.now(UTC)
         leases = session.scalars(
             select(ComponentLease).where(

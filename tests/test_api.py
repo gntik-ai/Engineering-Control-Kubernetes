@@ -14,6 +14,9 @@ from engineering_control.operations.models import OperationView
 
 
 class FakeService:
+    async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]:
+        return await self.get_workflow(workflow_id)
+
     async def plan_campaign(self, request: Any) -> dict[str, Any]:
         return {
             "project": request.project.value,
@@ -133,6 +136,35 @@ class FakeMetadataRepository(EmptyMetadataRepository):
             }
         }
 
+    async def list_campaigns(self, limit: int = 50) -> list[dict[str, Any]]:
+        assert limit == 50
+        return [
+            {
+                "campaign_id": "11111111-1111-4111-8111-111111111111",
+                "name": "terminal-with-active-cell",
+                "project": "llmwiki",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "IN_PROGRESS",
+                "status": "BLOCKED",
+            },
+            {
+                "campaign_id": "22222222-2222-4222-8222-222222222222",
+                "name": "terminal-with-no-cells",
+                "project": "falcone",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "NOT_RUN",
+                "status": "NOT_RUN",
+            },
+            {
+                "campaign_id": "33333333-3333-4333-8333-333333333333",
+                "name": "terminal-with-partial-blocker",
+                "project": "musematic",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "PARTIAL_BLOCKED",
+                "status": "PARTIAL_BLOCKED",
+            },
+        ]
+
 
 def test_api_requires_bearer_auth() -> None:
     app = create_app(settings=Settings(), service=FakeService(), token="x" * 32)
@@ -200,7 +232,7 @@ def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> No
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile?limit=2&offset=0", headers=headers)
+        response = client.get("/v1/campaigns/reconcile?limit=2&offset=0", headers=headers)
         assert response.status_code == 200
         assert len(response.json()["items"]) == 2
         assert response.json()["classification_scope"] == {
@@ -211,7 +243,7 @@ def test_campaign_reconciliation_api_is_bounded_and_returns_continuation() -> No
         }
         assert response.json()["has_more"] is True
         assert response.json()["next_offset"] == 2
-        assert client.post("/v1/campaigns/reconcile?limit=201", headers=headers).status_code == 422
+        assert client.get("/v1/campaigns/reconcile?limit=201", headers=headers).status_code == 422
 
     operations.campaign_reconciliation_candidates.assert_awaited_once_with(3, 0)
 
@@ -295,19 +327,17 @@ def test_campaign_reconciliation_repairs_terminal_before_scoping_duplicate_canar
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
     items = {item["workflow_id"]: item for item in response.json()["items"]}
-    assert items["terminal-canary"]["classification"] == "TERMINAL_NOT_RECONCILED"
-    assert items["terminal-canary"]["projection_repaired"] is True
+    assert items["terminal-canary"]["classification"] == "EXECUTION_BINDING_UNVERIFIED"
+    assert items["terminal-canary"]["projection_repaired"] is False
     assert items["active-canary-0"]["classification"] == "DUPLICATE_CANARY"
     assert items["active-canary-1"]["classification"] == "DUPLICATE_CANARY"
     assert items["different-project-canary"]["classification"] == "RUNNING_HEALTHY"
     assert items["different-name-canary"]["classification"] == "RUNNING_HEALTHY"
-    operations.reconcile_terminal_campaign.assert_awaited_once_with(
-        terminal_campaign_id, "terminal-canary", "COMPLETED"
-    )
+    operations.reconcile_terminal_campaign.assert_not_awaited()
 
 
 def test_campaign_reconciliation_distinguishes_missing_from_unavailable_temporal() -> None:
@@ -341,9 +371,9 @@ def test_campaign_reconciliation_distinguishes_missing_from_unavailable_temporal
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        missing = client.post("/v1/campaigns/reconcile", headers=headers)
+        missing = client.get("/v1/campaigns/reconcile", headers=headers)
         service.get_workflow.side_effect = RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
-        unavailable = client.post("/v1/campaigns/reconcile", headers=headers)
+        unavailable = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert missing.status_code == 200
     assert missing.json()["items"][0]["classification"] == "TEMPORAL_WORKFLOW_MISSING"
@@ -387,7 +417,7 @@ def test_campaign_reconciliation_never_repairs_a_shared_terminal_workflow_bindin
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
     assert [item["classification"] for item in response.json()["items"]] == [
@@ -437,7 +467,7 @@ def test_shared_projection_rows_do_not_make_a_distinct_canary_look_duplicate() -
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
     assert [item["classification"] for item in response.json()["items"]] == [
@@ -448,7 +478,7 @@ def test_shared_projection_rows_do_not_make_a_distinct_canary_look_duplicate() -
     assert service.get_workflow.await_count == 2
 
 
-def test_campaign_reconciliation_maps_a_concurrent_rebind_to_inconsistent_state() -> None:
+def test_campaign_reconciliation_unbound_preview_does_not_reach_writer() -> None:
     candidate = {
         "campaign_id": str(uuid4()),
         "project": "falcone",
@@ -482,11 +512,12 @@ def test_campaign_reconciliation_maps_a_concurrent_rebind_to_inconsistent_state(
     headers = {"Authorization": f"Bearer {'x' * 32}"}
 
     with TestClient(app) as client:
-        response = client.post("/v1/campaigns/reconcile", headers=headers)
+        response = client.get("/v1/campaigns/reconcile", headers=headers)
 
     assert response.status_code == 200
-    assert response.json()["items"][0]["classification"] == "INCONSISTENT_STATE"
+    assert response.json()["items"][0]["classification"] == "EXECUTION_BINDING_UNVERIFIED"
     assert response.json()["items"][0]["projection_repaired"] is False
+    operations.reconcile_terminal_campaign.assert_not_awaited()
 
 
 def test_typed_command_route_accepts_only_cli_or_telegram_actors() -> None:
@@ -760,6 +791,10 @@ def test_internal_metrics_expose_named_control_plane_families() -> None:
     assert "engineering_active_campaigns" in response.text
     assert "engineering_worker_health" in response.text
     assert "engineering_evidence_storage_bytes" in response.text
+    assert "engineering_dashboard_session_revocations" in response.text
+    assert "engineering_dashboard_session_revocation_cleanup_truncated" in response.text
+    assert "engineering_notification_outbox" in response.text
+    assert "engineering_notification_oldest_pending_age_seconds" in response.text
 
 
 def test_api_rejects_extra_fields() -> None:
@@ -996,7 +1031,38 @@ def test_metadata_endpoints_return_stored_records_and_unknown_usage() -> None:
         assert usage.json()["codex"]["source"] == "cli-does-not-report"
         assert usage.json()["codex"]["authenticated"] is True
         assert usage.json()["codex"]["cli_present"] is True
-        assert usage.json()["codex"]["status"] == "AVAILABLE"
+
+        campaigns = client.get("/v1/campaigns", headers=headers)
+        assert campaigns.status_code == 200
+        assert campaigns.json()["items"] == [
+            {
+                "campaign_id": "11111111-1111-4111-8111-111111111111",
+                "name": "terminal-with-active-cell",
+                "project": "llmwiki",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "IN_PROGRESS",
+                "status": "BLOCKED",
+            },
+            {
+                "campaign_id": "22222222-2222-4222-8222-222222222222",
+                "name": "terminal-with-no-cells",
+                "project": "falcone",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "NOT_RUN",
+                "status": "NOT_RUN",
+            },
+            {
+                "campaign_id": "33333333-3333-4333-8333-333333333333",
+                "name": "terminal-with-partial-blocker",
+                "project": "musematic",
+                "execution_status": "COMPLETED",
+                "coverage_outcome": "PARTIAL_BLOCKED",
+                "status": "PARTIAL_BLOCKED",
+            },
+        ]
+        # This historical fixture has no timestamp, so it is not current readiness.
+        assert usage.json()["codex"]["status"] == "STALE"
+        assert usage.json()["codex"]["raw_status"] == "AVAILABLE"
         assert usage.json()["codex"]["running_jobs"] == 1
         assert usage.json()["codex"]["history"]["roles"]["implementer"]["success_rate"] == 0.5
         assert usage.json()["claude"]["source"] == "not-reported"

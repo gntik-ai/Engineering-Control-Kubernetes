@@ -4,9 +4,12 @@ import asyncio
 import contextlib
 import logging
 import secrets
+import time
 from datetime import datetime
 from typing import Any
 from uuid import UUID
+
+import structlog
 
 from engineering_control.api.schemas import (
     AuditPlanRequest,
@@ -24,6 +27,7 @@ from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.operations.connections import ConnectionHealthProjector
+from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditAllProjectsCommand,
@@ -49,6 +53,7 @@ from engineering_control.operations.models import (
 from engineering_control.operations.repository import OperationsRepository
 
 _LOG = logging.getLogger(__name__)
+logger = structlog.get_logger()
 _CLOSED_WORKFLOW_STATUSES = frozenset(
     {"COMPLETED", "FAILED", "CANCELED", "TERMINATED", "TIMED_OUT"}
 )
@@ -65,11 +70,17 @@ class TypedCommandBus:
         control: ControlService,
         metadata: MetadataRepository,
         operations: OperationsRepository,
+        *,
+        diagnostics_only: bool = False,
     ) -> None:
         self.control = control
         self.metadata = metadata
         self.operations = operations
         self.connections = ConnectionHealthProjector(operations)
+        self.diagnostics_only = diagnostics_only
+        self._next_connection_refresh_at = 0.0
+        self._next_issue_recovery_at = 0.0
+        self._issue_recovery_cursor: UUID | None = None
         self._runless_cursor: tuple[datetime, UUID] | None = None
 
     async def submit(
@@ -80,6 +91,8 @@ class TypedCommandBus:
         operator_class: str,
         idempotency_key: str,
     ) -> OperationView:
+        if self.diagnostics_only and not isinstance(command, RefreshConnectionsCommand):
+            raise ValueError("product operation admission is disabled during diagnostics")
         operation = await self.operations.create_external(
             command,
             source_channel=source_channel,
@@ -96,71 +109,85 @@ class TypedCommandBus:
         return refreshed
 
     async def dispatch_pending(self) -> bool:
+        if self.diagnostics_only:
+            if time.monotonic() >= self._next_connection_refresh_at:
+                self._next_connection_refresh_at = time.monotonic() + 120.0
+                await self.connections.refresh("all")
+            claim = await self.operations.claim_pending(diagnostics_only=True)
+            if claim is None:
+                return False
+            await self.dispatch_claim(claim)
+            return True
+        if time.monotonic() >= self._next_issue_recovery_at:
+            self._next_issue_recovery_at = time.monotonic() + 5.0
+            await self.recover_issue_start_once()
         claim = await self.operations.claim_pending()
         if claim is None:
             return False
         await self.dispatch_claim(claim)
         return True
 
+    async def recover_issue_start_once(self) -> None:
+        candidate = await self.operations.next_issue_start_recovery(self._issue_recovery_cursor)
+        if candidate is None:
+            self._issue_recovery_cursor = None
+            return
+        operation_id, request = candidate
+        self._issue_recovery_cursor = operation_id
+        if request is None:
+            logger.error("issue_start_recovery_invalid_binding", operation_id=str(operation_id))
+            return
+        try:
+            accepted = await self.control.observe_issue_start(request)
+        except Exception:  # noqa: BLE001 - observation failures never release or restart ownership
+            await self.operations.mark_issue_start_unconfirmed(
+                operation_id, issue_workflow_id(request)
+            )
+            return
+        await self.operations.record_issue_start_recovery(request, accepted)
+
     async def dispatch_claim(self, claim: tuple[UUID, Command, SourceChannel, str]) -> None:
         operation_id, command, _source_channel, operator_class = claim
         try:
+            if self.diagnostics_only and not isinstance(command, RefreshConnectionsCommand):
+                raise ValueError("product operation admission is disabled during diagnostics")
             capability = await self.operations.capability(
                 command, exclude_operation_id=operation_id
             )
             if capability.status != "AVAILABLE":
                 blocker = capability.blockers[0] if capability.blockers else capability.status
                 raise ValueError(f"operation preflight changed: {blocker}")
+            if isinstance(command, SolveIssueCommand):
+                await self.operations.validate_issue_approval(operation_id, command)
             accepted = await self._execute(
                 command,
                 operator_class=operator_class,
                 operation_id=operation_id,
             )
+        except IssueStartUnconfirmedError as error:
+            await self.operations.mark_issue_start_unconfirmed(operation_id, error.workflow_id)
         except ValueError as error:
             await self.operations.finish(operation_id, status="BLOCKED", safe_error=str(error))
-            await self.operations.record_dispatch_event(
-                operation_id,
-                event_type="operation.blocked",
-                level="WARNING",
-                message="Typed operation was blocked by current policy or state",
-            )
         except Exception:  # noqa: BLE001 - safe error boundary must not expose provider details
             await self.operations.finish(
                 operation_id,
                 status="FAILED",
                 safe_error="typed application operation failed",
             )
-            await self.operations.record_dispatch_event(
-                operation_id,
-                event_type="operation.failed",
-                level="ERROR",
-                message="Typed application operation failed",
-            )
         else:
             if accepted is None:
                 await self.operations.finish(operation_id, status="COMPLETED")
-                await self.operations.record_dispatch_event(
-                    operation_id,
-                    event_type="operation.completed",
-                    level="INFO",
-                    message="Typed operation completed without starting a workflow",
-                )
             elif isinstance(command, WorkflowControlCommand):
                 # NEW-35: a control only signals an existing workflow. Leaving it STARTED
                 # bound to that long-lived loop made it "active" forever, so every later
                 # retry/skip/resume of the same loop was deduplicated onto it unsent.
+                # The receipt and its dashboard event commit together (2b678d9).
                 await self.operations.finish(
                     operation_id,
                     status="COMPLETED",
                     workflow_id=accepted.workflow_id,
                     run_id=accepted.run_id,
-                )
-                await self.operations.record_dispatch_event(
-                    operation_id,
-                    event_type="operation.completed",
-                    level="INFO",
-                    message="Typed workflow control signal delivered",
-                    workflow_id=accepted.workflow_id,
+                    signal_receipt=True,
                 )
             else:
                 await self.operations.finish(
@@ -168,13 +195,7 @@ class TypedCommandBus:
                     status="STARTED",
                     workflow_id=accepted.workflow_id,
                     run_id=accepted.run_id,
-                )
-                await self.operations.record_dispatch_event(
-                    operation_id,
-                    event_type="operation.started",
-                    level="INFO",
-                    message="Typed operation started one durable workflow",
-                    workflow_id=accepted.workflow_id,
+                    linked=accepted.status == "EXISTING",
                 )
 
     async def reconcile_runless_operations(self) -> int:
@@ -210,13 +231,6 @@ class TypedCommandBus:
             return 0
         if not await self.operations.complete_closed_runless_operation(operation_id):
             return 0
-        await self.operations.record_dispatch_event(
-            operation_id,
-            event_type="operation.completed",
-            level="INFO",
-            message="Typed operation workflow closed before recording a run",
-            workflow_id=workflow_id,
-        )
         return 1
 
     policy_activation_timeout_seconds = 60.0
@@ -256,6 +270,24 @@ class TypedCommandBus:
                 AutonomousBacklogStart.model_validate(command.model_dump(mode="json"))
             )
         if isinstance(command, SolveIssueCommand):
+            operation = await self.operations.operation(operation_id)
+            if operation is None:
+                raise ValueError("issue operation disappeared before durable handoff")
+            request = ExistingBacklogLoopStart(
+                project=command.project.value,
+                backlog_campaign_id=command.backlog_campaign_id,
+                maximum_risk=command.maximum_risk,
+                delivery_mode=command.delivery_mode,
+                maximum_items=1,
+                target_repository=command.repository,
+                target_issue_number=command.issue_number,
+                continue_after_blocked_issue=False,
+                correction_limit=command.correction_limit,
+                runtime_proof=command.runtime_proof,
+                r3_approval_binding=command.r3_approval_binding,
+                issue_operation_id=operation_id,
+                issue_approval_binding=operation.binding_hash,
+            )
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
                 BacklogApprovalCandidateRequest(
@@ -264,6 +296,7 @@ class TypedCommandBus:
                     maximum_risk=command.maximum_risk,
                     maximum_items=1,
                 ),
+                issue_request=request,
             )
             approval = await self.metadata.approve_backlog_campaign(
                 command.backlog_campaign_id,
@@ -272,21 +305,7 @@ class TypedCommandBus:
                 self._approval_actor(operator_class),
             )
             await self._await_policy_activation(command.backlog_campaign_id, approval)
-            return await self.control.start_existing_backlog_loop(
-                ExistingBacklogLoopStart(
-                    project=command.project.value,
-                    backlog_campaign_id=command.backlog_campaign_id,
-                    maximum_risk=command.maximum_risk,
-                    delivery_mode=command.delivery_mode,
-                    maximum_items=1,
-                    target_repository=command.repository,
-                    target_issue_number=command.issue_number,
-                    continue_after_blocked_issue=False,
-                    correction_limit=command.correction_limit,
-                    runtime_proof=command.runtime_proof,
-                    r3_approval_binding=command.r3_approval_binding,
-                )
-            )
+            return await self.control.start_existing_backlog_loop(request)
         if isinstance(command, SolveBacklogCommand):
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
@@ -487,7 +506,11 @@ async def operation_dispatch_loop(bus: TypedCommandBus, stop: asyncio.Event) -> 
     reconciler = asyncio.create_task(_runless_reconcile_loop(bus, stop))
     try:
         while not stop.is_set():
-            worked = await bus.dispatch_pending()
+            try:
+                worked = await bus.dispatch_pending()
+            except Exception as error:  # noqa: BLE001 - keep dispatcher alive without hiding cancellation
+                logger.error("operation_dispatch_iteration_failed", error_type=type(error).__name__)
+                worked = False
             if not worked:
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=0.5)

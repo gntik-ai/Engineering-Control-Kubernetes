@@ -8,8 +8,9 @@ import re
 import shutil
 import stat
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -17,6 +18,10 @@ from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker, GhCliPolicyError
+from engineering_control.adapters.publication_authority import (
+    PublicationAuthorityClient,
+    PublicationAuthorityError,
+)
 from engineering_control.config import Settings
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.evidence.transfer import EvidencePublisher
@@ -38,6 +43,9 @@ from engineering_control.policy.github_write import (
     GitHubWritePolicyEvaluator,
 )
 from engineering_control.security.redaction import SecretRedactor
+
+_T = TypeVar("_T")
+PublicationContext = tuple[PublicationAuthorityClient, dict[str, Any], dict[str, Any]]
 
 
 class RepositoryPublication(BaseModel):
@@ -139,8 +147,10 @@ class DeliveryActivityHandler:
         settings: Settings,
         runner: SafeCommandRunner | None = None,
         broker: GhCliBroker | None = None,
+        publication_authority: PublicationAuthorityClient | None = None,
     ) -> None:
         self.settings = settings
+        self.publication_authority = publication_authority
         self.runner = runner or SafeCommandRunner(
             {"git": settings.git_executable, "gh": settings.github_executable}
         )
@@ -193,7 +203,25 @@ class DeliveryActivityHandler:
             raise ApplicationError("unsupported delivery activity", non_retryable=True)
         try:
             plan = PublicationPlan.model_validate(payload.get("publication_plan"))
-            results = await asyncio.to_thread(self._publish_all, plan)
+            if not isinstance(payload.get("publication_intent"), dict):
+                raise PublicationAuthorityError("publication requires its durable intent")
+            authority = self.publication_authority or PublicationAuthorityClient(
+                self.settings, self.broker
+            )
+            results = await asyncio.to_thread(
+                self._publish_all, plan, (authority, payload, plan.model_dump(mode="json"))
+            )
+        except PublicationAuthorityError as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED",
+                "publication_effect_unknown": error.unknown,
+                # Refers to the current effect, not earlier completed effects
+                # within a paired publication. Unknown may still describe lost
+                # receipt custody even when this callback never began.
+                "publication_effect_not_attempted": error.not_attempted,
+            }
         except GhCliAuthError:
             return {
                 **payload,
@@ -840,11 +868,52 @@ class DeliveryActivityHandler:
             raise ValueError("GitHub registry auth file permissions are invalid")
         return resolved
 
-    def _publish_all(self, plan: PublicationPlan) -> list[dict[str, Any]]:
+    def _publish_all(
+        self, plan: PublicationPlan, publication_context: PublicationContext | None = None
+    ) -> list[dict[str, Any]]:
         self.broker.preflight(tuple(item.repository for item in plan.publications))
-        return [self._publish(item, plan.change_set_id) for item in plan.publications]
+        return [
+            self._publish(item, plan.change_set_id, publication_context=publication_context)
+            for item in plan.publications
+        ]
 
-    def _publish(self, plan: RepositoryPublication, change_set_id: UUID) -> dict[str, Any]:
+    def _publication_effect(
+        self,
+        plan: RepositoryPublication,
+        publication_context: PublicationContext | None,
+        action: str,
+        operation: Callable[[], _T],
+    ) -> _T | None:
+        """Run one GitHub write effect, re-checking the write policy immediately before it.
+
+        With a publication context the effect runs under durable publication-authority
+        custody; without one (promotion's distinct approval path) it runs directly.
+        """
+
+        def guarded() -> _T:
+            denial = self.write_policy.evaluate(lambda: (plan.repository,))
+            if denial is not None:
+                raise PublicationAuthorityError(f"publication write policy changed before {action}")
+            return operation()
+
+        if publication_context is None:
+            return guarded()
+        authority, payload, full_plan = publication_context
+        return authority.execute(
+            payload=payload,
+            plan=full_plan,
+            repository=plan.repository,
+            action=action,
+            operation=guarded,
+        )
+
+    def _publish(
+        self,
+        plan: RepositoryPublication,
+        change_set_id: UUID,
+        *,
+        publication_context: PublicationContext | None = None,
+    ) -> dict[str, Any]:
         if plan.branch.rsplit("/", 1)[-1] != str(change_set_id):
             raise ValueError("publication branch does not bind its ChangeSet")
         # NEW-103: a CI repair of the deployment PR may re-publish a ChangeSet whose source
@@ -859,15 +928,21 @@ class DeliveryActivityHandler:
         if any(item.get("headRefOid") != plan.head_sha for item in merged):
             raise ValueError("a merged pull request's branch cannot be republished")
         if merged:
-            return self._bind_pull_request(plan)  # already merged at exactly this head
+            # already merged at exactly this head
+            return self._bind_pull_request(plan, publication_context)
         if self.settings.publication_fetch_from_worker:
             # NEW-61: the worktree lives on the worker host; bring only its commits here.
-            self._push_from_worker(plan, change_set_id)
+            self._push_from_worker(plan, change_set_id, publication_context)
         else:
-            self._push_from_local_worktree(plan)
-        return self._bind_pull_request(plan)
+            self._push_from_local_worktree(plan, publication_context)
+        return self._bind_pull_request(plan, publication_context)
 
-    def _push_from_worker(self, plan: RepositoryPublication, change_set_id: UUID) -> None:
+    def _push_from_worker(
+        self,
+        plan: RepositoryPublication,
+        change_set_id: UUID,
+        publication_context: PublicationContext | None = None,
+    ) -> None:
         """NEW-61: fetch the exact validated branch from the worker, then push it.
 
         The worker keeps each ChangeSet's commits in a bare Git metadata repository whose
@@ -913,17 +988,22 @@ class DeliveryActivityHandler:
             if fetched != plan.head_sha:
                 # NEW-61: fail closed; never publish anything but the validated commit.
                 raise ValueError("fetched ChangeSet branch does not match the validated commit")
-            self.runner.run(
-                "git",
-                [
-                    "push",
-                    "--porcelain",
-                    f"https://github.com/{plan.repository}.git",
-                    f"{plan.head_sha}:{ref}",
-                ],
-                cwd=repository,
-                timeout_seconds=900,
-                environment=environment,
+            self._publication_effect(
+                plan,
+                publication_context,
+                "git_push",
+                lambda: self.runner.run(
+                    "git",
+                    [
+                        "push",
+                        "--porcelain",
+                        f"https://github.com/{plan.repository}.git",
+                        f"{plan.head_sha}:{ref}",
+                    ],
+                    cwd=repository,
+                    timeout_seconds=900,
+                    environment=environment,
+                ),
             )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -964,7 +1044,11 @@ class DeliveryActivityHandler:
             environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(mirror / "objects")
         return environment
 
-    def _push_from_local_worktree(self, plan: RepositoryPublication) -> None:
+    def _push_from_local_worktree(
+        self,
+        plan: RepositoryPublication,
+        publication_context: PublicationContext | None = None,
+    ) -> None:
         worktree = self._bounded_worktree(plan)
         git_arguments = ["-c", f"safe.directory={worktree}"]
         branch = self.runner.run(
@@ -985,35 +1069,49 @@ class DeliveryActivityHandler:
             "GIT_CONFIG_KEY_0": "safe.directory",
             "GIT_CONFIG_VALUE_0": str(worktree),
         }
-        self.runner.run(
-            "git",
-            [
-                *git_arguments,
-                "push",
-                "--porcelain",
-                f"https://github.com/{plan.repository}.git",
-                f"HEAD:refs/heads/{plan.branch}",
-            ],
-            cwd=worktree,
-            timeout_seconds=900,
-            environment=environment,
+        self._publication_effect(
+            plan,
+            publication_context,
+            "git_push",
+            lambda: self.runner.run(
+                "git",
+                [
+                    *git_arguments,
+                    "push",
+                    "--porcelain",
+                    f"https://github.com/{plan.repository}.git",
+                    f"{plan.head_sha}:refs/heads/{plan.branch}",
+                ],
+                cwd=worktree,
+                timeout_seconds=900,
+                environment=environment,
+            ),
         )
 
-    def _bind_pull_request(self, plan: RepositoryPublication) -> dict[str, Any]:
+    def _bind_pull_request(
+        self,
+        plan: RepositoryPublication,
+        publication_context: PublicationContext | None = None,
+    ) -> dict[str, Any]:
         existing = self._existing_pull_request(plan)
         if existing is None:
             body_path = self._body_file(plan)
             try:
-                created = self.broker.create_pull_request(
-                    repository=plan.repository,
-                    head=plan.branch,
-                    base=plan.base_branch,
-                    title=plan.title,
-                    body_file=body_path,
-                    change_binding=f"changeset:{plan.branch.rsplit('/', 1)[-1]}",
-                    draft=True,
+                created = self._publication_effect(
+                    plan,
+                    publication_context,
+                    "pr_create",
+                    lambda: self.broker.create_pull_request(
+                        repository=plan.repository,
+                        head=plan.branch,
+                        base=plan.base_branch,
+                        title=plan.title,
+                        body_file=body_path,
+                        change_binding=f"changeset:{plan.branch.rsplit('/', 1)[-1]}",
+                        draft=True,
+                    ),
                 )
-                if not re.fullmatch(
+                if created is not None and not re.fullmatch(
                     rf"https://github\.com/{re.escape(plan.repository)}/pull/[1-9][0-9]*",
                     created,
                 ):

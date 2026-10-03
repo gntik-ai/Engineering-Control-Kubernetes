@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import secrets
 import shutil
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,17 +17,20 @@ import yaml
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from engineering_control.api.schemas import MultiProjectAuditStart, OperationAccepted
 from engineering_control.config import Settings
 from engineering_control.dashboard.app import create_app
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.dashboard.session_store import SessionAuthorization
 from engineering_control.db.base import Base
 from engineering_control.db.models import (
     BacklogIssueRecord,
     Campaign,
     ConnectionSnapshot,
     CoverageCell,
+    DashboardEvent,
     Enhancement,
     GitHubBacklogCampaign,
     OperationExport,
@@ -53,7 +58,10 @@ from engineering_control.operations.models import (
     parse_command,
 )
 from engineering_control.operations.registry import COMMAND_REGISTRY
-from engineering_control.operations.repository import OperationsRepository
+from engineering_control.operations.repository import (
+    OperationsRepository,
+    _operation_integrity_conflict,
+)
 from engineering_control.operations.service import TypedCommandBus
 from engineering_control.workflows import definitions as workflow_definitions
 from engineering_control.workflows.definitions import (
@@ -73,6 +81,24 @@ SESSION_A = "a" * 64
 SESSION_B = "b" * 64
 PASSWORD = "bounded dashboard fixture password"  # noqa: S105
 PROJECT_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config" / "projects"
+
+
+async def _rotate_candidate(repository, candidate_id, previous_binding):
+    """Use the real rotating repository path with explicit synthetic session proof."""
+    dashboard = DashboardRepository(str(repository.engine.url))
+    try:
+        version = await dashboard.authentication_version()
+        if version is None:
+            version = await dashboard.initialize_password(PASSWORD)
+        expiry = datetime.now(UTC) + timedelta(hours=12)
+        previous = SessionAuthorization(previous_binding, version, expiry)
+        replacement = SessionAuthorization(secrets.token_hex(32), version, expiry)
+        token, _expires_at = await repository.rotate_reauthentication(
+            candidate_id, previous, replacement.binding_hash
+        )
+        return token, replacement
+    finally:
+        dashboard.engine.dispose()
 
 
 def _repository(tmp_path: Path) -> OperationsRepository:
@@ -200,6 +226,41 @@ def _solve_issue() -> SolveIssueCommand:
 
 def _idempotency_fixture(channel: str, ordinal: int) -> str:
     return f"{channel}-test-{ordinal:012d}"
+
+
+def test_operation_integrity_conflict_classifier_is_constraint_specific() -> None:
+    class PostgreSQLDiagnostic:
+        constraint_name = "uq_operation_requests_idempotency_key"
+
+    class PostgreSQLUniqueViolation(Exception):
+        diag = PostgreSQLDiagnostic()
+
+    active_owner = IntegrityError(
+        "INSERT",
+        {},
+        sqlite3.IntegrityError(
+            "UNIQUE constraint failed: operation_requests.action, operation_requests.target_id"
+        ),
+    )
+    idempotency = IntegrityError(
+        "INSERT",
+        {},
+        sqlite3.IntegrityError("UNIQUE constraint failed: operation_requests.idempotency_key"),
+    )
+    unrelated = IntegrityError(
+        "INSERT",
+        {},
+        sqlite3.IntegrityError("FOREIGN KEY constraint failed"),
+    )
+    assert _operation_integrity_conflict(active_owner) == "active_owner"
+    assert _operation_integrity_conflict(idempotency) == "idempotency"
+    assert (
+        _operation_integrity_conflict(
+            IntegrityError("INSERT", {}, PostgreSQLUniqueViolation("duplicate key"))
+        )
+        == "idempotency"
+    )
+    assert _operation_integrity_conflict(unrelated) is None
 
 
 def _seed_enhancement(repository: OperationsRepository, *, ordinal: int = 1) -> str:
@@ -362,21 +423,86 @@ async def test_issue_candidate_reauth_is_session_bound_one_use_and_idempotent(
     assert candidate.binding_hash == same_candidate_other_session.binding_hash
     assert candidate.candidate_id != same_candidate_other_session.candidate_id
 
-    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
     operation = await repository.queue_candidate(
         candidate.candidate_id,
         token,
-        SESSION_A,
+        authorization.binding_hash,
         None,
+        authorization=authorization,
     )
     assert operation.source_channel == "dashboard"
     assert operation.status == "PENDING"
-    with pytest.raises(ValueError, match="already used"):
-        await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, None)
+    repeated = await repository.queue_candidate(
+        candidate.candidate_id,
+        token,
+        authorization.binding_hash,
+        None,
+        authorization=authorization,
+    )
+    assert repeated.operation_id == operation.operation_id
     with repository.sessions() as session:
         binding = session.scalar(select(ReauthenticationBinding))
         assert binding is not None and binding.used_at is not None
         assert token not in binding.token_digest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_field", ["body", "risk", "source_head"])
+async def test_issue_confirmation_rejects_changed_approved_snapshot(
+    tmp_path: Path, changed_field: str
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    candidate = await repository.candidate(_solve_issue(), SESSION_A)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
+    with repository.sessions.begin() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        campaign = session.get(GitHubBacklogCampaign, CAMPAIGN_ID)
+        assert issue is not None and campaign is not None
+        if changed_field == "body":
+            issue.body_sha256 = "9" * 64
+        elif changed_field == "risk":
+            issue.calculated_risk = "R3"
+        else:
+            campaign.source_head_at_import = "9" * 40
+    with pytest.raises(ValueError, match="approval snapshot changed"):
+        await repository.queue_candidate(
+            candidate.candidate_id,
+            token,
+            authorization.binding_hash,
+            None,
+            authorization=authorization,
+        )
+    with repository.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(OperationRequest)) == 0
+        binding = session.scalar(select(ReauthenticationBinding))
+        assert binding is not None and binding.used_at is None
+
+
+@pytest.mark.asyncio
+async def test_issue_approval_is_revalidated_after_queue_before_dispatch(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    command = _solve_issue()
+    candidate = await repository.candidate(command, SESSION_A)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
+    operation = await repository.queue_candidate(
+        candidate.candidate_id, token, authorization.binding_hash, None, authorization=authorization
+    )
+    await repository.validate_issue_approval(operation.operation_id, command)
+    with repository.sessions.begin() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert issue is not None
+        issue.body_sha256 = "9" * 64
+    control = Mock()
+    control.start_existing_backlog_loop = AsyncMock()
+    bus = TypedCommandBus(control, Mock(), repository)
+    assert await bus.dispatch_pending()
+    current = await repository.operation(operation.operation_id)
+    assert current is not None and current.status == "BLOCKED"
+    assert current.safe_error is not None and "approval snapshot changed" in current.safe_error
+    control.start_existing_backlog_loop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -393,16 +519,23 @@ async def test_backlog_requires_server_phrase_and_prevents_duplicate_active_oper
     candidate = await repository.candidate(command, SESSION_A)
     assert candidate.capability.status == "AVAILABLE"
     assert candidate.confirmation_phrase is not None
-    token = await repository.create_reauthentication(candidate.candidate_id, SESSION_A)
+    token, authorization = await _rotate_candidate(repository, candidate.candidate_id, SESSION_A)
     with pytest.raises(ValueError, match="typed confirmation"):
-        await repository.queue_candidate(candidate.candidate_id, token, SESSION_A, "WRONG")
+        await repository.queue_candidate(
+            candidate.candidate_id,
+            token,
+            authorization.binding_hash,
+            "WRONG",
+            authorization=authorization,
+        )
 
     # A failed phrase does not consume the one-use reauthentication binding.
     first = await repository.queue_candidate(
         candidate.candidate_id,
         token,
-        SESSION_A,
+        authorization.binding_hash,
         candidate.confirmation_phrase,
+        authorization=authorization,
     )
     second = await repository.create_external(
         command,
@@ -432,23 +565,52 @@ async def test_completed_connection_refresh_can_be_run_again(tmp_path: Path) -> 
     command = RefreshConnectionsCommand(scope="all")
 
     first_candidate = await repository.candidate(command, SESSION_A)
-    first_token = await repository.create_reauthentication(first_candidate.candidate_id, SESSION_A)
+    first_token, first_auth = await _rotate_candidate(
+        repository, first_candidate.candidate_id, SESSION_A
+    )
     first = await repository.queue_candidate(
-        first_candidate.candidate_id, first_token, SESSION_A, None
+        first_candidate.candidate_id,
+        first_token,
+        first_auth.binding_hash,
+        None,
+        authorization=first_auth,
     )
     await repository.finish(first.operation_id, status="COMPLETED")
 
-    second_candidate = await repository.candidate(command, SESSION_A)
-    second_token = await repository.create_reauthentication(
-        second_candidate.candidate_id, SESSION_A
+    second_candidate = await repository.candidate(command, first_auth.binding_hash)
+    second_token, second_auth = await _rotate_candidate(
+        repository, second_candidate.candidate_id, first_auth.binding_hash
     )
     second = await repository.queue_candidate(
-        second_candidate.candidate_id, second_token, SESSION_A, None
+        second_candidate.candidate_id,
+        second_token,
+        second_auth.binding_hash,
+        None,
+        authorization=second_auth,
     )
 
     assert second.operation_id != first.operation_id
     with repository.sessions() as session:
         assert len(session.scalars(select(OperationRequest)).all()) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("age_seconds", "stale"), [(290, False), (310, True), (14 * 60, True)])
+async def test_preflight_keeps_the_300_second_provider_freshness_contract(
+    tmp_path: Path, age_seconds: int, stale: bool
+) -> None:
+    # NEW-112 review: the merge had widened the preflight to 14 minutes (NEW-16's buffer
+    # over the old 30 min schedule); 2b678d9's 300 s contract applies again.
+    repository = _repository(tmp_path)
+    _seed_ready_issue(repository)
+    with repository.sessions.begin() as session:
+        for snapshot in session.scalars(select(QuotaSnapshot)).all():
+            snapshot.captured_at = datetime.now(UTC) - timedelta(seconds=age_seconds)
+    candidate = await repository.candidate(_solve_issue(), SESSION_A)
+    blockers = {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"}
+    assert (blockers <= set(candidate.capability.blockers)) is stale
+    if not stale:
+        assert not blockers & set(candidate.capability.blockers)
 
 
 @pytest.mark.asyncio
@@ -458,12 +620,15 @@ async def test_candidate_fails_closed_for_stale_provider_and_r3(tmp_path: Path) 
     with repository.sessions.begin() as session:
         snapshots = session.scalars(select(QuotaSnapshot)).all()
         for snapshot in snapshots:
-            # Must exceed QUOTA_REFRESH_INTERVAL (30 min) + its staleness buffer,
-            # not an arbitrary short age -- see NEW-16 (2026-09-22).
+            # Well beyond the 300 s provider freshness contract (and NEW-16's old window).
             snapshot.captured_at = datetime.now(UTC) - timedelta(minutes=45)
     stale = await repository.candidate(_solve_issue(), SESSION_A)
     assert stale.capability.status == "BLOCKED"
     assert {"CODEX_HEALTH_STALE", "CLAUDE_HEALTH_STALE"} <= set(stale.capability.blockers)
+    providers = await repository.operator_snapshot("providers")
+    assert providers["status"] == "DEGRADED"
+    assert {value["status"] for value in providers["providers"].values()} == {"STALE"}
+    assert all(value["freshness_seconds"] >= 599 for value in providers["providers"].values())
 
     r3 = await repository.candidate(
         SolveIssueCommand(
@@ -768,7 +933,11 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
         operations_repository=operations,
         session_key=b"c" * 48,
     )
-    with TestClient(app, base_url="https://testserver") as client:
+    with TestClient(
+        app,
+        base_url="https://ade.musematic.ai",
+        headers={"Origin": "https://ade.musematic.ai"},
+    ) as client:
         endpoint = "/api/dashboard/actions/candidates"
         assert client.post(endpoint, json={}).status_code == 401
         login = client.get("/login")
@@ -825,6 +994,9 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
             },
         )
         assert authorized.status_code == 200
+        assert authorized.json()["session_rotated"] is True
+        assert authorized.json()["csrf_token"] != csrf
+        csrf = authorized.json()["csrf_token"]
         queued = client.post(
             "/api/dashboard/actions/execute",
             json={
@@ -836,18 +1008,17 @@ def test_dashboard_action_endpoints_require_session_csrf_and_password_reauthenti
         )
         assert queued.status_code == 202
         assert queued.json()["status"] == "PENDING"
-        assert (
-            client.post(
-                "/api/dashboard/actions/execute",
-                json={
-                    "csrf_token": csrf,
-                    "candidate_id": candidate["candidate_id"],
-                    "reauthentication_token": authorized.json()["reauthentication_token"],
-                    "confirmation_phrase": None,
-                },
-            ).status_code
-            == 409
+        repeated = client.post(
+            "/api/dashboard/actions/execute",
+            json={
+                "csrf_token": csrf,
+                "candidate_id": candidate["candidate_id"],
+                "reauthentication_token": authorized.json()["reauthentication_token"],
+                "confirmation_phrase": None,
+            },
         )
+        assert repeated.status_code == 202
+        assert repeated.json()["operation_id"] == queued.json()["operation_id"]
 
 
 @pytest.mark.asyncio
@@ -872,10 +1043,223 @@ async def test_connection_snapshot_reports_freshness_without_sensitive_probe_out
         }
     )
     values = await repository.connections()
-    assert len(values) == 1
-    assert values[0].status == "STALE"
-    assert values[0].freshness_seconds >= 599
-    assert values[0].details == {"authentication_status": "READY"}
+    by_component = {value.component: value for value in values}
+    assert set(by_component) == {"synthetic-safe-probe", "provider-codex", "provider-claude"}
+    value = by_component["synthetic-safe-probe"]
+    assert value.status == "STALE"
+    assert value.freshness_seconds >= 599
+    assert value.details == {"authentication_status": "READY"}
+    for provider in ("codex", "claude"):
+        missing = by_component[f"provider-{provider}"]
+        assert missing.status == "NOT_CONFIGURED"
+        assert missing.last_success_at is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_zero_and_blocked_campaigns_have_truthful_coverage_status(
+    tmp_path: Path,
+) -> None:
+    operations = _repository(tmp_path)
+    now = datetime.now(UTC)
+    empty = Campaign(
+        project="falcone",
+        name="empty-terminal",
+        status="COMPLETED",
+        required_cells=0,
+        metadata_json={},
+        source_sha=None,
+        deployment_sha=None,
+        created_at=now,
+        updated_at=now,
+    )
+    blocked = Campaign(
+        project="falcone",
+        name="blocked-terminal",
+        status="COMPLETED",
+        required_cells=1,
+        metadata_json={},
+        source_sha=None,
+        deployment_sha=None,
+        created_at=now - timedelta(seconds=1),
+        updated_at=now,
+    )
+    inconsistent = Campaign(
+        project="llmwiki",
+        name="terminal-with-active-cell",
+        status="COMPLETED",
+        required_cells=1,
+        metadata_json={},
+        source_sha=None,
+        deployment_sha=None,
+        created_at=now - timedelta(seconds=2),
+        updated_at=now,
+    )
+    with operations.sessions.begin() as session:
+        session.add_all([empty, blocked, inconsistent])
+        session.flush()
+        session.add(
+            CoverageCell(
+                campaign_id=blocked.id,
+                repository_surface="source",
+                domain="api",
+                persona="operator",
+                flow="bounded-fixture",
+                lens="functional",
+                environment="staging",
+                status="BLOCKED",
+                blocker="FIXTURE_DEPENDENCY",
+                exclusion_approval_id=None,
+                evidence_json=[],
+                result_json={},
+            )
+        )
+        session.add(
+            CoverageCell(
+                campaign_id=inconsistent.id,
+                repository_surface="docs",
+                domain="publication",
+                persona="operator",
+                flow="bounded-fixture",
+                lens="functional",
+                environment="staging",
+                status="IN_PROGRESS",
+                blocker=None,
+                exclusion_approval_id=None,
+                evidence_json=[],
+                result_json={},
+            )
+        )
+
+    metadata = SQLMetadataRepository(str(operations.engine.url))
+    values = {value["name"]: value for value in await metadata.list_campaigns(10)}
+    assert values["empty-terminal"]["execution_status"] == "COMPLETED"
+    assert values["empty-terminal"]["coverage_outcome"] == "NOT_RUN"
+    assert values["empty-terminal"]["status"] == "NOT_RUN"
+    assert values["blocked-terminal"]["coverage_outcome"] == "BLOCKED"
+    assert values["blocked-terminal"]["status"] == "BLOCKED"
+    assert values["terminal-with-active-cell"]["execution_status"] == "COMPLETED"
+    assert values["terminal-with-active-cell"]["coverage_outcome"] == "IN_PROGRESS"
+    assert values["terminal-with-active-cell"]["status"] == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_connection_reads_expire_green_snapshots_and_cli_is_not_a_connection(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    old = datetime.now(UTC) - timedelta(minutes=10)
+    for component in ("engineering-api", "temporal"):
+        await repository.upsert_connection(
+            {
+                "component": component,
+                "logical_target": component,
+                "status": "CONNECTED",
+                "checked_at": old,
+                "last_success_at": old,
+                "last_failure_at": None,
+                "latency_ms": 1,
+                "safe_error": None,
+                "source": "stale-green-fixture",
+                "next_action": None,
+                "details": {},
+            }
+        )
+    await repository.upsert_connection(
+        {
+            "component": "engineering-cli",
+            "logical_target": "/opt/engineering-control/venv/bin/engineering-ctl",
+            "status": "PRESENT",
+            "checked_at": old,
+            "last_success_at": None,
+            "last_failure_at": None,
+            "latency_ms": None,
+            "safe_error": None,
+            "source": "fixed-path-metadata",
+            "next_action": None,
+            "details": {"api_compatibility": "v1", "kind": "client"},
+        }
+    )
+
+    values = {value.component: value for value in await repository.connections()}
+    assert values["engineering-api"].status == "STALE"
+    assert values["temporal"].status == "STALE"
+    assert values["engineering-api"].safe_error == (
+        "persisted connection snapshot exceeded its freshness limit"
+    )
+    assert values["engineering-api"].next_action == (
+        "Refresh the owning fixed probe or persisted publisher."
+    )
+    assert values["engineering-cli"].status == "PRESENT"
+    readiness = await repository.operator_snapshot("readiness-all")
+    assert readiness["connection_count"] == 2
+    assert readiness["connected_count"] == 0
+    assert readiness["status"] == "DEGRADED"
+
+
+def test_gateway_delivery_failure_is_never_projected_as_success(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    now = datetime.now(UTC)
+    with repository.sessions.begin() as session:
+        session.add_all(
+            [
+                DashboardEvent(
+                    occurred_at=now - timedelta(seconds=2),
+                    level="INFO",
+                    event_type="telegram.response_delivered",
+                    source="hermes",
+                    host=None,
+                    worker_kind=None,
+                    project=None,
+                    workflow_id=None,
+                    temporal_run_id=None,
+                    issue_number=None,
+                    campaign_id=None,
+                    entity_type=None,
+                    entity_id=None,
+                    current_phase=None,
+                    message="Telegram response delivered",
+                    metadata_json={},
+                ),
+                DashboardEvent(
+                    occurred_at=now - timedelta(seconds=1),
+                    level="ERROR",
+                    event_type="telegram.response_delivery_failed",
+                    source="hermes",
+                    host=None,
+                    worker_kind=None,
+                    project=None,
+                    workflow_id=None,
+                    temporal_run_id=None,
+                    issue_number=None,
+                    campaign_id=None,
+                    entity_type=None,
+                    entity_id=None,
+                    current_phase=None,
+                    message="Telegram response delivery failed",
+                    metadata_json={},
+                ),
+            ]
+        )
+
+    event_types = [event.event_type for event in repository.health_sources()["events"]]
+    assert event_types[:2] == [
+        "telegram.response_delivery_failed",
+        "telegram.response_delivered",
+    ]
+    ConnectionHealthProjector(repository)._persisted(now)
+    values = {value.component: value for value in repository._connections()}
+    for component in ("hermes-gateway", "telegram"):
+        assert values[component].status == "DEGRADED"
+        assert values[component].last_success_at is not None
+        assert values[component].last_failure_at is not None
+        assert values[component].last_success_at.replace(tzinfo=UTC) == now - timedelta(seconds=2)
+        assert values[component].last_failure_at.replace(tzinfo=UTC) == now - timedelta(seconds=1)
+        assert values[component].details["last_event_type"] == ("telegram.response_delivery_failed")
+    assert values["engineering-cli"].status == "PRESENT"
+
+    channel = repository._operator_snapshot("channel")
+    assert channel["status"] == "DEGRADED"
+    assert channel["last_safe_error"] == "Telegram response delivery failed"
 
 
 @pytest.mark.asyncio

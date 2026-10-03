@@ -15,6 +15,7 @@ from engineering_control.dashboard.status_mapping import (
     expected_next_step,
     map_status,
 )
+from engineering_control.dashboard.time_projection import project_duration
 from engineering_control.db.models import (
     AgentExecution,
     AgentLogChunk,
@@ -32,6 +33,11 @@ from engineering_control.db.models import (
     VerificationResult,
     WorkerHeartbeat,
 )
+from engineering_control.operations.connection_status import (
+    PROVIDER_FRESHNESS_SECONDS,
+    provider_connection_status,
+)
+from engineering_control.run_projection import classify_run_projection
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -134,33 +140,89 @@ class DashboardObservabilityProjection:
                 .select_from(Campaign)
                 .where(~Campaign.status.in_(("COMPLETE", "COMPLETED", "FAILED", "CANCELLED")))
             )
-            queued_issues = session.scalar(
-                select(func.count())
-                .select_from(BacklogIssueRecord)
-                .where(
-                    BacklogIssueRecord.delivery_status.in_(("NOT_STARTED", "QUEUED")),
-                    BacklogIssueRecord.eligibility_status.in_(
-                        ("ELIGIBLE", "ELIGIBLE_FOR_REVALIDATION")
-                    ),
+            # Rank every membership before filtering: an older open/pending
+            # snapshot must not reappear after a newer closed/terminal one.
+            latest_memberships = (
+                select(
+                    BacklogIssueRecord.id.label("issue_id"),
+                    func.count()
+                    .over(
+                        partition_by=(
+                            BacklogIssueRecord.repository,
+                            BacklogIssueRecord.issue_number,
+                            GitHubBacklogCampaign.imported_at,
+                        )
+                    )
+                    .label("same_timestamp_count"),
+                    func.row_number()
+                    .over(
+                        partition_by=(
+                            BacklogIssueRecord.repository,
+                            BacklogIssueRecord.issue_number,
+                        ),
+                        order_by=(
+                            GitHubBacklogCampaign.imported_at.desc(),
+                            GitHubBacklogCampaign.id.desc(),
+                        ),
+                    )
+                    .label("membership_rank"),
                 )
+                .join(
+                    GitHubBacklogCampaign,
+                    BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
+                )
+                .subquery()
             )
-            next_issue = session.execute(
+            inventory = (
                 select(BacklogIssueRecord, GitHubBacklogCampaign)
                 .join(
                     GitHubBacklogCampaign,
                     BacklogIssueRecord.backlog_campaign_id == GitHubBacklogCampaign.id,
                 )
+                .join(latest_memberships, latest_memberships.c.issue_id == BacklogIssueRecord.id)
                 .where(
+                    latest_memberships.c.membership_rank == 1,
+                    latest_memberships.c.same_timestamp_count == 1,
+                    func.upper(BacklogIssueRecord.state) == "OPEN",
+                    BacklogIssueRecord.delivery_status.in_(("NOT_STARTED", "QUEUED")),
+                    BacklogIssueRecord.final_closure_status == "OPEN",
+                    BacklogIssueRecord.change_set_id.is_(None),
+                    GitHubBacklogCampaign.status.in_(
+                        (
+                            "IMPORTED",
+                            "QUEUED",
+                            "AWAITING_APPROVAL",
+                            "APPROVED_INVENTORY",
+                            "APPROVED_POLICY_PENDING",
+                            "APPROVED",
+                            "RUNNING",
+                            "PAUSED",
+                            "BLOCKED",
+                        )
+                    ),
                     BacklogIssueRecord.eligibility_status.in_(
                         ("ELIGIBLE", "ELIGIBLE_FOR_REVALIDATION")
-                    )
+                    ),
                 )
-                .order_by(
+            )
+            pending_inventory_count = session.scalar(
+                select(func.count()).select_from(inventory.subquery())
+            )
+            ambiguous_inventory_count = session.scalar(
+                select(func.count())
+                .select_from(latest_memberships)
+                .where(
+                    latest_memberships.c.membership_rank == 1,
+                    latest_memberships.c.same_timestamp_count > 1,
+                )
+            )
+            next_issue = session.execute(
+                inventory.order_by(
                     BacklogIssueRecord.planned_wave,
                     BacklogIssueRecord.planned_order,
+                    BacklogIssueRecord.repository,
                     BacklogIssueRecord.issue_number,
-                )
-                .limit(1)
+                ).limit(1)
             ).first()
             services = self._services(session)
             active_work = []
@@ -171,7 +233,8 @@ class DashboardObservabilityProjection:
             return {
                 "summary": {
                     "active_workflows": len(active),
-                    "queued_issues": int(queued_issues or 0),
+                    "pending_inventory_count": int(pending_inventory_count or 0),
+                    "ambiguous_inventory_count": int(ambiguous_inventory_count or 0),
                     "blocked_workflows": sum(
                         item["normalized_status"] == "blocked" for item in serialized
                     ),
@@ -184,16 +247,27 @@ class DashboardObservabilityProjection:
                 },
                 "active_work": active_work,
                 "idle": len(active) == 0,
-                "next_eligible_issue": (
+                "next_inventory_candidate": (
                     {
                         "project": next_issue[1].project,
                         "repository": next_issue[0].repository,
                         "issue_number": next_issue[0].issue_number,
-                        "title": next_issue[0].title,
+                        "title": self.redactor.redact_text(next_issue[0].title).value,
                         "issue_url": self._safe_issue_url(next_issue[0].issue_url_reference),
+                        "campaign_id": str(next_issue[1].id),
+                        "campaign_status": next_issue[1].status,
+                        "inventory_observed_at": utc_iso(next_issue[1].imported_at),
+                        "delivery_status": next_issue[0].delivery_status,
+                        "eligibility_status": next_issue[0].eligibility_status,
+                        "authorization": "NOT_EVALUATED",
                     }
                     if next_issue
                     else None
+                ),
+                "inventory_semantics": (
+                    "Latest recorded membership per repository and issue; not a dispatch queue "
+                    "or an approved next task. Current issue state and approval "
+                    "require revalidation. Equal latest snapshot times are ambiguous and excluded."
                 ),
                 "services": services["services"],
                 "providers": services["providers"],
@@ -600,8 +674,35 @@ class DashboardObservabilityProjection:
             active_step.updated_at if active_step else None,
             events[0].occurred_at if events else None,
         )
-        start = run.started_at or run.created_at
-        end = run.finished_at or datetime.now(UTC)
+        projection_state = classify_run_projection(
+            status=run.status,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            updated_at=run.updated_at,
+            now=datetime.now(UTC),
+        )
+        terminal_requires_review = (
+            projection_state == "TERMINAL" and mapped.normalized not in TERMINAL_STATUSES
+        )
+        normalized_status = (
+            "blocked"
+            if projection_state == "ORPHANED_START_INTENT" or terminal_requires_review
+            else mapped.normalized
+        )
+        blocker_code = (
+            run.error_code
+            or ("ORPHANED_START_INTENT" if projection_state == "ORPHANED_START_INTENT" else None)
+            or ("TERMINAL_OUTCOME_REQUIRES_REVIEW" if terminal_requires_review else None)
+            or (active_execution.blocker_code if active_execution else None)
+            or mapped.blocker_code
+        )
+        start = run.started_at
+        timing = project_duration(
+            start,
+            run.finished_at,
+            running=projection_state not in {"TERMINAL", "ORPHANED_START_INTENT"},
+            now=datetime.now(UTC),
+        )
         item: dict[str, Any] = {
             "workflow_id": run.workflow_id,
             "temporal_run_id": temporal_run_id,
@@ -625,13 +726,10 @@ class DashboardObservabilityProjection:
             "change_set_id": str(run.change_set_id) if run.change_set_id else None,
             "deployment_id": str(deployments[0].id) if deployments else None,
             "workflow_type": run.run_type,
-            "normalized_status": mapped.normalized,
+            "normalized_status": normalized_status,
             "raw_status": run.status,
-            "blocker_code": (
-                run.error_code
-                or (active_execution.blocker_code if active_execution else None)
-                or mapped.blocker_code
-            ),
+            "projection_state": projection_state,
+            "blocker_code": blocker_code,
             "blocker": self._sanitize(
                 run.error_code or (active_execution.error_summary if active_execution else None)
             ),
@@ -642,10 +740,12 @@ class DashboardObservabilityProjection:
             "worker": active_execution.worker_kind if active_execution else run.worker,
             "task_queue": active_execution.task_queue if active_execution else None,
             "started_at": utc_iso(start),
+            "queued_at": utc_iso(run.created_at),
+            "ended_at": utc_iso(run.finished_at),
             "last_activity_at": utc_iso(last_activity),
             "updated_at": utc_iso(run.updated_at),
             "updated_datetime": current_utc(run.updated_at) or datetime.min.replace(tzinfo=UTC),
-            "duration_seconds": duration_seconds(start, end),
+            **timing,
             "last_heartbeat": utc_iso(
                 active_execution.last_heartbeat_at if active_execution else None
             ),
@@ -659,7 +759,13 @@ class DashboardObservabilityProjection:
                 == "completed"
             ],
             "current_step": active_step.name if active_step else phase,
-            "expected_next_step": expected_next_step(mapped.normalized, mapped.blocker_code),
+            "expected_next_step": (
+                "Reconcile the durable start intent against Temporal before retrying."
+                if projection_state == "ORPHANED_START_INTENT"
+                else "Review the recorded terminal outcome; no replacement run is implied."
+                if terminal_requires_review
+                else expected_next_step(mapped.normalized, blocker_code)
+            ),
             "execution_id": str(active_execution.id) if active_execution else None,
             "source": "runs/steps/agent_executions/dashboard_events",
             **freshness(last_activity, stale_seconds=self.stale_seconds),
@@ -713,8 +819,12 @@ class DashboardObservabilityProjection:
 
     def _execution(self, row: AgentExecution, *, include_internal: bool = True) -> dict[str, Any]:
         mapped = map_status(row.status, phase=row.phase, entity_type="agent_execution")
-        end = row.ended_at or datetime.now(UTC)
-        start = row.started_at or row.created_at
+        timing = project_duration(
+            row.started_at,
+            row.ended_at,
+            running=mapped.normalized not in TERMINAL_STATUSES,
+            now=datetime.now(UTC),
+        )
         item = {
             "execution_id": str(row.id),
             "workflow_id": row.workflow_id,
@@ -741,7 +851,7 @@ class DashboardObservabilityProjection:
             "started_at": utc_iso(row.started_at),
             "last_heartbeat": utc_iso(row.last_heartbeat_at),
             "ended_at": utc_iso(row.ended_at),
-            "duration_seconds": duration_seconds(start, end),
+            **timing,
             "exit_code": row.exit_code,
             "retryable": row.retryable,
             "blocker_code": row.blocker_code or mapped.blocker_code,
@@ -847,18 +957,40 @@ class DashboardObservabilityProjection:
             observed = (
                 quota.captured_at if quota else executions[0].updated_at if executions else None
             )
+            provider_status = (
+                provider_connection_status(
+                    captured_at=quota.captured_at,
+                    authenticated=quota.authenticated,
+                    cli_present=quota.cli_present,
+                    rate_limited=quota.rate_limited,
+                    now=datetime.now(UTC),
+                )
+                if quota
+                else "NOT_CONFIGURED"
+            )
             providers.append(
                 {
                     "provider": provider,
-                    "available": bool(quota and quota.cli_present and quota.authenticated),
+                    "available": provider_status == "CONNECTED",
                     "authentication_status": (
-                        "authenticated"
+                        "stale"
+                        if provider_status == "STALE"
+                        else "authenticated"
                         if quota and quota.authenticated is True
                         else "required"
                         if quota and quota.authenticated is False
                         else "unknown"
                     ),
-                    "capacity_status": quota.status if quota else "NOT_REPORTED",
+                    "capacity_status": (
+                        "UNKNOWN"
+                        if quota.total_capacity is None
+                        else "STALE"
+                        if provider_status == "STALE"
+                        else quota.status
+                    )
+                    if quota
+                    else "NOT_REPORTED",
+                    "status": provider_status,
                     "rate_limited": quota.rate_limited if quota else None,
                     "active_executions": len(active),
                     "queue_depth": sum(value.status == "QUEUED" for value in executions),
@@ -868,7 +1000,7 @@ class DashboardObservabilityProjection:
                     "last_success": utc_iso(success.ended_at) if success else None,
                     "last_failure": utc_iso(failure.ended_at) if failure else None,
                     "source": "quota_snapshots/agent_executions",
-                    **freshness(observed, stale_seconds=max(self.stale_seconds, 3600)),
+                    **freshness(observed, stale_seconds=PROVIDER_FRESHNESS_SECONDS),
                 }
             )
         return {

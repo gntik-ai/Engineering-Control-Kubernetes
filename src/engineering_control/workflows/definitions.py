@@ -4,6 +4,7 @@ import re
 from dataclasses import asdict, replace
 from datetime import timedelta
 from typing import Any
+from uuid import UUID, uuid5
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -74,6 +75,7 @@ class ControlledWorkflow:
     )
 
     def __init__(self) -> None:
+        self._child_run_ids: dict[str, str] = {}
         self._paused = False
         self._cancelled = False
         self._pause_after_current = False
@@ -163,7 +165,161 @@ class ControlledWorkflow:
         )
         if not isinstance(result, dict):
             raise TypeError(f"activity {step} returned a non-object result")
+        if step == "backlog.register_child_run" and workflow.patched("child-run-start-memo-v1"):
+            status = result.get("status")
+            result_child_id = result.get("child_workflow_id")
+            run_id = result.get("run_id")
+            payload_child_id = payload.get("child_workflow_id")
+            if (
+                status != "REGISTERED"
+                or result_child_id != payload_child_id
+                or type(payload_child_id) is not str
+            ):
+                raise ApplicationError(
+                    "child Run registration is invalid",
+                    type="PolicyViolation",
+                    non_retryable=True,
+                )
+            self._remember_child_run(payload_child_id, run_id)
         return result
+
+    def _remember_child_run(self, workflow_id: str, run_id: Any) -> None:
+        if type(workflow_id) is not str or not (1 <= len(workflow_id) <= 240):
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if not workflow_id.isprintable():
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if type(run_id) is not str or len(run_id) != 36:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        try:
+            parsed = UUID(run_id)
+        except ValueError:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            ) from None
+        if str(parsed) != run_id or parsed.int == 0:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        existing = self._child_run_ids.get(workflow_id)
+        if existing == run_id:
+            return
+        if existing is not None:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        if len(self._child_run_ids) >= 1024:
+            raise ApplicationError(
+                "child Run registration is invalid",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        self._child_run_ids[workflow_id] = run_id
+
+    def _child_run_options(self, workflow_id: str) -> dict[str, Any]:
+        run_id = self._child_run_ids.get(workflow_id)
+        if run_id is None:
+            return {}
+        return {
+            "memo": {
+                "engineering_application_run_id": run_id,
+                "engineering_binding_version": 1,
+            }
+        }
+
+    async def _observability_terminal_run(
+        self, context: dict[str, Any], *, reverse: bool = False
+    ) -> dict[str, Any]:
+        """Finalize a registered canary after cleanup; retain real activity failures."""
+        context = await self._step("observability.register", context)
+        primary_error: ActivityError | None = None
+        cleanup_error: ActivityError | None = None
+        terminal = "FAILED"
+        blocker: str | None = None
+        try:
+            context = await self._step("observability.prepare_workspace", context)
+            maker_prepare, maker_invoke, checker_prepare, checker_invoke = (
+                (
+                    "observability.prepare_claude_maker",
+                    "observability.invoke_claude_maker",
+                    "observability.prepare_codex_checker",
+                    "observability.invoke_codex_checker",
+                )
+                if reverse
+                else (
+                    "observability.prepare_codex",
+                    "observability.invoke_codex",
+                    "observability.prepare_claude",
+                    "observability.invoke_claude",
+                )
+            )
+            context = await self._step(maker_prepare, context)
+            context = await self._agent_step(maker_invoke, context, timeout_minutes=10)
+            if context.get("status") == "SUCCESS":
+                context = await self._step(checker_prepare, context)
+                context = await self._agent_step(checker_invoke, context, timeout_minutes=10)
+                terminal = "COMPLETED" if context.get("status") == "SUCCESS" else "FAILED"
+            if terminal == "FAILED":
+                safe_blockers = {
+                    "MANUAL_AUTH_REQUIRED_CODEX",
+                    "MANUAL_AUTH_REQUIRED_CLAUDE",
+                    "PROVIDER_CLI_MISSING_CODEX",
+                    "PROVIDER_CLI_MISSING_CLAUDE",
+                    "RATE_LIMITED",
+                    "SchemaViolation",
+                    "PolicyViolation",
+                    "PROVIDER_ACTIVITY_FAILED",
+                }
+                raw_blocker = context.get("blocker")
+                blocker = (
+                    raw_blocker
+                    if isinstance(raw_blocker, str) and raw_blocker in safe_blockers
+                    else "OBSERVABILITY_PROVIDER_NON_SUCCESS"
+                )
+        except ActivityError as error:
+            primary_error = error
+            blocker = "OBSERVABILITY_ACTIVITY_FAILED"
+        finally:
+            # A failed prepare may have created part of the owned workspace.
+            # The existing cleanup activity derives its confined path from workspace_id.
+            # Cancellation is not swallowed or converted into a successful result.
+            try:
+                await self._step("observability.cleanup_workspace", context)
+            except ActivityError as error:
+                cleanup_error = error
+        if cleanup_error is not None:
+            terminal = "FAILED"
+            blocker = (
+                "OBSERVABILITY_ACTIVITY_AND_CLEANUP_FAILED"
+                if primary_error is not None
+                else "OBSERVABILITY_CLEANUP_FAILED"
+            )
+        finalized = await self._step(
+            "observability.finalize",
+            {**context, "terminal_status": terminal, "blocker": blocker},
+        )
+        if primary_error is not None:
+            raise primary_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        return finalized
 
     async def _github_write_step(
         self, step: str, payload: dict[str, Any], *, timeout_minutes: int = 30
@@ -686,6 +842,7 @@ class AuditCampaignWorkflow(ControlledWorkflow):
                     id=f"finding-verify-{finding_id}",
                     task_queue=workflow.info().task_queue,
                     execution_timeout=timedelta(hours=4),
+                    **self._child_run_options(f"finding-verify-{finding_id}"),
                 )
                 if verification.get("status") in {"RATE_LIMITED", "BLOCKED", "FAILED"}:
                     continue
@@ -798,6 +955,21 @@ class MultiProjectAuditWorkflow(ControlledWorkflow):
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        if request.application_run_id is not None:
+            try:
+                if type(request.application_run_id) is not str:
+                    raise ValueError
+                parent_run_id = UUID(request.application_run_id)
+                if str(parent_run_id) != request.application_run_id or parent_run_id.int == 0:
+                    raise ValueError
+            except (TypeError, ValueError, AttributeError):
+                raise ApplicationError(
+                    "all-project Run binding is invalid", type="PolicyViolation", non_retryable=True
+                ) from None
+            for project in self._projects:
+                self._remember_child_run(
+                    request.child_workflow_ids[project], str(uuid5(parent_run_id, project))
+                )
         parent_workflow_id = workflow.info().workflow_id
         await self._step(
             "campaign.group_status",
@@ -838,6 +1010,7 @@ class MultiProjectAuditWorkflow(ControlledWorkflow):
                     id=request.child_workflow_ids[project],
                     task_queue=workflow.info().task_queue,
                     execution_timeout=timedelta(days=7),
+                    **self._child_run_options(request.child_workflow_ids[project]),
                 )
             except ChildWorkflowError:
                 child = {"status": "FAILED", "blocker": "AUDIT_CHILD_WORKFLOW_FAILED"}
@@ -961,7 +1134,14 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
         self._risk_class = request.risk_class
-        context = await self._step("delivery.load_confirmed_finding", asdict(request))
+        delivery_request = request.payload()
+        context = await self._step("delivery.load_confirmed_finding", delivery_request)
+        if context.get("status") == "BLOCKED":
+            # 2b678d9: a durable approval/binding refusal ends the delivery before any
+            # lease or worktree exists. Main's loader never returned BLOCKED (it raised),
+            # so main histories never reach this return; it precedes the toolchain
+            # marker so neither line's command sequence changes.
+            return context
         # Makers and the checker have no network, so the scan worker installs the project
         # toolchain in the source worktree first -- after the prechecks, so the NEW-28
         # finding baseline never contains toolchain directories. Histories recorded
@@ -996,7 +1176,7 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
                 if not await self._checkpoint(step.upper().replace(".", "_")):
                     await self._release_delivery_leases_best_effort(context)
                     return {"status": "CANCELLED", "context": context}
-                step_payload = {**context, "delivery_request": asdict(request)}
+                step_payload = {**context, "delivery_request": delivery_request}
                 if step in {
                     "delivery.invoke_spec",
                     "delivery.invoke_maker",
@@ -1084,7 +1264,7 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             if not workflow.patched("delivery-resolve-dependencies-v1"):
                 break
             rounds += 1
-            delivery_request = asdict(request)
+            delivery_request = request.payload()
             resolved = await self._step(
                 "delivery.resolve_dependencies",
                 {**context, "delivery_request": delivery_request},
@@ -1137,13 +1317,27 @@ class IssueDeliveryWorkflow(ControlledWorkflow):
             return context
         if not workflow.patched("delivery-refresh-issue-body-v1"):
             return context
-        refreshed = await self._step(
-            "delivery.refresh_issue_body",
-            {
-                "issue_repository": context.get("issue_repository"),
-                "issue_number": context.get("issue_number"),
-            },
-        )
+        refresh_request: dict[str, Any] = {
+            "issue_repository": context.get("issue_repository"),
+            "issue_number": context.get("issue_number"),
+        }
+        if context.get("approved_issue_body_sha256") is not None:
+            refresh_request["approved_issue_body_sha256"] = context["approved_issue_body_sha256"]
+        refreshed = await self._step("delivery.refresh_issue_body", refresh_request)
+        if refreshed.get("status") == "ISSUE_BODY_CHANGED_SINCE_APPROVAL" and workflow.patched(
+            "delivery-refresh-body-approval-scope-v1"
+        ):
+            # NEW-112 review: an issue edited after approval stops this delivery (and
+            # releases its leases) with the operator's re-approval guidance; only the
+            # approved text may reach the spec/maker. Older histories never see this status.
+            return {
+                **context,
+                "status": "BLOCKED",
+                "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+                "blocker_detail": refreshed.get("blocker_detail"),
+                "approved_body_sha256": refreshed.get("approved_body_sha256"),
+                "current_body_sha256": refreshed.get("current_body_sha256"),
+            }
         body = refreshed.get("body_excerpt")
         if refreshed.get("status") != "ISSUE_BODY_REFRESHED" or not isinstance(body, str):
             return context
@@ -1375,6 +1569,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
             id=staging_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(staging_id),
         )
         if staging.get("status") != "STAGING_DEPLOYED":
             return {
@@ -1408,6 +1603,7 @@ class FinalClosureWorkflow(ControlledWorkflow):
             id=verification_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(verification_id),
         )
         if verified.get("status") != "RUNTIME_VERIFIED":
             return {
@@ -1753,6 +1949,18 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step("identity.inspect_stale", context)
             context = await self._step("cleanup.inspect_codex_files", context)
             context = await self._step("cleanup.inspect_preview_namespaces", context)
+            if workflow.patched("cleanup-inspection-outcome-v1") and context.get(
+                "identity_recovery_blockers"
+            ):
+                context = await self._step(
+                    "cleanup.finalize",
+                    {
+                        **context,
+                        "terminal_status": "BLOCKED",
+                        "blocker": "CLEANUP_IDENTITY_INSPECTION_BLOCKED",
+                    },
+                )
+                return {"status": "BLOCKED", "context": context}
             if request.dry_run:
                 if workflow.patched("cleanup-orphan-worktrees-v1"):
                     # NEW-85: report snapshot/acceptance leftovers no lease tracks.
@@ -1849,6 +2057,8 @@ class ObservabilityAcceptanceWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: ObservabilityAcceptanceInput) -> dict[str, Any]:
         context: dict[str, Any] = asdict(request)
+        if workflow.patched("observability-terminal-finalization-v1"):
+            return await self._observability_terminal_run(context)
         context = await self._step("observability.register", context)
         context = await self._step("observability.prepare_workspace", context)
         try:
@@ -1880,6 +2090,8 @@ class ReverseObservabilityAcceptanceWorkflow(ControlledWorkflow):
     @workflow.run
     async def run(self, request: ObservabilityAcceptanceInput) -> dict[str, Any]:
         context: dict[str, Any] = {**asdict(request), "provider_direction": "claude-to-codex"}
+        if workflow.patched("observability-terminal-finalization-v1"):
+            return await self._observability_terminal_run(context, reverse=True)
         context = await self._step("observability.register", context)
         context = await self._step("observability.prepare_workspace", context)
         try:
@@ -1915,6 +2127,48 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
         if not 1 <= request.maximum_items <= 100 or not 1 <= request.component_concurrency <= 4:
             raise ValueError("issue-loop bounds are invalid")
         context = await self._step("loop.load_selection", asdict(request))
+        if workflow.patched("issue-loop-selection-outcomes-v1"):
+            selection_status = context.get("status")
+            if isinstance(selection_status, str) and selection_status in {"BLOCKED", "FAILED"}:
+                blocker = context.get("blocker")
+                if not (
+                    isinstance(blocker, str)
+                    and 1 <= len(blocker) <= 120
+                    and blocker.isascii()
+                    and blocker.isupper()
+                    and blocker.replace("_", "").isalnum()
+                ):
+                    blocker = f"LOOP_SELECTION_{selection_status}"
+                self._phase = f"SELECTION_{selection_status}"
+                return {"status": selection_status, "blocker": blocker, "results": []}
+            if not isinstance(selection_status, str) or selection_status not in {
+                "SELECTED",
+                "PASS",
+            }:
+                self._phase = "SELECTION_FAILED"
+                return {
+                    "status": "FAILED",
+                    "blocker": "LOOP_SELECTION_STATUS_INVALID",
+                    "results": [],
+                }
+            selection_items = context.get("items")
+            if not isinstance(selection_items, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("finding_id"), str)
+                or not item.get("finding_id")
+                or not isinstance(item.get("risk_class"), str)
+                or item.get("risk_class") not in {"R0", "R1", "R2", "R3"}
+                for item in selection_items[: request.maximum_items]
+            ):
+                self._phase = "SELECTION_FAILED"
+                return {
+                    "status": "FAILED",
+                    "blocker": "LOOP_SELECTION_SCHEMA_INVALID",
+                    "results": [],
+                }
+            if not selection_items:
+                self._phase = "EMPTY"
+                return {"status": "EMPTY", "reason": "NO_ELIGIBLE_FINDINGS", "results": []}
         raw_items = context.get("items", [])
         if not isinstance(raw_items, list):
             raise TypeError("issue-loop selection must be a list")
@@ -1945,10 +2199,13 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
                             finding_id=str(item["finding_id"]),
                             risk_class=str(item["risk_class"]),
                             dry_run=request.dry_run or request.execution_mode == "plan-only",
-                        ),
+                        ).payload(),
                         id=f"{workflow.info().workflow_id}-issue-{ordinal}-review-{review_attempt}",
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(
+                            f"{workflow.info().workflow_id}-issue-{ordinal}-review-{review_attempt}"
+                        ),
                     )
                     if delivery.get("status") != "REQUEST_CHANGES":
                         break
@@ -1985,6 +2242,9 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
                         id=f"{workflow.info().workflow_id}-issue-{ordinal}-reconcile",
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(
+                            f"{workflow.info().workflow_id}-issue-{ordinal}-reconcile"
+                        ),
                     )
                     if reconciled.get("status") not in {"READY", "COMPLETE", "PASS"}:
                         return {
@@ -2010,6 +2270,9 @@ class IssueSolutionLoopWorkflow(ControlledWorkflow):
                         id=f"{workflow.info().workflow_id}-issue-{ordinal}-deploy",
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(
+                            f"{workflow.info().workflow_id}-issue-{ordinal}-deploy"
+                        ),
                     )
                     if deployment.get("status") not in {"COMPLETE", "PASS", "VERIFIED"}:
                         return {
@@ -2745,6 +3008,15 @@ def _compact_loop_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
     return {**outcome, "results": compact, "results_total": len(results)}
 
 
+def _backlog_execution_payload(request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+    value = asdict(request)
+    # Preserve the exact legacy activity payload when replaying old inputs.
+    for key in ("issue_operation_id", "issue_approval_binding"):
+        if value[key] is None:
+            value.pop(key)
+    return value
+
+
 @workflow.defn(name="ExistingGitHubBacklogLoopWorkflow")
 class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     """Durably control imported issues; fail closed until current reproduction is proven."""
@@ -2781,7 +3053,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         final_closure_enabled = workflow.patched("existing-backlog-final-closure-v1")
         global_child_blocker_return = workflow.patched("global-backlog-child-blocker-return-v1")
         register_run = workflow.patched("existing-backlog-register-run-v1")
-        context = await self._step("backlog.load_execution", asdict(request))
+        context = await self._step("backlog.load_execution", _backlog_execution_payload(request))
         if context.get("status") == "BLOCKED":
             if register_run and self._blocked_start_closes_run_patched():
                 # NEW-97: without a Run the operation stayed STARTED forever and every later
@@ -2789,7 +3061,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step(
                     "backlog.register_run",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "workflow_id": workflow.info().workflow_id,
                         "closed_blocker": str(context.get("blocker") or "BLOCKED"),
                     },
@@ -2799,7 +3071,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if register_run:
                 await self._step(
                     "backlog.register_run",
-                    {**asdict(request), "workflow_id": workflow.info().workflow_id},
+                    {
+                        **_backlog_execution_payload(request),
+                        "workflow_id": workflow.info().workflow_id,
+                    },
                 )
             return await self._run_backlog_loop(
                 request,
@@ -2832,7 +3107,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step(
                     "backlog.record_loop_state",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "workflow_id": workflow.info().workflow_id,
                         "loop_status": "FAILED",
                     },
@@ -2865,7 +3140,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             reload_blocker: str | None = None
             while True:
                 if not await self._checkpoint(f"BACKLOG_ISSUE_{ordinal}"):
-                    cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                    cancel_state = {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "CANCELLED",
+                    }
                     if register_run:
                         cancel_state["workflow_id"] = workflow.info().workflow_id
                     await self._step("backlog.record_loop_state", cancel_state)
@@ -2887,7 +3165,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 else:
                     gate = await self._step(
                         "backlog.revalidate_gate",
-                        {**asdict(request), "item": item},
+                        {**_backlog_execution_payload(request), "item": item},
                     )
                 if gate.get("status") == "READY":
                     break
@@ -2900,7 +3178,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         request,
                         item,
                         "backlog.materialize_candidate",
-                        {**asdict(request), "item": item},
+                        {**_backlog_execution_payload(request), "item": item},
                         register_run=register_run,
                     )
                     verification_workflow_id = (
@@ -2920,7 +3198,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             item,
                             "backlog.register_child_run",
                             {
-                                **asdict(request),
+                                **_backlog_execution_payload(request),
                                 "child_kind": "finding-verification",
                                 "child_workflow_id": verification_workflow_id,
                                 "finding_id": str(candidate["finding_id"]),
@@ -2938,6 +3216,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             id=verification_workflow_id,
                             task_queue=workflow.info().task_queue,
                             execution_timeout=timedelta(hours=4),
+                            **self._child_run_options(verification_workflow_id),
                         )
                     except ChildWorkflowError:
                         # NEW-72: a failed revalidation child (e.g. a stale mirror) crashed
@@ -2949,13 +3228,15 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                             item,
                             "backlog.record_revalidation",
                             {
-                                **asdict(request),
+                                **_backlog_execution_payload(request),
                                 "item": item,
                                 "verification": verification,
                             },
                             register_run=register_run,
                         )
-                    refreshed = await self._step("backlog.load_execution", asdict(request))
+                    refreshed = await self._step(
+                        "backlog.load_execution", _backlog_execution_payload(request)
+                    )
                     candidates = refreshed.get("items")
                     stale_reload: str | None = None
                     if isinstance(candidates, list):
@@ -2992,7 +3273,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                     await self._step(
                         "backlog.record_loop_state",
-                        {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                        {
+                            **_backlog_execution_payload(request),
+                            "loop_status": "PAUSED",
+                            "blocker": blocker,
+                        },
                     )
                     return {"status": "BLOCKED", "blocker": blocker, "results": results}
                 if (
@@ -3014,7 +3299,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 self._skip_reason = None
                 self._retry_step = None
                 gate_paused: dict[str, Any] = {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "loop_status": "PAUSED",
                     "blocker": blocker,
                 }
@@ -3031,7 +3316,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     )
                 )
                 if self._cancelled:
-                    cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                    cancel_state = {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "CANCELLED",
+                    }
                     if register_run:
                         cancel_state["workflow_id"] = workflow.info().workflow_id
                     await self._step("backlog.record_loop_state", cancel_state)
@@ -3045,7 +3333,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     skipped = await self._step(
                         "backlog.record_skip",
                         {
-                            **asdict(request),
+                            **_backlog_execution_payload(request),
                             "repository": item["repository"],
                             "issue_number": item["issue_number"],
                             "reason_code": reason,
@@ -3062,11 +3350,16 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     # NEW-91: the gate pause set the campaign PAUSED, which voids its
                     # approval; without RUNNING the reload below returned no items and the
                     # loop re-ran revalidation on its stale copy of the item.
-                    resumed: dict[str, Any] = {**asdict(request), "loop_status": "RUNNING"}
+                    resumed: dict[str, Any] = {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "RUNNING",
+                    }
                     if register_run:
                         resumed["workflow_id"] = workflow.info().workflow_id
                     await self._step("backlog.record_loop_state", resumed)
-                refreshed = await self._step("backlog.load_execution", asdict(request))
+                refreshed = await self._step(
+                    "backlog.load_execution", _backlog_execution_payload(request)
+                )
                 candidates = refreshed.get("items")
                 if isinstance(candidates, list):
                     item = next(
@@ -3110,39 +3403,47 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     delivery = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
                     for attempt in range(1, request.correction_limit + 2):
                         delivery_workflow_id = f"{issue_prefix}-attempt-{attempt}"
+                        child_approval_id: str | None = None
                         if register_child_runs:
-                            await self._loop_step(
+                            child_registration = await self._loop_step(
                                 request,
                                 item,
                                 "backlog.register_child_run",
                                 {
-                                    **asdict(request),
+                                    **_backlog_execution_payload(request),
                                     "child_kind": "issue-delivery",
                                     "child_workflow_id": delivery_workflow_id,
                                     "finding_id": str(gate["finding_id"]),
                                 },
                                 register_run=register_run,
                             )
-                        delivery = await self._issue_delivery(gate, delivery_workflow_id)
+                            child_approval_id = child_registration.get("issue_approval_id")
+                        delivery = await self._issue_delivery(
+                            gate, delivery_workflow_id, child_approval_id
+                        )
                         results.append({**delivery, "attempt": attempt})
                         if delivery.get("status") != "REQUEST_CHANGES":
                             break
                 else:
                     delivery_workflow_id = issue_prefix
+                    child_approval_id = None
                     if register_child_runs:
-                        await self._loop_step(
+                        child_registration = await self._loop_step(
                             request,
                             item,
                             "backlog.register_child_run",
                             {
-                                **asdict(request),
+                                **_backlog_execution_payload(request),
                                 "child_kind": "issue-delivery",
                                 "child_workflow_id": delivery_workflow_id,
                                 "finding_id": str(gate["finding_id"]),
                             },
                             register_run=register_run,
                         )
-                    delivery = await self._issue_delivery(gate, delivery_workflow_id)
+                        child_approval_id = child_registration.get("issue_approval_id")
+                    delivery = await self._issue_delivery(
+                        gate, delivery_workflow_id, child_approval_id
+                    )
                     results.append(delivery)
                 pause_blocker: str | None = None
                 if delivery.get("status") in {"BLOCKED", "FAILED", "RATE_LIMITED", "TIMED_OUT"}:
@@ -3150,7 +3451,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     if global_child_blocker_return and request.global_campaign_id is not None:
                         await self._step(
                             "backlog.record_loop_state",
-                            {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                            {
+                                **_backlog_execution_payload(request),
+                                "loop_status": "PAUSED",
+                                "blocker": blocker,
+                            },
                         )
                         return {"status": "BLOCKED", "blocker": blocker, "results": results}
                     if (
@@ -3166,7 +3471,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         await self._step(
                             "backlog.record_loop_state",
                             {
-                                **asdict(request),
+                                **_backlog_execution_payload(request),
                                 "loop_status": "PAUSED",
                                 "blocker": "CORRECTION_LIMIT_EXHAUSTED",
                             },
@@ -3180,7 +3485,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if pause_blocker is None:
                     break
                 paused_state = {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "loop_status": "PAUSED",
                     "blocker": pause_blocker,
                 }
@@ -3191,7 +3496,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step("backlog.record_loop_state", paused_state)
                 if not operator_pause:
                     return {"status": "PAUSED", "results": results}
-                resumed_state = {**asdict(request), "loop_status": "RUNNING"}
+                resumed_state = {**_backlog_execution_payload(request), "loop_status": "RUNNING"}
                 if register_run:
                     resumed_state["workflow_id"] = workflow.info().workflow_id
                 outcome, skipped = await self._await_delivery_operator(
@@ -3279,7 +3584,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step(
                     "backlog.record_loop_state",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "loop_status": "PAUSED",
                         "blocker": full_delivery["blocker"],
                     },
@@ -3293,7 +3598,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 blocker = "FINAL_MERGED_REVISION_DELIVERY_SERVICE_REQUIRED"
                 await self._step(
                     "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "PAUSED",
+                        "blocker": blocker,
+                    },
                 )
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
             closure_id = f"{workflow.info().workflow_id}-issue-{ordinal}-final-closure"
@@ -3313,6 +3622,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 id=closure_id,
                 task_queue=workflow.info().task_queue,
                 execution_timeout=timedelta(days=7),
+                **self._child_run_options(closure_id),
             )
             results.append({**closure, "stage": "final-closure"})
             if closure.get("status") != "FIXED":
@@ -3321,7 +3631,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 await self._step(
                     "backlog.record_loop_state",
-                    {**asdict(request), "loop_status": "PAUSED", "blocker": blocker},
+                    {
+                        **_backlog_execution_payload(request),
+                        "loop_status": "PAUSED",
+                        "blocker": blocker,
+                    },
                 )
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
             boundary = await self._after_issue_boundary(
@@ -3332,7 +3646,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             )
             if boundary is not None:
                 return boundary
-        complete_state = {**asdict(request), "loop_status": "COMPLETE"}
+        complete_state = {**_backlog_execution_payload(request), "loop_status": "COMPLETE"}
         if register_run:
             complete_state["workflow_id"] = workflow.info().workflow_id
         await self._step("backlog.record_loop_state", complete_state)
@@ -3380,7 +3694,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 await self._step(
                     "backlog.register_child_run",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "child_kind": child_kind,
                         "child_workflow_id": child_id,
                         "finding_id": finding_id,
@@ -3393,6 +3707,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 id=child_id,
                 task_queue=task_queue,
                 execution_timeout=timedelta(hours=12),
+                **self._child_run_options(child_id),
             )
             results.append({**current, "stage": child_kind})
             if current.get("status") != "DEPLOY_PR":
@@ -3410,7 +3725,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             await self._step(
                 "backlog.register_child_run",
                 {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "child_kind": "staging-deployment",
                     "child_workflow_id": staging_id,
                     "finding_id": finding_id,
@@ -3425,6 +3740,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             id=staging_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(staging_id),
         )
         results.append({**staging, "stage": "staging-deployment"})
         if staging.get("status") != "STAGING_DEPLOYED":
@@ -3448,7 +3764,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             await self._step(
                 "backlog.register_child_run",
                 {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "child_kind": "runtime-verification",
                     "child_workflow_id": verification_id,
                     "finding_id": finding_id,
@@ -3462,6 +3778,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             id=verification_id,
             task_queue=task_queue,
             execution_timeout=timedelta(hours=12),
+            **self._child_run_options(verification_id),
         )
         results.append({**verified, "stage": "runtime-verification"})
         if verified.get("status") != "RUNTIME_VERIFIED":
@@ -3527,22 +3844,34 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     staged = {"status": "BLOCKED", "blocker": restore_blocker}
             if staged is None and repair_pending and gate is not None:
                 repair_round += 1
-                repaired = await self._ci_repair_delivery(
+                authorization_blocker = await self._authorize_ci_repair(
                     request=request,
                     item=item,
                     register_run=register_run,
-                    gate=gate,
                     ordinal=ordinal,
                     repair_round=repair_round,
-                    results=results,
-                    register_child_runs=register_child_runs,
+                    change_set_id=change_set_id,
+                    workflow_root=workflow_root,
                 )
-                if repaired.get("status") == "SOURCE_PR":
-                    repair_pending = False
-                    gitops_round += 1
+                if authorization_blocker is not None:
+                    staged = {"status": "BLOCKED", "blocker": authorization_blocker}
                 else:
-                    reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
-                    staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
+                    repaired = await self._ci_repair_delivery(
+                        request=request,
+                        item=item,
+                        register_run=register_run,
+                        gate=gate,
+                        ordinal=ordinal,
+                        repair_round=repair_round,
+                        results=results,
+                        register_child_runs=register_child_runs,
+                    )
+                    if repaired.get("status") == "SOURCE_PR":
+                        repair_pending = False
+                        gitops_round += 1
+                    else:
+                        reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
+                        staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
             if staged is None and change_set_id:
                 child_id = f"{workflow_root}-issue-{ordinal}-staging-gitops"
                 if gitops_round:
@@ -3553,7 +3882,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         item,
                         "backlog.register_child_run",
                         {
-                            **asdict(request),
+                            **_backlog_execution_payload(request),
                             "child_kind": "staging-gitops",
                             "child_workflow_id": child_id,
                             "finding_id": finding_id,
@@ -3575,6 +3904,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         id=child_id,
                         task_queue=workflow.info().task_queue,
                         execution_timeout=timedelta(hours=12),
+                        **self._child_run_options(child_id),
                     )
                 except ChildWorkflowError:
                     staged = {"status": "FAILED", "blocker": "STAGING_GITOPS_CHILD_WORKFLOW_FAILED"}
@@ -3598,7 +3928,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             ):
                 repair_pending = True
                 continue
-            paused_state = {**asdict(request), "loop_status": "PAUSED", "blocker": blocker}
+            paused_state = {
+                **_backlog_execution_payload(request),
+                "loop_status": "PAUSED",
+                "blocker": blocker,
+            }
             if register_run:
                 paused_state["workflow_id"] = workflow_root
             await self._step("backlog.record_loop_state", paused_state)
@@ -3609,7 +3943,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             )
             if outcome == "CANCELLED":
                 return "CANCELLED", blocker
-            resumed_state = {**asdict(request), "loop_status": "RUNNING"}
+            resumed_state = {**_backlog_execution_payload(request), "loop_status": "RUNNING"}
             if register_run:
                 resumed_state["workflow_id"] = workflow_root
             await self._step("backlog.record_loop_state", resumed_state)
@@ -3703,6 +4037,43 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         # an earlier issue replayed from before the deploy does not pin later ones to it.
         return workflow.patched(f"existing-backlog-ci-repair-retry-rechecks-v1-{ordinal}")
 
+    async def _authorize_ci_repair(
+        self,
+        *,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        register_run: bool,
+        ordinal: int,
+        repair_round: int,
+        change_set_id: str,
+        workflow_root: str,
+    ) -> str | None:
+        """NEW-112 review: durably record the repair round before any repair child starts.
+
+        The delivery-child approval accepts a CI-repair child only against this record.
+        Histories recorded before it carry no marker and keep their command sequence.
+        """
+        if not workflow.patched(f"existing-backlog-ci-repair-authority-v1-{ordinal}"):
+            return None
+        if not register_run or not change_set_id:
+            return "CI_REPAIR_PARENT_RUN_UNVERIFIED"
+        recorded = await self._loop_step(
+            request,
+            item,
+            "backlog.record_ci_repair",
+            {
+                **_backlog_execution_payload(request),
+                "workflow_id": workflow_root,
+                "ordinal": ordinal,
+                "repair_round": repair_round,
+                "change_set_id": change_set_id,
+            },
+            register_run=register_run,
+        )
+        if recorded.get("status") == "RECORDED":
+            return None
+        return str(recorded.get("blocker") or "CI_REPAIR_NOT_AUTHORIZED")[:120]
+
     async def _ci_repair_delivery(
         self,
         *,
@@ -3720,20 +4091,22 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         delivery: dict[str, Any] = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
         for attempt in range(1, request.correction_limit + 2):
             child_id = f"{prefix}-attempt-{attempt}"
+            child_approval_id: str | None = None
             if register_child_runs:
-                await self._loop_step(
+                child_registration = await self._loop_step(
                     request,
                     item,
                     "backlog.register_child_run",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "child_kind": "issue-delivery",
                         "child_workflow_id": child_id,
                         "finding_id": str(gate["finding_id"]),
                     },
                     register_run=register_run,
                 )
-            delivery = await self._issue_delivery(gate, child_id)
+                child_approval_id = child_registration.get("issue_approval_id")
+            delivery = await self._issue_delivery(gate, child_id, child_approval_id)
             results.append({**delivery, "attempt": attempt, "stage": "ci-repair"})
             if delivery.get("status") != "REQUEST_CHANGES":
                 break
@@ -3756,7 +4129,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             await self._step(
                 "backlog.record_loop_state",
                 {
-                    **asdict(request),
+                    **_backlog_execution_payload(request),
                     "loop_status": "STOPPED",
                     "control_state": "STOPPED_AFTER_CURRENT",
                 },
@@ -3770,7 +4143,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         await self._step(
             "backlog.record_loop_state",
             {
-                **asdict(request),
+                **_backlog_execution_payload(request),
                 "loop_status": "PAUSED",
                 "control_state": "PAUSED_AFTER_CURRENT",
             },
@@ -3780,7 +4153,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             return None
         await self._step(
             "backlog.record_loop_state",
-            {**asdict(request), "loop_status": "CANCELLED"},
+            {**_backlog_execution_payload(request), "loop_status": "CANCELLED"},
         )
         return {"status": "CANCELLED", "results": results}
 
@@ -3803,7 +4176,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if not workflow.patched("existing-backlog-resilient-loop-steps-v1"):
                     raise
                 blocker = "LOOP_STEP_FAILED_" + step.upper().replace(".", "_")
-                paused = {**asdict(request), "loop_status": "PAUSED", "blocker": blocker}
+                paused = {
+                    **_backlog_execution_payload(request),
+                    "loop_status": "PAUSED",
+                    "blocker": blocker,
+                }
                 if register_run:
                     paused["workflow_id"] = workflow.info().workflow_id
                 await self._step("backlog.record_loop_state", paused)
@@ -3812,7 +4189,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 if outcome != "RETRY":
                     raise error
-                resumed = {**asdict(request), "loop_status": "RUNNING"}
+                resumed = {**_backlog_execution_payload(request), "loop_status": "RUNNING"}
                 if register_run:
                     resumed["workflow_id"] = workflow.info().workflow_id
                 await self._step("backlog.record_loop_state", resumed)
@@ -3837,7 +4214,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
             )
             if self._cancelled:
-                cancel_state = {**asdict(request), "loop_status": "CANCELLED"}
+                cancel_state = {**_backlog_execution_payload(request), "loop_status": "CANCELLED"}
                 if register_run:
                     cancel_state["workflow_id"] = workflow.info().workflow_id
                 await self._step("backlog.record_loop_state", cancel_state)
@@ -3851,7 +4228,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 skipped = await self._step(
                     "backlog.record_skip",
                     {
-                        **asdict(request),
+                        **_backlog_execution_payload(request),
                         "repository": item["repository"],
                         "issue_number": item["issue_number"],
                         "reason_code": reason,
@@ -3863,8 +4240,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 self._phase = f"RESUMED:{issue_ref}"
                 return "RETRY", {}
 
-    @staticmethod
-    async def _issue_delivery(gate: dict[str, Any], delivery_workflow_id: str) -> dict[str, Any]:
+    async def _issue_delivery(
+        self,
+        gate: dict[str, Any],
+        delivery_workflow_id: str,
+        issue_approval_id: str | None = None,
+    ) -> dict[str, Any]:
         # A failed delivery child (e.g. NEW-23's evidence 422) must block its one issue
         # through the normal FAILED path below, not crash the whole backlog loop.
         try:
@@ -3874,10 +4255,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     finding_id=str(gate["finding_id"]),
                     risk_class=str(gate["risk_class"]),
                     dry_run=False,
-                ),
+                    issue_approval_id=issue_approval_id,
+                ).payload(),
                 id=delivery_workflow_id,
                 task_queue=workflow.info().task_queue,
                 execution_timeout=timedelta(hours=12),
+                **self._child_run_options(delivery_workflow_id),
             )
         except ChildWorkflowError:
             return {"status": "FAILED", "blocker": "DELIVERY_CHILD_WORKFLOW_FAILED"}
@@ -3979,6 +4362,7 @@ class AutonomousBacklogCampaignWorkflow(ControlledWorkflow):
                 id=child_id,
                 task_queue=workflow.info().task_queue,
                 execution_timeout=timedelta(days=7),
+                **self._child_run_options(child_id),
             )
             context = await self._step(
                 "global_backlog.record_result", {**context, "item": item, "result": result}
@@ -4082,6 +4466,7 @@ class EnhancementSolutionLoopWorkflow(ControlledWorkflow):
             id=f"{workflow.info().workflow_id}-solution",
             task_queue=workflow.info().task_queue,
             execution_timeout=timedelta(days=7),
+            **self._child_run_options(f"{workflow.info().workflow_id}-solution"),
         )
         if not isinstance(result, dict):
             raise RuntimeError("enhancement solution child returned an invalid result")

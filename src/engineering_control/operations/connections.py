@@ -10,8 +10,17 @@ from typing import Any, cast
 
 import httpx
 
+from engineering_control.operations.connection_budget import (
+    diagnostic_budget,
+    joined_diagnostic_thread,
+)
+from engineering_control.operations.connection_status import provider_connection_status
 from engineering_control.operations.repository import OperationsRepository
 from engineering_control.workflows.worker_registry import ROLE_TASK_QUEUES
+
+
+def _utc(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 class ConnectionHealthProjector:
@@ -19,8 +28,14 @@ class ConnectionHealthProjector:
 
     def __init__(self, repository: OperationsRepository) -> None:
         self.repository = repository
+        self._refresh_lock = asyncio.Lock()
 
     async def refresh(self, scope: str = "all") -> None:
+        async with asyncio.timeout(35), self._refresh_lock:
+            with diagnostic_budget(35):
+                await self._refresh(scope)
+
+    async def _refresh(self, scope: str) -> None:
         now = datetime.now(UTC)
         await self._fixed_http("engineering-api", "http://127.0.0.1:8740/health/ready", now)
         await self._fixed_http("engineering-dashboard", "http://127.0.0.1:8750/health/ready", now)
@@ -34,8 +49,8 @@ class ConnectionHealthProjector:
         if scope in {"all", "public"}:
             await self._dns(now)
             await self._public_https(now)
-            await asyncio.to_thread(self._tls, now)
-        await asyncio.to_thread(self._persisted, now)
+            await self._tls(now)
+        await joined_diagnostic_thread(self._persisted, now)
 
     async def _fixed_http(
         self,
@@ -49,11 +64,11 @@ class ConnectionHealthProjector:
         status = "DISCONNECTED"
         safe_error: str | None = None
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                response = await client.get(url, follow_redirects=False)
-            status = "CONNECTED" if response.status_code in expected else "DEGRADED"
-            if response.status_code not in expected:
-                safe_error = f"unexpected HTTP status {response.status_code}"
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as client:
+                async with client.stream("GET", url, follow_redirects=False) as response:
+                    status = "CONNECTED" if response.status_code in expected else "DEGRADED"
+                    if response.status_code not in expected:
+                        safe_error = f"unexpected HTTP status {response.status_code}"
         except (httpx.HTTPError, OSError):
             safe_error = "bounded HTTP probe failed"
         latency = max(0, int((time.monotonic() - started) * 1000))
@@ -108,12 +123,12 @@ class ConnectionHealthProjector:
         http_status: int | None = None
         server = ""
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                response = await client.get(
-                    "https://ade.musematic.ai/login", follow_redirects=False
-                )
-            http_status = response.status_code
-            server = response.headers.get("server", "")[:40]
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as client:
+                async with client.stream(
+                    "GET", "https://ade.musematic.ai/login", follow_redirects=False
+                ) as response:
+                    http_status = response.status_code
+                    server = response.headers.get("server", "")[:40]
         except (httpx.HTTPError, OSError):
             pass
         connected = http_status in {200, 303}
@@ -150,16 +165,25 @@ class ConnectionHealthProjector:
             }
         )
 
-    def _tls(self, now: datetime) -> None:
+    async def _tls(self, now: datetime) -> None:
         started = time.monotonic()
         status = "DISCONNECTED"
         safe_error: str | None = "TLS certificate probe failed"
         details: dict[str, Any] = {}
+        writer: asyncio.StreamWriter | None = None
         try:
             context = ssl.create_default_context()
-            with socket.create_connection(("ade.musematic.ai", 443), timeout=5.0) as raw:
-                with context.wrap_socket(raw, server_hostname="ade.musematic.ai") as tls:
-                    certificate = cast(dict[str, Any], tls.getpeercert() or {})
+            async with asyncio.timeout(5):
+                _reader, writer = await asyncio.open_connection(
+                    "ade.musematic.ai",
+                    443,
+                    ssl=context,
+                    server_hostname="ade.musematic.ai",
+                    ssl_handshake_timeout=5,
+                    ssl_shutdown_timeout=1,
+                )
+                tls = writer.get_extra_info("ssl_object")
+                certificate = cast(dict[str, Any], tls.getpeercert() or {})
             names = {
                 value for kind, value in certificate.get("subjectAltName", ()) if kind == "DNS"
             }
@@ -172,9 +196,19 @@ class ConnectionHealthProjector:
                 "hostname_valid": "ade.musematic.ai" in names,
                 "expires_at": expires_at.isoformat(),
             }
-        except (OSError, ssl.SSLError, ValueError):
+        except (OSError, ssl.SSLError, ValueError, TimeoutError):
             pass
-        self.repository._upsert_connection(
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1)
+                except (OSError, TimeoutError):
+                    writer.transport.abort()
+                except asyncio.CancelledError:
+                    writer.transport.abort()
+                    raise
+        await self.repository.upsert_connection(
             {
                 "component": "tls-certificate",
                 "logical_target": "ade.musematic.ai:443",
@@ -196,11 +230,14 @@ class ConnectionHealthProjector:
         started = time.monotonic()
         answers: set[str] = set()
         try:
-            values = await asyncio.get_running_loop().getaddrinfo(
-                "ade.musematic.ai", 443, family=socket.AF_INET, type=socket.SOCK_STREAM
+            values = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(
+                    "ade.musematic.ai", 443, family=socket.AF_INET, type=socket.SOCK_STREAM
+                ),
+                timeout=3.0,
             )
             answers = {str(item[4][0]) for item in values}
-        except OSError:
+        except (OSError, TimeoutError):
             answers = set()
         connected = answers == {"138.199.173.27"}
         await self.repository.upsert_connection(
@@ -308,25 +345,23 @@ class ConnectionHealthProjector:
                 details: dict[str, Any] = {}
             else:
                 checked = snapshot.captured_at
-                age = int(
-                    (
-                        now - (checked if checked.tzinfo else checked.replace(tzinfo=UTC))
-                    ).total_seconds()
-                )
-                ready = snapshot.cli_present is True and snapshot.authenticated is True
-                status = (
-                    "STALE"
-                    if age > 300
-                    else "CONNECTED"
-                    if ready and not snapshot.rate_limited
-                    else "DEGRADED"
+                status = provider_connection_status(
+                    captured_at=checked,
+                    authenticated=snapshot.authenticated,
+                    cli_present=snapshot.cli_present,
+                    rate_limited=snapshot.rate_limited,
+                    now=now,
                 )
                 details = {
                     "cli_present": snapshot.cli_present,
                     "authentication_status": "READY" if snapshot.authenticated else "NOT_READY",
                     "rate_limited": snapshot.rate_limited,
                     "running_jobs": snapshot.running_jobs,
-                    "capacity_status": snapshot.status,
+                    "capacity_status": "UNKNOWN"
+                    if snapshot.total_capacity is None
+                    else "STALE"
+                    if status == "STALE"
+                    else snapshot.status,
                 }
             self.repository._upsert_connection(
                 {
@@ -348,8 +383,28 @@ class ConnectionHealthProjector:
                 }
             )
         events = sources["events"]
+        gateway_success = next(
+            (event for event in events if event.event_type == "telegram.response_delivered"), None
+        )
+        gateway_failure = next(
+            (event for event in events if event.event_type == "telegram.response_delivery_failed"),
+            None,
+        )
+        gateway_inbound = next(
+            (event for event in events if event.event_type == "telegram.command_received"), None
+        )
         gateway = next(
-            (event for event in events if event.event_type.startswith("telegram.")), None
+            (
+                event
+                for event in events
+                if event.event_type
+                in {
+                    "telegram.response_delivered",
+                    "telegram.response_delivery_failed",
+                    "telegram.command_received",
+                }
+            ),
+            None,
         )
         gateway_age = (
             int(
@@ -365,11 +420,24 @@ class ConnectionHealthProjector:
             if gateway is not None
             else None
         )
+        gateway_recent = gateway_age is not None and gateway_age <= 600
+        failure_is_latest = gateway_failure is not None and (
+            gateway_success is None
+            or _utc(gateway_failure.occurred_at) >= _utc(gateway_success.occurred_at)
+        )
+        reply_follows_inbound = gateway_success is not None and (
+            gateway_inbound is None
+            or _utc(gateway_success.occurred_at) >= _utc(gateway_inbound.occurred_at)
+        )
         gateway_status = (
-            "CONNECTED"
-            if gateway_age is not None and gateway_age <= 86400
-            else "STALE"
-            if gateway
+            "STALE"
+            if gateway is not None and not gateway_recent
+            else "DEGRADED"
+            if gateway is not None and (failure_is_latest or not reply_follows_inbound)
+            else "CONNECTED"
+            if gateway_success is not None
+            else "DEGRADED"
+            if gateway is not None
             else "NOT_CONFIGURED"
         )
         for component, target in (
@@ -382,12 +450,18 @@ class ConnectionHealthProjector:
                     "logical_target": target,
                     "status": gateway_status,
                     "checked_at": gateway.occurred_at if gateway else now,
-                    "last_success_at": gateway.occurred_at if gateway else None,
-                    "last_failure_at": None,
+                    "last_success_at": (
+                        gateway_success.occurred_at if gateway_success is not None else None
+                    ),
+                    "last_failure_at": (
+                        gateway_failure.occurred_at if gateway_failure is not None else None
+                    ),
                     "latency_ms": None,
                     "safe_error": None
                     if gateway_status == "CONNECTED"
-                    else "safe gateway event is stale or absent",
+                    else "latest Telegram delivery failed"
+                    if failure_is_latest and gateway_recent
+                    else "safe gateway event is stale or incomplete",
                     "source": "redacted-gateway-events",
                     "next_action": None
                     if gateway_status == "CONNECTED"
@@ -505,9 +579,9 @@ class ConnectionHealthProjector:
             {
                 "component": "engineering-cli",
                 "logical_target": str(cli_path),
-                "status": "CONNECTED" if cli_path.is_file() else "NOT_INSTALLED",
+                "status": "PRESENT" if cli_path.is_file() else "NOT_INSTALLED",
                 "checked_at": now,
-                "last_success_at": now if cli_path.is_file() else None,
+                "last_success_at": None,
                 "last_failure_at": None,
                 "latency_ms": None,
                 "safe_error": None if cli_path.is_file() else "engineering-ctl is not installed",

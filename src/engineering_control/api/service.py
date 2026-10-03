@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
@@ -35,7 +38,10 @@ from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.change_requests import change_request_workflow_id
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.models.enums import Project
+from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
+from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.policy.approvals import ApprovalService
+from engineering_control.workflow_outcome import derive_workflow_application_projection
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
@@ -77,6 +83,7 @@ class ControlService(Protocol):
     ) -> OperationAccepted: ...
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]: ...
     async def workflow_run_status(self, workflow_id: str, run_id: str) -> str: ...
+    async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]: ...
     async def record_approval(self, request: ApprovalRecord, approver_subject: str) -> None: ...
     async def start_acceptance(
         self, request: AcceptanceLifecycleStart, validation_root: str
@@ -94,6 +101,7 @@ class ControlService(Protocol):
     async def start_existing_backlog_loop(
         self, request: ExistingBacklogLoopStart
     ) -> OperationAccepted: ...
+    async def observe_issue_start(self, request: ExistingBacklogLoopStart) -> OperationAccepted: ...
     async def start_autonomous_backlog(
         self, request: AutonomousBacklogStart
     ) -> OperationAccepted: ...
@@ -149,21 +157,63 @@ class TemporalControlService:
             mode="json"
         )
 
+    async def _start_recorded_workflow(
+        self,
+        application_run_id: UUID,
+        workflow_id: str,
+        workflow_name: str,
+        workflow_input: Any,
+        *,
+        campaign_id: UUID | None = None,
+    ) -> OperationAccepted:
+        try:
+            async with asyncio.timeout(15):
+                handle = await self.client.start_workflow(
+                    workflow_name,
+                    workflow_input,
+                    id=workflow_id,
+                    task_queue=self.task_queue,
+                    rpc_timeout=timedelta(seconds=5),
+                    id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                    memo={
+                        "engineering_application_run_id": str(application_run_id),
+                        "engineering_binding_version": 1,
+                    },
+                )
+                first_run_id = handle.first_execution_run_id
+                try:
+                    parsed = UUID(first_run_id)
+                except (TypeError, ValueError):
+                    raise ValueError("invalid first_execution_run_id") from None
+                if str(parsed) != first_run_id or parsed.int == 0:
+                    raise ValueError("invalid first_execution_run_id")
+                await self.repository.bind_recorded_run(
+                    application_run_id, workflow_id, first_run_id
+                )
+                if campaign_id is not None:
+                    await self.repository.bind_campaign_execution(
+                        campaign_id, workflow_id, first_run_id
+                    )
+        except Exception:
+            raise RecordedRunStartUnconfirmedError(workflow_id, application_run_id) from None
+        return OperationAccepted(workflow_id=workflow_id, run_id=first_run_id)
+
     async def start_campaign(self, request: CampaignStart) -> OperationAccepted:
         campaign_id = uuid4()
         workflow_id = f"audit-{request.project.value}-{campaign_id}"
-        await self.repository.create_campaign(campaign_id, workflow_id, request)
+        application_run_id = uuid4()
+        await self.repository.create_campaign(
+            campaign_id, workflow_id, request, application_run_id=application_run_id
+        )
         value = request.model_dump(mode="json")
         value["preset"] = request.preset or "static-full"
         value["environment"] = request.environment or request.environments[0]
-        handle = await self.client.start_workflow(
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.AUDIT_CAMPAIGN.value,
             AuditCampaignInput(**value, campaign_id=str(campaign_id)),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+            campaign_id=campaign_id,
         )
 
     async def start_all_project_audits(self, request: MultiProjectAuditStart) -> OperationAccepted:
@@ -177,8 +227,13 @@ class TemporalControlService:
             )
             for project in projects
         }
-        await self.repository.create_multi_project_audit(workflow_id, campaigns, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        await self.repository.create_multi_project_audit(
+            workflow_id, campaigns, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.MULTI_PROJECT_AUDIT.value,
             MultiProjectAuditInput(
                 preset=request.preset,
@@ -186,55 +241,72 @@ class TemporalControlService:
                 publish_findings=request.publish_findings,
                 campaign_ids={project.value: str(campaigns[project][0]) for project in projects},
                 child_workflow_ids={project.value: campaigns[project][1] for project in projects},
+                application_run_id=str(application_run_id),
             ),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def start_delivery(self, request: DeliveryStart) -> OperationAccepted:
+        # Also validate internally constructed/model_copy callers. A real direct
+        # entrypoint adopts the approved single-issue operation, not a second
+        # unbound child Run with its own random workflow ID.
+        request = DeliveryStart.model_validate(request.model_dump(mode="json"))
+        if not request.dry_run:
+            await self.repository.validate_delivery_issue_request(request)
+            assert request.approved_issue is not None
+            accepted = await self.start_existing_backlog_loop(request.approved_issue)
+            try:
+                await self.repository.record_delivery_issue_start(request, accepted)
+            except Exception as error:
+                # Temporal already accepted or identified the canonical execution.
+                # A missing receipt is not a pre-start denial, even if approval
+                # changed during persistence. Preserve its owner for observation;
+                # do not retry the start or try another write to an unavailable DB.
+                raise IssueStartUnconfirmedError(request.approved_issue) from error
+            return accepted
         workflow_id = f"delivery-{request.finding_id}-{uuid4()}"
-        await self.repository.create_delivery_run(workflow_id, request)
-        handle = await self.client.start_workflow(
-            WorkflowName.ISSUE_DELIVERY.value,
-            IssueDeliveryInput(**request.model_dump()),
-            id=workflow_id,
-            task_queue=self.task_queue,
+        application_run_id = uuid4()
+        await self.repository.create_delivery_run(
+            workflow_id, request, application_run_id=application_run_id
         )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
+            WorkflowName.ISSUE_DELIVERY.value,
+            IssueDeliveryInput(
+                finding_id=str(request.finding_id),
+                risk_class=request.risk_class.value,
+                dry_run=True,
+            ).payload(),
         )
 
     async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted:
         workflow_id = f"finding-verify-{finding_id}-{uuid4()}"
-        project = await self.repository.create_finding_verification_run(workflow_id, finding_id)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        project = await self.repository.create_finding_verification_run(
+            workflow_id, finding_id, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.FINDING_VERIFICATION.value,
             FindingVerificationInput(
                 finding_id=str(finding_id),
                 project=project.value,
                 fresh_snapshot=True,
             ),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted:
         workflow_id = f"reconcile-{request.change_set_id}-{uuid4()}"
-        await self.repository.create_delivery_reconciliation_run(workflow_id, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        await self.repository.create_delivery_reconciliation_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.DELIVERY_RECONCILIATION.value,
             DeliveryReconciliationInput(**request.model_dump(mode="json")),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None:
@@ -278,64 +350,97 @@ class TemporalControlService:
 
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted:
         workflow_id = f"deploy-{request.environment}-{request.change_set_id}-{uuid4()}"
-        project = await self.repository.create_deployment_run(workflow_id, request)
+        application_run_id = uuid4()
+        project = await self.repository.create_deployment_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
         if request.environment == "preview":
-            handle = await self.client.start_workflow(
+            return await self._start_recorded_workflow(
+                application_run_id,
+                workflow_id,
                 WorkflowName.PREVIEW_DEPLOYMENT.value,
                 PreviewDeploymentInput(
                     change_set_id=str(request.change_set_id),
                     project=project.value,
                     dry_run=request.dry_run,
                 ),
-                id=workflow_id,
-                task_queue=self.task_queue,
             )
-        else:
-            handle = await self.client.start_workflow(
-                WorkflowName.STAGING_DEPLOYMENT.value,
-                StagingDeploymentInput(**request.model_dump()),
-                id=workflow_id,
-                task_queue=self.task_queue,
-            )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
+            WorkflowName.STAGING_DEPLOYMENT.value,
+            StagingDeploymentInput(**request.model_dump()),
         )
 
     async def rollback(self, request: RollbackRequest) -> OperationAccepted:
         workflow_id = f"recovery-{request.deployment_id}-{uuid4()}"
-        await self.repository.create_recovery_run(workflow_id, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        await self.repository.create_recovery_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.RECOVERY.value,
             RecoveryInput(**request.model_dump()),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def start_runtime_verification(
         self, request: RuntimeVerificationStart
     ) -> OperationAccepted:
         workflow_id = f"runtime-verify-{request.deployment_id}-{uuid4()}"
-        project = await self.repository.create_runtime_verification_run(workflow_id, request)
-        handle = await self.client.start_workflow(
+        application_run_id = uuid4()
+        project = await self.repository.create_runtime_verification_run(
+            workflow_id, request, application_run_id=application_run_id
+        )
+        return await self._start_recorded_workflow(
+            application_run_id,
+            workflow_id,
             WorkflowName.RUNTIME_VERIFICATION.value,
             RuntimeVerificationInput(
                 deployment_id=str(request.deployment_id),
                 project=project.value,
             ),
-            id=workflow_id,
-            task_queue=self.task_queue,
-        )
-        return OperationAccepted(
-            workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
 
     async def workflow_run_status(self, workflow_id: str, run_id: str) -> str:
         """Status of one execution, not of whatever later run reused the workflow ID."""
         description = await self.client.get_workflow_handle(workflow_id, run_id=run_id).describe()
         return description.status.name if description.status is not None else "UNKNOWN"
+
+    async def get_reconciliation_observation(self, workflow_id: str) -> dict[str, Any]:
+        """Bounded, pinned result read; never follow a different execution implicitly."""
+        async with asyncio.timeout(10):
+            description = await self.client.get_workflow_handle(workflow_id).describe()
+            info = description.raw_description.workflow_execution_info
+            value: dict[str, Any] = {
+                "workflow_id": workflow_id,
+                "run_id": description.run_id,
+                "first_execution_run_id": info.first_run_id,
+                "status": description.status.name if description.status else "UNKNOWN",
+                "identity_verified": False,
+                "business_status": None,
+                "result_campaign_id": None,
+            }
+            if value["status"] == "COMPLETED":
+                pinned = self.client.get_workflow_handle(workflow_id, run_id=description.run_id)
+                result = await pinned.result(follow_runs=False, rpc_timeout=timedelta(seconds=5))
+                if isinstance(result, dict):
+                    status, campaign_id = result.get("status"), result.get("campaign_id")
+                    from engineering_control.operations.reconciliation import TERMINAL_OUTCOMES
+
+                    if isinstance(status, str) and status in TERMINAL_OUTCOMES:
+                        value["business_status"] = status
+                    if isinstance(campaign_id, str) and len(campaign_id) <= 36:
+                        value["result_campaign_id"] = campaign_id
+            latest = await self.client.get_workflow_handle(workflow_id).describe()
+            value["identity_verified"] = (
+                bool(info.first_run_id)
+                and latest.run_id == description.run_id
+                and latest.raw_description.workflow_execution_info.first_run_id == info.first_run_id
+                and latest.status == description.status
+            )
+            return value
 
     async def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         handle = self.client.get_workflow_handle(workflow_id)
@@ -358,6 +463,25 @@ class TemporalControlService:
                     "redaction_status",
                 )
                 response["validation"] = {key: result.get(key) for key in allowed}
+        try:
+            async with asyncio.timeout(5):
+                rows = await self.repository.get_workflow_projection(workflow_id)
+            projection = derive_workflow_application_projection(rows)
+            response["application"] = asdict(projection)
+        except Exception:
+            response["application"] = {
+                "run_association": "UNAVAILABLE",
+                "persisted_status": None,
+                "business_status": None,
+                "error_code": None,
+                "run_projection": None,
+                "observed_at": datetime.now(UTC).isoformat(),
+                "updated_at": None,
+                "started_at": None,
+                "finished_at": None,
+                "source": "APPLICATION_RUN_PROJECTION",
+                "scope": "WORKFLOW_ID_ONLY",
+            }
         return response
 
     async def start_acceptance(
@@ -449,6 +573,14 @@ class TemporalControlService:
     async def start_existing_backlog_loop(
         self, request: ExistingBacklogLoopStart
     ) -> OperationAccepted:
+        direct = request.target_repository is not None or request.issue_operation_id is not None
+        if direct:
+            await self.repository.validate_issue_operation_approval(request)
+            if request.issue_operation_id is None:
+                raise ValueError(
+                    "approved global/R3 issue execution is owned by its durable parent; "
+                    "direct API starts require an originating typed issue operation"
+                )
         campaign = await self.repository.get_backlog_campaign(request.backlog_campaign_id)
         if campaign is None or campaign.get("project") != request.project:
             raise ValueError("existing backlog campaign does not exist")
@@ -456,7 +588,7 @@ class TemporalControlService:
             "APPROVED_POLICY_PENDING",
             "APPROVED",
             "APPROVED_INVENTORY",
-        }:
+        } and not (direct and campaign.get("status") == "RUNNING"):
             raise ValueError("existing backlog campaign requires its exact Telegram approval")
         if campaign.get("maximum_risk") != request.maximum_risk.value:
             raise ValueError("existing backlog maximum risk changed after approval")
@@ -464,16 +596,78 @@ class TemporalControlService:
             raise ValueError("existing backlog delivery mode changed after approval")
         if request.maximum_items > int(campaign.get("maximum_items") or 0):
             raise ValueError("existing backlog item bound exceeds its approval")
-        workflow_id = f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
-        handle = await self.client.start_workflow(
-            WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,
-            ExistingGitHubBacklogLoopInput(**request.model_dump(mode="json")),
-            id=workflow_id,
-            task_queue=self.task_queue,
+        if direct:
+            await self.repository.validate_issue_operation_approval(request)
+        workflow_id = (
+            issue_workflow_id(request)
+            if request.issue_operation_id is not None
+            else f"backlog-loop-{request.project}-{request.backlog_campaign_id}-{uuid4()}"
         )
+        if campaign.get("status") == "RUNNING":
+            # Only an exact approved direct operation can reach this branch.
+            # Resolve its actual existing execution; missing/wrong history is
+            # not permission to start another workflow from a running projection.
+            try:
+                return await self._existing_issue_workflow(workflow_id)
+            except Exception as error:
+                raise IssueStartUnconfirmedError(request) from error
+        try:
+            handle = await self.client.start_workflow(
+                WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value,
+                ExistingGitHubBacklogLoopInput(**request.model_dump(mode="json")),
+                id=workflow_id,
+                task_queue=self.task_queue,
+                id_reuse_policy=(
+                    WorkflowIDReusePolicy.REJECT_DUPLICATE
+                    if direct
+                    else WorkflowIDReusePolicy.ALLOW_DUPLICATE
+                ),
+                rpc_timeout=timedelta(seconds=30),
+            )
+        except WorkflowAlreadyStartedError as error:
+            if not direct:
+                raise
+            try:
+                return await self._existing_issue_workflow(workflow_id, run_id=error.run_id)
+            except Exception as lookup_error:
+                raise IssueStartUnconfirmedError(request) from lookup_error
+        except Exception as error:
+            if direct:
+                raise IssueStartUnconfirmedError(request) from error
+            raise
         return OperationAccepted(
             workflow_id=workflow_id, run_id=handle.first_execution_run_id or ""
         )
+
+    async def _existing_issue_workflow(
+        self,
+        workflow_id: str,
+        *,
+        run_id: str | None = None,
+        rpc_timeout: timedelta = timedelta(seconds=30),
+    ) -> OperationAccepted:
+        existing = self.client.get_workflow_handle(workflow_id, run_id=run_id)
+        description = await existing.describe(rpc_timeout=rpc_timeout)
+        if (
+            description.id != workflow_id
+            or description.workflow_type != WorkflowName.EXISTING_GITHUB_BACKLOG_LOOP.value
+        ):
+            raise ValueError("existing issue workflow identity does not match the operation")
+        return OperationAccepted(
+            workflow_id=workflow_id, run_id=description.run_id, status="EXISTING"
+        )
+
+    async def observe_issue_start(self, request: ExistingBacklogLoopStart) -> OperationAccepted:
+        # Only describe an exact persisted attempt. No current-policy approval,
+        # new start, signal, cancellation or external write occurs here.
+        request = ExistingBacklogLoopStart.model_validate(request.model_dump(mode="json"))
+        if request.issue_operation_id is None or request.issue_approval_binding is None:
+            raise ValueError("issue observation requires an immutable operation reference")
+        accepted = await self._existing_issue_workflow(
+            issue_workflow_id(request), rpc_timeout=timedelta(seconds=5)
+        )
+        UUID(accepted.run_id)
+        return accepted
 
     async def start_autonomous_backlog(self, request: AutonomousBacklogStart) -> OperationAccepted:
         for project, campaign_id in request.backlog_campaign_ids.items():

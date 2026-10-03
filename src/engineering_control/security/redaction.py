@@ -94,13 +94,21 @@ class SecretRedactor:
         r"(?i)(authorization|cookie|password|passwd|secret|session|token|api.?key|access.?key|client.?secret|private.?key|encryption.?key|credential|kubeconfig)"
     )
     _safe_reference_keys = re.compile(r"(?i)(?:_path|_file|_filename|_ref|_reference|_id|_sha256)$")
-    _usage_counter_keys = frozenset(
+    _safe_nonnegative_counter_keys = frozenset(
         {
             "input_tokens",
             "output_tokens",
             "cached_input_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
+            "dashboard_session_revocation_cleanup_count",
+            "deleted_dashboard_session_revocation_count",
+            "remaining_dashboard_session_revocation_count",
+        }
+    )
+    _safe_boolean_flag_keys = frozenset(
+        {
+            "dashboard_session_revocation_cleanup_truncated",
         }
     )
 
@@ -139,10 +147,16 @@ class SecretRedactor:
             nonlocal replacements
             if (
                 key is not None
-                and key.lower() in self._usage_counter_keys
+                and key.lower() in self._safe_nonnegative_counter_keys
                 and isinstance(item, int)
                 and not isinstance(item, bool)
                 and item >= 0
+            ):
+                return item
+            if (
+                key is not None
+                and key.lower() in self._safe_boolean_flag_keys
+                and isinstance(item, bool)
             ):
                 return item
             if (

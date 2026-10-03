@@ -171,6 +171,9 @@ async def test_transcript_redacted_before_db_ordered_resumable_and_idempotent(
     async def connected() -> bool:
         return False
 
+    async def authorized() -> bool:
+        return True
+
     frames = [
         frame
         async for frame in transcript_sse(
@@ -178,6 +181,7 @@ async def test_transcript_redacted_before_db_ordered_resumable_and_idempotent(
             execution_id,  # type: ignore[arg-type]
             after_sequence=1,
             disconnected=connected,
+            authorized=authorized,
             poll_seconds=0,
             heartbeat_seconds=0,
             maximum_iterations=2,
@@ -186,6 +190,49 @@ async def test_transcript_redacted_before_db_ordered_resumable_and_idempotent(
     assert any("id: 2" in frame and "pytest completed" in frame for frame in frames)
     assert all(secret not in frame for frame in frames)
     assert any("heartbeat" in frame for frame in frames)
+
+    async def revoked() -> bool:
+        return False
+
+    assert [
+        frame
+        async for frame in transcript_sse(
+            dashboard.observability,
+            execution_id,  # type: ignore[arg-type]
+            after_sequence=0,
+            disconnected=connected,
+            authorized=revoked,
+            poll_seconds=0,
+            heartbeat_seconds=0,
+            authorization_seconds=0,
+            maximum_iterations=2,
+        )
+    ] == []
+
+    authorization_calls = 0
+
+    async def authorized_then_revoked() -> bool:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        return authorization_calls == 1
+
+    bounded_frames = [
+        frame
+        async for frame in transcript_sse(
+            dashboard.observability,
+            execution_id,  # type: ignore[arg-type]
+            after_sequence=2,
+            disconnected=connected,
+            authorized=authorized_then_revoked,
+            poll_seconds=0.001,
+            heartbeat_seconds=0,
+            authorization_seconds=0.005,
+            maximum_iterations=8,
+        )
+    ]
+    assert authorization_calls == 2
+    assert len(bounded_frames) <= 5
+    assert all("heartbeat" in frame for frame in bounded_frames)
 
 
 @pytest.mark.asyncio
@@ -481,7 +528,18 @@ async def test_gateway_event_persists_only_safe_bounded_arguments(tmp_path: Path
         serialized = str(event.metadata_json)
         assert event.source == "hermes"
         assert event.issue_number == 1119
-        assert set(event.metadata_json) == {"command", "mode", "outcome", "gateway"}
+        assert set(event.metadata_json) == {
+            "command",
+            "mode",
+            "outcome",
+            "gateway",
+            "event_contract",
+            "event_received_at",
+            "ingestion_payload_sha256",
+        }
+        assert event.metadata_json["event_contract"] == "legacy-unattested"
+        assert len(event.metadata_json["ingestion_payload_sha256"]) == 64
+        assert datetime.fromisoformat(event.metadata_json["event_received_at"]).tzinfo is not None
         assert "user" not in serialized.lower()
         assert "token" not in serialized.lower()
 
@@ -497,6 +555,42 @@ async def test_gateway_event_rejects_non_gateway_identity(tmp_path: Path) -> Non
                 command="loop",
             ),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "level", "label"),
+    [
+        (
+            "telegram.response_prepared",
+            "INFO",
+            "Telegram response prepared; delivery not acknowledged",
+        ),
+        ("engineering.request_failed", "WARNING", "Engineering Control request failed"),
+    ],
+)
+async def test_preparation_and_request_errors_do_not_establish_telegram_delivery(
+    tmp_path: Path, event_type: str, level: str, label: str
+) -> None:
+    from engineering_control.operations.connections import ConnectionHealthProjector
+    from engineering_control.operations.repository import OperationsRepository
+
+    repository, _, url = _repositories(tmp_path)
+    await repository.gateway_event(
+        "hermes-gateway",
+        GatewayEventInput.model_validate({"event_type": event_type, "command": "usage"}),
+    )
+    with repository.sessions() as session:
+        event = session.query(DashboardEvent).one()
+        assert event.level == level
+        assert event.message == label
+        assert event.event_type == event_type
+    operations = OperationsRepository(url)
+    ConnectionHealthProjector(operations)._persisted(datetime.now(UTC))
+    connections = {item.component: item for item in operations._connections()}
+    for component in ("telegram", "hermes-gateway"):
+        assert connections[component].status != "CONNECTED"
+        assert connections[component].last_success_at is None
 
 
 def test_private_control_api_accepts_safe_gateway_event_only_when_authenticated(

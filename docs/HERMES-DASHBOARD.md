@@ -1,5 +1,49 @@
 # Hermes Engineering Operations Dashboard
 
+## Inventory and execution admission
+
+Overview separates **pending inventory** from a dispatch queue. Its candidate is
+the next pending OPEN issue in the latest recorded membership for each repository
+and issue number. Closed, delivered, owned-by-ChangeSet, terminal-campaign and
+superseded memberships are excluded from this projection, not deleted. Snapshot
+time ties across campaigns are counted as ambiguous and excluded from candidate
+selection: UUID ordering is deterministic, but does not establish chronology. Snapshot
+time and raw statuses are displayed. The candidate is **not approved**: current
+issue state, risk, policy, dependencies and approval must be revalidated by the
+typed execution path. A new inventory does not expand an approved campaign.
+
+The private API's existing `/health/ready` includes only a value-free admission
+summary: scope `private-api-only`, startup-bound mode, and whether its pending
+operation dispatcher is running. `/v1/admission` remains bearer-authenticated.
+The dashboard reads the health summary only from its configured literal loopback
+API endpoint, without API credentials, environment proxies or redirects. Reads
+have a one-second deadline, 4096-byte response limit and two-second in-process
+cache; failed/invalid reads become UNKNOWN rather than preserving a green result.
+Fixture repositories do not construct this network client unless explicitly
+injected. No database migration or additional credential is required.
+
+SYNTHETIC ONLY means product dispatch is fenced at the private API. DISPATCHING
+only attests that process's dispatcher; it is not project readiness or permission
+for a specific action. Dashboard candidate/queue preparation and other admission
+boundaries are separate: this observation must not be used as an authorization
+check. Per-action server gates remain mandatory, and project production
+deployment is prohibited. Browser refreshes time out after four seconds and mark
+admission UNKNOWN on failure. This is bounded status observation, not an approved
+performance SLO or the session/SSE revocation security contract.
+
+### Stream revocation
+
+Activity and transcript streams revalidate inside event batches. Their response
+also owns a separate durable-authorization watcher so an idle database fetch or
+a paused reader cannot defer checks until the next batch. Authorization results
+are observed for at most one second including query time; unavailable validation
+fails closed. Network sends and optional protocol/iterator cleanup have bounded
+waits, and owned watcher/response tasks are joined on termination. The five-second
+maximum revocation-exposure target is unchanged. Buffered bytes already accepted
+by the network cannot be recalled; newly sent payloads require a current stream
+authorization observation. This is not an in-memory revocation source of truth:
+session validity and revocation remain checked against the shared application DB.
+
 ## Architecture
 
 `engineering-dashboard` is a separate FastAPI process bound only to `127.0.0.1:8750`. It uses
@@ -82,6 +126,15 @@ Codex/Claude readiness, a bounded risk, and a server-generated confirmation phra
 call the existing enhancement repository and solution workflow; they do not add a GitHub or shell
 bypass.
 
+The application validates the HTTP `Host` before routing. It also requires an allowlisted
+`Origin`, or an allowlisted same-origin `Referer` when `Origin` is absent, for every unsafe method.
+Anonymous `/api/dashboard/*` requests are rejected before request-body or object validation so the
+public boundary does not expose an authenticated route's schema or object-existence differences.
+The bounded settings are `dashboard_allowed_hosts` and `dashboard_allowed_origins`; only the
+installed public name and loopback origins are defaults. A proxy hostname change must update these
+settings through normal release configuration and repeat the Host/Origin regression tests. A
+non-default `dashboard_port` must likewise be reflected in the loopback origin entries.
+
 Raw state remains visible. The canonical normalized states are `backlog`, `eligible`, `queued`,
 `preparing`, `implementing`, `reviewing`, `reworking`, `testing`, `awaiting_ci`,
 `awaiting_approval`, `building`, `deploying`, `verifying`, `blocked`, `paused`, `completed`,
@@ -90,6 +143,21 @@ Raw state remains visible. The canonical normalized states are `backlog`, `eligi
 their raw role remains durable metadata. Audit completion uses terminal coverage cells divided by
 total cells; zero-cell campaigns report zero percent and indeterminate work never receives a false
 percentage.
+
+Workflow projections distinguish terminal rows, durable external/human waits, active rows that
+still require Temporal correlation, and queued/planned start intents older than 15 minutes. The
+last class is shown as `ORPHANED_START_INTENT` with a reconciliation next action; it is never
+reported as active merely because its database row is nonterminal. Campaigns expose both their
+workflow execution status and a derived coverage outcome. A terminal campaign with no executed
+cells is `NOT_RUN`; all-blocked cells are `BLOCKED`; findings and partial blockers remain distinct
+from a clean pass. If the campaign execution is terminal while any coverage cell remains
+nonterminal, its execution and coverage fields remain visible but its derived operator status is
+`BLOCKED` until reconciled.
+
+Status domains are explicit per surface. The private control API's campaign `execution_status`
+preserves the raw uppercase persisted workflow value, while the dashboard audit projection uses a
+lowercase normalized `execution_status` for presentation. Both expose the independently derived
+`coverage_outcome`; consumers must not compare raw and normalized fields without conversion.
 
 Operational-event and transcript streams use authenticated SSE, ordered event IDs,
 `Last-Event-ID`, bounded PostgreSQL reads, approximately 15-second heartbeats and clean disconnect
@@ -124,7 +192,12 @@ Provider roles mean:
 
 There is one password and no username. Sessions are HMAC signed for 12 hours and use Secure,
 HttpOnly, SameSite=Strict cookies. The signed value includes `password_version`; a password change
-or reset invalidates all older sessions. Login failures are limited in memory per public client IP.
+or reset invalidates all older sessions. Successful logout also writes a token-binding digest to
+PostgreSQL, so that exact cookie remains revoked across process restarts while other concurrent
+operator sessions remain valid. Authorization matches the revocation row's binding digest and
+password version and independently requires the current global password version. If PostgreSQL is unavailable,
+session validation fails closed and logout returns 503 without clearing the still-active cookie.
+Login failures are limited in memory per public client IP.
 All state-changing forms use CSRF validation. Controlled operations additionally require the same
 password again; the password value is verified in memory and never enters an operation record,
 event, log, report, or URL.
@@ -182,9 +255,16 @@ restrictive Permissions-Policy and self-only CSP headers. Validate before every 
 systemctl status engineering-dashboard.service
 journalctl -u engineering-dashboard.service
 curl --fail http://127.0.0.1:8750/health/ready
+curl --fail -H 'Host: 127.0.0.1' http://127.0.0.1:8750/internal/metrics
 dig +short ade.musematic.ai A
 curl -I https://ade.musematic.ai/login
 ```
+
+The dashboard metrics endpoint is accepted only with a loopback Host and is not a public Caddy
+surface. It exports fixed-label counters and active-state gauges for readiness, logout-revocation,
+and session-validation persistence failures. A public-host request receives 404. Alert on an
+active gauge of one and close the incident only after it returns to zero following the matching
+recovery event.
 
 The systemd unit runs as `engineering-control:engineering-control`, not `hermes`. It uses a strict
 filesystem sandbox, loopback-only network access and explicit inaccessible operator credential
@@ -219,10 +299,30 @@ durable `operation_requests` queue; the dashboard process never receives the pri
 Temporal client. A started dashboard operation creates a bounded Telegram notification outbox
 record containing only project, target, workflow and phase.
 
+The fixed `/api/dashboard/r3-issues/candidate` GET and POST routes authenticate the dashboard
+session before examining the query or POST body. Their only accepted query contains exactly the
+order-insensitive keys and values `project=musematic`, `surface=source`, and `issue_number=1119`,
+with no duplicate or extra keys. Anonymous
+missing, malformed and oversized inputs receive the generic authentication response. Authenticated
+invalid targets receive the fixed `{"detail":"invalid request"}` 422 response; authenticated valid
+targets retain the typed 404/409 operation outcomes. A valid target with an invalid typed body gets
+the same generic 422, while bounded JSON media-type, size and syntax errors keep their fixed
+415/413/400 responses; an incorrect CSRF token gets the fixed generic 403. The fixed query is validated in application
+code after authentication and is therefore intentionally not inferred from FastAPI query-parameter
+declarations in the generated OpenAPI schema. Requests larger than the proxy or ASGI request-line
+limit can be rejected at that edge before application authentication; the application contract
+applies to requests admitted to the ASGI app with an accepted Host/Origin. Host and unsafe-method
+Origin enforcement intentionally runs before the route-level session check.
+
 Connections refresh executes only fixed loopback/public HTTP, DNS, TLS and Temporal TCP probes.
 Privileged components publish safe heartbeat/quota/event/project snapshots into PostgreSQL. A
 missing or old snapshot becomes `NOT_CONFIGURED` or `STALE`; source code presence alone never
-produces `CONNECTED`.
+produces `CONNECTED`. Status is recomputed at read time: workers expire after 180 seconds,
+providers and ordinary service probes after 300 seconds, Hermes/Telegram after 600 seconds,
+GitHub broker observations after 900 seconds, and project readiness observations after 24 hours.
+The CLI is reported as `PRESENT`, not as a continuously connected service. Telegram requires a
+causally ordered delivered response after the latest inbound command; a later delivery failure is
+`DEGRADED`, and an old exchange is `STALE`.
 
 ## Bounded evidence exports
 
@@ -277,11 +377,13 @@ not expose `journalctl` through a web route.
 Before installation, take fresh root-owned runtime, configuration and PostgreSQL backups. Install
 only the exact committed tree using the existing commit-addressed controller bootstrap. Because
 provider adapters and worker instrumentation are part of this release, controller and worker must
-run the exact same committed tree. Apply migrations through `0013` only after the database backup, then
-restart only the affected controller, provider, scan, evidence-ingest and dashboard services.
-Preserve the current password hash/version, session key, DNS, Caddy and TLS state. Apply migration
-`0013` after `0012`; it is additive and does not alter authentication, workflow, campaign, finding,
-ChangeSet, evidence, transcript or session-key state.
+run the exact same committed tree. Apply the reviewed linear migration chain through `0014` only
+after the database backup and while the affected dashboard/API writers are stopped. Verify the
+`dashboard_session_revocations` table and both indexes before starting the candidate dashboard/API;
+candidate authentication fails closed when the table is unavailable. Preserve the current password
+hash/version, session key, DNS, Caddy and TLS state. Migration `0013` remains the additive bounded
+export projection; migration `0014` adds durable per-session revocations without changing product,
+workflow, campaign, finding, ChangeSet, evidence, transcript or session-key data.
 
 Normal rollback:
 
@@ -289,12 +391,16 @@ Normal rollback:
 2. Switch controller and worker `/opt/engineering-control/source` links to their recorded previous
    commit-addressed releases.
 3. Restart the previous controller, worker and dashboard services in controlled order.
-4. Leave `agent_executions`, `agent_log_chunks`, and `operation_exports` in place by default; the
-   previous release ignores additive tables.
-5. If a database downgrade is explicitly required, back up PostgreSQL again, stop all writers, and
-   downgrade `0013` to `0012`; this removes only bounded downloadable export projections. Do not
-   remove operation audit records. Leave `0012` command candidates, operation correlation,
-   connection snapshots, and `0011` transcript data in place.
+4. Do not start pre-`0014` dashboard/API code while revocation rows are merely being ignored. Before
+   that code rollback, use the reviewed `0014` downgrade while all writers are stopped; it increments
+   the global password version before dropping the revocation table so old cookies cannot revive.
+   Verify denial of an acceptance-owned old cookie before reopening the console. If that forward-safe
+   rollback cannot be completed, keep the public console in maintenance and repair forward.
+5. Leave `agent_executions`, `agent_log_chunks`, and `operation_exports` in place by default; the
+   previous release ignores those additive tables. A separate downgrade from `0013` to `0012` is not
+   part of normal rollback and requires its own reviewed database change because it removes bounded
+   export projections. Do not remove operation audit records. Leave `0012` command candidates,
+   operation correlation, connection snapshots, and `0011` transcript data in place.
 6. Preserve the dashboard password row/version and `/etc/engineering-control/dashboard/session.key`.
 7. Do not change DNS, Caddy or TLS for a normal observability rollback.
 

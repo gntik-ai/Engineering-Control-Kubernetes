@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import insert, select
+from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
@@ -14,11 +15,210 @@ from engineering_control.db.base import Base
 from engineering_control.db.models import (
     AgentInvocation,
     ChangeSet,
+    DashboardSessionRevocation,
     Deployment,
+    NotificationOutbox,
     OperationExport,
     OperationRequest,
     Run,
 )
+
+
+@pytest.mark.asyncio
+async def test_revocation_cleanup_limit_alert_is_durable_and_idempotent(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'cleanup-alert.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    workflow_id = "revocation-cleanup-alert-test"
+    now = datetime.now(UTC)
+    with handler.sessions.begin() as session:
+        session.add(
+            Run(
+                id=uuid4(),
+                workflow_id=workflow_id,
+                run_type="CleanupWorkflow",
+                status="RUNNING",
+                project="platform",
+                started_at=now,
+                summary="safe worktree retention cleanup",
+            )
+        )
+    payload = {
+        "orchestration": {"workflow_id": workflow_id},
+        "terminal_status": "DRY_RUN",
+        "dashboard_session_revocation_cleanup_count": 12_345,
+        "dashboard_session_revocation_cleanup_truncated": True,
+    }
+    first = await handler.handle("cleanup.finalize", payload)
+    second = await handler.handle("cleanup.finalize", payload)
+    assert first["status"] == "DRY_RUN"
+    assert second["status"] == "DRY_RUN"
+    with handler.sessions() as session:
+        alerts = list(session.scalars(select(NotificationOutbox)).all())
+    assert len(alerts) == 1
+    assert alerts[0].id == uuid5(
+        NAMESPACE_URL,
+        f"notification:{alerts[0].topic}:{workflow_id}",
+    )
+    assert alerts[0].topic == "alerts.dashboard-session-revocation-cleanup-truncated"
+    assert alerts[0].status == "PENDING"
+    assert alerts[0].payload_json == {
+        "workflow_id": workflow_id,
+        "severity": "warning",
+        "reason": "SESSION_REVOCATION_CLEANUP_LIMIT_EXCEEDED",
+        "observed_expired_count": 12_345,
+        "cleanup_limit": 10_000,
+        "deleted_count": 0,
+        "remaining_count": 12_345,
+    }
+
+
+@pytest.mark.asyncio
+async def test_disabled_cleanup_execution_cannot_delete_expired_revocations(
+    tmp_path: Path,
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'cleanup-disabled.sqlite'}")
+    )
+    Base.metadata.create_all(handler.engine)
+    now = datetime.now(UTC)
+    with handler.sessions.begin() as session:
+        session.add(
+            DashboardSessionRevocation(
+                session_binding_hash="f" * 64,
+                password_version=1,
+                revoked_at=now - timedelta(days=2),
+                expires_at=now - timedelta(days=1),
+            )
+        )
+    with pytest.raises(ApplicationError, match="disabled by policy"):
+        await handler.handle(
+            "cleanup.execute_metadata",
+            {"orchestration": {"workflow_id": "cleanup-disabled-test"}},
+        )
+    with handler.sessions() as session:
+        remaining = list(session.scalars(select(DashboardSessionRevocation)).all())
+    assert [row.session_binding_hash for row in remaining] == ["f" * 64]
+
+
+@pytest.mark.parametrize("execution_fields", [{"dry_run": True}, {}], ids=["true", "missing"])
+@pytest.mark.asyncio
+async def test_nonexecuting_metadata_payload_is_rejected_even_when_execution_is_enabled(
+    tmp_path: Path, execution_fields: dict[str, object]
+) -> None:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'cleanup-dry-run.sqlite'}",
+            cleanup_execution_enabled=True,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    now = datetime.now(UTC)
+    with handler.sessions.begin() as session:
+        session.add(
+            DashboardSessionRevocation(
+                session_binding_hash="e" * 64,
+                password_version=1,
+                revoked_at=now - timedelta(days=2),
+                expires_at=now - timedelta(days=1),
+            )
+        )
+    with pytest.raises(ApplicationError, match="explicit dry_run=false"):
+        await handler.handle(
+            "cleanup.execute_metadata",
+            {
+                **execution_fields,
+                "orchestration": {"workflow_id": "cleanup-dry-run-test"},
+            },
+        )
+    with handler.sessions() as session:
+        remaining = list(session.scalars(select(DashboardSessionRevocation)).all())
+    assert [row.session_binding_hash for row in remaining] == ["e" * 64]
+
+
+@pytest.mark.asyncio
+async def test_revocation_cleanup_recounts_rows_expiring_after_discovery(tmp_path: Path) -> None:
+    handler = MetadataActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'cleanup-recount.sqlite'}",
+            cleanup_execution_enabled=True,
+        )
+    )
+    Base.metadata.create_all(handler.engine)
+    now = datetime.now(UTC)
+    base_rows = [
+        {
+            "session_binding_hash": f"{index:064x}",
+            "password_version": 1,
+            "revoked_at": now - timedelta(days=2),
+            "expires_at": now - timedelta(days=1),
+        }
+        for index in range(9_999)
+    ]
+    with handler.sessions.begin() as session:
+        session.execute(insert(DashboardSessionRevocation), base_rows)
+    workflow_id = "revocation-cleanup-recount-test"
+    discovered = await handler.handle(
+        "cleanup.discover",
+        {
+            "dry_run": False,
+            "retention_policy": "standard",
+            "orchestration": {"workflow_id": workflow_id},
+        },
+    )
+    assert discovered["dashboard_session_revocation_cleanup_count"] == 9_999
+    assert discovered["dashboard_session_revocation_cleanup_truncated"] is False
+    with handler.sessions.begin() as session:
+        session.execute(
+            insert(DashboardSessionRevocation),
+            [
+                {
+                    "session_binding_hash": f"{index:064x}",
+                    "password_version": 1,
+                    "revoked_at": now - timedelta(days=2),
+                    "expires_at": now - timedelta(days=1),
+                }
+                for index in range(9_999, 10_001)
+            ],
+        )
+    authorized = await handler.handle(
+        "cleanup.authorize",
+        {
+            **discovered,
+            "eligible_candidates": [],
+            "inspected_file_candidates": [],
+            "inspected_preview_namespace_candidates": [],
+        },
+    )
+    executed = await handler.handle(
+        "cleanup.execute_metadata",
+        {
+            **authorized,
+            "removed_file_candidate_ids": [],
+            "absent_file_candidate_ids": [],
+            "removed_preview_namespace_candidate_ids": [],
+            "absent_preview_namespace_candidate_ids": [],
+        },
+    )
+    assert executed["deleted_dashboard_session_revocation_count"] == 10_000
+    assert executed["remaining_dashboard_session_revocation_count"] == 1
+    assert executed["dashboard_session_revocation_cleanup_truncated"] is True
+    await handler.handle(
+        "cleanup.finalize",
+        {
+            **executed,
+            "removed_lease_ids": [],
+            "already_absent_lease_ids": [],
+            "terminal_status": "COMPLETE",
+        },
+    )
+    with handler.sessions() as session:
+        alert = session.scalar(select(NotificationOutbox))
+    assert alert is not None
+    assert alert.payload_json["observed_expired_count"] == 9_999
+    assert alert.payload_json["deleted_count"] == 10_000
+    assert alert.payload_json["remaining_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -68,6 +268,22 @@ async def test_expired_operation_exports_are_bounded_cleanup_metadata(tmp_path: 
                     expires_at=now + timedelta(days=-1 if index == 0 else 1),
                 )
             )
+        session.add_all(
+            [
+                DashboardSessionRevocation(
+                    session_binding_hash="a" * 64,
+                    password_version=1,
+                    revoked_at=now - timedelta(days=2),
+                    expires_at=now - timedelta(days=1),
+                ),
+                DashboardSessionRevocation(
+                    session_binding_hash="b" * 64,
+                    password_version=1,
+                    revoked_at=now,
+                    expires_at=now + timedelta(days=1),
+                ),
+            ]
+        )
     discovered = await handler.handle(
         "cleanup.discover",
         {
@@ -77,6 +293,8 @@ async def test_expired_operation_exports_are_bounded_cleanup_metadata(tmp_path: 
         },
     )
     assert discovered["operation_export_cleanup_count"] == 1
+    assert discovered["dashboard_session_revocation_cleanup_count"] == 1
+    assert discovered["dashboard_session_revocation_cleanup_truncated"] is False
     authorized = await handler.handle(
         "cleanup.authorize",
         {
@@ -97,10 +315,14 @@ async def test_expired_operation_exports_are_bounded_cleanup_metadata(tmp_path: 
         },
     )
     assert executed["deleted_operation_export_count"] == 1
+    assert executed["deleted_dashboard_session_revocation_count"] == 1
+    assert executed["dashboard_session_revocation_cleanup_truncated"] is False
     with handler.sessions() as session:
         remaining = list(session.scalars(select(OperationExport)).all())
+        remaining_revocations = list(session.scalars(select(DashboardSessionRevocation)).all())
     assert len(remaining) == 1
     assert remaining[0].operation_id == operation_ids[1]
+    assert [value.session_binding_hash for value in remaining_revocations] == ["b" * 64]
 
 
 @pytest.mark.asyncio

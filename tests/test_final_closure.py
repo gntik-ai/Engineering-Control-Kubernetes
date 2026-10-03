@@ -277,7 +277,11 @@ def test_final_worktree_sync_rejects_symlink_before_git(
     outside.mkdir()
     source.symlink_to(outside, target_is_directory=True)
     handler = DeliveryActivityHandler(
-        Settings(state_root=tmp_path / "state", worktree_root=worktree_root)
+        Settings(
+            state_root=tmp_path / "state",
+            worktree_root=worktree_root,
+            run_root=tmp_path / "runs",
+        )
     )
 
     def merged(binding: dict[str, Any], merge_sha: str, tree_sha: str) -> dict[str, Any]:

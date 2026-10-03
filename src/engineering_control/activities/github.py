@@ -55,6 +55,15 @@ def bounded_issue_body(body: str, limit: int = ISSUE_BODY_REFRESH_LIMIT) -> tupl
     return head + marker + tail, True
 
 
+ISSUE_BODY_REAPPROVAL_GUIDANCE = (
+    "The GitHub issue text changed after this delivery was approved, so the change was not "
+    "used. To deliver from the new text: re-import the backlog (/loop import <project> "
+    "github-open ...), then approve and start the issue again (/loop issue ... or "
+    "solve_issue; for an R3 issue first /loop r3-candidate and /loop approve-r3). To keep "
+    "the approved text instead, revert the issue edit and retry."
+)
+
+
 class GitHubActivityHandler:
     """Run only typed gh broker activities under the authenticated broker identity."""
 
@@ -120,12 +129,26 @@ class GitHubActivityHandler:
             value = self.broker.view_issue_body(repository, number)
         except (GhCliAuthError, GhCliPolicyError, CommandFailure, OSError, ValueError) as error:
             return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": type(error).__name__}
+        # NEW-112 review (2b678d9 approval model): an approved delivery works only from the
+        # issue text it was approved for. A body edited on GitHub after approval is not
+        # used; the delivery stops early (publication custody would refuse it anyway).
+        source_sha256 = hashlib.sha256(str(value["body"]).encode()).hexdigest()
+        approved = payload.get("approved_issue_body_sha256")
+        if approved is not None and approved != source_sha256:
+            return {
+                "status": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+                "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL",
+                "blocker_detail": ISSUE_BODY_REAPPROVAL_GUIDANCE,
+                "approved_body_sha256": str(approved)[:64],
+                "current_body_sha256": source_sha256,
+            }
         body = str(SecretRedactor().redact_text(str(value["body"])).value).strip()
         if not body:
             return {"status": "ISSUE_BODY_UNAVAILABLE", "reason": "ISSUE_BODY_EMPTY"}
         excerpt, truncated = bounded_issue_body(body)
         return {
             "status": "ISSUE_BODY_REFRESHED",
+            "source_body_sha256": source_sha256,
             "body_excerpt": excerpt,
             "body_sha256": hashlib.sha256(excerpt.encode()).hexdigest(),
             "body_chars": len(body),

@@ -43,7 +43,7 @@ platform fails closed rather than bypassing.
 | 33 Control API | IMPLEMENTED | Strict authenticated campaign/finding/delivery/approval/deployment/usage/evidence routes bound off public wildcards |
 | 34 Telegram approvals | ACTIVE/PASS | Allowlist, fixed hook-to-API, bounded `/validate`, outbound Telegram, and release/workflow-bound secret-free user-originated `/usage`/`validate`/`status` receipts pass |
 | 35 systemd | ACTIVE | Controller, Hermes and six worker identities are supervised with resource/filesystem limits and journald |
-| 36 Observability | IMPLEMENTED | Structured redacted context logs, PostgreSQL-backed Prometheus metrics, authenticated worker heartbeats |
+| 36 Observability | IMPLEMENTED | Structured redacted context logs, PostgreSQL-backed Prometheus metrics including session-revocation and durable-notification backlog signals, authenticated worker heartbeats |
 | 37 Failure/handoff | IMPLEMENTED | Required handoff bundle files and explicit `RATE_LIMITED`/cross-provider semantics |
 | 38 Cleanup automation | IMPLEMENTED/DISABLED | Daily schedule defaults dry-run and switches to typed mutation only under the explicit per-identity execution setting; it covers expired clean worktrees, bounded delivery/browser/Codex-temp directories, explicitly ephemeral evidence, stale terminal component leases, and opt-in managed preview namespaces; owner inspection, one immutable cross-resource authorization, symlink/drift checks, and protected evidence/incident/rate-limit gates are tested; host mutation remains disabled |
 | 39 Documentation | IMPLEMENTED | All requested manuals plus cheatsheet, validation status and this matrix |

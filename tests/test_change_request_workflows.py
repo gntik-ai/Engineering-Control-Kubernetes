@@ -349,7 +349,9 @@ def test_migration_0019_creates_exactly_the_model_table(
 ) -> None:
     database_url = f"sqlite+pysqlite:///{tmp_path / 'migration.sqlite3'}"
     monkeypatch.setenv("ENGINEERING_DATABASE_URL", database_url)
-    config = Config(ROOT / "alembic.ini")
+    # No fileConfig() (as 2b678d9's migration fixtures): it would disable the existing
+    # application loggers for every later test in the session.
+    config = Config()
     config.set_main_option("script_location", str(ROOT / "migrations"))
     command.upgrade(config, "head")
     command.downgrade(config, "0018")

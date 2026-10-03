@@ -37,18 +37,20 @@ class WorkerHeartbeatPublisher:
                 raise ValueError("worker heartbeat origin is not a private evidence ingest")
             self.url = urlunsplit((parsed.scheme, parsed.netloc, "/v1/workers/heartbeat", "", ""))
 
-    async def publish_once(self) -> None:
+    @staticmethod
+    def _client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False)
+
+    async def publish_once(self, *, client: httpx.AsyncClient | None = None) -> None:
         if self.url is None:
             if self.settings.environment == "production":
                 raise ValueError("production worker heartbeat is not configured")
             return
         token = self.settings.read_evidence_ingest_token()
-        async with httpx.AsyncClient(
-            timeout=10,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await client.post(
+        owned_client = client is None
+        active_client = self._client() if client is None else client
+        try:
+            response = await active_client.post(
                 self.url,
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -57,15 +59,27 @@ class WorkerHeartbeatPublisher:
                 },
             )
             response.raise_for_status()
+        finally:
+            if owned_client:
+                await active_client.aclose()
 
     async def serve(self) -> None:
-        while True:
-            try:
-                await self.publish_once()
-            except Exception as error:  # noqa: BLE001 - health reporting must not kill work
-                logger.warning(
-                    "worker_heartbeat_failed",
-                    worker=self.identity,
-                    error_type=type(error).__name__,
-                )
-            await asyncio.sleep(self.settings.worker_heartbeat_seconds)
+        client: httpx.AsyncClient | None = None
+        try:
+            while True:
+                try:
+                    # Keep one TLS context/connection pool for this publisher's lifetime.
+                    # Construct lazily inside the retry boundary and never cache credentials.
+                    if self.url is not None and client is None:
+                        client = self._client()
+                    await self.publish_once(client=client)
+                except Exception as error:  # noqa: BLE001 - health reporting must not kill work
+                    logger.warning(
+                        "worker_heartbeat_failed",
+                        worker=self.identity,
+                        error_type=type(error).__name__,
+                    )
+                await asyncio.sleep(self.settings.worker_heartbeat_seconds)
+        finally:
+            if client is not None:
+                await client.aclose()
