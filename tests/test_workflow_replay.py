@@ -883,6 +883,8 @@ def _full_delivery_loop_script(
             "risk_class": "R1",
         },
         "backlog.register_child_run": {"status": "REGISTERED"},
+        # NEW-112 review: the loop durably records each CI-repair round first.
+        "backlog.record_ci_repair": {"status": "RECORDED"},
         "backlog.record_loop_state": {"status": "RECORDED"},
         "backlog.record_skip": {"status": "SKIPPED", "reason_code": "OPERATOR"},
         "backlog.restore_published_change_set": {"status": "RESTORED"},
@@ -1128,6 +1130,18 @@ async def test_ci_regression_redelivers_twice_then_waits_for_the_operator() -> N
         if request["step"] == "backlog.register_child_run"
     ]
     assert registered.count("issue-delivery") == 3
+    # Each repair round is durably recorded by the loop right before its repair child.
+    names = [request["step"] for request in steps]
+    authorizations = [
+        (request["payload"]["ordinal"], request["payload"]["repair_round"])
+        for request in steps
+        if request["step"] == "backlog.record_ci_repair"
+    ]
+    assert authorizations == [(1, 1), (1, 2)]
+    for position in [
+        index for index, name in enumerate(names) if name == "backlog.record_ci_repair"
+    ]:
+        assert names[position + 1] == "backlog.register_child_run"
     await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
 
 

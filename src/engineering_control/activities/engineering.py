@@ -50,7 +50,12 @@ from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
 )
-from engineering_control.operations.issue_delivery_approval import register_child_issue_approval
+from engineering_control.operations.issue_delivery_approval import (
+    CI_REPAIR_AUTHORIZATION_STEP,
+    CI_REPAIR_REGRESSIONS,
+    ci_repair_authorization_id,
+    register_child_issue_approval,
+)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -139,6 +144,7 @@ class EngineeringActivityHandler:
             "notify.write_policy_required",
             "backlog.register_child_run",
             "backlog.register_run",
+            "backlog.record_ci_repair",
             "global_backlog.register",
             "global_backlog.select_next",
             "global_backlog.record_result",
@@ -279,6 +285,8 @@ class EngineeringActivityHandler:
             return self._register_backlog_child_run(payload)
         if step == "backlog.register_run":
             return self._register_backlog_run(payload)
+        if step == "backlog.record_ci_repair":
+            return self._record_backlog_ci_repair(payload)
         if step == "global_backlog.register":
             return self._register_global_backlog(payload)
         if step == "global_backlog.select_next":
@@ -2107,6 +2115,97 @@ class EngineeringActivityHandler:
                 {**payload, "run_id": str(run.id)},
                 "REGISTERED",
             )
+
+    def _record_backlog_ci_repair(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-112 review: durably record the CI-repair round the loop is about to start.
+
+        Written by the loop's own verified execution, only after a recorded CI regression
+        on a ChangeSet whose origin delivery this same loop registered; the delivery-child
+        approval check accepts a CI-repair child only against this record.
+        """
+        step = "backlog.record_ci_repair"
+        workflow_id = str(payload.get("workflow_id", ""))
+        ordinal, repair_round = payload.get("ordinal"), payload.get("repair_round")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", workflow_id)
+            or type(ordinal) is not int
+            or not 1 <= ordinal <= 500
+            or type(repair_round) is not int
+            or not 1 <= repair_round <= 999
+        ):
+            raise ValueError("CI-repair authorization request is invalid")
+        change_set_id = UUID(str(payload["change_set_id"]))
+        campaign_id = UUID(str(payload["backlog_campaign_id"]))
+
+        def blocked(blocker: str) -> dict[str, Any]:
+            return {**payload, "status": "BLOCKED", "blocker": blocker, "last_step": step}
+
+        with self.sessions.begin() as session:
+            loops = session.scalars(
+                select(db.Run)
+                .where(
+                    db.Run.workflow_id == workflow_id, db.Run.run_type == "existing-backlog-loop"
+                )
+                .limit(2)
+            ).all()
+            if len(loops) != 1 or loops[0].temporal_first_execution_run_id is None:
+                return blocked("CI_REPAIR_PARENT_RUN_UNVERIFIED")
+            loop = loops[0]
+            change_set = session.get(db.ChangeSet, change_set_id, with_for_update=True)
+            recovery = (change_set.recovery_json or {}) if change_set is not None else {}
+            gitops = recovery.get("staging_gitops")
+            regression = gitops.get("blocker") if isinstance(gitops, dict) else None
+            if regression not in CI_REPAIR_REGRESSIONS:
+                return blocked("CI_REPAIR_REGRESSION_NOT_RECORDED")
+            reference = recovery.get("issue_execution_approval")
+            origin = (
+                session.get(db.Step, UUID(str(reference["approval_id"])))
+                if isinstance(reference, dict) and reference.get("approval_id")
+                else None
+            )
+            origin_value = origin.result_json if origin is not None else {}
+            origin_request = origin_value.get("request") if isinstance(origin_value, dict) else None
+            if (
+                origin is None
+                or origin_value.get("parent_workflow_id") != workflow_id
+                or not isinstance(origin_request, dict)
+                or origin_request.get("backlog_campaign_id") != str(campaign_id)
+            ):
+                return blocked("CI_REPAIR_PARENT_DID_NOT_PUBLISH_CHANGE_SET")
+            value = {
+                "version": 1,
+                "parent_workflow_id": workflow_id,
+                "parent_run_id": str(loop.id),
+                "parent_first_execution_run_id": loop.temporal_first_execution_run_id,
+                "backlog_campaign_id": str(campaign_id),
+                "change_set_id": str(change_set_id),
+                "origin_approval_id": str(origin.id),
+                "ordinal": ordinal,
+                "repair_round": repair_round,
+                "regression": regression,
+            }
+            identifier = ci_repair_authorization_id(loop.id, change_set_id, ordinal, repair_round)
+            existing = session.get(db.Step, identifier)
+            if existing is None:
+                session.add(
+                    db.Step(
+                        id=identifier,
+                        run_id=loop.id,
+                        name=CI_REPAIR_AUTHORIZATION_STEP,
+                        ordinal=repair_round,
+                        status="COMPLETE",
+                        idempotency_key=f"ci-repair-authorization:{identifier}",
+                        attempt=1,
+                        result_json=value,
+                    )
+                )
+            elif existing.run_id != loop.id or {
+                key: existing.result_json.get(key) for key in value if key != "regression"
+            } != {key: item for key, item in value.items() if key != "regression"}:
+                raise ValueError("CI-repair authorization changed during idempotent retry")
+        return self._envelope(
+            step, {**payload, "repair_authorization": str(identifier)}, "RECORDED"
+        )
 
     # NEW-102: states a CI-repair re-delivery leaves behind when it stops before publishing.
     _REPAIR_INTERMEDIATE_STATES = frozenset({"PLANNED", "IMPLEMENTING", "REQUEST_CHANGES"})

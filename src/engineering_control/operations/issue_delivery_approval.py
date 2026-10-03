@@ -235,26 +235,98 @@ def _approval_scope(value: dict[str, Any]) -> dict[str, Any]:
 CI_REPAIR_ROUNDS = 2
 # Published states a CI-repair child may start from (it reuses the published branch).
 _CI_REPAIR_START_STATES = frozenset({"SOURCE_PR", "SOURCE_MERGED"})
+# Durable record the parent loop writes when it decides to start one CI-repair round.
+CI_REPAIR_AUTHORIZATION_STEP = "backlog.ci_repair_authorization"
+CI_REPAIR_REGRESSIONS = frozenset({"SOURCE_PR_CI_REGRESSION", "DEPLOYMENT_PR_CI_REGRESSION"})
+_CI_REPAIR_MARKER = "-ci-repair-"
+_CI_REPAIR_SUFFIX = re.compile(
+    r"-issue-(?P<ordinal>[1-9][0-9]{0,5})-ci-repair-(?P<round>[1-9][0-9]{0,2})"
+    r"-attempt-(?P<attempt>[1-9][0-9]{0,2})"
+)
 
 
-def _is_ci_repair_child(value: dict[str, Any]) -> bool:
-    """A CI-repair delivery child of the same loop, by its deterministic workflow ID."""
+def ci_repair_authorization_id(
+    parent_run_id: UUID, change_set_id: UUID, ordinal: int, repair_round: int
+) -> UUID:
+    return uuid5(
+        NAMESPACE_URL,
+        f"ci-repair-authorization:{parent_run_id}:{change_set_id}:{ordinal}:{repair_round}",
+    )
+
+
+def _claims_ci_repair(value: dict[str, Any]) -> bool:
+    child = value.get("child_workflow_id")
+    return isinstance(child, str) and _CI_REPAIR_MARKER in child
+
+
+def _verify_ci_repair_child(
+    session: Session, change_set: ChangeSet, origin: Step, value: dict[str, Any]
+) -> None:
+    """Prove a CI-repair child from durable facts; its workflow ID only locates them.
+
+    The parent loop must exist with a verified execution binding, must be the loop that
+    registered (and so published) this ChangeSet's origin delivery, must have recorded
+    the exact repair round for this issue ordinal after a recorded CI regression, and the
+    attempt must stay within the origin approval's correction bound.
+    """
     parent = value.get("parent_workflow_id")
     child = value.get("child_workflow_id")
-    return (
-        isinstance(parent, str)
-        and isinstance(child, str)
-        and re.fullmatch(
-            re.escape(parent) + r"-issue-[1-9][0-9]{0,5}-ci-repair-[1-9][0-9]?-attempt-[1-9][0-9]?",
-            child,
-        )
-        is not None
+    origin_value = origin.result_json
+    if (
+        not isinstance(parent, str)
+        or not isinstance(child, str)
+        or origin_value.get("parent_workflow_id") != parent
+        or not child.startswith(parent)
+    ):
+        raise ValueError("CI-repair child is not owned by the loop that published the ChangeSet")
+    match = _CI_REPAIR_SUFFIX.fullmatch(child[len(parent) :])
+    if match is None:
+        raise ValueError("CI-repair child identity is malformed")
+    ordinal, repair_round, attempt = (
+        int(match["ordinal"]),
+        int(match["round"]),
+        int(match["attempt"]),
     )
+    parents = session.scalars(
+        select(Run)
+        .where(Run.workflow_id == parent, Run.run_type == "existing-backlog-loop")
+        .limit(2)
+    ).all()
+    if len(parents) != 1 or parents[0].temporal_first_execution_run_id is None:
+        raise ValueError("CI-repair parent loop Run is missing or unverified")
+    parent_run = parents[0]
+    origin_request = ExistingBacklogLoopStart.model_validate(origin_value["request"])
+    record = session.get(
+        Step, ci_repair_authorization_id(parent_run.id, change_set.id, ordinal, repair_round)
+    )
+    expected = {
+        "version": 1,
+        "parent_workflow_id": parent,
+        "parent_run_id": str(parent_run.id),
+        "parent_first_execution_run_id": parent_run.temporal_first_execution_run_id,
+        "backlog_campaign_id": str(origin_request.backlog_campaign_id),
+        "change_set_id": str(change_set.id),
+        "origin_approval_id": str(origin.id),
+        "ordinal": ordinal,
+        "repair_round": repair_round,
+    }
+    if (
+        record is None
+        or record.name != CI_REPAIR_AUTHORIZATION_STEP
+        or record.status != "COMPLETE"
+        or record.run_id != parent_run.id
+        or not isinstance(record.result_json, dict)
+        or {key: record.result_json.get(key) for key in expected} != expected
+        or record.result_json.get("regression") not in CI_REPAIR_REGRESSIONS
+    ):
+        raise ValueError("CI-repair round was not recorded by its parent loop")
+    if repair_round > CI_REPAIR_ROUNDS or attempt > origin_request.correction_limit + 1:
+        raise ValueError("CI-repair child exceeds the approved repair bound")
 
 
 def _lineage_within_bounds(records: list[Step], request: ExistingBacklogLoopStart) -> bool:
     attempts = request.correction_limit + 1
-    repairs = sum(1 for record in records if _is_ci_repair_child(record.result_json))
+    repairs = sum(1 for record in records if _claims_ci_repair(record.result_json))
     return len(records) - repairs <= attempts and repairs <= CI_REPAIR_ROUNDS * attempts
 
 
@@ -298,11 +370,14 @@ def bind_change_set_issue_approval(
             [*[item for item in recorded if item is not None], record], request
         ):
             raise ValueError("ChangeSet exceeds the approved correction limit")
-        # A correction child starts from REQUEST_CHANGES. A CI-repair child of the same
-        # approval scope (checked above) may also start from the published states that a
-        # source/deployment PR CI regression leaves; nothing else is widened.
+        # A correction child starts from REQUEST_CHANGES. A CI-repair child, proven from
+        # its parent loop's durable records (never from its ID alone), may also start from
+        # the published states a source/deployment PR CI regression leaves.
+        repair = _claims_ci_repair(record.result_json)
+        if repair:
+            _verify_ci_repair_child(session, change_set, origin, record.result_json)
         if change_set.state != "REQUEST_CHANGES" and not (
-            _is_ci_repair_child(record.result_json) and change_set.state in _CI_REPAIR_START_STATES
+            repair and change_set.state in _CI_REPAIR_START_STATES
         ):
             raise ValueError("another delivery child requires an explicit correction state")
         children = [*children, reference]
@@ -372,6 +447,8 @@ def validate_change_set_issue_approval(
             child_record.result_json
         ) != _approval_scope(valid.result_json):
             raise ValueError("ChangeSet correction authority changed")
+        if _claims_ci_repair(child_record.result_json):
+            _verify_ci_repair_child(session, change_set, valid, child_record.result_json)
         lineage.append(child_record)
     if not _lineage_within_bounds(lineage, request):
         raise ValueError("ChangeSet correction approval lineage is malformed")

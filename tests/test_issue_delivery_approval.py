@@ -329,12 +329,56 @@ async def test_correction_cannot_expand_or_replace_original_authority(tmp_path: 
     _dispose(values)
 
 
-async def _ci_repair_load(values, state: str, *, child_id: str, parent: str | None = None):
+PARENT = "backlog-fixture-parent"
+
+
+async def _ci_repair_load(
+    values,
+    state: str,
+    *,
+    child_id: str,
+    parent: str | None = None,
+    parent_run: str | None = "bound",
+    regression: str | None = "SOURCE_PR_CI_REGRESSION",
+    record: tuple[int, int] | None = (1, 1),
+    record_campaign: str | None = None,
+):
+    """Load a CI-repair child after the parent loop durably records its repair round."""
     operations, metadata, engineering, handler, payload, registered, child_payload = values
     first = handler._load_confirmed_finding(child_payload)
     with handler.sessions.begin() as session:
         change_set = session.get(ChangeSet, UUID(first["change_set_id"]))
         change_set.state = state
+        if regression is not None:
+            recovery = dict(change_set.recovery_json or {})
+            recovery["staging_gitops"] = {"blocker": regression}
+            change_set.recovery_json = recovery
+        if parent_run is not None:
+            session.add(
+                Run(
+                    workflow_id=PARENT,
+                    run_type="existing-backlog-loop",
+                    status="RUNNING",
+                    project="falcone",
+                    temporal_first_execution_run_id=(
+                        str(uuid4()) if parent_run == "bound" else None
+                    ),
+                )
+            )
+    if record is not None:
+        ordinal, repair_round = record
+        authorized = engineering._record_backlog_ci_repair(
+            {
+                **payload,
+                "backlog_campaign_id": record_campaign or payload["backlog_campaign_id"],
+                "workflow_id": PARENT,
+                "ordinal": ordinal,
+                "repair_round": repair_round,
+                "change_set_id": first["change_set_id"],
+            }
+        )
+        if authorized["status"] != "RECORDED":
+            raise ValueError(authorized["blocker"])
     repair_payload = {**payload, "child_workflow_id": child_id}
     if parent is not None:
         repair_payload["orchestration"] = {"workflow_id": parent}
@@ -350,21 +394,24 @@ async def _ci_repair_load(values, state: str, *, child_id: str, parent: str | No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "state",
+    ("state", "regression"),
     [
-        "SOURCE_PR",  # SOURCE_PR_CI_REGRESSION (NEW-99/102)
-        "SOURCE_MERGED",  # DEPLOYMENT_PR_CI_REGRESSION after the source merged (NEW-103)
+        ("SOURCE_PR", "SOURCE_PR_CI_REGRESSION"),  # NEW-99/102
+        ("SOURCE_MERGED", "DEPLOYMENT_PR_CI_REGRESSION"),  # NEW-103, source already merged
     ],
 )
 async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_state(
-    tmp_path: Path, state: str
+    tmp_path: Path, state: str, regression: str
 ):
     # NEW-112 review: main's CI repair re-delivers a published ChangeSet; the restored
-    # 2b678d9 approval lineage must admit that child with its binding still verified.
+    # 2b678d9 approval lineage admits that child against its parent loop's durable record.
     values = await _child(tmp_path)
     handler = values[3]
     first, loaded = await _ci_repair_load(
-        values, state, child_id="backlog-fixture-parent-issue-1-ci-repair-1-attempt-1"
+        values,
+        state,
+        child_id=f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+        regression=regression,
     )
     assert loaded["status"] == "CONFIRMED_LOADED"
     assert loaded["issue_execution_approval"] == first["issue_execution_approval"]
@@ -373,7 +420,7 @@ async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_sta
         assert approved_issue is not None
         # The approved issue text bounds the workflow's live issue-body refresh.
         assert loaded["approved_issue_body_sha256"] == approved_issue.body_sha256
-    # Every later preparation step re-verifies the same lineage and proceeds.
+    # Every later preparation step (and publication custody) re-verifies the lineage.
     assert handler._issue_approval_preparation(loaded)["change_set_id"] == first["change_set_id"]
     with handler.sessions() as session:
         change_set = session.get(ChangeSet, UUID(first["change_set_id"]))
@@ -387,23 +434,113 @@ async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_sta
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("state", "child_id", "parent"),
+    ("case", "reason", "state", "child_id", "options"),
     [
+        # The exact forged ID from the review, with no parent loop Run or record at all.
+        (
+            "forged",
+            "another issue approval",
+            "SOURCE_PR",
+            "parent-issue-999999-ci-repair-99-attempt-99",
+            {"parent": "parent", "parent_run": None, "record": None},
+        ),
+        (
+            "forged-same-parent",
+            "parent loop Run is missing",
+            "SOURCE_PR",
+            f"{PARENT}-issue-999999-ci-repair-99-attempt-99",
+            {"parent_run": None, "record": None},
+        ),
+        (
+            "unbound-parent",
+            "CI_REPAIR_PARENT_RUN_UNVERIFIED",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {"parent_run": "unbound"},
+        ),
+        (
+            "wrong-campaign",
+            "CI_REPAIR_PARENT_DID_NOT_PUBLISH_CHANGE_SET",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {"record_campaign": "00000000-0000-4000-8000-000000000099"},
+        ),
+        (
+            "no-regression",
+            "CI_REPAIR_REGRESSION_NOT_RECORDED",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {"regression": None},
+        ),
+        (
+            "unrecorded-round",
+            "not recorded by its parent loop",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-2-attempt-1",
+            {},
+        ),
+        (
+            "other-ordinal",
+            "not recorded by its parent loop",
+            "SOURCE_PR",
+            f"{PARENT}-issue-2-ci-repair-1-attempt-1",
+            {},
+        ),
+        (
+            "attempt-over-limit",
+            "exceeds the approved repair bound",
+            "SOURCE_PR",
+            "ATTEMPT_OVER_LIMIT",
+            {},
+        ),
+        (
+            "round-over-limit",
+            "exceeds the approved repair bound",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-ci-repair-3-attempt-1",
+            {"record": (1, 3)},
+        ),
         # An ordinary correction child still needs REQUEST_CHANGES.
-        ("SOURCE_PR", "backlog-fixture-parent-issue-1-attempt-2", None),
+        (
+            "ordinary-child",
+            "explicit correction state",
+            "SOURCE_PR",
+            f"{PARENT}-issue-1-attempt-2",
+            {},
+        ),
         # A CI-repair name from another loop is another approval scope.
-        ("SOURCE_PR", "other-loop-issue-1-ci-repair-1-attempt-1", "other-loop"),
+        (
+            "other-loop",
+            "another issue approval",
+            "SOURCE_PR",
+            "other-loop-issue-1-ci-repair-1-attempt-1",
+            {"parent": "other-loop"},
+        ),
         # A CI-repair child never starts from an unpublished intermediate state.
-        ("IMPLEMENTING", "backlog-fixture-parent-issue-1-ci-repair-1-attempt-1", None),
-        ("CONFIRMED", "backlog-fixture-parent-issue-1-ci-repair-1-attempt-1", None),
+        (
+            "intermediate",
+            "explicit correction state",
+            "IMPLEMENTING",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {},
+        ),
+        (
+            "unpublished",
+            "explicit correction state",
+            "CONFIRMED",
+            f"{PARENT}-issue-1-ci-repair-1-attempt-1",
+            {},
+        ),
     ],
 )
-async def test_unrelated_child_of_a_published_change_set_is_still_rejected(
-    tmp_path: Path, state: str, child_id: str, parent: str | None
+async def test_unproven_or_unrelated_child_of_a_published_change_set_is_rejected(
+    tmp_path: Path, case: str, reason: str, state: str, child_id: str, options: dict
 ):
     values = await _child(tmp_path)
-    with pytest.raises(ValueError):
-        await _ci_repair_load(values, state, child_id=child_id, parent=parent)
+    if child_id == "ATTEMPT_OVER_LIMIT":
+        child_id = f"{PARENT}-issue-1-ci-repair-1-attempt-{values[4]['correction_limit'] + 2}"
+    with pytest.raises(ValueError, match=reason):
+        await _ci_repair_load(values, state, child_id=child_id, **options)
     _dispose(values)
 
 

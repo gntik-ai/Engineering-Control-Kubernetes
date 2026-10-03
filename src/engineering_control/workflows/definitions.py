@@ -3814,22 +3814,34 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     staged = {"status": "BLOCKED", "blocker": restore_blocker}
             if staged is None and repair_pending and gate is not None:
                 repair_round += 1
-                repaired = await self._ci_repair_delivery(
+                authorization_blocker = await self._authorize_ci_repair(
                     request=request,
                     item=item,
                     register_run=register_run,
-                    gate=gate,
                     ordinal=ordinal,
                     repair_round=repair_round,
-                    results=results,
-                    register_child_runs=register_child_runs,
+                    change_set_id=change_set_id,
+                    workflow_root=workflow_root,
                 )
-                if repaired.get("status") == "SOURCE_PR":
-                    repair_pending = False
-                    gitops_round += 1
+                if authorization_blocker is not None:
+                    staged = {"status": "BLOCKED", "blocker": authorization_blocker}
                 else:
-                    reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
-                    staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
+                    repaired = await self._ci_repair_delivery(
+                        request=request,
+                        item=item,
+                        register_run=register_run,
+                        gate=gate,
+                        ordinal=ordinal,
+                        repair_round=repair_round,
+                        results=results,
+                        register_child_runs=register_child_runs,
+                    )
+                    if repaired.get("status") == "SOURCE_PR":
+                        repair_pending = False
+                        gitops_round += 1
+                    else:
+                        reason = str(repaired.get("blocker") or repaired.get("status") or "FAILED")
+                        staged = {"status": "BLOCKED", "blocker": f"CI_REPAIR_{reason}"[:120]}
             if staged is None and change_set_id:
                 child_id = f"{workflow_root}-issue-{ordinal}-staging-gitops"
                 if gitops_round:
@@ -3994,6 +4006,43 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         # Temporal memoizes a patch per workflow, so the decision is scoped to the issue:
         # an earlier issue replayed from before the deploy does not pin later ones to it.
         return workflow.patched(f"existing-backlog-ci-repair-retry-rechecks-v1-{ordinal}")
+
+    async def _authorize_ci_repair(
+        self,
+        *,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        register_run: bool,
+        ordinal: int,
+        repair_round: int,
+        change_set_id: str,
+        workflow_root: str,
+    ) -> str | None:
+        """NEW-112 review: durably record the repair round before any repair child starts.
+
+        The delivery-child approval accepts a CI-repair child only against this record.
+        Histories recorded before it carry no marker and keep their command sequence.
+        """
+        if not workflow.patched(f"existing-backlog-ci-repair-authority-v1-{ordinal}"):
+            return None
+        if not register_run or not change_set_id:
+            return "CI_REPAIR_PARENT_RUN_UNVERIFIED"
+        recorded = await self._loop_step(
+            request,
+            item,
+            "backlog.record_ci_repair",
+            {
+                **_backlog_execution_payload(request),
+                "workflow_id": workflow_root,
+                "ordinal": ordinal,
+                "repair_round": repair_round,
+                "change_set_id": change_set_id,
+            },
+            register_run=register_run,
+        )
+        if recorded.get("status") == "RECORDED":
+            return None
+        return str(recorded.get("blocker") or "CI_REPAIR_NOT_AUTHORIZED")[:120]
 
     async def _ci_repair_delivery(
         self,

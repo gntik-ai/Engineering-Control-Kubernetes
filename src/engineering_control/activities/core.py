@@ -225,6 +225,7 @@ class ControlActivities:
         "notify.write_policy_required",
         "backlog.register_child_run",
         "backlog.register_run",
+        "backlog.record_ci_repair",
         "global_backlog.register",
         "global_backlog.select_next",
         "global_backlog.record_result",
