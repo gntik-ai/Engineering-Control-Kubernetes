@@ -3370,22 +3370,15 @@ async def test_new_116_escalation_lists_out_of_sync_resources(tmp_path: Path) ->
     assert "`SCOPE_INHERITED`" in body and "`full_resync`" in body
 
 
-# -- NEW-118: prune resources the delivered deployment change removed (staging only) ---
+# -- NEW-118: resources Argo CD would prune are detected and escalated, never pruned ----
 
 PRUNE_AT = "2026-10-03T12:00:00Z"
-DEPLOYMENT_PR = {
-    "deployment_pr_number": 45,
-    "deployment_pr_url": "https://github.com/gntik-ai/musematic-deploy/pull/45",
-    "deployment_head_sha": "e" * 40,
-    "deployment_base_sha": "c" * 40,
-}
 KEYCLOAK_CONFIG = {
     "group": "",
     "kind": "ConfigMap",
     "namespace": "musematic-platform",
     "name": "falcone-keycloak-config",
 }
-KEYCLOAK_KEY = "/ConfigMap/musematic-platform/falcone-keycloak-config"
 
 
 def _prunable(kind: str, name: str, *, group: str = "", namespace: str = "musematic-platform"):
@@ -3400,11 +3393,11 @@ def _prunable(kind: str, name: str, *, group: str = "", namespace: str = "musema
     }
 
 
-def _prune_application(*extra: dict[str, Any], phase: str = "Succeeded") -> dict[str, Any]:
+def _prune_application(*extra: dict[str, Any]) -> dict[str, Any]:
     """falcone-charts #45: the full sync applied, only the removed ConfigMap is left."""
     return _application(
         operationState={
-            "phase": phase,
+            "phase": "Succeeded",
             "startedAt": PRUNE_AT,
             "operation": {
                 "initiatedBy": {"username": "hermes-engineering"},
@@ -3421,23 +3414,6 @@ def _prune_application(*extra: dict[str, Any], phase: str = "Succeeded") -> dict
     )
 
 
-def _prune(**changes: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "plan": _plan(**DEPLOYMENT_PR),
-        "merge_sha": MERGE_SHA,
-        "action": "prune_removed",
-        "round": 1,
-        "attempt": 0,
-        "already_remediated": [],
-        "remediation_id": "wf-1:round-1:prune_removed",
-        "failed_operation_started_at": None,
-        "resources": [KEYCLOAK_CONFIG],
-        "render_removed_keys": [KEYCLOAK_KEY],
-    }
-    payload.update(changes)
-    return payload
-
-
 @pytest.mark.asyncio
 async def test_new_118_sync_status_reports_drift_that_only_pruning_fixes(tmp_path: Path) -> None:
     kubectl = FakeKubectl(application=_prune_application())
@@ -3445,208 +3421,91 @@ async def test_new_118_sync_status_reports_drift_that_only_pruning_fixes(tmp_pat
     payload = {**_plan_payload(), "previous_operation_started_at": "2026-10-03T11:00:00Z"}
     result = await handler.handle("gitops.sync_status", payload)
     assert result["status"] == "SYNC_PRUNE_REQUIRED"
-    assert (result["blocker"], result["operation_started_at"]) == (
-        "ARGO_SYNC_PRUNE_REQUIRED",
-        PRUNE_AT,
-    )
+    assert (result["blocker"], result["operation_started_at"]) == ("ARGO_PRUNE_REQUIRED", PRUNE_AT)
     # Other drift still waits for the sync to settle (or time out) as before.
     kubectl.application = _prune_application(_managed("Deployment", "api"))
     assert (await handler.handle("gitops.sync_status", payload))["status"] == "SYNC_PENDING"
+    # Detection is read-only: no write of any kind reached the cluster.
+    assert {call[2] for call in kubectl.calls if call[0] == "--namespace"} == {"get"}
 
 
 @pytest.mark.asyncio
-async def test_new_118_diagnosis_classifies_prunable_and_forbidden_resources(
-    tmp_path: Path,
-) -> None:
-    kubectl = FakeKubectl(application=_prune_application())
-    handler = _controller(tmp_path, kubectl)
-    diagnosed = await handler.handle("gitops.diagnose_sync", {"plan": _plan()})
-    assert diagnosed["failure_class"] == "PRUNE_REQUIRED"
-    assert diagnosed["diagnosis"]["prune_required_resources"] == [
-        {**KEYCLOAK_CONFIG, "status": "OutOfSync", "eligible": True, "refusal": None}
-    ]
-    for kind, group, refusal in (
-        ("Secret", "", "PRUNE_KIND_FORBIDDEN"),
-        ("PersistentVolumeClaim", "", "PRUNE_KIND_FORBIDDEN"),
-        ("StatefulSet", "apps", "PRUNE_KIND_FORBIDDEN"),
-        ("Ingress", "networking.k8s.io", "PRUNE_KIND_NOT_ALLOWLISTED"),
-    ):
-        kubectl.application = _prune_application(_prunable(kind, "data", group=group))
-        other = await handler.handle("gitops.diagnose_sync", {"plan": _plan()})
-        assert other["failure_class"] == "OTHER", kind
-        entry = other["diagnosis"]["prune_required_resources"][1]
-        assert (entry["kind"], entry["eligible"], entry["refusal"]) == (kind, False, refusal)
-    kubectl.application = _prune_application(
-        _prunable("ConfigMap", "elsewhere", namespace="kube-public")
-    )
-    outside = await handler.handle("gitops.diagnose_sync", {"plan": _plan()})
-    assert outside["diagnosis"]["prune_required_resources"][1]["refusal"] == (
-        "PRUNE_OUTSIDE_NAMESPACES"
-    )
-
-
-@pytest.mark.asyncio
-async def test_new_118_production_never_auto_prunes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from engineering_control.activities import gitops
-
-    real = gitops.enabled_staging_flow
-
-    def production(root: Path, project: str) -> tuple[ProjectManifest, StagingFlowPolicy]:
-        manifest, flow = real(root, project)
-        deployment = manifest.deployment.model_copy(update={"production_installed": True})
-        return manifest.model_copy(update={"deployment": deployment}), flow
-
-    monkeypatch.setattr(gitops, "enabled_staging_flow", production)
-    kubectl = FakeKubectl(application=_prune_application())
-    handler = _controller(tmp_path, kubectl)
-    diagnosed = await handler.handle("gitops.diagnose_sync", {"plan": _plan()})
-    assert diagnosed["failure_class"] == "OTHER"
-    assert diagnosed["diagnosis"]["prune_required_resources"][0]["refusal"] == (
-        "PRUNE_PRODUCTION_REFUSED"
-    )
-    refused = await handler.handle("gitops.remediate_sync", _prune())
-    assert refused == {"status": "BLOCKED", "blocker": "ARGO_REMEDIATION_PRODUCTION_REFUSED"}
-    assert _operation_patches(kubectl) == []
-
-
-@pytest.mark.asyncio
-async def test_new_118_an_allowed_configmap_is_pruned_selectively_then_fully_synced(
-    tmp_path: Path,
-) -> None:
-    kubectl = FakeKubectl(application=_prune_application())
-    handler = _controller(tmp_path, kubectl)
-
-    pruned = await handler.handle("gitops.remediate_sync", _prune())
-
-    assert pruned["status"] == "REMEDIATION_TRIGGERED"
-    assert pruned["remediated_keys"] == [KEYCLOAK_KEY]
-    assert _written_operation(kubectl) == {
-        "initiatedBy": {"username": "hermes-engineering"},
-        "info": [
-            {"name": "hermes-remediation", "value": "wf-1:round-1:prune_removed"},
-            {"name": "hermes-previous-started-at", "value": PRUNE_AT},
-        ],
-        # Exactly the removed resource, prune=true, nothing else in scope.
-        "sync": {"resources": [KEYCLOAK_CONFIG], "prune": True},
-    }
-    # Argo CD runs the prune: the operation completes and the ConfigMap is gone.
-    operation = kubectl.application.pop("operation")
-    kubectl.application["status"]["operationState"] = {
-        "phase": "Succeeded",
-        "startedAt": "2026-10-03T12:05:00Z",
-        "operation": operation,
-    }
-    kubectl.application["status"]["resources"] = kubectl.application["status"]["resources"][:1]
-    kubectl.application["status"]["sync"] = {"status": "Synced"}
-
-    full = await handler.handle(
-        "gitops.remediate_sync",
-        _prune(
-            action="prune_full_sync",
-            resources=[],
-            remediation_id="wf-1:round-1:prune_full_sync",
-            prune_remediation_id="wf-1:round-1:prune_removed",
-        ),
-    )
-
-    assert full["status"] == "REMEDIATION_TRIGGERED" and full["resources"] == []
-    written = _written_operation(kubectl)
-    # NEW-116: a TRUE full sync (no scope, hook strategy, prune off) that also clears the
-    # previous selective operation state.
-    assert written["sync"] == {"prune": False, "syncStrategy": {"hook": {}}}
-    assert {"op": "remove", "path": "/status/operationState"} in _operation_patches(kubectl)[-1]
-    # A second prune of the same resource in this delivery is refused.
-    kubectl.application = _prune_application()
-    again = await handler.handle(
-        "gitops.remediate_sync",
-        _prune(remediation_id="wf-1:round-2:prune_removed", already_remediated=[KEYCLOAK_KEY]),
-    )
-    assert again["blocker"] == "ARGO_REMEDIATION_ALREADY_APPLIED"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("resource", "blocker"),
-    [
-        ({**KEYCLOAK_CONFIG, "kind": "Secret"}, "ARGO_PRUNE_KIND_FORBIDDEN"),
-        ({**KEYCLOAK_CONFIG, "kind": "PersistentVolumeClaim"}, "ARGO_PRUNE_KIND_FORBIDDEN"),
-        (
-            {**KEYCLOAK_CONFIG, "group": "apps", "kind": "StatefulSet"},
-            "ARGO_PRUNE_KIND_FORBIDDEN",
-        ),
-        ({**KEYCLOAK_CONFIG, "kind": "Pod"}, "ARGO_PRUNE_KIND_NOT_ALLOWLISTED"),
-        ({**KEYCLOAK_CONFIG, "namespace": "argocd"}, "ARGO_REMEDIATION_OUTSIDE_NAMESPACES"),
-    ],
-)
-async def test_new_118_forbidden_kinds_are_never_pruned(
-    tmp_path: Path, resource: dict[str, str], blocker: str
-) -> None:
-    key = "/".join(resource[field] for field in ("group", "kind", "namespace", "name"))
-    kubectl = FakeKubectl(
-        application=_prune_application(
-            _prunable(
-                resource["kind"],
-                resource["name"],
-                group=resource["group"],
-                namespace=resource["namespace"],
-            )
-        )
-    )
-    result = await _controller(tmp_path, kubectl).handle(
-        "gitops.remediate_sync", _prune(resources=[resource], render_removed_keys=[key])
-    )
-    assert result["status"] == "REMEDIATION_REFUSED" and result["blocker"] == blocker
-    assert _operation_patches(kubectl) == []
-
-
-@pytest.mark.asyncio
-async def test_new_118_a_resource_this_change_did_not_remove_is_never_pruned(
-    tmp_path: Path,
-) -> None:
-    kubectl = FakeKubectl(application=_prune_application())
-    handler = _controller(tmp_path, kubectl)
-    present_at_head = await handler.handle("gitops.remediate_sync", _prune(render_removed_keys=[]))
-    no_deployment_pr = await handler.handle("gitops.remediate_sync", _prune(plan=_plan()))
-    # Argo CD no longer marks it for pruning: the live state is re-read at write time.
-    kubectl.application = _prune_application()
-    kubectl.application["status"]["resources"][1]["requiresPruning"] = False
-    kubectl.application["status"]["resources"].append(_prunable("ConfigMap", "other"))
-    stale = await handler.handle("gitops.remediate_sync", _prune())
-
-    assert present_at_head["blocker"] == "ARGO_PRUNE_NOT_REMOVED_BY_CHANGE"
-    assert no_deployment_pr["blocker"] == "ARGO_PRUNE_REQUIRES_DEPLOYMENT_PR"
-    assert stale["blocker"] == "ARGO_PRUNE_RESOURCE_NOT_PRUNABLE"
-    assert _operation_patches(kubectl) == []
-
-
-@pytest.mark.asyncio
-async def test_new_118_the_full_sync_follows_only_this_deliverys_prune(tmp_path: Path) -> None:
-    kubectl = FakeKubectl(application=_prune_application())
-    result = await _controller(tmp_path, kubectl).handle(
-        "gitops.remediate_sync",
-        _prune(
-            action="prune_full_sync",
-            resources=[],
-            remediation_id="wf-1:round-1:prune_full_sync",
-            prune_remediation_id="wf-1:round-1:prune_removed",
-        ),
-    )
-    assert result["blocker"] == "ARGO_REMEDIATION_STALE_DIAGNOSIS"
-    assert _operation_patches(kubectl) == []
-
-
-@pytest.mark.asyncio
-async def test_new_118_escalation_lists_each_requires_prune_resource_with_its_reason(
+async def test_new_118_diagnosis_lists_every_prune_resource_with_its_tracking_id(
     tmp_path: Path,
 ) -> None:
     kubectl = FakeKubectl(application=_prune_application(_prunable("Secret", "old-credentials")))
     diagnosed = await _controller(tmp_path, kubectl).handle(
         "gitops.diagnose_sync", {"plan": _plan()}
     )
+    assert diagnosed["failure_class"] == "PRUNE_REQUIRED"
     diagnosis = diagnosed["diagnosis"]
-    diagnosis["prune_required_resources"][0]["refusal"] = "PRUNE_RENDER_FAILED"
+    assert diagnosis["prune_required_resources_total"] == 2
+    assert diagnosis["prune_required_resources"] == [
+        {
+            **KEYCLOAK_CONFIG,
+            "status": "OutOfSync",
+            "tracking_id": "musematic-platform:/ConfigMap:musematic-platform/"
+            "falcone-keycloak-config",
+            "safe_kind": True,
+            "in_flow_namespaces": True,
+        },
+        {
+            **KEYCLOAK_CONFIG,
+            "kind": "Secret",
+            "name": "old-credentials",
+            "status": "OutOfSync",
+            "tracking_id": "musematic-platform:/Secret:musematic-platform/old-credentials",
+            "safe_kind": False,
+            "in_flow_namespaces": True,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_118_hermes_has_no_prune_remediation(tmp_path: Path) -> None:
+    from engineering_control.activities.gitops import SYNC_REMEDIATION_ACTIONS
+
+    assert not any("prune" in action for action in SYNC_REMEDIATION_ACTIONS)
+    kubectl = FakeKubectl(application=_prune_application())
+    handler = _controller(tmp_path, kubectl)
+    for action in ("prune_removed", "prune_full_sync", "prune"):
+        refused = await handler.handle(
+            "gitops.remediate_sync",
+            {
+                "plan": _plan(),
+                "merge_sha": MERGE_SHA,
+                "action": action,
+                "round": 1,
+                "remediation_id": f"wf-1:round-1:{action}",
+                "resources": [KEYCLOAK_CONFIG],
+            },
+        )
+        assert refused == {"status": "BLOCKED", "blocker": "ARGO_REMEDIATION_ACTION_INVALID"}
+    # Even a full sync Hermes writes keeps prune=false.
+    await handler.handle("gitops.trigger_sync", _plan_payload())
+    assert all(
+        operation["value"]["sync"]["prune"] is False
+        for patch in _operation_patches(kubectl)
+        for operation in patch
+        if operation["path"] == "/operation"
+    )
+    assert not any(call[2] == "delete" for call in kubectl.calls if call[0] == "--namespace")
+
+
+@pytest.mark.asyncio
+async def test_new_118_escalation_issue_gives_verification_and_operator_commands(
+    tmp_path: Path,
+) -> None:
+    kubectl = FakeKubectl(
+        application=_prune_application(
+            _prunable("Secret", "old-credentials"),
+            _prunable("StatefulSet", "old-db", group="apps"),
+            _prunable("Weird", "Bad_Name"),
+        )
+    )
+    diagnosed = await _controller(tmp_path, kubectl).handle(
+        "gitops.diagnose_sync", {"plan": _plan()}
+    )
     handler, fake = _github(tmp_path / "gh")
     opened = await handler.handle(
         "gitops.environment_issue",
@@ -3654,37 +3513,35 @@ async def test_new_118_escalation_lists_each_requires_prune_resource_with_its_re
             "plan": _plan(),
             "merge_sha": MERGE_SHA,
             "action": "report_sync",
-            "failure_class": "OTHER",
-            "blocker": "ARGO_SYNC_FAILED",
-            "diagnosis": diagnosis,
+            "failure_class": "PRUNE_REQUIRED",
+            "blocker": "ARGO_PRUNE_REQUIRED",
+            "diagnosis": diagnosed["diagnosis"],
             "attempts": [],
         },
     )
     body = fake.issues[("gntik-ai/musematic", opened["issue_number"])]["body"]
+    assert "(blocker `ARGO_PRUNE_REQUIRED`, failure class `PRUNE_REQUIRED`)" in body
     section = body.split("### Requires prune", 1)[1]
-    assert "`falcone-keycloak-config`: not pruned automatically (`PRUNE_RENDER_FAILED`)" in section
-    assert "`old-credentials`: not pruned automatically (`PRUNE_KIND_FORBIDDEN`)" in section
-
-
-def test_new_118_persisted_prune_render_evidence_is_bounded_and_content_free() -> None:
-    from engineering_control.activities.gitops import _prune_render_evidence
-
-    assert _prune_render_evidence(None) is None
-    assert _prune_render_evidence(
-        {
-            "deployment_base_sha": "c" * 40,
-            "deployment_merge_sha": "not-a-sha",
-            "base_rendered_sha256": "1" * 64,
-            "head_rendered_sha256": "2" * 64,
-            "base_documents": 3,
-            "head_documents": -1,
-            "manifest": "kind: Secret\ndata: {}",
-        }
-    ) == {
-        "deployment_base_sha": "c" * 40,
-        "deployment_merge_sha": None,
-        "base_rendered_sha256": "1" * 64,
-        "head_rendered_sha256": "2" * 64,
-        "base_documents": 3,
-        "head_documents": None,
-    }
+    assert "Hermes never prunes or deletes" in section
+    keycloak, secret, statefulset, weird = section.split("\n- ")[1:]
+    assert "(Argo CD tracking id `musematic-platform:/ConfigMap:musematic-platform/" in keycloak
+    assert "safe-kind allowlist: yes (informational)" in keycloak
+    assert (
+        "verify (read-only): `kubectl -n musematic-platform get configmap/falcone-keycloak-config"
+        " -o yaml` and `kubectl -n musematic-platform get deployments,statefulsets,daemonsets,"
+        "jobs,cronjobs,pods -o yaml | grep -n -F -- 'falcone-keycloak-config'`" in keycloak
+    )
+    assert (
+        "prune (run only after verifying it is unused): "
+        "`kubectl -n musematic-platform delete configmap/falcone-keycloak-config`" in keycloak
+    )
+    for entry, resource in (
+        (secret, "secret/old-credentials"),
+        (statefulset, "statefulset.apps/old-db"),
+    ):
+        assert "safe-kind allowlist: no (informational)" in entry
+        assert f"get {resource} -o yaml" in entry
+        assert "requires manual review; do not delete blindly." in entry
+        assert "delete" not in entry.replace("do not delete blindly", "")
+    # An identifier that is not a valid Kubernetes name gets no command at all.
+    assert "kubectl" not in weird and "requires manual review; do not delete blindly." in weird

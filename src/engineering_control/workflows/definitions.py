@@ -453,7 +453,6 @@ class ControlledWorkflow:
             "delivery.prepare_toolchain",
             "delivery.resolve_dependencies",
             "delivery.converge_deployment_pin",
-            "gitops.render_removed_resources",
             "delivery.validate_changeset",
             "audit.deterministic_cell",
             "runtime.deterministic_checks",
@@ -2382,9 +2381,8 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
     # NEW-116: a full sync Argo CD ran with an inherited selective scope (one full resync).
     _SCOPE_PATCH = "gitops-argo-sync-scope-inherited-v1"
     _SCOPE_RESYNCS = 1
-    # NEW-118: prune (staging only) resources the delivered deployment change removed.
-    _PRUNE_PATCH = "gitops-argo-prune-removed-v1"
-    _PRUNE_MAXIMUM = 10
+    # NEW-118: resources Argo CD would prune are escalated at once (Hermes never prunes).
+    _PRUNE_PATCH = "gitops-argo-prune-escalation-v1"
     # Tests run the real flow with short timers. Production keeps 1.0, and _timer then
     # returns the very same timedelta, so every timer command stays byte-identical.
     _TIMER_SCALE = 1.0
@@ -2675,84 +2673,13 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         # the marker, so every earlier history replays unchanged.
         return synced.get("status") == "SYNC_PRUNE_REQUIRED" and workflow.patched(self._PRUNE_PATCH)
 
-    async def _prune_targets(
-        self,
-        deployed_base: dict[str, Any],
-        evidence: dict[str, Any],
-        diagnosis: dict[str, Any],
-        remediated: list[str],
-    ) -> list[dict[str, str]]:
-        """NEW-118: the resources to prune, all or nothing.
-
-        Every resource Argo CD would prune must be an eligible kind (the diagnosis made any
-        other one OTHER), not pruned before in this delivery, and removed by the delivered
-        deployment PR: present in the render at the ChangeSet's deployment base, absent at
-        the merged deployment head. Otherwise nothing is pruned, and each entry records why
-        for the escalation issue.
-        """
-        raw = diagnosis.get("prune_required_resources")
-        entries = [
-            entry for entry in (raw if isinstance(raw, list) else []) if isinstance(entry, dict)
-        ]
-        total = diagnosis.get("prune_required_resources_total")
-        plan = deployed_base.get("plan")
-        plan = plan if isinstance(plan, dict) else {}
-        refusal: str | None = None
-        removed: set[str] = set()
-        if not plan.get("deployment_pr_number"):
-            refusal = "PRUNE_NO_DEPLOYMENT_PR"
-        elif not entries or total != len(entries) or len(entries) > self._PRUNE_MAXIMUM:
-            refusal = "PRUNE_TOO_MANY_RESOURCES"
-        else:
-            try:
-                await self._step("github.refresh_mirrors", {"project": deployed_base["project"]})
-            except ActivityError:
-                pass  # the render then fails closed if the merged head is not mirrored
-            try:
-                rendered = await self._step(
-                    "gitops.render_removed_resources",
-                    {
-                        "project": deployed_base["project"],
-                        "change_set_id": plan.get("change_set_id"),
-                        "deployment_base_sha": plan.get("deployment_base_sha"),
-                        "deployment_merge_sha": evidence.get("deployment_merge_sha"),
-                        "render_source": diagnosis.get("render_source"),
-                    },
-                    timeout_minutes=40,
-                )
-            except ActivityError:
-                rendered = {"status": "RENDER_UNAVAILABLE", "blocker": "PRUNE_RENDER_FAILED"}
-            if rendered.get("status") != "RENDERED":
-                refusal = str(rendered.get("blocker") or "PRUNE_RENDER_UNAVAILABLE")[:80]
-            else:
-                evidence["argo_prune_render"] = rendered.get("render_evidence")
-                listed = rendered.get("removed_resources")
-                removed = {
-                    self._sync_resource_key(item)
-                    for item in (listed if isinstance(listed, list) else [])
-                    if isinstance(item, dict)
-                }
-        targets: list[dict[str, str]] = []
-        for entry in entries:
-            key = self._sync_resource_key(entry)
-            if entry.get("eligible") is not True:
-                continue  # already carries its diagnosis refusal
-            if refusal is not None:
-                entry["refusal"] = refusal
-            elif key in remediated:
-                entry["refusal"] = "PRUNE_ALREADY_ATTEMPTED"
-            elif key not in removed:
-                entry["refusal"] = "PRUNE_NOT_REMOVED_BY_THIS_CHANGE"
-            else:
-                targets.append(
-                    {
-                        field: str(entry.get(field) or "")
-                        for field in ("group", "kind", "namespace", "name")
-                    }
-                )
-        if any(entry.get("refusal") for entry in entries):
-            return []
-        return targets
+    @staticmethod
+    def _sync_blocker(synced: dict[str, Any], failure_class: str) -> str:
+        # NEW-118: resources Argo CD would prune are never remediated; the operator
+        # verifies and deletes them (the issue lists each one with commands).
+        if synced.get("status") == "SYNC_PRUNE_REQUIRED" or failure_class == "PRUNE_REQUIRED":
+            return "ARGO_PRUNE_REQUIRED"
+        return "ARGO_SYNC_TIMEOUT" if synced.get("status") == "TIMED_OUT" else "ARGO_SYNC_FAILED"
 
     @staticmethod
     def _remediation_id(rounds: int, action: str) -> str:
@@ -2782,9 +2709,6 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
             return ("full_resync", []) if scope_resyncs < cls._SCOPE_RESYNCS else (None, [])
         if failure_class == "TRANSIENT":
             return ("resync", []) if transient < cls._TRANSIENT_RESYNCS else (None, [])
-        if failure_class == "PRUNE_REQUIRED":
-            # NEW-118: the targets are settled by _prune_targets (render comparison).
-            return "prune_removed", []
         if timed_out or failure_class not in {"PATCH_CONFLICT", "JOB_IMMUTABLE"}:
             # Degraded health and everything unclassified go to the operator.
             return None, []
@@ -2845,7 +2769,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     deployed_base,
                     "detected",
                     failure_class=failure_class,
-                    blocker="ARGO_SYNC_TIMEOUT" if timed_out else "ARGO_SYNC_FAILED",
+                    blocker=self._sync_blocker(synced, failure_class),
                     diagnosis=diagnosis,
                 )
             action, resources = self._sync_remediation_plan(
@@ -2856,15 +2780,6 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 transient=transient,
                 scope_resyncs=scope_resyncs,
             )
-            if action == "prune_removed":
-                if workflow.patched(self._PRUNE_PATCH) and rounds < self._SYNC_REMEDIATION_ROUNDS:
-                    resources = await self._prune_targets(
-                        deployed_base, evidence, diagnosis, remediated
-                    )
-                else:
-                    resources = []
-                if not resources:
-                    action = None
             if action is None or rounds >= self._SYNC_REMEDIATION_ROUNDS:
                 return await self._escalate_sync(
                     deployed_base, synced, failure_class, diagnosis, attempts, evidence
@@ -2900,12 +2815,6 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                         if synced.get("status") == "SYNC_FAILED" or scope_inherited
                         else None
                     ),
-                    # NEW-118: the render comparison the activity re-checks every target in.
-                    **(
-                        {"render_removed_keys": [self._sync_resource_key(r) for r in resources]}
-                        if action == "prune_removed"
-                        else {}
-                    ),
                 },
                 pending=frozenset({"SYNC_BUSY"}),
                 attempts=10,
@@ -2928,49 +2837,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                     attempts=40,
                     interval=half_minute,
                 )
-                if action == "prune_removed":
-                    # NEW-118: once the prune operation completed, one TRUE full sync, so
-                    # no selective scope lingers on the Application.
-                    if synced.get("status") in {"SYNCED", "SYNC_PARTIAL"} or (
-                        synced.get("status") == "TIMED_OUT" and synced.get("phase") == "Succeeded"
-                    ):
-                        full = await self._remediation_call(
-                            "gitops.remediate_sync",
-                            {
-                                **deployed_base,
-                                "action": "prune_full_sync",
-                                "round": rounds,
-                                "remediation_id": self._remediation_id(rounds, "prune_full_sync"),
-                                "prune_remediation_id": self._remediation_id(
-                                    rounds, "prune_removed"
-                                ),
-                            },
-                            pending=frozenset({"SYNC_BUSY"}),
-                            attempts=10,
-                            interval=half_minute,
-                        )
-                        if full.get("status") == "REMEDIATION_TRIGGERED":
-                            synced = await self._poll(
-                                "gitops.sync_status",
-                                {
-                                    **deployed_base,
-                                    "previous_operation_started_at": full.get(
-                                        "previous_operation_started_at"
-                                    ),
-                                },
-                                pending=frozenset({"SYNC_PENDING"}),
-                                attempts=40,
-                                interval=half_minute,
-                            )
-                        elif full.get("status") == "REMEDIATION_OUTCOME_UNKNOWN":
-                            record["result"] = "ARGO_REMEDIATION_OUTCOME_UNKNOWN"
-                            attempts.append(record)
-                            return await self._escalate_sync(
-                                deployed_base, full, failure_class, diagnosis, attempts, evidence
-                            )
-                        else:
-                            synced = {**full, "status": "SYNC_FAILED"}
-                elif synced.get("status") == "SYNC_PARTIAL":
+                if synced.get("status") == "SYNC_PARTIAL":
                     # The replaced resources applied; one normal sync applies the rest.
                     completed = await self._remediation_call(
                         "gitops.remediate_sync",
@@ -3073,7 +2940,7 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
         """NEW-113: one issue + one notification with the diagnosis, then BLOCKED."""
-        blocker = "ARGO_SYNC_TIMEOUT" if synced.get("status") == "TIMED_OUT" else "ARGO_SYNC_FAILED"
+        blocker = self._sync_blocker(synced, failure_class)
         evidence["argo_sync_failure_class"] = failure_class
         evidence["argo_sync_remediations"] = attempts
         if not await self._checkpoint("GITOPS_SYNC_ESCALATION"):

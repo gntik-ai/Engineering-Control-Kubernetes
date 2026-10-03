@@ -163,8 +163,13 @@ def test_both_pins_are_rewritten_to_the_deployment_head_in_one_platform_commit(
     evidence = result["deployment_pin_result"]
     assert evidence["deployment_head"] == head
     assert evidence["files"] == [
-        {"file": ".github/workflows/ci.yml", "old": [OLD_PIN], "new": head},
-        {"file": ".github/workflows/integration.yml", "old": [OLD_PIN], "new": head},
+        {"file": ".github/workflows/ci.yml", "old": [OLD_PIN], "new": head, "changed_lines": 1},
+        {
+            "file": ".github/workflows/integration.yml",
+            "old": [OLD_PIN],
+            "new": head,
+            "changed_lines": 1,
+        },
     ]
     commit = _git(source, "rev-parse", "HEAD").strip()
     assert evidence["commit"] == commit
@@ -205,11 +210,23 @@ def test_pins_already_at_the_deployment_head_are_a_no_op(tmp_path: Path) -> None
     assert _git(source, "rev-parse", "HEAD").strip() == head
 
 
-def test_no_deployment_commit_or_no_pin_contract_leaves_the_source_alone(tmp_path: Path) -> None:
-    handler, payload, source, _ = _setup(tmp_path, deployment_commit=False)
+def test_a_stale_pin_converges_even_without_a_deployment_commit(tmp_path: Path) -> None:
+    # Codex review 4: after an earlier deployment PR merged, the pin still names its
+    # authored commit; a later source-only delivery must move it to the deployment HEAD.
+    handler, payload, source, deployment = _setup(tmp_path, deployment_commit=False)
+    head = _git(deployment, "rev-parse", "HEAD").strip()
+    assert head == payload["deployment_base_sha"]
+
+    result = handler._converge_deployment_pin(payload)
+
+    assert result["status"] == "DEPLOYMENT_PIN_CONVERGED"
+    assert (source / ".github/workflows/ci.yml").read_text() == CI.replace(OLD_PIN, head)
+
+
+def test_incomplete_maker_or_shared_worktree_leaves_the_source_alone(tmp_path: Path) -> None:
+    handler, payload, source, _ = _setup(tmp_path)
     head = _git(source, "rev-parse", "HEAD").strip()
 
-    unchanged = handler._converge_deployment_pin(payload)
     incomplete = handler._converge_deployment_pin(
         {**payload, "agent_result": {"structured_result": {"decision": "BLOCKED"}}}
     )
@@ -217,11 +234,52 @@ def test_no_deployment_commit_or_no_pin_contract_leaves_the_source_alone(tmp_pat
         {**payload, "deployment_worktree": payload["source_worktree"]}
     )
 
-    assert unchanged["status"] == "DEPLOYMENT_PIN_NOT_APPLICABLE"
-    assert unchanged["deployment_pin_result"]["reason"] == "DEPLOYMENT_UNCHANGED"
     assert incomplete["deployment_pin_result"]["reason"] == "DEPLOYMENT_MAKER_NOT_COMPLETE"
     assert shared["deployment_pin_result"]["reason"] == "NO_PAIRED_WORKTREES"
     assert _git(source, "rev-parse", "HEAD").strip() == head
+
+
+@pytest.mark.parametrize("ancestor", [True, False])
+def test_a_merged_source_pr_is_never_moved_and_its_pin_is_recorded(
+    tmp_path: Path, ancestor: bool
+) -> None:
+    # Codex review 3 (NEW-103): a deployment repair after the source PR merged must not
+    # create a source commit the merged branch can never publish.
+    handler, payload, source, deployment = _setup(tmp_path)
+    pin = payload["deployment_base_sha"] if ancestor else OLD_PIN
+    if ancestor:
+        for name in ("ci.yml", "integration.yml"):
+            path = source / ".github/workflows" / name
+            path.write_text(path.read_text().replace(OLD_PIN, pin))
+        _commit(source, "merged pin")
+    head = _git(source, "rev-parse", "HEAD").strip()
+
+    result = handler._converge_deployment_pin({**payload, "source_pr_merged": True})
+
+    assert result["status"] == "DEPLOYMENT_PIN_NOT_APPLICABLE"
+    evidence = result["deployment_pin_result"]
+    assert evidence["reason"] == "SOURCE_PR_MERGED"
+    assert evidence["deployment_head"] == _git(deployment, "rev-parse", "HEAD").strip()
+    assert evidence["merged_pins"] == [{"pin": pin, "ancestor_of_deployment_head": ancestor}]
+    assert _git(source, "rev-parse", "HEAD").strip() == head
+    assert _git(source, "status", "--porcelain") == ""
+
+
+def test_crlf_files_keep_every_byte_except_the_pin(tmp_path: Path) -> None:
+    crlf = CI.replace("\n", "\r\n").encode()
+    handler, payload, source, deployment = _setup(tmp_path)
+    (source / ".github/workflows/ci.yml").write_bytes(crlf)
+    _commit(source, "crlf workflow")
+    head = _git(deployment, "rev-parse", "HEAD").strip()
+
+    result = handler._converge_deployment_pin(payload)
+
+    assert result["status"] == "DEPLOYMENT_PIN_CONVERGED"
+    assert (source / ".github/workflows/ci.yml").read_bytes() == crlf.replace(
+        OLD_PIN.encode(), head.encode()
+    )
+    numstat = _git(source, "diff", "--numstat", "HEAD^", "HEAD").split()
+    assert numstat[:3] == ["1", "1", ".github/workflows/ci.yml"]
 
 
 def test_a_project_without_a_pin_contract_is_not_applicable(tmp_path: Path) -> None:
@@ -307,3 +365,22 @@ def test_makers_and_the_checker_are_told_hermes_manages_the_pin() -> None:
     assert f"Never edit {where}" in source
     assert "Hermes pin convergence" in checker and "expected" in checker
     assert _pin_prompt("deployment", project="musematic") == ""
+    stub = SimpleNamespace(settings=SimpleNamespace(project_config_root=PROJECTS))
+    merged = MetadataActivityHandler._deployment_pin_prompt(
+        stub,  # type: ignore[arg-type]
+        {
+            "project": "falcone",
+            "source_worktree": "/w/a",
+            "deployment_worktree": "/w/b",
+            "deployment_pin_result": {
+                "reason": "SOURCE_PR_MERGED",
+                "merged_pins": [{"pin": "a" * 40, "ancestor_of_deployment_head": True}],
+            },
+        },
+        role="checker",
+    )
+    assert (
+        "already merged" in merged
+        and f"{'a' * 40} (ancestor of the deployment HEAD: yes)" in merged
+    )
+    assert "Never request a source change for the pin" in merged

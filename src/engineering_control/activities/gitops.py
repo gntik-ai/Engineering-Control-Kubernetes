@@ -110,9 +110,6 @@ class StagingGitOpsPlan(BaseModel):
     deployment_pr_number: int | None = Field(default=None, ge=1)
     deployment_pr_url: str | None = Field(default=None, max_length=300)
     deployment_head_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
-    # NEW-118: the deployment commit the ChangeSet started from (prune render comparison);
-    # None in plans prepared before it existed, which then never auto-prune.
-    deployment_base_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
     deployment_base_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
     issue_repository: str = Field(pattern=_REPOSITORY)
     issue_number: int = Field(ge=1)
@@ -316,8 +313,8 @@ def _normalize_repo_url(value: str) -> str:
 
 # NEW-116: SCOPE_INHERITED is a completed Hermes full-sync request that Argo CD ran with a
 # previous operation's selective scope (resources, syncOptions, strategy or revision).
-# NEW-118: PRUNE_REQUIRED is an OutOfSync resource Argo CD marks requiresPruning (the
-# delivered deployment change removed it; Hermes syncs with prune=false).
+# NEW-118: PRUNE_REQUIRED is a resource Argo CD marks requiresPruning (a delivered change
+# removed it; Hermes syncs with prune=false). Hermes never prunes: it escalates at once.
 SYNC_FAILURE_CLASSES = (
     "PATCH_CONFLICT",
     "JOB_IMMUTABLE",
@@ -326,9 +323,9 @@ SYNC_FAILURE_CLASSES = (
     "PRUNE_REQUIRED",
     "OTHER",
 )
-# NEW-118: the only (group, kind)s Hermes may prune, and kinds it never prunes whatever
-# the allowlist says (data, cluster scope or identity-bearing resources).
-PRUNABLE_KINDS = frozenset(
+# NEW-118: kinds an operator may usually delete once verified unused. Informational only:
+# the escalation issue offers the delete command for these, never runs it.
+SAFE_PRUNE_KINDS = frozenset(
     {
         ("", "ConfigMap"),
         ("", "Service"),
@@ -340,17 +337,8 @@ PRUNABLE_KINDS = frozenset(
         ("apps", "Deployment"),
     }
 )
-NEVER_PRUNED_KINDS = frozenset(
-    {
-        "Secret",
-        "PersistentVolumeClaim",
-        "CustomResourceDefinition",
-        "Namespace",
-        "StatefulSet",
-        "ClusterRole",
-        "ClusterRoleBinding",
-    }
-)
+_KIND = re.compile(r"[A-Z][A-Za-z0-9]{0,62}")
+_GROUP = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 MAXIMUM_SYNC_REMEDIATION_ROUNDS = 3
 MAXIMUM_TRANSIENT_RESYNCS = 3
 MAXIMUM_REMEDIATED_RESOURCES = 10
@@ -424,10 +412,6 @@ SYNC_REMEDIATION_ACTIONS: dict[str, tuple[str, tuple[str, ...], bool]] = {
     "complete": ("", (), False),
     # NEW-116: one TRUE full sync after a full-sync request ran with an inherited scope.
     "full_resync": ("SCOPE_INHERITED", (), False),
-    # NEW-118: a selective prune=true sync of exactly the resources the delivered
-    # deployment change removed, then one TRUE full sync so no selective scope lingers.
-    "prune_removed": ("PRUNE_REQUIRED", (), False),
-    "prune_full_sync": ("", (), False),
 }
 MAXIMUM_SCOPE_RESYNCS = 1
 # NEW-116: the explicit hook strategy of a full sync (Argo CD's default strategy, and the
@@ -515,24 +499,6 @@ def full_sync_scope_violations(
     if check_result and not _pinned_revisions_synced(application, operation_state):
         violations.append("revision")
     return violations
-
-
-def prune_refusal(
-    identity: dict[str, str], namespaces: Iterable[str], *, production: bool
-) -> str | None:
-    """NEW-118: why Hermes may not prune this resource itself (None: it may, subject to
-    the render comparison and the live revalidation at write time)."""
-    if production:
-        return "PRUNE_PRODUCTION_REFUSED"
-    if identity["kind"] in NEVER_PRUNED_KINDS:
-        return "PRUNE_KIND_FORBIDDEN"
-    if (identity["group"], identity["kind"]) not in PRUNABLE_KINDS:
-        return "PRUNE_KIND_NOT_ALLOWLISTED"
-    if identity["namespace"] not in set(namespaces):
-        return "PRUNE_OUTSIDE_NAMESPACES"
-    if not _KUBERNETES_NAME.fullmatch(identity["name"]):
-        return "PRUNE_RESOURCE_INVALID"
-    return None
 
 
 def _pinned_revisions_synced(application: dict[str, Any], operation_state: dict[str, Any]) -> bool:
@@ -705,11 +671,6 @@ class GitOpsControllerHandler:
                 deployment_pr_number=int(deployment.group(2)) if deployment else None,
                 deployment_pr_url=deployment_url if deployment else None,
                 deployment_head_sha=(change_set.deployment_head_sha if deployment else None),
-                deployment_base_sha=(
-                    change_set.deployment_base_sha
-                    if deployment and _SHA.fullmatch(str(change_set.deployment_base_sha or ""))
-                    else None
-                ),
                 deployment_base_branch=manifest.repositories.deployment.default_branch,
                 issue_repository=issue_repository,
                 issue_number=int(payload.get("issue_number", 0)),
@@ -770,8 +731,6 @@ class GitOpsControllerHandler:
                 else None
             ),
             "argo_sync_remediations": _sync_attempts(payload.get("argo_sync_remediations")),
-            # NEW-118: the render comparison a prune relied on (digests and commits only).
-            "argo_prune_render": _prune_render_evidence(payload.get("argo_prune_render")),
             # NEW-63/64: CI job names only (the baseline gate's verdict).
             "ci_regressions": _check_names(payload.get("ci_regressions")),
             "ci_preexisting_failures": _check_names(payload.get("ci_preexisting_failures")),
@@ -1019,8 +978,6 @@ class GitOpsControllerHandler:
         flow: StagingFlowPolicy,
         build: Callable[[dict[str, Any]], dict[str, Any] | str],
         landed: Callable[[dict[str, Any]], bool] | None = None,
-        *,
-        prune: bool = False,
     ) -> str:
         """Write the COMPLETE operation only if none is in flight, atomically.
 
@@ -1039,9 +996,6 @@ class GitOpsControllerHandler:
         exactly as Argo CD's own API does (util/argo ``SetAppOperation`` sets
         ``Status.OperationState = nil`` with the operation). A full-sync request (no
         resources) always carries the explicit hook strategy.
-
-        NEW-118: ``prune`` is honoured only for a selective operation (an explicit resource
-        list) that asked for it; every other operation keeps ``prune: false``.
         """
         for _ in range(3):
             application = self._application(flow)
@@ -1057,13 +1011,7 @@ class GitOpsControllerHandler:
             operation = build(application)
             if isinstance(operation, str):
                 return operation
-            requested = operation.get("sync", {})
-            sync = {
-                **requested,
-                "prune": bool(
-                    prune and requested.get("resources") and requested.get("prune") is True
-                ),
-            }
+            sync = {**operation.get("sync", {}), "prune": False}
             if not sync.get("resources") and "syncStrategy" not in sync:
                 sync["syncStrategy"] = FULL_SYNC_STRATEGY
             operation = {**operation, "sync": sync}
@@ -1271,7 +1219,7 @@ class GitOpsControllerHandler:
             # remain OutOfSync, which no amount of waiting fixes (falcone-charts #45).
             return {
                 "status": "SYNC_PRUNE_REQUIRED",
-                "blocker": "ARGO_SYNC_PRUNE_REQUIRED",
+                "blocker": "ARGO_PRUNE_REQUIRED",
                 "operation_started_at": started[:80],
                 **observed,
             }
@@ -1360,7 +1308,7 @@ class GitOpsControllerHandler:
         return reasons
 
     def _sync_diagnosis(
-        self, flow: StagingFlowPolicy, application: dict[str, Any], *, production: bool = False
+        self, flow: StagingFlowPolicy, application: dict[str, Any]
     ) -> dict[str, Any]:
         """Read-only: failed sync results and degraded managed resources, classified.
 
@@ -1466,25 +1414,27 @@ class GitOpsControllerHandler:
                 out_of_sync.append(
                     {**resource_identity(item), "status": str(item.get("status"))[:40]}
                 )
-        # NEW-118: resources Argo CD would prune (Hermes syncs with prune=false). Only an
-        # allowlisted kind in the flow's namespaces on a staging target is PRUNE_REQUIRED;
-        # anything else is the operator's (OTHER), with the reason it is not auto-pruned.
+        # NEW-118: resources Argo CD would prune (Hermes syncs with prune=false and never
+        # prunes); each is the operator's, with its Argo CD tracking id for verification.
         prune_required: list[dict[str, Any]] = []
         prune_required_total = 0
         for item in managed_items:
             if not isinstance(item, dict) or item.get("requiresPruning") is not True:
                 continue
             identity = resource_identity(item)
-            refusal = prune_refusal(identity, flow.namespaces, production=production)
-            classes.append("PRUNE_REQUIRED" if refusal is None else "OTHER")
+            classes.append("PRUNE_REQUIRED")
             prune_required_total += 1
             if len(prune_required) < MAXIMUM_DIAGNOSED_RESOURCES:
                 prune_required.append(
                     {
                         **identity,
                         "status": str(item.get("status") or "")[:40],
-                        "eligible": refusal is None,
-                        "refusal": refusal,
+                        "tracking_id": (
+                            f"{flow.argo_application}:{identity['group']}/{identity['kind']}:"
+                            f"{identity['namespace']}/{identity['name']}"
+                        )[:700],
+                        "safe_kind": (identity["group"], identity["kind"]) in SAFE_PRUNE_KINDS,
+                        "in_flow_namespaces": identity["namespace"] in flow.namespaces,
                     }
                 )
         operation_sync = _nested(operation_state, "operation", "sync")
@@ -1519,59 +1469,29 @@ class GitOpsControllerHandler:
             "out_of_sync_resources_total": out_of_sync_total,
             "prune_required_resources": prune_required,
             "prune_required_resources_total": prune_required_total,
-            "render_source": self._render_source(application) if prune_required else None,
             "operation_scope": operation_scope,
             "classes": sorted(set(classes)),
             "failure_class": overall_failure_class(classes),
         }
 
-    @staticmethod
-    def _render_source(application: dict[str, Any]) -> dict[str, Any] | None:
-        """NEW-118: what Argo CD renders (single Helm source), for the prune render diff."""
-        spec = application.get("spec")
-        spec = spec if isinstance(spec, dict) else {}
-        source = spec.get("source")
-        if spec.get("sources") or not isinstance(source, dict):
-            return None
-        helm = source.get("helm")
-        helm = helm if isinstance(helm, dict) else {}
-        value_files = helm.get("valueFiles")
-        return {
-            "repo_url": str(source.get("repoURL") or "")[:300],
-            "path": str(source.get("path") or "")[:240],
-            "value_files": [
-                str(value)[:240] for value in (value_files if isinstance(value_files, list) else [])
-            ][:10],
-            "release_name": str(
-                helm.get("releaseName") or _nested(application, "metadata", "name") or ""
-            )[:53],
-            "namespace": str(_nested(spec, "destination", "namespace") or "")[:63],
-        }
-
-    @staticmethod
-    def _is_production(manifest: ProjectManifest) -> bool:
-        deployment = manifest.deployment
-        return bool(
-            deployment.staging_policy.production
-            or deployment.production_supported
-            or deployment.production_installed
-        )
-
     def _diagnose_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
-        manifest, flow = enabled_staging_flow(self.settings.project_config_root, plan.project)
-        diagnosis = self._sync_diagnosis(
-            flow, self._application(flow), production=self._is_production(manifest)
-        )
+        _, flow = enabled_staging_flow(self.settings.project_config_root, plan.project)
+        diagnosis = self._sync_diagnosis(flow, self._application(flow))
         return {
             "status": "DIAGNOSED",
             "failure_class": diagnosis["failure_class"],
             "diagnosis": diagnosis,
         }
 
-    @classmethod
-    def _require_staging_target(cls, manifest: ProjectManifest) -> None:
-        if cls._is_production(manifest):
+    @staticmethod
+    def _require_staging_target(manifest: ProjectManifest) -> None:
+        deployment = manifest.deployment
+        if (
+            deployment.staging_policy.production
+            or deployment.production_supported
+            or deployment.production_installed
+        ):
             raise StagingFlowBlocked("ARGO_REMEDIATION_PRODUCTION_REFUSED")
 
     @staticmethod
@@ -1607,7 +1527,7 @@ class GitOpsControllerHandler:
         return None
 
     def _remediate_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Bounded staging-only Argo CD sync remediation; prunes only removed resources.
+        """Bounded staging-only Argo CD sync remediation; never prunes.
 
         Idempotent per ``remediation_id`` (workflow id, round, action): a retried attempt
         whose write already landed returns that operation instead of syncing again. The
@@ -1615,11 +1535,6 @@ class GitOpsControllerHandler:
         on: the failed operation must still be the one the flow diagnosed, the overall
         class must still be the remediable class (no OTHER), and every named resource
         must still be failing, drifting, managed, in the flow's namespaces and unrepaired.
-
-        NEW-118: ``prune_removed`` prunes (selective, ``prune: true``) only allowlisted
-        resources that Argo CD still marks requiresPruning, that the delivered deployment
-        PR removed (absent from the merged head's render, present in the base's), once
-        each; ``prune_full_sync`` then requests one TRUE full sync after that prune.
         """
         plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
         manifest, flow = enabled_staging_flow(self.settings.project_config_root, plan.project)
@@ -1681,17 +1596,8 @@ class GitOpsControllerHandler:
             not isinstance(attempt, int) or not 1 <= attempt <= MAXIMUM_SCOPE_RESYNCS
         ):
             return refused("ARGO_REMEDIATION_SCOPE_RETRIES_EXHAUSTED")
-        if action == "prune_removed" and plan.deployment_pr_number is None:
-            return refused("ARGO_PRUNE_REQUIRES_DEPLOYMENT_PR")
-        prune_id = str(payload.get("prune_remediation_id") or "")
-        if action == "prune_full_sync" and not _REMEDIATION_ID.fullmatch(prune_id):
-            return refused("ARGO_REMEDIATION_ID_INVALID")
-        raw_removed = payload.get("render_removed_keys")
-        removed_keys = (
-            {str(value) for value in raw_removed} if isinstance(raw_removed, list) else set()
-        )
         selected: list[dict[str, str]] = []
-        if action in {"replace", "replace_force", "prune_removed"}:
+        if action in {"replace", "replace_force"}:
             raw_resources = payload.get("resources")
             if not isinstance(raw_resources, list) or not raw_resources:
                 return refused("ARGO_REMEDIATION_NO_RESOURCES")
@@ -1709,14 +1615,6 @@ class GitOpsControllerHandler:
                     identity["kind"] != "Job" or identity["group"] != "batch"
                 ):
                     return refused("ARGO_REMEDIATION_FORCE_REQUIRES_JOB")
-                if action == "prune_removed":
-                    refusal = prune_refusal(identity, flow.namespaces, production=False)
-                    if refusal is not None:
-                        return refused(f"ARGO_{refusal}")
-                    if resource_key(identity) not in removed_keys:
-                        # Present at the merged head (or the render was unavailable): this
-                        # delivery did not remove it, so it is not Hermes's to prune.
-                        return refused("ARGO_PRUNE_NOT_REMOVED_BY_CHANGE")
                 if identity not in selected:
                     selected.append(identity)
         raw_done = payload.get("already_remediated")
@@ -1732,44 +1630,6 @@ class GitOpsControllerHandler:
             if action == "complete":
                 if not self._selective_sync_completed(application):
                     return "ARGO_REMEDIATION_NOTHING_TO_COMPLETE"
-            elif action == "prune_full_sync":
-                # NEW-118: the latest operation must be this delivery's completed prune.
-                last = _nested(operation_state, "operation")
-                info = _nested(last, "info")
-                if str(operation_state.get("phase") or "") not in {
-                    "Succeeded",
-                    "Failed",
-                    "Error",
-                } or not any(
-                    isinstance(item, dict)
-                    and item.get("name") == REMEDIATION_INFO
-                    and item.get("value") == prune_id
-                    for item in (info if isinstance(info, list) else [])
-                ):
-                    return "ARGO_REMEDIATION_STALE_DIAGNOSIS"
-            elif action == "prune_removed":
-                diagnosis = self._sync_diagnosis(flow, application)
-                if diagnosis["failure_class"] != expected_class:
-                    return "ARGO_REMEDIATION_CLASS_MISMATCH"
-                managed_items = _nested(application, "status", "resources")
-                managed = {
-                    resource_key(item)
-                    for item in (managed_items if isinstance(managed_items, list) else [])
-                    if isinstance(item, dict)
-                }
-                prunable = {
-                    resource_key(entry)
-                    for entry in diagnosis["prune_required_resources"]
-                    if entry["eligible"]
-                }
-                for identity in selected:
-                    key = resource_key(identity)
-                    if key not in managed:
-                        return "ARGO_REMEDIATION_RESOURCE_NOT_MANAGED"
-                    if key in done:
-                        return "ARGO_REMEDIATION_ALREADY_APPLIED"
-                    if key not in prunable:
-                        return "ARGO_PRUNE_RESOURCE_NOT_PRUNABLE"
             elif action == "full_resync":
                 # NEW-116: the diagnosed Hermes full-sync request must still be the latest
                 # operation, completed, and still show the inherited scope.
@@ -1826,8 +1686,6 @@ class GitOpsControllerHandler:
             sync: dict[str, Any] = {}
             if selected:
                 sync["resources"] = selected
-            if action == "prune_removed":
-                sync["prune"] = True
             if sync_options:
                 sync["syncOptions"] = list(sync_options)
             if force:
@@ -1849,7 +1707,6 @@ class GitOpsControllerHandler:
             landed=lambda application: (
                 self._remediation_operation(application, remediation_id) is not None
             ),
-            prune=action == "prune_removed",
         )
         if started == "BUSY":
             return {"status": "SYNC_BUSY", "action": action}
@@ -1915,6 +1772,8 @@ class GitOpsControllerHandler:
             outcome = (
                 "did not become Synced and Healthy in time"
                 if blocker == "ARGO_SYNC_TIMEOUT"
+                else "left resources that require pruning"
+                if blocker == "ARGO_PRUNE_REQUIRED"
                 else "failed"
             )
             message = (
@@ -2767,7 +2626,7 @@ class GitOpsGitHubHandler:
         if failure_class not in SYNC_FAILURE_CLASSES:
             return {"status": "BLOCKED", "blocker": "ENVIRONMENT_ISSUE_CLASS_INVALID"}
         blocker = str(payload.get("blocker") or "")
-        if blocker not in {"ARGO_SYNC_FAILED", "ARGO_SYNC_TIMEOUT"}:
+        if blocker not in {"ARGO_SYNC_FAILED", "ARGO_SYNC_TIMEOUT", "ARGO_PRUNE_REQUIRED"}:
             blocker = "ARGO_SYNC_FAILED"
         diagnosis = payload.get("diagnosis")
         attempts = payload.get("attempts")
@@ -3102,23 +2961,48 @@ def _sync_attempts(value: Any) -> list[dict[str, Any]]:
     return attempts
 
 
-def _prune_render_evidence(value: Any) -> dict[str, Any] | None:
-    """NEW-118: bounded, content-free record of the base/head render comparison."""
-    if not isinstance(value, dict):
-        return None
-    record: dict[str, Any] = {}
-    for key in ("deployment_base_sha", "deployment_merge_sha"):
-        record[key] = str(value[key]) if _SHA.fullmatch(str(value.get(key) or "")) else None
-    for key in ("base_rendered_sha256", "head_rendered_sha256"):
-        digest = str(value.get(key) or "")
-        record[key] = digest if re.fullmatch(r"[a-f0-9]{64}", digest) else None
-    for key in ("base_documents", "head_documents"):
-        count = value.get(key)
-        record[key] = count if isinstance(count, int) and count >= 0 else None
-    return record
-
-
 _RENDER_REDACTOR = SecretRedactor()
+
+
+def _render_prune_required(items: list[dict[str, Any]]) -> list[str]:
+    """NEW-118: per resource, its identity, read-only verification and operator guidance.
+
+    Commands are built only from validated Kubernetes identifiers; anything else gets no
+    command at all. Hermes runs none of them.
+    """
+    lines: list[str] = []
+    for item in items:
+        identity = resource_identity(item)
+        kind, group = identity["kind"], identity["group"]
+        namespace, name = identity["namespace"], identity["name"]
+        lines.append(
+            f"- {_code(kind, 63)} {_code(namespace, 63)}/{_code(name, 120)} "
+            f"(Argo CD tracking id {_code(item.get('tracking_id'), 400)}); safe-kind "
+            f"allowlist: {'yes' if item.get('safe_kind') is True else 'no'} (informational)"
+        )
+        valid = (
+            _KIND.fullmatch(kind)
+            and (group == "" or _GROUP.fullmatch(group))
+            and _KUBERNETES_NAME.fullmatch(namespace)
+            and _KUBERNETES_NAME.fullmatch(name)
+        )
+        if not valid:
+            lines.append("  - requires manual review; do not delete blindly.")
+            continue
+        resource = f"{kind.lower()}.{group}" if group else kind.lower()
+        lines.append(
+            f"  - verify (read-only): `kubectl -n {namespace} get {resource}/{name} -o yaml` "
+            f"and `kubectl -n {namespace} get deployments,statefulsets,daemonsets,jobs,"
+            f"cronjobs,pods -o yaml | grep -n -F -- '{name}'`"
+        )
+        if item.get("safe_kind") is True and (group, kind) in SAFE_PRUNE_KINDS:
+            lines.append(
+                "  - prune (run only after verifying it is unused): "
+                f"`kubectl -n {namespace} delete {resource}/{name}`"
+            )
+        else:
+            lines.append("  - requires manual review; do not delete blindly.")
+    return lines
 
 
 def _code(value: Any, limit: int) -> str:
@@ -3176,20 +3060,11 @@ def render_sync_failure(
         f"{_code(item.get('name'), 120)} status={_code(item.get('status'), 40)}"
         for item in entries("out_of_sync_resources")
     ]
-    # NEW-118: every resource Argo CD would prune, with why Hermes did not prune it.
-    prune_required = [
-        f"- {_code(item.get('kind'), 63)} {_code(item.get('namespace'), 63)}/"
-        f"{_code(item.get('name'), 120)}: "
-        + (
-            f"not pruned automatically ({_code(item.get('refusal'), 60)})"
-            if item.get("refusal")
-            else "eligible for the bounded prune"
-        )
-        for item in entries("prune_required_resources")
-    ]
+    prune_required = _render_prune_required(entries("prune_required_resources"))
     prune_total = diagnosis.get("prune_required_resources_total")
-    if isinstance(prune_total, int) and prune_total > len(prune_required):
-        prune_required.append(f"- ... and {prune_total - len(prune_required)} more")
+    listed = len(entries("prune_required_resources"))
+    if isinstance(prune_total, int) and prune_total > listed:
+        prune_required.append(f"- ... and {prune_total - listed} more")
     out_of_sync_total = diagnosis.get("out_of_sync_resources_total")
     if isinstance(out_of_sync_total, int) and out_of_sync_total > len(out_of_sync):
         out_of_sync.append(f"- ... and {out_of_sync_total - len(out_of_sync)} more")
@@ -3237,12 +3112,9 @@ def render_sync_failure(
         "Bounded remediation: a patch-incompatible change is re-synced once per resource with "
         "`Replace=true`, an immutable Job once with `Replace=true,Force=true`, and transient "
         "API errors are re-synced at most 3 times, and a full sync that ran with an inherited "
-        "selective scope is re-synced once as a true full sync. On staging only, a resource "
-        "Argo CD would prune is pruned once (then one true full sync) when it is an "
-        "allowlisted kind (ConfigMap, Service, ServiceAccount, Role, RoleBinding, "
-        "NetworkPolicy, Job, Deployment) in the flow's namespaces and the merged deployment "
-        "pull request removed it from the rendered chart; nothing else is ever pruned. "
-        "Everything else needs the operator. No secret values are included in this report.",
+        "selective scope is re-synced once as a true full sync; nothing is ever pruned or "
+        "deleted by Hermes. Everything else needs the operator. No secret values are "
+        "included in this report.",
         "",
         "### Failed resources",
         *(failed or ["- none"]),
@@ -3254,7 +3126,16 @@ def render_sync_failure(
         *(out_of_sync or ["- none"]),
         "",
         "### Requires prune",
-        *(prune_required or ["- none"]),
+        *(
+            [
+                "Argo CD would prune these resources (the delivered change removed them); "
+                "Hermes never prunes or deletes. Verify each one is unused before acting.",
+                "",
+                *prune_required,
+            ]
+            if prune_required
+            else ["- none"]
+        ),
     ]
     # gh comments are bounded to 12,000 bytes including the marker.
     return "\n".join(lines).encode()[:11_000].decode(errors="ignore")

@@ -1422,3 +1422,26 @@ def test_a_source_merged_change_set_accepts_repair_writes_until_its_deployment_m
                 handler._persist_delivery_handoff(payload)
             except ValueError as error:
                 assert "already delivered" not in str(error)
+
+
+def test_new_118_the_deployment_maker_step_records_whether_the_source_pr_merged(
+    tmp_path: Path,
+) -> None:
+    handler, allocation = _lease_fixture(tmp_path)
+    payload = {
+        **allocation,
+        "maker_provider": "codex",
+        "orchestration": {"workflow_id": "backlog-loop-musematic-issue-1-ci-repair-1-attempt-1"},
+        "issue_url": "https://github.com/gntik-ai/musematic/issues/993",
+        "risk_class": "R1",
+        "project": "musematic",
+        "openspec_document": {"decision": "READY", "title": "import"},
+        "agent_result": {"structured_result": {"decision": "COMPLETE"}},
+    }
+    assert handler._prepare_maker(payload, deployment=True)["source_pr_merged"] is False
+    assert "source_pr_merged" not in handler._prepare_maker(payload, deployment=False)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(allocation["change_set_id"]))
+        assert change_set is not None
+        change_set.state = "SOURCE_MERGED"
+    assert handler._prepare_maker(payload, deployment=True)["source_pr_merged"] is True

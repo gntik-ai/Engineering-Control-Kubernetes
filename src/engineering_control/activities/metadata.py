@@ -3608,7 +3608,21 @@ class MetadataActivityHandler:
         }
         if deployment:
             response["source_maker_result"] = prior
+            # NEW-118: a merged source branch never moves, so the scan worker must not
+            # converge its CI pin (NEW-103 deployment-only repair).
+            response["source_pr_merged"] = self._source_pr_merged(change_set_id)
         return response
+
+    def _source_pr_merged(self, change_set_id: UUID) -> bool:
+        with self.sessions() as session:
+            change_set = session.get(ChangeSet, change_set_id)
+            if change_set is None:
+                return False
+            record = dict(change_set.recovery_json or {}).get("staging_gitops")
+            merged_sha = record.get("merge_sha") if isinstance(record, dict) else None
+            return change_set.state in _DELIVERED_CHANGE_SET_STATES or bool(
+                isinstance(merged_sha, str) and re.fullmatch(r"[a-f0-9]{40}", merged_sha)
+            )
 
     def _checker_range_prompt(self, payload: dict[str, Any]) -> str:
         """NEW-52: a resumed ChangeSet spans several commits; review all of base..HEAD."""
@@ -3637,12 +3651,30 @@ class MetadataActivityHandler:
             return ""
         where = f"{pin.variable} in {', '.join(pin.files)}"
         if role == "checker":
+            result = payload.get("deployment_pin_result")
+            if isinstance(result, dict) and result.get("reason") == "SOURCE_PR_MERGED":
+                # NEW-118/NEW-103: a merged source branch never moves.
+                merged = result.get("merged_pins")
+                pins = ", ".join(
+                    f"{item.get('pin')} (ancestor of the deployment HEAD: "
+                    f"{'yes' if item.get('ancestor_of_deployment_head') else 'no'})"
+                    for item in (merged if isinstance(merged, list) else [])
+                    if isinstance(item, dict)
+                )
+                return (
+                    f"The source repository's CI pin of the deployment repository ({where}) "
+                    "is managed by Hermes. The source pull request is already merged, so "
+                    f"its pin stays at the merged value ({pins or 'unknown'}); a pin that is "
+                    "an ancestor of the deployment worktree HEAD is acceptable. Never request "
+                    "a source change for the pin.\n"
+                )
             return (
                 f"The source repository's CI pin of the deployment repository ({where}) is "
                 "managed by Hermes: after the deployment maker it is set to the deployment "
-                "worktree HEAD in a platform commit 'chore(ci): pin ... (Hermes pin "
-                "convergence)'. That commit is expected; report the pin only if it differs "
-                "from the deployment worktree HEAD.\n"
+                "worktree HEAD (also when the deployment repository has no new commit) in a "
+                "platform commit 'chore(ci): pin ... (Hermes pin convergence)'. That commit "
+                "is expected; report the pin only if it differs from the deployment worktree "
+                "HEAD.\n"
             )
         if role == "deployment":
             return (

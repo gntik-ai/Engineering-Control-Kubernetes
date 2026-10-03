@@ -94,12 +94,19 @@ build_release controller
 
 # NEW-118: run the NEW release's alembic exactly as engineering-migrate.service would
 # (same user, EnvironmentFile and working directory), without touching the symlinks.
-new_release_alembic() {
+# $1 = release source dir, $2 = its venv, then the alembic arguments.
+release_alembic() {
+  local source="$1" venv="$2"
+  shift 2
   sudo systemd-run --quiet --wait --pipe --collect \
     --uid=engineering-control --gid=engineering-control \
     --property=EnvironmentFile="$CONTROL_ENV" \
-    --working-directory="$RELEASE_DIR/source" \
-    "$VENV_DIR/bin/alembic" -c "$RELEASE_DIR/source/alembic.ini" "$@"
+    --working-directory="$source" \
+    "$venv/bin/alembic" -c "$source/alembic.ini" "$@"
+}
+
+new_release_alembic() {
+  release_alembic "$RELEASE_DIR/source" "$VENV_DIR" "$@"
 }
 
 # Revision IDs from `alembic current` / `alembic heads` output ("0019 (head)").
@@ -179,6 +186,16 @@ rm -f "$REMOTE_SCRIPT"
 
 echo ""
 echo "=== 4/7: swap symlinks on controller ==="
+# NEW-118: recorded first, so a failed migration can roll both hosts back.
+PREVIOUS_SOURCE=$(readlink /opt/engineering-control/source)
+PREVIOUS_VENV=$(readlink /opt/engineering-control/venv)
+PREVIOUS_WORKER_SOURCE=$(ssh worker "readlink /opt/engineering-control/source")
+PREVIOUS_WORKER_VENV=$(ssh worker "readlink /opt/engineering-control/venv")
+if [[ -z "$PREVIOUS_SOURCE" || -z "$PREVIOUS_VENV" || -z "$PREVIOUS_WORKER_SOURCE" || -z "$PREVIOUS_WORKER_VENV" ]]; then
+  echo "ABORT: the current release symlinks could not be read; nothing swapped." >&2
+  exit 1
+fi
+echo "Previous release: controller $PREVIOUS_SOURCE ($PREVIOUS_VENV), worker $PREVIOUS_WORKER_SOURCE ($PREVIOUS_WORKER_VENV)"
 sudo ln -sfn "$RELEASE_DIR/source" /opt/engineering-control/source
 sudo ln -sfn "$VENV_DIR" /opt/engineering-control/venv
 
@@ -238,20 +255,85 @@ mapfile -t MIGRATE_DEPENDENTS < <(
     | grep -vx 'engineering-migrate.service' || true
 )
 echo "Requires=engineering-migrate dependents: ${MIGRATE_DEPENDENTS[*]:-none}"
+# Start every dependent (a stopped one pulls engineering-migrate in again first).
+start_dependents() {
+  local failed=0 unit
+  sudo systemctl reset-failed engineering-migrate.service || true
+  for unit in "${MIGRATE_DEPENDENTS[@]}"; do
+    echo "-- controller: start $unit --"
+    sudo systemctl start "$unit" || failed=1
+  done
+  return "$failed"
+}
+
+recovery_instructions() {
+  echo "RECOVERY (controller):" >&2
+  echo "  journalctl -u engineering-migrate.service -n 100 --no-pager" >&2
+  echo "  # previous release: $PREVIOUS_SOURCE ($PREVIOUS_VENV)" >&2
+  echo "  sudo ln -sfn '$PREVIOUS_SOURCE' /opt/engineering-control/source && sudo ln -sfn '$PREVIOUS_VENV' /opt/engineering-control/venv" >&2
+  echo "  ssh -t worker \"sudo ln -sfn '$PREVIOUS_WORKER_SOURCE' /opt/engineering-control/source && sudo ln -sfn '$PREVIOUS_WORKER_VENV' /opt/engineering-control/venv\"" >&2
+  echo "  sudo systemctl reset-failed engineering-migrate.service && sudo systemctl start ${MIGRATE_DEPENDENTS[*]}" >&2
+  echo "  # (only roll back if the database is still at $DB_REVISION; otherwise fix forward" >&2
+  echo "  #  and run: sudo systemctl restart engineering-migrate.service, then start the units)" >&2
+}
+
+# NEW-118: a failed migration never leaves the controller stopped. With the database
+# still at its old revision (alembic runs each migration in a transaction), both hosts
+# go back to the previous release and every dependent is started on it.
+recover_failed_migration() {
+  local reason="$1" after_out after=""
+  echo "MIGRATION FAILED: $reason" >&2
+  if after_out=$(new_release_alembic current); then
+    after=$(alembic_revisions <<<"$after_out" | head -n 1)
+  fi
+  echo "Database revision after the failure: ${after:-unknown} (before: $DB_REVISION)" >&2
+  if [[ "$after" == "$DB_REVISION" ]]; then
+    echo "-- rollback: database unchanged; restoring the previous release on both hosts --" >&2
+    sudo ln -sfn "$PREVIOUS_SOURCE" /opt/engineering-control/source
+    sudo ln -sfn "$PREVIOUS_VENV" /opt/engineering-control/venv
+    ssh -t worker "sudo ln -sfn '$PREVIOUS_WORKER_SOURCE' /opt/engineering-control/source && sudo ln -sfn '$PREVIOUS_WORKER_VENV' /opt/engineering-control/venv" ||
+      echo "WARNING: the worker symlinks were not restored (see RECOVERY below)." >&2
+    if start_dependents; then
+      echo "ROLLED BACK: every dependent runs the previous release again; $HASH is NOT deployed." >&2
+      echo "(Project contracts installed in step 5b were not reverted.)" >&2
+    else
+      echo "ERROR: some dependents did not start on the previous release." >&2
+      recovery_instructions
+    fi
+  else
+    echo "The database is not at its previous revision; the new release stays linked." >&2
+    start_dependents || true
+    recovery_instructions
+  fi
+  exit 1
+}
+
 if [[ "$MIGRATION_NEEDED" == yes ]]; then
   echo "-- controller: engineering-migrate ($DB_REVISION -> ${RELEASE_HEADS[*]}) --"
-  sudo systemctl restart engineering-migrate.service || true
+  MIGRATE_INVOCATION_BEFORE=$(systemctl show engineering-migrate.service --property=InvocationID --value)
+  if ! sudo systemctl restart engineering-migrate.service; then
+    recover_failed_migration "systemctl restart engineering-migrate.service failed"
+  fi
+  MIGRATE_INVOCATION_AFTER=$(systemctl show engineering-migrate.service --property=InvocationID --value)
+  if [[ -z "$MIGRATE_INVOCATION_AFTER" || "$MIGRATE_INVOCATION_AFTER" == "$MIGRATE_INVOCATION_BEFORE" ]]; then
+    # An old Result=success from the previous run must never pass for this one.
+    recover_failed_migration "engineering-migrate did not run again (InvocationID unchanged)"
+  fi
   MIGRATE_RESULT=$(systemctl show engineering-migrate.service --property=Result --value)
   if [[ "$MIGRATE_RESULT" != success ]]; then
-    echo "ABORT: engineering-migrate finished with Result=$MIGRATE_RESULT; its dependents" >&2
-    echo "are stopped. Inspect: journalctl -u engineering-migrate.service -n 100" >&2
+    recover_failed_migration "engineering-migrate finished with Result=$MIGRATE_RESULT"
+  fi
+  MIGRATED_OUT=$(new_release_alembic current) || recover_failed_migration "alembic current failed after the migration"
+  MIGRATED_REVISION=$(alembic_revisions <<<"$MIGRATED_OUT" | head -n 1)
+  if ! printf '%s\n' "${RELEASE_HEADS[@]}" | grep -qx -- "$MIGRATED_REVISION"; then
+    recover_failed_migration "database at ${MIGRATED_REVISION:-unknown}, not at a release head (${RELEASE_HEADS[*]})"
+  fi
+  echo "engineering-migrate: Result=success, database at $MIGRATED_REVISION"
+  if ! start_dependents; then
+    echo "ERROR: some Requires=engineering-migrate dependents did not start." >&2
+    recovery_instructions
     exit 1
   fi
-  echo "engineering-migrate: Result=success"
-  for unit in "${MIGRATE_DEPENDENTS[@]}"; do
-    echo "-- controller: start $unit (stopped with engineering-migrate) --"
-    sudo systemctl start "$unit"
-  done
 else
   echo "Database already at a release head; engineering-migrate not restarted."
 fi
@@ -301,14 +383,15 @@ for unit in "${MIGRATE_DEPENDENTS[@]}"; do
   [[ "$state" == active ]] || INACTIVE_DEPENDENTS+=("$unit")
 done
 echo "-- controller: database revision (this release) --"
-DB_REVISION_AFTER=$(sudo systemd-run --quiet --wait --pipe --collect \
-  --uid=engineering-control --gid=engineering-control \
-  --property=EnvironmentFile="$CONTROL_ENV" \
-  --working-directory=/opt/engineering-control/source \
-  /opt/engineering-control/venv/bin/alembic -c /opt/engineering-control/source/alembic.ini current || true)
-echo "${DB_REVISION_AFTER:-unknown}"
+DB_FINAL_OUT=$(release_alembic /opt/engineering-control/source /opt/engineering-control/venv current || true)
+DB_FINAL_REVISION=$(alembic_revisions <<<"$DB_FINAL_OUT" | head -n 1)
+echo "Database revision: ${DB_FINAL_REVISION:-unknown} (release heads: ${RELEASE_HEADS[*]})"
 if [[ "${#INACTIVE_DEPENDENTS[@]}" -gt 0 ]]; then
   echo "ERROR: not active after the deploy: ${INACTIVE_DEPENDENTS[*]}" >&2
+  exit 1
+fi
+if ! printf '%s\n' "${RELEASE_HEADS[@]}" | grep -qx -- "${DB_FINAL_REVISION:-unknown}"; then
+  echo "ERROR: the database revision ${DB_FINAL_REVISION:-unknown} is not this release's head." >&2
   exit 1
 fi
 echo "-- worker --"
