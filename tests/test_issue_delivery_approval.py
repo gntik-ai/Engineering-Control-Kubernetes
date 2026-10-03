@@ -327,3 +327,83 @@ async def test_correction_cannot_expand_or_replace_original_authority(tmp_path: 
         )
         assert session.scalar(select(func.count()).select_from(ChangeSet)) == 1
     _dispose(values)
+
+
+async def _ci_repair_load(values, state: str, *, child_id: str, parent: str | None = None):
+    operations, metadata, engineering, handler, payload, registered, child_payload = values
+    first = handler._load_confirmed_finding(child_payload)
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, UUID(first["change_set_id"]))
+        change_set.state = state
+    repair_payload = {**payload, "child_workflow_id": child_id}
+    if parent is not None:
+        repair_payload["orchestration"] = {"workflow_id": parent}
+    repair = engineering._register_backlog_child_run(repair_payload)
+    return first, handler._load_confirmed_finding(
+        {
+            **child_payload,
+            "issue_approval_id": repair["issue_approval_id"],
+            "orchestration": {"workflow_id": child_id},
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        "SOURCE_PR",  # SOURCE_PR_CI_REGRESSION (NEW-99/102)
+        "SOURCE_MERGED",  # DEPLOYMENT_PR_CI_REGRESSION after the source merged (NEW-103)
+    ],
+)
+async def test_ci_repair_child_of_the_same_approval_loads_from_its_published_state(
+    tmp_path: Path, state: str
+):
+    # NEW-112 review: main's CI repair re-delivers a published ChangeSet; the restored
+    # 2b678d9 approval lineage must admit that child with its binding still verified.
+    values = await _child(tmp_path)
+    handler = values[3]
+    first, loaded = await _ci_repair_load(
+        values, state, child_id="backlog-fixture-parent-issue-1-ci-repair-1-attempt-1"
+    )
+    assert loaded["status"] == "CONFIRMED_LOADED"
+    assert loaded["issue_execution_approval"] == first["issue_execution_approval"]
+    # Every later preparation step re-verifies the same lineage and proceeds.
+    assert handler._issue_approval_preparation(loaded)["change_set_id"] == first["change_set_id"]
+    with handler.sessions() as session:
+        change_set = session.get(ChangeSet, UUID(first["change_set_id"]))
+        assert len(change_set.recovery_json["issue_execution_approval_children"]) == 2
+        assert (
+            validate_change_set_issue_approval(session, change_set.id)
+            == first["issue_execution_approval"]
+        )
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "child_id", "parent"),
+    [
+        # An ordinary correction child still needs REQUEST_CHANGES.
+        ("SOURCE_PR", "backlog-fixture-parent-issue-1-attempt-2", None),
+        # A CI-repair name from another loop is another approval scope.
+        ("SOURCE_PR", "other-loop-issue-1-ci-repair-1-attempt-1", "other-loop"),
+        # A CI-repair child never starts from an unpublished intermediate state.
+        ("IMPLEMENTING", "backlog-fixture-parent-issue-1-ci-repair-1-attempt-1", None),
+        ("CONFIRMED", "backlog-fixture-parent-issue-1-ci-repair-1-attempt-1", None),
+    ],
+)
+async def test_unrelated_child_of_a_published_change_set_is_still_rejected(
+    tmp_path: Path, state: str, child_id: str, parent: str | None
+):
+    values = await _child(tmp_path)
+    with pytest.raises(ValueError):
+        await _ci_repair_load(values, state, child_id=child_id, parent=parent)
+    _dispose(values)
+
+
+def test_ci_repair_lineage_bound_mirrors_the_backlog_loop() -> None:
+    from engineering_control.operations.issue_delivery_approval import CI_REPAIR_ROUNDS
+    from engineering_control.workflows.definitions import ExistingGitHubBacklogLoopWorkflow
+
+    assert CI_REPAIR_ROUNDS == ExistingGitHubBacklogLoopWorkflow._CI_REPAIR_ROUNDS

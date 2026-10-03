@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -228,6 +229,35 @@ def _approval_scope(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Main's backlog loop (NEW-99/101/102/103) re-delivers a published ChangeSet after a
+# source or deployment PR CI regression, at most this many repair rounds per issue
+# (ExistingGitHubBacklogLoopWorkflow._CI_REPAIR_ROUNDS), each with the correction bound.
+CI_REPAIR_ROUNDS = 2
+# Published states a CI-repair child may start from (it reuses the published branch).
+_CI_REPAIR_START_STATES = frozenset({"SOURCE_PR", "SOURCE_MERGED"})
+
+
+def _is_ci_repair_child(value: dict[str, Any]) -> bool:
+    """A CI-repair delivery child of the same loop, by its deterministic workflow ID."""
+    parent = value.get("parent_workflow_id")
+    child = value.get("child_workflow_id")
+    return (
+        isinstance(parent, str)
+        and isinstance(child, str)
+        and re.fullmatch(
+            re.escape(parent) + r"-issue-[1-9][0-9]{0,5}-ci-repair-[1-9][0-9]?-attempt-[1-9][0-9]?",
+            child,
+        )
+        is not None
+    )
+
+
+def _lineage_within_bounds(records: list[Step], request: ExistingBacklogLoopStart) -> bool:
+    attempts = request.correction_limit + 1
+    repairs = sum(1 for record in records if _is_ci_repair_child(record.result_json))
+    return len(records) - repairs <= attempts and repairs <= CI_REPAIR_ROUNDS * attempts
+
+
 def bind_change_set_issue_approval(
     session: Session, change_set: ChangeSet, record: Step
 ) -> dict[str, str]:
@@ -263,9 +293,17 @@ def bind_change_set_issue_approval(
         raise ValueError("ChangeSet correction approval lineage is malformed")
     request = ExistingBacklogLoopStart.model_validate(origin.result_json["request"])
     if reference not in children:
-        if len(children) >= request.correction_limit + 1:
+        recorded = [session.get(Step, UUID(str(child["approval_id"]))) for child in children]
+        if any(item is None for item in recorded) or not _lineage_within_bounds(
+            [*[item for item in recorded if item is not None], record], request
+        ):
             raise ValueError("ChangeSet exceeds the approved correction limit")
-        if change_set.state != "REQUEST_CHANGES":
+        # A correction child starts from REQUEST_CHANGES. A CI-repair child of the same
+        # approval scope (checked above) may also start from the published states that a
+        # source/deployment PR CI regression leaves; nothing else is widened.
+        if change_set.state != "REQUEST_CHANGES" and not (
+            _is_ci_repair_child(record.result_json) and change_set.state in _CI_REPAIR_START_STATES
+        ):
             raise ValueError("another delivery child requires an explicit correction state")
         children = [*children, reference]
     recovery["issue_execution_approval_children"] = children
@@ -311,10 +349,11 @@ def validate_change_set_issue_approval(
         not isinstance(children, list)
         or not children
         or children[0] != reference
-        or len(children) > request.correction_limit + 1
+        or len(children) > (CI_REPAIR_ROUNDS + 1) * (request.correction_limit + 1)
     ):
         raise ValueError("ChangeSet correction approval lineage is malformed")
     seen = set()
+    lineage: list[Step] = []
     for child in children:
         if not isinstance(child, dict) or set(child) != {"approval_id", "binding_sha256"}:
             raise ValueError("ChangeSet correction approval reference is malformed")
@@ -333,4 +372,7 @@ def validate_change_set_issue_approval(
             child_record.result_json
         ) != _approval_scope(valid.result_json):
             raise ValueError("ChangeSet correction authority changed")
+        lineage.append(child_record)
+    if not _lineage_within_bounds(lineage, request):
+        raise ValueError("ChangeSet correction approval lineage is malformed")
     return approval_reference(valid)
