@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     # Claude Code >= 2.1.280 on the worker (upgraded to 2.1.282 on 2026-09-25).
     claude_spec_model: str | None = "claude-opus-5-5"
     claude_checker_model: str | None = "claude-opus-5-5"
+    # NEW-123: at most this many UI blueprint items become change-request drafts per fan-out
+    # run; an approval replay resumes with the next items (idempotent, deterministic ids).
+    ui_blueprint_fanout_max_items: int = Field(default=80, ge=1, le=600)
     helm_executable: Path = Path("/usr/local/bin/helm")
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")
     staging_kubeconfig_path: Path = Path("/etc/engineering-control/credentials/staging/kubeconfig")

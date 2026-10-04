@@ -353,6 +353,7 @@ class ChangeRequestCreate(APIModel):
             "gntik-ai/musematic",
             "gntik-ai/musematic-deploy",
             "gntik-ai/llmwiki",
+            "gntik-ai/gntik-ui",
         ]
         | None
     ) = None
@@ -363,6 +364,21 @@ class ChangeRequestApproval(APIModel):
     typed_confirmation: str = Field(
         pattern=r"^APPROVE_CHANGE_(FALCONE|MUSEMATIC|LLMWIKI)_[A-F0-9]{16}$"
     )
+
+
+class UiPlanCreate(APIModel):
+    """NEW-123: start flow A (the UI migration blueprint) for one configured project."""
+
+    project: Literal["falcone"]
+    # Optional expected legacy main head; the snapshot refuses any other commit.
+    source_sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+
+
+class UiBlueprintApproval(APIModel):
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    typed_confirmation: Literal["APPROVE_UI_BLUEPRINT"]
+    # Fan-out cap for this run; bounded by the configured maximum (default 80).
+    max_items: int | None = Field(default=None, ge=1, le=600)
 
 
 class ChangeRequestRevision(APIModel):
@@ -379,7 +395,8 @@ class ChangeRequestPublication(APIModel):
     issue_url: str = Field(
         pattern=(
             r"^https://github\.com/gntik-ai/"
-            r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)/issues/[1-9][0-9]*$"
+            r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
+            r"/issues/[1-9][0-9]*$"
         )
     )
     approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -454,6 +471,10 @@ class ChangeRequestAccepted(OperationAccepted):
     request_key: str
     revision: int = Field(ge=1)
     redacted: bool = False
+
+
+class UiPlanAccepted(OperationAccepted):
+    blueprint_id: UUID
 
 
 class RecordList(APIModel):

@@ -26,6 +26,7 @@ from engineering_control.adapters.github.client import (
 from engineering_control.config import Settings
 from engineering_control.db.change_requests import ChangeRequestRepository
 from engineering_control.engineering.change_requests import (
+    UI_KIT_REPOSITORIES,
     ChangeProposal,
     ChangeReview,
     ChangeReviewRecord,
@@ -259,6 +260,14 @@ class ChangeRequestActivityHandler:
                 "Previous proposal, for reference:\n"
                 + _fenced("previous proposal", json.dumps(previous, sort_keys=True))
             )
+        continued = payload.get("ui_continued")
+        if isinstance(continued, list) and continued:
+            sections.append(
+                "Continued requirements: these lists belong to this change request and are "
+                "kept verbatim in its issue body. The proposal must stay consistent with every "
+                "entry; never contradict or silently drop one.\n"
+                + _fenced("continued requirements", json.dumps(continued, sort_keys=True))
+            )
         rounds = payload.get("review_rounds")
         if attempt == 2 and isinstance(rounds, list) and rounds:
             sections.append(
@@ -300,7 +309,9 @@ class ChangeRequestActivityHandler:
         change_request_id, revision = self._identity(payload)
         structured = self._structured_result(payload)
         try:
-            proposal = validate_proposal(structured, str(payload["project"]))
+            proposal = validate_proposal(
+                structured, str(payload["project"]), payload.get("target_repository")
+            )
         except ValueError:
             return {**payload, "status": "FAILED", "blocker": "DRAFT_SCHEMA_INVALID"}
         attempt = int(payload.get("draft_attempt") or 1)
@@ -330,6 +341,17 @@ class ChangeRequestActivityHandler:
                     _fenced(
                         "proposal",
                         json.dumps(proposal.model_dump(mode="json"), sort_keys=True),
+                    ),
+                    *(
+                        (
+                            _fenced(
+                                "continued requirements (part of the proposal, published "
+                                "verbatim in the issue body: review them too)",
+                                json.dumps(payload["ui_continued"], sort_keys=True),
+                            ),
+                        )
+                        if isinstance(payload.get("ui_continued"), list) and payload["ui_continued"]
+                        else ()
                     ),
                 )
             ),
@@ -487,6 +509,17 @@ class ChangeRequestGitHubHandler:
 
     def _dedupe(self, payload: dict[str, Any]) -> dict[str, Any]:
         repository = str(payload.get("target_repository", ""))
+        if repository in UI_KIT_REPOSITORIES.get(str(payload.get("project", "")), ()):
+            # NEW-123: the GitHub worker has no access to the UI-kit repository; the
+            # operator's own gh searches it when publishing. Deduplication only warns.
+            return {
+                **payload,
+                "dedupe": {
+                    "searched_repository": repository,
+                    "matches": [],
+                    "status": "UNAVAILABLE",
+                },
+            }
         if repository not in ALLOWED_REPOSITORIES:
             raise ApplicationError(
                 "change request repository is not allowlisted",

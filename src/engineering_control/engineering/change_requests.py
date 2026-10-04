@@ -30,10 +30,16 @@ MAXIMUM_ISSUE_BODY_CHARACTERS = 60_000
 CHANGE_REQUEST_KINDS = ("feature", "enhancement", "bug", "chore")
 REVIEW_CATEGORIES = ("code_claim", "testability", "scope", "risk", "other")
 
-_REPOSITORY_PATTERN = r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
+_REPOSITORY_PATTERN = (
+    r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)$"
+)
+# NEW-123: the UI-kit repository a project's console migration may file change requests in
+# (kit gaps). Hermes never writes these issues: the operator publishes with their own gh.
+UI_KIT_REPOSITORIES: dict[str, tuple[str, ...]] = {"falcone": ("gntik-ai/gntik-ui",)}
 # The GitHub broker accepts only this character set in an issue title (GhCliBroker._value).
 _TITLE_UNSAFE = re.compile(r"[^A-Za-z0-9._:/@+ =,\"'-]+")
 _BINDING = re.compile(r"^[a-f0-9]{64}$")
+_UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 # Any revision's hidden marker for a change request (group 1 is the request id).
 MARKER_PATTERN = re.compile(
     r"<!-- hermes-change-request id=([0-9a-f-]{36}) revision=([0-9]+) "
@@ -116,6 +122,45 @@ class ChangeReviewRecord(ChangeRequestModel):
         )
 
 
+class UiChangeDependency(ChangeRequestModel):
+    """NEW-123: one change request a UI migration item is blocked by."""
+
+    change_request_id: str = Field(pattern=_UUID_PATTERN)
+    item_key: str = Field(pattern=r"^(epic|page|cutover|gap):[a-z0-9][a-z0-9-]{0,99}$")
+
+
+class UiContinuedSection(ChangeRequestModel):
+    """NEW-123: a proposal list too long for the proposal bounds, rendered in full."""
+
+    field: Literal[
+        "what_changes",
+        "out_of_scope",
+        "acceptance_criteria",
+        "risks",
+        "rollout",
+        "kill_switch",
+        "open_questions",
+    ]
+    entries: tuple[Annotated[str, Field(min_length=1, max_length=20_000)], ...] = Field(
+        min_length=1, max_length=300
+    )
+
+
+class UiChangeContext(ChangeRequestModel):
+    """NEW-123: the blueprint item a change request was fanned out from (rendered, bound)."""
+
+    blueprint_id: str = Field(pattern=_UUID_PATTERN)
+    blueprint_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    item_key: str = Field(pattern=r"^(epic|page|cutover|gap):[a-z0-9][a-z0-9-]{0,99}$")
+    item_kind: Literal["epic", "page", "cutover", "backend-gap", "kit-gap"]
+    wave: Literal["u0", "u1", "u2", "u3", "u4", "u5"] | None
+    labels: tuple[Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9:-]{0,49}$")], ...] = Field(
+        min_length=1, max_length=10
+    )
+    blocked_by: tuple[UiChangeDependency, ...] = Field(max_length=300)
+    continued: tuple[UiContinuedSection, ...] = Field(default=(), max_length=7)
+
+
 class ChangeRequestIntake(ChangeRequestModel):
     project: Literal["falcone", "musematic", "llmwiki"]
     description_redacted: str = Field(min_length=DESCRIPTION_MIN_CHARACTERS)
@@ -141,6 +186,8 @@ def project_repositories(project: str) -> tuple[str, str]:
 
 
 def target_repository_allowed(project: str, repository: str) -> bool:
+    if repository in UI_KIT_REPOSITORIES.get(project, ()):
+        return True
     return (
         project in BACKLOG_PROJECT_PAIRS
         and repository in BACKLOG_PROJECT_PAIRS[project]
@@ -176,11 +223,18 @@ def prepare_intake(
     )
 
 
-def validate_proposal(value: Any, project: str) -> ChangeProposal:
-    """Validate a drafted proposal and bind its repositories to the project allowlist."""
+def validate_proposal(
+    value: Any, project: str, target_repository: str | None = None
+) -> ChangeProposal:
+    """Validate a drafted proposal and bind its repositories to the project allowlist.
+
+    NEW-123: a change request targeting the project's UI-kit repository may also name
+    that repository (as its source)."""
     proposal = ChangeProposal.model_validate(value)
     source, deployment = project_repositories(project)
     allowed = {(source, "source"), (deployment, "deployment")}
+    if target_repository is not None and target_repository in UI_KIT_REPOSITORIES.get(project, ()):
+        allowed.add((target_repository, "source"))
     for item in proposal.affected_repositories:
         if (item.repository, item.role) not in allowed:
             raise ValueError("proposal names a repository outside the project allowlist")
@@ -289,6 +343,7 @@ def render_change_request(
     proposal: ChangeProposal,
     review: ChangeReviewRecord,
     description_redacted: str,
+    ui_context: UiChangeContext | None = None,
 ) -> RenderedChangeRequest:
     """Render the exact issue title and body an operator approves (pure, deterministic).
 
@@ -309,6 +364,9 @@ def render_change_request(
         f"- Target repository: `{target_repository}`",
         f"- Proposal fingerprint: `{fingerprint}`",
         "",
+        # NEW-123: only a fanned-out UI migration item has this section, so every other
+        # change request renders (and binds) exactly as before.
+        *(_ui_context_lines(ui_context) if ui_context is not None else ()),
         "## Why",
         "",
         f"- {_line(proposal.why)}",
@@ -397,6 +455,33 @@ def render_change_request(
         approval_binding=binding,
         marker=marker,
     )
+
+
+def _ui_context_lines(context: UiChangeContext) -> list[str]:
+    blocked = [
+        f"  - change request `{item.change_request_id}` (`{item.item_key}`)"
+        for item in context.blocked_by
+    ]
+    return [
+        "## UI migration",
+        "",
+        f"- Blueprint: `{context.blueprint_id}` (sha256 `{context.blueprint_sha256}`)",
+        f"- Item: `{context.item_key}` ({context.item_kind}, wave {context.wave or 'none'})",
+        "- Labels: " + ", ".join(f"`{label}`" for label in context.labels),
+        *(["- Blocked by:", *blocked] if blocked else ["- Blocked by: none"]),
+        "",
+        *(line for section in context.continued for line in _continued_lines(section)),
+    ]
+
+
+def _continued_lines(section: UiContinuedSection) -> list[str]:
+    bullet = "- [ ] " if section.field == "acceptance_criteria" else "- "
+    return [
+        f"## UI migration: {section.field} (continued, {len(section.entries)} entries)",
+        "",
+        *(f"{bullet}{_line(entry)}" for entry in section.entries),
+        "",
+    ]
 
 
 def change_proposal_schema() -> dict[str, Any]:

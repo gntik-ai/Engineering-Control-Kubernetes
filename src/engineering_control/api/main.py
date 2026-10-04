@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -55,6 +55,9 @@ from engineering_control.api.schemas import (
     RecordList,
     RollbackRequest,
     RuntimeVerificationStart,
+    UiBlueprintApproval,
+    UiPlanAccepted,
+    UiPlanCreate,
 )
 from engineering_control.api.service import ControlService, TemporalControlService
 from engineering_control.config import Settings, get_settings
@@ -66,6 +69,10 @@ from engineering_control.db.repository import (
     EmptyMetadataRepository,
     MetadataRepository,
     SQLMetadataRepository,
+)
+from engineering_control.db.ui_blueprints import (
+    UiBlueprintNotFoundError,
+    UiBlueprintRepository,
 )
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.engineering.change_requests import prepare_intake
@@ -86,6 +93,13 @@ from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
 
+# NEW-123 review 2: how long a claimed but not yet started fan-out counts as starting.
+UI_FANOUT_START_GRACE = timedelta(minutes=5)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
 
 def create_app(
     *,
@@ -97,6 +111,7 @@ def create_app(
     operations_repository: OperationsRepository | None = None,
     command_bus: TypedCommandBus | None = None,
     change_request_repository: ChangeRequestRepository | None = None,
+    ui_blueprint_repository: UiBlueprintRepository | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     admission_mode = resolved.api_admission_mode
@@ -158,6 +173,10 @@ def create_app(
                 resolved.database_url.get_secret_value()
             )
         app.state.change_request_repository = resolved_change_requests
+        resolved_ui_blueprints = ui_blueprint_repository
+        if resolved_ui_blueprints is None and service is None:
+            resolved_ui_blueprints = UiBlueprintRepository(resolved.database_url.get_secret_value())
+        app.state.ui_blueprint_repository = resolved_ui_blueprints
         stop = asyncio.Event()
         reconciler = None
         if resolved.projection_reconciliation_enabled and admission_mode in {
@@ -202,6 +221,8 @@ def create_app(
                 resolved_operations.engine.dispose()
             if change_request_repository is None and resolved_change_requests is not None:
                 resolved_change_requests.engine.dispose()
+            if ui_blueprint_repository is None and resolved_ui_blueprints is not None:
+                resolved_ui_blueprints.engine.dispose()
 
     app = FastAPI(
         title="Engineering Control API",
@@ -278,8 +299,15 @@ def create_app(
             raise HTTPException(status_code=503, detail="change request repository unavailable")
         return cast(ChangeRequestRepository, value)
 
+    def ui_blueprints(request: Request) -> UiBlueprintRepository:
+        value = request.app.state.ui_blueprint_repository
+        if value is None:
+            raise HTTPException(status_code=503, detail="ui blueprint repository unavailable")
+        return cast(UiBlueprintRepository, value)
+
     control_dependency = Depends(control)
     change_requests_dependency = Depends(change_requests)
+    ui_blueprints_dependency = Depends(ui_blueprints)
     metadata_dependency = Depends(metadata)
     operations_dependency = Depends(operations)
     commands_dependency = Depends(commands)
@@ -1259,6 +1287,148 @@ def create_app(
             revision=1,
             redacted=intake.redacted,
         )
+
+    # NEW-123: UI migration flow A -- the blueprint, its approval and the draft fan-out.
+    @app.post("/v1/ui-blueprints", response_model=UiPlanAccepted, status_code=202)
+    async def ui_plan_create(
+        body: UiPlanCreate,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: UiBlueprintRepository = ui_blueprints_dependency,
+    ) -> UiPlanAccepted:
+        actor = approval_actor(subject)
+        try:
+            created = await repository.create(body.project, actor, body.source_sha)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        blueprint_id = UUID(str(created["id"]))
+        try:
+            accepted = await service.start_ui_plan(
+                blueprint_id, body.project, actor, body.source_sha
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced as a durable FAILED row
+            await repository.record_start_failure(blueprint_id)
+            raise HTTPException(
+                status_code=503, detail="ui plan workflow could not be started"
+            ) from error
+        return UiPlanAccepted(
+            workflow_id=accepted.workflow_id, run_id=accepted.run_id, blueprint_id=blueprint_id
+        )
+
+    @app.get("/v1/ui-blueprints", response_model=RecordList)
+    async def ui_blueprint_list(
+        project: str | None = Query(default=None, pattern=r"^(falcone|musematic|llmwiki)$"),
+        status: str | None = Query(
+            default=None,
+            pattern=r"^(DRAFTING|BLOCKED|FAILED|CANDIDATE|APPROVED|SUPERSEDED)$",
+        ),
+        limit: int = Query(default=20, ge=1, le=200),
+        _subject: str = auth_dependency,
+        repository: UiBlueprintRepository = ui_blueprints_dependency,
+    ) -> RecordList:
+        return RecordList(
+            items=await repository.list_blueprints(project, status, limit), next_cursor=None
+        )
+
+    @app.get("/v1/ui-blueprints/{blueprint_id}")
+    async def ui_blueprint_get(
+        blueprint_id: UUID,
+        _subject: str = auth_dependency,
+        repository: UiBlueprintRepository = ui_blueprints_dependency,
+    ) -> dict[str, Any]:
+        value = await repository.get(blueprint_id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="ui blueprint not found")
+        return value
+
+    @app.get("/v1/ui-blueprints/{blueprint_id}/markdown")
+    async def ui_blueprint_markdown(
+        blueprint_id: UUID,
+        _subject: str = auth_dependency,
+        repository: UiBlueprintRepository = ui_blueprints_dependency,
+    ) -> dict[str, Any]:
+        try:
+            markdown = await repository.markdown(blueprint_id)
+        except UiBlueprintNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        if markdown is None:
+            raise HTTPException(status_code=409, detail="ui blueprint has no draft yet")
+        return {"blueprint_id": str(blueprint_id), "markdown": markdown}
+
+    @app.post("/v1/ui-blueprints/{blueprint_id}/approve")
+    async def ui_blueprint_approve(
+        blueprint_id: UUID,
+        body: UiBlueprintApproval,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: UiBlueprintRepository = ui_blueprints_dependency,
+    ) -> dict[str, Any]:
+        actor = approval_actor(subject)
+        try:
+            approved = await repository.approve(
+                blueprint_id, body.approval_binding, body.typed_confirmation, actor
+            )
+        except UiBlueprintNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        limit = resolved.ui_blueprint_fanout_max_items
+        max_items = min(body.max_items or limit, limit)
+        try:
+            accepted, joined = await ui_fanout_start_or_join(
+                blueprint_id, max_items, service, repository
+            )
+        except Exception as error:  # noqa: BLE001 - the approval stands; a replay resumes
+            raise HTTPException(
+                status_code=503,
+                detail="ui blueprint approved, but its fan-out could not be started; "
+                "repeat the approval to resume",
+            ) from error
+        # Hermes drafts the change requests only; the operator publishes each one.
+        return {
+            **approved,
+            "fanout": {
+                "workflow_id": accepted.workflow_id,
+                "run_id": accepted.run_id,
+                "max_items": max_items,
+                "joined": joined,
+            },
+        }
+
+    async def ui_fanout_start_or_join(
+        blueprint_id: UUID,
+        max_items: int,
+        service: ControlService,
+        repository: UiBlueprintRepository,
+    ) -> tuple[OperationAccepted, bool]:
+        """One fan-out per blueprint: join the active one, or win the claim and start.
+
+        A marker whose workflow is no longer running (it ended without clearing it) is
+        released once and the claim retried; a failed start keeps its marker, so the next
+        approval checks that workflow before anything else starts."""
+        for _ in range(2):
+            claim = await repository.claim_fanout(blueprint_id)
+            if claim["action"] == "START":
+                started = await service.start_ui_fanout(
+                    blueprint_id, max_items, str(claim["workflow_id"])
+                )
+                return started, False
+            state, running = await service.ui_fanout_state(str(claim["workflow_id"]))
+            if state == "RUNNING" and running is not None:
+                return running, True
+            # NEW-123 review 2/3: a marker whose workflow Temporal does not know yet is a
+            # start in progress (another approval won the claim and is starting it), not an
+            # ended fan-out: join it during a grace period; only a stale claim (a start that
+            # crashed) or a CLOSED execution is released.
+            claimed_at = claim.get("claimed_at")
+            if (
+                state == "NOT_FOUND"
+                and isinstance(claimed_at, datetime)
+                and datetime.now(UTC) - _as_utc(claimed_at) < UI_FANOUT_START_GRACE
+            ):
+                return OperationAccepted(workflow_id=str(claim["workflow_id"]), run_id=""), True
+            await repository.release_fanout(blueprint_id, str(claim["workflow_id"]))
+        raise RuntimeError("ui fan-out claim did not settle")
 
     @app.get("/v1/change-requests", response_model=RecordList)
     async def change_request_list(

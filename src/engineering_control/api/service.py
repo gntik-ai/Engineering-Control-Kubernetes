@@ -7,9 +7,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
@@ -37,6 +38,9 @@ from engineering_control.api.schemas import (
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.change_requests import change_request_workflow_id
 from engineering_control.engineering.models import CampaignPlan
+from engineering_control.engineering.ui_blueprint import (
+    ui_plan_workflow_id,
+)
 from engineering_control.models.enums import Project
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
@@ -63,6 +67,8 @@ from engineering_control.workflows.inputs import (
     RecoveryInput,
     RuntimeVerificationInput,
     StagingDeploymentInput,
+    UiBlueprintFanOutInput,
+    UiMigrationPlanInput,
 )
 from engineering_control.workflows.names import WorkflowName
 
@@ -124,6 +130,13 @@ class ControlService(Protocol):
     async def start_change_request(
         self, change_request_id: UUID, revision: int
     ) -> OperationAccepted: ...
+    async def start_ui_plan(
+        self, blueprint_id: UUID, project: str, requested_by: str, source_sha: str | None
+    ) -> OperationAccepted: ...
+    async def start_ui_fanout(
+        self, blueprint_id: UUID, max_items: int, workflow_id: str
+    ) -> OperationAccepted: ...
+    async def ui_fanout_state(self, workflow_id: str) -> tuple[str, OperationAccepted | None]: ...
 
 
 class TemporalControlService:
@@ -826,6 +839,50 @@ class TemporalControlService:
             ChangeRequestInput(change_request_id=str(change_request_id), revision=revision),
             change_request_workflow_id(str(change_request_id), revision),
         )
+
+    async def start_ui_plan(
+        self, blueprint_id: UUID, project: str, requested_by: str, source_sha: str | None
+    ) -> OperationAccepted:
+        """NEW-123: one flow A blueprint workflow per blueprint row."""
+        return await self._start_once(
+            WorkflowName.UI_MIGRATION_PLAN.value,
+            UiMigrationPlanInput(
+                blueprint_id=str(blueprint_id),
+                project=project,
+                requested_by=requested_by,
+                source_sha=source_sha,
+            ),
+            ui_plan_workflow_id(project, str(blueprint_id)),
+        )
+
+    async def start_ui_fanout(
+        self, blueprint_id: UUID, max_items: int, workflow_id: str
+    ) -> OperationAccepted:
+        """NEW-123: start the fan-out execution the caller claimed (the blueprint's single
+        active-fan-out marker). Every item is idempotent under its deterministic id, so a
+        later execution resumes with the items not yet drafted."""
+        if not workflow_id.startswith(f"ui-blueprint-fanout-{blueprint_id}-"):
+            raise ValueError("ui fan-out workflow id does not belong to the blueprint")
+        return await self._start_once(
+            WorkflowName.UI_BLUEPRINT_FANOUT.value,
+            UiBlueprintFanOutInput(blueprint_id=str(blueprint_id), max_items=max_items),
+            workflow_id,
+        )
+
+    async def ui_fanout_state(self, workflow_id: str) -> tuple[str, OperationAccepted | None]:
+        """One lookup: ("RUNNING", accepted), ("CLOSED", None) or ("NOT_FOUND", None).
+
+        NEW-123 review 3: a single describe, so a start landing between two lookups can
+        never make a running fan-out look ended."""
+        try:
+            description = await self.client.get_workflow_handle(workflow_id).describe()
+        except RPCError as error:
+            if error.status is RPCStatusCode.NOT_FOUND:
+                return "NOT_FOUND", None
+            raise
+        if description.status == WorkflowExecutionStatus.RUNNING:
+            return "RUNNING", OperationAccepted(workflow_id=workflow_id, run_id=description.run_id)
+        return "CLOSED", None
 
     async def _start_once(
         self, workflow: str, argument: Any, workflow_id: str

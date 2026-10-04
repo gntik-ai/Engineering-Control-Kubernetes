@@ -464,10 +464,71 @@ class ChangeRequest(UUIDPrimaryKey, Timestamps, Base):
     decision_sequence: Mapped[int] = mapped_column(Integer, default=0)
     # Written only at approval: the decision record and a hash of the approved content.
     approval_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # NEW-123: the blueprint item a fanned-out UI migration request came from (labels,
+    # dependencies); rendered into the bound issue body. NULL for operator requests.
+    ui_context_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     __table_args__ = (
         CheckConstraint("revision >= 1", name="revision_positive"),
         CheckConstraint(
             "status IN ('DRAFTING', 'CANDIDATE', 'APPROVED', 'PUBLISHED', 'REJECTED', 'FAILED')",
+            name="status_known",
+        ),
+    )
+
+
+UI_BLUEPRINT_STATUSES = (
+    "DRAFTING",
+    "BLOCKED",
+    "FAILED",
+    "CANDIDATE",
+    "APPROVED",
+    "SUPERSEDED",
+)
+
+
+class UiBlueprint(UUIDPrimaryKey, Timestamps, Base):
+    """NEW-123: one UI migration blueprint run (flow A), its candidate and its approval."""
+
+    __tablename__ = "ui_blueprints"
+    project: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(240))
+    requested_by: Mapped[str] = mapped_column(String(128))
+    requested_source_sha: Mapped[str | None] = mapped_column(String(40))
+    source_sha: Mapped[str | None] = mapped_column(String(40))
+    inventory_sha256: Mapped[str | None] = mapped_column(String(64))
+    inventory_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    kit_snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
+    gntik_ui_version: Mapped[str | None] = mapped_column(String(100))
+    kit_image: Mapped[str | None] = mapped_column(String(300))
+    draft_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    review_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Every draft version, immutable once recorded; the reviewed one becomes the candidate.
+    drafts_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    blueprint_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    blueprint_sha256: Mapped[str | None] = mapped_column(String(64))
+    # Hermes's hash of the exact draft file the independent reviewer read.
+    reviewed_sha256: Mapped[str | None] = mapped_column(String(64))
+    markdown_sha256: Mapped[str | None] = mapped_column(String(64))
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    approval_binding_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    blockers_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    decided_by: Mapped[str | None] = mapped_column(String(128))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    fanout_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # At most one active fan-out: set by compare-and-set, cleared when that fan-out ends.
+    fanout_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    active_fanout_workflow_id: Mapped[str | None] = mapped_column(
+        String(240), unique=True, index=True
+    )
+    # When the active marker was claimed: a marker whose workflow Temporal does not know
+    # yet is a start in progress for a grace period, not an ended fan-out.
+    fanout_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('DRAFTING', 'BLOCKED', 'FAILED', 'CANDIDATE', 'APPROVED', 'SUPERSEDED')",
             name="status_known",
         ),
     )

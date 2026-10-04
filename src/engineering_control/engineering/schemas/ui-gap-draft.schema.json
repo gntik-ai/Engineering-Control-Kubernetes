@@ -1,0 +1,759 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "finding_ref",
+    "finding_type",
+    "source_flow",
+    "target",
+    "change_request",
+    "openspec",
+    "backend_contract",
+    "kit_proposal",
+    "ui_defect",
+    "backend_change",
+    "blocking",
+    "labels",
+    "dependencies",
+    "duplicate_search",
+    "publication",
+    "notes"
+  ],
+  "properties": {
+    "decision": {
+      "enum": [
+        "DRAFTED",
+        "NOT_TRIAGEABLE",
+        "BLOCKED"
+      ]
+    },
+    "finding_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "finding_type": {
+      "enum": [
+        "BACKEND_GAP",
+        "BUG_LEGACY",
+        "KIT_GAP",
+        "KIT_BUG",
+        "IMPROVEMENT",
+        "BUG_NEW_UI"
+      ]
+    },
+    "source_flow": {
+      "enum": [
+        "A",
+        "B",
+        "C"
+      ]
+    },
+    "target": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "reason"
+          ],
+          "properties": {
+            "repository": {
+              "enum": [
+                "gntik-ai/falcone",
+                "gntik-ai/gntik-ui"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "change_request": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/change_request"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "openspec": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/openspec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "backend_contract": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/backend_contract"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "kit_proposal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/kit_proposal"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ui_defect": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ui_defect"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "backend_change": {
+      "type": "boolean"
+    },
+    "blocking": {
+      "type": "boolean"
+    },
+    "labels": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 50
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "blocks",
+        "blocked_by"
+      ],
+      "properties": {
+        "blocks": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "blocked_by": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        }
+      }
+    },
+    "duplicate_search": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "queries",
+            "fingerprint",
+            "probable_duplicates"
+          ],
+          "properties": {
+            "repository": {
+              "enum": [
+                "gntik-ai/falcone",
+                "gntik-ai/gntik-ui"
+              ]
+            },
+            "queries": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "minItems": 1
+            },
+            "fingerprint": {
+              "type": "string",
+              "pattern": "^[a-z0-9:._/-]{16,200}$"
+            },
+            "probable_duplicates": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              }
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "publication": {
+      "enum": [
+        "DRAFT_ONLY"
+      ]
+    },
+    "notes": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      }
+    }
+  },
+  "$defs": {
+    "change_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "kind",
+        "why",
+        "what_changes",
+        "out_of_scope",
+        "affected_repositories",
+        "acceptance_criteria",
+        "risks",
+        "rollout",
+        "kill_switch",
+        "open_questions",
+        "proposed_risk",
+        "risk_rationale"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:/@+ =,\"'-]{1,100}$"
+        },
+        "kind": {
+          "enum": [
+            "feature",
+            "enhancement",
+            "bug",
+            "chore"
+          ]
+        },
+        "why": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3000
+        },
+        "what_changes": {
+          "type": "array",
+          "maxItems": 15,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "minItems": 1
+        },
+        "out_of_scope": {
+          "type": "array",
+          "maxItems": 15,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          }
+        },
+        "affected_repositories": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "repository",
+              "role"
+            ],
+            "properties": {
+              "repository": {
+                "enum": [
+                  "gntik-ai/falcone",
+                  "gntik-ai/gntik-ui"
+                ]
+              },
+              "role": {
+                "enum": [
+                  "source",
+                  "deployment"
+                ]
+              }
+            }
+          },
+          "minItems": 1
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "maxItems": 15,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "minItems": 1
+        },
+        "risks": {
+          "type": "array",
+          "maxItems": 15,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          }
+        },
+        "rollout": {
+          "type": "array",
+          "maxItems": 15,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          }
+        },
+        "kill_switch": {
+          "type": "array",
+          "maxItems": 15,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          }
+        },
+        "open_questions": {
+          "type": "array",
+          "maxItems": 15,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          }
+        },
+        "proposed_risk": {
+          "enum": [
+            "R0",
+            "R1",
+            "R2",
+            "R3"
+          ]
+        },
+        "risk_rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1500
+        }
+      }
+    },
+    "openspec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "change_id",
+        "capability",
+        "requirements"
+      ],
+      "properties": {
+        "change_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{2,63}$"
+        },
+        "capability": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,63}$"
+        },
+        "requirements": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "statement",
+              "scenarios"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "statement": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "scenarios": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "name",
+                    "given",
+                    "when",
+                    "then"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200
+                    },
+                    "given": {
+                      "type": "array",
+                      "maxItems": 10,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 600
+                      }
+                    },
+                    "when": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 600
+                    },
+                    "then": {
+                      "type": "array",
+                      "maxItems": 10,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 600
+                      },
+                      "minItems": 1
+                    }
+                  }
+                },
+                "minItems": 1
+              }
+            }
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "backend_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path",
+        "xcheck_class",
+        "auth",
+        "tenant_scope",
+        "roles",
+        "request_shape",
+        "response_shape",
+        "error_codes",
+        "publish_in_route_catalog",
+        "acceptance_tests"
+      ],
+      "properties": {
+        "method": {
+          "enum": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "maxLength": 300
+        },
+        "xcheck_class": {
+          "enum": [
+            "OK",
+            "ROUTED_NOT_PUBLISHED",
+            "NO_ROUTE",
+            "GATEWAY_ONLY"
+          ]
+        },
+        "auth": {
+          "enum": [
+            "public",
+            "bearer-session",
+            "api-key"
+          ]
+        },
+        "tenant_scope": {
+          "enum": [
+            "platform",
+            "tenant",
+            "workspace"
+          ]
+        },
+        "roles": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "minItems": 1
+        },
+        "request_shape": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "response_shape": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "error_codes": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "minItems": 1
+        },
+        "publish_in_route_catalog": {
+          "type": "boolean"
+        },
+        "acceptance_tests": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "minItems": 3
+        }
+      }
+    },
+    "kit_proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "kit_id",
+        "api",
+        "aria_pattern",
+        "keyboard",
+        "themes",
+        "tokens_only",
+        "tokens",
+        "closest_existing",
+        "interim_composite"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "component",
+            "block",
+            "template",
+            "layout",
+            "prop-extension",
+            "bug-fix"
+          ]
+        },
+        "kit_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,99}$"
+        },
+        "api": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "prop",
+              "type",
+              "required",
+              "description"
+            ],
+            "properties": {
+              "prop": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "type": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 600
+              }
+            }
+          }
+        },
+        "aria_pattern": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "keyboard": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          }
+        },
+        "themes": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "enum": [
+              "dark",
+              "light",
+              "high_contrast"
+            ]
+          }
+        },
+        "tokens_only": {
+          "type": "boolean"
+        },
+        "tokens": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "closest_existing": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,99}$"
+          }
+        },
+        "interim_composite": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "ui_defect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app",
+        "page_ids",
+        "repro_steps",
+        "expected_behaviour",
+        "actual_behaviour",
+        "viewports",
+        "fixtures"
+      ],
+      "properties": {
+        "app": {
+          "enum": [
+            "web-console",
+            "web-console-next"
+          ]
+        },
+        "page_ids": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,99}$"
+          },
+          "minItems": 1
+        },
+        "repro_steps": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "minItems": 1
+        },
+        "expected_behaviour": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "actual_behaviour": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "viewports": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "enum": [
+              "mobile",
+              "tablet",
+              "desktop"
+            ]
+          }
+        },
+        "fixtures": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          }
+        }
+      }
+    }
+  }
+}

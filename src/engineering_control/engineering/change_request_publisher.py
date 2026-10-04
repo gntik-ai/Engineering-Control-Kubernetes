@@ -24,7 +24,9 @@ from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES
 from engineering_control.engineering.backlog import CHANGE_REQUEST_LABEL
 from engineering_control.engineering.change_requests import (
     MARKER_PATTERN,
+    UI_KIT_REPOSITORIES,
     ChangeReviewRecord,
+    UiChangeContext,
     approval_binding,
     approval_record_matches,
     render_change_request,
@@ -87,7 +89,9 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
     change_request_id = str(view.get("id", ""))
     project = str(view.get("project", ""))
     repository = str(view.get("target_repository", ""))
-    if repository not in ALLOWED_REPOSITORIES or not target_repository_allowed(project, repository):
+    # NEW-123: a UI-kit repository (gntik-ui) is published only by the operator's gh.
+    known = ALLOWED_REPOSITORIES | frozenset(UI_KIT_REPOSITORIES.get(project, ()))
+    if repository not in known or not target_repository_allowed(project, repository):
         raise ChangePublishError("change request repository is not allowlisted")
     revision = view.get("revision")
     sequence = view.get("decision_sequence")
@@ -98,7 +102,9 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
     if not isinstance(revision, int) or not isinstance(sequence, int) or sequence < 1:
         raise ChangePublishError("change request decision record is incomplete")
     try:
-        proposal = validate_proposal(view.get("proposal"), project)
+        proposal = validate_proposal(view.get("proposal"), project, repository)
+        raw_context = view.get("ui_context")
+        ui_context = UiChangeContext.model_validate(raw_context) if raw_context else None
         rendered = render_change_request(
             change_request_id=change_request_id,
             revision=revision,
@@ -107,6 +113,7 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
             proposal=proposal,
             review=ChangeReviewRecord.model_validate(view.get("review")),
             description_redacted=str(view.get("description_redacted", "")),
+            ui_context=ui_context,
         )
     except ValueError as error:
         raise ChangePublishError("change request content cannot be re-rendered") from error
@@ -159,7 +166,11 @@ def verified_plan(view: dict[str, Any]) -> PublicationPlan:
         title=title,
         body=body,
         marker=rendered.marker,
-        wanted_labels=(CHANGE_REQUEST_LABEL, proposal.kind),
+        wanted_labels=tuple(
+            dict.fromkeys(
+                (CHANGE_REQUEST_LABEL, proposal.kind, *(ui_context.labels if ui_context else ()))
+            )
+        ),
     )
 
 

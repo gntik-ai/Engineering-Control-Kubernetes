@@ -46,7 +46,20 @@ class AgentInstructionPack:
         # Codex checker reviews the proposal with the checker role's review skill.
         "change_request.draft": "create-openspec",
         "change_request.review": "review-change",
+        # NEW-123: flow A -- Claude drafts and Codex reviews the blueprint with the same
+        # skill (draft and review modes); Claude drafts each gap change request.
+        "ui_plan.draft": "plan-ui-migration",
+        "ui_plan.review": "plan-ui-migration",
+        "ui_fanout.gap_draft": "triage-ui-gap",
     }
+    # NEW-123: these steps must send exactly the released skill's output schema.
+    _pinned_schema_steps = frozenset({"ui_plan.draft", "ui_plan.review", "ui_fanout.gap_draft"})
+    # NEW-123 (design section 11): the UI roles list gntik-ui MCP tools, but models get no
+    # MCP -- Hermes supplies the kit data. Those grants are accepted in the role definition
+    # and never granted; the UI roles are otherwise strictly read-only.
+    _read_only_roles = frozenset({"ui-migration-architect", "ui-gap-triager"})
+    _read_only_tools = frozenset({"Read", "Glob", "Grep"})
+    _unused_mcp_grant = re.compile(r"^mcp__gntik_ui__[a-z][a-z_]{0,63}$")
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -86,9 +99,13 @@ class AgentInstructionPack:
             raise ValueError("agent-pack output schema is invalid") from error
         if step == "reconcile.invoke_release_reviewer" and request.output_schema != schema:
             raise ValueError("release review request drifted from its canonical output schema")
+        if step in self._pinned_schema_steps and request.output_schema != schema:
+            raise ValueError("ui plan request drifted from the released skill output schema")
 
         digest = self._digest(sources)
-        allowed_tools = tuple(str(tool) for tool in role["tools"])
+        allowed_tools = tuple(
+            str(tool) for tool in role["tools"] if str(tool) in self._allowed_tools
+        )
         if request.allowed_tools:
             if not set(request.allowed_tools).issubset(allowed_tools):
                 raise ValueError("request tools exceed the canonical role boundary")
@@ -162,6 +179,10 @@ class AgentInstructionPack:
         if not isinstance(raw_tools, list) or not raw_tools:
             raise ValueError("agent role has no bounded tool set")
         tools = {str(tool) for tool in raw_tools}
+        if request.role in self._read_only_roles:
+            tools = {tool for tool in tools if not self._unused_mcp_grant.fullmatch(tool)}
+            if not tools or not tools.issubset(self._read_only_tools) or request.writable:
+                raise ValueError("UI migration roles are read-only and receive no MCP tools")
         if not tools.issubset(self._allowed_tools):
             raise ValueError("agent role requests a non-allowlisted tool")
         write_tools = {"Edit", "Write"}

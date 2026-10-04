@@ -80,6 +80,9 @@ class ProviderActivityHandler:
         "observability.invoke_codex_checker": "checker_request",
         "change_request.draft": "draft_request",
         "change_request.review": "review_request",
+        "ui_plan.draft": "draft_request",
+        "ui_plan.review": "review_request",
+        "ui_fanout.gap_draft": "draft_request",
     }
 
     def __init__(
