@@ -649,6 +649,14 @@ def socket_preflight(path: str, *, trusted_uid: int = 0) -> None:
         raise KitUnavailable(f"{path} is not owned by root")
 
 
+_ABORT_SECONDS = 2.0
+
+
+def _descriptor_closed(writer: asyncio.StreamWriter) -> bool:
+    connection = writer.get_extra_info("socket")
+    return connection is None or connection.fileno() == -1
+
+
 def _peer_uid(writer: asyncio.StreamWriter) -> int | None:
     connection = writer.get_extra_info("socket")
     if connection is None or not hasattr(socket, "SO_PEERCRED"):
@@ -730,18 +738,40 @@ class GntikUiSocketClient(KitSession):
             raise KitUnavailable("the gntik-ui MCP socket is not served by root")
 
     async def _shutdown(self) -> None:
-        """Close the connection (aborted when forced); the service removes the container
-        once its stdin reaches EOF. Bounded: a peer that never acknowledges is abandoned."""
+        """Close the connection; the service removes the container once its stdin reaches
+        EOF. A graceful close flushes buffered output for at most `shutdown_seconds`; on that
+        timeout, a forced stop or a cancellation the transport is aborted, so the descriptor
+        (and the service's connection slot) is always released."""
         writer = self._writer
         if writer is None:
             return
-        if self._escalate.is_set():
+        try:
+            if not self._escalate.is_set():
+                writer.close()
+                await self._closed_or_escalated(writer)
+        finally:
+            # A no-op once the graceful close completed; otherwise (a peer that does not
+            # read keeps buffered output pending) it drops the buffer and closes the fd.
             writer.transport.abort()
-        else:
-            writer.close()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(writer.wait_closed(), timeout=self.shutdown_seconds)
-        self.connection_closed = True
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(writer.wait_closed()), _ABORT_SECONDS)
+            self.connection_closed = _descriptor_closed(writer)
+
+    async def _closed_or_escalated(self, writer: asyncio.StreamWriter) -> None:
+        # Shielded: cancelling wait_closed() would cancel the protocol's shared close
+        # future, and every later wait_closed() would raise CancelledError.
+        closed: asyncio.Future[Any] = asyncio.ensure_future(asyncio.shield(writer.wait_closed()))
+        escalation: asyncio.Future[Any] = asyncio.ensure_future(self._escalate.wait())
+        try:
+            await asyncio.wait(
+                {closed, escalation},
+                timeout=self.shutdown_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for pending in (closed, escalation):
+                pending.cancel()
+            await asyncio.gather(closed, escalation, return_exceptions=True)
 
 
 async def _kill_group(process: asyncio.subprocess.Process) -> None:

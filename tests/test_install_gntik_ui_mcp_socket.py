@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from engineering_control.engineering import ui_kit
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "install-gntik-ui-mcp-socket.sh"
@@ -83,7 +86,6 @@ def test_dry_run_prints_the_pinned_hardened_units(source: tuple[str, str]) -> No
         "Environment=DOCKER_CONFIG=/var/lib/gntik-ui-mcp/docker-config "
         "DOCKER_CONTEXT=default DOCKER_HOST=unix:///var/run/docker.sock",
         "ExecStopPost=-/usr/bin/docker rm -f gntik-ui-mcp-%i",
-        "RuntimeMaxSec=120",
         "TimeoutStopSec=15",
         "NoNewPrivileges=yes",
         "CapabilityBoundingSet=",
@@ -146,3 +148,154 @@ def test_a_real_run_requires_root() -> None:
     assert result.returncode != 0 and "run as root" in result.stderr
     result = _run("--uninstall")
     assert result.returncode != 0 and "run as root" in result.stderr
+
+
+def test_the_service_outlives_the_client_session() -> None:
+    service = _units(_run("--manifest", str(MANIFEST), "--dry-run").stdout)[
+        "/etc/systemd/system/gntik-ui-mcp@.service"
+    ]
+    (runtime,) = [
+        int(line.removeprefix("RuntimeMaxSec="))
+        for line in service.splitlines()
+        if line.startswith("RuntimeMaxSec=")
+    ]
+    assert runtime == 210
+    assert runtime >= ui_kit.DEFAULT_DEADLINE_SECONDS + ui_kit._REAP_SECONDS + 15
+
+
+def _source(tmp_path: Path, body: str, **env: str) -> subprocess.CompletedProcess[str]:
+    """Run script functions as this user: the owner checks expect this uid/gid."""
+    program = f"source {SCRIPT}\nROOT_UID=$(id -u)\nROOT_GID=$(id -g)\nset -euo pipefail\n{body}"
+    return subprocess.run(  # noqa: S603 - the fixed interpreter and script
+        [BASH, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", **env},
+    )
+
+
+def test_install_file_replaces_a_symlink_and_repairs_a_reused_file(tmp_path: Path) -> None:
+    units = tmp_path / "units"
+    units.mkdir(mode=0o755)
+    units.chmod(0o755)
+    victim = tmp_path / "victim"
+    victim.write_text("victim\n", encoding="utf-8")
+    (units / "a.service").symlink_to(victim)
+    reused = units / "b.service"
+    reused.write_text("same\n", encoding="utf-8")
+    reused.chmod(0o666)
+    before = reused.stat().st_ino
+    result = _source(
+        tmp_path,
+        f'install_file {units}/a.service 0644 "new"\n'
+        f'install_file {units}/b.service 0644 "same"\n'
+        'printf "%s\\n" "${CHANGED[@]}"',
+    )
+    assert result.returncode == 0, result.stderr
+    assert victim.read_text(encoding="utf-8") == "victim\n"  # never followed
+    linked = units / "a.service"
+    assert not linked.is_symlink() and linked.read_text(encoding="utf-8") == "new\n"
+    assert reused.stat().st_ino != before  # always rewritten, never trusted as found
+    for path in (linked, reused):
+        assert stat.S_IMODE(path.lstat().st_mode) == 0o644
+    assert result.stdout.split() == [str(linked)]  # unchanged content needs no restart
+    assert sorted(p.name for p in units.iterdir()) == ["a.service", "b.service"]
+
+
+def test_install_file_refuses_foreign_ownership_and_open_directories(tmp_path: Path) -> None:
+    units = tmp_path / "units"
+    units.mkdir()
+    units.chmod(0o775)
+    result = _source(tmp_path, f'install_file {units}/a.service 0644 "x"')
+    assert result.returncode != 0 and "writable by group or others" in result.stderr
+    units.chmod(0o755)
+    # Production expects root: a directory or file owned by this user is refused.
+    (units / "a.service").write_text("x\n", encoding="utf-8")
+    root_owner = f"source {SCRIPT}\nset -euo pipefail\n"
+    for check in (
+        f'install_file {units}/a.service 0644 "x"',
+        f'verify_root_path {units}/a.service 0644 "regular file"',
+    ):
+        result = subprocess.run(  # noqa: S603
+            [BASH, "-c", root_owner + check], capture_output=True, text=True, check=False
+        )
+        assert result.returncode != 0
+        assert "not a root-owned directory" in result.stderr or "expected 0:0" in result.stderr
+
+
+def test_ensure_root_dir_replaces_a_symlink_without_following_it(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o755)
+    state.chmod(0o755)
+    victim = tmp_path / "victim-dir"
+    victim.mkdir(mode=0o755)
+    victim.chmod(0o755)
+    (state / "docker-config").symlink_to(victim, target_is_directory=True)
+    result = _source(tmp_path, f"ensure_root_dir {state}/docker-config 0700")
+    assert result.returncode == 0, result.stderr
+    config = state / "docker-config"
+    assert config.is_dir() and not config.is_symlink()
+    assert stat.S_IMODE(config.lstat().st_mode) == 0o700
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+
+
+def _fake_docker(tmp_path: Path, digests: str) -> Path:
+    fake = tmp_path / "docker"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'env | sort > "{tmp_path}/env-$1"\n'
+        f'echo "$@" >> "{tmp_path}/args"\n'
+        f'if [ "$1" = image ]; then printf "%s\\n" "{digests}"; fi\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    return fake
+
+
+def test_docker_commands_use_exactly_the_service_environment(tmp_path: Path) -> None:
+    reference = f"{IMAGE}@{DIGEST}"
+    fake = _fake_docker(tmp_path, reference)
+    planted = {
+        "DOCKER_HOST": "tcp://10.0.0.1:2375",
+        "DOCKER_CONTEXT": "evil",
+        "DOCKER_CONFIG": str(tmp_path / "operator-config"),
+        "HOME": str(tmp_path),
+    }
+    result = _source(tmp_path, f"DOCKER={fake}\nREFERENCE={reference}\npull_image", **planted)
+    assert result.returncode == 0, result.stderr
+    expected = [
+        "DOCKER_CONFIG=/var/lib/gntik-ui-mcp/docker-config",
+        "DOCKER_CONTEXT=default",
+        "DOCKER_HOST=unix:///var/run/docker.sock",
+        "PATH=/usr/bin:/bin",
+    ]
+    for command in ("pull", "image"):
+        seen = (tmp_path / f"env-{command}").read_text(encoding="utf-8").split()
+        assert [v for v in seen if not v.startswith(("PWD=", "SHLVL=", "_="))] == expected
+    assert (tmp_path / "args").read_text(encoding="utf-8").splitlines() == [
+        f"pull --quiet {reference}",
+        f"image inspect --format {{{{range .RepoDigests}}}}{{{{println .}}}}{{{{end}}}} "
+        f"{reference}",
+    ]
+
+
+def test_a_pull_that_leaves_another_digest_is_refused(tmp_path: Path) -> None:
+    other = f"{IMAGE}@sha256:{'0' * 64}"
+    fake = _fake_docker(tmp_path, other)
+    result = _source(tmp_path, f"DOCKER={fake}\nREFERENCE={IMAGE}@{DIGEST}\npull_image")
+    assert result.returncode != 0 and "does not carry" in result.stderr
+
+
+def test_units_are_verified_before_systemd_reloads_them() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    main = text[text.index("\nmain() {") :]
+    pull = main.index("pull_image")
+    installs = main.index('install_file "$TMPFILES_CONF"')
+    verify = main.index('verify_root_path "$generated" 0644 "regular file"')
+    reload = main.index("systemctl daemon-reload")
+    assert main.index('ensure_root_dir "$DOCKER_CONFIG_DIR" 0700') < pull < installs
+    assert installs < verify < reload
+    assert '"$DOCKER" pull' not in text and "docker_service pull" in text

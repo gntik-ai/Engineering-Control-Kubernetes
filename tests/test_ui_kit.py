@@ -742,6 +742,7 @@ class _SocketService:
         self.path, self.mode, self.log = path, mode, log
         self.processes: list[Any] = []
         self.eof = threading.Event()
+        self.release = threading.Event()
         self.listener = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         self.listener.bind(str(path))
         self.listener.listen(4)
@@ -758,6 +759,9 @@ class _SocketService:
                 return
             if self.mode == "silent":  # never answers; records the client's close
                 threading.Thread(target=self._silent, args=(connection,), daemon=True).start()
+                continue
+            if self.mode == "stall":  # answers the handshake, then stops reading
+                threading.Thread(target=self._stall, args=(connection,), daemon=True).start()
                 continue
             if self.mode == "oversize":
                 threading.Thread(target=self._oversize, args=(connection,), daemon=True).start()
@@ -778,6 +782,25 @@ class _SocketService:
                 pass
         self.eof.set()
 
+    def _stall(self, connection: _socket.socket) -> None:
+        with connection:
+            stream = connection.makefile("rb")
+            for request_id in (1, 2):  # initialize, then (after the notification) tools/list
+                while json.loads(stream.readline()).get("id") != request_id:
+                    pass
+                result: dict[str, Any] = (
+                    {"protocolVersion": "2025-06-18", "serverInfo": {"name": "gntik-ui"}}
+                    if request_id == 1
+                    else {"tools": [{"name": "get_rules"}]}
+                )
+                reply = {"jsonrpc": "2.0", "id": request_id, "result": result}
+                connection.sendall(json.dumps(reply).encode() + b"\n")
+            self.release.wait(60)  # a peer that does not read: the client's output stays buffered
+            with contextlib.suppress(OSError):
+                while connection.recv(1 << 20):
+                    pass
+        self.eof.set()
+
     def _oversize(self, connection: _socket.socket) -> None:
         with connection:
             connection.recv(65536)
@@ -788,6 +811,7 @@ class _SocketService:
         self.eof.set()
 
     def stop(self) -> None:
+        self.release.set()
         self.listener.close()
         for process in self.processes:
             with contextlib.suppress(ProcessLookupError):
@@ -1122,3 +1146,50 @@ def test_cli_docker_flag_forces_the_local_launch(
     result = _ui_kit_snapshot_command(arguments)
     assert result["status"] == "UI_KIT_SNAPSHOT_PASS" and result["transport"] == "docker"
     assert seen == [(IMAGE, DIGEST)]
+
+
+def _fill_send_buffer(client: GntikUiSocketClient) -> None:
+    """Queue far more than the kernel buffers hold: the peer reads none of it."""
+    assert client._writer is not None
+    client._writer.write(b"x" * (32 << 20))
+    assert client._writer.transport.get_write_buffer_size() > 0
+
+
+async def test_a_close_timeout_aborts_and_closes_the_descriptor(tmp_path: Path) -> None:
+    with _service(tmp_path, "stall") as (service, path):
+        client = _socket_client(path, shutdown_seconds=0.5)
+        async with client:
+            _fill_send_buffer(client)
+            writer = client._writer
+            assert writer is not None
+        # The graceful close could not flush: the transport was aborted, the fd is closed.
+        assert client.connection_closed is True
+        assert writer.get_extra_info("socket").fileno() == -1
+        service.release.set()
+        assert await asyncio.to_thread(service.eof.wait, 10)  # the service sees EOF
+
+
+async def test_cancellation_during_a_graceful_close_aborts_the_connection(
+    tmp_path: Path,
+) -> None:
+    with _service(tmp_path, "stall") as (service, path):
+        client = _socket_client(path, shutdown_seconds=60)  # the graceful wait would block
+
+        async def session() -> None:
+            async with client:
+                _fill_send_buffer(client)
+
+        task = asyncio.create_task(session())
+        for _ in range(500):
+            if client._writer is not None and client._writer.transport.is_closing():
+                break
+            await asyncio.sleep(0.01)
+        assert client._writer is not None and client._writer.transport.is_closing()
+        writer = client._writer
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10)
+        assert client.connection_closed is True
+        assert writer.get_extra_info("socket").fileno() == -1
+        service.release.set()
+        assert await asyncio.to_thread(service.eof.wait, 10)

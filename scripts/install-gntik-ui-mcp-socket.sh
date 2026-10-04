@@ -31,10 +31,18 @@ readonly UNIT_DIR=/etc/systemd/system
 readonly TMPFILES_CONF=/etc/tmpfiles.d/gntik-ui-mcp.conf
 readonly STATE_DIR=/var/lib/gntik-ui-mcp
 readonly DOCKER_CONFIG_DIR=/var/lib/gntik-ui-mcp/docker-config
-readonly DOCKER=/usr/bin/docker
+readonly DOCKER_HOST_SOCKET=unix:///var/run/docker.sock
+# The service outlives the client's whole session: ui_kit DEFAULT_DEADLINE_SECONDS (180)
+# plus its shutdown allowance (10) plus a margin (tests/test_install_gntik_ui_mcp_socket.py).
+readonly SERVICE_RUNTIME_MAX_SEC=210
 readonly SCAN_WORKER_UNIT=engineering-worker@scan.service
 readonly IMAGE_RE='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9][a-z0-9._-]*)+$'
 readonly DIGEST_RE='^sha256:[a-f0-9]{64}$'
+# Not readonly only so the tests can source this file and substitute an unprivileged owner
+# and a fake CLI; nothing reads them from the environment.
+DOCKER=/usr/bin/docker
+ROOT_UID=0
+ROOT_GID=0
 
 usage() {
   sed -n '13,18p' "$0" | sed 's/^# \{0,1\}//'
@@ -50,16 +58,7 @@ MANIFEST=""
 IMAGE_ARG=""
 DRY_RUN=0
 UNINSTALL=0
-while (($#)); do
-  case "$1" in
-    --manifest) MANIFEST=${2:?--manifest needs a file}; shift 2 ;;
-    --image) IMAGE_ARG=${2:?--image needs a reference}; shift 2 ;;
-    --dry-run) DRY_RUN=1; shift ;;
-    --uninstall) UNINSTALL=1; shift ;;
-    -h | --help) usage ;;
-    *) die "unknown argument: $1" ;;
-  esac
-done
+REFERENCE=""
 
 # -- the pinned image reference ----------------------------------------------------------
 
@@ -145,10 +144,10 @@ StandardOutput=socket
 StandardError=journal
 # An empty, root-owned config directory and the explicit local daemon: no user context,
 # credential helper or DOCKER_HOST can redirect the CLI.
-Environment=DOCKER_CONFIG=${DOCKER_CONFIG_DIR} DOCKER_CONTEXT=default DOCKER_HOST=unix:///var/run/docker.sock
+Environment=DOCKER_CONFIG=${DOCKER_CONFIG_DIR} DOCKER_CONTEXT=default DOCKER_HOST=${DOCKER_HOST_SOCKET}
 ExecStart=${DOCKER} run -i --rm --name gntik-ui-mcp-%i --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 512m --pids-limit 256 ${REFERENCE} --stdio
 ExecStopPost=-${DOCKER} rm -f gntik-ui-mcp-%i
-RuntimeMaxSec=120
+RuntimeMaxSec=${SERVICE_RUNTIME_MAX_SEC}
 TimeoutStopSec=15
 # Hardening of the Docker CLI process (root, no capabilities: it owns no privilege beyond
 # connecting to the root-owned /var/run/docker.sock, a filesystem AF_UNIX socket).
@@ -235,19 +234,70 @@ PY
 
 CHANGED=()
 
-install_file() {
-  # install_file <path> <mode> <content>: atomic, only when the content changes.
-  local path=$1 mode=$2 content=$3 temporary
-  if [[ -f "$path" ]] && cmp -s <(printf '%s\n' "$content") "$path"; then
-    chmod "$mode" "$path"
-    return 0
+verify_root_directory() {
+  # verify_root_directory <path>: a real directory (stat never follows a symlink) owned by
+  # root that neither group nor others can write, so no one else can swap its entries.
+  local owner mode kind
+  read -r owner mode kind < <(stat -c '%u %a %F' -- "$1") || die "cannot stat $1"
+  [[ "$owner" == "$ROOT_UID" && "$kind" == directory ]] || die "$1 is not a root-owned directory"
+  ((!(8#$mode & 8#022))) || die "$1 is writable by group or others"
+}
+
+verify_root_path() {
+  # verify_root_path <path> <mode> <type>: exactly root:root, <mode>, <type>; no symlink.
+  local path=$1 expected actual
+  expected="$ROOT_UID:$ROOT_GID ${2#0} $3"
+  actual=$(stat -c '%u:%g %a %F' -- "$path") || die "cannot stat $path"
+  [[ "$actual" == "$expected" ]] || die "$path is $actual, expected $expected"
+}
+
+ensure_root_dir() {
+  # ensure_root_dir <path> <mode>: a symlink or non-directory at <path> is removed (never
+  # followed) and a root-owned directory is (re)created; ownership and mode are repaired.
+  local path=$1 mode=$2
+  verify_root_directory "$(dirname -- "$path")"
+  if [[ -L "$path" || (-e "$path" && ! -d "$path") ]]; then
+    rm -f -- "$path"
   fi
-  temporary=$(mktemp "${path}.XXXXXX")
+  [[ -d "$path" ]] || mkdir -m "$mode" -- "$path"
+  chown -h "$ROOT_UID:$ROOT_GID" -- "$path"
+  [[ ! -L "$path" ]] || die "$path became a symlink"
+  chmod "$mode" -- "$path"
+  verify_root_path "$path" "$mode" directory
+}
+
+install_file() {
+  # install_file <path> <mode> <content>: ALWAYS rewritten as root:root <mode> through a
+  # root-owned temporary file in the same root-owned directory, renamed over the target
+  # with mv -T: rename(2) replaces a symlink or a foreign-owned file, never follows it.
+  local path=$1 mode=$2 content=$3 temporary same=0
+  verify_root_directory "$(dirname -- "$path")"
+  if [[ -f "$path" && ! -L "$path" ]] && cmp -s <(printf '%s\n' "$content") "$path"; then
+    same=1
+  fi
+  temporary=$(mktemp -- "${path}.XXXXXX")
   printf '%s\n' "$content" >"$temporary"
-  chown root:root "$temporary"
-  chmod "$mode" "$temporary"
-  mv -f "$temporary" "$path"
-  CHANGED+=("$path")
+  chown "$ROOT_UID:$ROOT_GID" -- "$temporary"
+  chmod "$mode" -- "$temporary"
+  mv -fT -- "$temporary" "$path"
+  verify_root_path "$path" "$mode" "regular file"
+  ((same)) || CHANGED+=("$path")
+}
+
+docker_service() {
+  # The service's exact Docker environment: none of the operator's context, config,
+  # DOCKER_HOST or credential helpers can point these commands at another daemon.
+  env -i PATH=/usr/bin:/bin DOCKER_CONFIG="$DOCKER_CONFIG_DIR" DOCKER_CONTEXT=default \
+    DOCKER_HOST="$DOCKER_HOST_SOCKET" "$DOCKER" "$@"
+}
+
+pull_image() {
+  # Pre-pull by digest, then prove the local daemon holds exactly that digest.
+  local digests
+  docker_service pull --quiet "$REFERENCE" >/dev/null || die "pulling $REFERENCE failed"
+  digests=$(docker_service image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+    "$REFERENCE") || die "$REFERENCE is not present on the local daemon"
+  grep -Fqx -- "$REFERENCE" <<<"$digests" || die "the local image does not carry $REFERENCE"
 }
 
 uninstall() {
@@ -265,6 +315,17 @@ uninstall() {
 
 # -- main --------------------------------------------------------------------------------
 
+main() {
+while (($#)); do
+  case "$1" in
+    --manifest) MANIFEST=${2:?--manifest needs a file}; shift 2 ;;
+    --image) IMAGE_ARG=${2:?--image needs a reference}; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --uninstall) UNINSTALL=1; shift ;;
+    -h | --help) usage ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
 if ((UNINSTALL)); then
   ((DRY_RUN)) && die "--dry-run and --uninstall are exclusive"
   [[ $EUID -eq 0 ]] || die "run as root (sudo)"
@@ -291,23 +352,29 @@ fi
 getent group "$SOCKET_GROUP" >/dev/null || die "group $SOCKET_GROUP does not exist"
 getent passwd "$SOCKET_GROUP" >/dev/null || die "user $SOCKET_GROUP does not exist"
 [[ -x "$DOCKER" ]] || die "$DOCKER is missing"
-[[ "$(stat -c %u "$DOCKER")" == 0 ]] || die "$DOCKER is not root-owned"
+verify_root_path "$DOCKER" 0755 "regular file"
 systemctl is-active --quiet docker.service || die "docker.service is not active"
 
-printf '==> pre-pulling %s\n' "$REFERENCE"
-"$DOCKER" pull --quiet "$REFERENCE" >/dev/null
-"$DOCKER" image inspect --format '{{.Id}}' "$REFERENCE" >/dev/null
-
-install -d -o root -g root -m 0700 "$STATE_DIR" "$DOCKER_CONFIG_DIR"
+ensure_root_dir "$STATE_DIR" 0700
+ensure_root_dir "$DOCKER_CONFIG_DIR" 0700
 if [[ -n "$(ls -A "$DOCKER_CONFIG_DIR")" ]]; then
   die "$DOCKER_CONFIG_DIR must stay empty (found: $(ls -A "$DOCKER_CONFIG_DIR" | tr '\n' ' '))"
 fi
+
+printf '==> pre-pulling %s with the service Docker environment\n' "$REFERENCE"
+pull_image
 
 WAS_ACTIVE=0
 systemctl is-active --quiet "$SOCKET_UNIT" && WAS_ACTIVE=1
 install_file "$TMPFILES_CONF" 0644 "$TMPFILES_CONTENT"
 install_file "$UNIT_DIR/$SERVICE_UNIT" 0644 "$SERVICE_CONTENT"
 install_file "$UNIT_DIR/$SOCKET_UNIT" 0644 "$SOCKET_CONTENT"
+# Reload only once every generated path is verified root:root and not g/o-writable.
+for generated in "$TMPFILES_CONF" "$UNIT_DIR/$SERVICE_UNIT" "$UNIT_DIR/$SOCKET_UNIT"; do
+  verify_root_path "$generated" 0644 "regular file"
+done
+verify_root_path "$STATE_DIR" 0700 directory
+verify_root_path "$DOCKER_CONFIG_DIR" 0700 directory
 systemd-tmpfiles --create "$TMPFILES_CONF"
 systemctl daemon-reload
 systemctl enable --now "$SOCKET_UNIT"
@@ -356,3 +423,8 @@ gntik-ui MCP socket installed (NEW-129)
   smoke (worker):  $WORKER_SMOKE
   worker drop-in:  none needed ($SCAN_WORKER_UNIT connects through its read-only /run)
 EOF
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
