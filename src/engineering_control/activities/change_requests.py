@@ -260,6 +260,14 @@ class ChangeRequestActivityHandler:
                 "Previous proposal, for reference:\n"
                 + _fenced("previous proposal", json.dumps(previous, sort_keys=True))
             )
+        continued = payload.get("ui_continued")
+        if isinstance(continued, list) and continued:
+            sections.append(
+                "Continued requirements: these lists belong to this change request and are "
+                "kept verbatim in its issue body. The proposal must stay consistent with every "
+                "entry; never contradict or silently drop one.\n"
+                + _fenced("continued requirements", json.dumps(continued, sort_keys=True))
+            )
         rounds = payload.get("review_rounds")
         if attempt == 2 and isinstance(rounds, list) and rounds:
             sections.append(
@@ -333,6 +341,17 @@ class ChangeRequestActivityHandler:
                     _fenced(
                         "proposal",
                         json.dumps(proposal.model_dump(mode="json"), sort_keys=True),
+                    ),
+                    *(
+                        (
+                            _fenced(
+                                "continued requirements (part of the proposal, published "
+                                "verbatim in the issue body: review them too)",
+                                json.dumps(payload["ui_continued"], sort_keys=True),
+                            ),
+                        )
+                        if isinstance(payload.get("ui_continued"), list) and payload["ui_continued"]
+                        else ()
                     ),
                 )
             ),

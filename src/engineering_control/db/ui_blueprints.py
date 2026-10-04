@@ -229,7 +229,13 @@ class UiBlueprintRepository:
             if row.status != "DRAFTING":
                 raise ValueError("ui blueprint is no longer drafting")
             drafts = list(row.drafts_json or [])
-            if any(entry.get("attempt") == draft_attempts for entry in drafts):
+            existing = [entry for entry in drafts if entry.get("attempt") == draft_attempts]
+            if existing:
+                # NEW-123 review 2: an activity retry after a committed write (Temporal lost
+                # the completion) replays the identical draft: accept it unchanged. Changed
+                # content for an existing version is still refused.
+                if existing[0].get("blueprint_sha256") == digest:
+                    return digest
                 raise ValueError("ui blueprint draft versions are immutable")
             drafts.append(
                 {
@@ -381,7 +387,11 @@ class UiBlueprintRepository:
             if row.status != "APPROVED":
                 raise ValueError("only an APPROVED ui blueprint fans out")
             if row.active_fanout_workflow_id:
-                return {"action": "JOIN", "workflow_id": row.active_fanout_workflow_id}
+                return {
+                    "action": "JOIN",
+                    "workflow_id": row.active_fanout_workflow_id,
+                    "claimed_at": row.fanout_claimed_at,
+                }
             seen = int(row.fanout_sequence or 0)
         workflow_id = ui_fanout_workflow_id(str(blueprint_id), seen + 1)
         with self.sessions.begin() as session:
@@ -395,7 +405,11 @@ class UiBlueprintRepository:
                         UiBlueprint.active_fanout_workflow_id.is_(None),
                         UiBlueprint.fanout_sequence == seen,
                     )
-                    .values(active_fanout_workflow_id=workflow_id, fanout_sequence=seen + 1)
+                    .values(
+                        active_fanout_workflow_id=workflow_id,
+                        fanout_sequence=seen + 1,
+                        fanout_claimed_at=datetime.now(UTC),
+                    )
                     .execution_options(synchronize_session=False)
                 ),
             ).rowcount
@@ -404,9 +418,10 @@ class UiBlueprintRepository:
         with self.sessions() as session:
             row = session.get(UiBlueprint, blueprint_id)
             active = row.active_fanout_workflow_id if row is not None else None
+            claimed_at = row.fanout_claimed_at if row is not None else None
         if not active:
             raise ValueError("ui fan-out claim raced; repeat the approval")
-        return {"action": "JOIN", "workflow_id": active}
+        return {"action": "JOIN", "workflow_id": active, "claimed_at": claimed_at}
 
     async def release_fanout(self, blueprint_id: UUID, workflow_id: str) -> bool:
         return await asyncio.to_thread(self.release_fanout_sync, blueprint_id, workflow_id)
@@ -422,7 +437,7 @@ class UiBlueprintRepository:
                         UiBlueprint.id == blueprint_id,
                         UiBlueprint.active_fanout_workflow_id == workflow_id,
                     )
-                    .values(active_fanout_workflow_id=None)
+                    .values(active_fanout_workflow_id=None, fanout_claimed_at=None)
                     .execution_options(synchronize_session=False)
                 ),
             ).rowcount

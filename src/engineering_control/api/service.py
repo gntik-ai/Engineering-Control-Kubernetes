@@ -137,6 +137,7 @@ class ControlService(Protocol):
         self, blueprint_id: UUID, max_items: int, workflow_id: str
     ) -> OperationAccepted: ...
     async def running_ui_fanout(self, workflow_id: str) -> OperationAccepted | None: ...
+    async def ui_fanout_known(self, workflow_id: str) -> bool: ...
 
 
 class TemporalControlService:
@@ -880,6 +881,16 @@ class TemporalControlService:
         if description.status != WorkflowExecutionStatus.RUNNING:
             return None
         return OperationAccepted(workflow_id=workflow_id, run_id=description.run_id)
+
+    async def ui_fanout_known(self, workflow_id: str) -> bool:
+        """Whether Temporal has any execution under `workflow_id` (running or closed)."""
+        try:
+            await self.client.get_workflow_handle(workflow_id).describe()
+        except RPCError as error:
+            if error.status is RPCStatusCode.NOT_FOUND:
+                return False
+            raise
+        return True
 
     async def _start_once(
         self, workflow: str, argument: Any, workflow_id: str

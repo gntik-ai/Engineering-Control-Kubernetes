@@ -50,6 +50,7 @@ _COLUMNS = {
     "fanout_json",
     "fanout_sequence",
     "active_fanout_workflow_id",
+    "fanout_claimed_at",
     "created_at",
     "updated_at",
 }
@@ -112,6 +113,7 @@ def upgrade() -> None:
         sa.Column("fanout_json", sa.JSON(), nullable=False),
         sa.Column("fanout_sequence", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("active_fanout_workflow_id", sa.String(240), nullable=True),
+        sa.Column("fanout_claimed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(

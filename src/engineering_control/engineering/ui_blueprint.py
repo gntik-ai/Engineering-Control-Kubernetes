@@ -21,6 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
 from jsonschema import Draft202012Validator
+from pydantic import ValidationError
 
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.change_requests import (
@@ -734,16 +735,45 @@ def render_item(item: FanoutItem) -> tuple[dict[str, Any], tuple[UiContinuedSect
         ):
             proposal[field_name] = entries
             continue
+        # NEW-123 review 2: an entry that joins many requirements can exceed one continued
+        # entry; split it into ordered parts (never cut), and turn any bound violation
+        # into a typed verdict the fan-out records, never an uncaught error.
+        parts = [part for entry in entries for part in _split_entry(entry)]
         proposal[field_name] = [
             f"All {len(entries)} entries are listed under UI migration: {field_name} "
             "(continued) below."
         ]
-        continued.append(UiContinuedSection(field=field_name, entries=tuple(entries)))  # type: ignore[arg-type]
+        try:
+            continued.append(UiContinuedSection(field=field_name, entries=tuple(parts)))  # type: ignore[arg-type]
+        except ValidationError as error:
+            raise BlueprintRejected("ITEM_RENDER_TOO_LARGE", [field_name]) from error
     for field_name, limit in _SCALAR_LIMITS.items():
         proposal[field_name] = _entry(proposal[field_name])
         if len(proposal[field_name]) > limit:
             raise BlueprintRejected("ITEM_RENDER_TOO_LARGE", [field_name])
     return proposal, tuple(continued)
+
+
+_CONTINUED_MAX_ENTRY = 19_000
+
+
+def _split_entry(entry: str) -> list[str]:
+    """One requirement entry in ordered parts no longer than a continued entry allows."""
+    if len(entry) <= _CONTINUED_MAX_ENTRY:
+        return [entry]
+    chunks: list[str] = []
+    remaining = entry
+    while remaining:
+        cut = len(remaining)
+        if cut > _CONTINUED_MAX_ENTRY:
+            cut = remaining.rfind("; ", 0, _CONTINUED_MAX_ENTRY)
+            cut = cut + 1 if cut > 0 else remaining.rfind(", ", 0, _CONTINUED_MAX_ENTRY) + 1
+            if cut <= 0:
+                cut = _CONTINUED_MAX_ENTRY
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    total = len(chunks)
+    return [f"(part {index} of {total}) {chunk}" for index, chunk in enumerate(chunks, 1)]
 
 
 def _item_lists(item: FanoutItem) -> dict[str, Any]:

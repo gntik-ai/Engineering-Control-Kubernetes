@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -92,6 +92,13 @@ from engineering_control.operations.recurring_reconciliation import RecurringRun
 from engineering_control.operations.repository import OperationsRepository
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
+
+# NEW-123 review 2: how long a claimed but not yet started fan-out counts as starting.
+UI_FANOUT_START_GRACE = timedelta(minutes=5)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def create_app(
@@ -1409,6 +1416,17 @@ def create_app(
             running = await service.running_ui_fanout(str(claim["workflow_id"]))
             if running is not None:
                 return running, True
+            # NEW-123 review 2: a marker whose workflow Temporal does not know yet is a
+            # start in progress (another approval won the claim and is starting it), not
+            # an ended fan-out: join it during a grace period; only a stale claim (a
+            # start that crashed) is released.
+            claimed_at = claim.get("claimed_at")
+            if (
+                isinstance(claimed_at, datetime)
+                and datetime.now(UTC) - _as_utc(claimed_at) < UI_FANOUT_START_GRACE
+                and not await service.ui_fanout_known(str(claim["workflow_id"]))
+            ):
+                return OperationAccepted(workflow_id=str(claim["workflow_id"]), run_id=""), True
             await repository.release_fanout(blueprint_id, str(claim["workflow_id"]))
         raise RuntimeError("ui fan-out claim did not settle")
 

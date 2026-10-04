@@ -322,6 +322,8 @@ def test_draft_versions_are_immutable_and_only_the_reviewed_one_persists(engine:
         },
     )
     first = repository.record_draft_sync(blueprint_id, 1, blueprint(), [])
+    # An activity retry after a committed write replays the identical draft: accepted.
+    assert repository.record_draft_sync(blueprint_id, 1, blueprint(), []) == first
     changed = blueprint()
     changed["pages"][0]["wave"] = "u3"
     with pytest.raises(ValueError, match="immutable"):
@@ -669,3 +671,83 @@ def test_fanned_out_items_are_idempotent_rows_published_with_their_labels(engine
     assert repository.item_states_sync([identity]) == {
         str(identity): {"status": "PUBLISHED", "revision": 1}
     }
+
+
+def test_long_joined_requirements_are_split_into_parts_never_cut() -> None:
+    # NEW-123 review 2: 45 long validation rules join into one entry over 20,000 chars.
+    value = blueprint()
+    value["pages"][0]["behaviour"]["validations"] = [
+        {"field": f"field_{n:02d}", "rule": _words(f"Rule {n:02d}", 590)} for n in range(45)
+    ]
+    item = next(i for i in fanout_items(value) if i.key == "page:tenants")
+    proposal, continued = render_item(item)
+    joined = [entry for section in continued for entry in section.entries if "(part " in entry]
+    assert joined and all(len(entry) <= 20_000 for entry in joined)
+    text = " ".join(section_entry for s in continued for section_entry in s.entries)
+    for rule in value["pages"][0]["behaviour"]["validations"]:
+        assert rule["rule"][:200] in text
+
+
+def test_too_many_continued_parts_is_a_typed_blocker_not_an_error() -> None:
+    from engineering_control.engineering import ui_blueprint as module
+
+    item = next(i for i in fanout_items(blueprint()) if i.key == "epic:u0-scaffold")
+    original = module._split_entry
+    try:
+        module._split_entry = lambda entry: [entry] * 400  # type: ignore[assignment]
+        with pytest.raises(BlueprintRejected, match="ITEM_RENDER_TOO_LARGE"):
+            item.spec["scope"] = [_words(f"Scope {n:02d}", 600) for n in range(20)]
+            render_item(item)
+    finally:
+        module._split_entry = original  # type: ignore[assignment]
+
+
+def test_revisions_draft_and_review_the_continued_requirements(engine: Any) -> None:
+    from unittest.mock import Mock
+
+    from engineering_control.activities.change_requests import ChangeRequestActivityHandler
+    from engineering_control.config import Settings
+
+    repository = ChangeRequestRepository(engine=engine)
+    value = blueprint()
+    value["foundation_epics"][0]["scope"] = [_words(f"Scope {n:02d}", 300) for n in range(16)]
+    item = next(i for i in fanout_items(value) if i.key == "epic:u0-scaffold")
+    _proposal, continued = render_item(item)
+    blueprint_sha = canonical_sha256(value)
+    identity = item_change_request_id(blueprint_sha, item.key)
+    context = item_context(
+        item,
+        blueprint_id="00000000-0000-4000-8000-000000000001",
+        blueprint_sha256=blueprint_sha,
+        continued=continued,
+    )
+    intake = prepare_intake(
+        "falcone",
+        item_description(item, blueprint_id="00000000-0000-4000-8000-000000000001"),
+        item.target_repository,
+    )
+    repository.create_ui_item_sync(identity, intake, "telegram:42", context)
+    loaded = repository.load_draft_sync(identity, 1)
+    assert loaded["ui_continued"] and loaded["ui_continued"][0]["field"] == "what_changes"
+    assert len(loaded["ui_continued"][0]["entries"]) == 16
+    handler = ChangeRequestActivityHandler(Settings(), repository=Mock())
+    proposal = render_item_proposal(item)
+    base = {
+        "change_request_id": str(identity),
+        "revision": 2,
+        "project": "falcone",
+        "target_repository": item.target_repository,
+        "source_worktree": "/srv/wt/falcone/x",
+        "description_redacted": intake.description_redacted,
+        "proposal": proposal,
+        "review_rounds": [],
+        "ui_continued": loaded["ui_continued"],
+    }
+    redraft = handler._prepare_draft({**base, "draft_attempt": 1})
+    review = handler._prepare_review(
+        {**base, "draft_attempt": 1, "agent_result": {"structured_result": proposal}}
+    )
+    scope = value["foundation_epics"][0]["scope"][15]
+    assert scope in redraft["draft_request"]["prompt"]
+    assert "continued requirements" in redraft["draft_request"]["prompt"].lower()
+    assert scope in review["review_request"]["prompt"]

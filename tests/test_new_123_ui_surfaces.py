@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -14,7 +15,7 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 from new_123_fixtures import INVENTORY_SHA, KIT_SHA, KIT_VERSION, SOURCE_SHA, blueprint
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, update
 
 from engineering_control.activities.core import ControlActivities
 from engineering_control.activities.scan import ScanActivityHandler
@@ -25,6 +26,7 @@ from engineering_control.config import Settings
 from engineering_control.db import models  # noqa: F401
 from engineering_control.db.base import Base
 from engineering_control.db.change_requests import ChangeRequestRepository
+from engineering_control.db.models import UiBlueprint
 from engineering_control.db.ui_blueprints import UiBlueprintRepository
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.ui_blueprint import APPROVAL_PHRASE
@@ -276,6 +278,7 @@ def api(tmp_path: Path) -> tuple[TestClient, Mock, UiBlueprintRepository]:
         )
     )
     fake.running_ui_fanout = AsyncMock(return_value=None)
+    fake.ui_fanout_known = AsyncMock(return_value=True)
     app = create_app(
         settings=Settings(),
         service=fake,
@@ -386,6 +389,40 @@ def test_api_approval_is_bound_and_starts_the_capped_fanout(api: Any) -> None:
         assert fake.start_ui_fanout.await_count == 2
         view = repository.get_sync(blueprint_id)
         assert view is not None and view["fanout_workflow_id"] == resumed["workflow_id"]
+
+
+def test_a_claimed_fanout_temporal_does_not_know_yet_is_joined_not_replaced(api: Any) -> None:
+    # NEW-123 review 2: while the winner is still starting its fan-out, another approval
+    # sees NOT_FOUND; it must join (pending) rather than release the marker and start 2.
+    client, fake, repository = api
+    blueprint_id, binding = candidate(repository)
+    first = f"ui-blueprint-fanout-{blueprint_id}-1"
+
+    def approve() -> dict[str, Any]:
+        response = client.post(
+            f"/v1/ui-blueprints/{blueprint_id}/approve",
+            json={"approval_binding": binding, "typed_confirmation": APPROVAL_PHRASE},
+            headers=CLI,
+        )
+        assert response.status_code == 200
+        return dict(response.json()["fanout"])
+
+    with client:
+        assert approve()["workflow_id"] == first  # the claim, and its start
+        fake.running_ui_fanout.return_value = None
+        fake.ui_fanout_known.return_value = False  # Temporal does not know it (yet)
+        pending = approve()
+        assert (pending["workflow_id"], pending["joined"], pending["run_id"]) == (first, True, "")
+        assert fake.start_ui_fanout.await_count == 1
+        # A claim older than the grace period is a crashed start: released and restarted.
+        with repository.sessions.begin() as session:
+            session.execute(
+                update(UiBlueprint)
+                .where(UiBlueprint.id == blueprint_id)
+                .values(fanout_claimed_at=datetime.now(UTC) - timedelta(minutes=10))
+            )
+        assert approve()["workflow_id"] == f"ui-blueprint-fanout-{blueprint_id}-2"
+        assert fake.start_ui_fanout.await_count == 2
 
 
 def test_a_single_fanout_claim_wins_under_concurrent_approvals(tmp_path: Path) -> None:

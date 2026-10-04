@@ -366,6 +366,9 @@ class ChangeRequestRepository:
                 "description_redacted": row.description_redacted,
                 "revision_note": row.revision_note,
                 "previous_proposal": row.proposal_json if row.revision > 1 else None,
+                # NEW-123 review 2: the continued sections are part of a UI item's proposal
+                # (retained verbatim in its issue body), so revisions draft and review them.
+                "ui_continued": _ui_continued(row.ui_context_json),
             }
 
     def persist_candidate_sync(
@@ -582,3 +585,14 @@ class ChangeRequestRepository:
             "workflow_id": change_request_workflow_id(str(row.id), row.revision),
             "ui_context": row.ui_context_json or None,
         }
+
+
+def _ui_continued(context: Any) -> list[dict[str, Any]]:
+    if not isinstance(context, dict):
+        return []
+    sections = context.get("continued")
+    return (
+        [dict(section) for section in sections if isinstance(section, dict)]
+        if isinstance(sections, list)
+        else []
+    )

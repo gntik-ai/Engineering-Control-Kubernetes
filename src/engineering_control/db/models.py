@@ -523,6 +523,9 @@ class UiBlueprint(UUIDPrimaryKey, Timestamps, Base):
     active_fanout_workflow_id: Mapped[str | None] = mapped_column(
         String(240), unique=True, index=True
     )
+    # When the active marker was claimed: a marker whose workflow Temporal does not know
+    # yet is a start in progress for a grace period, not an ended fan-out.
+    fanout_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint(
             "status IN ('DRAFTING', 'BLOCKED', 'FAILED', 'CANDIDATE', 'APPROVED', 'SUPERSEDED')",
