@@ -16,7 +16,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 import structlog
-from sqlalchemy import and_, create_engine, desc, func, or_, select
+from sqlalchemy import and_, create_engine, desc, or_, select
 from sqlalchemy.orm import Session
 
 from engineering_control.config import Settings, get_settings
@@ -31,6 +31,8 @@ from engineering_control.delivery_notifications import (
     LOOP_STATE_TOPIC,
     MILESTONE_TOPIC,
     WRITE_POLICY_TOPIC,
+    bounded_code,
+    parse_issue,
 )
 from engineering_control.logging import configure_logging
 from engineering_control.notifier import NotificationSink
@@ -62,9 +64,12 @@ LOOP_PROGRESS_LIMIT = timedelta(minutes=45)
 # sync within its own 12 h execution bound; a write-approval wait re-checks every 5 min.
 LOOP_STAGING_WAIT_BOUND = timedelta(hours=12)
 LOOP_APPROVAL_WAIT_BOUND = timedelta(hours=24)
+# Loop-state notices older than this are not read (they only name issue and blocker).
 LOOP_HORIZON = timedelta(days=7)
-LOOP_LIMIT = 50
+LOOP_PAGE = 50
+LOOP_LIMIT = 500
 LOOP_REALERT_SECONDS = 3600
+LOOP_LIVE_STATUSES = frozenset({"RUNNING", "PAUSED", "BLOCKED", "QUEUED"})
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,12 @@ class ProbeResult:
 
 
 ProbeProvider = Callable[[], list[ProbeResult]]
+
+
+def _like_prefix(prefix: str) -> str:
+    """A LIKE pattern matching ``prefix`` literally (escape character: backslash)."""
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
 
 
 def _utc(value: datetime) -> datetime:
@@ -488,19 +499,28 @@ class OperationalWatchdog:
         """NEW-127: a running backlog loop paused >15 min or without progress >45 min."""
         try:
             with Session(self.engine) as session:
-                loops = list(
-                    session.scalars(
-                        select(Run)
-                        .where(
-                            Run.run_type == "existing-backlog-loop",
-                            Run.finished_at.is_(None),
-                            Run.status.in_(("RUNNING", "PAUSED", "BLOCKED")),
-                            Run.updated_at >= now - LOOP_HORIZON,
-                        )
-                        .order_by(desc(Run.updated_at))
-                        .limit(LOOP_LIMIT)
-                    ).all()
-                )
+                # Page through every unfinished loop, most stale first, so no bound on
+                # the number of rows can hide the loop that most needs attention.
+                loops: list[Run] = []
+                while len(loops) < LOOP_LIMIT:
+                    page = list(
+                        session.scalars(
+                            select(Run)
+                            .where(
+                                Run.run_type == "existing-backlog-loop",
+                                Run.finished_at.is_(None),
+                                Run.status.in_(("RUNNING", "PAUSED", "BLOCKED")),
+                            )
+                            .order_by(Run.updated_at, Run.id)
+                            .offset(len(loops))
+                            .limit(LOOP_PAGE)
+                        ).all()
+                    )
+                    loops.extend(page)
+                    if len(page) < LOOP_PAGE:
+                        break
+                truncated = len(loops) >= LOOP_LIMIT
+                loops = loops[:LOOP_LIMIT]
                 notices = list(
                     session.scalars(
                         select(NotificationOutbox)
@@ -517,20 +537,31 @@ class OperationalWatchdog:
                 activity: dict[str, tuple[list[Run], datetime | None]] = {}
                 for loop in loops:
                     prefix = f"{loop.workflow_id}-"
+                    pattern = _like_prefix(prefix)
+                    # LIKE narrows; the literal prefix check decides (ids may hold _ or %).
                     children = [
                         child
                         for child in session.scalars(
-                            select(Run).where(Run.workflow_id.like(f"{prefix}%")).limit(500)
+                            select(Run).where(Run.workflow_id.like(pattern, escape="\\")).limit(500)
                         ).all()
                         if child.workflow_id.startswith(prefix)
                     ]
-                    updated, heartbeat = session.execute(
-                        select(
-                            func.max(AgentExecution.updated_at),
-                            func.max(AgentExecution.last_heartbeat_at),
-                        ).where(AgentExecution.workflow_id.like(f"{prefix}%"))
-                    ).one()
-                    agent_times = [_utc(value) for value in (updated, heartbeat) if value]
+                    agent_times = [
+                        _utc(value)
+                        for workflow_id, updated, heartbeat in session.execute(
+                            select(
+                                AgentExecution.workflow_id,
+                                AgentExecution.updated_at,
+                                AgentExecution.last_heartbeat_at,
+                            )
+                            .where(AgentExecution.workflow_id.like(pattern, escape="\\"))
+                            .order_by(desc(AgentExecution.updated_at))
+                            .limit(200)
+                        ).all()
+                        if workflow_id.startswith(prefix)
+                        for value in (updated, heartbeat)
+                        if value is not None
+                    ]
                     activity[loop.workflow_id] = (
                         children,
                         max(agent_times) if agent_times else None,
@@ -544,9 +575,11 @@ class OperationalWatchdog:
         results = [
             ProbeResult(
                 LOOP_PROBE,
-                True,
-                "READABLE",
-                f"{len(loops)} running backlog loop(s) checked for progress",
+                not truncated,
+                "LOOP_LIMIT_EXCEEDED" if truncated else "READABLE",
+                f"more than {LOOP_LIMIT} unfinished backlog loops; the most stale are checked"
+                if truncated
+                else f"{len(loops)} running backlog loop(s) checked for progress",
             )
         ]
         for loop in loops:
@@ -574,14 +607,17 @@ class OperationalWatchdog:
             (row for row in notices if row.topic == LOOP_STATE_TOPIC and owned(row)), None
         )
         state_value = state_row.payload_json if state_row is not None else {}
-        issue = str(state_value.get("issue") or "") or "unknown"
-        blocker = str(state_value.get("blocker") or "") or "none"
+        # Only validated shapes reach the alert text (no free text from any payload).
+        issue = str(state_value.get("issue") or "")
+        issue = issue if parse_issue(issue) else "unknown"
+        blocker = bounded_code(state_value.get("blocker")) or "none"
         if issue == "unknown":
             milestone = next(
                 (row for row in notices if row.topic == MILESTONE_TOPIC and owned(row)), None
             )
-            if milestone is not None and milestone.payload_json.get("issue"):
-                issue = str(milestone.payload_json["issue"])
+            candidate = str(milestone.payload_json.get("issue") or "") if milestone else ""
+            if parse_issue(candidate):
+                issue = candidate
         # Progress: the loop's own record, its child runs and their agents' heartbeats.
         child_times = [_utc(child.updated_at) for child in children]
         work_at = max([*child_times, *([agent_at] if agent_at else [])], default=None)
@@ -727,19 +763,43 @@ class OperationalWatchdog:
             except FileNotFoundError:
                 pass
 
-    @staticmethod
-    def _close_ended_loops(results: list[ProbeResult], previous: dict[str, Any]) -> None:
-        """NEW-127: a loop that stopped running recovers its alert, then leaves the state."""
-        readable = any(probe.key == LOOP_PROBE and probe.healthy for probe in results)
-        if not readable:
+    def _close_ended_loops(self, results: list[ProbeResult], previous: dict[str, Any]) -> None:
+        """NEW-127: recover a loop's alert only when its Run durably ended.
+
+        Absence from the probe is not proof: only a finished/terminal loop Run is. A loop
+        that is missing without that proof keeps its state (and its alert) untouched.
+        """
+        if not any(probe.key == LOOP_PROBE for probe in results):
             return
         present = {probe.key for probe in results}
-        for key in [key for key in previous if key.startswith(LOOP_PROBE_PREFIX)]:
-            if key in present:
+        missing = {
+            key.removeprefix(LOOP_PROBE_PREFIX): key
+            for key in previous
+            if key.startswith(LOOP_PROBE_PREFIX) and key not in present
+        }
+        if not missing:
+            return
+        try:
+            with Session(self.engine) as session:
+                runs = session.scalars(
+                    select(Run).where(
+                        Run.run_type == "existing-backlog-loop",
+                        Run.workflow_id.in_(list(missing)),
+                    )
+                ).all()
+        except Exception:  # noqa: BLE001 - unverifiable: keep the state unchanged
+            return
+        ended = {
+            run.workflow_id
+            for run in runs
+            if run.finished_at is not None or run.status not in LOOP_LIVE_STATUSES
+        }
+        for workflow_id, key in missing.items():
+            if workflow_id not in ended:
                 continue
             prior = previous[key]
             if isinstance(prior, dict) and (prior.get("active") or prior.get("pending_event")):
-                results.append(ProbeResult(key, True, "ENDED", "backlog loop is no longer running"))
+                results.append(ProbeResult(key, True, "ENDED", "backlog loop Run has ended"))
             else:
                 del previous[key]
 

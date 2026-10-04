@@ -2960,8 +2960,9 @@ class MetadataActivityHandler:
         blocker = str(payload.get("blocker") or status)
         blocker = blocker if re.fullmatch(r"[A-Z][A-Z0-9_:]{0,119}", blocker) else status
         details = [f"{status} {blocker} - {explain_blocker(blocker)}"]
-        if payload.get("last_step"):
-            details.append(f"at {str(payload['last_step'])[:80]}")
+        last_step = str(payload.get("last_step") or "")
+        if re.fullmatch(r"[a-z_]{1,40}\.[a-z_]{1,60}", last_step):
+            details.append(f"at {last_step}")
         failed = maker_failures(payload)
         if failed:
             details.append("maker FAIL: " + "; ".join(failed))

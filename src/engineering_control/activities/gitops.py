@@ -47,7 +47,11 @@ from engineering_control.adapters.github.client import (
 )
 from engineering_control.config import Settings
 from engineering_control.db import models as db
-from engineering_control.delivery_notifications import enqueue_milestone, explain_blocker
+from engineering_control.delivery_notifications import (
+    enqueue_milestone,
+    explain_blocker,
+    literal,
+)
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.enums import ChangeSetState
 from engineering_control.models.reconciliation import StagingFlowPolicy
@@ -69,6 +73,7 @@ GITOPS_CONTROLLER_STEPS = frozenset(
         "gitops.diagnose_sync",
         "gitops.remediate_sync",
         "gitops.notify_sync",
+        "gitops.notify_merged",
         "gitops.verify_workloads",
         "gitops.persist_result",
     }
@@ -580,6 +585,7 @@ class GitOpsControllerHandler:
             "gitops.diagnose_sync": self._diagnose_sync,
             "gitops.remediate_sync": self._remediate_sync,
             "gitops.notify_sync": self._notify_sync,
+            "gitops.notify_merged": self._notify_merged,
             "gitops.verify_workloads": self._verify_workloads,
             "gitops.persist_result": self._persist_result,
         }
@@ -846,6 +852,46 @@ class GitOpsControllerHandler:
                 self._notify_result(session, plan, record, outcome, workflow_id)
         return {"status": "PERSISTED", "outcome": outcome, "change_set_state": state}
 
+    def _notify_merged(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-127 review: announce a merge as soon as the merge step succeeded."""
+        plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
+        target = str(payload.get("target") or "")
+        merge_sha = str(payload.get("merge_sha") or "")
+        if target not in {"source", "deployment"} or not _SHA.fullmatch(merge_sha):
+            raise ValueError("merge notification target or SHA is invalid")
+        orchestration = payload.get("orchestration")
+        workflow_id = (
+            str(orchestration.get("workflow_id", "")) if isinstance(orchestration, dict) else ""
+        )
+        with self.sessions.begin() as session:
+            created = self._enqueue_merged(session, plan, target, merge_sha, workflow_id)
+        return {"status": "NOTIFIED" if created else "ALREADY_NOTIFIED", "target": target}
+
+    def _enqueue_merged(
+        self,
+        session: Any,
+        plan: StagingGitOpsPlan,
+        target: str,
+        merge_sha: str,
+        workflow_id: str,
+    ) -> bool:
+        """One PRS_MERGED per merged PR; persist_result reuses the key (no duplicate)."""
+        url = plan.source_pr_url if target == "source" else plan.deployment_pr_url
+        if not url:
+            return False
+        issue = f"{plan.issue_repository}#{plan.issue_number}" if plan.issue_number else None
+        return enqueue_milestone(
+            session,
+            event="PRS_MERGED",
+            dedupe_key=f"{plan.change_set_id}:{target}:{merge_sha}",
+            project=plan.project,
+            issue=issue,
+            workflow_id=workflow_id or None,
+            detail=f"{target} PR {url} merged at {merge_sha[:12]}",
+            extra={"target": target, "merge_sha": merge_sha, "pull_request": url},
+            redactor=self.redactor,
+        )
+
     def _notify_result(
         self,
         session: Any,
@@ -863,19 +909,12 @@ class GitOpsControllerHandler:
             "redactor": self.redactor,
         }
         merge_sha = record.get("merge_sha")
-        deployment_sha = record.get("deployment_merge_sha")
-        if merge_sha:
-            merged = [f"{plan.source_pr_url} at {str(merge_sha)[:12]}"]
-            if plan.deployment_pr_url and deployment_sha:
-                merged.append(f"{plan.deployment_pr_url} at {str(deployment_sha)[:12]}")
-            enqueue_milestone(
-                session,
-                event="PRS_MERGED",
-                dedupe_key=f"{plan.change_set_id}:{merge_sha}:{deployment_sha or ''}",
-                detail=" and ".join(merged),
-                extra={"merge_sha": merge_sha, "deployment_merge_sha": deployment_sha},
-                **common,
-            )
+        for target, sha in (
+            ("source", merge_sha),
+            ("deployment", record.get("deployment_merge_sha")),
+        ):
+            if sha:
+                self._enqueue_merged(session, plan, target, str(sha), workflow_id)
         if outcome == "STAGING_VERIFIED":
             enqueue_milestone(
                 session,
@@ -894,7 +933,7 @@ class GitOpsControllerHandler:
             )
         elif outcome == "BLOCKED":
             blocker = str(record.get("blocker") or "STAGING_GITOPS_FAILED")
-            checks = list(record.get("ci_regressions") or [])[:8]
+            checks = [literal(item, 120) for item in list(record.get("ci_regressions") or [])[:8]]
             enqueue_milestone(
                 session,
                 event="STAGING_BLOCKED",
@@ -903,7 +942,7 @@ class GitOpsControllerHandler:
                     f"{blocker} - {explain_blocker(blocker)}"
                     + (
                         f"; failing checks on the {record.get('ci_regression_target')} PR: "
-                        + ", ".join(str(check)[:120] for check in checks)
+                        + ", ".join(checks)
                         if checks
                         else ""
                     )

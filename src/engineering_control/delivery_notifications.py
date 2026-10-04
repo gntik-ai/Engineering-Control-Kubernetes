@@ -465,7 +465,23 @@ def attempt_label(child_workflow_id: str) -> str:
     return label
 
 
+def literal(value: Any, limit: int = 160) -> str:
+    """Untrusted text as one inline-code span (NEW-127 review).
+
+    The gateway renders the notification through Telegram's Markdown-to-MarkdownV2
+    converter, which keeps inline code verbatim: links, bold or italics inside it are
+    never formatted, and Telegram does not linkify URLs in code. A backtick (the only way
+    out of the span) and control characters are replaced first.
+    """
+    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in str(value))
+    text = " ".join(text.replace("`", "'").split())
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return f"`{text or '-'}`"
+
+
 def maker_failures(context: dict[str, Any]) -> list[str]:
+    """Failing maker test commands, each as a literal."""
     failed: list[str] = []
     for key in ("source_maker_result", "deployment_maker_result"):
         maker = context.get(key)
@@ -474,7 +490,7 @@ def maker_failures(context: dict[str, Any]) -> list[str]:
         if not isinstance(tests, list):
             continue
         failed.extend(
-            str(test.get("command", ""))[:160]
+            literal(test.get("command", ""))
             for test in tests
             if isinstance(test, dict) and test.get("status") == "FAIL"
         )
@@ -486,5 +502,63 @@ def checker_verdict(context: dict[str, Any]) -> str | None:
     structured = checker.get("structured_result") if isinstance(checker, dict) else None
     if not isinstance(structured, dict) or "decision" not in structured:
         return None
-    summary = " ".join(str(structured.get("summary") or "").split())[:300]
-    return f"{structured.get('decision')}" + (f" ({summary})" if summary else "")
+    decision = bounded_code(structured.get("decision")) or literal(structured.get("decision"), 40)
+    summary = str(structured.get("summary") or "").strip()
+    return decision + (f" {literal(summary, 300)}" if summary else "")
+
+
+def enqueue_blocked_start(
+    session: Session,
+    payload: dict[str, Any],
+    *,
+    workflow_id: str,
+    blocker: Any,
+    redactor: SecretRedactor | None = None,
+) -> bool:
+    """A loop refused at its initial selection (NEW-97 closed Run) is announced once."""
+    code = bounded_code(blocker) or "BLOCKED"
+    project = str(payload.get("project") or "")
+    project = project if project in _PROJECTS else ""
+    target_repository = payload.get("target_repository")
+    target_number = payload.get("target_issue_number")
+    issue = f"{target_repository}#{target_number}" if target_repository and target_number else ""
+    issue = issue if parse_issue(issue) else ""
+    campaign_id = str(payload.get("backlog_campaign_id") or "")
+    campaign_id = campaign_id if re.fullmatch(r"[0-9a-f-]{36}", campaign_id) else ""
+    commands = [
+        line
+        for line in loop_commands(
+            workflow_id=workflow_id,
+            project=project or None,
+            issue=issue or None,
+            state="PAUSED",
+            blocker=code,
+            campaign_id=campaign_id or None,
+        )
+        # The loop has ended: retry/skip signals cannot reach it.
+        if not line.startswith(("/loop retry", "/loop skip", f"{CTL} backlog-retry"))
+    ]
+    message = (
+        "Hermes backlog loop BLOCKED at start"
+        + (f" for {project}" if project else "")
+        + (f" {issue}" if issue else "")
+        + f" (loop {workflow_id}): {code} - {explain_blocker(code)}. The loop did not start;"
+        " resolve the cause and start it again."
+    )
+    return enqueue(
+        session,
+        topic=LOOP_STATE_TOPIC,
+        dedupe_key=f"{workflow_id}:blocked-start",
+        payload={
+            "message": message,
+            "event": "BLOCKED_AT_START",
+            "loop_state": "STOPPED",
+            "project": project or None,
+            "issue": issue or None,
+            "workflow_id": workflow_id,
+            "blocker": code,
+            "backlog_campaign_id": campaign_id or None,
+            "commands": commands,
+        },
+        redactor=redactor,
+    )

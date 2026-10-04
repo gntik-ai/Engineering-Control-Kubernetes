@@ -93,6 +93,8 @@ def _scripted_execute_control_step(script: dict[str, dict[str, Any]]) -> Any:
     @activity.defn(name="execute_control_step")
     async def execute_control_step(request: dict[str, Any]) -> dict[str, Any]:
         step = request["step"]
+        if step == "gitops.notify_merged" and step not in script:
+            return {"status": "NOTIFIED"}  # NEW-127: each merge is announced at once
         if step == "github.refresh_mirrors" and step not in script:
             return {"status": "PASS"}  # NEW-71: every loop issue refreshes the mirrors
         if step not in script:
@@ -116,6 +118,8 @@ def _scripted_execute_control_step_with_failure(
         step = request["step"]
         if step == fails_on:
             raise ApplicationError("unknown or invalid control step", non_retryable=True)
+        if step == "gitops.notify_merged" and step not in script:
+            return {"status": "NOTIFIED"}  # NEW-127: each merge is announced at once
         if step == "github.refresh_mirrors" and step not in script:
             return {"status": "PASS"}  # NEW-71
         if step not in script:
@@ -622,6 +626,8 @@ def _gitops_script(**overrides: dict[str, Any]) -> dict[str, dict[str, Any]]:
         },
         "gitops.pr_checks": {"status": "CHECKS_PASSED"},
         "gitops.merge": {"status": "MERGED", "target": "source", "merge_sha": "d" * 40},
+        # NEW-127: each merge is announced right after it succeeded.
+        "gitops.notify_merged": {"status": "NOTIFIED"},
         "gitops.release_tag": {"status": "TAG_READY", "release_tag": "v0.0.11"},
         "gitops.workflow_run": {"status": "RUN_SUCCEEDED"},
         "gitops.environment_check": {"status": "HEALTHY", "diagnosis": {}},
@@ -676,6 +682,7 @@ async def test_staging_gitops_workflow_happy_path_replays_cleanly() -> None:
         "gitops.prepare",
         "gitops.pr_checks",
         "gitops.merge",
+        "gitops.notify_merged",
         "gitops.release_tag",
         "gitops.workflow_run",
         "gitops.environment_check",
@@ -978,6 +985,8 @@ async def test_a_failed_loop_bookkeeping_step_pauses_and_retries_instead_of_fail
             raise ApplicationError(
                 "backlog child run idempotency binding changed", non_retryable=True
             )
+        if step == "gitops.notify_merged" and step not in script:
+            return {"status": "NOTIFIED"}  # NEW-127: each merge is announced at once
         if step == "github.refresh_mirrors" and step not in script:
             return {"status": "PASS"}
         return _registered_child(step, request, script[step])
@@ -2268,12 +2277,15 @@ _BEFORE_SYNC = [
     "gitops.prepare",
     "gitops.pr_checks",
     "gitops.merge",
+    "gitops.notify_merged",  # NEW-127
     "gitops.release_tag",
     "gitops.workflow_run",
     "gitops.environment_check",
     "gitops.image_pin",
     "gitops.trigger_sync",
 ]
+# Histories recorded before NEW-127 never announced the merge as its own step.
+_BEFORE_SYNC_PRE_127 = [step for step in _BEFORE_SYNC if step != "gitops.notify_merged"]
 
 
 async def test_a_patch_conflict_is_replaced_then_verified() -> None:
@@ -2737,7 +2749,7 @@ async def test_a_pre_new_113_sync_failure_history_replays_unchanged() -> None:
     assert (result["status"], result["blocker"]) == ("BLOCKED", "ARGO_SYNC_FAILED")
     assert "failure_class" not in result
     assert [request["step"] for request in _scheduled_steps(history)] == [
-        *_BEFORE_SYNC,
+        *_BEFORE_SYNC_PRE_127,
         "gitops.sync_status",
         "gitops.persist_result",
     ]
@@ -2805,7 +2817,7 @@ async def test_an_execution_mid_sync_poll_upgrades_into_the_new_path() -> None:
     # Old timer and the upgraded code's timer are the same production command.
     assert _timer_durations(history) == [timedelta(seconds=30)] * 2
     steps = [request["step"] for request in _scheduled_steps(history)]
-    assert steps[len(_BEFORE_SYNC) :] == [
+    assert steps[len(_BEFORE_SYNC_PRE_127) :] == [
         "gitops.sync_status",
         "gitops.sync_status",
         "gitops.sync_status",

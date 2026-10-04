@@ -2346,6 +2346,8 @@ async def test_backlog_stop_after_current_ends_at_the_next_issue_boundary(
     assert attempts == ["synthetic-backlog-issue-1-attempt-1"]
     assert state_calls[-1]["loop_status"] == "STOPPED"
     assert state_calls[-1]["control_state"] == "STOPPED_AFTER_CURRENT"
+    # NEW-127: the stop names the loop Run, so record_loop_state finalizes it.
+    assert state_calls[-1]["workflow_id"] == "synthetic-backlog"
 
 
 @pytest.mark.asyncio
@@ -2412,11 +2414,14 @@ async def test_backlog_pause_after_current_waits_then_resumes_at_boundary(
         "synthetic-backlog-issue-1-attempt-1",
         "synthetic-backlog-issue-2-attempt-1",
     ]
+    # NEW-127: the resume is recorded too, and boundary states name the loop Run.
     assert [call["loop_status"] for call in state_calls] == [
         "PAUSED",
+        "RUNNING",
         "COMPLETE",
     ]
     assert state_calls[0]["control_state"] == "PAUSED_AFTER_CURRENT"
+    assert state_calls[0]["workflow_id"] == state_calls[1]["workflow_id"] == "synthetic-backlog"
 
 
 def test_operator_pause_classification_is_fail_closed_for_high_impact_blockers() -> None:

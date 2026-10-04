@@ -18,9 +18,11 @@ from engineering_control.db import models as db
 from engineering_control.db.runtime_binding import _current_identity, new_bound_run
 from engineering_control.delivery_notifications import (
     attempt_label,
+    enqueue_blocked_start,
     enqueue_loop_state,
     enqueue_milestone,
     issue_for_finding,
+    literal,
 )
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
@@ -2214,6 +2216,10 @@ class EngineeringActivityHandler:
             if closed_blocker:
                 run.finished_at = now
                 run.summary = f"Blocked before start: {str(closed_blocker)[:200]}"
+                # NEW-127 review: a start refused at selection is not silent.
+                enqueue_blocked_start(
+                    session, payload, workflow_id=workflow_id, blocker=closed_blocker
+                )
             session.add(run)
             session.flush()
             return self._envelope(
@@ -2314,7 +2320,9 @@ class EngineeringActivityHandler:
                 # NEW-127: tell the operator a CI-repair round starts and which checks fail.
                 failing = gitops.get("ci_regressions") if isinstance(gitops, dict) else None
                 checks = (
-                    [str(name)[:120] for name in failing[:8]] if isinstance(failing, list) else []
+                    [literal(name, 120) for name in failing[:8]]
+                    if isinstance(failing, list)
+                    else []
                 )
                 target = gitops.get("ci_regression_target") if isinstance(gitops, dict) else None
                 enqueue_milestone(
