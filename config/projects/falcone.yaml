@@ -168,3 +168,28 @@ delivery_control:
         - {scope: turbo.json, path: .hermes-ci-baseline}
     external_secrets_namespace: external-secrets
     external_secrets_deployment: external-secrets
+# NEW-120: side-by-side console migration to gntik-ui (design docs/ui-migration, decisions
+# 2026-10-04). Exact canary and digest-pinned MCP image, both from gntik-ui main fe6ccc0:
+# 0.0.0-canary-20261003230037 is the version the canary workflow (run 37160322020) published;
+# the digest is the multi-arch index of ghcr.io/gntik-ai/gntik-ui-mcp:sha-fe6ccc0.
+ui_migration:
+  legacy_app: apps/web-console
+  target_app: apps/web-console-next
+  api_package: packages/console-api
+  gntik_ui:
+    registry: npm.pkg.github.com
+    scope: "@gntik-ai"
+    version: 0.0.0-canary-20261003230037
+  mcp:
+    image: ghcr.io/gntik-ai/gntik-ui-mcp
+    digest: sha256:4613adab5939872306a11d8b428e6cab14ace498855212f20a8859a5b7e1ef63
+  route_tables:
+    control_plane_routes: apps/control-plane/routes.mjs
+    control_plane_runtime_map: apps/control-plane/route-map.runtime.json
+    public_route_catalog: packages/internal-contracts/src/public-route-catalog.json
+    executor_openapi: apps/control-plane-executor/openapi/control-plane.openapi.json
+    gateway_config: deploy/kind/apisix/apisix.yaml
+  staging_base_url: https://baas.musematic.ai
+  staging_next_path: /next/
+  languages: [es, en]
+  default_language: es

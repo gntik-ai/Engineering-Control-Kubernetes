@@ -1,0 +1,4 @@
+{"openapi": "3.1.0", "paths": {
+  "/v1/plans": {"get": {}, "post": {"deprecated": false}},
+  "/v1/events/topics": {"get": {}}
+}}

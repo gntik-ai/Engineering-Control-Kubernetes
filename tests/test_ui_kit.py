@@ -1,0 +1,721 @@
+"""NEW-121 v2: the Hermes-side, model-free gntik-ui kit client and `ui.kit_snapshot`."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import stat
+import sys
+from argparse import Namespace
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from engineering_control.activities.core import ControlActivities
+from engineering_control.activities.scan import ScanActivityHandler
+from engineering_control.cli import _ui_kit_snapshot_command
+from engineering_control.config import Settings
+from engineering_control.engineering import ui_kit
+from engineering_control.engineering.models import ProjectManifest, UiMigrationPolicy
+from engineering_control.engineering.safe_files import write_text_no_follow
+from engineering_control.engineering.ui_kit import (
+    READ_ONLY_TOOLS,
+    GntikUiKitClient,
+    KitProtocolError,
+    KitToolRefused,
+    KitUnavailable,
+    collect_kit_snapshot,
+    kit_command,
+    snapshot_hash,
+    snapshot_plan,
+    trusted_docker_executable,
+    validate_page,
+)
+from engineering_control.workflows.definitions import ControlledWorkflow
+from engineering_control.workflows.worker_registry import ROLE_WORKER_REGISTRY, task_queue_for
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS = ROOT / "config" / "projects"
+STUB = ROOT / "tests" / "fixtures" / "ui_kit_stub_server.py"
+IMAGE = "ghcr.io/gntik-ai/gntik-ui-mcp"
+DIGEST = "sha256:4613adab5939872306a11d8b428e6cab14ace498855212f20a8859a5b7e1ef63"
+VERSION = "0.0.0-canary-20261003230037"
+
+
+def _policy() -> UiMigrationPolicy:
+    value = yaml.safe_load((PROJECTS / "falcone.yaml").read_text(encoding="utf-8"))
+    policy = ProjectManifest.model_validate(value).ui_migration
+    assert policy is not None
+    return policy
+
+
+def _stub(tmp_path: Path, mode: str = "ok", **kwargs: Any) -> tuple[GntikUiKitClient, Path]:
+    log = tmp_path / f"{mode}.log"
+    client = GntikUiKitClient(
+        [sys.executable, str(STUB), mode, str(log)],
+        environment={"PATH": "/usr/bin:/bin"},
+        **kwargs,
+    )
+    return client, log
+
+
+def _log(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A zombie still answers kill(0); it must at least not be running.
+    status = Path(f"/proc/{pid}/stat")
+    return status.exists() and status.read_text().split()[2] != "Z"
+
+
+# -- the pinned launch -------------------------------------------------------------------
+
+
+SOCKET = "unix:///var/run/docker.sock"
+
+
+def test_the_container_command_is_pinned_offline_and_unprivileged() -> None:
+    assert kit_command(
+        "/usr/bin/docker",
+        IMAGE,
+        DIGEST,
+        name="hermes-ui-kit-abc",
+        endpoint=SOCKET,
+        config_dir="/run/kit-config",
+    ) == [
+        "/usr/bin/docker",
+        "--config",
+        "/run/kit-config",
+        "-H",
+        SOCKET,
+        "run",
+        "-i",
+        "--rm",
+        "--pull",
+        "never",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--name",
+        "hermes-ui-kit-abc",
+        f"{IMAGE}@{DIGEST}",
+        "--stdio",
+    ]
+    for docker, image, digest, endpoint in (
+        ("docker", IMAGE, DIGEST, SOCKET),  # never a PATH lookup
+        ("/usr/bin/docker", f"{IMAGE}:latest", DIGEST, SOCKET),
+        ("/usr/bin/docker", IMAGE, "sha256:abc", SOCKET),
+        ("/usr/bin/docker", IMAGE, "latest", SOCKET),
+        ("/usr/bin/docker", IMAGE, DIGEST, "tcp://10.0.0.1:2375"),
+        ("/usr/bin/docker", IMAGE, DIGEST, "ssh://host"),
+    ):
+        with pytest.raises(ValueError):
+            kit_command(
+                docker, image, digest, name="hermes-ui-kit-abc", endpoint=endpoint, config_dir="/c"
+            )
+
+
+def test_pinned_client_uses_an_explicit_endpoint_and_a_private_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    client = GntikUiKitClient.pinned(IMAGE, DIGEST, docker_executable="/usr/bin/docker")
+    try:
+        (config,) = client.private_dirs
+        assert client.cwd == "/"
+        assert client.environment == {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": config,
+            "DOCKER_CONFIG": config,
+            "DOCKER_CONTEXT": "default",
+            "DOCKER_HOST": SOCKET,
+        }
+        metadata = os.lstat(config)
+        assert stat.S_IMODE(metadata.st_mode) == 0o700 and metadata.st_uid == os.geteuid()
+        assert os.listdir(config) == []
+        flags = ["/usr/bin/docker", "--config", config, "-H", SOCKET]
+        assert client.argv[:5] == flags
+        assert client.argv[-2:] == [f"{IMAGE}@{DIGEST}", "--stdio"]
+        assert client.preflight == [
+            *flags,
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            client.argv[-2],
+        ]
+        name = client.argv[client.argv.index("--name") + 1]
+        assert client.cleanup_argv == [*flags, "rm", "-f", name]
+    finally:
+        for directory in client.private_dirs:
+            os.rmdir(directory)
+
+
+def test_only_a_local_docker_socket_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ui_kit.docker_endpoint({}) == SOCKET
+    assert ui_kit.docker_endpoint({"DOCKER_HOST": "unix:///run/hermes/docker-scan.sock"}) == (
+        "unix:///run/hermes/docker-scan.sock"
+    )
+    for host in ("tcp://10.0.0.1:2375", "ssh://x", "unix:///run/../tmp/s", "npipe:////./pipe"):
+        with pytest.raises(KitUnavailable, match="non-local docker endpoint"):
+            ui_kit.docker_endpoint({"DOCKER_HOST": host})
+    monkeypatch.setenv("DOCKER_HOST", "tcp://10.0.0.1:2375")
+    with pytest.raises(KitUnavailable):
+        GntikUiKitClient.pinned(IMAGE, DIGEST, docker_executable="/usr/bin/docker")
+
+
+def _docker_usable() -> bool:
+    docker = trusted_docker_executable()
+    if docker is None:
+        return False
+    import subprocess
+
+    try:
+        return (
+            subprocess.run(  # noqa: S603
+                [docker, "-H", SOCKET, "version", "--format", "{{.Server.Version}}"],
+                capture_output=True,
+                timeout=20,
+                check=False,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@pytest.mark.skipif(not _docker_usable(), reason="no usable local docker daemon")
+async def test_a_planted_docker_context_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user config.json selecting a TCP context (and DOCKER_CONTEXT in the worker env)
+    must not redirect the kit's docker invocations away from the local socket."""
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "config.json").write_text(json.dumps({"currentContext": "evil"}), "utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DOCKER_CONFIG", str(planted))
+    monkeypatch.setenv("DOCKER_CONTEXT", "evil")
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    client = GntikUiKitClient.pinned(IMAGE, DIGEST)
+    (config,) = client.private_dirs
+    docker = client.argv[0]
+    process = await asyncio.create_subprocess_exec(
+        docker,
+        "--config",
+        config,
+        "-H",
+        SOCKET,
+        "version",
+        "--format",
+        "{{.Server.Version}}",
+        env=client.environment,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    assert process.returncode == 0, stderr  # the "evil" context would not even resolve
+    assert os.listdir(config) == []
+    await client.close(force=True)
+    assert not os.path.exists(config)  # noqa: ASYNC240
+
+
+def test_docker_must_be_absolute_and_root_owned(tmp_path: Path) -> None:
+    planted = tmp_path / "docker"
+    planted.write_text("#!/bin/sh\n", encoding="utf-8")
+    planted.chmod(0o755)
+    assert trusted_docker_executable([str(planted)]) is None
+    assert trusted_docker_executable(["docker"]) is None
+    resolved = trusted_docker_executable(["/bin/sh"])
+    assert resolved is not None and Path(resolved).is_absolute()
+
+
+def test_missing_docker_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ui_kit, "trusted_docker_executable", lambda: None)
+    with pytest.raises(KitUnavailable, match="no root-owned docker CLI"):
+        GntikUiKitClient.pinned(IMAGE, DIGEST)
+    assert KitUnavailable.code == "UI_MCP_UNAVAILABLE"
+
+
+async def test_a_missing_image_fails_closed_before_any_container_starts(tmp_path: Path) -> None:
+    calls = tmp_path / "docker-calls"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f'#!/bin/sh\necho "$5" >> {calls}\necho "Error: No such image: x" >&2\nexit 1\n',
+        encoding="utf-8",
+    )
+    docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+    client = GntikUiKitClient.pinned(IMAGE, DIGEST, docker_executable=str(docker))
+    with pytest.raises(KitUnavailable, match="is not pre-pulled"):
+        async with client:
+            pass
+    # inspect only (after --config <dir> -H <socket>): no run, no rm
+    assert calls.read_text(encoding="utf-8").split() == ["image"]
+    assert not any(os.path.exists(directory) for directory in client.private_dirs)  # noqa: ASYNC240
+
+
+# -- the session -------------------------------------------------------------------------
+
+
+async def test_only_read_only_allowlisted_tools_can_be_called(tmp_path: Path) -> None:
+    assert READ_ONLY_TOOLS == {
+        "list_kit",
+        "get_component",
+        "get_block",
+        "get_template",
+        "get_app_shell",
+        "get_tokens",
+        "get_rules",
+        "get_adoption_guide",
+        "analyze_page",
+        "validate_page",
+    }
+    client, log = _stub(tmp_path)
+    async with client:
+        for tool in ("sync_design_system", "scaffold_page", "overview", "rm_rf"):
+            with pytest.raises(KitToolRefused):
+                await client.call(tool)
+        assert (await client.call("get_rules"))["text"] == "ruleone"  # NUL removed
+    called = [entry["params"]["name"] for entry in _log(log) if entry["method"] == "tools/call"]
+    assert called == ["get_rules"]
+
+
+async def test_snapshot_is_versioned_bounded_and_deterministic(tmp_path: Path) -> None:
+    plan = snapshot_plan(templates=["home-dashboard"], components=["button"])
+    documents = []
+    for attempt in range(2):
+        client, _log_path = _stub(tmp_path / str(attempt))
+        (tmp_path / str(attempt)).mkdir()
+        async with client:
+            documents.append(
+                await collect_kit_snapshot(
+                    client, image=IMAGE, digest=DIGEST, gntik_ui_version=VERSION, plan=plan
+                )
+            )
+    first, second = documents
+    assert first == second
+    assert first["schema_version"] == 1
+    assert first["image"] == f"{IMAGE}@{DIGEST}"
+    assert first["gntik_ui_version"] == VERSION
+    assert first["server_info"] == {"name": "gntik-ui", "version": "0.1.0"}
+    assert len(first["tools_available"]) == 16
+    assert first["snapshot_sha256"] == snapshot_hash(first)
+    calls = {
+        (call["tool"], json.dumps(call["arguments"], sort_keys=True)): call
+        for call in first["calls"]
+    }
+    assert len(first["calls"]) == len(plan) == 10
+    tokens = calls[("get_tokens", '{"format": "json", "theme": "all"}')]
+    assert tokens["truncated"] is True and tokens["bytes"] == 512 * 1024
+    template = calls[("get_template", '{"id": "home-dashboard", "include_source": true}')]
+    assert template["text"].startswith("# get_template ")
+    assert first["summary"] == {
+        "calls": 10,
+        "errors": 0,
+        "truncated": 1,
+        "text_bytes": sum(call["bytes"] for call in first["calls"]),
+    }
+
+
+def test_snapshot_plan_refuses_unsafe_ids() -> None:
+    for bad in ("../x", "a b", "", "x" * 81):
+        with pytest.raises(ValueError):
+            snapshot_plan(templates=[bad])
+
+
+async def test_validate_page_is_a_bounded_deterministic_check(tmp_path: Path) -> None:
+    client, log = _stub(tmp_path)
+    async with client:
+        result = await validate_page(client, "export const P = 1", filename="pages/P.tsx")
+        with pytest.raises(ValueError):
+            await validate_page(client, "x" * (256 * 1024 + 1))
+        with pytest.raises(ValueError):
+            await validate_page(client, "x", filename="../P.tsx")
+        analyzed = await client.call("analyze_page", {"source": "x"})
+    assert result["tool"] == "validate_page"
+    assert result["is_error"] is False
+    assert analyzed["is_error"] is True
+    sent = [entry["params"] for entry in _log(log) if entry["method"] == "tools/call"]
+    assert sent[0] == {
+        "name": "validate_page",
+        "arguments": {"source": "export const P = 1", "filename": "pages/P.tsx"},
+    }
+
+
+async def test_timeout_kills_and_reaps_the_whole_process_group(tmp_path: Path) -> None:
+    marker = tmp_path / "cleanup-ran"
+    client, log = _stub(
+        tmp_path,
+        "hang",
+        deadline_seconds=1.5,
+        cleanup=["/bin/sh", "-c", f"touch {marker}"],
+    )
+    with pytest.raises(TimeoutError):
+        async with client:
+            pass
+    (entry,) = _log(log)
+    assert client.process is not None and client.process.returncode is not None
+    assert not _alive(entry["server"])
+    assert not _alive(entry["grandchild"])  # the stub's own child, same process group
+    assert marker.exists()  # the named container is removed too
+
+
+async def test_cancellation_kills_and_reaps_the_whole_process_group(tmp_path: Path) -> None:
+    client, log = _stub(tmp_path, "hang", deadline_seconds=60)
+
+    async def session() -> None:
+        async with client:
+            pass
+
+    task = asyncio.create_task(session())
+    for _ in range(100):
+        if _log(log):
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (entry,) = _log(log)
+    assert not _alive(entry["server"])
+    assert not _alive(entry["grandchild"])
+
+
+async def test_a_closed_or_broken_server_is_a_protocol_error(tmp_path: Path) -> None:
+    client = GntikUiKitClient(["/bin/true"], environment={"PATH": "/usr/bin:/bin"})
+    with pytest.raises(KitProtocolError, match="closed"):
+        async with client:
+            pass
+    with pytest.raises(ValueError, match="absolute"):
+        GntikUiKitClient(["docker", "run"], environment={})
+
+
+# -- the scan step and the CLI -----------------------------------------------------------
+
+
+def test_kit_snapshot_step_runs_on_the_scan_worker_only() -> None:
+    owners = {
+        kind
+        for kind in ("controller", *ROLE_WORKER_REGISTRY)
+        if "ui.kit_snapshot" in ControlActivities.steps_for_worker(kind)
+    }
+    assert owners == {"scan"}
+    assert "ui.kit_snapshot" in ScanActivityHandler.supported_steps
+    assert ControlledWorkflow._activity_queue("ui.kit_snapshot", {}) == task_queue_for("scan")
+
+
+def _handler(tmp_path: Path, factory: Any) -> ScanActivityHandler:
+    settings = Settings(
+        worktree_root=tmp_path / "worktrees",
+        evidence_root=tmp_path / "evidence",
+        project_config_root=PROJECTS,
+    )
+    return ScanActivityHandler(settings, kit_client_factory=factory)
+
+
+async def test_kit_snapshot_step_stores_evidence_and_returns_a_summary(tmp_path: Path) -> None:
+    seen: list[UiMigrationPolicy] = []
+
+    def factory(policy: UiMigrationPolicy) -> GntikUiKitClient:
+        seen.append(policy)
+        return _stub(tmp_path)[0]
+
+    result = await _handler(tmp_path, factory).handle(
+        "ui.kit_snapshot", {"project": "falcone", "templates": ["home-dashboard"]}
+    )
+    assert seen == [_policy()]
+    assert result["status"] == "UI_KIT_SNAPSHOT_PASS"
+    assert result["image"] == f"{IMAGE}@{DIGEST}"
+    assert result["gntik_ui_version"] == VERSION
+    assert "calls" not in result
+    stored = tmp_path / "evidence/scan/ui-kit" / result["snapshot_sha256"][:32]
+    document = json.loads((stored / "ui-kit-snapshot.json").read_text(encoding="utf-8"))
+    assert document["snapshot_sha256"] == result["snapshot_sha256"]
+    assert [receipt["status"] for receipt in result["evidence"]] == ["LOCAL_DEVELOPMENT_ONLY"]
+
+
+async def test_kit_snapshot_step_is_blocked_when_docker_or_the_image_is_missing(
+    tmp_path: Path,
+) -> None:
+    def unavailable(policy: UiMigrationPolicy) -> GntikUiKitClient:
+        raise KitUnavailable("image ghcr.io/gntik-ai/gntik-ui-mcp@sha256:... is not pre-pulled")
+
+    result = await _handler(tmp_path, unavailable).handle("ui.kit_snapshot", {"project": "falcone"})
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "UI_MCP_UNAVAILABLE"
+    assert "not pre-pulled" in result["reason"]
+    assert not (tmp_path / "evidence").exists()
+
+
+async def test_kit_snapshot_step_refuses_bad_selections(tmp_path: Path) -> None:
+    from temporalio.exceptions import ApplicationError
+
+    handler = _handler(tmp_path, lambda policy: _stub(tmp_path)[0])
+    for payload in (
+        {"project": "musematic"},
+        {"project": "falcone", "templates": "home-dashboard"},
+        {"project": "falcone", "templates": ["../etc"]},
+    ):
+        with pytest.raises(ApplicationError):
+            await handler.handle("ui.kit_snapshot", payload)
+
+
+def test_cli_writes_a_local_snapshot_or_reports_the_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = Namespace(
+        project="falcone",
+        manifest=PROJECTS / "falcone.yaml",
+        templates=["home-dashboard"],
+        blocks=[],
+        components=[],
+        output_dir=tmp_path / "out",
+    )
+    monkeypatch.setattr(
+        GntikUiKitClient, "from_policy", classmethod(lambda cls, policy: _stub(tmp_path)[0])
+    )
+    result = _ui_kit_snapshot_command(arguments)
+    assert result["status"] == "UI_KIT_SNAPSHOT_PASS"
+    (path,) = result["outputs"]
+    assert (
+        json.loads(Path(path).read_text(encoding="utf-8"))["snapshot_sha256"]
+        == (result["snapshot_sha256"])
+    )
+
+    def unavailable(cls: Any, policy: UiMigrationPolicy) -> GntikUiKitClient:
+        raise KitUnavailable("the docker daemon is unreachable")
+
+    monkeypatch.setattr(GntikUiKitClient, "from_policy", classmethod(unavailable))
+    assert _ui_kit_snapshot_command(arguments) == {
+        "status": "BLOCKED",
+        "blocker": "UI_MCP_UNAVAILABLE",
+        "reason": "the docker daemon is unreachable",
+    }
+
+
+# -- review round 3 ----------------------------------------------------------------------
+
+
+async def test_a_killed_cli_always_removes_the_named_container(tmp_path: Path) -> None:
+    marker = tmp_path / "rm-ran"
+    client, log = _stub(
+        tmp_path,
+        "linger",  # answers, then keeps running after stdin closes
+        shutdown_seconds=0.5,
+        cleanup=["/bin/sh", "-c", f"touch {marker}"],
+    )
+    async with client:
+        await client.call("get_rules")
+    assert client.process is not None and client.process.returncode == -9
+    assert client.removed_container is True
+    assert marker.exists()
+    eof = next(entry["eof"] for entry in _log(log) if "eof" in entry)
+    assert not _alive(eof)
+
+
+async def test_a_clean_exit_needs_no_container_removal(tmp_path: Path) -> None:
+    marker = tmp_path / "rm-ran"
+    client, _log_path = _stub(tmp_path, cleanup=["/bin/sh", "-c", f"touch {marker}"])
+    async with client:
+        await client.call("get_rules")
+    assert client.process is not None and client.process.returncode == 0
+    assert client.removed_container is False and not marker.exists()
+
+
+async def test_cancellation_during_exit_completes_every_cleanup_step(tmp_path: Path) -> None:
+    marker = tmp_path / "rm-ran"
+    private = tmp_path / "private-config"
+    private.mkdir()
+    client, log = _stub(
+        tmp_path,
+        "linger",
+        shutdown_seconds=60,  # the graceful wait would block for a minute
+        cleanup=["/bin/sh", "-c", f"touch {marker}"],
+        private_dirs=[str(private)],
+    )
+
+    async def session() -> None:
+        async with client:
+            await client.call("get_rules")
+
+    task = asyncio.create_task(session())
+    for _ in range(200):  # until __aexit__ closed stdin and is waiting
+        if any("eof" in entry for entry in _log(log)):
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+    eof = next(entry["eof"] for entry in _log(log) if "eof" in entry)
+    assert not _alive(eof)
+    assert client.process is not None and client.process.returncode is not None
+    assert client._stderr_task is None
+    assert marker.exists() and client.removed_container is True
+    assert not private.exists()
+
+
+async def test_snapshot_text_is_redacted_before_it_is_hashed(tmp_path: Path) -> None:
+    client, _log_path = _stub(tmp_path)
+    async with client:
+        document = await collect_kit_snapshot(
+            client,
+            image=IMAGE,
+            digest=DIGEST,
+            gntik_ui_version=VERSION,
+            plan=[("get_adoption_guide", {})],
+        )
+    (call,) = document["calls"]
+    assert "abcdefghijklmnopqrstuvwxyz0123456789" not in call["text"]
+    assert "Bearer [REDACTED]" in call["text"] or "[REDACTED]" in call["text"]
+    data = call["text"].encode("utf-8")
+    assert call["sha256"] == hashlib.sha256(data).hexdigest() and call["bytes"] == len(data)
+    assert document["snapshot_sha256"] == snapshot_hash(document)
+
+
+async def test_stored_evidence_verifies_against_the_reported_digest(tmp_path: Path) -> None:
+    result = await _handler(tmp_path, lambda policy: _stub(tmp_path)[0]).handle(
+        "ui.kit_snapshot", {"project": "falcone"}
+    )
+    stored_path = (
+        tmp_path / "evidence/scan/ui-kit" / result["snapshot_sha256"][:32] / "ui-kit-snapshot.json"
+    )
+    stored = json.loads(stored_path.read_text(encoding="utf-8"))
+    assert snapshot_hash(stored) == stored["snapshot_sha256"] == result["snapshot_sha256"]
+    for call in stored["calls"]:
+        assert call["sha256"] == hashlib.sha256(call["text"].encode("utf-8")).hexdigest()
+    assert "abcdefghijklmnopqrstuvwxyz0123456789" not in stored_path.read_text(encoding="utf-8")
+
+
+async def test_server_controlled_fields_are_bounded_in_the_workflow_result(
+    tmp_path: Path,
+) -> None:
+    result = await _handler(tmp_path, lambda policy: _stub(tmp_path, "manytools")[0]).handle(
+        "ui.kit_snapshot", {"project": "falcone"}
+    )
+    assert result["tools_available_count"] == 20016
+    assert len(result["tools_available"]) <= 64
+    assert all(len(name) <= 64 for name in result["tools_available"])
+    assert len(json.dumps(result).encode("utf-8")) < 16 * 1024
+    stored_path = (
+        tmp_path / "evidence/scan/ui-kit" / result["snapshot_sha256"][:32] / "ui-kit-snapshot.json"
+    )
+    stored = json.loads(stored_path.read_text(encoding="utf-8"))
+    assert len(stored["tools_available"]) == 20016  # the full list is evidence only
+
+
+def test_evidence_and_cli_writes_never_follow_a_destination_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    victim = tmp_path / "checkout-file.ts"
+    victim.write_text("original\n", encoding="utf-8")
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "target.json").symlink_to(victim)
+    with pytest.raises(ValueError, match="symlink"):
+        write_text_no_follow(output / "target.json", "overwritten\n")
+    assert victim.read_text(encoding="utf-8") == "original\n"
+    write_text_no_follow(output / "fresh.json", "ok\n")
+    assert (output / "fresh.json").read_text(encoding="utf-8") == "ok\n"
+    assert [path.name for path in output.iterdir() if path.name.endswith(".tmp")] == []
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(output, target_is_directory=True)
+    with pytest.raises(OSError):
+        write_text_no_follow(linked_dir / "fresh.json", "x\n")
+
+    # The kit CLI refuses a planted symlink at its output name.
+    monkeypatch.setattr(
+        GntikUiKitClient, "from_policy", classmethod(lambda cls, policy: _stub(tmp_path)[0])
+    )
+    arguments = Namespace(
+        project="falcone",
+        manifest=PROJECTS / "falcone.yaml",
+        templates=[],
+        blocks=[],
+        components=[],
+        output_dir=tmp_path / "kit-out",
+    )
+    first = _ui_kit_snapshot_command(arguments)
+    (path,) = first["outputs"]
+    Path(path).unlink()
+    Path(path).symlink_to(victim)
+    with pytest.raises(ValueError, match="symlink"):
+        _ui_kit_snapshot_command(arguments)
+    assert victim.read_text(encoding="utf-8") == "original\n"
+
+
+# -- review round 4 (orchestrator) -------------------------------------------------------
+
+
+async def test_cancellation_before_the_process_is_assigned_still_removes_the_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "rm-ran"
+    client, _log_path = _stub(tmp_path, cleanup=["/bin/sh", "-c", f"touch {marker}"])
+    real_exec = asyncio.create_subprocess_exec
+    calls = {"n": 0}
+
+    async def spawn_then_cancel(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if args and "touch" in " ".join(map(str, args)):
+            return await real_exec(*args, **kwargs)  # the cleanup command itself
+        raise asyncio.CancelledError  # the CLI was spawned; `self.process` never assigned
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_then_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        async with client:
+            await client.call("get_rules")
+    assert client.process is None
+    assert client.removed_container is True and marker.exists()
+
+
+def test_evidence_directories_refuse_a_symlink_at_any_component(tmp_path: Path) -> None:
+    from engineering_control.engineering.safe_files import open_directory_no_follow
+
+    root = tmp_path / "evidence"
+    (root / "scan").mkdir(parents=True)
+    outside = tmp_path / "checkout"
+    outside.mkdir()
+    (root / "scan" / "ui-kit").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        open_directory_no_follow(root, root / "scan" / "ui-kit" / "abc")
+    assert not (outside / "abc").exists()
+    os.close(open_directory_no_follow(root, root / "scan" / "ui-inventory" / "abc"))
+    assert (root / "scan" / "ui-inventory" / "abc").is_dir()
+    with pytest.raises(ValueError):
+        open_directory_no_follow(root, root / "scan" / ".." / "x")
+
+
+def test_writes_stay_in_the_verified_directory_after_a_parent_swap(tmp_path: Path) -> None:
+    from engineering_control.engineering.safe_files import open_directory_no_follow, write_text_at
+
+    root = tmp_path / "evidence"
+    target = root / "scan" / "ui-kit" / "abc"
+    verified = open_directory_no_follow(root, target)
+    try:
+        # After verification a parent is swapped for a symlink to a checkout that has the
+        # same digest directory: writes must still land in the verified directory.
+        outside = tmp_path / "checkout"
+        (outside / "abc").mkdir(parents=True)
+        (root / "scan" / "ui-kit").rename(tmp_path / "moved")
+        (root / "scan" / "ui-kit").symlink_to(outside, target_is_directory=True)
+        write_text_at(verified, "ui-kit-snapshot.json", "{}\n")
+        with pytest.raises(ValueError):
+            write_text_at(verified, "../escape.json", "x\n")
+    finally:
+        os.close(verified)
+    assert (tmp_path / "moved" / "abc" / "ui-kit-snapshot.json").read_text() == "{}\n"
+    assert not (outside / "abc" / "ui-kit-snapshot.json").exists()

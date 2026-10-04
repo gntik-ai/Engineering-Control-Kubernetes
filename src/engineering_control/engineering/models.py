@@ -5,7 +5,15 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
 
 from engineering_control.models.reconciliation import StagingFlowPolicy
 
@@ -292,6 +300,101 @@ class DeploymentPinPolicy(EngineeringModel):
         return values
 
 
+_REPO_PATH = r"^[A-Za-z0-9_@][A-Za-z0-9_.@-]*(?:/[A-Za-z0-9_@][A-Za-z0-9_.@-]*)*$"
+# An exact npm version: MAJOR.MINOR.PATCH with an optional pre-release (canary snapshots are
+# `0.0.0-canary-<datetime>`). Ranges, dist-tags, `x` wildcards and build metadata are refused.
+_EXACT_VERSION = (
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+
+
+def _repository_path(value: str) -> str:
+    """A normalised repository-relative path: no absolute, `..`, `.`, empty or .git parts."""
+    parts = value.split("/")
+    if (
+        not value
+        or len(value) > 240
+        or not re.fullmatch(_REPO_PATH, value)
+        or any(part in {"", ".", ".."} for part in parts)
+        or parts[0] == ".git"
+    ):
+        raise ValueError("ui_migration paths must be normalised repository-relative paths")
+    return value
+
+
+RepositoryPath = Annotated[str, AfterValidator(_repository_path)]
+
+
+class GntikUiPackagePin(EngineeringModel):
+    """NEW-120: the exact gntik-ui release the migrated console consumes (no ranges)."""
+
+    registry: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9-]+)+$")
+    scope: str = Field(pattern=r"^@[a-z0-9][a-z0-9-]{0,63}$")
+    version: str = Field(pattern=_EXACT_VERSION, max_length=80)
+
+
+class GntikUiMcpPin(EngineeringModel):
+    """NEW-120/121: the gntik-ui MCP image, always run by digest (never by tag)."""
+
+    image: str = Field(
+        pattern=r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?(?:/[a-z0-9][a-z0-9._-]*)+$",
+        max_length=200,
+    )
+    digest: Digest
+
+    def reference(self) -> str:
+        return f"{self.image}@{self.digest}"
+
+
+class UiRouteTables(EngineeringModel):
+    """The backend route tables a UI endpoint is cross-checked against."""
+
+    control_plane_routes: RepositoryPath
+    public_route_catalog: RepositoryPath
+    executor_openapi: RepositoryPath
+    gateway_config: RepositoryPath
+    # Optional: the control-plane runtime map, unioned with control_plane_routes.
+    control_plane_runtime_map: RepositoryPath | None = None
+
+
+class UiMigrationPolicy(EngineeringModel):
+    """NEW-120: the side-by-side console migration contract of one project."""
+
+    legacy_app: RepositoryPath
+    target_app: RepositoryPath
+    api_package: RepositoryPath
+    gntik_ui: GntikUiPackagePin
+    mcp: GntikUiMcpPin
+    route_tables: UiRouteTables
+    staging_base_url: HttpUrl
+    staging_next_path: str = Field(default="/next/", pattern=r"^/(?:[a-z0-9-]+/)+$")
+    languages: tuple[str, ...] = Field(min_length=1, max_length=10)
+    default_language: str = Field(pattern=r"^[a-z]{2}$")
+
+    @field_validator("languages")
+    @classmethod
+    def language_codes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values) or any(
+            not re.fullmatch(r"[a-z]{2}", value) for value in values
+        ):
+            raise ValueError("ui_migration languages must be unique two-letter codes")
+        return values
+
+    @model_validator(mode="after")
+    def coherent(self) -> UiMigrationPolicy:
+        if self.default_language not in self.languages:
+            raise ValueError("ui_migration default_language must be one of its languages")
+        apps = (self.legacy_app, self.target_app, self.api_package)
+        if len(set(apps)) != len(apps) or any(
+            a != b and (a.startswith(b + "/") or b.startswith(a + "/")) for a in apps for b in apps
+        ):
+            raise ValueError("ui_migration app and package paths must be distinct and disjoint")
+        if self.staging_base_url.scheme != "https":
+            raise ValueError("ui_migration staging_base_url must use https")
+        return self
+
+
 class ProjectManifest(EngineeringModel):
     schema_version: Literal[1]
     project: Literal["falcone", "musematic", "llmwiki"]
@@ -306,6 +409,8 @@ class ProjectManifest(EngineeringModel):
     toolchain: ToolchainPolicy | None = None
     # NEW-118: paired source/deployment repositories only (see DeploymentPinPolicy).
     deployment_pin: DeploymentPinPolicy | None = None
+    # NEW-120: the side-by-side console migration (legacy -> gntik-ui) contract.
+    ui_migration: UiMigrationPolicy | None = None
 
     @model_validator(mode="after")
     def deployment_pin_requires_a_pair(self) -> ProjectManifest:

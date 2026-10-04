@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +35,11 @@ from engineering_control.engineering.models import (
     ProjectPairSnapshot,
     ToolchainPolicy,
     ToolchainTestCommand,
+    UiMigrationPolicy,
+)
+from engineering_control.engineering.safe_files import (
+    open_directory_no_follow,
+    write_text_at,
 )
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
@@ -42,6 +47,14 @@ from engineering_control.engineering.toolchain import (
     match_toolchain_test_command,
     prepare_executables,
     render_argv,
+)
+from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
+from engineering_control.engineering.ui_kit import (
+    UI_MCP_UNAVAILABLE,
+    GntikUiKitClient,
+    KitUnavailable,
+    collect_kit_snapshot,
+    snapshot_plan,
 )
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.identity.attestation import observer_contract_hash
@@ -61,6 +74,24 @@ _TOOLCHAIN_HEARTBEAT_SECONDS = 30.0
 _BASELINE_TEST_TIMEOUT_SECONDS = 1200
 _BASELINE_OUTPUT_TAIL = 500
 _DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+_MAX_RESULT_NAMES = 64
+_MAX_RESULT_NAME_CHARS = 64
+_MAX_RESULT_NAMES_BYTES = 4096
+
+
+def _bounded_names(values: Any) -> list[str]:
+    """At most 64 names of at most 64 characters and 4 KiB in total (Temporal payloads)."""
+    names: list[str] = []
+    total = 0
+    for value in values if isinstance(values, list) else []:
+        name = str(value)[:_MAX_RESULT_NAME_CHARS]
+        total += len(name.encode("utf-8"))
+        if len(names) >= _MAX_RESULT_NAMES or total > _MAX_RESULT_NAMES_BYTES:
+            break
+        names.append(name)
+    return names
 
 
 class WorktreeAllocationRequest(BaseModel):
@@ -162,6 +193,8 @@ class ScanActivityHandler:
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
+            "ui.inventory",
+            "ui.kit_snapshot",
         }
     )
     _repositories = {
@@ -182,8 +215,11 @@ class ScanActivityHandler:
         dependency_runner: SafeCommandRunner | None = None,
         git_runner: SafeCommandRunner | None = None,
         baseline_runner: SafeCommandRunner | None = None,
+        kit_client_factory: Callable[[UiMigrationPolicy], GntikUiKitClient] | None = None,
     ) -> None:
         self.settings = settings
+        # NEW-121 v2: Hermes itself queries the pinned gntik-ui MCP image (no model).
+        self.kit_client_factory = kit_client_factory or GntikUiKitClient.from_policy
         self.manager = manager or GitWorktreeManager(
             mirror_root=settings.mirror_root,
             worktree_root=settings.worktree_root,
@@ -288,6 +324,12 @@ class ScanActivityHandler:
                 return await asyncio.to_thread(self._prepare_observability_workspace, payload)
             if step == "observability.cleanup_workspace":
                 return await asyncio.to_thread(self._cleanup_observability_workspace, payload)
+            if step == "ui.inventory":
+                return await asyncio.to_thread(self._ui_inventory, payload)
+            if step == "ui.kit_snapshot":
+                return await self._with_heartbeat(
+                    self._ui_kit_snapshot(payload), phase="ui_kit_snapshot"
+                )
         except PermissionError as error:
             raise ApplicationError(
                 "runtime observer credential violates least-privilege policy",
@@ -1158,6 +1200,138 @@ class ScanActivityHandler:
             f"{name}_inspection": inspection,
             f"{name}_inspection_sha256": hashlib.sha256(canonical).hexdigest(),
         }
+
+    def _ui_inventory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-120: the deterministic legacy-console inventory of an immutable snapshot.
+
+        Model-free and read-only on the worktree: the snapshot must be at the expected SHA
+        and clean. The full JSON and Markdown go to evidence; the result carries only the
+        summary, the hashes and the evidence receipts (bounded Temporal payload).
+        """
+        project = Project(str(payload["project"]))
+        snapshot = self._find_mapping(payload, "snapshot")
+        if snapshot is None:
+            raise ValueError("ui inventory requires the immutable source snapshot")
+        worktree = Path(str(snapshot["source_worktree"]))
+        source_sha = self._sha(snapshot.get("source_sha"), "source_sha")
+        inspection = self.manager.inspect_snapshot(worktree, expected_sha=source_sha)
+        policy = self.catalog.project(project.value).ui_migration
+        if policy is None:
+            raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {project.value} has no ui_migration")
+        document = build_inventory(worktree, policy, source_sha=source_sha, project=project.value)
+        digest = str(document["inventory_sha256"])
+        directory = self.settings.evidence_root / "scan" / "ui-inventory" / digest[:32]
+        json_path = directory / "ui-inventory.json"
+        markdown_path = directory / "ui-inventory.md"
+        verified = open_directory_no_follow(self.settings.evidence_root, directory)
+        try:
+            self._store_redacted_json(verified, json_path.name, document)
+            write_text_at(verified, markdown_path.name, render_markdown(document))
+        finally:
+            os.close(verified)
+        receipts = self._publish_reports(
+            payload,
+            [json_path, markdown_path],
+            filename_prefix=f"ui-inventory-{digest[:12]}",
+            category="snapshot",
+        )
+        return {
+            **payload,
+            "status": "UI_INVENTORY_PASS",
+            "schema_version": document["schema_version"],
+            "source_sha": source_sha,
+            "source_inspection": inspection,
+            "inventory_sha256": digest,
+            "summary": document["summary"],
+            "route_tables": document["route_tables"],
+            "evidence": receipts,
+        }
+
+    async def _ui_kit_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-121 v2: a versioned gntik-ui kit snapshot from the digest-pinned image.
+
+        Deterministic and model-free: the scan worker runs the container itself (no
+        network, read-only, no capabilities) and calls only read-only allowlisted tools.
+        A missing docker or image is a BLOCKED result (UI_MCP_UNAVAILABLE), not a retry.
+        """
+        project = Project(str(payload["project"]))
+        policy = (await asyncio.to_thread(self.catalog.project, project.value)).ui_migration
+        if policy is None:
+            raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {project.value} has no ui_migration")
+        selection: dict[str, list[str]] = {}
+        for kind in ("templates", "blocks", "components"):
+            value = payload.get(kind, [])
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"ui kit snapshot {kind} must be a list of ids")
+            if len(value) > 100:
+                raise ValueError(f"ui kit snapshot {kind} exceeds 100 ids")
+            selection[kind] = value
+        plan = snapshot_plan(**selection)
+        try:
+            async with self.kit_client_factory(policy) as client:
+                document = await collect_kit_snapshot(
+                    client,
+                    image=policy.mcp.image,
+                    digest=policy.mcp.digest,
+                    gntik_ui_version=policy.gntik_ui.version,
+                    plan=plan,
+                )
+        except KitUnavailable as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": UI_MCP_UNAVAILABLE,
+                "reason": str(error)[:300],
+                "image": f"{policy.mcp.image}@{policy.mcp.digest}",
+            }
+        except TimeoutError as error:
+            raise ApplicationError(
+                "gntik-ui kit snapshot exceeded its deadline", type="UiKitTimeout"
+            ) from error
+        return await asyncio.to_thread(self._store_kit_snapshot, payload, document)
+
+    def _store_kit_snapshot(
+        self, payload: dict[str, Any], document: dict[str, Any]
+    ) -> dict[str, Any]:
+        digest = str(document["snapshot_sha256"])
+        directory = self.settings.evidence_root / "scan" / "ui-kit" / digest[:32]
+        path = directory / "ui-kit-snapshot.json"
+        verified = open_directory_no_follow(self.settings.evidence_root, directory)
+        try:
+            self._store_redacted_json(verified, path.name, document)
+        finally:
+            os.close(verified)
+        receipts = self._publish_reports(
+            payload, [path], filename_prefix=f"ui-kit-{digest[:12]}", category="snapshot"
+        )
+        return {
+            **payload,
+            "status": "UI_KIT_SNAPSHOT_PASS",
+            "schema_version": document["schema_version"],
+            "snapshot_sha256": digest,
+            "image": document["image"],
+            "gntik_ui_version": document["gntik_ui_version"],
+            # Server-controlled data is bounded here; the full lists live only in evidence.
+            "server_info": {
+                str(key)[:32]: str(value)[:64]
+                for key, value in list(document["server_info"].items())[:4]
+            },
+            "tools_available_count": len(document["tools_available"]),
+            "tools_available": _bounded_names(document["tools_available"]),
+            "summary": {
+                key: int(document["summary"][key])
+                for key in ("calls", "errors", "truncated", "text_bytes")
+            },
+            "evidence": receipts,
+        }
+
+    @staticmethod
+    def _store_redacted_json(directory: int, name: str, document: dict[str, Any]) -> None:
+        """Store exactly the hashed document: it must already be redaction-stable, so the
+        evidence upload's own redaction cannot change what the reported digest covers."""
+        if SecretRedactor().redact(document).value != document:
+            raise ValueError("ui evidence was not redacted before it was hashed")
+        write_text_at(directory, name, json.dumps(document, indent=2, sort_keys=True) + "\n")
 
     def _snapshot_pair(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = Project(str(payload.get("project")))
@@ -2723,6 +2897,7 @@ class ScanActivityHandler:
         reports: list[Path],
         *,
         filename_prefix: str,
+        category: str = "changes",
     ) -> list[dict[str, Any]]:
         orchestration = payload.get("orchestration")
         if not isinstance(orchestration, dict) or not isinstance(
@@ -2770,7 +2945,7 @@ class ScanActivityHandler:
                 workflow_id=workflow_id,
                 campaign_id=campaign_id,
                 change_set_id=change_set_id,
-                category="changes",
+                category=category,
                 filename=f"{filename_prefix}-{report.name}",
                 producer="scan-runner",
                 content_type=content_type,
