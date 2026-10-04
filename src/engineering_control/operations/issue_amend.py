@@ -30,6 +30,7 @@ from engineering_control.db.models import (
     DashboardEvent,
     Finding,
     GitHubBacklogCampaign,
+    OperationRequest,
     Run,
     Step,
 )
@@ -39,6 +40,11 @@ from engineering_control.engineering.backlog import (
     canonical_sha256,
 )
 from engineering_control.models.enums import ChangeSetState
+from engineering_control.operations.issue_start import (
+    backlog_issue_signal_blocker,
+    issue_request_from_operation,
+    issue_workflow_id,
+)
 from engineering_control.security.redaction import SecretRedactor
 
 AMENDMENT_KEY = "approved_body_amendment"
@@ -398,7 +404,7 @@ def amend_issue(
             # A rerun after an unknown outcome (e.g. a client timeout) reconciles: the
             # recorded amendment is this revision, so a requested retry is still sent.
             result["amended_by"] = amendment.get("amended_by")
-            result["retry_workflow_id"] = retry_workflow_id(session, change_set)
+            result["retry_workflow_id"] = retry_workflow_id(session, change_set, issue)
             result["retry_key"] = str(amendment.get("binding_sha256", ""))[:32]
         return result
     excerpt = str(observed["body_excerpt"])
@@ -509,7 +515,7 @@ def amend_issue(
         "reason": AMEND_REASON,
         "previous_body_sha256": approved_sha256,
         "audit_event_id": event.id,
-        "retry_workflow_id": retry_workflow_id(session, change_set),
+        "retry_workflow_id": retry_workflow_id(session, change_set, issue),
         "retry_key": value["binding_sha256"][:32],
     }
 
@@ -571,8 +577,47 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def retry_workflow_id(session: Session, change_set: ChangeSet | None) -> str | None:
-    """The backlog loop that started this issue's latest delivery child, if recorded."""
+def retry_workflow_id(
+    session: Session,
+    change_set: ChangeSet | None,
+    issue: BacklogIssueRecord | None = None,
+) -> str | None:
+    """The backlog loop that holds this issue's delivery, if durably recorded.
+
+    The ChangeSet's latest delivery child names its parent loop. NEW-128: a loop paused
+    before any ChangeSet exists (e.g. CURRENT_REVALIDATION_FLAKY) is resolved from the
+    issue's durable records too: the parents of its registered delivery-child approvals,
+    the approved issue operation's deterministic loop and the campaign's active loops.
+    Every candidate must hold this issue (the retry preflight's campaign check, an
+    issue-start loop's own target, and no later child registered for another issue);
+    the newest active one wins, and nothing is guessed when none matches."""
+    recorded = _change_set_loop(session, change_set)
+    if issue is None:
+        return recorded
+    names = {*_issue_loop_candidates(session, issue)}
+    if recorded is not None:
+        names.add(recorded)
+    active = session.execute(
+        select(Run.workflow_id)
+        .where(
+            Run.workflow_id.in_(sorted(names)),
+            Run.run_type == _LOOP_RUN_TYPE,
+            Run.status.in_(_ACTIVE_LOOP_STATUSES),
+            Run.finished_at.is_(None),
+        )
+        .order_by(desc(Run.created_at), desc(Run.id))
+    ).all()
+    for (workflow_id,) in active:
+        if _loop_holds_issue(session, workflow_id, issue):
+            return str(workflow_id)
+    # A recorded loop without an active loop Run (e.g. a legacy row) is kept only while it
+    # still holds the issue; the retry preflight then reports its live state.
+    if recorded is not None and _loop_holds_issue(session, recorded, issue):
+        return recorded
+    return None
+
+
+def _change_set_loop(session: Session, change_set: ChangeSet | None) -> str | None:
     if change_set is None:
         return None
     children = (change_set.recovery_json or {}).get("issue_execution_approval_children")
@@ -584,3 +629,101 @@ def retry_workflow_id(session: Session, change_set: ChangeSet | None) -> str | N
         return None
     parent = record.result_json.get("parent_workflow_id") if record is not None else None
     return parent if isinstance(parent, str) and parent else None
+
+
+# operations.issue_delivery_approval.STEP_NAME (that module imports this one).
+_CHILD_APPROVAL_STEP = "delivery.issue_approval"
+_LOOP_RUN_TYPE = "existing-backlog-loop"
+_ACTIVE_LOOP_STATUSES = ("RUNNING", "PAUSED")
+
+
+_ISSUE_START_LOOP = re.compile(
+    r"backlog-loop-[a-z]+-[0-9a-f-]{36}-operation-"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
+
+def _loop_holds_issue(session: Session, workflow_id: str, issue: BacklogIssueRecord) -> bool:
+    """Whether a backlog loop still owns (or waits on) this issue, from durable records."""
+    repository = issue.repository.removeprefix("gntik-ai/")
+    if backlog_issue_signal_blocker(session, workflow_id, repository, issue.issue_number):
+        return False
+    issue_start = _ISSUE_START_LOOP.fullmatch(workflow_id)
+    if issue_start is not None:
+        operation = session.get(OperationRequest, UUID(issue_start.group(1)))
+        if operation is None:
+            return False
+        try:
+            request = issue_request_from_operation(operation)
+        except ValueError:
+            return False
+        if (
+            issue_workflow_id(request) != workflow_id
+            or request.target_repository != issue.repository
+            or request.target_issue_number != issue.issue_number
+        ):
+            return False
+    # A loop that registered a delivery child for another issue after this one moved on.
+    latest = session.scalar(
+        select(Step)
+        .where(
+            Step.name == _CHILD_APPROVAL_STEP,
+            Step.result_json["parent_workflow_id"].as_string() == workflow_id,
+        )
+        .order_by(desc(Step.created_at), desc(Step.id))
+        .limit(1)
+    )
+    if latest is not None:
+        value = latest.result_json if isinstance(latest.result_json, dict) else {}
+        if (value.get("issue_repository"), value.get("issue_number")) != (
+            issue.repository,
+            issue.issue_number,
+        ):
+            return False
+    return True
+
+
+def _issue_loop_candidates(session: Session, issue: BacklogIssueRecord) -> list[str]:
+    campaign = session.get(GitHubBacklogCampaign, issue.backlog_campaign_id)
+    if campaign is None:
+        return []
+    campaign_id = str(issue.backlog_campaign_id)
+    names: list[str] = []
+    # Parents of this issue's registered delivery children.
+    if issue.finding_id is not None:
+        for approval in session.scalars(
+            select(Step).where(
+                Step.name == _CHILD_APPROVAL_STEP,
+                Step.status == "COMPLETE",
+                Step.result_json["finding_id"].as_string() == str(issue.finding_id),
+            )
+        ).all():
+            value = approval.result_json if isinstance(approval.result_json, dict) else {}
+            request = value.get("request")
+            parent = value.get("parent_workflow_id")
+            if (
+                isinstance(request, dict)
+                and str(request.get("backlog_campaign_id")) == campaign_id
+                and isinstance(parent, str)
+                and parent
+            ):
+                names.append(parent)
+    # The approved issue operations' deterministic loops (/loop issue-start).
+    for operation in session.scalars(
+        select(OperationRequest).where(
+            OperationRequest.action == "solve_issue",
+            OperationRequest.project == campaign.project,
+            OperationRequest.target_id == f"{issue.repository}#{issue.issue_number}",
+        )
+    ).all():
+        try:
+            request = issue_request_from_operation(operation)
+        except ValueError:
+            continue
+        if str(request.backlog_campaign_id) == campaign_id:
+            names.append(issue_workflow_id(request))
+    # NEW-128 review 2: no campaign-membership fallback. A campaign loop that has not
+    # registered a delivery child for this issue (nor is its issue-start loop) does not
+    # prove ownership; without positive proof no loop is returned and the operator
+    # retries explicitly (/loop retry <workflow-id> <repository> <issue>).
+    return names

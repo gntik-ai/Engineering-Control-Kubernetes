@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import hmac
 import json
-import re
 import secrets
 import stat
 from datetime import UTC, datetime, timedelta
@@ -47,7 +46,6 @@ from engineering_control.db.models import (
 )
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
-    BACKLOG_PROJECT_PAIRS,
     BacklogApprovalBinding,
     canonical_sha256,
     is_reauthenticated_backlog_operator,
@@ -70,6 +68,7 @@ from engineering_control.operations.issue_amend import amend_issue, resolve_amen
 from engineering_control.operations.issue_approval import current_issue_approval_binding
 from engineering_control.operations.issue_start import (
     ISSUE_START_UNCONFIRMED,
+    backlog_issue_signal_blocker,
     issue_request_from_operation,
     issue_workflow_id,
 )
@@ -319,38 +318,6 @@ def _r3_delivery_briefing(manifest: ProjectManifest, surface: str) -> dict[str, 
         ],
         "rollback": "revert-repo-local-manifest-and-reapply-staging-bootstrap",
     }
-
-
-_BACKLOG_LOOP_WORKFLOW = re.compile(
-    r"backlog-loop-(falcone|musematic|llmwiki)-"
-    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-|$)"
-)
-
-
-def backlog_issue_signal_blocker(
-    session: Session, workflow_id: str, repository: str, issue_number: int
-) -> str | None:
-    """NEW-114: an issue-bound retry/skip must name an issue of that loop's campaign.
-
-    `backlog-retry <wf> falcone 45` was accepted although #45 belongs to falcone-charts,
-    and the loop silently ignored the signal. Workflows that are not backlog loops keep
-    their behavior (None)."""
-    match = _BACKLOG_LOOP_WORKFLOW.match(workflow_id)
-    if match is None:
-        return None
-    full_repository = f"gntik-ai/{repository}"
-    if full_repository not in BACKLOG_PROJECT_PAIRS[match.group(1)]:
-        return "BACKLOG_ISSUE_NOT_IN_LOOP_PROJECT"
-    found = session.scalar(
-        select(BacklogIssueRecord.id)
-        .where(
-            BacklogIssueRecord.backlog_campaign_id == UUID(match.group(2)),
-            BacklogIssueRecord.repository == full_repository,
-            BacklogIssueRecord.issue_number == issue_number,
-        )
-        .limit(1)
-    )
-    return None if found is not None else "BACKLOG_ISSUE_NOT_IN_LOOP"
 
 
 class OperationsRepository:

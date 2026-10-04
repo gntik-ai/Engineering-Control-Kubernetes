@@ -5,6 +5,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import lru_cache
 from typing import Any, Literal
 
 from pydantic import (
@@ -630,18 +631,44 @@ def approval_binding(
     )
 
 
+def _plural_suffix(word: str) -> str:
+    """The regular English plural of a keyword's last word, as an optional regex suffix."""
+    if word.endswith(("s", "x", "z", "ch", "sh")):
+        return re.escape(word) + "(?:es)?"
+    if len(word) > 1 and word.endswith("y") and word[-2] not in "aeiou":
+        return re.escape(word[:-1]) + "(?:y|ies)"
+    return re.escape(word) + "s?"
+
+
+@lru_cache(maxsize=256)
+def _keyword_pattern(term: str) -> re.Pattern[str]:
+    words = term.split()
+    phrase = r"\s+".join([*(re.escape(word) for word in words[:-1]), _plural_suffix(words[-1])])
+    # Regular plurals stay matched ("authorization bypasses", "data losses", "clusterroles");
+    # letters or digits on either side are a different word ("reproduction", "metadata").
+    return re.compile(rf"(?<![a-z0-9]){phrase}(?![a-z0-9])")
+
+
+def _mentions(text: str, *terms: str) -> bool:
+    """NEW-128: whole-word or whole-phrase keyword match on lowercased text or labels.
+
+    A substring match classified "source-reproduction" as R3 ("production") and
+    "destructiveness" as "destructive". Phrases match across any whitespace."""
+    return any(_keyword_pattern(term).search(text) is not None for term in terms)
+
+
 def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogIssueType:
     label_text = " ".join(labels)
     title = text.splitlines()[0].strip()
-    if "duplicate" in label_text or re.search(r"(?i)\bduplicate\s+(?:of\s+)?#\d+", text):
+    if _mentions(label_text, "duplicate") or re.search(r"(?i)\bduplicate\s+(?:of\s+)?#\d+", text):
         return BacklogIssueType.DUPLICATE
-    if any(value in label_text for value in ("already-fixed", "already fixed")):
+    if _mentions(label_text, "already-fixed", "already fixed"):
         return BacklogIssueType.ALREADY_FIXED
-    if "superseded" in label_text:
+    if _mentions(label_text, "superseded"):
         return BacklogIssueType.SUPERSEDED
     if "stale" in labels:
         return BacklogIssueType.STALE
-    if any(value in label_text for value in ("invalid", "not reproducible", "wontfix")):
+    if _mentions(label_text, "invalid", "not reproducible", "wontfix"):
         return BacklogIssueType.INVALID_OR_UNREPRODUCIBLE
     enhancement_metadata = (
         any(
@@ -661,35 +688,35 @@ def _issue_type(repository: str, labels: tuple[str, ...], text: str) -> BacklogI
         any(value in labels for value in ("bug", "defect", "type:bug", "type:defect"))
         or re.match(r"^(?:\[bug\]|bug(?:\([^)]*\))?:|security defect:|deployment defect:)", title)
         is not None
-        or "independently confirmed defect" in text
+        or _mentions(text, "independently confirmed defect")
     )
     # Explicit enhancement/OpenSpec task metadata wins unless the issue also
     # carries independent defect evidence.  Security impact or high severity
     # alone does not convert a feature request into a bugs-campaign item.
     if enhancement_metadata and not independent_defect:
         return BacklogIssueType.ENHANCEMENT
-    if "security" in label_text or any(
-        value in text for value in ("vulnerability", "tenant isolation", "authorization bypass")
+    if _mentions(label_text, "security") or _mentions(
+        text, "vulnerability", "tenant isolation", "authorization bypass"
     ):
         return BacklogIssueType.SECURITY_DEFECT
-    if any(value in label_text for value in ("needs-decision", "product-decision", "rfc")) or any(
-        value in text for value in ("needs product decision", "decision required", "proposal only")
+    if _mentions(label_text, "needs-decision", "product-decision", "rfc") or _mentions(
+        text, "needs product decision", "decision required", "proposal only"
     ):
         return BacklogIssueType.SPEC_DECISION
     if enhancement_metadata:
         return BacklogIssueType.ENHANCEMENT
-    if repository.endswith(("-charts", "-deploy")) or any(
-        value in label_text for value in ("deployment", "helm", "argocd", "gitops")
+    if repository.endswith(("-charts", "-deploy")) or _mentions(
+        label_text, "deployment", "helm", "argocd", "gitops"
     ):
         return BacklogIssueType.DEPLOYMENT_DEFECT
-    documentation_label = any(value in label_text for value in ("documentation", "docs", "runbook"))
+    documentation_label = _mentions(label_text, "documentation", "docs", "runbook")
     if documentation_label or text.startswith(("docs:", "documentation:")):
         return BacklogIssueType.DOCUMENTATION_DEFECT
-    if any(value in label_text for value in ("operations", "operational", "devops", "sre")):
+    if _mentions(label_text, "operations", "operational", "devops", "sre"):
         return BacklogIssueType.OPERATIONS_DEFECT
-    if any(value in label_text for value in ("meta", "tooling", "ci")) and "bug" not in label_text:
+    if _mentions(label_text, "meta", "tooling", "ci") and not _mentions(label_text, "bug"):
         return BacklogIssueType.META_TOOLING
-    if "question" in label_text or issue_title_is_question(text):
+    if _mentions(label_text, "question") or issue_title_is_question(text):
         return BacklogIssueType.QUESTION
     return BacklogIssueType.PRODUCT_BUG
 
@@ -753,27 +780,34 @@ def _severity(
 ) -> Literal["critical", "high", "medium", "low", "unspecified"]:
     combined = " ".join(labels)
     for severity in ("critical", "high", "medium", "low"):
-        if f"severity:{severity}" in combined or f"severity/{severity}" in combined:
+        if _mentions(combined, f"severity:{severity}", f"severity/{severity}"):
             return severity
-    if any(value in text for value in ("critical severity", "remote code execution", "data loss")):
+    if _mentions(text, "critical severity", "remote code execution", "data loss"):
         return "critical"
     return "unspecified"
+
+
+# NEW-128 review 2: the R3 safety gate must over-match, never under-match. Each R3 root
+# matches at a word START and may continue with any word characters, so every inflection
+# (productionisation, destructively, clusterrolebindings, data migrations) stays R3, while
+# a root inside another word ("reproduction") has no word boundary and is not matched.
+_R3_KEYWORD_ROOTS = (
+    r"data\s+migrat",
+    r"destructiv",
+    r"credential\s+rotat",
+    r"secret\s+lifecycle",
+    r"production",
+    r"clusterrole",
+)
+# A root starts where no letter or digit precedes it: underscores and other Markdown
+# delimiters (``_production_``, ``**destructive**``) still count as word starts.
+_R3_KEYWORDS = re.compile(r"(?<![a-z0-9])(?:" + "|".join(_R3_KEYWORD_ROOTS) + r")", re.IGNORECASE)
 
 
 def _risk(
     issue_type: BacklogIssueType, severity: str, text: str
 ) -> Literal["R0", "R1", "R2", "R3"]:
-    if any(
-        value in text
-        for value in (
-            "data migration",
-            "destructive",
-            "credential rotation",
-            "secret lifecycle",
-            "production",
-            "clusterrole",
-        )
-    ):
+    if _R3_KEYWORDS.search(text) is not None:
         return "R3"
     if issue_type is BacklogIssueType.SECURITY_DEFECT or severity in {"critical", "high"}:
         return "R2"
@@ -791,11 +825,10 @@ def _reproduction_mode(
 ) -> ReproductionMode:
     if issue_type is BacklogIssueType.DOCUMENTATION_DEFECT:
         return ReproductionMode.DOCUMENTATION_REQUIRED
-    if owner == "deployment" or any(value in text for value in ("helm", "argocd", "gitops")):
+    if owner == "deployment" or _mentions(text, "helm", "argocd", "gitops"):
         return ReproductionMode.DEPLOYMENT_REQUIRED
-    if any(value in labels for value in ("runtime", "e2e", "browser")) or any(
-        value in text
-        for value in ("login", "http 401", "http 404", "runtime", "staging", "browser")
+    if any(value in labels for value in ("runtime", "e2e", "browser")) or _mentions(
+        text, "login", "http 401", "http 404", "runtime", "staging", "browser"
     ):
         return ReproductionMode.RUNTIME_REQUIRED
     if any(value in labels for value in ("unit-test", "regression")):
@@ -806,17 +839,15 @@ def _reproduction_mode(
 def _wave(
     issue_type: BacklogIssueType, severity: str, dependencies: tuple[str, ...], text: str
 ) -> Literal["W0", "W1", "W2", "W3", "W4", "W5"]:
-    if any(
-        value in text
-        for value in (
-            "login",
-            "identity endpoint",
-            "build blocker",
-            "outofsync",
-            "degraded",
-            "deployment blocker",
-            "runtime blocker",
-        )
+    if _mentions(
+        text,
+        "login",
+        "identity endpoint",
+        "build blocker",
+        "outofsync",
+        "degraded",
+        "deployment blocker",
+        "runtime blocker",
     ):
         return "W0"
     if issue_type is BacklogIssueType.SECURITY_DEFECT or severity in {"critical", "high"}:
@@ -887,7 +918,7 @@ def _filter_eligibility(
         )
     if import_filter == "enhancements":
         return False, "FILTER_EXCLUDED"
-    if import_filter == "all" and "needs product decision" not in text:
+    if import_filter == "all" and not _mentions(text, "needs product decision"):
         return True, "FILTER_MATCH_PENDING_REVALIDATION"
     return False, "FILTER_EXCLUDED"
 
@@ -973,11 +1004,11 @@ def _documentation_levels(
     levels: set[str] = set()
     if issue_type is BacklogIssueType.DOCUMENTATION_DEFECT:
         levels.add("technical-documentation")
-    if any(value in text for value in ("api documentation", "openapi")):
+    if _mentions(text, "api documentation", "openapi"):
         levels.add("api-documentation")
-    if any(value in text for value in ("runbook", "devops", "deployment")) or "runbook" in labels:
+    if _mentions(text, "runbook", "devops", "deployment") or "runbook" in labels:
         levels.add("devops-runbook")
-    if any(value in text for value in ("user guide", "end-user", "administrator")):
+    if _mentions(text, "user guide", "end-user", "administrator"):
         levels.add("end-user-or-administrator")
     levels.add("documentation-impact-review-required")
     return tuple(sorted(levels))

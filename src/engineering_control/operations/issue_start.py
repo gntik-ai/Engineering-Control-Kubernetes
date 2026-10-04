@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import re
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from engineering_control.api.schemas import ExistingBacklogLoopStart
-from engineering_control.db.models import OperationRequest
+from engineering_control.db.models import BacklogIssueRecord, OperationRequest
+from engineering_control.engineering.backlog import BACKLOG_PROJECT_PAIRS
 from engineering_control.operations.models import SolveIssueCommand, parse_command
 
 ISSUE_START_UNCONFIRMED = (
@@ -56,3 +61,36 @@ def issue_request_from_operation(operation: OperationRequest) -> ExistingBacklog
         issue_operation_id=operation.id,
         issue_approval_binding=operation.binding_hash,
     )
+
+
+# NEW-128: shared by the retry preflight and /loop amend --retry loop resolution.
+_BACKLOG_LOOP_WORKFLOW = re.compile(
+    r"backlog-loop-(falcone|musematic|llmwiki)-"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-|$)"
+)
+
+
+def backlog_issue_signal_blocker(
+    session: Session, workflow_id: str, repository: str, issue_number: int
+) -> str | None:
+    """NEW-114: an issue-bound retry/skip must name an issue of that loop's campaign.
+
+    `backlog-retry <wf> falcone 45` was accepted although #45 belongs to falcone-charts,
+    and the loop silently ignored the signal. Workflows that are not backlog loops keep
+    their behavior (None)."""
+    match = _BACKLOG_LOOP_WORKFLOW.match(workflow_id)
+    if match is None:
+        return None
+    full_repository = f"gntik-ai/{repository}"
+    if full_repository not in BACKLOG_PROJECT_PAIRS[match.group(1)]:
+        return "BACKLOG_ISSUE_NOT_IN_LOOP_PROJECT"
+    found = session.scalar(
+        select(BacklogIssueRecord.id)
+        .where(
+            BacklogIssueRecord.backlog_campaign_id == UUID(match.group(2)),
+            BacklogIssueRecord.repository == full_repository,
+            BacklogIssueRecord.issue_number == issue_number,
+        )
+        .limit(1)
+    )
+    return None if found is not None else "BACKLOG_ISSUE_NOT_IN_LOOP"
