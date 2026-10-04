@@ -26,6 +26,16 @@ from engineering_control.engineering.ui_blueprint import (
     ui_fanout_workflow_id,
     ui_plan_workflow_id,
 )
+from engineering_control.engineering.ui_blueprint_parts import (
+    BATCH,
+    FRAME,
+    MECHANICAL_PART,
+    assemble,
+    check_assembled,
+    part_content_sha256,
+    review_digest,
+    usage_summary,
+)
 
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _SHA = re.compile(r"^[a-f0-9]{40}$")
@@ -274,6 +284,254 @@ class UiBlueprintRepository:
                 entry if item.get("attempt") == draft_attempts else item for item in drafts
             ]
             return {"blueprint": entry["blueprint"], "blueprint_sha256": digest}
+
+    # NEW-131: batched drafting. Parts live in drafts_json next to the draft versions, as
+    # entries keyed by "part" (never "attempt"): the mechanical fields Hermes filled, then
+    # every immutable version of the frame and of each page batch with its review.
+
+    def record_mechanical_sync(
+        self, blueprint_id: UUID, mechanical: dict[str, Any], mechanical_sha256: str
+    ) -> str:
+        digest = part_content_sha256(mechanical)
+        if not hmac.compare_digest(digest, mechanical_sha256):
+            raise ValueError("ui blueprint mechanical fields do not match their hash")
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            if row.status != "DRAFTING":
+                raise ValueError("ui blueprint is no longer drafting")
+            drafts = list(row.drafts_json or [])
+            existing = [entry for entry in drafts if entry.get("part") == MECHANICAL_PART]
+            if existing:
+                if existing[0].get("content_sha256") != digest:
+                    raise ValueError("ui blueprint mechanical fields are immutable")
+                return digest
+            drafts.append(
+                {"part": MECHANICAL_PART, "content": mechanical, "content_sha256": digest}
+            )
+            row.drafts_json = drafts
+        return digest
+
+    def parts_sync(self, blueprint_id: UUID) -> dict[str, Any]:
+        """The mechanical fields and the approved part versions recorded so far."""
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            if row is None:
+                raise UiBlueprintNotFoundError("ui blueprint not found")
+            drafts = list(row.drafts_json or [])
+        mechanical = [e for e in drafts if e.get("part") == MECHANICAL_PART]
+        approved = {
+            str(entry["part"]): entry
+            for entry in drafts
+            if entry.get("part") not in {None, MECHANICAL_PART} and self._approved_part(entry)
+        }
+        return {
+            "mechanical": mechanical[0]["content"] if mechanical else None,
+            "approved": approved,
+        }
+
+    @staticmethod
+    def _approved_part(entry: dict[str, Any]) -> bool:
+        content = entry.get("content")
+        if not isinstance(content, dict) or entry.get("decision") != "APPROVE":
+            return False
+        digest = part_content_sha256(content)
+        return entry.get("content_sha256") == digest and entry.get("reviewed_sha256") == digest
+
+    def record_part_sync(
+        self, blueprint_id: UUID, part_id: str, kind: str, attempt: int, content: dict[str, Any]
+    ) -> str:
+        """Append part version `attempt` (immutable; an identical retry is accepted)."""
+        if kind not in {FRAME, BATCH}:
+            raise ValueError("ui blueprint part kind is invalid")
+        digest = part_content_sha256(content)
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            if row.status != "DRAFTING":
+                raise ValueError("ui blueprint is no longer drafting")
+            drafts = list(row.drafts_json or [])
+            existing = [
+                entry
+                for entry in drafts
+                if entry.get("part") == part_id and entry.get("part_attempt") == attempt
+            ]
+            if existing:
+                if existing[0].get("content_sha256") == digest:
+                    return digest
+                raise ValueError("ui blueprint part versions are immutable")
+            drafts.append(
+                {
+                    "part": part_id,
+                    "kind": kind,
+                    "part_attempt": attempt,
+                    "content": content,
+                    "content_sha256": digest,
+                    "reviewed_sha256": None,
+                    "decision": None,
+                }
+            )
+            row.drafts_json = drafts
+        return digest
+
+    def mark_part_reviewed_sync(
+        self,
+        blueprint_id: UUID,
+        part_id: str,
+        attempt: int,
+        staged_sha256: str,
+        review: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind part version `attempt` to Hermes's hash of the exact file the reviewer read,
+        record the review, and append it to the blueprint's review rounds."""
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            if row.status != "DRAFTING":
+                raise ValueError("ui blueprint is no longer drafting")
+            drafts = list(row.drafts_json or [])
+            matches = [
+                index
+                for index, entry in enumerate(drafts)
+                if entry.get("part") == part_id and entry.get("part_attempt") == attempt
+            ]
+            if len(matches) != 1:
+                raise ValueError("ui blueprint part version does not exist")
+            entry = dict(drafts[matches[0]])
+            digest = part_content_sha256(entry["content"])
+            if not (
+                hmac.compare_digest(digest, staged_sha256)
+                and hmac.compare_digest(str(entry.get("content_sha256")), staged_sha256)
+            ):
+                raise ValueError("stored ui blueprint part differs from the reviewed part")
+            if entry.get("reviewed_sha256") not in {None, staged_sha256}:
+                raise ValueError("ui blueprint part was already reviewed as other content")
+            entry.update(
+                reviewed_sha256=staged_sha256, decision=review.get("decision"), review=review
+            )
+            drafts[matches[0]] = entry
+            row.drafts_json = drafts
+            rounds = [
+                item
+                for item in (row.review_json or {}).get("rounds") or []
+                if not (item.get("part_id") == part_id and item.get("attempt") == attempt)
+            ]
+            rounds.append({**review, "part_id": part_id, "attempt": attempt})
+            row.review_json = {"rounds": rounds}
+            return {"content_sha256": digest, "rounds": rounds}
+
+    def reuse_part_sync(self, blueprint_id: UUID, part_id: str) -> dict[str, Any] | None:
+        """NEW-131 resumability: an approved version of this exact part (same inventory,
+        kit, pages and frame by construction of its id), from this blueprint or an earlier
+        one of the same project and inputs, is adopted instead of being drafted again."""
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            if row.status != "DRAFTING":
+                raise ValueError("ui blueprint is no longer drafting")
+            own = [
+                e
+                for e in row.drafts_json or []
+                if e.get("part") == part_id and self._approved_part(e)
+            ]
+            if own:
+                return dict(own[-1])
+            earlier = session.scalars(
+                select(UiBlueprint)
+                .where(
+                    UiBlueprint.project == row.project,
+                    UiBlueprint.inventory_sha256 == row.inventory_sha256,
+                    UiBlueprint.kit_snapshot_sha256 == row.kit_snapshot_sha256,
+                    UiBlueprint.id != row.id,
+                )
+                .order_by(UiBlueprint.created_at.desc())
+            ).all()
+            for other in earlier:
+                found = [
+                    e
+                    for e in other.drafts_json or []
+                    if e.get("part") == part_id and self._approved_part(e)
+                ]
+                if not found:
+                    continue
+                adopted = {**dict(found[-1]), "reused_from": str(other.id)}
+                row.drafts_json = [*(row.drafts_json or []), adopted]
+                review = adopted.get("review")
+                if isinstance(review, dict):
+                    rounds = list((row.review_json or {}).get("rounds") or [])
+                    rounds.append(
+                        {
+                            **review,
+                            "part_id": part_id,
+                            "attempt": adopted.get("part_attempt"),
+                            "reused_from": str(other.id),
+                        }  # fmt: skip
+                    )
+                    row.review_json = {"rounds": rounds}
+                return adopted
+            return None
+
+    def assemble_sync(self, blueprint_id: UUID, part_ids: list[str], inputs: Any) -> dict[str, Any]:
+        """Assemble the mechanical fields and the approved parts into the full blueprint,
+        validate it, and record it as the reviewed draft version 1 (whose hash is computed
+        from the reviewed part versions). Raises BlueprintRejected when it is invalid."""
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            if row.status != "DRAFTING":
+                raise ValueError("ui blueprint is no longer drafting")
+            drafts = list(row.drafts_json or [])
+            mechanical = [e for e in drafts if e.get("part") == MECHANICAL_PART]
+            if len(mechanical) != 1:
+                raise ValueError("ui blueprint mechanical fields were never recorded")
+            parts: list[dict[str, Any]] = []
+            for part_id in part_ids:
+                approved = [
+                    e for e in drafts if e.get("part") == part_id and self._approved_part(e)
+                ]
+                if not approved:
+                    raise ValueError(f"ui blueprint part {part_id} is not approved")
+                parts.append(approved[-1])
+            if [entry.get("kind") for entry in parts[:1]] != [FRAME] or any(
+                entry.get("kind") != BATCH for entry in parts[1:]
+            ):
+                raise ValueError("ui blueprint parts are not one frame and its batches")
+            content = mechanical[0]["content"]
+            blueprint = assemble(content, parts[0]["content"], [e["content"] for e in parts[1:]])
+            check_assembled(blueprint, inputs, content)
+            digest = blueprint_sha256(blueprint)
+            existing = [entry for entry in drafts if entry.get("attempt") == 1]
+            if existing:
+                if existing[0].get("blueprint_sha256") != digest:
+                    raise ValueError("ui blueprint draft versions are immutable")
+            else:
+                drafts.append(
+                    {
+                        "attempt": 1,
+                        "blueprint": blueprint,
+                        "blueprint_sha256": digest,
+                        "reviewed_sha256": digest,
+                        "assembled_from": [
+                            {"part": e["part"], "content_sha256": e["content_sha256"]}
+                            for e in parts
+                        ],
+                        "mechanical_sha256": mechanical[0]["content_sha256"],
+                    }
+                )
+                row.drafts_json = drafts
+            row.draft_attempts = 1
+            rounds = list((row.review_json or {}).get("rounds") or [])
+            return {"blueprint": blueprint, "blueprint_sha256": digest, "rounds": rounds}
+
+    def record_usage_sync(self, blueprint_id: UUID, entry: dict[str, Any]) -> None:
+        """Append one provider call's token usage to the blueprint evidence (idempotent)."""
+        key = tuple(entry.get(name) for name in ("part_id", "phase", "attempt", "run_id"))
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            evidence = dict(row.evidence_json or {})
+            usage = [
+                item
+                for item in evidence.get("usage") or []
+                if tuple(item.get(name) for name in ("part_id", "phase", "attempt", "run_id"))
+                != key
+            ]
+            evidence["usage"] = [*usage, entry]
+            row.evidence_json = evidence
 
     @staticmethod
     def _draft(drafts: list[dict[str, Any]], attempt: int) -> dict[str, Any]:
@@ -549,7 +807,7 @@ class UiBlueprintRepository:
             kit_snapshot_sha256=str(row.kit_snapshot_sha256),
             gntik_ui_version=row.gntik_ui_version,
             blueprint_sha256=str(row.blueprint_sha256),
-            review=rounds[-1] if rounds and isinstance(rounds[-1], dict) else None,
+            review=review_digest(rounds),
         )
 
     @staticmethod
@@ -611,4 +869,6 @@ class UiBlueprintRepository:
             "fanout_workflow_id": row.active_fanout_workflow_id,
             "fanout_sequence": row.fanout_sequence,
             "reviewed_sha256": row.reviewed_sha256,
+            # NEW-131: per-call token usage of the batched drafting (and its totals).
+            "usage": usage_summary((row.evidence_json or {}).get("usage")),
         }

@@ -928,6 +928,11 @@ def main() -> None:
         raise SystemExit(1) from error
     if arguments.command == "ui-blueprint-show" and isinstance(result, dict):
         print(str(result.get("markdown", "")), end="")
+        usage = result.get("usage")
+        if isinstance(usage, dict) and (usage.get("total") or {}).get("calls"):
+            from engineering_control.engineering.ui_blueprint_parts import render_usage
+
+            print(render_usage(usage), end="")
         return
     print(json.dumps(result, indent=2, sort_keys=True))
 

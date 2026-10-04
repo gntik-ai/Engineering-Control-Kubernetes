@@ -1353,7 +1353,10 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         if markdown is None:
             raise HTTPException(status_code=409, detail="ui blueprint has no draft yet")
-        return {"blueprint_id": str(blueprint_id), "markdown": markdown}
+        view = await repository.get(blueprint_id)
+        # NEW-131: the per-call token usage of the batched drafting, as totals.
+        usage = (view or {}).get("usage") or {}
+        return {"blueprint_id": str(blueprint_id), "markdown": markdown, "usage": usage}
 
     @app.post("/v1/ui-blueprints/{blueprint_id}/approve")
     async def ui_blueprint_approve(

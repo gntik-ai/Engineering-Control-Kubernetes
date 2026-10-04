@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     # NEW-123: at most this many UI blueprint items become change-request drafts per fan-out
     # run; an approval replay resumes with the next items (idempotent, deterministic ids).
     ui_blueprint_fanout_max_items: int = Field(default=80, ge=1, le=600)
+    # NEW-131: pages per drafted blueprint batch (the frame is drafted first, alone).
+    ui_plan_batch_pages: int = Field(default=8, ge=1, le=25)
     helm_executable: Path = Path("/usr/local/bin/helm")
     kubectl_executable: Path = Path("/usr/local/bin/kubectl")
     staging_kubeconfig_path: Path = Path("/etc/engineering-control/credentials/staging/kubeconfig")

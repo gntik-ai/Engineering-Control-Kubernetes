@@ -8,7 +8,11 @@ from typing import Any
 
 import yaml
 
-from engineering_control.engineering.ui_blueprint import UI_PLAN_SKILLS, load_schema
+from engineering_control.engineering.ui_blueprint import (
+    UI_PLAN_PART_SCHEMAS,
+    UI_PLAN_SKILLS,
+    load_schema,
+)
 
 SOURCE_SHA = "a" * 40
 INVENTORY_SHA = "b" * 64
@@ -284,7 +288,16 @@ def build_fake_pack(root: Path, *, version: str = "1.4.0", skip: tuple[str, ...]
         "skills/catalog.yaml": yaml.safe_dump(
             {
                 "skills": [
-                    {"id": skill, "role": role} for skill, (role, _schema) in UI_PLAN_SKILLS.items()
+                    {
+                        "id": skill,
+                        "role": role,
+                        **(
+                            {"part_output_schemas": list(UI_PLAN_PART_SCHEMAS[skill])}
+                            if skill in UI_PLAN_PART_SCHEMAS
+                            else {}
+                        ),
+                    }
+                    for skill, (role, _schema) in UI_PLAN_SKILLS.items()
                 ]
             }
         ),
@@ -293,6 +306,8 @@ def build_fake_pack(root: Path, *, version: str = "1.4.0", skip: tuple[str, ...]
         files[f"skills/{skill}/SKILL.md"] = f"# {skill}\n"
         files[f"skills/{skill}/references/contract.md"] = "# Contract\n"
         files[f"skills/{skill}/references/output.schema.json"] = json.dumps(load_schema(schema))
+        for part in UI_PLAN_PART_SCHEMAS.get(skill, ()):
+            files[f"skills/{skill}/references/{part}"] = json.dumps(load_schema(part))
         files[f"roles/{role}.yaml"] = f"id: {role}\n"
         files[f"generated/claude/agents/{role}.md"] = f"# {role}\n"
         files[f"generated/codex/agents/{role}.toml"] = f'id = "{role}"\n'

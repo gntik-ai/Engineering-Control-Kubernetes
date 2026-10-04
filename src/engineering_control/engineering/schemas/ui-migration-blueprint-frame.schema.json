@@ -1,0 +1,449 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "mode",
+    "project",
+    "inputs",
+    "frame",
+    "review",
+    "blockers"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "COMPLETE",
+        "BLOCKED"
+      ]
+    },
+    "mode": {
+      "enum": [
+        "draft",
+        "review"
+      ]
+    },
+    "project": {
+      "enum": [
+        "falcone",
+        "musematic",
+        "llmwiki"
+      ]
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inventory_sha256",
+        "legacy_source_sha",
+        "gntik_ui_version",
+        "kit_source",
+        "kit_snapshot_sha256",
+        "draft_sha256",
+        "part_id"
+      ],
+      "properties": {
+        "inventory_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "legacy_source_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{7,40}$"
+        },
+        "gntik_ui_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "kit_source": {
+          "enum": [
+            "mcp",
+            "snapshot"
+          ]
+        },
+        "kit_snapshot_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "draft_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "part_id": {
+          "type": "string",
+          "pattern": "^(frame|b[0-9]{3})-[a-f0-9]{16}$"
+        }
+      }
+    },
+    "frame": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/frame"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "review": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/review"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "blockers": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      }
+    }
+  },
+  "$defs": {
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "foundation_epics",
+        "gaps",
+        "cutover",
+        "global_decisions"
+      ],
+      "properties": {
+        "foundation_epics": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/epic"
+          },
+          "minItems": 7
+        },
+        "gaps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/part_gap"
+          },
+          "maxItems": 300
+        },
+        "cutover": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "steps",
+            "acceptance_criteria"
+          ],
+          "properties": {
+            "steps": {
+              "type": "array",
+              "maxItems": 3,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "action",
+                  "detail"
+                ],
+                "properties": {
+                  "action": {
+                    "enum": [
+                      "switch-default-route",
+                      "keep-legacy-one-release",
+                      "delete-legacy-and-dead-modules"
+                    ]
+                  },
+                  "detail": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  }
+                }
+              },
+              "minItems": 3
+            },
+            "acceptance_criteria": {
+              "type": "array",
+              "maxItems": 30,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 600
+              },
+              "minItems": 1
+            }
+          }
+        },
+        "global_decisions": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          }
+        }
+      }
+    },
+    "epic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "scope",
+        "acceptance_criteria",
+        "depends_on",
+        "gap_ids"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^u0-[a-z0-9][a-z0-9-]{0,63}$"
+        },
+        "kind": {
+          "enum": [
+            "scaffold",
+            "console-api",
+            "shell-navigation-auth",
+            "i18n",
+            "playwright-harness",
+            "csp-assets",
+            "image-chart"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "scope": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "minItems": 1
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "minItems": 1
+        },
+        "depends_on": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "pattern": "^u0-[a-z0-9][a-z0-9-]{0,63}$"
+          }
+        },
+        "gap_ids": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "pattern": "^gap-[a-z0-9][a-z0-9-]{0,63}$"
+          }
+        }
+      }
+    },
+    "part_gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "target_repository",
+        "summary",
+        "evidence",
+        "blocks",
+        "interim",
+        "seed_ref",
+        "cutover_resolution",
+        "cutover_reason"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^gap-[a-z0-9][a-z0-9-]{0,63}$"
+        },
+        "type": {
+          "enum": [
+            "BACKEND_GAP",
+            "KIT_GAP"
+          ]
+        },
+        "target_repository": {
+          "enum": [
+            "gntik-ai/falcone",
+            "gntik-ai/gntik-ui"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "minItems": 1
+        },
+        "blocks": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "interim": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "seed_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cutover_resolution": {
+          "enum": [
+            "RESOLVED",
+            "DEFERRED"
+          ]
+        },
+        "cutover_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision",
+        "summary",
+        "findings"
+      ],
+      "properties": {
+        "decision": {
+          "enum": [
+            "APPROVE",
+            "REVISE"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "findings": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "subject",
+              "detail",
+              "reference"
+            ],
+            "properties": {
+              "category": {
+                "enum": [
+                  "invented_endpoint",
+                  "invented_kit_item",
+                  "missing_page",
+                  "dead_module_migrated",
+                  "wave_order",
+                  "behaviour_gap",
+                  "parity_criteria",
+                  "gap_classification",
+                  "foundation_epic",
+                  "other"
+                ]
+              },
+              "subject": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "detail": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000
+              },
+              "reference": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 300
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

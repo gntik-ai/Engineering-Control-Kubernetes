@@ -335,6 +335,8 @@ class ScanActivityHandler(UiPlanScanSteps):
                 return await asyncio.to_thread(self._ui_plan_stage_inputs, payload)
             if step == "ui_plan.stage_document":
                 return await asyncio.to_thread(self._ui_plan_stage_document, payload)
+            if step == "ui_plan.stage_parts":
+                return await asyncio.to_thread(self._ui_plan_stage_parts, payload)
             if step == "ui.kit_snapshot":
                 return await self._with_heartbeat(
                     self._ui_kit_snapshot(payload), phase="ui_kit_snapshot"

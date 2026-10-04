@@ -39,6 +39,13 @@ UI_PLAN_SKILLS: dict[str, tuple[str, str]] = {
     "plan-ui-migration": ("ui-migration-architect", "ui-migration-blueprint.schema.json"),
     "triage-ui-gap": ("ui-gap-triager", "ui-gap-draft.schema.json"),
 }
+# NEW-131: the skill's released part schemas (frame and page batch), in that order.
+UI_PLAN_PART_SCHEMAS: dict[str, tuple[str, ...]] = {
+    "plan-ui-migration": (
+        "ui-migration-blueprint-frame.schema.json",
+        "ui-migration-blueprint-batch.schema.json",
+    ),
+}
 FANOUT_DEFAULT_MAX_ITEMS = 80
 FANOUT_MAX_ITEMS_LIMIT = 600
 FANOUT_BATCH = 10
@@ -165,6 +172,28 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
             same = False
         if not same:
             problems.append(f"skills/{skill} output schema differs from Hermes's {schema_name}")
+        parts = UI_PLAN_PART_SCHEMAS.get(skill, ())
+        listed = next(
+            (
+                record.get("part_output_schemas")
+                for record in (records if isinstance(records, list) else [])
+                if isinstance(record, dict) and record.get("id") == skill
+            ),
+            None,
+        )
+        if parts and listed != list(parts):
+            problems.append(f"skills/catalog.yaml does not list the {skill} part schemas")
+        for part in parts:
+            released = _pack_bytes(root, f"skills/{skill}/references/{part}")
+            if released is None:
+                problems.append(f"missing skills/{skill}/references/{part}")
+                continue
+            try:
+                same = json.loads(released) == load_schema(part)
+            except json.JSONDecodeError:
+                same = False
+            if not same:
+                problems.append(f"skills/{skill} part schema differs from Hermes's {part}")
     return problems
 
 

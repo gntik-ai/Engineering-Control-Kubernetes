@@ -533,7 +533,7 @@ class ControlledWorkflow:
             return provider_task_queue("claude", default="claude")
         if step == "ui_plan.review":
             return provider_task_queue("codex", default="codex")
-        if step in {"ui_plan.stage_inputs", "ui_plan.stage_document"}:
+        if step in {"ui_plan.stage_inputs", "ui_plan.stage_document", "ui_plan.stage_parts"}:
             return task_queue_for("scan")
         # NEW-108: fixed opposite providers -- Claude drafts, Codex independently reviews.
         if step == "change_request.draft":
@@ -5064,6 +5064,10 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
     snapshot -> deterministic inventory -> kit snapshot (BLOCKED without kit data) ->
     Claude draft (plan-ui-migration) -> Codex review; at most one redraft and a second
     review, otherwise BLOCKED with the findings. It never approves anything.
+
+    NEW-131 (patch ui-plan-batched-blueprint-v1): Hermes fills the mechanical fields from the
+    inventory; Claude drafts a frame, then page batches; Codex reviews each part (one redraft
+    per part); Hermes assembles the reviewed parts into the blueprint candidate.
     """
 
     @workflow.run
@@ -5202,6 +5206,10 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             },
             "review_rounds": [],
         }
+        if workflow.patched(self._BATCHED_PATCH):
+            # NEW-131: Hermes fills the mechanical fields; Claude drafts the frame and the
+            # page batches, Codex reviews each part; Hermes assembles the reviewed parts.
+            return await self._plan_batched(request, context)
         approved: dict[str, Any] | None = None
         for attempt in (1, 2):
             if not await self._checkpoint("UI_PLAN_DRAFT"):
@@ -5314,6 +5322,197 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             "approval_binding": persisted.get("approval_binding"),
             "review_rounds": len(context.get("review_rounds", [])),
         }
+
+    _BATCHED_PATCH = "ui-plan-batched-blueprint-v1"
+    # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s);
+    # the activity bound leaves room for the CLI's start-up and result handling.
+    _PART_TIMEOUT_MINUTES = 40
+
+    async def _plan_batched(
+        self, request: UiMigrationPlanInput, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        staged = await self._step(
+            "ui_plan.stage_parts",
+            {
+                "project": request.project,
+                "blueprint_id": request.blueprint_id,
+                "inventory_sha256": context.get("inventory_sha256"),
+                "kit_snapshot_sha256": context.get("kit_snapshot_sha256"),
+                "batch_pages": context.get("batch_pages"),
+            },
+            timeout_minutes=30,
+        )
+        if staged.get("status") != "STAGED":
+            return await self._ui_plan_terminal(
+                context,
+                "BLOCKED",
+                str(staged.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
+                [str(staged.get("reason") or "")[:300]],
+            )
+        recorded = await self._step(
+            "ui_plan.record_parts",
+            {
+                **context,
+                "mechanical": staged.get("mechanical"),
+                "mechanical_sha256": staged.get("mechanical_sha256"),
+                "parts": staged.get("parts"),
+                "kit_slice": staged.get("kit_slice"),
+            },
+        )
+        if recorded.get("status") != "PARTS_RECORDED":
+            return await self._ui_plan_terminal(
+                recorded, "FAILED", str(recorded.get("blocker") or "UI_PLAN_PARTS_INVALID")
+            )
+        context = {key: value for key, value in recorded.items() if key != "status"}
+        approved: list[dict[str, Any]] = []
+        for part in list(context.get("parts") or []):
+            outcome = await self._ui_plan_part(
+                request, {**context, "approved_parts": approved}, part
+            )
+            if outcome.get("status") != "PART_APPROVED":
+                return await self._ui_plan_terminal(
+                    outcome,
+                    str(outcome.get("terminal") or "BLOCKED"),
+                    str(outcome.get("blocker") or "UI_PLAN_PART_FAILED"),
+                    outcome.get("blockers"),
+                )
+            approved.append(
+                {
+                    "part_id": outcome.get("part_id"),
+                    "kind": part.get("kind"),
+                    "content_sha256": outcome.get("content_sha256"),
+                }
+            )
+        if not await self._checkpoint("UI_PLAN_ASSEMBLE"):
+            return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
+        assembled = await self._step("ui_plan.assemble", {**context, "approved_parts": approved})
+        if assembled.get("status") != "ASSEMBLED":
+            return await self._ui_plan_terminal(
+                context,
+                "BLOCKED",
+                str(assembled.get("blocker") or "ASSEMBLY_INVALID"),
+                assembled.get("blockers"),
+            )
+        if not await self._checkpoint("UI_PLAN_PERSIST"):
+            return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
+        published = await self._step(
+            "ui_plan.stage_document",
+            {
+                "project": request.project,
+                "blueprint_id": request.blueprint_id,
+                "publish": True,
+                "document": assembled.get("document"),
+                "markdown": assembled.get("markdown"),
+            },
+        )
+        rounds = list(assembled.get("review_rounds") or [])
+        persisted = await self._step(
+            "ui_plan.persist",
+            {
+                "blueprint_id": request.blueprint_id,
+                "project": request.project,
+                "draft_attempt": assembled.get("draft_attempt"),
+                "reviewed_sha256": assembled.get("reviewed_sha256"),
+                "review_rounds": rounds,
+                "evidence": published.get("evidence", []),
+            },
+        )
+        return {
+            "status": persisted.get("status", "FAILED"),
+            "blueprint_id": request.blueprint_id,
+            "error_code": persisted.get("error_code"),
+            "blueprint_sha256": persisted.get("blueprint_sha256"),
+            "approval_binding": persisted.get("approval_binding"),
+            "review_rounds": len(rounds),
+            "parts": len(approved),
+        }
+
+    async def _ui_plan_part(
+        self, request: UiMigrationPlanInput, context: dict[str, Any], part: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Draft (Claude) and review (Codex) one part; at most one redraft of that part."""
+        current: dict[str, Any] = {**context, "part": part, "part_rounds": []}
+        for attempt in (1, 2):
+            if not await self._checkpoint("UI_PLAN_PART_DRAFT"):
+                return {**current, "terminal": "FAILED", "blocker": "UI_PLAN_CANCELLED"}
+            current = await self._step(
+                "ui_plan.prepare_part", {**current, "draft_attempt": attempt}
+            )
+            if current.get("status") == "PART_REUSED":
+                return {**current, "status": "PART_APPROVED"}
+            if current.get("status") != "DRAFT_READY":
+                return {
+                    **current,
+                    "terminal": "FAILED",
+                    "blocker": str(current.get("blocker") or "DRAFT_INPUT_INVALID"),
+                }
+            current = await self._agent_step(
+                "ui_plan.draft", current, timeout_minutes=self._PART_TIMEOUT_MINUTES
+            )
+            if current.get("status") != "SUCCESS":
+                return {**current, "blocker": self._ui_provider_blocker("DRAFT", current)}
+            recorded = await self._step("ui_plan.record_part_draft", current)
+            if recorded.get("status") != "DRAFT_RECORDED":
+                return {
+                    **recorded,
+                    "blocker": str(recorded.get("blocker") or "DRAFT_SCHEMA_INVALID"),
+                }
+            current = {key: value for key, value in recorded.items() if key != "document"}
+            name = f"part-{current.get('part_id')}-draft-{attempt}.json"
+            draft = await self._step(
+                "ui_plan.stage_document",
+                {
+                    "project": request.project,
+                    "blueprint_id": request.blueprint_id,
+                    "name": name,
+                    "document": recorded.get("document"),
+                },
+            )
+            if draft.get("status") != "STAGED":
+                return {
+                    **current,
+                    "blocker": str(draft.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
+                }
+            current = {**current, "draft_file": draft.get("document")}
+            if not await self._checkpoint("UI_PLAN_PART_REVIEW"):
+                return {**current, "terminal": "FAILED", "blocker": "UI_PLAN_CANCELLED"}
+            current = await self._step("ui_plan.prepare_part_review", current)
+            if current.get("status") != "REVIEW_READY":
+                return {
+                    **current,
+                    "terminal": "FAILED",
+                    "blocker": str(current.get("blocker") or "REVIEW_INPUT_INVALID"),
+                }
+            current = await self._agent_step(
+                "ui_plan.review", current, timeout_minutes=self._PART_TIMEOUT_MINUTES
+            )
+            if current.get("status") != "SUCCESS":
+                return {**current, "blocker": self._ui_provider_blocker("REVIEW", current)}
+            reviewed = await self._step("ui_plan.record_part_review", current)
+            current = {key: value for key, value in reviewed.items() if key != "document"}
+            if reviewed.get("status") == "PART_APPROVED":
+                return current
+            if reviewed.get("status") != "PART_REVISE":
+                return {
+                    **current,
+                    "blocker": str(reviewed.get("blocker") or "REVIEW_SCHEMA_INVALID"),
+                }
+            review = await self._step(
+                "ui_plan.stage_document",
+                {
+                    "project": request.project,
+                    "blueprint_id": request.blueprint_id,
+                    "name": f"part-{current.get('part_id')}-review-{attempt}.json",
+                    "document": reviewed.get("document"),
+                },
+            )
+            if review.get("status") != "STAGED":
+                return {
+                    **current,
+                    "blocker": str(review.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
+                }
+            current = {**current, "review_file": review.get("document")}
+        return {**current, "blocker": "BLUEPRINT_PART_REVIEW_UNRESOLVED"}
 
     @staticmethod
     def _ui_provider_blocker(phase: str, context: dict[str, Any]) -> str:

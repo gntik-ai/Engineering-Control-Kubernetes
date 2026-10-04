@@ -327,6 +327,8 @@ def test_api_approval_is_bound_and_starts_the_capped_fanout(api: Any) -> None:
     with client:
         markdown = client.get(f"/v1/ui-blueprints/{blueprint_id}/markdown", headers=CLI).json()
         assert markdown["markdown"].startswith("# UI migration blueprint: falcone")
+        # NEW-131: the per-call token usage totals ride along (none for this fixture).
+        assert markdown["usage"]["total"]["calls"] == 0
         wrong = client.post(
             f"/v1/ui-blueprints/{blueprint_id}/approve",
             json={"approval_binding": "0" * 64, "typed_confirmation": APPROVAL_PHRASE},
