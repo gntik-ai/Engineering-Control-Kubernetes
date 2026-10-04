@@ -43,6 +43,7 @@ from engineering_control.engineering.toolchain import (
     prepare_executables,
     render_argv,
 )
+from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
@@ -162,6 +163,7 @@ class ScanActivityHandler:
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
+            "ui.inventory",
         }
     )
     _repositories = {
@@ -288,6 +290,8 @@ class ScanActivityHandler:
                 return await asyncio.to_thread(self._prepare_observability_workspace, payload)
             if step == "observability.cleanup_workspace":
                 return await asyncio.to_thread(self._cleanup_observability_workspace, payload)
+            if step == "ui.inventory":
+                return await asyncio.to_thread(self._ui_inventory, payload)
         except PermissionError as error:
             raise ApplicationError(
                 "runtime observer credential violates least-privilege policy",
@@ -1157,6 +1161,49 @@ class ScanActivityHandler:
             "status": "STATIC_SOURCE_PASS" if source else "STATIC_DEPLOYMENT_PASS",
             f"{name}_inspection": inspection,
             f"{name}_inspection_sha256": hashlib.sha256(canonical).hexdigest(),
+        }
+
+    def _ui_inventory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-120: the deterministic legacy-console inventory of an immutable snapshot.
+
+        Model-free and read-only on the worktree: the snapshot must be at the expected SHA
+        and clean. The full JSON and Markdown go to evidence; the result carries only the
+        summary, the hashes and the evidence receipts (bounded Temporal payload).
+        """
+        project = Project(str(payload["project"]))
+        snapshot = self._find_mapping(payload, "snapshot")
+        if snapshot is None:
+            raise ValueError("ui inventory requires the immutable source snapshot")
+        worktree = Path(str(snapshot["source_worktree"]))
+        source_sha = self._sha(snapshot.get("source_sha"), "source_sha")
+        inspection = self.manager.inspect_snapshot(worktree, expected_sha=source_sha)
+        policy = self.catalog.project(project.value).ui_migration
+        if policy is None:
+            raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {project.value} has no ui_migration")
+        document = build_inventory(worktree, policy, source_sha=source_sha, project=project.value)
+        digest = str(document["inventory_sha256"])
+        directory = self.settings.evidence_root / "scan" / "ui-inventory" / digest[:32]
+        directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        json_path = directory / "ui-inventory.json"
+        markdown_path = directory / "ui-inventory.md"
+        self._atomic_text(json_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+        self._atomic_text(markdown_path, render_markdown(document))
+        receipts = self._publish_reports(
+            payload,
+            [json_path, markdown_path],
+            filename_prefix=f"ui-inventory-{digest[:12]}",
+            category="snapshot",
+        )
+        return {
+            **payload,
+            "status": "UI_INVENTORY_PASS",
+            "schema_version": document["schema_version"],
+            "source_sha": source_sha,
+            "source_inspection": inspection,
+            "inventory_sha256": digest,
+            "summary": document["summary"],
+            "route_tables": document["route_tables"],
+            "evidence": receipts,
         }
 
     def _snapshot_pair(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2723,6 +2770,7 @@ class ScanActivityHandler:
         reports: list[Path],
         *,
         filename_prefix: str,
+        category: str = "changes",
     ) -> list[dict[str, Any]]:
         orchestration = payload.get("orchestration")
         if not isinstance(orchestration, dict) or not isinstance(
@@ -2770,7 +2818,7 @@ class ScanActivityHandler:
                 workflow_id=workflow_id,
                 campaign_id=campaign_id,
                 change_set_id=change_set_id,
-                category="changes",
+                category=category,
                 filename=f"{filename_prefix}-{report.name}",
                 producer="scan-runner",
                 content_type=content_type,

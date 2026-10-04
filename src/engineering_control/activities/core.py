@@ -243,6 +243,8 @@ class ControlActivities:
         "observability.invoke_codex_checker",
         "observability.finalize",
         "observability.cleanup_workspace",
+        # NEW-120: deterministic legacy-console inventory (scan worker, read-only).
+        "ui.inventory",
         # Post-merge staging GitOps flow: controller (DB + kubectl) steps ...
         "gitops.flow_for_project",
         "gitops.prepare",
@@ -362,6 +364,7 @@ class ControlActivities:
             "observability.invoke_claude_maker",
             "observability.invoke_codex_checker",
             "observability.cleanup_workspace",
+            "ui.inventory",
             "change_request.draft",
             "change_request.review",
             "change_request.github_dedupe",
@@ -391,6 +394,7 @@ class ControlActivities:
             "reconcile.apply_promotion",
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
+            "ui.inventory",
         },
         "codex": {
             "audit.agent_cell",

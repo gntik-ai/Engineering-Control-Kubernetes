@@ -5,6 +5,7 @@ import json
 import os
 import pwd
 import stat
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -356,6 +357,17 @@ def parser() -> argparse.ArgumentParser:
     change_reject = commands.add_parser("change-reject")
     change_reject.add_argument("change_request_id")
     change_reject.add_argument("--reason", required=True)
+    # NEW-120: local, read-only, model-free legacy-console inventory (no API call).
+    ui_inventory = commands.add_parser("ui-inventory")
+    ui_inventory.add_argument("--checkout", type=Path, required=True)
+    ui_inventory.add_argument("--project", choices=("falcone",), default="falcone")
+    ui_inventory.add_argument(
+        "--manifest",
+        type=Path,
+        help="project manifest (default: /etc/engineering-control/projects.d/<project>.yaml)",
+    )
+    ui_inventory.add_argument("--source-sha", help="default: the checkout's HEAD commit")
+    ui_inventory.add_argument("--output-dir", type=Path)
     dashboard = commands.add_parser("dashboard")
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
     for name in ("init-password", "reset-password"):
@@ -822,6 +834,14 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
 
 def main() -> None:
     arguments = parser().parse_args()
+    if arguments.command == "ui-inventory":
+        try:
+            result = _ui_inventory_command(arguments)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"engineering-ctl: {error}", file=sys.stderr)
+            raise SystemExit(1) from error
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     if arguments.command == "dashboard":
         try:
             _dashboard_password_command(arguments)
@@ -835,6 +855,60 @@ def main() -> None:
         print(f"engineering-ctl: {error}", file=sys.stderr)
         raise SystemExit(1) from error
     print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
+    """Inventory a local checkout read-only; writes only the requested output directory."""
+    import yaml
+
+    from engineering_control.engineering.models import ProjectManifest
+    from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
+
+    checkout = Path(arguments.checkout).resolve(strict=True)
+    if not checkout.is_dir():
+        raise ValueError("--checkout must be a directory")
+    manifest_path = arguments.manifest or Path(
+        f"/etc/engineering-control/projects.d/{arguments.project}.yaml"
+    )
+    manifest = ProjectManifest.model_validate(
+        yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8"))
+    )
+    if manifest.project != arguments.project:
+        raise ValueError("the manifest belongs to another project")
+    if manifest.ui_migration is None:
+        raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {arguments.project} has no ui_migration")
+    source_sha = (
+        arguments.source_sha
+        or subprocess.run(  # noqa: S603
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],  # noqa: S607
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+    )
+    document = build_inventory(
+        checkout, manifest.ui_migration, source_sha=source_sha, project=arguments.project
+    )
+    result: dict[str, Any] = {
+        "schema_version": document["schema_version"],
+        "project": document["project"],
+        "source_sha": document["source_sha"],
+        "inventory_sha256": document["inventory_sha256"],
+        "summary": document["summary"],
+    }
+    if arguments.output_dir is not None:
+        output = Path(arguments.output_dir).resolve()
+        if output == checkout or output.is_relative_to(checkout):
+            raise ValueError("--output-dir must be outside the checkout (read-only scan)")
+        output.mkdir(parents=True, exist_ok=True)
+        stem = f"ui-inventory-{arguments.project}-{source_sha[:12]}"
+        json_path = output / f"{stem}.json"
+        markdown_path = output / f"{stem}.md"
+        json_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", "utf-8")
+        markdown_path.write_text(render_markdown(document), encoding="utf-8")
+        result["outputs"] = [str(json_path), str(markdown_path)]
+    return result
 
 
 def _dashboard_password_command(arguments: argparse.Namespace) -> None:
