@@ -78,6 +78,7 @@ from engineering_control.engineering.models import ProjectManifest
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
     load_deployment_pin,
+    load_maker_rules,
     toolchain_test_command_lines,
 )
 from engineering_control.leases.component import ComponentLeaseConflict, ComponentLeaseManager
@@ -3646,6 +3647,7 @@ class MetadataActivityHandler:
                 else ""
             )
             + self._deployment_pin_prompt(payload, role="deployment" if deployment else "source")
+            + self._maker_rules_prompt(payload, deployments=(deployment,))
             + (
                 self._toolchain_prompt(payload, role="maker")
                 if not deployment or payload["source_worktree"] == payload["deployment_worktree"]
@@ -3735,6 +3737,34 @@ class MetadataActivityHandler:
             "commits and earlier attempts (" + "; ".join(ranges) + "), not only the last "
             "commit.\n"
         )
+
+    def _maker_rules_prompt(
+        self, payload: dict[str, Any], *, deployments: tuple[bool, ...], checker: bool = False
+    ) -> str:
+        """The project's standing maker rules (operator-owned manifest), per repository."""
+        sections: list[str] = []
+        for deployment in deployments:
+            try:
+                rules = load_maker_rules(
+                    self.settings.project_config_root,
+                    str(payload["project"]),
+                    deployment=deployment,
+                )
+            except (OSError, ValueError):
+                return ""  # advisory only: a missing manifest never blocks the maker
+            if rules:
+                target = "deployment" if deployment else "source"
+                sections.append(
+                    f"Standing project rules for the {target} repository"
+                    + (
+                        " (the maker had to follow them; a violation is a blocking finding)"
+                        if checker
+                        else ""
+                    )
+                    + ":\n"
+                    + "".join(f"- {rule}\n" for rule in rules)
+                )
+        return "".join(sections)
 
     def _deployment_pin_prompt(self, payload: dict[str, Any], *, role: str) -> str:
         """NEW-118: the source CI pin of the deployment repository is Hermes's to set."""
@@ -3842,6 +3872,7 @@ class MetadataActivityHandler:
             + _TASKS_MD_ADVISORY
             + self._checker_range_prompt(payload)
             + self._deployment_pin_prompt(payload, role="checker")
+            + self._maker_rules_prompt(payload, deployments=(False, True), checker=True)
             + self._toolchain_prompt(payload, role="checker")
             + f"Report concisely. {_STRUCTURED_OUTPUT_JSON_RULES}\n\n"
             f"Issue: {payload['issue_url']}\nRisk: {payload['risk_class']}\n"

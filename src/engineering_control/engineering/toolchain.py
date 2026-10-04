@@ -38,6 +38,14 @@ def load_deployment_pin(project_config_root: Path, project: str) -> DeploymentPi
     return load_project_manifest(project_config_root, project).deployment_pin
 
 
+def load_maker_rules(project_config_root: Path, project: str, *, deployment: bool) -> list[str]:
+    """The project's standing maker rules for the source or deployment repository."""
+    rules = load_project_manifest(project_config_root, project).maker_rules
+    if rules is None:
+        return []
+    return list(rules.deployment if deployment else rules.source)
+
+
 def load_project_manifest(project_config_root: Path, project: str) -> ProjectManifest:
     """Read one bounded project manifest (no symlinks, size-bounded, identity-checked)."""
     if project not in _PROJECTS:

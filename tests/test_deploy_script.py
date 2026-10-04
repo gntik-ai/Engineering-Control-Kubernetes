@@ -69,7 +69,7 @@ def test_the_migration_runs_after_the_swap_and_restores_every_dependent() -> Non
     assert '"$MIGRATE_RESULT" != success' in text[result:start]
 
 
-def test_notifier_and_dashboard_are_restarted_and_the_watchdog_pin_is_left_alone() -> None:
+def test_notifier_dashboard_and_watchdog_are_restarted() -> None:
     text = _text()
     restarts = _index(text, "=== 6/7: restart services ===")
     verify = _index(text, "=== 7/7: verify ===")
@@ -78,7 +78,21 @@ def test_notifier_and_dashboard_are_restarted_and_the_watchdog_pin_is_left_alone
         "sudo systemctl restart engineering-notifier.service engineering-dashboard.service" in step
     )
     assert 'sudo systemctl restart "$unit"' in step and "engineering-watchdog.service |" in step
-    assert "restart engineering-watchdog" not in text
+    assert "sudo systemctl restart engineering-watchdog.service" in step
+    assert "F-11 drop-in present" not in text
+
+
+def test_the_gateway_hook_is_installed_backed_up_and_synced_when_it_differs() -> None:
+    text = _text()
+    restarts = _index(text, "=== 6/7: restart services ===")
+    verify = _index(text, "=== 7/7: verify ===")
+    step = text[restarts:verify]
+    assert 'HOOK_TARGET="$HOME/.hermes/hooks/engineering-control"' in step
+    assert 'cp -a "$HOOK_TARGET/." "$HOOK_BACKUP/"' in step
+    assert step.index("cp -a") < step.index('install -m 0640 "$HOOK_SOURCE')
+    assert step.index('install -m 0640 "$HOOK_SOURCE') < step.index("\n  sync\n")
+    assert step.index("\n  sync\n") < step.index("sudo systemctl restart hermes-gateway.service")
+    assert "gateway hook already matches this release" in step
 
 
 def test_every_migrate_dependent_is_verified_active_and_the_revision_printed() -> None:
@@ -210,3 +224,32 @@ def test_recovery_attempts_every_step_even_when_commands_fail(
         assert "fix forward" in result.stderr
     assert "RECOVERY: run these on the controller" in result.stderr
     assert "ROLLED BACK" not in result.stderr
+
+
+def test_hook_install_runs_on_a_host_without_a_previous_hook(tmp_path: Path) -> None:
+    # Extract the hook block and run it against a fresh HOME without any previous hook.
+    text = _text()
+    start = text.index('HOOK_SOURCE="$RELEASE_DIR/source/integrations')
+    end = text.index("# Every other Requires=engineering-migrate dependent")
+    block = text[start:end].replace(
+        "sudo systemctl restart hermes-gateway.service", "echo RESTARTED-GATEWAY"
+    )
+    source = tmp_path / "release" / "source" / "integrations" / "hermes-engineering-control"
+    (source / "hook").mkdir(parents=True)
+    (source / "hook" / "HOOK.yaml").write_text("name: hook\n")
+    (source / "hook" / "handler.py").write_text("print('hook')\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    script = f"set -euo pipefail\nRELEASE_DIR={tmp_path / 'release'}\nHOME={home}\n{block}"
+    result = subprocess.run(  # noqa: S603 - a fixed interpreter and a generated script
+        ["/bin/bash", "-c", script], capture_output=True, text=True, check=True
+    )
+    target = home / ".hermes" / "hooks" / "engineering-control"
+    assert (target / "HOOK.yaml").read_text() == "name: hook\n"
+    assert (target / "handler.py").read_text() == "print('hook')\n"
+    assert "RESTARTED-GATEWAY" in result.stdout
+    assert "no previous hook" in result.stdout
+    again = subprocess.run(  # noqa: S603
+        ["/bin/bash", "-c", script], capture_output=True, text=True, check=True
+    )
+    assert "already matches" in again.stdout and "RESTARTED-GATEWAY" not in again.stdout

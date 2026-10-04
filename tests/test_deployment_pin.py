@@ -384,3 +384,36 @@ def test_makers_and_the_checker_are_told_hermes_manages_the_pin() -> None:
         and f"{'a' * 40} (ancestor of the deployment HEAD: yes)" in merged
     )
     assert "Never request a source change for the pin" in merged
+
+
+def _rules_prompt(deployments: tuple[bool, ...], *, checker: bool = False) -> str:
+    stub = SimpleNamespace(settings=SimpleNamespace(project_config_root=PROJECTS))
+    payload = {"project": "falcone"}
+    return str(
+        MetadataActivityHandler._maker_rules_prompt(  # type: ignore[arg-type]
+            stub, payload, deployments=deployments, checker=checker
+        )
+    )
+
+
+def test_standing_maker_rules_reach_the_matching_maker_and_the_checker() -> None:
+    deployment = _rules_prompt((True,))
+    source = _rules_prompt((False,))
+    checker = _rules_prompt((False, True), checker=True)
+    assert "--reuse-values" in deployment and "deployment repository" in deployment
+    assert source == ""  # falcone has no source rules
+    assert "--reuse-values" in checker and "a violation is a blocking finding" in checker
+
+
+def test_maker_rules_are_bounded_operator_config() -> None:
+    import pydantic
+
+    from engineering_control.engineering.models import MakerRules
+
+    MakerRules(deployment=["x" * 600])
+    with pytest.raises(pydantic.ValidationError):
+        MakerRules(deployment=["x" * 601])
+    with pytest.raises(pydantic.ValidationError):
+        MakerRules(deployment=["rule"] * 13)
+    with pytest.raises(pydantic.ValidationError):
+        MakerRules(deployment=[""])

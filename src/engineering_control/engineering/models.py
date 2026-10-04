@@ -414,6 +414,20 @@ class UiMigrationPolicy(EngineeringModel):
         return self
 
 
+class MakerRules(EngineeringModel):
+    """Project-specific standing rules for makers and checkers (operator-owned config).
+
+    Appended verbatim to the maker (and checker) instructions of the matching repository.
+    Bounded: these are short operator rules, not a second instruction channel."""
+
+    source: list[Annotated[str, Field(min_length=1, max_length=600)]] = Field(
+        default_factory=list, max_length=12
+    )
+    deployment: list[Annotated[str, Field(min_length=1, max_length=600)]] = Field(
+        default_factory=list, max_length=12
+    )
+
+
 class ProjectManifest(EngineeringModel):
     schema_version: Literal[1]
     project: Literal["falcone", "musematic", "llmwiki"]
@@ -430,6 +444,7 @@ class ProjectManifest(EngineeringModel):
     deployment_pin: DeploymentPinPolicy | None = None
     # NEW-120: the side-by-side console migration (legacy -> gntik-ui) contract.
     ui_migration: UiMigrationPolicy | None = None
+    maker_rules: MakerRules | None = None
 
     @model_validator(mode="after")
     def deployment_pin_requires_a_pair(self) -> ProjectManifest:

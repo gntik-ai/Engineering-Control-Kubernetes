@@ -194,3 +194,14 @@ ui_migration:
   staging_next_path: /next/
   languages: [es, en]
   default_language: es
+# Standing maker rules (2026-10-04): falcone-charts #15, #16 and #17 each needed a CI
+# repair round because new values keys broke `helm upgrade --reuse-values` of existing
+# releases (test bbx-temporal-bootstrap-048).
+maker_rules:
+  deployment:
+    - >-
+      Chart changes must survive `helm upgrade --reuse-values` from an existing release:
+      read every new or renamed values key with a safe default (`default`, `dig` or
+      `hasKey`) in templates and in templates/validate.yaml, so a release installed
+      before this change still renders. Run the reuse-values upgrade test
+      (bbx-temporal-bootstrap-048 in tests/blackbox/temporal-bootstrap) before finishing.
