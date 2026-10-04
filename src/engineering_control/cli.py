@@ -874,6 +874,7 @@ def main() -> None:
 
 def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
     """Inventory a local checkout read-only; writes only the requested output directory."""
+    from engineering_control.engineering.safe_files import write_text_no_follow
     from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
 
     checkout = Path(arguments.checkout).resolve(strict=True)
@@ -906,8 +907,8 @@ def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
         stem = f"ui-inventory-{arguments.project}-{source_sha[:12]}"
         json_path = output / f"{stem}.json"
         markdown_path = output / f"{stem}.md"
-        json_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", "utf-8")
-        markdown_path.write_text(render_markdown(document), encoding="utf-8")
+        write_text_no_follow(json_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+        write_text_no_follow(markdown_path, render_markdown(document))
         result["outputs"] = [str(json_path), str(markdown_path)]
     return result
 
@@ -934,6 +935,7 @@ def _ui_kit_snapshot_command(arguments: argparse.Namespace) -> dict[str, Any]:
     """Run the pinned gntik-ui image locally and write the kit snapshot (read-only tools)."""
     import asyncio
 
+    from engineering_control.engineering.safe_files import write_text_no_follow
     from engineering_control.engineering.ui_kit import (
         UI_MCP_UNAVAILABLE,
         GntikUiKitClient,
@@ -972,7 +974,7 @@ def _ui_kit_snapshot_command(arguments: argparse.Namespace) -> dict[str, Any]:
         output = Path(arguments.output_dir).resolve()
         output.mkdir(parents=True, exist_ok=True)
         path = output / f"ui-kit-snapshot-{document['snapshot_sha256'][:12]}.json"
-        path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", "utf-8")
+        write_text_no_follow(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
         result["outputs"] = [str(path)]
     return result
 

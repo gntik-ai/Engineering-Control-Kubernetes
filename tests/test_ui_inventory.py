@@ -592,6 +592,27 @@ def test_nested_directory_and_file_symlinks_are_skipped_and_recorded(tmp_path: P
         ("requestJson('/v1/x', { method: 'GET', method: 'DELETE' })", UNKNOWN_METHOD),
         ("requestJson('/v1/x', { method: 'TRACE' })", UNKNOWN_METHOD),
         ("requestJson('/v1/x', { method() { return 'GET' } })", UNKNOWN_METHOD),
+        # property syntax: accessors, escapes, prototype, generators
+        (
+            "requestJson('/v1/x', { method: 'GET', get method() { return 'DELETE' } })",
+            UNKNOWN_METHOD,
+        ),
+        ("requestJson('/v1/x', { set method(v) {} })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { 'meth\\u006fd': 'DELETE' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { meth\\u006fd: 'DELETE' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { __proto__: { method: 'DELETE' } })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { '__proto__': proto, body })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { *gen() {}, method: 'GET' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { async body() {} })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { `method`: 'GET' })", UNKNOWN_METHOD),
+        # plain properties, including a non-method identifier shorthand
+        ("requestJson('/v1/x', { method: 'POST', body, headers: h, 1: x })", "POST"),
+        ("requestJson('/v1/x', { 'method': 'PUT', 'body': b })", "PUT"),
+        # argument spreads
+        ("requestJson('/v1/x', ...rest)", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: 'GET' }, ...rest)", UNKNOWN_METHOD),
+        ("fetch(...['/v1/x', { method: 'DELETE' }])", UNKNOWN_METHOD),
+        ("fetch(...['/v1/x'])", UNKNOWN_METHOD),
     ],
 )
 def test_the_method_comes_only_from_the_top_level_options_literal(
@@ -618,3 +639,24 @@ def test_an_unknown_method_is_never_ok_on_a_possible_mismatch() -> None:
     assert tables.classify(EndpointUse(UNKNOWN_METHOD, "/v1/events/topics"))[0].value == (
         "GATEWAY_ONLY"
     )
+
+
+def test_cli_never_follows_a_symlink_planted_at_its_output_name(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    shutil.copytree(FIXTURE, checkout)
+    victim = checkout / "apps/web-console/src/main.tsx"
+    original = victim.read_text(encoding="utf-8")
+    output = tmp_path / "out"
+    output.mkdir()
+    for suffix in ("json", "md"):
+        (output / f"ui-inventory-falcone-{SHA[:12]}.{suffix}").symlink_to(victim)
+    arguments = Namespace(
+        checkout=checkout,
+        project="falcone",
+        manifest=PROJECTS / "falcone.yaml",
+        source_sha=SHA,
+        output_dir=output,
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        _ui_inventory_command(arguments)
+    assert victim.read_text(encoding="utf-8") == original

@@ -4,6 +4,8 @@ Usage: ui_kit_stub_server.py <mode> <log-file>
 - ok:    answers initialize, tools/list (the 16 pinned tool names) and tools/call (echoes
          the tool and arguments; `get_rules` returns NUL bytes, `get_tokens` 600 KiB).
 - hang:  ignores stdin, spawns a long-sleeping grandchild, records both pids, never answers.
+- linger: like ok, but keeps running after stdin closes (records its pid on EOF).
+- manytools: like ok, but tools/list also returns 20,000 long server-controlled names.
 """
 
 from __future__ import annotations
@@ -46,6 +48,9 @@ def main() -> None:
         log(log_path, {"server": os.getpid(), "grandchild": child.pid})
         while True:
             time.sleep(1)
+    extra = (
+        [f"tool-{index:05d}-" + "x" * 150 for index in range(20000)] if mode == "manytools" else []
+    )
     for line in sys.stdin:
         message = json.loads(line)
         log(log_path, {"method": message.get("method"), "params": message.get("params")})
@@ -59,12 +64,14 @@ def main() -> None:
                 "capabilities": {"tools": {}},
             }
         elif method == "tools/list":
-            result = {"tools": [{"name": name} for name in TOOLS]}
+            result = {"tools": [{"name": name} for name in TOOLS + extra]}
         elif method == "tools/call":
             name = message["params"]["name"]
             arguments = message["params"]["arguments"]
             if name == "get_rules":
                 text = "rule\x00one"
+            elif name == "get_adoption_guide":
+                text = "Use Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEF here"
             elif name == "get_tokens":
                 text = "x" * (600 * 1024)
             else:
@@ -81,6 +88,10 @@ def main() -> None:
             sys.stdout.flush()
             continue
         print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+    if mode == "linger":
+        log(log_path, {"eof": os.getpid()})
+        while True:
+            time.sleep(1)
 
 
 if __name__ == "__main__":

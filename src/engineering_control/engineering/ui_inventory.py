@@ -32,6 +32,7 @@ from typing import Any
 import yaml
 
 from engineering_control.engineering.models import UiMigrationPolicy
+from engineering_control.security.redaction import SecretRedactor
 
 SCHEMA_VERSION = 1
 GENERATOR = "engineering_control.engineering.ui_inventory"
@@ -357,6 +358,8 @@ def extract_endpoints(source: JsSource) -> set[EndpointUse]:
     attributed: dict[int, set[str]] = {}
     uses: set[EndpointUse] = set()
     for start, _end, first_argument, arguments in _request_calls(source):
+        if source.masked[first_argument[0] : first_argument[1]].strip().startswith("..."):
+            continue  # fetch(...args): the URL is not this call's own literal
         method = _call_method(source, arguments)
         for literal_start in _argument_literals(source, start, first_argument):
             if literal_start in paths:
@@ -428,17 +431,24 @@ def _request_calls(source: JsSource) -> Iterable[tuple[int, int, tuple[int, int]
         yield match.start(), close + 1, parts[0], arguments
 
 
+_PLAIN_KEY = re.compile(r"[A-Za-z_$][\w$]*|[0-9]+")
+
+
 def _call_method(source: JsSource, arguments: tuple[int, int]) -> str:
     """The verb from the call's own top-level options object literal, else UNKNOWN.
 
-    `fn(url)` is GET. `fn(url, {...})` is known only when the literal has exactly one
-    `method` property whose whole value is a complete string literal, no spread after it
-    and no computed key; with no `method` and no spread it is GET. Anything else -- a
-    nested `method`, indirect options (`fn(url, opts)`), a computed or partial value
-    (`'PO' + x`), a later `...opts`, `['method']` -- is UNKNOWN.
+    `fn(url)` is GET. `fn(url, {...})` is known only when every property of the literal
+    is plain -- `key: value` with an unescaped identifier, string or number key, or a
+    non-`method` identifier shorthand (`{ body }` is `body: body`) -- and exactly one is
+    `method`, whose whole value is one complete string literal, with no spread after it.
+    No `method` and no spread is GET. Anything else -- an argument spread, indirect options
+    (`fn(url, opts)`), accessors (`get method() {}`), method shorthand, computed (`[k]`) or
+    escaped keys, `__proto__`, partial values (`'PO' + x`), a later `...opts` -- is UNKNOWN.
     """
     masked = source.masked
     parts = _top_level_split(masked, *arguments)
+    if any(masked[a:b].strip().startswith("...") for a, b in parts):
+        return UNKNOWN_METHOD  # fetch(...args): neither the URL nor the options are known
     if len(parts) < 2 or not masked[parts[1][0] : parts[1][1]].strip():
         return "GET"  # fetch() and requestJson() default to GET
     if len(parts) > 2 and any(masked[a:b].strip() for a, b in parts[2:]):
@@ -467,24 +477,28 @@ def _call_method(source: JsSource, arguments: tuple[int, int]) -> str:
             spread = True
             spread_after_method = spread_after_method or methods > 0
             continue
-        if stripped.startswith("["):
-            return UNKNOWN_METHOD  # computed key: could be `method`
         key = source.literal_at(key_start)
         if key is not None:
-            name, key_end = key.value if not key.expressions else None, key.end
+            raw = source.text[key.start : key.end]
+            if key.expressions or "\\" in raw or raw.startswith("`"):
+                return UNKNOWN_METHOD  # template or escaped key
+            name, key_end = key.value, key.end
         else:
-            identifier = re.match(r"[A-Za-z_$][\w$]*", stripped)
+            identifier = _PLAIN_KEY.match(stripped)
             if identifier is None:
-                return UNKNOWN_METHOD
+                return UNKNOWN_METHOD  # computed key, generator, ...
             name, key_end = identifier.group(0), key_start + identifier.end()
-        if name is None:
-            return UNKNOWN_METHOD
+        rest = masked[key_end:prop_end]
+        colon = re.match(r"\s*:\s*", rest)
+        if colon is None:
+            if rest.strip() or key is not None or name in {"method", "__proto__"}:
+                return UNKNOWN_METHOD  # accessor, method shorthand, escaped identifier
+            continue  # `{ body }`: an identifier shorthand for `body: body`
+        if name == "__proto__" or not masked[key_end + colon.end() : prop_end].strip():
+            return UNKNOWN_METHOD  # prototype-derived properties
         if name != "method":
             continue
         methods += 1
-        colon = re.match(r"\s*:\s*", masked[key_end:prop_end])
-        if colon is None:
-            return UNKNOWN_METHOD  # shorthand `{ method }` or `method() {}`
         value = source.literal_at(key_end + colon.end())
         if value is None or value.expressions or masked[value.end : prop_end].strip():
             return UNKNOWN_METHOD  # not one complete string literal
@@ -1323,6 +1337,8 @@ def build_inventory(
         "orphan_pages": orphan_pages,
         "skipped_symlinks": sorted(skipped),
     }
+    # Redact first, so the hash covers exactly what is stored as evidence.
+    document = SecretRedactor().redact(document).value
     document["inventory_sha256"] = inventory_hash(document)
     return document
 

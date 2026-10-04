@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import stat
@@ -20,6 +21,7 @@ from engineering_control.cli import _ui_kit_snapshot_command
 from engineering_control.config import Settings
 from engineering_control.engineering import ui_kit
 from engineering_control.engineering.models import ProjectManifest, UiMigrationPolicy
+from engineering_control.engineering.safe_files import write_text_no_follow
 from engineering_control.engineering.ui_kit import (
     READ_ONLY_TOOLS,
     GntikUiKitClient,
@@ -28,7 +30,6 @@ from engineering_control.engineering.ui_kit import (
     KitUnavailable,
     collect_kit_snapshot,
     kit_command,
-    kit_environment,
     snapshot_hash,
     snapshot_plan,
     trusted_docker_executable,
@@ -81,9 +82,23 @@ def _alive(pid: int) -> bool:
 # -- the pinned launch -------------------------------------------------------------------
 
 
+SOCKET = "unix:///var/run/docker.sock"
+
+
 def test_the_container_command_is_pinned_offline_and_unprivileged() -> None:
-    assert kit_command("/usr/bin/docker", IMAGE, DIGEST, name="hermes-ui-kit-abc") == [
+    assert kit_command(
         "/usr/bin/docker",
+        IMAGE,
+        DIGEST,
+        name="hermes-ui-kit-abc",
+        endpoint=SOCKET,
+        config_dir="/run/kit-config",
+    ) == [
+        "/usr/bin/docker",
+        "--config",
+        "/run/kit-config",
+        "-H",
+        SOCKET,
         "run",
         "-i",
         "--rm",
@@ -101,44 +116,123 @@ def test_the_container_command_is_pinned_offline_and_unprivileged() -> None:
         f"{IMAGE}@{DIGEST}",
         "--stdio",
     ]
-    for docker, image, digest in (
-        ("docker", IMAGE, DIGEST),  # never a PATH lookup
-        ("/usr/bin/docker", f"{IMAGE}:latest", DIGEST),
-        ("/usr/bin/docker", IMAGE, "sha256:abc"),
-        ("/usr/bin/docker", IMAGE, "latest"),
+    for docker, image, digest, endpoint in (
+        ("docker", IMAGE, DIGEST, SOCKET),  # never a PATH lookup
+        ("/usr/bin/docker", f"{IMAGE}:latest", DIGEST, SOCKET),
+        ("/usr/bin/docker", IMAGE, "sha256:abc", SOCKET),
+        ("/usr/bin/docker", IMAGE, "latest", SOCKET),
+        ("/usr/bin/docker", IMAGE, DIGEST, "tcp://10.0.0.1:2375"),
+        ("/usr/bin/docker", IMAGE, DIGEST, "ssh://host"),
     ):
         with pytest.raises(ValueError):
-            kit_command(docker, image, digest, name="hermes-ui-kit-abc")
+            kit_command(
+                docker, image, digest, name="hermes-ui-kit-abc", endpoint=endpoint, config_dir="/c"
+            )
 
 
-def test_pinned_client_runs_in_root_with_a_minimal_environment() -> None:
+def test_pinned_client_uses_an_explicit_endpoint_and_a_private_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
     client = GntikUiKitClient.pinned(IMAGE, DIGEST, docker_executable="/usr/bin/docker")
-    assert client.cwd == "/"
-    assert set(client.environment) <= {"PATH", "DOCKER_HOST"}
-    assert client.argv[0] == "/usr/bin/docker"
-    assert client.argv[-2:] == [f"{IMAGE}@{DIGEST}", "--stdio"]
-    assert client.preflight == [
-        "/usr/bin/docker",
-        "image",
-        "inspect",
+    try:
+        (config,) = client.private_dirs
+        assert client.cwd == "/"
+        assert client.environment == {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": config,
+            "DOCKER_CONFIG": config,
+            "DOCKER_CONTEXT": "default",
+            "DOCKER_HOST": SOCKET,
+        }
+        metadata = os.lstat(config)
+        assert stat.S_IMODE(metadata.st_mode) == 0o700 and metadata.st_uid == os.geteuid()
+        assert os.listdir(config) == []
+        flags = ["/usr/bin/docker", "--config", config, "-H", SOCKET]
+        assert client.argv[:5] == flags
+        assert client.argv[-2:] == [f"{IMAGE}@{DIGEST}", "--stdio"]
+        assert client.preflight == [
+            *flags,
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            client.argv[-2],
+        ]
+        name = client.argv[client.argv.index("--name") + 1]
+        assert client.cleanup_argv == [*flags, "rm", "-f", name]
+    finally:
+        for directory in client.private_dirs:
+            os.rmdir(directory)
+
+
+def test_only_a_local_docker_socket_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ui_kit.docker_endpoint({}) == SOCKET
+    assert ui_kit.docker_endpoint({"DOCKER_HOST": "unix:///run/hermes/docker-scan.sock"}) == (
+        "unix:///run/hermes/docker-scan.sock"
+    )
+    for host in ("tcp://10.0.0.1:2375", "ssh://x", "unix:///run/../tmp/s", "npipe:////./pipe"):
+        with pytest.raises(KitUnavailable, match="non-local docker endpoint"):
+            ui_kit.docker_endpoint({"DOCKER_HOST": host})
+    monkeypatch.setenv("DOCKER_HOST", "tcp://10.0.0.1:2375")
+    with pytest.raises(KitUnavailable):
+        GntikUiKitClient.pinned(IMAGE, DIGEST, docker_executable="/usr/bin/docker")
+
+
+def _docker_usable() -> bool:
+    docker = trusted_docker_executable()
+    if docker is None:
+        return False
+    import subprocess
+
+    try:
+        return (
+            subprocess.run(  # noqa: S603
+                [docker, "-H", SOCKET, "version", "--format", "{{.Server.Version}}"],
+                capture_output=True,
+                timeout=20,
+                check=False,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@pytest.mark.skipif(not _docker_usable(), reason="no usable local docker daemon")
+async def test_a_planted_docker_context_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user config.json selecting a TCP context (and DOCKER_CONTEXT in the worker env)
+    must not redirect the kit's docker invocations away from the local socket."""
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "config.json").write_text(json.dumps({"currentContext": "evil"}), "utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DOCKER_CONFIG", str(planted))
+    monkeypatch.setenv("DOCKER_CONTEXT", "evil")
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    client = GntikUiKitClient.pinned(IMAGE, DIGEST)
+    (config,) = client.private_dirs
+    docker = client.argv[0]
+    process = await asyncio.create_subprocess_exec(
+        docker,
+        "--config",
+        config,
+        "-H",
+        SOCKET,
+        "version",
         "--format",
-        "{{.Id}}",
-        f"{IMAGE}@{DIGEST}",
-    ]
-    name = client.argv[client.argv.index("--name") + 1]
-    assert client.cleanup_argv == ["/usr/bin/docker", "rm", "-f", name]
-
-
-def test_environment_forwards_only_a_local_docker_socket() -> None:
-    assert kit_environment({"HOME": "/home/x", "LD_PRELOAD": "/var/lib/x.so"}) == {
-        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"
-    }
-    assert kit_environment({"DOCKER_HOST": "unix:///run/hermes/docker-scan.sock"}) == {
-        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-        "DOCKER_HOST": "unix:///run/hermes/docker-scan.sock",
-    }
-    for host in ("tcp://10.0.0.1:2375", "ssh://x", "unix:///run/../tmp/s"):
-        assert "DOCKER_HOST" not in kit_environment({"DOCKER_HOST": host})
+        "{{.Server.Version}}",
+        env=client.environment,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    assert process.returncode == 0, stderr  # the "evil" context would not even resolve
+    assert os.listdir(config) == []
+    await client.close(force=True)
+    assert not os.path.exists(config)  # noqa: ASYNC240
 
 
 def test_docker_must_be_absolute_and_root_owned(tmp_path: Path) -> None:
@@ -162,7 +256,7 @@ async def test_a_missing_image_fails_closed_before_any_container_starts(tmp_path
     calls = tmp_path / "docker-calls"
     docker = tmp_path / "docker"
     docker.write_text(
-        f'#!/bin/sh\necho "$1" >> {calls}\necho "Error: No such image: x" >&2\nexit 1\n',
+        f'#!/bin/sh\necho "$5" >> {calls}\necho "Error: No such image: x" >&2\nexit 1\n',
         encoding="utf-8",
     )
     docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
@@ -170,7 +264,9 @@ async def test_a_missing_image_fails_closed_before_any_container_starts(tmp_path
     with pytest.raises(KitUnavailable, match="is not pre-pulled"):
         async with client:
             pass
-    assert calls.read_text(encoding="utf-8").split() == ["image"]  # inspect only: no run
+    # inspect only (after --config <dir> -H <socket>): no run, no rm
+    assert calls.read_text(encoding="utf-8").split() == ["image"]
+    assert not any(os.path.exists(directory) for directory in client.private_dirs)  # noqa: ASYNC240
 
 
 # -- the session -------------------------------------------------------------------------
@@ -409,3 +505,153 @@ def test_cli_writes_a_local_snapshot_or_reports_the_blocker(
         "blocker": "UI_MCP_UNAVAILABLE",
         "reason": "the docker daemon is unreachable",
     }
+
+
+# -- review round 3 ----------------------------------------------------------------------
+
+
+async def test_a_killed_cli_always_removes_the_named_container(tmp_path: Path) -> None:
+    marker = tmp_path / "rm-ran"
+    client, log = _stub(
+        tmp_path,
+        "linger",  # answers, then keeps running after stdin closes
+        shutdown_seconds=0.5,
+        cleanup=["/bin/sh", "-c", f"touch {marker}"],
+    )
+    async with client:
+        await client.call("get_rules")
+    assert client.process is not None and client.process.returncode == -9
+    assert client.removed_container is True
+    assert marker.exists()
+    eof = next(entry["eof"] for entry in _log(log) if "eof" in entry)
+    assert not _alive(eof)
+
+
+async def test_a_clean_exit_needs_no_container_removal(tmp_path: Path) -> None:
+    marker = tmp_path / "rm-ran"
+    client, _log_path = _stub(tmp_path, cleanup=["/bin/sh", "-c", f"touch {marker}"])
+    async with client:
+        await client.call("get_rules")
+    assert client.process is not None and client.process.returncode == 0
+    assert client.removed_container is False and not marker.exists()
+
+
+async def test_cancellation_during_exit_completes_every_cleanup_step(tmp_path: Path) -> None:
+    marker = tmp_path / "rm-ran"
+    private = tmp_path / "private-config"
+    private.mkdir()
+    client, log = _stub(
+        tmp_path,
+        "linger",
+        shutdown_seconds=60,  # the graceful wait would block for a minute
+        cleanup=["/bin/sh", "-c", f"touch {marker}"],
+        private_dirs=[str(private)],
+    )
+
+    async def session() -> None:
+        async with client:
+            await client.call("get_rules")
+
+    task = asyncio.create_task(session())
+    for _ in range(200):  # until __aexit__ closed stdin and is waiting
+        if any("eof" in entry for entry in _log(log)):
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+    eof = next(entry["eof"] for entry in _log(log) if "eof" in entry)
+    assert not _alive(eof)
+    assert client.process is not None and client.process.returncode is not None
+    assert client._stderr_task is None
+    assert marker.exists() and client.removed_container is True
+    assert not private.exists()
+
+
+async def test_snapshot_text_is_redacted_before_it_is_hashed(tmp_path: Path) -> None:
+    client, _log_path = _stub(tmp_path)
+    async with client:
+        document = await collect_kit_snapshot(
+            client,
+            image=IMAGE,
+            digest=DIGEST,
+            gntik_ui_version=VERSION,
+            plan=[("get_adoption_guide", {})],
+        )
+    (call,) = document["calls"]
+    assert "abcdefghijklmnopqrstuvwxyz0123456789" not in call["text"]
+    assert "Bearer [REDACTED]" in call["text"] or "[REDACTED]" in call["text"]
+    data = call["text"].encode("utf-8")
+    assert call["sha256"] == hashlib.sha256(data).hexdigest() and call["bytes"] == len(data)
+    assert document["snapshot_sha256"] == snapshot_hash(document)
+
+
+async def test_stored_evidence_verifies_against_the_reported_digest(tmp_path: Path) -> None:
+    result = await _handler(tmp_path, lambda policy: _stub(tmp_path)[0]).handle(
+        "ui.kit_snapshot", {"project": "falcone"}
+    )
+    stored_path = (
+        tmp_path / "evidence/scan/ui-kit" / result["snapshot_sha256"][:32] / "ui-kit-snapshot.json"
+    )
+    stored = json.loads(stored_path.read_text(encoding="utf-8"))
+    assert snapshot_hash(stored) == stored["snapshot_sha256"] == result["snapshot_sha256"]
+    for call in stored["calls"]:
+        assert call["sha256"] == hashlib.sha256(call["text"].encode("utf-8")).hexdigest()
+    assert "abcdefghijklmnopqrstuvwxyz0123456789" not in stored_path.read_text(encoding="utf-8")
+
+
+async def test_server_controlled_fields_are_bounded_in_the_workflow_result(
+    tmp_path: Path,
+) -> None:
+    result = await _handler(tmp_path, lambda policy: _stub(tmp_path, "manytools")[0]).handle(
+        "ui.kit_snapshot", {"project": "falcone"}
+    )
+    assert result["tools_available_count"] == 20016
+    assert len(result["tools_available"]) <= 64
+    assert all(len(name) <= 64 for name in result["tools_available"])
+    assert len(json.dumps(result).encode("utf-8")) < 16 * 1024
+    stored_path = (
+        tmp_path / "evidence/scan/ui-kit" / result["snapshot_sha256"][:32] / "ui-kit-snapshot.json"
+    )
+    stored = json.loads(stored_path.read_text(encoding="utf-8"))
+    assert len(stored["tools_available"]) == 20016  # the full list is evidence only
+
+
+def test_evidence_and_cli_writes_never_follow_a_destination_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    victim = tmp_path / "checkout-file.ts"
+    victim.write_text("original\n", encoding="utf-8")
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "target.json").symlink_to(victim)
+    with pytest.raises(ValueError, match="symlink"):
+        write_text_no_follow(output / "target.json", "overwritten\n")
+    assert victim.read_text(encoding="utf-8") == "original\n"
+    write_text_no_follow(output / "fresh.json", "ok\n")
+    assert (output / "fresh.json").read_text(encoding="utf-8") == "ok\n"
+    assert [path.name for path in output.iterdir() if path.name.endswith(".tmp")] == []
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(output, target_is_directory=True)
+    with pytest.raises(OSError):
+        write_text_no_follow(linked_dir / "fresh.json", "x\n")
+
+    # The kit CLI refuses a planted symlink at its output name.
+    monkeypatch.setattr(
+        GntikUiKitClient, "from_policy", classmethod(lambda cls, policy: _stub(tmp_path)[0])
+    )
+    arguments = Namespace(
+        project="falcone",
+        manifest=PROJECTS / "falcone.yaml",
+        templates=[],
+        blocks=[],
+        components=[],
+        output_dir=tmp_path / "kit-out",
+    )
+    first = _ui_kit_snapshot_command(arguments)
+    (path,) = first["outputs"]
+    Path(path).unlink()
+    Path(path).symlink_to(victim)
+    with pytest.raises(ValueError, match="symlink"):
+        _ui_kit_snapshot_command(arguments)
+    assert victim.read_text(encoding="utf-8") == "original\n"

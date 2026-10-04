@@ -37,6 +37,7 @@ from engineering_control.engineering.models import (
     ToolchainTestCommand,
     UiMigrationPolicy,
 )
+from engineering_control.engineering.safe_files import write_text_no_follow
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
     load_toolchain_policy,
@@ -70,6 +71,24 @@ _TOOLCHAIN_HEARTBEAT_SECONDS = 30.0
 _BASELINE_TEST_TIMEOUT_SECONDS = 1200
 _BASELINE_OUTPUT_TAIL = 500
 _DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+_MAX_RESULT_NAMES = 64
+_MAX_RESULT_NAME_CHARS = 64
+_MAX_RESULT_NAMES_BYTES = 4096
+
+
+def _bounded_names(values: Any) -> list[str]:
+    """At most 64 names of at most 64 characters and 4 KiB in total (Temporal payloads)."""
+    names: list[str] = []
+    total = 0
+    for value in values if isinstance(values, list) else []:
+        name = str(value)[:_MAX_RESULT_NAME_CHARS]
+        total += len(name.encode("utf-8"))
+        if len(names) >= _MAX_RESULT_NAMES or total > _MAX_RESULT_NAMES_BYTES:
+            break
+        names.append(name)
+    return names
 
 
 class WorktreeAllocationRequest(BaseModel):
@@ -1202,8 +1221,8 @@ class ScanActivityHandler:
         directory.mkdir(parents=True, exist_ok=True, mode=0o750)
         json_path = directory / "ui-inventory.json"
         markdown_path = directory / "ui-inventory.md"
-        self._atomic_text(json_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
-        self._atomic_text(markdown_path, render_markdown(document))
+        self._store_redacted_json(json_path, document)
+        write_text_no_follow(markdown_path, render_markdown(document))
         receipts = self._publish_reports(
             payload,
             [json_path, markdown_path],
@@ -1272,7 +1291,7 @@ class ScanActivityHandler:
         directory = self.settings.evidence_root / "scan" / "ui-kit" / digest[:32]
         directory.mkdir(parents=True, exist_ok=True, mode=0o750)
         path = directory / "ui-kit-snapshot.json"
-        self._atomic_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+        self._store_redacted_json(path, document)
         receipts = self._publish_reports(
             payload, [path], filename_prefix=f"ui-kit-{digest[:12]}", category="snapshot"
         )
@@ -1283,11 +1302,27 @@ class ScanActivityHandler:
             "snapshot_sha256": digest,
             "image": document["image"],
             "gntik_ui_version": document["gntik_ui_version"],
-            "server_info": document["server_info"],
-            "tools_available": document["tools_available"],
-            "summary": document["summary"],
+            # Server-controlled data is bounded here; the full lists live only in evidence.
+            "server_info": {
+                str(key)[:32]: str(value)[:64]
+                for key, value in list(document["server_info"].items())[:4]
+            },
+            "tools_available_count": len(document["tools_available"]),
+            "tools_available": _bounded_names(document["tools_available"]),
+            "summary": {
+                key: int(document["summary"][key])
+                for key in ("calls", "errors", "truncated", "text_bytes")
+            },
             "evidence": receipts,
         }
+
+    @staticmethod
+    def _store_redacted_json(path: Path, document: dict[str, Any]) -> None:
+        """Store exactly the hashed document: it must already be redaction-stable, so the
+        evidence upload's own redaction cannot change what the reported digest covers."""
+        if SecretRedactor().redact(document).value != document:
+            raise ValueError("ui evidence was not redacted before it was hashed")
+        write_text_no_follow(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
 
     def _snapshot_pair(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = Project(str(payload.get("project")))

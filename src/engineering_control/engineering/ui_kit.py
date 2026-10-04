@@ -25,14 +25,17 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import stat
+import tempfile
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from engineering_control.engineering.models import UiMigrationPolicy
+from engineering_control.security.redaction import SecretRedactor
 
 KIT_SNAPSHOT_SCHEMA_VERSION = 1
 GENERATOR = "engineering_control.engineering.ui_kit"
@@ -129,15 +132,55 @@ def trusted_docker_executable(
     return None
 
 
-def kit_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The explicit, minimal environment of the docker child (nothing else inherited)."""
-    values = os.environ if source is None else source
-    environment = {"PATH": KIT_SERVER_PATH}
-    docker_host = values.get("DOCKER_HOST", "")
-    # Only a local (e.g. rootless) daemon socket; never a TCP or SSH daemon.
-    if re.fullmatch(r"unix:///[A-Za-z0-9._/-]{1,200}", docker_host) and ".." not in docker_host:
-        environment["DOCKER_HOST"] = docker_host
-    return environment
+DEFAULT_DOCKER_ENDPOINT = "unix:///var/run/docker.sock"
+_UNIX_ENDPOINT = re.compile(r"unix:///[A-Za-z0-9._/-]{1,200}")
+
+
+def docker_endpoint(source: Mapping[str, str] | None = None) -> str:
+    """The local daemon socket: the worker's unix:// DOCKER_HOST (e.g. a rootless daemon)
+    or the system socket. A TCP, SSH or any other endpoint is refused."""
+    value = (os.environ if source is None else source).get("DOCKER_HOST", "")
+    if not value:
+        return DEFAULT_DOCKER_ENDPOINT
+    if _UNIX_ENDPOINT.fullmatch(value) and ".." not in value:
+        return value
+    raise KitUnavailable("refusing a non-local docker endpoint (DOCKER_HOST must be unix://)")
+
+
+def private_docker_config() -> str:
+    """A fresh, empty, 0700 directory owned by this user: Docker's config and HOME, so no
+    saved context, credential helper or config.json of the user is ever consulted."""
+    directory = tempfile.mkdtemp(prefix="hermes-ui-kit-docker-")
+    os.chmod(directory, 0o700)
+    metadata = os.lstat(directory)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or os.listdir(directory)
+    ):
+        shutil.rmtree(directory, ignore_errors=True)
+        raise KitUnavailable("could not create a private docker config directory")
+    return directory
+
+
+def kit_environment(endpoint: str, config_dir: str) -> dict[str, str]:
+    """The explicit, minimal environment of every docker invocation (nothing inherited)."""
+    if not _UNIX_ENDPOINT.fullmatch(endpoint) or ".." in endpoint:
+        raise ValueError("the docker endpoint must be a unix:// socket")
+    if not os.path.isabs(config_dir):
+        raise ValueError("the docker config directory must be absolute")
+    return {
+        "PATH": KIT_SERVER_PATH,
+        "HOME": config_dir,
+        "DOCKER_CONFIG": config_dir,
+        "DOCKER_CONTEXT": "default",
+        "DOCKER_HOST": endpoint,
+    }
+
+
+def docker_global_flags(endpoint: str, config_dir: str) -> list[str]:
+    return ["--config", config_dir, "-H", endpoint]
 
 
 def kit_reference(image: str, digest: str) -> str:
@@ -150,13 +193,17 @@ def kit_reference(image: str, digest: str) -> str:
     return f"{image}@{digest}"
 
 
-def kit_command(docker: str, image: str, digest: str, *, name: str) -> list[str]:
+def kit_command(
+    docker: str, image: str, digest: str, *, name: str, endpoint: str, config_dir: str
+) -> list[str]:
     if not os.path.isabs(docker):
         raise ValueError("the docker CLI must be an absolute path")
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", name):
         raise ValueError("invalid container name")
+    kit_environment(endpoint, config_dir)  # validates both
     return [
         docker,
+        *docker_global_flags(endpoint, config_dir),
         "run",
         "-i",
         "--rm",
@@ -201,6 +248,8 @@ class GntikUiKitClient:
         preflight: Sequence[str] | None = None,
         cleanup: Sequence[str] | None = None,
         cwd: str = "/",
+        private_dirs: Sequence[str] = (),
+        shutdown_seconds: float = _REAP_SECONDS,
     ) -> None:
         if not argv or not os.path.isabs(argv[0]):
             raise ValueError("the kit server command must be an absolute executable")
@@ -210,6 +259,9 @@ class GntikUiKitClient:
         self.preflight = list(preflight) if preflight else None
         self.cleanup_argv = list(cleanup) if cleanup else None
         self.cwd = cwd
+        self.private_dirs = list(private_dirs)
+        self.shutdown_seconds = shutdown_seconds
+        self.removed_container = False
         self.process: asyncio.subprocess.Process | None = None
         self.server_info: dict[str, Any] = {}
         self.protocol_version = ""
@@ -218,6 +270,8 @@ class GntikUiKitClient:
         self._stderr = bytearray()
         self._stderr_task: asyncio.Task[None] | None = None
         self._deadline = 0.0
+        self._escalate = asyncio.Event()
+        self._closed = False
 
     @classmethod
     def pinned(
@@ -233,13 +287,24 @@ class GntikUiKitClient:
             raise KitUnavailable(
                 "no root-owned docker CLI found (/usr/bin/docker, /usr/local/bin/docker)"
             )
+        endpoint = docker_endpoint()
+        config_dir = private_docker_config()
         name = f"hermes-ui-kit-{uuid.uuid4().hex[:16]}"
+        flags = docker_global_flags(endpoint, config_dir)
+        try:
+            argv = kit_command(
+                docker, image, digest, name=name, endpoint=endpoint, config_dir=config_dir
+            )
+        except BaseException:
+            shutil.rmtree(config_dir, ignore_errors=True)
+            raise
         return cls(
-            kit_command(docker, image, digest, name=name),
-            environment=kit_environment(),
+            argv,
+            environment=kit_environment(endpoint, config_dir),
             deadline_seconds=deadline_seconds,
-            preflight=[docker, "image", "inspect", "--format", "{{.Id}}", f"{image}@{digest}"],
-            cleanup=[docker, "rm", "-f", name],
+            preflight=[docker, *flags, "image", "inspect", "--format", "{{.Id}}", argv[-2]],
+            cleanup=[docker, *flags, "rm", "-f", name],
+            private_dirs=[config_dir],
         )
 
     @classmethod
@@ -321,22 +386,65 @@ class GntikUiKitClient:
             del self._stderr[:-_STDERR_TAIL_BYTES]
 
     async def close(self, *, force: bool = False) -> None:
+        """Stop the session. Cancellation-safe: every cleanup step completes (shielded) and
+        only then is a cancellation propagated; a cancellation escalates to a forced stop."""
+        if self._closed:
+            return
+        if force:
+            self._escalate.set()
+        shutdown = asyncio.ensure_future(self._shutdown())
+        cancelled = False
+        while not shutdown.done():
+            try:
+                await asyncio.shield(shutdown)
+            except asyncio.CancelledError:
+                cancelled = True
+                self._escalate.set()
+        self._closed = True
+        if cancelled:
+            raise asyncio.CancelledError
+        shutdown.result()
+
+    async def _shutdown(self) -> None:
         process = self.process
-        if process is not None and process.returncode is None:
-            if not force and process.stdin is not None:
-                with contextlib.suppress(OSError, RuntimeError):
-                    process.stdin.close()
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(asyncio.shield(process.wait()), timeout=_REAP_SECONDS)
+        clean = process is not None
+        if process is not None:
+            if process.returncode is None and not self._escalate.is_set():
+                if process.stdin is not None:
+                    with contextlib.suppress(OSError, RuntimeError):
+                        process.stdin.close()
+                await self._wait_or_escalate(process)
             if process.returncode is None:
                 await _kill_group(process)
+            clean = process.returncode == 0 and not self._escalate.is_set()
         if self._stderr_task is not None:
             self._stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._stderr_task
             self._stderr_task = None
-        if force and self.cleanup_argv is not None and process is not None:
-            await _best_effort(self.cleanup_argv, self.environment, self.cwd)
+        try:
+            # `--rm` removes only an exited container: whenever the CLI had to be killed,
+            # failed or the session was aborted, remove the named container explicitly.
+            if process is not None and not clean and self.cleanup_argv is not None:
+                await _best_effort(self.cleanup_argv, self.environment, self.cwd)
+                self.removed_container = True
+        finally:
+            for directory in self.private_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+
+    async def _wait_or_escalate(self, process: asyncio.subprocess.Process) -> None:
+        waiter = asyncio.ensure_future(process.wait())
+        escalation = asyncio.ensure_future(self._escalate.wait())
+        try:
+            await asyncio.wait(
+                {waiter, escalation},
+                timeout=self.shutdown_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for pending in (waiter, escalation):
+                pending.cancel()
+            await asyncio.gather(waiter, escalation, return_exceptions=True)
 
     # -- JSON-RPC ------------------------------------------------------------------------
 
@@ -415,7 +523,9 @@ class GntikUiKitClient:
             and item.get("type") == "text"
             and isinstance(item.get("text"), str)
         ]
-        text, truncated = _bounded_text("\n".join(texts), MAX_TOOL_TEXT_BYTES)
+        bounded, truncated = _bounded_text("\n".join(texts), MAX_TOOL_TEXT_BYTES)
+        # Redact first: the stored text is exactly what is hashed and counted.
+        text = str(SecretRedactor().redact_text(bounded).value)
         return {
             "tool": tool,
             "arguments": payload,
@@ -515,8 +625,20 @@ async def collect_kit_snapshot(
             "text_bytes": total,
         },
     }
-    document["snapshot_sha256"] = snapshot_hash(document)
-    return document
+    return finalize_snapshot(document)
+
+
+def finalize_snapshot(document: dict[str, Any]) -> dict[str, Any]:
+    """Redact the whole snapshot, then hash and count exactly what will be stored."""
+    body = {key: value for key, value in document.items() if key != "snapshot_sha256"}
+    redacted: dict[str, Any] = SecretRedactor().redact(body).value
+    for call in redacted["calls"]:
+        data = str(call["text"]).encode("utf-8")
+        call["bytes"] = len(data)
+        call["sha256"] = hashlib.sha256(data).hexdigest()
+    redacted["summary"]["text_bytes"] = sum(call["bytes"] for call in redacted["calls"])
+    redacted["snapshot_sha256"] = snapshot_hash(redacted)
+    return redacted
 
 
 async def validate_page(
