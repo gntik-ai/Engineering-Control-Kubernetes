@@ -312,7 +312,12 @@ def test_installer_normalizes_docker_hub_references_before_comparing_digests() -
         "team/x@sha256:ab",
         "x@sha256:ab",
         "index.docker.io/library/x@sha256:ab",
+        "docker.io/ubuntu@sha256:ab",
+        "index.docker.io/ubuntu@sha256:ab",
+        "ubuntu@sha256:ab",
+        "TEAM/x@sha256:ab",
         "ghcr.io/gntik-ai/gntik-ui-mcp@sha256:ab",
+        "localhost/x@sha256:ab",
     ]
     result = subprocess.run(  # noqa: S603 - the fixed interpreter and script
         [BASH, "-c", probe, "probe", *refs], capture_output=True, text=True, check=True
@@ -322,5 +327,10 @@ def test_installer_normalizes_docker_hub_references_before_comparing_digests() -
         "docker.io/team/x@sha256:ab",
         "docker.io/library/x@sha256:ab",
         "docker.io/library/x@sha256:ab",
+        "docker.io/library/ubuntu@sha256:ab",
+        "docker.io/library/ubuntu@sha256:ab",
+        "docker.io/library/ubuntu@sha256:ab",
+        "TEAM/x@sha256:ab",  # an uppercase first component is a registry (TEAM), not docker.io
         "ghcr.io/gntik-ai/gntik-ui-mcp@sha256:ab",
+        "localhost/x@sha256:ab",
     ]

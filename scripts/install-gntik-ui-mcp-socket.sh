@@ -306,24 +306,30 @@ pull_image() {
 }
 
 normalize_reference() {
-  # Docker reports RepoDigests in familiar form (docker.io/library/x -> x,
-  # docker.io/team/x -> team/x); compare fully qualified names.
-  local ref=$1 name digest
+  # Mirrors distribution/reference ParseNormalizedNamed (docker's own rules): the first
+  # path component is a registry only if it contains "." or ":", is "localhost", or is
+  # not all lowercase; otherwise the name is on docker.io. index.docker.io is an alias of
+  # docker.io, and a single-component docker.io path lives under library/. No case is
+  # folded: names that differ only by case are different references.
+  local ref=$1 name digest domain remainder
   name=${ref%@*}
   digest=${ref##*@}
-  case "$name" in
-    */*/*) ;;                                   # registry/namespace/repo
-    */*)
-      if [[ ${name%%/*} == *.* || ${name%%/*} == *:* || ${name%%/*} == localhost ]]; then
-        :                                       # registry/repo
-      else
-        name="docker.io/$name"                  # namespace/repo on Docker Hub
-      fi
-      ;;
-    *) name="docker.io/library/$name" ;;        # an official Docker Hub image
-  esac
-  name=${name/#index.docker.io\//docker.io/}
-  printf '%s@%s\n' "${name,,}" "$digest"
+  if [[ $name != */* ]]; then
+    domain=docker.io
+    remainder=$name
+  else
+    domain=${name%%/*}
+    remainder=${name#*/}
+    if [[ $domain != *.* && $domain != *:* && $domain != localhost && $domain == "${domain,,}" ]]; then
+      domain=docker.io
+      remainder=$name
+    fi
+  fi
+  [[ $domain == index.docker.io ]] && domain=docker.io
+  if [[ $domain == docker.io && $remainder != */* ]]; then
+    remainder="library/$remainder"
+  fi
+  printf '%s/%s@%s\n' "$domain" "$remainder" "$digest"
 }
 
 uninstall() {
