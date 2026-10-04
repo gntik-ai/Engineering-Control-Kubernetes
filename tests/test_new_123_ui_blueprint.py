@@ -451,8 +451,14 @@ def test_an_item_too_large_for_an_issue_fails_with_a_typed_blocker(engine: Any) 
     handler = UiPlanActivityHandler(
         Settings(), repository=repository, change_requests=ChangeRequestRepository(engine=engine)
     )
+    claim = repository.claim_fanout_sync(blueprint_id)  # the approval's fan-out claim
     result = handler._prepare_item(
-        {"blueprint_id": str(blueprint_id), "item_key": "page:tenants", "source_worktree": "/x"}
+        {
+            "blueprint_id": str(blueprint_id),
+            "item_key": "page:tenants",
+            "source_worktree": "/x",
+            "orchestration": {"workflow_id": claim["workflow_id"]},
+        }
     )
     assert (result["status"], result["error_code"]) == (
         "FAILED_RECORDED",

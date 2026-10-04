@@ -443,6 +443,15 @@ class UiBlueprintRepository:
             ).rowcount
         return bool(released == 1)
 
+    def fanout_owner_sync(self, blueprint_id: UUID, workflow_id: str) -> bool:
+        """NEW-123 review 4: the fence. Only the fan-out the active marker names may draft;
+        a superseded execution (a start delayed past a released stale claim) stops."""
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            return bool(
+                row is not None and workflow_id and row.active_fanout_workflow_id == workflow_id
+            )
+
     def register_fanout_sync(self, blueprint_id: UUID, workflow_id: str) -> None:
         with self.sessions.begin() as session:
             row = self._locked(session, blueprint_id)

@@ -565,9 +565,12 @@ class UiPlanActivityHandler:
                 "blockers": problems,
                 "project": loaded["project"],
             }
-        self.repository.register_fanout_sync(
-            blueprint_id, str(self._orchestration(payload).get("workflow_id") or "")
-        )
+        workflow_id = str(self._orchestration(payload).get("workflow_id") or "")
+        if not self.repository.fanout_owner_sync(blueprint_id, workflow_id):
+            # Fenced: another fan-out owns the marker (this one's start was delayed past a
+            # released stale claim). Stop before any work; drafts are never duplicated.
+            return {**base, "status": "BLOCKED", "blocker": "UI_FANOUT_SUPERSEDED"}
+        self.repository.register_fanout_sync(blueprint_id, workflow_id)
         items = fanout_items(loaded["blueprint"])
         digest = str(loaded["blueprint_sha256"])
         identities = {item.key: item_change_request_id(digest, item.key) for item in items}
@@ -599,6 +602,11 @@ class UiPlanActivityHandler:
 
     def _prepare_item(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
+        # NEW-123 review 4: the ownership fence again for every item, so a superseded
+        # fan-out stops within one item even if it passed the plan's check just before.
+        workflow_id = str(self._orchestration(payload).get("workflow_id") or "")
+        if not self.repository.fanout_owner_sync(blueprint_id, workflow_id):
+            return {"status": "SKIPPED", "blocker": "UI_FANOUT_SUPERSEDED"}
         loaded = self._approved(blueprint_id)
         item = self._item(loaded, payload.get("item_key"))
         project = str(loaded["project"])

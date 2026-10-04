@@ -27,7 +27,7 @@ from new_123_fixtures import (
     gap_output,
     review_output,
 )
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, update
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
@@ -39,6 +39,7 @@ from engineering_control.config import Settings
 from engineering_control.db import models
 from engineering_control.db.base import Base
 from engineering_control.db.change_requests import ChangeRequestRepository
+from engineering_control.db.models import UiBlueprint
 from engineering_control.db.ui_blueprints import UiBlueprintRepository
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.ui_blueprint import (
@@ -113,6 +114,10 @@ class Harness:
 
     async def run(self, workflow_cls: type, argument: Any, workflow_id: str) -> Any:
         assert _TEMPORAL_CLI is not None
+        if workflow_cls is UiBlueprintFanOutWorkflow and getattr(self, "own_fanout", True):
+            # The approval API claims the active marker before it starts a fan-out (the
+            # NEW-123 fence): simulate that claim for the execution under test.
+            self.claim(str(argument.blueprint_id), workflow_id)
         queues = (
             CONTROL_TASK_QUEUE,
             GITHUB_TASK_QUEUE,
@@ -416,6 +421,18 @@ async def test_a_draft_bound_to_other_inputs_is_blocked(tmp_path: Path) -> None:
 # Fan-out -----------------------------------------------------------------------------------
 
 
+def _claim(harness: Harness, blueprint_id: str, workflow_id: str) -> None:
+    with harness.repository.sessions.begin() as session:
+        session.execute(
+            update(UiBlueprint)
+            .where(UiBlueprint.id == UUID(blueprint_id))
+            .values(active_fanout_workflow_id=workflow_id, fanout_claimed_at=datetime.now(UTC))
+        )
+
+
+Harness.claim = _claim  # type: ignore[attr-defined]
+
+
 def approved_blueprint(harness: Harness) -> tuple[str, str]:
     repository = harness.repository
     created = repository.create_sync("falcone", "cli:engineering-ctl", None)
@@ -582,3 +599,21 @@ async def test_fanout_of_an_unapproved_blueprint_is_blocked(tmp_path: Path) -> N
     )
     assert (result["status"], result["error_code"]) == ("BLOCKED", "UI_BLUEPRINT_NOT_APPROVED")
     assert provider_steps(harness.calls) == ["ui_fanout.plan", "ui_fanout.finalize"]
+
+
+async def test_a_superseded_fanout_is_fenced_before_any_draft(tmp_path: Path) -> None:
+    # NEW-123 review 4: a fan-out whose start was delayed past a released stale claim
+    # finds another fan-out in the marker and stops before drafting anything.
+    harness, blueprint_id, _digest = fanout_harness(tmp_path)
+    harness.own_fanout = False  # type: ignore[attr-defined]
+    harness.claim(blueprint_id, ui_fanout_workflow_id(blueprint_id, 2))  # type: ignore[attr-defined]
+    result = await harness.run(
+        UiBlueprintFanOutWorkflow,
+        UiBlueprintFanOutInput(blueprint_id=blueprint_id),
+        ui_fanout_workflow_id(blueprint_id, 1),
+    )
+    assert (result["status"], result["drafted"], result["error_code"]) == (
+        "BLOCKED",
+        0,
+        "UI_FANOUT_SUPERSEDED",
+    )
