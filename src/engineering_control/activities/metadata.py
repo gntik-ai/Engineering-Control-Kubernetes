@@ -2919,8 +2919,12 @@ class MetadataActivityHandler:
                 # paths, so every retry or correction attempt of the same ChangeSet
                 # conflicted. Once a PR exists the lease stays for the release path.
                 change_set = (
-                    session.get(ChangeSet, run.change_set_id) if run.change_set_id else None
+                    session.get(ChangeSet, run.change_set_id, with_for_update=True)
+                    if run.change_set_id
+                    else None
                 )
+                if change_set is not None:
+                    _record_correction_state(change_set, run, payload)
                 # NEW-66: a CI-repair re-delivery moves a published ChangeSet back to
                 # PLANNED/IMPLEMENTING; when one of its attempts stops, its correction
                 # attempt must be able to take the worktree over.
@@ -9517,6 +9521,51 @@ _DELIVERED_CHANGE_SET_STATES = frozenset(
         ChangeSetState.ISSUE_CLOSED.value,
     }
 )
+
+
+# NEW-128: delivery stops that ask the maker for a correction. delivery.validate_changeset
+# returns them (checker REQUEST_CHANGES, introduced findings, a maker test failure after a
+# checker PASS); nothing else in the delivery path produces these status/blocker pairs.
+_CORRECTION_STOPS = frozenset(
+    {
+        ("REQUEST_CHANGES", "INDEPENDENT_CHECKER_DID_NOT_PASS"),
+        ("REQUEST_CHANGES", "CHANGESET_VALIDATION_FINDINGS"),
+        ("BLOCKED", "MAKER_TEST_FAILURE"),
+    }
+)
+# Only states before any publication; a published, merged or verified ChangeSet is never
+# moved backwards (a CI-repair re-delivery is back in PLANNED/IMPLEMENTING by then).
+_CORRECTION_SOURCE_STATES = frozenset(
+    {ChangeSetState.PLANNED.value, ChangeSetState.IMPLEMENTING.value}
+)
+
+
+def _record_correction_state(change_set: ChangeSet, run: Run, payload: dict[str, Any]) -> None:
+    """NEW-128: persist REQUEST_CHANGES when a delivery attempt stops for a correction.
+
+    The bounded correction child (and an operator retry) may bind only to a ChangeSet in
+    REQUEST_CHANGES, but the validation verdict was never persisted, so every automatic
+    correction failed with "another delivery child requires an explicit correction state".
+    delivery.release_leases runs once at the end of every attempt with the final context;
+    an activity retry finds REQUEST_CHANGES already set and changes nothing.
+    """
+    stop = (str(payload.get("status") or ""), str(payload.get("blocker") or ""))
+    if stop not in _CORRECTION_STOPS:
+        return
+    if str(payload.get("change_set_id") or "") != str(change_set.id):
+        return
+    if change_set.state not in _CORRECTION_SOURCE_STATES:
+        return
+    change_set.state = ChangeSetState.REQUEST_CHANGES.value
+    change_set.version += 1
+    recovery = dict(change_set.recovery_json or {})
+    recovery["correction_requested"] = {
+        "run_id": str(run.id),
+        "status": stop[0],
+        "blocker": stop[1],
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    change_set.recovery_json = recovery
 
 
 def _refuse_delivered(change_set: ChangeSet) -> None:
