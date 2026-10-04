@@ -136,8 +136,7 @@ class ControlService(Protocol):
     async def start_ui_fanout(
         self, blueprint_id: UUID, max_items: int, workflow_id: str
     ) -> OperationAccepted: ...
-    async def running_ui_fanout(self, workflow_id: str) -> OperationAccepted | None: ...
-    async def ui_fanout_known(self, workflow_id: str) -> bool: ...
+    async def ui_fanout_state(self, workflow_id: str) -> tuple[str, OperationAccepted | None]: ...
 
 
 class TemporalControlService:
@@ -870,27 +869,20 @@ class TemporalControlService:
             workflow_id,
         )
 
-    async def running_ui_fanout(self, workflow_id: str) -> OperationAccepted | None:
-        """The fan-out execution under `workflow_id` while it still runs (else None)."""
+    async def ui_fanout_state(self, workflow_id: str) -> tuple[str, OperationAccepted | None]:
+        """One lookup: ("RUNNING", accepted), ("CLOSED", None) or ("NOT_FOUND", None).
+
+        NEW-123 review 3: a single describe, so a start landing between two lookups can
+        never make a running fan-out look ended."""
         try:
             description = await self.client.get_workflow_handle(workflow_id).describe()
         except RPCError as error:
             if error.status is RPCStatusCode.NOT_FOUND:
-                return None
+                return "NOT_FOUND", None
             raise
-        if description.status != WorkflowExecutionStatus.RUNNING:
-            return None
-        return OperationAccepted(workflow_id=workflow_id, run_id=description.run_id)
-
-    async def ui_fanout_known(self, workflow_id: str) -> bool:
-        """Whether Temporal has any execution under `workflow_id` (running or closed)."""
-        try:
-            await self.client.get_workflow_handle(workflow_id).describe()
-        except RPCError as error:
-            if error.status is RPCStatusCode.NOT_FOUND:
-                return False
-            raise
-        return True
+        if description.status == WorkflowExecutionStatus.RUNNING:
+            return "RUNNING", OperationAccepted(workflow_id=workflow_id, run_id=description.run_id)
+        return "CLOSED", None
 
     async def _start_once(
         self, workflow: str, argument: Any, workflow_id: str

@@ -1413,18 +1413,18 @@ def create_app(
                     blueprint_id, max_items, str(claim["workflow_id"])
                 )
                 return started, False
-            running = await service.running_ui_fanout(str(claim["workflow_id"]))
-            if running is not None:
+            state, running = await service.ui_fanout_state(str(claim["workflow_id"]))
+            if state == "RUNNING" and running is not None:
                 return running, True
-            # NEW-123 review 2: a marker whose workflow Temporal does not know yet is a
-            # start in progress (another approval won the claim and is starting it), not
-            # an ended fan-out: join it during a grace period; only a stale claim (a
-            # start that crashed) is released.
+            # NEW-123 review 2/3: a marker whose workflow Temporal does not know yet is a
+            # start in progress (another approval won the claim and is starting it), not an
+            # ended fan-out: join it during a grace period; only a stale claim (a start that
+            # crashed) or a CLOSED execution is released.
             claimed_at = claim.get("claimed_at")
             if (
-                isinstance(claimed_at, datetime)
+                state == "NOT_FOUND"
+                and isinstance(claimed_at, datetime)
                 and datetime.now(UTC) - _as_utc(claimed_at) < UI_FANOUT_START_GRACE
-                and not await service.ui_fanout_known(str(claim["workflow_id"]))
             ):
                 return OperationAccepted(workflow_id=str(claim["workflow_id"]), run_id=""), True
             await repository.release_fanout(blueprint_id, str(claim["workflow_id"]))

@@ -277,8 +277,7 @@ def api(tmp_path: Path) -> tuple[TestClient, Mock, UiBlueprintRepository]:
             workflow_id=workflow_id, run_id="fan"
         )
     )
-    fake.running_ui_fanout = AsyncMock(return_value=None)
-    fake.ui_fanout_known = AsyncMock(return_value=True)
+    fake.ui_fanout_state = AsyncMock(return_value=("CLOSED", None))
     app = create_app(
         settings=Settings(),
         service=fake,
@@ -373,13 +372,16 @@ def test_api_approval_is_bound_and_starts_the_capped_fanout(api: Any) -> None:
             return dict(response.json()["fanout"])
 
         # While fan-out 1 runs, every replay joins it and consumes no sequence.
-        fake.running_ui_fanout.return_value = OperationAccepted(workflow_id=first, run_id="r1")
+        fake.ui_fanout_state.return_value = (
+            "RUNNING",
+            OperationAccepted(workflow_id=first, run_id="r1"),
+        )
         for _ in range(3):
             assert replay()["workflow_id"] == first
         assert fake.start_ui_fanout.await_count == 1
         assert repository.get_sync(blueprint_id)["fanout_sequence"] == 1  # type: ignore[index]
         # Once it ended (without clearing its marker), the next replay starts fan-out 2.
-        fake.running_ui_fanout.return_value = None
+        fake.ui_fanout_state.return_value = ("CLOSED", None)
         resumed = replay()
         assert (resumed["workflow_id"], resumed["joined"], resumed["max_items"]) == (
             f"ui-blueprint-fanout-{blueprint_id}-2",
@@ -409,8 +411,7 @@ def test_a_claimed_fanout_temporal_does_not_know_yet_is_joined_not_replaced(api:
 
     with client:
         assert approve()["workflow_id"] == first  # the claim, and its start
-        fake.running_ui_fanout.return_value = None
-        fake.ui_fanout_known.return_value = False  # Temporal does not know it (yet)
+        fake.ui_fanout_state.return_value = ("NOT_FOUND", None)  # its start is in flight
         pending = approve()
         assert (pending["workflow_id"], pending["joined"], pending["run_id"]) == (first, True, "")
         assert fake.start_ui_fanout.await_count == 1
