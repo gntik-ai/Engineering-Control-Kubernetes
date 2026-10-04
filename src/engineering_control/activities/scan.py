@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -2616,6 +2616,20 @@ class ScanActivityHandler:
                 # findings. git clean -X never touches tracked or non-ignored files.
                 self._clean_ignored_toolchain_artifacts(worktree)
             summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
+            refused = self._agent_config_paths(summary.get("changed_paths"))
+            if refused:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "AGENT_CONFIG_CHANGE_REFUSED",
+                    "agent_config_paths": [f"{name}: {path}" for path in refused[:40]],
+                    "operator_message": (
+                        f"the {name} ChangeSet adds or modifies agent configuration "
+                        f"({', '.join(refused[:5])}); .codex/, .claude/ and .mcp.json are "
+                        "loaded by agent CLIs and are never delivered automatically. "
+                        "Review the change and deliver it manually if the issue targets it."
+                    ),
+                }
             if name == "source" and summary["changed_file_count"] == 0:
                 blocked = True
                 empty_change = True
@@ -2709,6 +2723,25 @@ class ScanActivityHandler:
             "blocker": "CHANGESET_VALIDATION_FINDINGS" if blocked else None,
             "change_evidence": changes,
         }
+
+    @staticmethod
+    def _agent_config_paths(changed_paths: object) -> list[str]:
+        """NEW-130: changed paths that agent CLIs load as configuration.
+
+        Codex loads every `.codex/` folder between its cwd and the project root, Claude
+        Code loads `.claude/` and `.mcp.json`; a maker that writes them could start an
+        MCP server or hook in a later run. Matches any directory level.
+        """
+        if not isinstance(changed_paths, list):
+            return []
+        refused: list[str] = []
+        for path in changed_paths:
+            parts = PurePosixPath(str(path)).parts
+            if any(part in {".codex", ".claude"} for part in parts[:-1]) or (
+                parts and parts[-1] == ".mcp.json"
+            ):
+                refused.append(str(path))
+        return sorted(refused)
 
     @staticmethod
     def _classify_release_impact(
