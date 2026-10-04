@@ -52,6 +52,7 @@ from engineering_control.engineering.ui_inventory import build_inventory, render
 from engineering_control.engineering.ui_kit import (
     UI_MCP_UNAVAILABLE,
     GntikUiKitClient,
+    KitSession,
     KitUnavailable,
     collect_kit_snapshot,
     snapshot_plan,
@@ -215,7 +216,7 @@ class ScanActivityHandler:
         dependency_runner: SafeCommandRunner | None = None,
         git_runner: SafeCommandRunner | None = None,
         baseline_runner: SafeCommandRunner | None = None,
-        kit_client_factory: Callable[[UiMigrationPolicy], GntikUiKitClient] | None = None,
+        kit_client_factory: Callable[[UiMigrationPolicy], KitSession] | None = None,
     ) -> None:
         self.settings = settings
         # NEW-121 v2: Hermes itself queries the pinned gntik-ui MCP image (no model).
@@ -1250,9 +1251,11 @@ class ScanActivityHandler:
     async def _ui_kit_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         """NEW-121 v2: a versioned gntik-ui kit snapshot from the digest-pinned image.
 
-        Deterministic and model-free: the scan worker runs the container itself (no
-        network, read-only, no capabilities) and calls only read-only allowlisted tools.
-        A missing docker or image is a BLOCKED result (UI_MCP_UNAVAILABLE), not a retry.
+        Deterministic and model-free: the scan worker calls only read-only allowlisted
+        tools. NEW-129: with `mcp.socket` set it connects to the root-owned gntik-ui MCP
+        service socket (the service runs the pinned, isolated container; the worker never
+        gets Docker access); otherwise it runs the container itself. A missing or untrusted
+        socket, docker or image is a BLOCKED result (UI_MCP_UNAVAILABLE), not a retry.
         """
         project = Project(str(payload["project"]))
         policy = (await asyncio.to_thread(self.catalog.project, project.value)).ui_migration
@@ -1283,6 +1286,7 @@ class ScanActivityHandler:
                 "blocker": UI_MCP_UNAVAILABLE,
                 "reason": str(error)[:300],
                 "image": f"{policy.mcp.image}@{policy.mcp.digest}",
+                "transport": "socket" if policy.mcp.socket else "docker",
             }
         except TimeoutError as error:
             raise ApplicationError(
@@ -1310,6 +1314,7 @@ class ScanActivityHandler:
             "schema_version": document["schema_version"],
             "snapshot_sha256": digest,
             "image": document["image"],
+            "transport": str(document["transport"]["kind"]),
             "gntik_ui_version": document["gntik_ui_version"],
             # Server-controlled data is bounded here; the full lists live only in evidence.
             "server_info": {
