@@ -69,7 +69,7 @@ def test_the_migration_runs_after_the_swap_and_restores_every_dependent() -> Non
     assert '"$MIGRATE_RESULT" != success' in text[result:start]
 
 
-def test_notifier_and_dashboard_are_restarted_and_the_watchdog_pin_is_left_alone() -> None:
+def test_notifier_dashboard_and_watchdog_are_restarted() -> None:
     text = _text()
     restarts = _index(text, "=== 6/7: restart services ===")
     verify = _index(text, "=== 7/7: verify ===")
@@ -78,7 +78,21 @@ def test_notifier_and_dashboard_are_restarted_and_the_watchdog_pin_is_left_alone
         "sudo systemctl restart engineering-notifier.service engineering-dashboard.service" in step
     )
     assert 'sudo systemctl restart "$unit"' in step and "engineering-watchdog.service |" in step
-    assert "restart engineering-watchdog" not in text
+    assert "sudo systemctl restart engineering-watchdog.service" in step
+    assert "F-11 drop-in present" not in text
+
+
+def test_the_gateway_hook_is_installed_backed_up_and_synced_when_it_differs() -> None:
+    text = _text()
+    restarts = _index(text, "=== 6/7: restart services ===")
+    verify = _index(text, "=== 7/7: verify ===")
+    step = text[restarts:verify]
+    assert 'HOOK_TARGET="$HOME/.hermes/hooks/engineering-control"' in step
+    assert 'cp -a "$HOOK_TARGET/." "$HOOK_BACKUP/"' in step
+    assert step.index("cp -a") < step.index('install -m 0640 "$HOOK_SOURCE')
+    assert step.index('install -m 0640 "$HOOK_SOURCE') < step.index("\n  sync\n")
+    assert step.index("\n  sync\n") < step.index("sudo systemctl restart hermes-gateway.service")
+    assert "gateway hook already matches this release" in step
 
 
 def test_every_migrate_dependent_is_verified_active_and_the_revision_printed() -> None:
