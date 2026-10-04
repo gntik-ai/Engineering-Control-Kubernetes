@@ -656,6 +656,11 @@ async def test_amend_retry_never_picks_another_issues_start_loop(tmp_path: Path)
         "credential rotation job",
         "clusterrolebindings are too broad",
         "secret lifecycle handling",
+        "Deploy to _production_.",
+        "a _destructive_ cleanup",
+        "**data migration** first",
+        "__clusterrole__ grants",
+        "the production-ready image",
     ],
 )
 def test_r3_gate_keeps_every_inflection_of_its_roots(text: str) -> None:

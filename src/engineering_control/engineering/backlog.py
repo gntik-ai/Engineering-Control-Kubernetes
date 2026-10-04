@@ -799,7 +799,9 @@ _R3_KEYWORD_ROOTS = (
     r"production",
     r"clusterrole",
 )
-_R3_KEYWORDS = re.compile(r"\b(?:" + "|".join(_R3_KEYWORD_ROOTS) + r")\w*", re.IGNORECASE)
+# A root starts where no letter or digit precedes it: underscores and other Markdown
+# delimiters (``_production_``, ``**destructive**``) still count as word starts.
+_R3_KEYWORDS = re.compile(r"(?<![a-z0-9])(?:" + "|".join(_R3_KEYWORD_ROOTS) + r")", re.IGNORECASE)
 
 
 def _risk(
