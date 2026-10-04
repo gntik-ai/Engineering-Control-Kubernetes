@@ -224,3 +224,32 @@ def test_recovery_attempts_every_step_even_when_commands_fail(
         assert "fix forward" in result.stderr
     assert "RECOVERY: run these on the controller" in result.stderr
     assert "ROLLED BACK" not in result.stderr
+
+
+def test_hook_install_runs_on_a_host_without_a_previous_hook(tmp_path: Path) -> None:
+    # Extract the hook block and run it against a fresh HOME without any previous hook.
+    text = _text()
+    start = text.index('HOOK_SOURCE="$RELEASE_DIR/source/integrations')
+    end = text.index("# Every other Requires=engineering-migrate dependent")
+    block = text[start:end].replace(
+        "sudo systemctl restart hermes-gateway.service", "echo RESTARTED-GATEWAY"
+    )
+    source = tmp_path / "release" / "source" / "integrations" / "hermes-engineering-control"
+    (source / "hook").mkdir(parents=True)
+    (source / "hook" / "HOOK.yaml").write_text("name: hook\n")
+    (source / "hook" / "handler.py").write_text("print('hook')\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    script = f"set -euo pipefail\nRELEASE_DIR={tmp_path / 'release'}\nHOME={home}\n{block}"
+    result = subprocess.run(  # noqa: S603 - a fixed interpreter and a generated script
+        ["/bin/bash", "-c", script], capture_output=True, text=True, check=True
+    )
+    target = home / ".hermes" / "hooks" / "engineering-control"
+    assert (target / "HOOK.yaml").read_text() == "name: hook\n"
+    assert (target / "handler.py").read_text() == "print('hook')\n"
+    assert "RESTARTED-GATEWAY" in result.stdout
+    assert "no previous hook" in result.stdout
+    again = subprocess.run(  # noqa: S603
+        ["/bin/bash", "-c", script], capture_output=True, text=True, check=True
+    )
+    assert "already matches" in again.stdout and "RESTARTED-GATEWAY" not in again.stdout

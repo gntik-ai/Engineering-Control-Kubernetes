@@ -389,8 +389,13 @@ done
 if [[ $hook_changed -eq 1 ]]; then
   echo "-- controller: gateway hook differs from this release; installing it --"
   HOOK_BACKUP="$HOME/engineering-backups/hook-$(date -u +%Y%m%dT%H%M%SZ)"
-  install -d -m 0750 "$HOOK_BACKUP"
-  cp -a "$HOOK_TARGET/." "$HOOK_BACKUP/"
+  if [[ -d $HOOK_TARGET ]]; then
+    install -d -m 0750 "$HOOK_BACKUP"
+    cp -a "$HOOK_TARGET/." "$HOOK_BACKUP/"
+  else
+    HOOK_BACKUP="(none: no previous hook)"
+  fi
+  install -d -m 0750 "$HOOK_TARGET"
   for hook_file in HOOK.yaml handler.py; do
     install -m 0640 "$HOOK_SOURCE/$hook_file" "$HOOK_TARGET/$hook_file"
     cmp -s "$HOOK_SOURCE/$hook_file" "$HOOK_TARGET/$hook_file" \
