@@ -63,6 +63,7 @@ from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
 from engineering_control.models.reconciliation import PromotionPlan
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.worktrees.agent_config import is_agent_config_path
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -2623,6 +2624,24 @@ class ScanActivityHandler(UiPlanScanSteps):
                 # findings. git clean -X never touches tracked or non-ignored files.
                 self._clean_ignored_toolchain_artifacts(worktree)
             summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
+            reported = summary.get("agent_config_paths")
+            refused = sorted(
+                set(self._agent_config_paths(summary.get("changed_paths")))
+                | {str(item) for item in (reported if isinstance(reported, list) else [])}
+            )
+            if refused:
+                return {
+                    **payload,
+                    "status": "BLOCKED",
+                    "blocker": "AGENT_CONFIG_CHANGE_REFUSED",
+                    "agent_config_paths": [f"{name}: {path}" for path in refused[:40]],
+                    "operator_message": (
+                        f"the {name} ChangeSet adds or modifies agent configuration "
+                        f"({', '.join(refused[:5])}); .codex/, .claude/ and .mcp.json are "
+                        "loaded by agent CLIs and are never delivered automatically. "
+                        "Review the change and deliver it manually if the issue targets it."
+                    ),
+                }
             if name == "source" and summary["changed_file_count"] == 0:
                 blocked = True
                 empty_change = True
@@ -2716,6 +2735,20 @@ class ScanActivityHandler(UiPlanScanSteps):
             "blocker": "CHANGESET_VALIDATION_FINDINGS" if blocked else None,
             "change_evidence": changes,
         }
+
+    @staticmethod
+    def _agent_config_paths(changed_paths: object) -> list[str]:
+        """NEW-130: changed paths that agent CLIs load as configuration.
+
+        Codex loads every `.codex/` folder between its cwd and the project root, Claude
+        Code loads `.claude/` and `.mcp.json`; a maker that writes them could start an
+        MCP server or hook in a later run. Any component, including the last, matches.
+        The worktree manager adds what a path list cannot show (NUL-delimited raw
+        names, renames split, symlink targets and aliases) as `agent_config_paths`.
+        """
+        if not isinstance(changed_paths, list):
+            return []
+        return sorted(str(path) for path in changed_paths if is_agent_config_path(str(path)))
 
     @staticmethod
     def _classify_release_impact(

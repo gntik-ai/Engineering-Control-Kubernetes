@@ -15,6 +15,7 @@ from uuid import UUID
 
 from engineering_control.leases.file_lease import FileLease
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.worktrees.agent_config import is_agent_config_path, overlaps
 
 
 class WorktreeError(RuntimeError):
@@ -897,8 +898,142 @@ class GitWorktreeManager:
             "status_sha256": hashlib.sha256(status.encode()).hexdigest(),
             "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
             "untracked": untracked,
+            "agent_config_paths": self._agent_config_changes(resolved, base_sha=base_sha),
         }
         return summary, diff
+
+    @staticmethod
+    def _git_bytes(args: list[str], cwd: Path) -> bytes:
+        """Raw stdout (NUL-delimited records, unquoted non-ASCII paths)."""
+        result = subprocess.run(  # noqa: S603 - argument vector only; shell is never used
+            args, cwd=cwd, check=False, capture_output=True, timeout=300
+        )
+        if result.returncode:
+            error = str(SecretRedactor().redact_text(os.fsdecode(result.stderr)).value)
+            raise WorktreeError(f"Git command failed ({result.returncode}): {error[-4000:]}")
+        return result.stdout
+
+    def _agent_config_changes(self, worktree: Path, *, base_sha: str) -> list[str]:
+        """NEW-130: every way a ChangeSet touches agent configuration (.codex, .claude,
+        .mcp.json at any depth): a changed, added, deleted or renamed path (renames are
+        split into deletion + addition), a symlink it adds, changes or deletes whose
+        target names such a location, and an agent-config path in the resulting tree
+        that resolves through a symlink onto something the ChangeSet changed."""
+        refused: set[str] = set()
+        changed: set[str] = set()
+
+        def display(raw: bytes) -> str:
+            return raw.decode("utf-8", "backslashreplace")
+
+        def link_target(sha: str, path: bytes) -> str | None:
+            if set(sha) != {"0"}:
+                return display(self._git_bytes(["git", "cat-file", "blob", sha], worktree))
+            on_disk = worktree / os.fsdecode(path)
+            return display(os.fsencode(os.readlink(on_disk))) if on_disk.is_symlink() else None
+
+        def resolved_inside(path: bytes) -> str | None:
+            real = Path(os.path.realpath(worktree / os.fsdecode(path)))
+            if not real.is_relative_to(worktree):
+                return None
+            return display(os.fsencode(real.relative_to(worktree).as_posix()))
+
+        def traversed(path: bytes) -> set[str]:
+            """Every symlink location traversed while resolving `path` component by
+            component (NEW-130 review 2: a changed symlink in the middle of the chain
+            counts; the final target is checked separately)."""
+            seen: set[str] = set()
+            pending = list(Path(os.fsdecode(path)).parts)
+            current = worktree
+            hops = 0
+            while pending and hops < 64:
+                part = pending.pop(0)
+                candidate = current / part
+                relative = (
+                    candidate.relative_to(worktree) if candidate.is_relative_to(worktree) else None
+                )
+                if candidate.is_symlink():
+                    if relative is not None:
+                        # The same encoding as `changed` (raw bytes, backslash-replaced).
+                        seen.add(display(os.fsencode(relative.as_posix())))
+                    hops += 1
+                    target = Path(os.readlink(candidate))
+                    if target.is_absolute():
+                        if not target.is_relative_to(worktree):
+                            break
+                        current = worktree
+                        pending = list(target.relative_to(worktree).parts) + pending
+                    else:
+                        pending = list(target.parts) + pending
+                    continue
+                current = Path(os.path.normpath(candidate))
+                if not current.is_relative_to(worktree):
+                    break
+            return seen
+
+        def check_symlink(path: bytes, target: str | None) -> None:
+            name = display(path)
+            if target is not None and is_agent_config_path(target):
+                refused.add(f"{name} -> {target}")
+            inside = resolved_inside(path)
+            if inside is not None and inside != name and is_agent_config_path(inside):
+                refused.add(f"{name} -> {inside}")
+
+        tokens = self._git_bytes(
+            ["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base_sha, "--"],
+            worktree,
+        ).split(b"\0")
+        index = 0
+        while index + 1 < len(tokens):
+            meta, path = tokens[index], tokens[index + 1]
+            index += 2
+            if not meta.startswith(b":"):
+                raise WorktreeError("unexpected git diff --raw record")
+            src_mode, dst_mode, src_sha, dst_sha, _ = meta[1:].decode("ascii").split(" ")
+            name = display(path)
+            changed.add(name)
+            if is_agent_config_path(name):
+                refused.add(name)
+            if src_mode == "120000" and set(src_sha) != {"0"}:
+                check_symlink(path, link_target(src_sha, path))
+            if dst_mode == "120000":
+                check_symlink(path, link_target(dst_sha, path))
+        for path in self._git_bytes(
+            ["git", "ls-files", "-z", "--others", "--exclude-standard"], worktree
+        ).split(b"\0"):
+            if not path:
+                continue
+            name = display(path)
+            changed.add(name)
+            if is_agent_config_path(name):
+                refused.add(name)
+            on_disk = worktree / os.fsdecode(path)
+            if on_disk.is_symlink():
+                check_symlink(path, display(os.fsencode(os.readlink(on_disk))))
+        if changed:
+            # The resulting tree: an agent-config path that resolves through a symlink
+            # (pre-existing or not) onto a path this ChangeSet changed.
+            for record in self._git_bytes(["git", "ls-files", "-z", "-s"], worktree).split(b"\0"):
+                if b"\t" not in record:
+                    continue
+                path = record.split(b"\t", 1)[1]
+                name = display(path)
+                if not is_agent_config_path(name):
+                    continue
+                inside = resolved_inside(path)
+                if (
+                    inside is not None
+                    and inside != name
+                    and any(overlaps(inside, item) for item in changed)
+                ):
+                    refused.add(f"{name} -> {inside}")
+                    continue
+                visited = traversed(path) - {name}
+                hit = sorted(
+                    step for step in visited if any(overlaps(step, item) for item in changed)
+                )
+                if hit:
+                    refused.add(f"{name} via {hit[0]}")
+        return sorted(refused)
 
     def prune_orphan_worktrees(
         self,

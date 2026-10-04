@@ -68,6 +68,59 @@ class CodexCLIAdapter:
         worktree_root = worktree.resolve()
         return [str(root) for root in roots if not root.is_relative_to(worktree_root)]
 
+    @staticmethod
+    def _project_trust_paths(working_directory: str) -> list[str]:
+        """NEW-130: the directories whose Codex project trust must be forced off.
+
+        Codex 0.159.3 loads a project's `.codex/config.toml` (MCP servers, `[agents]`,
+        model, sandbox and approval settings, hooks, exec policies) for every `.codex/`
+        folder between the cwd and the project root (the nearest `.git`) when the user
+        config marks the cwd, the project root, or (for a linked worktree) the main
+        checkout as trusted, and Codex wrote such entries for every past worktree. Trust
+        is looked up for the cwd first and then the project root; a session `-c` entry
+        for the same key beats the user config. Return the cwd and its project root,
+        each absolute and resolved, deduplicated in a stable order.
+        """
+        absolute = Path(os.path.abspath(working_directory))
+        candidates: list[Path] = []
+        for cwd in (absolute, absolute.resolve()):
+            candidates.append(cwd)
+            for directory in (cwd, *cwd.parents):
+                if (directory / ".git").exists():
+                    candidates.append(directory)
+                    break
+        unique: list[str] = []
+        for candidate in candidates:
+            for form in (str(candidate), str(candidate.resolve())):
+                if form not in unique:
+                    unique.append(form)
+        return unique
+
+    @classmethod
+    def _untrusted_project_override(cls, working_directory: str) -> str:
+        """NEW-130: one `--config` value that marks every trust path untrusted.
+
+        Verified on codex-cli 0.159.3 (temporary CODEX_HOME + repo, `app-server`
+        `config/read` and a real `exec` whose repo MCP server was a marker command):
+        - The dotted form `-c 'projects."<path>".trust_level="untrusted"'` does NOT work:
+          the `-c` key parser keeps the quotes, so it adds a key named `"<path>"` and
+          the trusted entry still applies.
+        - An inline table `-c 'projects={"<path>"={trust_level="untrusted"}}'` is merged
+          into `projects` and wins: the project layer gets a disabledReason, so its
+          `mcp_servers` (never started), `[agents]`, model, sandbox_mode and
+          approval_policy are dropped; the user config and CLI flags stay in force.
+        - The cwd entry beats the project-root entry, so both are overridden. An entry
+          on the main checkout of a linked worktree is beaten by the worktree root's.
+        - There is no option that disables project config entirely (only
+          `--ignore-user-config`, which also drops the runner's own config).
+        Skills and AGENTS.md still load from untrusted folders; they are instructions.
+        """
+        entries = ",".join(
+            f'{json.dumps(path, ensure_ascii=False)}={{trust_level="untrusted"}}'
+            for path in cls._project_trust_paths(working_directory)
+        )
+        return f"projects={{{entries}}}"
+
     async def execute(
         self, request: AgentRequest, on_event: EventCallback | None = None
     ) -> AgentResult:
@@ -112,6 +165,10 @@ class CodexCLIAdapter:
                 command.extend(("--model", model))
             if request.effort:
                 command.extend(("--config", f'model_reasoning_effort="{request.effort}"'))
+            # NEW-130: never load configuration from the repository being worked on.
+            command.extend(
+                ("--config", self._untrusted_project_override(request.working_directory))
+            )
             command.append("-")
 
             process_result = await run_jsonl_process(
