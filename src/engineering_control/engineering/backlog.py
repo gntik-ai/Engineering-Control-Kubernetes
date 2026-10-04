@@ -787,26 +787,25 @@ def _severity(
     return "unspecified"
 
 
+# NEW-128 review 2: the R3 safety gate must over-match, never under-match. Each R3 root
+# matches at a word START and may continue with any word characters, so every inflection
+# (productionisation, destructively, clusterrolebindings, data migrations) stays R3, while
+# a root inside another word ("reproduction") has no word boundary and is not matched.
+_R3_KEYWORD_ROOTS = (
+    r"data\s+migrat",
+    r"destructiv",
+    r"credential\s+rotat",
+    r"secret\s+lifecycle",
+    r"production",
+    r"clusterrole",
+)
+_R3_KEYWORDS = re.compile(r"\b(?:" + "|".join(_R3_KEYWORD_ROOTS) + r")\w*", re.IGNORECASE)
+
+
 def _risk(
     issue_type: BacklogIssueType, severity: str, text: str
 ) -> Literal["R0", "R1", "R2", "R3"]:
-    if _mentions(
-        text,
-        "data migration",
-        "destructive",
-        "credential rotation",
-        "secret lifecycle",
-        "production",
-        # "productionise the gateway": production-related verb forms stay R3.
-        "productionise",
-        "productionize",
-        "productionised",
-        "productionized",
-        "productionising",
-        "productionizing",
-        "clusterrole",
-        "clusterrolebinding",
-    ):
+    if _R3_KEYWORDS.search(text) is not None:
         return "R3"
     if issue_type is BacklogIssueType.SECURITY_DEFECT or severity in {"critical", "high"}:
         return "R2"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -227,7 +228,6 @@ def _issue(title: str, body: str, labels: tuple[str, ...] = ("bug",)) -> GitHubI
     [
         "A source-reproduction of the failure is attached.",
         "The bug is reproducible with the minimal reproduction below.",
-        "Check the destructiveness of the cleanup preview.",
         "Restores the metadata migration order.",
     ],
 )
@@ -299,7 +299,7 @@ async def test_amend_retry_resolves_the_paused_loop_before_any_change_set(
     with operations.sessions.begin() as session:
         run = session.scalar(select(Run).where(Run.workflow_id == loop_id))
         run.status, run.finished_at = "STOPPED", NOW
-        # The campaign's only other active loop holds the issue instead.
+        # NEW-128 review 2: campaign membership alone no longer proves ownership.
         session.add(
             Run(
                 campaign_id=None,
@@ -313,9 +313,7 @@ async def test_amend_retry_resolves_the_paused_loop_before_any_change_set(
         )
     with operations.sessions() as session:
         issue = session.scalar(select(BacklogIssueRecord))
-        assert retry_workflow_id(session, None, issue) == (
-            f"backlog-loop-falcone-{CAMPAIGN_ID}-campaign"
-        )
+        assert retry_workflow_id(session, None, issue) is None
     with operations.sessions.begin() as session:
         session.add(
             Run(
@@ -330,10 +328,8 @@ async def test_amend_retry_resolves_the_paused_loop_before_any_change_set(
         )
     with operations.sessions() as session:
         issue = session.scalar(select(BacklogIssueRecord))
-        # Both campaign loops hold the issue durably: the newest one is chosen.
-        assert retry_workflow_id(session, None, issue) == (
-            f"backlog-loop-falcone-{CAMPAIGN_ID}-other"
-        )
+        # Campaign loops without a registered child or issue-start binding prove nothing.
+        assert retry_workflow_id(session, None, issue) is None
     for item in (operations, metadata, handler):
         item.engine.dispose()
 
@@ -437,13 +433,12 @@ INTENDED_DROPS = {
     ("minimal reproduction", "production"),
     ("reproducible", "producible"),
     ("metadata", "meta"),
-    ("destructiveness", "destructive"),
 }
 
 
 def test_no_keyword_form_the_substring_matcher_caught_is_lost() -> None:
     terms = _keyword_terms()
-    assert {"authorization bypass", "data loss", "production", "productionise"} <= terms
+    assert {"authorization bypass", "data loss"} <= terms
     lost = []
     for term in sorted(terms):
         plural = _regular_plural(term)
@@ -506,6 +501,10 @@ def test_classification_matches_the_substring_classifier_except_false_positives(
     with monkeypatch.context() as patch:
         patch.setattr(
             backlog, "_mentions", lambda text, *terms: any(term in text for term in terms)
+        )
+        # The R3 gate's roots, matched as plain substrings like the old classifier.
+        patch.setattr(
+            backlog, "_R3_KEYWORDS", re.compile("|".join(backlog._R3_KEYWORD_ROOTS), re.IGNORECASE)
         )
         old = [_classification(body, labels) for body, labels in CORPUS]
         dropped = [
@@ -642,3 +641,31 @@ async def test_amend_retry_never_picks_another_issues_start_loop(tmp_path: Path)
         assert retry_workflow_id(session, None, issue) is None
     for item in (operations, metadata, handler):
         item.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Productionisation of the gateway",
+        "productionization plan",
+        "Productionise the gateway before the rollout",
+        "a production outage",
+        "purge destructively",
+        "check the destructiveness of the cleanup",
+        "two data migrations",
+        "credential rotation job",
+        "clusterrolebindings are too broad",
+        "secret lifecycle handling",
+    ],
+)
+def test_r3_gate_keeps_every_inflection_of_its_roots(text: str) -> None:
+    # NEW-128 review 2: the R3 gate over-matches by design (word-start prefixes).
+    assert calculated_issue_risk("gntik-ai/falcone", ("bug",), "API returns 500", text) == "R3"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["A source-reproduction is attached.", "The bug is reproducible.", "minimal reproduction"],
+)
+def test_r3_gate_ignores_roots_inside_other_words(text: str) -> None:
+    assert calculated_issue_risk("gntik-ai/falcone", ("bug",), "API returns 500", text) == "R1"

@@ -722,18 +722,8 @@ def _issue_loop_candidates(session: Session, issue: BacklogIssueRecord) -> list[
             continue
         if str(request.backlog_campaign_id) == campaign_id:
             names.append(issue_workflow_id(request))
-    # The campaign's loops (each still has to hold the issue).
-    prefix = f"backlog-loop-{campaign.project}-{campaign_id}"
-    names.extend(
-        name
-        for name in session.scalars(
-            select(Run.workflow_id).where(
-                Run.workflow_id.startswith(prefix, autoescape=True),
-                Run.run_type == _LOOP_RUN_TYPE,
-                Run.status.in_(_ACTIVE_LOOP_STATUSES),
-                Run.finished_at.is_(None),
-            )
-        ).all()
-        if name == prefix or name.startswith(f"{prefix}-")
-    )
+    # NEW-128 review 2: no campaign-membership fallback. A campaign loop that has not
+    # registered a delivery child for this issue (nor is its issue-start loop) does not
+    # prove ownership; without positive proof no loop is returned and the operator
+    # retries explicitly (/loop retry <workflow-id> <repository> <issue>).
     return names
