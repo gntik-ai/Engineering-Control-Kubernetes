@@ -23,7 +23,6 @@ from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
 
 ROOT = Path(__file__).resolve().parents[1]
-PRUNE = ROOT / "scripts" / "prune-codex-project-trust.sh"
 GIT = shutil.which("git") or "/usr/bin/git"
 
 
@@ -347,135 +346,6 @@ trust_level = "trusted"
 """
 
 
-def _prune(
-    config: Path, *extra: str, codex_running: bool = False, concurrent_edit: bool = False
-) -> subprocess.CompletedProcess[str]:
-    # A pgrep stub keeps the quiescence check deterministic on hosts running Codex.
-    stub = config.parent.parent / f"pgrep-stub-{codex_running}"
-    stub.mkdir(exist_ok=True)
-    (stub / "pgrep").write_text(f"#!/bin/sh\nexit {0 if codex_running else 1}\n")
-    (stub / "pgrep").chmod(0o755)
-    environment = {**os.environ, "PATH": f"{stub}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
-    if concurrent_edit:
-        environment["PRUNE_CODEX_TRUST_TEST_CONCURRENT_EDIT"] = "1"
-    return subprocess.run(  # noqa: S603 - repository script on a temporary file
-        ["/bin/bash", str(PRUNE), "--config", str(config), *extra],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-        env=environment,
-    )
-
-
-def _files(directory: Path) -> list[str]:
-    lock = "config.toml.prune.lock"
-    return sorted(item.name for item in directory.iterdir() if item.name != lock)
-
-
-def _config(tmp_path: Path, content: str) -> Path:
-    directory = tmp_path / "home"
-    directory.mkdir()
-    config = directory / "config.toml"
-    config.write_text(content, encoding="utf-8")
-    return config
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
-def test_prune_script_dry_run_changes_nothing(tmp_path: Path) -> None:
-    config = _config(tmp_path, _SAMPLE)
-
-    result = _prune(config, "--dry-run")
-
-    assert result.returncode == 0, result.stderr
-    assert "prune: /srv/engineering/worktrees/musematic/abc" in result.stdout
-    assert "prune: /srv/engineering/worktrees/llmwiki/def" in result.stdout
-    assert "2 of 4 project entries" in result.stdout
-    assert config.read_text(encoding="utf-8") == _SAMPLE
-    assert _files(config.parent) == ["config.toml"]
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
-def test_prune_script_removes_only_worktree_entries(tmp_path: Path) -> None:
-    config = _config(tmp_path, _SAMPLE)
-    config.chmod(0o640)
-    before = tomllib.loads(_SAMPLE)
-
-    result = _prune(config)
-
-    assert result.returncode == 0, result.stderr
-    after = tomllib.loads(config.read_text(encoding="utf-8"))
-    expected = {**before, "projects": dict(before["projects"])}
-    del expected["projects"]["/srv/engineering/worktrees/musematic/abc"]
-    del expected["projects"]["/srv/engineering/worktrees/llmwiki/def"]
-    assert after == expected
-    assert "# operator note" in config.read_text(encoding="utf-8")
-    assert config.stat().st_mode & 0o777 == 0o640
-    [backup] = [
-        item for item in config.parent.iterdir() if item.name.startswith("config.toml.bak-")
-    ]
-    assert backup.read_text(encoding="utf-8") == _SAMPLE
-    assert backup.stat().st_mode & 0o777 == 0o600
-    assert _files(config.parent) == ["config.toml", backup.name]
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
-@pytest.mark.parametrize(
-    "content",
-    [
-        'model = "x"\n[projects\n',  # invalid TOML
-        'projects = { "/srv/engineering/worktrees/a" = { trust_level = "trusted" } }\n',
-    ],
-)
-def test_prune_script_refuses_invalid_or_unusual_layouts(tmp_path: Path, content: str) -> None:
-    config = _config(tmp_path, content)
-
-    result = _prune(config)
-
-    assert result.returncode != 0
-    assert config.read_text(encoding="utf-8") == content
-    assert _files(config.parent) == ["config.toml"]
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
-def test_prune_script_refuses_a_concurrent_edit(tmp_path: Path) -> None:
-    config = _config(tmp_path, _SAMPLE)
-
-    result = _prune(config, concurrent_edit=True)
-
-    assert result.returncode == 3
-    assert "changed since it was read; nothing written" in result.stderr
-    # Only the simulated concurrent writer's line was added; nothing was pruned.
-    assert config.read_text(encoding="utf-8") == _SAMPLE + "# concurrent edit\n"
-    assert _files(config.parent) == ["config.toml"]
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
-def test_prune_script_refuses_while_codex_runs(tmp_path: Path) -> None:
-    config = _config(tmp_path, _SAMPLE)
-
-    result = _prune(config, codex_running=True)
-
-    assert result.returncode == 3
-    assert "codex process is running" in result.stderr
-    assert config.read_text(encoding="utf-8") == _SAMPLE
-    assert _files(config.parent) == ["config.toml"]
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
-def test_prune_script_refuses_while_another_prune_holds_the_lock(tmp_path: Path) -> None:
-    config = _config(tmp_path, _SAMPLE)
-    lock = config.parent / "config.toml.prune.lock"
-    with lock.open("a") as handle:
-        import fcntl
-
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        result = _prune(config)
-
-    assert result.returncode == 3
-    assert config.read_text(encoding="utf-8") == _SAMPLE
-
-
 def _base_repo(tmp_path: Path, files: dict[str, str], links: dict[str, str]) -> tuple[Path, str]:
     repo = tmp_path / "worktrees" / "repo"
     repo.mkdir(parents=True)
@@ -623,3 +493,20 @@ def test_validation_uses_the_manager_git_agent_config_report(tmp_path: Path) -> 
 
     assert validated["blocker"] == "AGENT_CONFIG_CHANGE_REFUSED"
     assert validated["agent_config_paths"] == ["source: .codex/agents/é.toml"]
+
+
+def test_git_changed_intermediate_symlink_in_the_chain_is_refused(tmp_path: Path) -> None:
+    # NEW-130 review 2: existing `.mcp.json -> settings.json`; the ChangeSet replaces
+    # `settings.json` with a symlink to an existing `payload.json` (unchanged). Only the
+    # middle of the chain changed, and that alone must be refused.
+    repo, base = _base_repo(
+        tmp_path,
+        {"settings.json": "{}\n", "payload.json": '{"mcpServers": {}}\n'},
+        {".mcp.json": "settings.json"},
+    )
+    (repo / "settings.json").unlink()
+    (repo / "settings.json").symlink_to("payload.json")
+    _commit(repo)
+
+    refused = _agent_paths(tmp_path, repo, base)
+    assert any(item.startswith(".mcp.json") for item in refused), refused

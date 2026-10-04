@@ -931,6 +931,38 @@ class GitWorktreeManager:
                 return None
             return display(os.fsencode(real.relative_to(worktree).as_posix()))
 
+        def traversed(path: bytes) -> set[str]:
+            """Every symlink location traversed while resolving `path` component by
+            component (NEW-130 review 2: a changed symlink in the middle of the chain
+            counts; the final target is checked separately)."""
+            seen: set[str] = set()
+            pending = list(Path(os.fsdecode(path)).parts)
+            current = worktree
+            hops = 0
+            while pending and hops < 64:
+                part = pending.pop(0)
+                candidate = current / part
+                relative = (
+                    candidate.relative_to(worktree) if candidate.is_relative_to(worktree) else None
+                )
+                if candidate.is_symlink():
+                    if relative is not None:
+                        seen.add(relative.as_posix())
+                    hops += 1
+                    target = Path(os.readlink(candidate))
+                    if target.is_absolute():
+                        if not target.is_relative_to(worktree):
+                            break
+                        current = worktree
+                        pending = list(target.relative_to(worktree).parts) + pending
+                    else:
+                        pending = list(target.parts) + pending
+                    continue
+                current = Path(os.path.normpath(candidate))
+                if not current.is_relative_to(worktree):
+                    break
+            return seen
+
         def check_symlink(path: bytes, target: str | None) -> None:
             name = display(path)
             if target is not None and is_agent_config_path(target):
@@ -981,10 +1013,19 @@ class GitWorktreeManager:
                 if not is_agent_config_path(name):
                     continue
                 inside = resolved_inside(path)
-                if inside is None or inside == name:
-                    continue
-                if any(overlaps(inside, item) for item in changed):
+                if (
+                    inside is not None
+                    and inside != name
+                    and any(overlaps(inside, item) for item in changed)
+                ):
                     refused.add(f"{name} -> {inside}")
+                    continue
+                visited = traversed(path) - {name}
+                hit = sorted(
+                    step for step in visited if any(overlaps(step, item) for item in changed)
+                )
+                if hit:
+                    refused.add(f"{name} via {hit[0]}")
         return sorted(refused)
 
     def prune_orphan_worktrees(
