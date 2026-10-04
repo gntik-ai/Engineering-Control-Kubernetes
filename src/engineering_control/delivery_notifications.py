@@ -243,7 +243,7 @@ def enqueue(
     safe = (redactor or SecretRedactor()).redact(payload).value
     if not isinstance(safe, dict):
         raise TypeError("redacted notification payload must remain an object")
-    safe["message"] = bounded_message(str(safe.get("message") or ""))
+    safe["message"] = inert_message(bounded_message(str(safe.get("message") or "")))
     now = datetime.now(UTC)
     session.add(
         NotificationOutbox(
@@ -473,11 +473,24 @@ def literal(value: Any, limit: int = 160) -> str:
     never formatted, and Telegram does not linkify URLs in code. A backtick (the only way
     out of the span) and control characters are replaced first.
     """
-    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in str(value))
+    # NEW-127 review 2: redact BEFORE wrapping, so a redaction pattern (e.g. "cookie: …")
+    # can never consume the closing backtick; the span is space-padded for the same reason.
+    text = str(SecretRedactor().redact_text(str(value)).value)
+    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in text)
     text = " ".join(text.replace("`", "'").split())
     if len(text) > limit:
         text = text[: limit - 3] + "..."
-    return f"`{text or '-'}`"
+    return f"` {text or '-'} `"
+
+
+_MARKDOWN_CONTROL = re.compile(r"[`*_\[\]()~|>#]")
+
+
+def inert_message(message: str) -> str:
+    """Last guard: a message whose code spans no longer pair is sent as plain text."""
+    if message.count("`") % 2 == 0:
+        return message
+    return " ".join(_MARKDOWN_CONTROL.sub(" ", message).split())
 
 
 def maker_failures(context: dict[str, Any]) -> list[str]:

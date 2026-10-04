@@ -50,6 +50,7 @@ from engineering_control.db.models import (
     Run,
 )
 from engineering_control.notifier import NotificationService, NotificationSink
+from engineering_control.security.redaction import SecretRedactor
 from engineering_control.watchdog import (
     LOOP_PROBE,
     LOOP_PROBE_PREFIX,
@@ -389,7 +390,7 @@ async def test_a_ci_repair_round_start_names_the_failing_checks(tmp_path: Path) 
         assert len(repairs) == 1
         message = repairs[0].payload_json["message"]
         assert "round 1 for SOURCE_PR_CI_REGRESSION on the source PR" in message
-        assert "failing checks: `lint`, `unit-tests`" in message
+        assert "failing checks: ` lint `, ` unit-tests `" in message
     finally:
         _dispose(values)
 
@@ -482,8 +483,8 @@ def test_a_blocked_delivery_names_the_failed_maker_test_and_checker_verdict(
     value = row.payload_json
     assert value["event"] == "DELIVERY_BLOCKED" and value["issue"] == ISSUE
     assert "attempt 2" in value["message"]
-    assert "maker FAIL: `pytest tests/test_api.py`" in value["message"]
-    assert "checker: PASS `change is correct`" in value["message"]
+    assert "maker FAIL: ` pytest tests/test_api.py `" in value["message"]
+    assert "checker: PASS ` change is correct `" in value["message"]
     assert "ruff check" not in value["message"]
     # A stop that is not a block (a dry run) or a cleanup without a run says nothing.
     handler._release_delivery_leases({**context, "status": "DRY_RUN"})
@@ -1265,3 +1266,71 @@ async def test_the_staging_flow_announces_the_merge_before_the_build_waits() -> 
         request["step"] for request in _scheduled_steps(old_history)
     ]
     await Replayer(workflows=[StagingGitOpsDeliveryWorkflow]).replay_workflow(old_history)
+
+
+def test_redaction_cannot_break_a_literal_span_open() -> None:
+    # NEW-127 review 2: a cookie-shaped secret right before the closing backtick.
+    attack = "[Approve fix](https://attacker.invalid/approve) cookie: ABCDEFG"
+    message = f"maker failed: {notices.literal(attack)} and {notices.literal(attack)}"
+    redacted = str(SecretRedactor().redact_text(message).value)
+    assert redacted.count("`") % 2 == 0
+    for outside in redacted.split("`")[0::2]:
+        assert "](" not in outside
+    assert "ABCDEFG" not in notices.literal(attack)
+
+
+def test_a_message_with_unpaired_code_spans_is_sent_as_plain_text() -> None:
+    broken = "loop paused: `[x](https://attacker.invalid) and more"
+    inert = notices.inert_message(broken)
+    assert "`" not in inert and "[" not in inert and "(" not in inert
+    paired = f"loop paused: {notices.literal('[x](https://a.invalid)')}"
+    assert notices.inert_message(paired) == paired
+
+
+def test_exactly_the_loop_limit_is_not_an_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(watchdog_module, "LOOP_LIMIT", 3)
+    monkeypatch.setattr(watchdog_module, "LOOP_PAGE", 2)
+    observed = [T0]
+    watchdog, _ = _watchdog(tmp_path, observed)
+    with watchdog.engine.begin() as connection:
+        for index in range(3):
+            connection.execute(
+                Run.__table__.insert().values(
+                    id=uuid4(),
+                    workflow_id=f"loop-{index}",
+                    run_type="existing-backlog-loop",
+                    status="RUNNING",
+                    project="falcone",
+                    created_at=T0,
+                    updated_at=T0,
+                )
+            )
+    results = watchdog._backlog_loop_progress(T0)
+    assert (results[0].healthy, results[0].status) == (True, "READABLE")
+    assert len(results) == 4
+
+
+def test_a_live_staging_child_is_seen_after_many_finished_children(tmp_path: Path) -> None:
+    observed = [T0]
+    watchdog, _ = _watchdog(tmp_path, observed)
+    started = T0 - timedelta(hours=2)
+    _seed_loop(watchdog, status="RUNNING", updated_at=started)
+    for index in range(501):
+        _child_run(
+            watchdog,
+            f"issue-{index}-attempt-1",
+            "issue-delivery",
+            started - timedelta(minutes=index % 7),
+            done=True,
+        )
+    _child_run(
+        watchdog,
+        "issue-999-staging-gitops",
+        "staging-gitops",
+        started - timedelta(hours=1),
+        done=False,
+    )
+    waiting = _loop_probe(watchdog, T0)
+    assert (waiting.healthy, waiting.status) == (True, "WAITING_STAGING_GITOPS")

@@ -502,7 +502,9 @@ class OperationalWatchdog:
                 # Page through every unfinished loop, most stale first, so no bound on
                 # the number of rows can hide the loop that most needs attention.
                 loops: list[Run] = []
-                while len(loops) < LOOP_LIMIT:
+                # NEW-127 review 2: read one row past the limit so exactly LOOP_LIMIT loops is
+                # not reported as an overflow.
+                while len(loops) <= LOOP_LIMIT:
                     page = list(
                         session.scalars(
                             select(Run)
@@ -519,7 +521,7 @@ class OperationalWatchdog:
                     loops.extend(page)
                     if len(page) < LOOP_PAGE:
                         break
-                truncated = len(loops) >= LOOP_LIMIT
+                truncated = len(loops) > LOOP_LIMIT
                 loops = loops[:LOOP_LIMIT]
                 notices = list(
                     session.scalars(
@@ -539,11 +541,27 @@ class OperationalWatchdog:
                     prefix = f"{loop.workflow_id}-"
                     pattern = _like_prefix(prefix)
                     # LIKE narrows; the literal prefix check decides (ids may hold _ or %).
+                    # NEW-127 review 2: the most recently updated children, plus every
+                    # unfinished one (e.g. the live staging child) however many retries came first.
+                    child_rows = {
+                        child.id: child
+                        for query in (
+                            select(Run)
+                            .where(Run.workflow_id.like(pattern, escape="\\"))
+                            .order_by(desc(Run.updated_at), desc(Run.id))
+                            .limit(500),
+                            select(Run)
+                            .where(
+                                Run.workflow_id.like(pattern, escape="\\"),
+                                Run.finished_at.is_(None),
+                            )
+                            .limit(500),
+                        )
+                        for child in session.scalars(query).all()
+                    }
                     children = [
                         child
-                        for child in session.scalars(
-                            select(Run).where(Run.workflow_id.like(pattern, escape="\\")).limit(500)
-                        ).all()
+                        for child in child_rows.values()
                         if child.workflow_id.startswith(prefix)
                     ]
                     agent_times = [
