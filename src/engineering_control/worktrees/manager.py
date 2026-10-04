@@ -947,7 +947,8 @@ class GitWorktreeManager:
                 )
                 if candidate.is_symlink():
                     if relative is not None:
-                        seen.add(relative.as_posix())
+                        # The same encoding as `changed` (raw bytes, backslash-replaced).
+                        seen.add(display(os.fsencode(relative.as_posix())))
                     hops += 1
                     target = Path(os.readlink(candidate))
                     if target.is_absolute():

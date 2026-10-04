@@ -510,3 +510,21 @@ def test_git_changed_intermediate_symlink_in_the_chain_is_refused(tmp_path: Path
 
     refused = _agent_paths(tmp_path, repo, base)
     assert any(item.startswith(".mcp.json") for item in refused), refused
+
+
+def test_git_non_utf8_intermediate_symlink_is_refused(tmp_path: Path) -> None:
+    # NEW-130 review 3: an intermediate filename that is not valid UTF-8.
+    import os as _os
+
+    odd = _os.fsdecode(b"settings-\xff.json")
+    repo, base = _base_repo(
+        tmp_path,
+        {odd: "{}\n", "payload.json": '{"mcpServers": {}}\n'},
+        {".mcp.json": odd},
+    )
+    (repo / odd).unlink()
+    (repo / odd).symlink_to("payload.json")
+    _commit(repo)
+
+    refused = _agent_paths(tmp_path, repo, base)
+    assert any(item.startswith(".mcp.json") for item in refused), refused
