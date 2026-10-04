@@ -268,6 +268,18 @@ def _guarded(value: Any) -> Any:
     return value
 
 
+_WHOLE_KEYS = frozenset({"commands"})
+
+
+def _whole(value: Any) -> Any:
+    """Paired code spans are still required, but strings are never shortened."""
+    if isinstance(value, str):
+        return inert_message(value)
+    if isinstance(value, list):
+        return [_whole(item) for item in value]
+    return _guarded(value)
+
+
 def _rendered_size(payload: dict[str, Any]) -> int:
     return len(json.dumps({"topic": "telegram.x", "payload": payload}, indent=2, ensure_ascii=True))
 
@@ -276,7 +288,13 @@ def bounded_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Every field's code spans pair, and the whole payload fits the gateway's rendering,
     so the gateway's own truncation can never cut a span open."""
     message = str(payload.get("message") or "")
-    bounded = {key: _guarded(value) for key, value in payload.items() if key != "message"}
+    bounded = {
+        # Generated operator commands are never cut (a partial command is wrong): they stay
+        # whole, or the whole list is dropped below if the budget requires it.
+        key: (_whole(value) if key in _WHOLE_KEYS else _guarded(value))
+        for key, value in payload.items()
+        if key != "message"
+    }
     bounded["message"] = inert_message(bounded_message(message))
     # Drop optional collections first (they only repeat what the message says).
     for key in sorted(

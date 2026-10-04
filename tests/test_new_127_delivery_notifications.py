@@ -1366,3 +1366,16 @@ def test_a_live_staging_child_is_seen_among_many_unfinished_children(tmp_path: P
         _child_run(watchdog, f"issue-{index}-attempt-1", "issue-delivery", started, done=False)
     waiting = _loop_probe(watchdog, T0)
     assert (waiting.healthy, waiting.status) == (True, "WAITING_STAGING_GITOPS")
+
+
+def test_generated_commands_are_never_cut() -> None:
+    workflow = "backlog-loop-falcone-" + "a" * 240
+    command = f"engineering-ctl backlog-retry {workflow} falcone 12"
+    assert len(command) > 300
+    bounded = notices.bounded_payload({"message": "paused", "commands": [command, "/loop status"]})
+    assert bounded["commands"] == [command, "/loop status"]
+    # Over budget, the commands go as a whole list, never truncated.
+    huge = notices.bounded_payload(
+        {"message": "paused", "commands": [command] * 40, "issue": "gntik-ai/falcone#12"}
+    )
+    assert "commands" not in huge or all(item == command for item in huge["commands"])
