@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 
-def ensure_directory_no_follow(root: Path, directory: Path, *, mode: int = 0o750) -> None:
+def open_directory_no_follow(root: Path, directory: Path, *, mode: int = 0o750) -> int:
     """Create `directory` under the trusted `root`, refusing a symlink at EVERY component.
 
     NEW-120 review 2: O_NOFOLLOW on the final component alone let a symlink at an
@@ -31,8 +31,42 @@ def ensure_directory_no_follow(root: Path, directory: Path, *, mode: int = 0o750
             following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
             os.close(current)
             current = following
-    finally:
+    except BaseException:
         os.close(current)
+        raise
+    # NEW-120 review 3: the caller keeps the VERIFIED descriptor and writes relative to it
+    # (write_text_at); reopening the path would race a symlink swap of a parent.
+    return current
+
+
+def write_text_at(directory: int, name: str, text: str, *, mode: int = 0o640) -> None:
+    """Atomically write `name` inside the already-verified directory descriptor."""
+    if "/" in name or name in {"", ".", ".."}:
+        raise ValueError(f"refusing a non-simple file name: {name!r}")
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        existing = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise ValueError(f"refusing to overwrite a non-regular file or symlink: {name}")
+    descriptor = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=directory
+    )
+    created = True
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        created = False
+    finally:
+        if created:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
 
 
 def write_text_no_follow(path: Path, text: str, *, mode: int = 0o640) -> None:

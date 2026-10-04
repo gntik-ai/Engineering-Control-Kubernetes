@@ -38,8 +38,8 @@ from engineering_control.engineering.models import (
     UiMigrationPolicy,
 )
 from engineering_control.engineering.safe_files import (
-    ensure_directory_no_follow,
-    write_text_no_follow,
+    open_directory_no_follow,
+    write_text_at,
 )
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
@@ -1221,11 +1221,14 @@ class ScanActivityHandler:
         document = build_inventory(worktree, policy, source_sha=source_sha, project=project.value)
         digest = str(document["inventory_sha256"])
         directory = self.settings.evidence_root / "scan" / "ui-inventory" / digest[:32]
-        ensure_directory_no_follow(self.settings.evidence_root, directory)
         json_path = directory / "ui-inventory.json"
         markdown_path = directory / "ui-inventory.md"
-        self._store_redacted_json(json_path, document)
-        write_text_no_follow(markdown_path, render_markdown(document))
+        verified = open_directory_no_follow(self.settings.evidence_root, directory)
+        try:
+            self._store_redacted_json(verified, json_path.name, document)
+            write_text_at(verified, markdown_path.name, render_markdown(document))
+        finally:
+            os.close(verified)
         receipts = self._publish_reports(
             payload,
             [json_path, markdown_path],
@@ -1292,9 +1295,12 @@ class ScanActivityHandler:
     ) -> dict[str, Any]:
         digest = str(document["snapshot_sha256"])
         directory = self.settings.evidence_root / "scan" / "ui-kit" / digest[:32]
-        ensure_directory_no_follow(self.settings.evidence_root, directory)
         path = directory / "ui-kit-snapshot.json"
-        self._store_redacted_json(path, document)
+        verified = open_directory_no_follow(self.settings.evidence_root, directory)
+        try:
+            self._store_redacted_json(verified, path.name, document)
+        finally:
+            os.close(verified)
         receipts = self._publish_reports(
             payload, [path], filename_prefix=f"ui-kit-{digest[:12]}", category="snapshot"
         )
@@ -1320,12 +1326,12 @@ class ScanActivityHandler:
         }
 
     @staticmethod
-    def _store_redacted_json(path: Path, document: dict[str, Any]) -> None:
+    def _store_redacted_json(directory: int, name: str, document: dict[str, Any]) -> None:
         """Store exactly the hashed document: it must already be redaction-stable, so the
         evidence upload's own redaction cannot change what the reported digest covers."""
         if SecretRedactor().redact(document).value != document:
             raise ValueError("ui evidence was not redacted before it was hashed")
-        write_text_no_follow(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+        write_text_at(directory, name, json.dumps(document, indent=2, sort_keys=True) + "\n")
 
     def _snapshot_pair(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = Project(str(payload.get("project")))

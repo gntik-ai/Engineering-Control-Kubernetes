@@ -683,7 +683,7 @@ async def test_cancellation_before_the_process_is_assigned_still_removes_the_con
 
 
 def test_evidence_directories_refuse_a_symlink_at_any_component(tmp_path: Path) -> None:
-    from engineering_control.engineering.safe_files import ensure_directory_no_follow
+    from engineering_control.engineering.safe_files import open_directory_no_follow
 
     root = tmp_path / "evidence"
     (root / "scan").mkdir(parents=True)
@@ -691,9 +691,31 @@ def test_evidence_directories_refuse_a_symlink_at_any_component(tmp_path: Path) 
     outside.mkdir()
     (root / "scan" / "ui-kit").symlink_to(outside, target_is_directory=True)
     with pytest.raises(OSError):
-        ensure_directory_no_follow(root, root / "scan" / "ui-kit" / "abc")
+        open_directory_no_follow(root, root / "scan" / "ui-kit" / "abc")
     assert not (outside / "abc").exists()
-    ensure_directory_no_follow(root, root / "scan" / "ui-inventory" / "abc")
+    os.close(open_directory_no_follow(root, root / "scan" / "ui-inventory" / "abc"))
     assert (root / "scan" / "ui-inventory" / "abc").is_dir()
     with pytest.raises(ValueError):
-        ensure_directory_no_follow(root, root / "scan" / ".." / "x")
+        open_directory_no_follow(root, root / "scan" / ".." / "x")
+
+
+def test_writes_stay_in_the_verified_directory_after_a_parent_swap(tmp_path: Path) -> None:
+    from engineering_control.engineering.safe_files import open_directory_no_follow, write_text_at
+
+    root = tmp_path / "evidence"
+    target = root / "scan" / "ui-kit" / "abc"
+    verified = open_directory_no_follow(root, target)
+    try:
+        # After verification a parent is swapped for a symlink to a checkout that has the
+        # same digest directory: writes must still land in the verified directory.
+        outside = tmp_path / "checkout"
+        (outside / "abc").mkdir(parents=True)
+        (root / "scan" / "ui-kit").rename(tmp_path / "moved")
+        (root / "scan" / "ui-kit").symlink_to(outside, target_is_directory=True)
+        write_text_at(verified, "ui-kit-snapshot.json", "{}\n")
+        with pytest.raises(ValueError):
+            write_text_at(verified, "../escape.json", "x\n")
+    finally:
+        os.close(verified)
+    assert (tmp_path / "moved" / "abc" / "ui-kit-snapshot.json").read_text() == "{}\n"
+    assert not (outside / "abc" / "ui-kit-snapshot.json").exists()
