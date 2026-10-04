@@ -944,6 +944,25 @@ def test_prune_orphan_worktrees_removes_only_old_untracked_directories(tmp_path:
     from datetime import UTC, datetime, timedelta
 
     cutoff = datetime.now(UTC) - timedelta(days=14)
+    # NEW-119: an identity-blocked project's repositories are not walked at all.
+    withheld = manager.prune_orphan_worktrees(
+        older_than=cutoff, dry_run=False, excluded_repositories=frozenset({"falcone"})
+    )
+    assert withheld == {"removed": [], "kept": []} and snapshot.path.exists()
+    # NEW-119 review: a protected, detached falcone checkout (its lease branch names a
+    # blocked musematic) is excluded by path even though falcone itself is not excluded.
+    branch = git(["branch", "--show-current"], changeset_path)
+    git(["checkout", "-q", "--detach"], changeset_path)
+    protected = manager.prune_orphan_worktrees(
+        older_than=cutoff,
+        dry_run=True,
+        excluded_repositories=frozenset({"musematic", "musematic-deploy"}),
+        excluded_paths=frozenset({str(changeset_path), str(snapshot.path)}),
+    )
+    assert protected == {"removed": [], "kept": []}
+    exposed = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=True)
+    assert str(changeset_path) in {item["path"] for item in exposed["removed"]}
+    git(["checkout", "-q", branch], changeset_path)
     dry = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=True)
     assert {item["path"] for item in dry["removed"]} == {str(snapshot.path)}
     assert snapshot.path.exists() and unowned.exists()

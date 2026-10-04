@@ -895,7 +895,13 @@ class GitWorktreeManager:
         return summary, diff
 
     def prune_orphan_worktrees(
-        self, *, older_than: datetime, dry_run: bool, limit: int = 200
+        self,
+        *,
+        older_than: datetime,
+        dry_run: bool,
+        limit: int = 200,
+        excluded_repositories: frozenset[str] = frozenset(),
+        excluded_paths: frozenset[str] = frozenset(),
     ) -> dict[str, list[dict[str, str]]]:
         """NEW-85: remove worktree directories no lease ever tracks.
 
@@ -908,9 +914,15 @@ class GitWorktreeManager:
         are reported, never raised.
         """
         root = self.worktree_root.resolve()
+        # NEW-119: a path a lease tracks or that cleanup inspection protected is never
+        # pruned, whatever the project scoping says.
+        excluded = {Path(path).resolve(strict=False) for path in excluded_paths}
         removed: list[dict[str, str]] = []
         kept: list[dict[str, str]] = []
-        slugs = sorted({self._slug(repository) for repository in self._repositories})
+        slugs = sorted(
+            {self._slug(repository) for repository in self._repositories}
+            - {self._slug(repository) for repository in excluded_repositories}
+        )
         for slug in slugs:
             repository_dir = root / slug
             if repository_dir.is_symlink() or not repository_dir.is_dir():
@@ -923,6 +935,8 @@ class GitWorktreeManager:
                 except ValueError:
                     continue
                 if target.is_symlink() or not target.is_dir():
+                    continue
+                if target in excluded or target.resolve() in excluded:
                     continue
                 modified = datetime.fromtimestamp(target.stat().st_mtime, UTC)
                 if modified > older_than:

@@ -10,6 +10,10 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, ChildWorkflowError
 
+from engineering_control.workflows.cleanup_scope import (
+    rescope_after_recovery,
+    scope_identity_blockers,
+)
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
     AuditCampaignInput,
@@ -1986,18 +1990,29 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step("identity.inspect_stale", context)
             context = await self._step("cleanup.inspect_codex_files", context)
             context = await self._step("cleanup.inspect_preview_namespaces", context)
+            blocked_projects: dict[str, str] = {}
             if workflow.patched("cleanup-inspection-outcome-v1") and context.get(
                 "identity_recovery_blockers"
             ):
-                context = await self._step(
-                    "cleanup.finalize",
-                    {
+                scope = (
+                    scope_identity_blockers(context)
+                    if self._identity_project_scope_patched()
+                    else None
+                )
+                if scope is None or scope.blocked_all:
+                    blocked_finalization = {
                         **context,
                         "terminal_status": "BLOCKED",
                         "blocker": "CLEANUP_IDENTITY_INSPECTION_BLOCKED",
-                    },
-                )
-                return {"status": "BLOCKED", "context": context}
+                    }
+                    if scope is not None:
+                        blocked_finalization["cleanup_blocked_projects"] = scope.blocked_projects
+                    context = await self._step("cleanup.finalize", blocked_finalization)
+                    return {"status": "BLOCKED", "context": context}
+                # NEW-119: only the blocked projects' candidates are withheld (recorded
+                # as protected); every other project's cleanup continues.
+                context = scope.context
+                blocked_projects = scope.blocked_projects
             if request.dry_run:
                 if workflow.patched("cleanup-orphan-worktrees-v1"):
                     # NEW-85: report snapshot/acceptance leftovers no lease tracks.
@@ -2007,6 +2022,12 @@ class CleanupWorkflow(ControlledWorkflow):
                 context = await self._step(
                     "cleanup.finalize", {**context, "terminal_status": "DRY_RUN"}
                 )
+                if blocked_projects:
+                    return {
+                        "status": "DRY_RUN",
+                        "blocked_projects": blocked_projects,
+                        "context": context,
+                    }
                 return {"status": "DRY_RUN", "context": context}
             context = await self._step("cleanup.authorize", context)
             if context.get("status") == "BLOCKED":
@@ -2014,6 +2035,30 @@ class CleanupWorkflow(ControlledWorkflow):
                     "cleanup.finalize", {**context, "terminal_status": "BLOCKED"}
                 )
                 return {"status": "BLOCKED", "context": context}
+            if blocked_projects:
+                # NEW-119: on the scoped path identity recovery runs before any removal,
+                # so a project that fails recovery is withheld before anything is removed.
+                context = await self._step("identity.recover_stale", {**context, "dry_run": False})
+                if context.get("identity_recovery_blockers") or context.get("status") != "PASS":
+                    rescope = rescope_after_recovery(context, blocked_projects)
+                    if rescope.blocked_all:
+                        context = await self._step(
+                            "cleanup.finalize",
+                            {
+                                **context,
+                                "terminal_status": "BLOCKED",
+                                "blocker": "CLEANUP_IDENTITY_RECOVERY_BLOCKED",
+                            },
+                        )
+                        return {"status": "BLOCKED", "context": context}
+                    blocked_projects = rescope.blocked_projects
+                    # The withheld candidates leave the authorization: authorize again.
+                    context = await self._step("cleanup.authorize", rescope.context)
+                    if context.get("status") == "BLOCKED":
+                        context = await self._step(
+                            "cleanup.finalize", {**context, "terminal_status": "BLOCKED"}
+                        )
+                        return {"status": "BLOCKED", "context": context}
             context = await self._step(
                 "cleanup.execute_evidence_files", {**context, "dry_run": False}
             )
@@ -2023,7 +2068,8 @@ class CleanupWorkflow(ControlledWorkflow):
             context = await self._step(
                 "cleanup.execute_browser_files", {**context, "dry_run": False}
             )
-            context = await self._step("identity.recover_stale", {**context, "dry_run": False})
+            if not blocked_projects:
+                context = await self._step("identity.recover_stale", {**context, "dry_run": False})
             context = await self._step("cleanup.execute_codex_files", {**context, "dry_run": False})
             context = await self._step(
                 "cleanup.execute_preview_namespaces", {**context, "dry_run": False}
@@ -2034,6 +2080,15 @@ class CleanupWorkflow(ControlledWorkflow):
                     "cleanup.prune_orphan_worktrees", {**context, "dry_run": False}
                 )
             context = await self._step("cleanup.execute_metadata", {**context, "dry_run": False})
+            if blocked_projects:
+                context = await self._step(
+                    "cleanup.finalize", {**context, "terminal_status": "PARTIAL"}
+                )
+                return {
+                    "status": "PARTIAL",
+                    "blocked_projects": blocked_projects,
+                    "context": context,
+                }
             context = await self._step(
                 "cleanup.finalize", {**context, "terminal_status": "COMPLETE"}
             )
@@ -2048,6 +2103,10 @@ class CleanupWorkflow(ControlledWorkflow):
                 },
             )
             return {"status": "BLOCKED", "context": context}
+
+    def _identity_project_scope_patched(self) -> bool:
+        # NEW-119: confine identity-recovery blockers to the projects they name.
+        return workflow.patched("cleanup-identity-blocker-project-scope-v1")
 
 
 @workflow.defn(name="AcceptanceLifecycleWorkflow")

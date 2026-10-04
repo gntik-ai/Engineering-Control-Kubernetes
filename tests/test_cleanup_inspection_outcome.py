@@ -75,7 +75,11 @@ class CleanupInspectionOutcomeTests(IsolatedAsyncioTestCase):
                 result = await instance.run(CleanupInput(dry_run=dry_run))
             markers = [call.args[0] for call in marker.call_args_list]
             self.assertEqual(markers[0], "cleanup-inspection-outcome-v1")
-            self.assertLessEqual(set(markers[1:]), {"cleanup-orphan-worktrees-v1"})
+            # NEW-119 is consulted only with a blocker and held off here (legacy path).
+            self.assertLessEqual(
+                set(markers[1:]),
+                {"cleanup-orphan-worktrees-v1", "cleanup-identity-blocker-project-scope-v1"},
+            )
             expected = "BLOCKED" if modern and blocked else "DRY_RUN"
             self.assertEqual(result["status"], expected)
             self.assertEqual(result["context"]["status"], expected)
