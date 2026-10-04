@@ -239,3 +239,55 @@ request is classified like the same hand-written issue without that metadata, so
 under the bug filters. An `enhancement` request follows the existing enhancement rules. Its
 `Risk: R<n>` line is a floor: the imported risk is the higher of the declared risk and the
 keyword-detected risk.
+
+## UI migration blueprint (NEW-123, flow A)
+
+`UiMigrationPlanWorkflow` (`ui-plan-falcone-<id>`) produces the Falcone console migration
+blueprint. Models get no MCP: Hermes collects the kit data itself.
+
+```bash
+engineering-ctl ui-plan falcone [--source-sha <expected main head>]
+engineering-ctl ui-plan-status <id>     # status, hashes, findings, blockers, approve command
+engineering-ctl ui-blueprint-show <id>  # Markdown summary of the candidate
+engineering-ctl ui-blueprint-approve <id> <binding> APPROVE_UI_BLUEPRINT [--max-items N]
+```
+
+The steps are:
+
+1. `ui_plan.register` checks that the released agent pack (`agent_pack_root`) has profile 1.4.0
+   or later and the `plan-ui-migration` and `triage-ui-gap` skills with Hermes's synced schemas.
+   Otherwise the run is `BLOCKED AGENT_PACK_SKILL_MISSING` and lists what is missing.
+2. A read-only snapshot of main (`project.snapshot`), then `ui.inventory` and `ui.kit_snapshot`
+   on the scan worker. A kit snapshot that is `BLOCKED UI_MCP_UNAVAILABLE` stops the run with
+   that blocker; nothing is drafted without kit data.
+3. `ui_plan.stage_inputs` copies the hash-verified inventory and kit JSON into
+   `/srv/engineering/worktrees/ui-plan-inputs/<id>/`, which only the model workers can read.
+4. Claude drafts the blueprint (`ui-migration-architect`, `plan-ui-migration` in draft mode,
+   high effort, Read/Glob/Grep only). Codex reviews it with the same skill in review mode. A
+   `REVISE` verdict gets one Claude redraft and a second review. A second `REVISE` ends
+   `BLOCKED BLUEPRINT_REVIEW_UNRESOLVED` with the findings.
+5. The approved draft is published as evidence (JSON and Markdown) and stored as a `CANDIDATE`.
+   Its approval binding is the sha256 of the blueprint id, the canonical blueprint hash, the
+   inventory and kit snapshot hashes and the source SHA. A newer candidate for the project
+   supersedes an older, unapproved one. Telegram gets "UI blueprint ready for approval".
+
+Approval accepts only the CLI operator and allowlisted `telegram:<id>` actors. It then starts
+`UiBlueprintFanOutWorkflow` (`ui-blueprint-fanout-<id>-<n>`, a new `<n>` for each approval or
+replay; a replay joins a fan-out that is still running). The fan-out creates one change-request
+draft for each foundation epic, page (u1 to u4), the u5 cutover and each gap. The id of each
+draft is derived from the blueprint hash and the item key.
+
+- Gaps are drafted by Claude with `triage-ui-gap`. Epics, pages and the cutover are rendered
+  deterministically.
+- Codex reviews every draft, as in NEW-108.
+- The issue body gains a `## UI migration` section with the labels (`ui-migration`, `wave:uN`
+  and the item kind) and the `blocked by` change requests: a page is blocked by its backend gaps.
+- Kit gaps target `gntik-ai/gntik-ui`. The Hermes GitHub worker never searches or writes that
+  repository; `change-publish` with the operator's own `gh` publishes them like any other change
+  request. Labels are applied only if they already exist in the repository.
+
+Each fan-out run drafts at most `--max-items` items, capped by `ui_blueprint_fanout_max_items`
+(default 80), in batches of 10 that continue as new. Repeating the approval command resumes with
+the remaining items; finished items are never drafted twice. Telegram gets "UI fan-out done: N
+drafts". Revision 0020 adds the `ui_blueprints` table and `change_requests.ui_context_json`: run
+the migration before deploying this release.

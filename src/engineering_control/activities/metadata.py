@@ -455,6 +455,9 @@ class MetadataActivityHandler:
         "observability.invoke_codex_checker": "checker_request",
         "change_request.draft": "draft_request",
         "change_request.review": "review_request",
+        "ui_plan.draft": "draft_request",
+        "ui_plan.review": "review_request",
+        "ui_fanout.gap_draft": "draft_request",
     }
 
     supported_steps = frozenset(
@@ -1396,6 +1399,10 @@ class MetadataActivityHandler:
             return "synthetic-observability"
         if provider_step.startswith("change_request."):
             return "change-request"
+        if provider_step.startswith("ui_plan."):
+            return "ui-migration-plan"
+        if provider_step.startswith("ui_fanout."):
+            return "ui-blueprint-fanout"
         raise ValueError("provider telemetry step has no bounded run type")
 
     @staticmethod

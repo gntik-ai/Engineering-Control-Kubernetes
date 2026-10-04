@@ -29,3 +29,6 @@ class WorkflowName(StrEnum):
     LLMWIKI_STAGING_BOOTSTRAP = "LLMWikiStagingBootstrapWorkflow"
     STAGING_GITOPS_DELIVERY = "StagingGitOpsDeliveryWorkflow"
     CHANGE_REQUEST = "ChangeRequestWorkflow"
+    # NEW-123: UI migration flow A (blueprint) and its approved change-request fan-out.
+    UI_MIGRATION_PLAN = "UiMigrationPlanWorkflow"
+    UI_BLUEPRINT_FANOUT = "UiBlueprintFanOutWorkflow"

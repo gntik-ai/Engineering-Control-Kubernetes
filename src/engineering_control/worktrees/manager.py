@@ -645,6 +645,12 @@ class GitWorktreeManager:
         self._run(["setfacl", "--modify", traverse_acl, str(root)], resolved)
         self._grant_tree_read_access(resolved, identities, cwd=resolved)
 
+    def grant_model_read(self, target: Path, identities: tuple[str, ...]) -> None:
+        """NEW-123: read-only access for model workers to a staged, non-Git input directory."""
+        if any(identity not in WorktreeAccess._allowed_identities for identity in identities):
+            raise WorktreeError("model input reader is not an allowed model worker")
+        self._grant_bounded_read_access(target, identities)
+
     def _grant_bounded_read_access(self, target: Path, identities: tuple[str, ...]) -> None:
         resolved_root = self.worktree_root.resolve()
         resolved_target = target.resolve()

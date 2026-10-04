@@ -41,6 +41,8 @@ from engineering_control.workflows.inputs import (
     RuntimeVerificationInput,
     StagingDeploymentInput,
     StagingGitOpsDeliveryInput,
+    UiBlueprintFanOutInput,
+    UiMigrationPlanInput,
 )
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
@@ -525,6 +527,14 @@ class ControlledWorkflow:
             return task_queue_for("release")
         if step == "change_request.github_dedupe":
             return GITHUB_TASK_QUEUE
+        # NEW-123: fixed opposite providers -- Claude drafts the blueprint and the gap change
+        # requests; Codex independently reviews (change_request.review routes below).
+        if step in {"ui_plan.draft", "ui_fanout.gap_draft"}:
+            return provider_task_queue("claude", default="claude")
+        if step == "ui_plan.review":
+            return provider_task_queue("codex", default="codex")
+        if step in {"ui_plan.stage_inputs", "ui_plan.stage_document"}:
+            return task_queue_for("scan")
         # NEW-108: fixed opposite providers -- Claude drafts, Codex independently reviews.
         if step == "change_request.draft":
             return provider_task_queue("claude", default="claude")
@@ -5044,6 +5054,423 @@ class ChangeRequestWorkflow(ControlledWorkflow):
         }
 
 
+_UI_FANOUT_NO_DEDUPE = {"status": "UNAVAILABLE", "matches": []}
+
+
+@workflow.defn(name="UiMigrationPlanWorkflow")
+class UiMigrationPlanWorkflow(ControlledWorkflow):
+    """NEW-123 flow A: the UI migration blueprint, persisted as an approvable candidate.
+
+    snapshot -> deterministic inventory -> kit snapshot (BLOCKED without kit data) ->
+    Claude draft (plan-ui-migration) -> Codex review; at most one redraft and a second
+    review, otherwise BLOCKED with the findings. It never approves anything.
+    """
+
+    @workflow.run
+    async def run(self, request: UiMigrationPlanInput) -> dict[str, Any]:
+        try:
+            result = await self._plan(request)
+        except ActivityError:
+            result = await self._ui_plan_terminal(
+                {"blueprint_id": request.blueprint_id, "project": request.project},
+                "FAILED",
+                "UI_PLAN_STEP_FAILED",
+            )
+        try:
+            await self._step(
+                "ui_plan.finalize_run",
+                {
+                    "blueprint_id": request.blueprint_id,
+                    "terminal_status": result.get("status"),
+                    "error_code": result.get("error_code"),
+                },
+            )
+        except ActivityError:
+            workflow.logger.warning("ui plan %s: Run finalization failed", request.blueprint_id)
+        return result
+
+    async def _ui_plan_terminal(
+        self,
+        context: dict[str, Any],
+        status: str,
+        blocker: str,
+        blockers: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        recorded = await self._step(
+            "ui_plan.record_terminal",
+            {
+                "blueprint_id": context.get("blueprint_id"),
+                "project": context.get("project"),
+                "terminal_status": status,
+                "blocker": blocker,
+                "blockers": list(blockers or [])[:50],
+            },
+        )
+        return {
+            "status": recorded.get("status", status),
+            "blueprint_id": context.get("blueprint_id"),
+            "error_code": recorded.get("error_code", blocker),
+            "blockers": list(blockers or [])[:50],
+        }
+
+    async def _plan(self, request: UiMigrationPlanInput) -> dict[str, Any]:
+        context = await self._step("ui_plan.register", asdict(request))
+        if context.get("status") == "BLOCKED":
+            return {
+                "status": "BLOCKED",
+                "blueprint_id": request.blueprint_id,
+                "error_code": context.get("blocker"),
+                "blockers": context.get("blockers", []),
+            }
+        if context.get("status") != "REGISTERED":
+            return {"status": "SUPERSEDED", "blueprint_id": request.blueprint_id}
+        if not await self._checkpoint("UI_PLAN_SNAPSHOT"):
+            return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
+        try:
+            snapshot = await self._step(
+                "project.snapshot",
+                {
+                    "project": request.project,
+                    "campaign_id": context["campaign_id"],
+                    "source_sha": context.get("source_sha"),
+                },
+                timeout_minutes=60,
+            )
+        except ActivityError:
+            return await self._ui_plan_terminal(context, "BLOCKED", "UI_PLAN_SNAPSHOT_UNAVAILABLE")
+        source = {
+            "source_worktree": snapshot.get("source_worktree"),
+            "source_sha": snapshot.get("source_sha"),
+        }
+        if not await self._checkpoint("UI_PLAN_INVENTORY"):
+            return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
+        inventory = await self._step(
+            "ui.inventory", {"project": request.project, "snapshot": source}
+        )
+        if inventory.get("status") != "UI_INVENTORY_PASS":
+            return await self._ui_plan_terminal(context, "FAILED", "UI_INVENTORY_FAILED")
+        kit = await self._step("ui.kit_snapshot", {"project": request.project})
+        if kit.get("status") == "BLOCKED":
+            # No draft without kit data (design section 11: models get no MCP).
+            return await self._ui_plan_terminal(
+                context,
+                "BLOCKED",
+                str(kit.get("blocker") or "UI_MCP_UNAVAILABLE"),
+                [str(kit.get("reason") or "")[:300]],
+            )
+        if kit.get("status") != "UI_KIT_SNAPSHOT_PASS":
+            return await self._ui_plan_terminal(context, "FAILED", "UI_KIT_SNAPSHOT_FAILED")
+        context = await self._step(
+            "ui_plan.record_inputs",
+            {
+                **context,
+                **source,
+                "inventory_sha256": inventory.get("inventory_sha256"),
+                "inventory_summary": inventory.get("summary"),
+                "kit_snapshot_sha256": kit.get("snapshot_sha256"),
+                "gntik_ui_version": kit.get("gntik_ui_version"),
+                "kit_image": kit.get("image"),
+                "evidence": {
+                    "inventory": inventory.get("evidence", []),
+                    "kit": kit.get("evidence", []),
+                },
+            },
+        )
+        if context.get("status") != "INPUTS_RECORDED":
+            return {"status": "SUPERSEDED", "blueprint_id": request.blueprint_id}
+        staged = await self._step(
+            "ui_plan.stage_inputs",
+            {
+                "project": request.project,
+                "blueprint_id": request.blueprint_id,
+                "inventory_sha256": context.get("inventory_sha256"),
+                "kit_snapshot_sha256": context.get("kit_snapshot_sha256"),
+            },
+        )
+        context = {
+            **context,
+            "inputs": {
+                "input_directory": staged.get("input_directory"),
+                "files": staged.get("files"),
+            },
+            "review_rounds": [],
+        }
+        approved: dict[str, Any] | None = None
+        for attempt in (1, 2):
+            if not await self._checkpoint("UI_PLAN_DRAFT"):
+                return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
+            context = await self._step(
+                "ui_plan.prepare_draft", {**context, "draft_attempt": attempt}
+            )
+            if context.get("status") != "DRAFT_READY":
+                return await self._ui_plan_terminal(
+                    context, "FAILED", str(context.get("blocker") or "DRAFT_INPUT_INVALID")
+                )
+            context = await self._agent_step("ui_plan.draft", context, timeout_minutes=200)
+            if context.get("status") != "SUCCESS":
+                return await self._ui_plan_terminal(
+                    context, "BLOCKED", self._ui_provider_blocker("DRAFT", context)
+                )
+            recorded = await self._step("ui_plan.record_draft", context)
+            if recorded.get("status") != "DRAFT_RECORDED":
+                return await self._ui_plan_terminal(
+                    recorded,
+                    "BLOCKED",
+                    str(recorded.get("blocker") or "DRAFT_SCHEMA_INVALID"),
+                    recorded.get("blockers"),
+                )
+            context = {key: value for key, value in recorded.items() if key != "document"}
+            draft = await self._step(
+                "ui_plan.stage_document",
+                {
+                    "project": request.project,
+                    "blueprint_id": request.blueprint_id,
+                    "name": f"draft-{attempt}.json",
+                    "document": recorded.get("document"),
+                },
+            )
+            context = {**context, "draft_file": draft.get("document")}
+            if not await self._checkpoint("UI_PLAN_REVIEW"):
+                return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
+            context = await self._step("ui_plan.prepare_review", context)
+            if context.get("status") != "REVIEW_READY":
+                return await self._ui_plan_terminal(
+                    context, "FAILED", str(context.get("blocker") or "REVIEW_INPUT_INVALID")
+                )
+            context = await self._agent_step("ui_plan.review", context, timeout_minutes=200)
+            if context.get("status") != "SUCCESS":
+                return await self._ui_plan_terminal(
+                    context, "BLOCKED", self._ui_provider_blocker("REVIEW", context)
+                )
+            reviewed = await self._step("ui_plan.record_review", context)
+            context = {
+                key: value for key, value in reviewed.items() if key not in {"document", "markdown"}
+            }
+            if reviewed.get("status") == "REVIEW_APPROVED":
+                approved = reviewed
+                break
+            if reviewed.get("status") != "REVIEW_REVISE":
+                return await self._ui_plan_terminal(
+                    context,
+                    "BLOCKED",
+                    str(reviewed.get("blocker") or "REVIEW_SCHEMA_INVALID"),
+                    reviewed.get("blockers"),
+                )
+            review = await self._step(
+                "ui_plan.stage_document",
+                {
+                    "project": request.project,
+                    "blueprint_id": request.blueprint_id,
+                    "name": f"review-{attempt}.json",
+                    "document": reviewed.get("document"),
+                },
+            )
+            context = {**context, "review_file": review.get("document")}
+        if approved is None:
+            return await self._ui_plan_terminal(context, "BLOCKED", "BLUEPRINT_REVIEW_UNRESOLVED")
+        if not await self._checkpoint("UI_PLAN_PERSIST"):
+            return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
+        published = await self._step(
+            "ui_plan.stage_document",
+            {
+                "project": request.project,
+                "blueprint_id": request.blueprint_id,
+                "publish": True,
+                "document": approved.get("document"),
+                "markdown": approved.get("markdown"),
+            },
+        )
+        persisted = await self._step(
+            "ui_plan.persist",
+            {
+                "blueprint_id": request.blueprint_id,
+                "project": request.project,
+                "blueprint_sha256": approved.get("blueprint_sha256"),
+                "review_rounds": context.get("review_rounds", []),
+                "evidence": published.get("evidence", []),
+            },
+        )
+        return {
+            "status": persisted.get("status", "FAILED"),
+            "blueprint_id": request.blueprint_id,
+            "error_code": persisted.get("error_code"),
+            "blueprint_sha256": persisted.get("blueprint_sha256"),
+            "approval_binding": persisted.get("approval_binding"),
+            "review_rounds": len(context.get("review_rounds", [])),
+        }
+
+    @staticmethod
+    def _ui_provider_blocker(phase: str, context: dict[str, Any]) -> str:
+        blocker = str(context.get("blocker") or context.get("status") or "")
+        if blocker in {"SchemaViolation", "PolicyViolation"} or not blocker:
+            return f"{phase}_PROVIDER_FAILED"
+        return blocker if re.fullmatch(r"[A-Z][A-Z0-9_]{2,79}", blocker) else f"{phase}_FAILED"
+
+
+@workflow.defn(name="UiBlueprintFanOutWorkflow")
+class UiBlueprintFanOutWorkflow(ControlledWorkflow):
+    """NEW-123: after operator approval, one change-request DRAFT per blueprint item.
+
+    Each epic, page, cutover and gap becomes a NEW-108 change request under a deterministic
+    id (blueprint hash + item key): gaps are drafted by Claude (triage-ui-gap), the rest is
+    rendered deterministically, and Codex reviews every draft. Idempotent and resumable,
+    capped at max_items per run; batches continue as new. Hermes never publishes.
+    """
+
+    @workflow.run
+    async def run(self, request: UiBlueprintFanOutInput) -> dict[str, Any]:
+        plan = await self._step("ui_fanout.plan", asdict(request))
+        counts = {
+            "drafted": request.drafted,
+            "failed": request.failed,
+            "skipped": request.skipped,
+        }
+        processed = request.processed
+        if plan.get("status") == "BLOCKED":
+            return await self._fanout_finalize(
+                request, plan, counts, processed, str(plan.get("blocker"))
+            )
+        items = [str(key) for key in plan.get("items", [])]
+        source_worktree = request.source_worktree
+        if items and not source_worktree:
+            try:
+                snapshot = await self._step(
+                    "project.snapshot",
+                    {"project": plan.get("project"), "campaign_id": plan.get("campaign_id")},
+                    timeout_minutes=60,
+                )
+            except ActivityError:
+                return await self._fanout_finalize(
+                    request, plan, counts, processed, "UI_FANOUT_SNAPSHOT_UNAVAILABLE"
+                )
+            source_worktree = str(snapshot.get("source_worktree") or "")
+        for key in items:
+            if not await self._checkpoint("UI_FANOUT_ITEM"):
+                return await self._fanout_finalize(
+                    request, plan, counts, processed, "UI_FANOUT_CANCELLED"
+                )
+            outcome = await self._fanout_item(request.blueprint_id, key, source_worktree or "")
+            counts[outcome] += 1
+            processed += 1
+        pending_after = int(plan.get("pending_total") or 0) - len(items)
+        if items and pending_after > 0 and processed < request.max_items:
+            workflow.continue_as_new(
+                replace(
+                    request,
+                    processed=processed,
+                    source_worktree=source_worktree,
+                    drafted=counts["drafted"],
+                    failed=counts["failed"],
+                    skipped=counts["skipped"],
+                )
+            )
+        return await self._fanout_finalize(request, plan, counts, processed, None)
+
+    async def _fanout_finalize(
+        self,
+        request: UiBlueprintFanOutInput,
+        plan: dict[str, Any],
+        counts: dict[str, int],
+        processed: int,
+        blocker: str | None,
+    ) -> dict[str, Any]:
+        pending = max(0, int(plan.get("pending_total") or 0) - len(plan.get("items", [])))
+        finalized = await self._step(
+            "ui_fanout.finalize",
+            {
+                "blueprint_id": request.blueprint_id,
+                "project": plan.get("project"),
+                "max_items": request.max_items,
+                "processed": processed,
+                "pending_total": pending if blocker is None else plan.get("pending_total", 0),
+                "blocker": blocker,
+                **counts,
+            },
+        )
+        return {
+            "status": "BLOCKED" if blocker else "COMPLETED",
+            "blueprint_id": request.blueprint_id,
+            "error_code": blocker,
+            "processed": processed,
+            "pending": finalized.get("pending_total", pending),
+            **counts,
+        }
+
+    async def _fanout_item(self, blueprint_id: str, key: str, source_worktree: str) -> str:
+        context: dict[str, Any] = {"blueprint_id": blueprint_id, "item_key": key}
+        try:
+            context = await self._step(
+                "ui_fanout.prepare_item",
+                {"blueprint_id": blueprint_id, "item_key": key, "source_worktree": source_worktree},
+            )
+            if context.get("status") == "SKIPPED":
+                return "skipped"
+            if context.get("status") not in {"DRAFT_READY", "PROPOSAL_READY"}:
+                return await self._fanout_item_failure(context, "draft")
+            gap = context.get("status") == "DRAFT_READY"
+            for attempt in (1, 2):
+                if context.get("status") == "DRAFT_READY":
+                    context = await self._agent_step(
+                        "ui_fanout.gap_draft", context, timeout_minutes=70
+                    )
+                    if context.get("status") != "SUCCESS":
+                        return await self._fanout_item_failure(context, "draft")
+                    context = await self._step("ui_fanout.record_gap_draft", context)
+                    if context.get("status") != "PROPOSAL_READY":
+                        return await self._fanout_item_failure(context, "draft")
+                context = await self._step(
+                    "ui_fanout.prepare_review", {**context, "draft_attempt": attempt}
+                )
+                if context.get("status") != "REVIEW_READY":
+                    return await self._fanout_item_failure(context, "draft")
+                context = await self._agent_step(
+                    "change_request.review", context, timeout_minutes=70
+                )
+                if context.get("status") != "SUCCESS":
+                    return await self._fanout_item_failure(context, "review")
+                context = await self._step("change_request.record_review", context)
+                if context.get("status") == "REVIEW_APPROVED":
+                    break
+                if context.get("status") != "REVIEW_REVISE":
+                    return await self._fanout_item_failure(context, "review")
+                if not gap or attempt == 2:
+                    # An unresolved review is persisted as a CANDIDATE with its findings.
+                    break
+                context = await self._step("ui_fanout.prepare_gap_draft", context)
+                if context.get("status") != "DRAFT_READY":
+                    return await self._fanout_item_failure(context, "draft")
+            if context.get("dedupe_supported"):
+                try:
+                    context = await self._step("change_request.github_dedupe", context)
+                except ActivityError:
+                    context = {**context, "dedupe": dict(_UI_FANOUT_NO_DEDUPE)}
+            else:
+                context = {**context, "dedupe": dict(_UI_FANOUT_NO_DEDUPE)}
+            persisted = await self._step("change_request.persist", context)
+        except ActivityError:
+            return await self._fanout_item_failure(
+                {**context, "blocker": "STEP_FAILED"}, "internal"
+            )
+        return "drafted" if persisted.get("status") == "CANDIDATE" else "failed"
+
+    async def _fanout_item_failure(self, context: dict[str, Any], phase: str) -> str:
+        if not context.get("change_request_id"):
+            return "failed"
+        try:
+            await self._step(
+                "change_request.record_failure",
+                {
+                    "change_request_id": context.get("change_request_id"),
+                    "revision": context.get("revision"),
+                    "failure_phase": phase,
+                    "blocker": str(context.get("blocker") or context.get("status") or "FAILED"),
+                },
+            )
+        except ActivityError:
+            workflow.logger.warning("ui fan-out item %s: failure was not recorded", context)
+        return "failed"
+
+
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     MultiProjectAuditWorkflow,
@@ -5072,4 +5499,6 @@ ALL_WORKFLOWS = [
     LLMWikiStagingBootstrapWorkflow,
     StagingGitOpsDeliveryWorkflow,
     ChangeRequestWorkflow,
+    UiMigrationPlanWorkflow,
+    UiBlueprintFanOutWorkflow,
 ]

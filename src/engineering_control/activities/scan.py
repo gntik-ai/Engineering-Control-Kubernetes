@@ -26,6 +26,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.retention import cleanup_authorization_sha256
+from engineering_control.activities.ui_plan_scan import UI_PLAN_SCAN_STEPS, UiPlanScanSteps
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
 from engineering_control.adapters.kubernetes import KubernetesObserver
 from engineering_control.adapters.scanning.tooling import DeterministicScanner
@@ -166,7 +167,7 @@ class CleanupCandidate(BaseModel):
     )
 
 
-class ScanActivityHandler:
+class ScanActivityHandler(UiPlanScanSteps):
     """Bounded mirror and worktree operations owned only by scan-runner."""
 
     supported_steps = frozenset(
@@ -195,6 +196,7 @@ class ScanActivityHandler:
             "observability.cleanup_workspace",
             "ui.inventory",
             "ui.kit_snapshot",
+            *UI_PLAN_SCAN_STEPS,
         }
     )
     _repositories = {
@@ -326,6 +328,11 @@ class ScanActivityHandler:
                 return await asyncio.to_thread(self._cleanup_observability_workspace, payload)
             if step == "ui.inventory":
                 return await asyncio.to_thread(self._ui_inventory, payload)
+            # NEW-123: model input staging and blueprint evidence (no model runs here).
+            if step == "ui_plan.stage_inputs":
+                return await asyncio.to_thread(self._ui_plan_stage_inputs, payload)
+            if step == "ui_plan.stage_document":
+                return await asyncio.to_thread(self._ui_plan_stage_document, payload)
             if step == "ui.kit_snapshot":
                 return await self._with_heartbeat(
                     self._ui_kit_snapshot(payload), phase="ui_kit_snapshot"

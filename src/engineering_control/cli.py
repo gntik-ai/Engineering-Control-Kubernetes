@@ -60,7 +60,14 @@ class APIClient:
         return SecretRedactor().redact(response.json()).value
 
 
-_CHANGE_REPOSITORIES = ("falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki")
+_CHANGE_REPOSITORIES = (
+    "falcone",
+    "falcone-charts",
+    "musematic",
+    "musematic-deploy",
+    "llmwiki",
+    "gntik-ui",
+)
 _CHANGE_DESCRIPTION_MAX_BYTES = 8 * 1024
 
 
@@ -358,6 +365,23 @@ def parser() -> argparse.ArgumentParser:
     change_reject.add_argument("change_request_id")
     change_reject.add_argument("--reason", required=True)
     # NEW-120: local, read-only, model-free legacy-console inventory (no API call).
+    # NEW-123 UI migration flow A: blueprint -> approval -> change-request drafts.
+    ui_plan = commands.add_parser("ui-plan")
+    ui_plan.add_argument("project", choices=("falcone",))
+    ui_plan.add_argument("--source-sha", help="expected legacy main head (full SHA)")
+    commands.add_parser("ui-plan-status").add_argument("blueprint_id")
+    ui_blueprints = commands.add_parser("ui-blueprints")
+    ui_blueprints.add_argument("--project", choices=("falcone",))
+    ui_blueprints.add_argument(
+        "--status",
+        choices=("DRAFTING", "BLOCKED", "FAILED", "CANDIDATE", "APPROVED", "SUPERSEDED"),
+    )
+    commands.add_parser("ui-blueprint-show").add_argument("blueprint_id")
+    ui_approve = commands.add_parser("ui-blueprint-approve")
+    ui_approve.add_argument("blueprint_id")
+    ui_approve.add_argument("approval_binding")
+    ui_approve.add_argument("typed_confirmation")
+    ui_approve.add_argument("--max-items", type=_bounded_integer(1, 600), metavar="1-600")
     ui_inventory = commands.add_parser("ui-inventory")
     ui_inventory.add_argument("--checkout", type=Path, required=True)
     ui_inventory.add_argument("--project", choices=("falcone",), default="falcone")
@@ -796,6 +820,34 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
         if arguments.repository is not None:
             draft["target_repository"] = f"gntik-ai/{arguments.repository}"
         return client.request("POST", "/v1/change-requests", draft)
+    if command == "ui-plan":
+        plan: dict[str, Any] = {"project": arguments.project}
+        if arguments.source_sha is not None:
+            plan["source_sha"] = arguments.source_sha
+        return client.request("POST", "/v1/ui-blueprints", plan)
+    if command == "ui-plan-status":
+        return client.request("GET", f"/v1/ui-blueprints/{arguments.blueprint_id}")
+    if command == "ui-blueprints":
+        query = httpx.QueryParams(
+            {
+                key: value
+                for key, value in (("project", arguments.project), ("status", arguments.status))
+                if value is not None
+            }
+        )
+        return client.request("GET", f"/v1/ui-blueprints?{query}")
+    if command == "ui-blueprint-show":
+        return client.request("GET", f"/v1/ui-blueprints/{arguments.blueprint_id}/markdown")
+    if command == "ui-blueprint-approve":
+        approval: dict[str, Any] = {
+            "approval_binding": arguments.approval_binding,
+            "typed_confirmation": arguments.typed_confirmation,
+        }
+        if arguments.max_items is not None:
+            approval["max_items"] = arguments.max_items
+        return client.request(
+            "POST", f"/v1/ui-blueprints/{arguments.blueprint_id}/approve", approval
+        )
     if command == "changes":
         query = httpx.QueryParams(
             {
@@ -869,6 +921,9 @@ def main() -> None:
     except (OSError, ValueError, httpx.HTTPError) as error:
         print(f"engineering-ctl: {error}", file=sys.stderr)
         raise SystemExit(1) from error
+    if arguments.command == "ui-blueprint-show" and isinstance(result, dict):
+        print(str(result.get("markdown", "")), end="")
+        return
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

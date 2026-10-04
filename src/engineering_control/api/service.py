@@ -7,9 +7,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from engineering_control.api.schemas import (
     AcceptanceLifecycleStart,
@@ -37,6 +38,10 @@ from engineering_control.api.schemas import (
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.change_requests import change_request_workflow_id
 from engineering_control.engineering.models import CampaignPlan
+from engineering_control.engineering.ui_blueprint import (
+    ui_fanout_workflow_id,
+    ui_plan_workflow_id,
+)
 from engineering_control.models.enums import Project
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
@@ -63,6 +68,8 @@ from engineering_control.workflows.inputs import (
     RecoveryInput,
     RuntimeVerificationInput,
     StagingDeploymentInput,
+    UiBlueprintFanOutInput,
+    UiMigrationPlanInput,
 )
 from engineering_control.workflows.names import WorkflowName
 
@@ -123,6 +130,12 @@ class ControlService(Protocol):
     ) -> OperationAccepted: ...
     async def start_change_request(
         self, change_request_id: UUID, revision: int
+    ) -> OperationAccepted: ...
+    async def start_ui_plan(
+        self, blueprint_id: UUID, project: str, requested_by: str, source_sha: str | None
+    ) -> OperationAccepted: ...
+    async def start_ui_fanout(
+        self, blueprint_id: UUID, max_items: int, sequence: int
     ) -> OperationAccepted: ...
 
 
@@ -825,6 +838,43 @@ class TemporalControlService:
             WorkflowName.CHANGE_REQUEST.value,
             ChangeRequestInput(change_request_id=str(change_request_id), revision=revision),
             change_request_workflow_id(str(change_request_id), revision),
+        )
+
+    async def start_ui_plan(
+        self, blueprint_id: UUID, project: str, requested_by: str, source_sha: str | None
+    ) -> OperationAccepted:
+        """NEW-123: one flow A blueprint workflow per blueprint row."""
+        return await self._start_once(
+            WorkflowName.UI_MIGRATION_PLAN.value,
+            UiMigrationPlanInput(
+                blueprint_id=str(blueprint_id),
+                project=project,
+                requested_by=requested_by,
+                source_sha=source_sha,
+            ),
+            ui_plan_workflow_id(project, str(blueprint_id)),
+        )
+
+    async def start_ui_fanout(
+        self, blueprint_id: UUID, max_items: int, sequence: int
+    ) -> OperationAccepted:
+        """NEW-123: start fan-out execution `sequence`, or join the previous one while it
+        still runs (one fan-out at a time). Every item is idempotent under its deterministic
+        id, so a later execution resumes with the items not yet drafted."""
+        if sequence > 1:
+            previous = ui_fanout_workflow_id(str(blueprint_id), sequence - 1)
+            try:
+                description = await self.client.get_workflow_handle(previous).describe()
+            except RPCError as error:
+                if error.status is not RPCStatusCode.NOT_FOUND:
+                    raise
+            else:
+                if description.status == WorkflowExecutionStatus.RUNNING:
+                    return OperationAccepted(workflow_id=previous, run_id=description.run_id)
+        return await self._start_once(
+            WorkflowName.UI_BLUEPRINT_FANOUT.value,
+            UiBlueprintFanOutInput(blueprint_id=str(blueprint_id), max_items=max_items),
+            ui_fanout_workflow_id(str(blueprint_id), sequence),
         )
 
     async def _start_once(

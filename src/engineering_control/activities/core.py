@@ -27,6 +27,7 @@ from .provider import ProviderActivityHandler
 from .release import ReleaseActivityHandler
 from .retention import RetentionActivityHandler
 from .scan import ScanActivityHandler
+from .ui_plan import UiPlanActivityHandler
 
 
 class ControlActivities:
@@ -207,6 +208,27 @@ class ControlActivities:
         "change_request.persist",
         "change_request.record_failure",
         "change_request.finalize_run",
+        # NEW-123: UI migration flow A (blueprint) and its approved change-request fan-out.
+        "ui_plan.register",
+        "ui_plan.record_inputs",
+        "ui_plan.stage_inputs",
+        "ui_plan.prepare_draft",
+        "ui_plan.draft",
+        "ui_plan.record_draft",
+        "ui_plan.stage_document",
+        "ui_plan.prepare_review",
+        "ui_plan.review",
+        "ui_plan.record_review",
+        "ui_plan.persist",
+        "ui_plan.record_terminal",
+        "ui_plan.finalize_run",
+        "ui_fanout.plan",
+        "ui_fanout.prepare_item",
+        "ui_fanout.gap_draft",
+        "ui_fanout.record_gap_draft",
+        "ui_fanout.prepare_gap_draft",
+        "ui_fanout.prepare_review",
+        "ui_fanout.finalize",
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",
@@ -371,6 +393,11 @@ class ControlActivities:
             "change_request.draft",
             "change_request.review",
             "change_request.github_dedupe",
+            "ui_plan.stage_inputs",
+            "ui_plan.stage_document",
+            "ui_plan.draft",
+            "ui_plan.review",
+            "ui_fanout.gap_draft",
         }
         - GITOPS_GITHUB_STEPS,
         "scan": {
@@ -399,6 +426,8 @@ class ControlActivities:
             "observability.cleanup_workspace",
             "ui.inventory",
             "ui.kit_snapshot",
+            "ui_plan.stage_inputs",
+            "ui_plan.stage_document",
         },
         "codex": {
             "audit.agent_cell",
@@ -417,6 +446,7 @@ class ControlActivities:
             "observability.invoke_codex",
             "observability.invoke_codex_checker",
             "change_request.review",
+            "ui_plan.review",
         },
         "claude": {
             "audit.agent_cell",
@@ -433,6 +463,8 @@ class ControlActivities:
             "observability.invoke_claude",
             "observability.invoke_claude_maker",
             "change_request.draft",
+            "ui_plan.draft",
+            "ui_fanout.gap_draft",
         },
         "browser": {
             "runtime.browser_checks",
@@ -544,6 +576,9 @@ class ControlActivities:
         self.change_request_github_handler = (
             ChangeRequestGitHubHandler(settings) if self.worker_kind == "github" else None
         )
+        self.ui_plan_handler = (
+            UiPlanActivityHandler(settings) if self.worker_kind == "controller" else None
+        )
 
     @activity.defn(name="execute_control_step")
     async def execute_control_step(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -592,6 +627,8 @@ class ControlActivities:
             and step in self.change_request_handler.supported_steps
         ):
             return await self.change_request_handler.handle(step, safe_payload)
+        if self.ui_plan_handler is not None and step in self.ui_plan_handler.supported_steps:
+            return await self.ui_plan_handler.handle(step, safe_payload)
         if step in self._mutation_steps:
             dry_run = bool(self._find_value(safe_payload, "dry_run", default=True))
             if dry_run:

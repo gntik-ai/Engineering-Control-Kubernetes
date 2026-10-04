@@ -225,6 +225,30 @@ class ChangeRequestInput:
 
 
 @dataclass
+class UiMigrationPlanInput:
+    """NEW-123: one flow A blueprint run (the row is created by the API first)."""
+
+    blueprint_id: str
+    project: str
+    requested_by: str
+    # Optional: the expected legacy main head (a full SHA); default is the current head.
+    source_sha: str | None = None
+
+
+@dataclass
+class UiBlueprintFanOutInput:
+    """NEW-123: one resumable fan-out run of an approved blueprint (continue-as-new state)."""
+
+    blueprint_id: str
+    max_items: int = 80
+    processed: int = 0
+    drafted: int = 0
+    failed: int = 0
+    skipped: int = 0
+    source_worktree: str | None = None
+
+
+@dataclass
 class LLMWikiStagingBootstrapInput:
     project: str = "llmwiki"
     environment: str = "staging"

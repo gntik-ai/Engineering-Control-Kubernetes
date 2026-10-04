@@ -23,6 +23,7 @@ from engineering_control.engineering.change_requests import (
     ChangeRequestIntake,
     ChangeReviewRecord,
     RenderedChangeRequest,
+    UiChangeContext,
     approval_phrase,
     approval_record,
     approval_record_matches,
@@ -34,7 +35,8 @@ from engineering_control.security.redaction import SecretRedactor
 
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _ISSUE_URL = re.compile(
-    r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)"
+    r"^https://github\.com/gntik-ai/"
+    r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
     r"/issues/([1-9][0-9]*)$"
 )
 
@@ -98,6 +100,64 @@ class ChangeRequestRepository:
             session.add(row)
             session.flush()
             return self._view(row)
+
+    def create_ui_item_sync(
+        self,
+        change_request_id: UUID,
+        intake: ChangeRequestIntake,
+        requested_by: str,
+        ui_context: UiChangeContext,
+    ) -> dict[str, Any]:
+        """NEW-123: one fanned-out blueprint item, idempotent under its deterministic id.
+
+        A repeated (resumed) fan-out finds the existing row and never creates a second one;
+        a row under the same id for a different item is refused."""
+        if not is_reauthenticated_backlog_operator(requested_by):
+            raise ValueError("change requests require an allowlisted operator channel")
+        context = ui_context.model_dump(mode="json")
+        now = datetime.now(UTC)
+        with self.sessions.begin() as session:
+            row = session.get(ChangeRequest, change_request_id, with_for_update=True)
+            if row is not None:
+                stored = row.ui_context_json if isinstance(row.ui_context_json, dict) else {}
+                if (
+                    stored.get("blueprint_id") != context["blueprint_id"]
+                    or stored.get("item_key") != context["item_key"]
+                ):
+                    raise ValueError("change request id is bound to another blueprint item")
+                return {**self._summary(row), "created": False}
+            row = ChangeRequest(
+                id=change_request_id,
+                request_key=f"ui-{change_request_id.hex}",
+                project=intake.project,
+                status="DRAFTING",
+                revision=1,
+                description_redacted=intake.description_redacted,
+                description_sha256=intake.description_sha256,
+                redacted=intake.redacted,
+                revision_note=None,
+                proposal_json={},
+                review_json={},
+                dedupe_json={},
+                target_repository=intake.target_repository,
+                requested_by=requested_by,
+                ui_context_json=context,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.flush()
+            return {**self._summary(row), "created": True}
+
+    def item_states_sync(self, change_request_ids: list[UUID]) -> dict[str, dict[str, Any]]:
+        """NEW-123: the current status of fanned-out items (missing ids are absent)."""
+        if not change_request_ids:
+            return {}
+        with self.sessions() as session:
+            rows = session.scalars(
+                select(ChangeRequest).where(ChangeRequest.id.in_(change_request_ids))
+            ).all()
+            return {str(row.id): {"status": row.status, "revision": row.revision} for row in rows}
 
     async def list_requests(
         self, project: str | None, status: str | None, limit: int
@@ -320,7 +380,7 @@ class ChangeRequestRepository:
             row = self._locked(session, change_request_id)
             if row.status != "DRAFTING" or row.revision != revision:
                 return {"status": "SUPERSEDED", "current_status": row.status}
-            validate_proposal(proposal.model_dump(mode="json"), row.project)
+            validate_proposal(proposal.model_dump(mode="json"), row.project, row.target_repository)
             rendered = render_change_request(
                 change_request_id=str(row.id),
                 revision=row.revision,
@@ -329,6 +389,7 @@ class ChangeRequestRepository:
                 proposal=proposal,
                 review=review,
                 description_redacted=row.description_redacted,
+                ui_context=self._ui_context(row),
             )
             error = self._render_error(rendered)
             if error is not None:
@@ -413,7 +474,7 @@ class ChangeRequestRepository:
 
     @staticmethod
     def rendered(row: ChangeRequest) -> RenderedChangeRequest:
-        proposal = validate_proposal(row.proposal_json, row.project)
+        proposal = validate_proposal(row.proposal_json, row.project, row.target_repository)
         review = ChangeReviewRecord.model_validate(row.review_json)
         return render_change_request(
             change_request_id=str(row.id),
@@ -423,7 +484,14 @@ class ChangeRequestRepository:
             proposal=proposal,
             review=review,
             description_redacted=row.description_redacted,
+            ui_context=ChangeRequestRepository._ui_context(row),
         )
+
+    @staticmethod
+    def _ui_context(row: ChangeRequest) -> UiChangeContext | None:
+        """NEW-123: the fanned-out blueprint item, part of the rendered (bound) body."""
+        value = row.ui_context_json
+        return UiChangeContext.model_validate(value) if value else None
 
     @classmethod
     def _verify_stored_content(cls, row: ChangeRequest) -> None:
@@ -512,4 +580,5 @@ class ChangeRequestRepository:
             "published_at": cls._iso(row.published_at),
             "decision_sequence": row.decision_sequence,
             "workflow_id": change_request_workflow_id(str(row.id), row.revision),
+            "ui_context": row.ui_context_json or None,
         }
