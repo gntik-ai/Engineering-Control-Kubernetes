@@ -158,8 +158,8 @@ class AgentInstructionPack:
             for record in catalog.get("skills") or []
             if isinstance(record, dict) and record.get("id") == skill
         ]
-        names = records[0].get("part_output_schemas") if len(records) == 1 else None
-        for name in names if isinstance(names, list) else []:
+        parts = records[0].get("part_output_schemas") if len(records) == 1 else None
+        for name in parts.values() if isinstance(parts, dict) else []:
             if not isinstance(name, str) or not self._part_schema_name.fullmatch(name):
                 raise ValueError("agent-pack part schema name is invalid")
             relative = f"skills/{skill}/references/{name}"

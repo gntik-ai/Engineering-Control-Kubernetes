@@ -42,6 +42,8 @@ UI_PLAN_INPUT_DIRECTORY_MISSING = "UI_PLAN_INPUT_DIRECTORY_MISSING"
 _DOCUMENT_NAME = re.compile(r"^(draft|review)-[12]\.json$")
 # NEW-131: one part version or its review, e.g. part-b003-0123456789abcdef-draft-1.json.
 _PART_DOCUMENT_NAME = re.compile(r"^part-(frame|b[0-9]{3})-[a-f0-9]{16}-(draft|review)-[12]\.json$")
+# NEW-131 review: the complete reviewed frame every batch drafter and reviewer reads.
+_FRAME_BRIEF_NAME = re.compile(r"^part-frame-[a-f0-9]{16}-brief\.json$")
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
 _MODEL_READERS = ("codex-runner", "claude-runner")
 
@@ -210,7 +212,11 @@ class UiPlanScanSteps:
         if not payload.get("publish"):
             name = str(payload.get("name", ""))
             part = _PART_DOCUMENT_NAME.fullmatch(name)
-            if not _DOCUMENT_NAME.fullmatch(name) and part is None:
+            if (
+                not _DOCUMENT_NAME.fullmatch(name)
+                and part is None
+                and not _FRAME_BRIEF_NAME.fullmatch(name)
+            ):
                 raise ValueError("ui plan document name is invalid")
             base = self._ui_plan_input_base()
             if base is None:

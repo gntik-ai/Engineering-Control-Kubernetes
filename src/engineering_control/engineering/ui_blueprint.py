@@ -10,6 +10,7 @@ drafter and the reviewer only as Hermes-collected data.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -39,12 +40,13 @@ UI_PLAN_SKILLS: dict[str, tuple[str, str]] = {
     "plan-ui-migration": ("ui-migration-architect", "ui-migration-blueprint.schema.json"),
     "triage-ui-gap": ("ui-gap-triager", "ui-gap-draft.schema.json"),
 }
-# NEW-131: the skill's released part schemas (frame and page batch), in that order.
-UI_PLAN_PART_SCHEMAS: dict[str, tuple[str, ...]] = {
-    "plan-ui-migration": (
-        "ui-migration-blueprint-frame.schema.json",
-        "ui-migration-blueprint-batch.schema.json",
-    ),
+# NEW-131: the skill's released part schemas, part name -> schema (catalog
+# `part_output_schemas`).
+UI_PLAN_PART_SCHEMAS: dict[str, dict[str, str]] = {
+    "plan-ui-migration": {
+        "frame": "ui-migration-blueprint-frame.schema.json",
+        "batch": "ui-migration-blueprint-batch.schema.json",
+    },
 }
 FANOUT_DEFAULT_MAX_ITEMS = 80
 FANOUT_MAX_ITEMS_LIMIT = 600
@@ -172,7 +174,7 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
             same = False
         if not same:
             problems.append(f"skills/{skill} output schema differs from Hermes's {schema_name}")
-        parts = UI_PLAN_PART_SCHEMAS.get(skill, ())
+        parts = UI_PLAN_PART_SCHEMAS.get(skill, {})
         listed = next(
             (
                 record.get("part_output_schemas")
@@ -181,9 +183,9 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
             ),
             None,
         )
-        if parts and listed != list(parts):
+        if parts and listed != parts:
             problems.append(f"skills/catalog.yaml does not list the {skill} part schemas")
-        for part in parts:
+        for part in parts.values():
             released = _pack_bytes(root, f"skills/{skill}/references/{part}")
             if released is None:
                 problems.append(f"missing skills/{skill}/references/{part}")
@@ -195,6 +197,51 @@ def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> li
             if not same:
                 problems.append(f"skills/{skill} part schema differs from Hermes's {part}")
     return problems
+
+
+def plan_provenance(root: Path, project: str, skill: str = "plan-ui-migration") -> str:
+    """NEW-131: what a drafted part depends on besides its data -- the released instruction
+    sources of the skill and its role (as the instruction bundle reads them), the profile
+    version, the skill's catalog record, and Hermes's full and part schemas. Bound into every
+    part id, so a skill, role, profile or schema change forces a redraft."""
+    role, schema_name = UI_PLAN_SKILLS[skill]
+    sources = (
+        "profiles/engineering.yaml",
+        f"skills/{skill}/SKILL.md",
+        f"skills/{skill}/references/contract.md",
+        f"roles/{role}.yaml",
+        f"generated/claude/agents/{role}.md",
+        f"generated/codex/agents/{role}.toml",
+        "domain-packs/common/POLICIES.md",
+        f"domain-packs/{project}/domains.yaml",
+    )
+    catalog_bytes = _pack_bytes(root, "skills/catalog.yaml")
+    try:
+        catalog = yaml.safe_load(catalog_bytes) if catalog_bytes is not None else None
+    except yaml.YAMLError:
+        catalog = None
+    records = catalog.get("skills") if isinstance(catalog, dict) else None
+    record = next(
+        (
+            item
+            for item in (records if isinstance(records, list) else [])
+            if isinstance(item, dict) and item.get("id") == skill
+        ),
+        None,
+    )
+    digests = {}
+    for relative in sources:
+        payload = _pack_bytes(root, relative)
+        digests[relative] = hashlib.sha256(payload).hexdigest() if payload is not None else None
+    schemas = [schema_name, *UI_PLAN_PART_SCHEMAS.get(skill, {}).values()]
+    return canonical_sha256(
+        {
+            "kind": "hermes-ui-plan-provenance-v1",
+            "sources": digests,
+            "catalog_record": record,
+            "schemas": {name: canonical_sha256(load_schema(name)) for name in schemas},
+        }
+    )
 
 
 def schema_errors(value: Any, schema: dict[str, Any]) -> list[str]:

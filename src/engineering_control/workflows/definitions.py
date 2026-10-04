@@ -5099,6 +5099,8 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
         status: str,
         blocker: str,
         blockers: list[Any] | None = None,
+        *,
+        usage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         recorded = await self._step(
             "ui_plan.record_terminal",
@@ -5108,6 +5110,8 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 "terminal_status": status,
                 "blocker": blocker,
                 "blockers": list(blockers or [])[:50],
+                # NEW-131 review: input only (no new command), so replay is unaffected.
+                **({"part_usage": usage} if usage else {}),
             },
         )
         return {
@@ -5375,7 +5379,26 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     str(outcome.get("terminal") or "BLOCKED"),
                     str(outcome.get("blocker") or "UI_PLAN_PART_FAILED"),
                     outcome.get("blockers"),
+                    usage=self._part_usage(outcome),
                 )
+            if part.get("kind") == "frame":
+                # The complete reviewed frame, as a file every batch reads (never truncated).
+                brief = await self._step(
+                    "ui_plan.stage_document",
+                    {
+                        "project": request.project,
+                        "blueprint_id": request.blueprint_id,
+                        "name": f"part-{outcome.get('part_id')}-brief.json",
+                        "document": outcome.get("frame_brief"),
+                    },
+                )
+                if brief.get("status") != "STAGED":
+                    return await self._ui_plan_terminal(
+                        context,
+                        "BLOCKED",
+                        str(brief.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
+                    )
+                context = {**context, "frame_brief_file": brief.get("document")}
             approved.append(
                 {
                     "part_id": outcome.get("part_id"),
@@ -5425,6 +5448,20 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             "approval_binding": persisted.get("approval_binding"),
             "review_rounds": len(rounds),
             "parts": len(approved),
+        }
+
+    @staticmethod
+    def _part_usage(outcome: dict[str, Any]) -> dict[str, Any] | None:
+        """A failed part's last provider result, so its token usage is still recorded."""
+        result = outcome.get("agent_result")
+        if not isinstance(result, dict) or outcome.get("status") == "SUCCESS":
+            return None
+        step = str(outcome.get("provider_step") or "")
+        return {
+            "agent_result": result,
+            "part_id": outcome.get("part_id"),
+            "phase": "review" if step == "ui_plan.review" else "draft",
+            "attempt": outcome.get("draft_attempt"),
         }
 
     async def _ui_plan_part(

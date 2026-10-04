@@ -292,7 +292,7 @@ def build_fake_pack(root: Path, *, version: str = "1.4.0", skip: tuple[str, ...]
                         "id": skill,
                         "role": role,
                         **(
-                            {"part_output_schemas": list(UI_PLAN_PART_SCHEMAS[skill])}
+                            {"part_output_schemas": dict(UI_PLAN_PART_SCHEMAS[skill])}
                             if skill in UI_PLAN_PART_SCHEMAS
                             else {}
                         ),
@@ -306,7 +306,7 @@ def build_fake_pack(root: Path, *, version: str = "1.4.0", skip: tuple[str, ...]
         files[f"skills/{skill}/SKILL.md"] = f"# {skill}\n"
         files[f"skills/{skill}/references/contract.md"] = "# Contract\n"
         files[f"skills/{skill}/references/output.schema.json"] = json.dumps(load_schema(schema))
-        for part in UI_PLAN_PART_SCHEMAS.get(skill, ()):
+        for part in UI_PLAN_PART_SCHEMAS.get(skill, {}).values():
             files[f"skills/{skill}/references/{part}"] = json.dumps(load_schema(part))
         files[f"roles/{role}.yaml"] = f"id: {role}\n"
         files[f"generated/claude/agents/{role}.md"] = f"# {role}\n"

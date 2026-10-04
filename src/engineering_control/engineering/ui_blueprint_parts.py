@@ -39,7 +39,7 @@ from engineering_control.engineering.ui_blueprint import (
 
 FRAME = "frame"
 BATCH = "batch"
-PART_SCHEMAS = dict(zip((FRAME, BATCH), UI_PLAN_PART_SCHEMAS["plan-ui-migration"], strict=True))
+PART_SCHEMAS = dict(UI_PLAN_PART_SCHEMAS["plan-ui-migration"])
 PART_ID_PATTERN = r"^(frame|b[0-9]{3})-[a-f0-9]{16}$"
 PART_ID_VERSION = "ui-plan-part-v1"
 DEFAULT_BATCH_PAGES = 8
@@ -395,8 +395,13 @@ def _short(*parts: str) -> str:
     return hashlib.sha256("|".join((PART_ID_VERSION, *parts)).encode()).hexdigest()[:16]
 
 
-def frame_part_id(inventory_sha256: str, kit_snapshot_sha256: str, routed: list[str]) -> str:
-    return f"frame-{_short(FRAME, inventory_sha256, kit_snapshot_sha256, ','.join(routed))}"
+def frame_part_id(
+    inventory_sha256: str, kit_snapshot_sha256: str, routed: list[str], provenance: str
+) -> str:
+    """Deterministic: the inventory, the kit, the routed pages and the provenance (skill,
+    role, profile and schemas, see ui_blueprint.plan_provenance)."""
+    digest = _short(FRAME, inventory_sha256, kit_snapshot_sha256, ",".join(routed), provenance)
+    return f"frame-{digest}"
 
 
 def batch_part_id(
@@ -405,13 +410,20 @@ def batch_part_id(
     kit_snapshot_sha256: str,
     identities: list[str],
     frame_sha256: str,
+    provenance: str,
 ) -> str:
-    """Deterministic: the inventory, the kit, the batch's pages and the reviewed frame the
-    batch was drafted against. A reviewed batch with this id is never drafted again."""
+    """Deterministic: the inventory, the kit, the batch's pages, the reviewed frame the
+    batch was drafted against and the provenance. A reviewed batch with this id is never
+    drafted again."""
     if not 1 <= index <= 999:
         raise ValueError("ui plan batch index is out of range")
     digest = _short(
-        BATCH, inventory_sha256, kit_snapshot_sha256, ",".join(identities), frame_sha256
+        BATCH,
+        inventory_sha256,
+        kit_snapshot_sha256,
+        ",".join(identities),
+        frame_sha256,
+        provenance,
     )
     return f"b{index:03d}-{digest}"
 
@@ -592,20 +604,32 @@ def check_part_draft(
         )
     _check_part_inputs(value, inputs, part_id, "DRAFT")
     content: dict[str, Any] = value[kind]
-    problems = (
-        frame_problems(content, context["all_page_ids"])
-        if kind == FRAME
-        else batch_problems(
-            content,
-            index=int(context["index"]),
-            page_ids=list(context["page_ids"]),
-            all_page_ids=context["all_page_ids"],
-            frame=context["frame"],
-        )
-    )
+    problems = _content_structure(kind, content, context)
     if problems:
         raise BlueprintRejected("DRAFT_STRUCTURE_INVALID", [f"{part_id}: {p}" for p in problems])
     return content
+
+
+def _content_structure(kind: str, content: dict[str, Any], context: dict[str, Any]) -> list[str]:
+    if kind == FRAME:
+        return frame_problems(content, context["all_page_ids"])
+    return batch_problems(
+        content,
+        index=int(context["index"]),
+        page_ids=list(context["page_ids"]),
+        all_page_ids=context["all_page_ids"],
+        frame=context["frame"],
+    )
+
+
+def part_content_problems(kind: str, content: Any, context: dict[str, Any]) -> list[str]:
+    """Revalidate stored part content (a reused approval) against the current part schema
+    and the current references; empty when it is still valid."""
+    schema = part_schema(kind)
+    errors = schema_errors(content, {"$ref": f"#/$defs/{kind}", "$defs": schema["$defs"]})
+    if errors or not isinstance(content, dict):
+        return errors or ["part content is not an object"]
+    return _content_structure(kind, content, context)
 
 
 def check_part_review(
@@ -789,6 +813,90 @@ def check_assembled(
         problems.append("assembled pages differ from the inventoried pages")
     if problems:
         raise BlueprintRejected("ASSEMBLY_INVALID", problems)
+    graph = graph_problems(blueprint)
+    if graph:
+        raise BlueprintRejected("BLUEPRINT_GRAPH_INVALID", graph)
+
+
+_WAVES = ("u0", "u1", "u2", "u3", "u4", "u5")
+
+
+def graph_problems(blueprint: dict[str, Any]) -> list[str]:
+    """Cross-batch dependency graph of the assembled blueprint (no batch reviewer sees it):
+    no cycles across epics and pages, a page depends only on items of its own or an earlier
+    wave (epics are u0) and never on a deleted page, every gap a page or the cutover names
+    exists, and the cutover's pages and gap decisions match the blueprint exactly."""
+    problems: list[str] = []
+    epics = {epic["id"]: epic for epic in blueprint["foundation_epics"]}
+    pages = {page["page_id"]: page for page in blueprint["pages"]}
+    gaps = {gap["id"] for gap in blueprint["gaps"]}
+    wave = {identity: "u0" for identity in epics}
+    wave |= {p: page["wave"] for p, page in pages.items() if page["disposition"] != "DELETE"}
+    edges: dict[str, list[str]] = {}
+    for identity, epic in epics.items():
+        edges[identity] = list(epic["depends_on"])
+    for identity, page in pages.items():
+        if page["disposition"] == "DELETE":
+            continue
+        edges[identity] = list(page["depends_on"])
+        for target in page["depends_on"]:
+            edge = f"{identity} -> {target}"
+            if target in pages and pages[target]["disposition"] == "DELETE":
+                problems.append(f"{edge}: depends on a deleted page")
+            elif target not in wave:
+                problems.append(f"{edge}: depends on an unknown item")
+            elif _WAVES.index(str(wave[target])) > _WAVES.index(str(wave[identity])):
+                problems.append(
+                    f"{edge}: wave {wave[identity]} depends on later wave {wave[target]}"
+                )
+        problems += [
+            f"{identity} -> {gap}: names an unknown gap"
+            for gap in page["gap_ids"]
+            if gap not in gaps
+        ]
+    problems += _cycles(edges)
+    cutover = blueprint["cutover"]
+    migrated = [p for p, page in pages.items() if page["disposition"] != "DELETE"]
+    if sorted(cutover["depends_on_pages"]) != sorted(migrated):
+        problems.append("u5-cutover: depends_on_pages differs from the MIGRATE and WRAP pages")
+    decided = [item["gap_id"] for item in cutover["blocking_gaps"]]
+    problems += [f"u5-cutover -> {g}: decided twice" for g in _duplicates(decided)]
+    problems += [f"u5-cutover -> {g}: names an unknown gap" for g in decided if g not in gaps]
+    problems += [f"u5-cutover -> {g}: has no cutover decision" for g in sorted(gaps - set(decided))]
+    return problems[:50]
+
+
+def _cycles(edges: dict[str, list[str]]) -> list[str]:
+    """Each dependency cycle once, as its edges (deterministic, iterative DFS)."""
+    found: list[str] = []
+    state: dict[str, int] = {}
+    seen: set[frozenset[str]] = set()
+    for root in sorted(edges):
+        if state.get(root):
+            continue
+        stack: list[tuple[str, int]] = [(root, 0)]
+        path: list[str] = []
+        while stack:
+            node, position = stack.pop()
+            if position == 0:
+                state[node] = 1
+                path.append(node)
+            targets = [t for t in edges.get(node, []) if t in edges]
+            if position < len(targets):
+                stack.append((node, position + 1))
+                target = targets[position]
+                if state.get(target) == 1:
+                    cycle = path[path.index(target) :] + [target]
+                    key = frozenset(cycle)
+                    if key not in seen:
+                        seen.add(key)
+                        found.append("cycle: " + " -> ".join(cycle))
+                elif not state.get(target):
+                    stack.append((target, 0))
+            else:
+                state[node] = 2
+                path.pop()
+    return found
 
 
 # --------------------------------------------------------------------------------------

@@ -279,17 +279,22 @@ The steps are:
    judgement fields of its pages), with `plan-ui-migration` (high effort, Read/Glob/Grep only,
    1800 s per call). Codex reviews every part with the same skill in review mode against the
    same slice. A `REVISE` redrafts only that part, once; a second `REVISE` ends `BLOCKED
-   BLUEPRINT_PART_REVIEW_UNRESOLVED`, naming the part, its pages and the findings. Part ids are
-   deterministic (inventory, kit, pages and the reviewed frame): a later plan with the same
-   inputs reuses every part already approved instead of drafting it again.
+   BLUEPRINT_PART_REVIEW_UNRESOLVED`, naming the part, its pages and the findings. The complete
+   reviewed frame is staged as a file every batch drafter and reviewer reads. Part ids are
+   deterministic (inventory, kit, pages, the reviewed frame, and the provenance: the skill and
+   role instruction sources, profile and schemas): a later plan with the same inputs reuses
+   every part already approved, after revalidating it against the current schema, instead of
+   drafting it again; a skill or schema change forces a redraft.
 6. Every part version is immutable; Hermes hashes the exact part file the reviewer read. Hermes
    then assembles the reviewed parts and the mechanical fields into the full blueprint,
-   validates it against the full schema, and publishes and stores it as a `CANDIDATE`. Its
+   validates it against the full schema and a cross-batch dependency graph check (no cycles,
+   no dependency on a later wave or a deleted page, consistent cutover gaps; otherwise `BLOCKED
+   BLUEPRINT_GRAPH_INVALID` listing the offending edges), and publishes and stores it as a `CANDIDATE`. Its
    approval binding is the sha256 of the blueprint id, the canonical blueprint hash, the
    reviewed hash (the assembled blueprint), the inventory and kit snapshot hashes and the
    source SHA. A newer candidate for the project supersedes an older, unapproved one.
    Telegram gets "UI blueprint ready for approval". `ui-blueprint-show` ends with the token
-   usage of every drafting and review call, per provider and in total.
+   usage of every drafting and review call (failed calls included), per provider and in total.
 
 Histories started before NEW-131 (patch `ui-plan-batched-blueprint-v1` absent) keep the
 whole-blueprint draft and review: one Claude draft, a Codex review, at most one redraft.

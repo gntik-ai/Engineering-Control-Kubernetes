@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -417,19 +418,29 @@ class UiBlueprintRepository:
             row.review_json = {"rounds": rounds}
             return {"content_sha256": digest, "rounds": rounds}
 
-    def reuse_part_sync(self, blueprint_id: UUID, part_id: str) -> dict[str, Any] | None:
+    def reuse_part_sync(
+        self,
+        blueprint_id: UUID,
+        part_id: str,
+        validate: Callable[[Any], list[str]] | None = None,
+    ) -> dict[str, Any] | None:
         """NEW-131 resumability: an approved version of this exact part (same inventory,
         kit, pages and frame by construction of its id), from this blueprint or an earlier
-        one of the same project and inputs, is adopted instead of being drafted again."""
+        one of the same project and inputs, is adopted instead of being drafted again -- only
+        if it still passes `validate` (the current part schema and references)."""
         with self.sessions.begin() as session:
             row = self._locked(session, blueprint_id)
             if row.status != "DRAFTING":
                 raise ValueError("ui blueprint is no longer drafting")
-            own = [
-                e
-                for e in row.drafts_json or []
-                if e.get("part") == part_id and self._approved_part(e)
-            ]
+
+            def usable(entry: dict[str, Any]) -> bool:
+                return (
+                    entry.get("part") == part_id
+                    and self._approved_part(entry)
+                    and not (validate is not None and validate(entry["content"]))
+                )
+
+            own = [e for e in row.drafts_json or [] if usable(e)]
             if own:
                 return dict(own[-1])
             earlier = session.scalars(
@@ -443,11 +454,7 @@ class UiBlueprintRepository:
                 .order_by(UiBlueprint.created_at.desc())
             ).all()
             for other in earlier:
-                found = [
-                    e
-                    for e in other.drafts_json or []
-                    if e.get("part") == part_id and self._approved_part(e)
-                ]
+                found = [e for e in other.drafts_json or [] if usable(e)]
                 if not found:
                     continue
                 adopted = {**dict(found[-1]), "reused_from": str(other.id)}

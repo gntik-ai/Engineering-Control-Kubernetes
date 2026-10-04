@@ -65,6 +65,7 @@ from engineering_control.engineering.ui_blueprint_parts import (
     derive_part_schemas,
     frame_part_id,
     mechanical_fields,
+    part_content_problems,
     part_schema,
     render_usage,
     review_digest,
@@ -82,6 +83,7 @@ LOCAL_PACK = Path(
     os.environ.get("ENGINEERING_AGENT_PACK_CHECKOUT") or ROOT.parent / "engineering-agent-pack"
 )
 INPUTS = PlanInputs("falcone", SOURCE_SHA, INVENTORY_SHA, KIT_SHA, KIT_VERSION)
+PROVENANCE = "p" * 64
 REAL_INVENTORY = Path(
     "/home/hermes/engineering/research/ui-inv-check/ui-inventory-falcone-54d1f33515bf.json"
 )
@@ -96,7 +98,7 @@ def approved_parts(staged: dict[str, Any]) -> tuple[dict[str, Any], list[dict[st
     mechanical = staged["mechanical"]
     routed = routed_page_ids(mechanical)
     all_ids = [page["page_id"] for page in mechanical["pages"]]
-    frame_id = frame_part_id(INVENTORY_SHA, KIT_SHA, routed)
+    frame_id = frame_part_id(INVENTORY_SHA, KIT_SHA, routed, PROVENANCE)
     frame = check_part_draft(
         part_output(FRAME, frame_id, frame_content(routed[0])),
         FRAME,
@@ -107,7 +109,12 @@ def approved_parts(staged: dict[str, Any]) -> tuple[dict[str, Any], list[dict[st
     batches = []
     for part in staged["parts"][1:]:
         part_id = batch_part_id(
-            part["index"], INVENTORY_SHA, KIT_SHA, part["page_ids"], canonical_sha256(frame)
+            part["index"],
+            INVENTORY_SHA,
+            KIT_SHA,
+            part["page_ids"],
+            canonical_sha256(frame),
+            PROVENANCE,
         )
         batches.append(
             check_part_draft(
@@ -291,13 +298,13 @@ def test_batching_splits_fifty_routed_pages_into_seven_batches_after_the_frame()
 
 def test_part_ids_are_deterministic_and_bound_to_their_inputs() -> None:
     pages = ["a-page", "b-page"]
-    first = batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages, "f" * 64)
-    assert first == batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages, "f" * 64)
+    first = batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages, "f" * 64, PROVENANCE)
+    assert first == batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages, "f" * 64, PROVENANCE)
     assert first.startswith("b003-")
-    assert first != batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages, "e" * 64)
-    assert first != batch_part_id(3, INVENTORY_SHA, "d" * 64, pages, "f" * 64)
-    assert first != batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages[:1], "f" * 64)
-    assert frame_part_id(INVENTORY_SHA, KIT_SHA, pages).startswith("frame-")
+    assert first != batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages, "e" * 64, PROVENANCE)
+    assert first != batch_part_id(3, INVENTORY_SHA, "d" * 64, pages, "f" * 64, PROVENANCE)
+    assert first != batch_part_id(3, INVENTORY_SHA, KIT_SHA, pages[:1], "f" * 64, PROVENANCE)
+    assert frame_part_id(INVENTORY_SHA, KIT_SHA, pages, PROVENANCE).startswith("frame-")
 
 
 def test_frame_and_batches_assemble_into_a_valid_full_blueprint() -> None:
@@ -335,7 +342,9 @@ def test_part_checks_reject_scope_identity_and_reference_errors() -> None:
     mechanical = staged["mechanical"]
     all_ids = [page["page_id"] for page in mechanical["pages"]]
     part = staged["parts"][2]
-    part_id = batch_part_id(2, INVENTORY_SHA, KIT_SHA, part["page_ids"], canonical_sha256(frame))
+    part_id = batch_part_id(
+        2, INVENTORY_SHA, KIT_SHA, part["page_ids"], canonical_sha256(frame), PROVENANCE
+    )
     context = {"all_page_ids": all_ids, "index": 2, "page_ids": part["page_ids"], "frame": frame}
 
     def rejected(content: dict[str, Any], identity: str = part_id) -> BlueprintRejected:
@@ -361,7 +370,7 @@ def test_part_checks_reject_scope_identity_and_reference_errors() -> None:
     assert rejected(good, "b002-" + "0" * 16).code == "DRAFT_BINDING_MISMATCH"
     bad_frame = frame_content(all_ids[0])
     bad_frame["gaps"][0]["id"] = "gap-b001-plans"
-    frame_id = frame_part_id(INVENTORY_SHA, KIT_SHA, routed_page_ids(mechanical))
+    frame_id = frame_part_id(INVENTORY_SHA, KIT_SHA, routed_page_ids(mechanical), PROVENANCE)
     with pytest.raises(BlueprintRejected) as caught:
         check_part_draft(part_output(FRAME, frame_id, bad_frame), FRAME, INPUTS, frame_id,
                          context={"all_page_ids": all_ids})  # fmt: skip
@@ -533,3 +542,110 @@ def test_stage_parts_writes_each_part_input_and_hashes_part_drafts(tmp_path: Pat
         handler._ui_plan_stage_document(
             {"blueprint_id": BLUEPRINT_ID, "name": "part-../x-draft-1.json", "document": document}
         )
+
+
+# Review fixes: provenance, revalidation, cross-batch graph --------------------------------
+
+
+def test_a_skill_or_schema_change_forces_a_redraft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from engineering_control.engineering import ui_blueprint
+
+    pack = build_fake_pack(tmp_path / "pack")
+    first = ui_blueprint.plan_provenance(pack, "falcone")
+    assert first == ui_blueprint.plan_provenance(pack, "falcone")
+    skill = pack / "skills/plan-ui-migration/SKILL.md"
+    skill.write_text(skill.read_text() + "A changed instruction.\n")
+    edited = ui_blueprint.plan_provenance(pack, "falcone")
+    assert edited != first
+    original = ui_blueprint.load_schema
+
+    def changed(name: str) -> dict[str, Any]:
+        value = original(name)
+        if name == PART_SCHEMAS[BATCH]:
+            value["$defs"]["batch"]["properties"]["pages"]["maxItems"] = 24
+        return value
+
+    monkeypatch.setattr(ui_blueprint, "load_schema", changed)
+    schema_changed = ui_blueprint.plan_provenance(pack, "falcone")
+    assert schema_changed not in {first, edited}
+    routed = ["a-page"]
+    ids = {
+        frame_part_id(INVENTORY_SHA, KIT_SHA, routed, p) for p in (first, edited, schema_changed)
+    }
+    assert len(ids) == 3
+    batches = {
+        batch_part_id(1, INVENTORY_SHA, KIT_SHA, routed, "f" * 64, p)
+        for p in (first, edited, schema_changed)
+    }
+    assert len(batches) == 3
+
+
+def test_a_reused_part_is_revalidated_against_the_current_schema(
+    repository: UiBlueprintRepository,
+) -> None:
+    staged = plan()
+    frame, batches = approved_parts(staged)
+    all_ids = [page["page_id"] for page in staged["mechanical"]["pages"]]
+    part = staged["parts"][1]
+    context = {"all_page_ids": all_ids, "index": 1, "page_ids": part["page_ids"], "frame": frame}
+    assert part_content_problems(BATCH, batches[0], context) == []
+    stale = copy.deepcopy(batches[0])
+    stale["pages"][0]["wave"] = "u9"  # valid when approved under an older schema
+    assert part_content_problems(BATCH, stale, context)
+    first = _drafting(repository)
+    part_id = "b001-" + "d" * 16
+    digest = repository.record_part_sync(first, part_id, BATCH, 1, stale)
+    review = {"decision": "APPROVE", "summary": "ok", "findings": []}
+    repository.mark_part_reviewed_sync(first, part_id, 1, digest, review)
+    repository.record_terminal_sync(first, "BLOCKED", "RATE_LIMITED", [])
+    second = _drafting(repository)
+    validate = lambda content: part_content_problems(BATCH, content, context)  # noqa: E731
+    assert repository.reuse_part_sync(second, part_id, validate=validate) is None
+    assert repository.reuse_part_sync(second, part_id) is not None
+
+
+def _assembled() -> tuple[dict[str, Any], dict[str, Any]]:
+    staged = plan()
+    frame, batches = approved_parts(staged)
+    return assemble(staged["mechanical"], frame, batches), staged["mechanical"]
+
+
+def _graph_rejection(blueprint: dict[str, Any], mechanical: dict[str, Any]) -> list[str]:
+    with pytest.raises(BlueprintRejected) as rejected:
+        check_assembled(blueprint, INPUTS, mechanical)
+    assert rejected.value.code == "BLUEPRINT_GRAPH_INVALID"
+    return rejected.value.details
+
+
+def test_graph_rejects_a_dependency_cycle_across_batches() -> None:
+    blueprint, mechanical = _assembled()
+    pages = {page["page_id"]: page for page in blueprint["pages"]}
+    routed = routed_page_ids(mechanical)
+    first, last = routed[0], routed[-1]  # batch 1 and batch 7
+    pages[first]["depends_on"] = ["u0-scaffold", last]
+    pages[last]["depends_on"] = ["u0-scaffold", first]
+    details = _graph_rejection(blueprint, mechanical)
+    assert any(item.startswith("cycle: ") and first in item and last in item for item in details)
+
+
+def test_graph_rejects_a_wave_inversion() -> None:
+    blueprint, mechanical = _assembled()
+    pages = {page["page_id"]: page for page in blueprint["pages"]}
+    routed = routed_page_ids(mechanical)
+    pages[routed[-1]]["wave"] = "u4"
+    pages[routed[0]]["depends_on"] = [routed[-1]]
+    details = _graph_rejection(blueprint, mechanical)
+    assert f"{routed[0]} -> {routed[-1]}: wave u1 depends on later wave u4" in details
+
+
+def test_graph_rejects_a_dependency_on_a_deleted_page() -> None:
+    blueprint, mechanical = _assembled()
+    orphan = next(p["page_id"] for p in blueprint["pages"] if p["disposition"] == "DELETE")
+    routed = routed_page_ids(mechanical)
+    page = next(p for p in blueprint["pages"] if p["page_id"] == routed[2])
+    page["depends_on"] = [orphan]
+    details = _graph_rejection(blueprint, mechanical)
+    assert f"{routed[2]} -> {orphan}: depends on a deleted page" in details
+    check_assembled(_assembled()[0], INPUTS, mechanical)  # the untouched graph passes

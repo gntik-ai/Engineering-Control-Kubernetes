@@ -50,6 +50,7 @@ from engineering_control.engineering.ui_blueprint import (
     item_change_request_id,
     item_context,
     item_description,
+    plan_provenance,
     render_item,
     render_markdown,
 )
@@ -62,6 +63,7 @@ from engineering_control.engineering.ui_blueprint_parts import (
     check_part_draft,
     check_part_review,
     frame_part_id,
+    part_content_problems,
     part_schema,
     review_digest,
     routed_page_ids,
@@ -82,7 +84,9 @@ _PROVIDER_RESULT_KEYS = frozenset(
 )
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
 # NEW-131: parts of the batched plan carried between steps but never into the next request.
-_PART_TRANSIENT_KEYS = frozenset({"mechanical", "mechanical_sha256", "document", "markdown"})
+_PART_TRANSIENT_KEYS = frozenset(
+    {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief"}
+)
 
 # Design sections 7 and 10 (2026-10-04), given to the drafter and the reviewer as data.
 OPERATOR_DECISIONS = (
@@ -535,6 +539,17 @@ class UiPlanActivityHandler:
     def _record_terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
         status = "BLOCKED" if payload.get("terminal_status") == "BLOCKED" else "FAILED"
+        usage = payload.get("part_usage")
+        if isinstance(usage, dict):
+            # NEW-131 review: a failed or rate-limited provider call still counts.
+            entry = usage_entry(
+                usage.get("agent_result"),
+                part_id=str(usage.get("part_id")),
+                phase=str(usage.get("phase")),
+                attempt=int(usage.get("attempt") or 1),
+            )
+            if entry is not None:
+                self.repository.record_usage_sync(blueprint_id, entry)
         result = self.repository.record_terminal_sync(
             blueprint_id,
             status,
@@ -598,8 +613,13 @@ class UiPlanActivityHandler:
         self.repository.record_mechanical_sync(
             blueprint_id, mechanical, str(payload.get("mechanical_sha256") or "")
         )
+        # NEW-131 review: part ids bind the skill, role, profile and schema provenance.
+        provenance = plan_provenance(self.settings.agent_pack_root, str(payload["project"]))
         frame_id = frame_part_id(
-            str(payload["inventory_sha256"]), str(payload["kit_snapshot_sha256"]), routed
+            str(payload["inventory_sha256"]),
+            str(payload["kit_snapshot_sha256"]),
+            routed,
+            provenance,
         )
         plan = [
             {
@@ -613,6 +633,7 @@ class UiPlanActivityHandler:
         ]
         return {
             **base,
+            "part_provenance": provenance,
             "status": "PARTS_RECORDED",
             "parts": plan,
             "batch_count": len(plan) - 1,
@@ -637,21 +658,19 @@ class UiPlanActivityHandler:
             str(payload["kit_snapshot_sha256"]),
             list(part["page_ids"]),
             str(frames[0]["content_sha256"]),
+            str(payload.get("part_provenance") or ""),
         )
         return identity, kind, part
 
     @staticmethod
-    def _frame_brief(frame: dict[str, Any]) -> dict[str, Any]:
+    def _frame_brief(part_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+        """The complete reviewed frame, staged as a file every batch drafter and reviewer
+        reads (never truncated into a prompt)."""
         return {
-            "foundation_epics": [
-                {key: epic[key] for key in ("id", "kind", "title", "depends_on")}
-                for epic in frame["foundation_epics"]
-            ],
-            "gaps": [
-                {key: gap[key] for key in ("id", "type", "target_repository", "summary", "blocks")}
-                for gap in frame["gaps"]
-            ],
-            "global_decisions": frame["global_decisions"],
+            "kind": "reviewed-frame",
+            "part_id": part_id,
+            "content_sha256": entry["content_sha256"],
+            "frame": entry["content"],
         }
 
     def _part_section(self, payload: dict[str, Any], part_id: str, part: dict[str, Any]) -> str:
@@ -718,13 +737,23 @@ class UiPlanActivityHandler:
         part_id, kind, part = self._part_identity(payload)
         base = {**self._part_base(payload), "part_id": part_id, "part_kind": kind}
         if attempt == 1:
-            reused = self.repository.reuse_part_sync(blueprint_id, part_id)
+            context = self._part_check_context(blueprint_id, kind, part, payload)
+            # An approval is adopted only if it still validates against the current part
+            # schema and references (its id already binds the provenance).
+            reused = self.repository.reuse_part_sync(
+                blueprint_id,
+                part_id,
+                validate=lambda content: part_content_problems(kind, content, context),
+            )
             if reused is not None:
                 return {
                     **base,
                     "status": "PART_REUSED",
                     "content_sha256": reused["content_sha256"],
                     "reused_from": reused.get("reused_from"),
+                    **(
+                        {"frame_brief": self._frame_brief(part_id, reused)} if kind == FRAME else {}
+                    ),
                 }
         if attempt not in {1, 2} or not payload.get("source_worktree"):
             return {**base, "status": "FAILED", "blocker": "DRAFT_INPUT_INVALID"}
@@ -784,14 +813,18 @@ class UiPlanActivityHandler:
         frames = [item for item in payload.get("approved_parts") or [] if item.get("kind") == FRAME]
         stored = self.repository.parts_sync(blueprint_id)["approved"]
         frame = stored.get(str(frames[0]["part_id"])) if frames else None
-        if frame is None:
+        brief = payload.get("frame_brief_file")
+        if frame is None or not isinstance(brief, dict) or not brief.get("path"):
             raise ApplicationError(
                 "ui plan batch has no reviewed frame", type="PolicyViolation", non_retryable=True
             )
+        content = frame["content"]
         return (
-            "The reviewed frame (independently approved; reference its epic and gap ids and "
-            "follow its global decisions, never change it):\n"
-            + _fenced("frame", _bounded_json(self._frame_brief(frame["content"]), 40_000))
+            "The reviewed frame, complete (independently approved; Read it, reference its "
+            "epic and gap ids, follow its global decisions, never change it): "
+            f"{brief.get('path')} (file sha256 {brief.get('sha256')}, {brief.get('bytes')} "
+            f"bytes). Summary only: {len(content['foundation_epics'])} foundation epics, "
+            f"{len(content['gaps'])} gaps, {len(content['global_decisions'])} global decisions."
         )
 
     def _part_check_context(
@@ -939,6 +972,9 @@ class UiPlanActivityHandler:
         rounds = [*(payload.get("part_rounds") or []), review]
         result = {**base, "part_rounds": rounds, "content_sha256": reviewed_sha256}
         if review["decision"] == "APPROVE":
+            if kind == FRAME:
+                entry = self.repository.parts_sync(blueprint_id)["approved"][part_id]
+                result["frame_brief"] = self._frame_brief(part_id, entry)
             return {**result, "status": "PART_APPROVED"}
         if attempt >= 2:
             scope = (

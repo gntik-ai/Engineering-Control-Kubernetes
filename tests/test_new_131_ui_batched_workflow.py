@@ -188,7 +188,9 @@ async def test_frame_then_seven_batches_each_reviewed_become_one_candidate(
         "ui_plan.stage_inputs",
         "ui_plan.stage_parts",
         "ui_plan.record_parts",
-        *PART_LOOP * 8,
+        *PART_LOOP,
+        "ui_plan.stage_document",  # the complete reviewed frame, as a file
+        *PART_LOOP * 7,
         "ui_plan.assemble",
         "ui_plan.stage_document",
         "ui_plan.persist",
@@ -211,7 +213,9 @@ async def test_frame_then_seven_batches_each_reviewed_become_one_candidate(
     assert "/in/part-b003-input.json" in prompt and "/in/kit-catalogue.json" in prompt
     assert all(page in prompt for page in third["part"]["page_ids"])
     assert "/in/part-b002-input.json" not in prompt and "/in/ui-inventory.json" not in prompt
-    assert "gap-plans-api" in prompt and "Hermes fills every mechanical field" in prompt
+    frame_id = harness.payloads["ui_plan.draft"][0]["part_id"]
+    assert f"/in/part-{frame_id}-brief.json" in prompt
+    assert "--- BEGIN FRAME ---" not in prompt and "Hermes fills every mechanical field" in prompt
     assert "/in/ui-kit-snapshot.json" in drafts[0]["prompt"]
     view = harness.repository.get_sync(UUID(request.blueprint_id))
     assert view is not None
@@ -332,3 +336,68 @@ async def test_a_pre_new_131_history_replays_unchanged_and_new_histories_carry_t
     assert (await newer.run(UiMigrationPlanWorkflow, new_request, new_id))["status"] == "CANDIDATE"
     with pytest.raises(Exception):  # noqa: B017 - any nondeterminism error
         await Replayer(workflows=[ParentUiMigrationPlanWorkflow]).replay_workflow(newer.history)
+
+
+async def test_a_large_frame_reaches_every_batch_complete_as_a_file(tmp_path: Path) -> None:
+    harness, request, workflow_id = batched_harness(tmp_path)
+
+    def large_frame(payload: dict[str, Any]) -> dict[str, Any]:
+        output = draft_for(payload["part"], payload["part_id"], ROUTED)
+        if payload["part"]["kind"] == FRAME:
+            output["frame"]["gaps"] += [
+                {
+                    **output["frame"]["gaps"][0],
+                    "id": f"gap-cross-{index:02d}",
+                    "summary": "A cross-page capability is missing. " * 20,
+                    "blocks": [],
+                }
+                for index in range(43)
+            ]
+            output["frame"]["global_decisions"] = [f"Decision {i}: " + "x" * 400 for i in range(30)]
+        return with_usage(agent(output), 30_000)(payload)
+
+    harness.responses["ui_plan.draft"] = large_frame
+    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    assert result["status"] == "CANDIDATE"
+    briefs = [
+        payload
+        for payload in harness.payloads["ui_plan.stage_document"]
+        if str(payload.get("name") or "").endswith("-brief.json")
+    ]
+    assert len(briefs) == 1
+    frame = briefs[0]["document"]["frame"]
+    assert len(json.dumps(briefs[0]["document"])) > 40_000
+    assert len(frame["gaps"]) == 45
+    assert [gap["id"] for gap in frame["gaps"][2:]] == [f"gap-cross-{i:02d}" for i in range(43)]
+    assert len(frame["global_decisions"]) == 30
+    for payload in harness.payloads["ui_plan.draft"][1:] + harness.payloads["ui_plan.review"][1:]:
+        request_key = "draft_request" if "draft_request" in payload else "review_request"
+        prompt = payload[request_key]["prompt"]
+        assert f"/in/{briefs[0]['name']}" in prompt
+        assert "45 gaps, 30 global decisions" in prompt
+
+
+async def test_a_failed_provider_call_still_counts_in_the_usage(tmp_path: Path) -> None:
+    harness, request, workflow_id = batched_harness(tmp_path)
+    approve = part_reviewer()
+
+    def rate_limited_second_review(payload: dict[str, Any]) -> dict[str, Any]:
+        result = approve(payload)
+        if payload["part"]["kind"] == BATCH:
+            result["status"] = "RATE_LIMITED"
+            result["blocker"] = "RATE_LIMITED"
+            result["agent_result"]["status"] = "RATE_LIMITED"
+        return result
+
+    harness.responses["ui_plan.review"] = rate_limited_second_review
+    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    assert (result["status"], result["error_code"]) == ("BLOCKED", "RATE_LIMITED")
+    view = harness.repository.get_sync(UUID(request.blueprint_id))
+    assert view is not None
+    assert view["usage"]["total"]["calls"] == 4  # frame draft and review, b001 draft and review
+    assert view["usage"]["providers"]["codex"] == {
+        "calls": 2,
+        "input_tokens": 20_000,
+        "output_tokens": 8_000,
+        "cached_input_tokens": 4_000,
+    }
