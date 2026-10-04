@@ -7,6 +7,7 @@ deterministic id, so an activity retry or a repeated call never sends twice.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -223,9 +224,76 @@ def loop_commands(
     return commands
 
 
+_CODE_SPAN = re.compile(r"(`[^`]*`)")
+
+
+def trim_spans(text: str, limit: int) -> str:
+    """Shorten to at most `limit` characters cutting only BETWEEN code spans, never inside
+    one (NEW-127 review 3): untrusted text stays inside its span or is dropped whole."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    kept = ""
+    for part in _CODE_SPAN.split(text):
+        if not part:
+            continue
+        if len(kept) + len(part) > limit - 3:
+            if not part.startswith("`"):
+                kept += part[: max(0, limit - 3 - len(kept))]
+            break
+        kept += part
+    return kept.rstrip() + "..."
+
+
 def bounded_message(message: str) -> str:
-    message = " ".join(message.split())
-    return message if len(message) <= MESSAGE_LIMIT else message[: MESSAGE_LIMIT - 3] + "..."
+    return trim_spans(message, MESSAGE_LIMIT)
+
+
+# NEW-127 review 3: the gateway renders the whole JSON payload and truncates it (4,000
+# characters), so a code span must never straddle that cut: the payload is bounded against
+# a worst-case rendering (ASCII-escaped, indented) well below the gateway's limit, and each
+# string field's spans are checked after any truncation.
+PAYLOAD_RENDER_LIMIT = 3000
+
+
+def _guarded(value: Any) -> Any:
+    """Every string keeps its code spans; a string whose spans no longer pair (after any
+    truncation) becomes plain text. Collections are guarded element by element."""
+    if isinstance(value, str):
+        return inert_message(trim_spans(value, 300))
+    if isinstance(value, list):
+        return [_guarded(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _guarded(item) for key, item in value.items()}
+    return value
+
+
+def _rendered_size(payload: dict[str, Any]) -> int:
+    return len(json.dumps({"topic": "telegram.x", "payload": payload}, indent=2, ensure_ascii=True))
+
+
+def bounded_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Every field's code spans pair, and the whole payload fits the gateway's rendering,
+    so the gateway's own truncation can never cut a span open."""
+    message = str(payload.get("message") or "")
+    bounded = {key: _guarded(value) for key, value in payload.items() if key != "message"}
+    bounded["message"] = inert_message(bounded_message(message))
+    # Drop optional collections first (they only repeat what the message says).
+    for key in sorted(
+        (key for key, value in bounded.items() if isinstance(value, (list, dict))),
+        key=lambda key: -len(json.dumps(bounded[key], ensure_ascii=True)),
+    ):
+        if _rendered_size(bounded) <= PAYLOAD_RENDER_LIMIT:
+            break
+        bounded.pop(key)
+    limit = MESSAGE_LIMIT
+    while _rendered_size(bounded) > PAYLOAD_RENDER_LIMIT and limit > 200:
+        limit = int(limit * 0.8)
+        bounded["message"] = inert_message(trim_spans(message, limit))
+    if _rendered_size(bounded) > PAYLOAD_RENDER_LIMIT:
+        # Last resort: the message alone, as plain text without any formatting characters.
+        bounded = {"message": " ".join(_MARKDOWN_CONTROL.sub(" ", message).split())[:1000]}
+    return bounded
 
 
 def enqueue(
@@ -243,7 +311,7 @@ def enqueue(
     safe = (redactor or SecretRedactor()).redact(payload).value
     if not isinstance(safe, dict):
         raise TypeError("redacted notification payload must remain an object")
-    safe["message"] = inert_message(bounded_message(str(safe.get("message") or "")))
+    safe = bounded_payload(safe)
     now = datetime.now(UTC)
     session.add(
         NotificationOutbox(

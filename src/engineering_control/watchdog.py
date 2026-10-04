@@ -550,12 +550,11 @@ class OperationalWatchdog:
                             .where(Run.workflow_id.like(pattern, escape="\\"))
                             .order_by(desc(Run.updated_at), desc(Run.id))
                             .limit(500),
-                            select(Run)
-                            .where(
+                            # Unfinished children are few per loop: read all of them.
+                            select(Run).where(
                                 Run.workflow_id.like(pattern, escape="\\"),
                                 Run.finished_at.is_(None),
-                            )
-                            .limit(500),
+                            ),
                         )
                         for child in session.scalars(query).all()
                     }

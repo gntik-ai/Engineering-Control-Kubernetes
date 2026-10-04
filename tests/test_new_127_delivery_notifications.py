@@ -1334,3 +1334,35 @@ def test_a_live_staging_child_is_seen_after_many_finished_children(tmp_path: Pat
     )
     waiting = _loop_probe(watchdog, T0)
     assert (waiting.healthy, waiting.status) == (True, "WAITING_STAGING_GITOPS")
+
+
+def test_the_rendered_payload_stays_below_the_gateway_cut_with_spans_only_in_message() -> None:
+    attack = "[Approve fix](https://attacker.invalid/approve) " + "é" * 300
+    payload = {
+        "message": "maker FAIL: " + " ".join(notices.literal(attack) for _ in range(12)),
+        "maker_failures": [notices.literal(attack) for _ in range(40)],
+        "blocker_detail": "`" + "ü" * 2000,
+        "issue": "gntik-ai/falcone#12",
+    }
+    bounded = notices.bounded_payload(payload)
+    rendered = json.dumps({"topic": "t", "payload": bounded}, indent=2, ensure_ascii=True)
+    assert len(rendered) <= notices.PAYLOAD_RENDER_LIMIT + 100
+    _assert_inert(bounded)
+
+
+def test_a_live_staging_child_is_seen_among_many_unfinished_children(tmp_path: Path) -> None:
+    observed = [T0]
+    watchdog, _ = _watchdog(tmp_path, observed)
+    started = T0 - timedelta(hours=2)
+    _seed_loop(watchdog, status="RUNNING", updated_at=started)
+    _child_run(
+        watchdog,
+        "issue-0-staging-gitops",
+        "staging-gitops",
+        started - timedelta(hours=1),
+        done=False,
+    )
+    for index in range(1, 520):
+        _child_run(watchdog, f"issue-{index}-attempt-1", "issue-delivery", started, done=False)
+    waiting = _loop_probe(watchdog, T0)
+    assert (waiting.healthy, waiting.status) == (True, "WAITING_STAGING_GITOPS")
