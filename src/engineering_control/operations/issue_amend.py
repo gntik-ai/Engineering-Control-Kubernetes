@@ -41,6 +41,7 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.models.enums import ChangeSetState
 from engineering_control.operations.issue_start import (
+    backlog_issue_signal_blocker,
     issue_request_from_operation,
     issue_workflow_id,
 )
@@ -585,17 +586,35 @@ def retry_workflow_id(
 
     The ChangeSet's latest delivery child names its parent loop. NEW-128: a loop paused
     before any ChangeSet exists (e.g. CURRENT_REVALIDATION_FLAKY) is resolved from the
-    issue's own durable records instead, each proven against an active loop Run:
-    a registered delivery-child approval of this issue's finding in this campaign, the
-    approved issue operation's deterministic loop, or the campaign's only active loop.
-    A recorded loop that is no longer active yields to such a loop. The retry preflight
-    still verifies that the loop is waiting on this issue."""
+    issue's durable records too: the parents of its registered delivery-child approvals,
+    the approved issue operation's deterministic loop and the campaign's active loops.
+    Every candidate must hold this issue (the retry preflight's campaign check, an
+    issue-start loop's own target, and no later child registered for another issue);
+    the newest active one wins, and nothing is guessed when none matches."""
     recorded = _change_set_loop(session, change_set)
-    if issue is None or (recorded is not None and _active_loop(session, recorded)):
+    if issue is None:
         return recorded
-    # An inactive recorded loop (an earlier loop's ChangeSet) yields to an active loop
-    # that holds the issue now; otherwise the recorded one is kept for the preflight.
-    return _issue_loop(session, issue) or recorded
+    names = {*_issue_loop_candidates(session, issue)}
+    if recorded is not None:
+        names.add(recorded)
+    active = session.execute(
+        select(Run.workflow_id)
+        .where(
+            Run.workflow_id.in_(sorted(names)),
+            Run.run_type == _LOOP_RUN_TYPE,
+            Run.status.in_(_ACTIVE_LOOP_STATUSES),
+            Run.finished_at.is_(None),
+        )
+        .order_by(desc(Run.created_at), desc(Run.id))
+    ).all()
+    for (workflow_id,) in active:
+        if _loop_holds_issue(session, workflow_id, issue):
+            return str(workflow_id)
+    # A recorded loop without an active loop Run (e.g. a legacy row) is kept only while it
+    # still holds the issue; the retry preflight then reports its live state.
+    if recorded is not None and _loop_holds_issue(session, recorded, issue):
+        return recorded
+    return None
 
 
 def _change_set_loop(session: Session, change_set: ChangeSet | None) -> str | None:
@@ -618,76 +637,96 @@ _LOOP_RUN_TYPE = "existing-backlog-loop"
 _ACTIVE_LOOP_STATUSES = ("RUNNING", "PAUSED")
 
 
-def _active_loop(session: Session, workflow_id: object) -> str | None:
-    if not isinstance(workflow_id, str) or not workflow_id:
-        return None
-    found = session.scalar(
-        select(Run.workflow_id)
+_ISSUE_START_LOOP = re.compile(
+    r"backlog-loop-[a-z]+-[0-9a-f-]{36}-operation-"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
+
+def _loop_holds_issue(session: Session, workflow_id: str, issue: BacklogIssueRecord) -> bool:
+    """Whether a backlog loop still owns (or waits on) this issue, from durable records."""
+    repository = issue.repository.removeprefix("gntik-ai/")
+    if backlog_issue_signal_blocker(session, workflow_id, repository, issue.issue_number):
+        return False
+    issue_start = _ISSUE_START_LOOP.fullmatch(workflow_id)
+    if issue_start is not None:
+        operation = session.get(OperationRequest, UUID(issue_start.group(1)))
+        if operation is None:
+            return False
+        try:
+            request = issue_request_from_operation(operation)
+        except ValueError:
+            return False
+        if (
+            issue_workflow_id(request) != workflow_id
+            or request.target_repository != issue.repository
+            or request.target_issue_number != issue.issue_number
+        ):
+            return False
+    # A loop that registered a delivery child for another issue after this one moved on.
+    latest = session.scalar(
+        select(Step)
         .where(
-            Run.workflow_id == workflow_id,
-            Run.run_type == _LOOP_RUN_TYPE,
-            Run.status.in_(_ACTIVE_LOOP_STATUSES),
-            Run.finished_at.is_(None),
+            Step.name == _CHILD_APPROVAL_STEP,
+            Step.result_json["parent_workflow_id"].as_string() == workflow_id,
         )
+        .order_by(desc(Step.created_at), desc(Step.id))
         .limit(1)
     )
-    return found if isinstance(found, str) else None
+    if latest is not None:
+        value = latest.result_json if isinstance(latest.result_json, dict) else {}
+        if (value.get("issue_repository"), value.get("issue_number")) != (
+            issue.repository,
+            issue.issue_number,
+        ):
+            return False
+    return True
 
 
-def _issue_loop(session: Session, issue: BacklogIssueRecord) -> str | None:
+def _issue_loop_candidates(session: Session, issue: BacklogIssueRecord) -> list[str]:
     campaign = session.get(GitHubBacklogCampaign, issue.backlog_campaign_id)
     if campaign is None:
-        return None
+        return []
     campaign_id = str(issue.backlog_campaign_id)
-    # 1. A delivery child of this issue already registered (its approval names the loop).
+    names: list[str] = []
+    # Parents of this issue's registered delivery children.
     if issue.finding_id is not None:
-        approvals = session.scalars(
-            select(Step)
-            .where(
+        for approval in session.scalars(
+            select(Step).where(
                 Step.name == _CHILD_APPROVAL_STEP,
                 Step.status == "COMPLETE",
                 Step.result_json["finding_id"].as_string() == str(issue.finding_id),
             )
-            .order_by(desc(Step.created_at))
-        ).all()
-        for approval in approvals:
+        ).all():
             value = approval.result_json if isinstance(approval.result_json, dict) else {}
             request = value.get("request")
+            parent = value.get("parent_workflow_id")
             if (
-                not isinstance(request, dict)
-                or str(request.get("backlog_campaign_id")) != campaign_id
-                or value.get("issue_repository") != issue.repository
-                or value.get("issue_number") != issue.issue_number
+                isinstance(request, dict)
+                and str(request.get("backlog_campaign_id")) == campaign_id
+                and isinstance(parent, str)
+                and parent
             ):
-                continue
-            loop = _active_loop(session, value.get("parent_workflow_id"))
-            if loop is not None:
-                return loop
-    # 2. The approved issue operation (/loop issue-start): its loop identity is derived.
-    operations = session.scalars(
-        select(OperationRequest)
-        .where(
+                names.append(parent)
+    # The approved issue operations' deterministic loops (/loop issue-start).
+    for operation in session.scalars(
+        select(OperationRequest).where(
             OperationRequest.action == "solve_issue",
             OperationRequest.project == campaign.project,
             OperationRequest.target_id == f"{issue.repository}#{issue.issue_number}",
         )
-        .order_by(desc(OperationRequest.created_at))
-    ).all()
-    for operation in operations:
+    ).all():
         try:
             request = issue_request_from_operation(operation)
         except ValueError:
             continue
-        if str(request.backlog_campaign_id) != campaign_id:
-            continue
-        loop = _active_loop(session, issue_workflow_id(request))
-        if loop is not None:
-            return loop
-    # 3. The campaign's only active loop (an ambiguous campaign resolves nothing).
+        if str(request.backlog_campaign_id) == campaign_id:
+            names.append(issue_workflow_id(request))
+    # The campaign's loops (each still has to hold the issue).
     prefix = f"backlog-loop-{campaign.project}-{campaign_id}"
-    loops = {
-        workflow_id
-        for workflow_id in session.scalars(
+    names.extend(
+        name
+        for name in session.scalars(
             select(Run.workflow_id).where(
                 Run.workflow_id.startswith(prefix, autoescape=True),
                 Run.run_type == _LOOP_RUN_TYPE,
@@ -695,6 +734,6 @@ def _issue_loop(session: Session, issue: BacklogIssueRecord) -> str | None:
                 Run.finished_at.is_(None),
             )
         ).all()
-        if workflow_id == prefix or workflow_id.startswith(f"{prefix}-")
-    }
-    return loops.pop() if len(loops) == 1 else None
+        if name == prefix or name.startswith(f"{prefix}-")
+    )
+    return names

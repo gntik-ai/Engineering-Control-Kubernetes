@@ -631,12 +631,22 @@ def approval_binding(
     )
 
 
+def _plural_suffix(word: str) -> str:
+    """The regular English plural of a keyword's last word, as an optional regex suffix."""
+    if word.endswith(("s", "x", "z", "ch", "sh")):
+        return re.escape(word) + "(?:es)?"
+    if len(word) > 1 and word.endswith("y") and word[-2] not in "aeiou":
+        return re.escape(word[:-1]) + "(?:y|ies)"
+    return re.escape(word) + "s?"
+
+
 @lru_cache(maxsize=256)
 def _keyword_pattern(term: str) -> re.Pattern[str]:
-    words = r"\s+".join(re.escape(word) for word in term.split())
-    # An optional plural "s" keeps "data migrations" and "clusterroles"; letters or digits
-    # on either side are a different word ("reproduction", "metadata loss").
-    return re.compile(rf"(?<![a-z0-9]){words}s?(?![a-z0-9])")
+    words = term.split()
+    phrase = r"\s+".join([*(re.escape(word) for word in words[:-1]), _plural_suffix(words[-1])])
+    # Regular plurals stay matched ("authorization bypasses", "data losses", "clusterroles");
+    # letters or digits on either side are a different word ("reproduction", "metadata").
+    return re.compile(rf"(?<![a-z0-9]){phrase}(?![a-z0-9])")
 
 
 def _mentions(text: str, *terms: str) -> bool:
@@ -787,6 +797,13 @@ def _risk(
         "credential rotation",
         "secret lifecycle",
         "production",
+        # "productionise the gateway": production-related verb forms stay R3.
+        "productionise",
+        "productionize",
+        "productionised",
+        "productionized",
+        "productionising",
+        "productionizing",
         "clusterrole",
         "clusterrolebinding",
     ):

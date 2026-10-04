@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import ast
+import hashlib
+import inspect
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -15,7 +18,14 @@ from test_issue_operation_approval import _approved_direct_request
 
 from engineering_control.activities.scan import ScanActivityHandler
 from engineering_control.config import Settings
-from engineering_control.db.models import BacklogIssueRecord, ChangeSet, Run
+from engineering_control.db.models import (
+    BacklogIssueRecord,
+    ChangeSet,
+    OperationRequest,
+    Run,
+    Step,
+)
+from engineering_control.engineering import backlog
 from engineering_control.engineering.backlog import (
     BacklogIssueType,
     GitHubIssueSnapshot,
@@ -23,7 +33,11 @@ from engineering_control.engineering.backlog import (
     classify_issue,
 )
 from engineering_control.operations.issue_amend import retry_workflow_id
-from engineering_control.operations.issue_start import issue_workflow_id
+from engineering_control.operations.issue_start import (
+    issue_request_from_operation,
+    issue_workflow_id,
+)
+from engineering_control.operations.models import SolveIssueCommand
 
 NOW = datetime(2026, 10, 4, tzinfo=UTC)
 
@@ -316,8 +330,10 @@ async def test_amend_retry_resolves_the_paused_loop_before_any_change_set(
         )
     with operations.sessions() as session:
         issue = session.scalar(select(BacklogIssueRecord))
-        # Two active campaign loops are ambiguous: nothing is guessed.
-        assert retry_workflow_id(session, None, issue) is None
+        # Both campaign loops hold the issue durably: the newest one is chosen.
+        assert retry_workflow_id(session, None, issue) == (
+            f"backlog-loop-falcone-{CAMPAIGN_ID}-other"
+        )
     for item in (operations, metadata, handler):
         item.engine.dispose()
 
@@ -344,3 +360,285 @@ async def test_amend_retry_prefers_a_registered_child_approval_loop(tmp_path: Pa
         assert session.scalar(select(ChangeSet)) is None
         assert retry_workflow_id(session, None, issue) == "backlog-fixture-parent"
     _dispose(values)
+
+
+# --- Codex review of 4ff2a1a ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_delayed_duplicate_release_of_a_superseded_attempt_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    values = await _child(tmp_path)
+    _operations, _metadata, engineering, handler, payload, _registered, child = values
+    first = handler._load_confirmed_finding(child)
+    change_set_id = first["change_set_id"]
+    _planned(handler, change_set_id)
+    stopped = _validated(tmp_path, first, checker="REQUEST_CHANGES")
+    handler._release_delivery_leases(stopped)
+    assert _state(handler, change_set_id)[0] == "REQUEST_CHANGES"
+    second = _next_child(engineering, handler, payload, child, "backlog-fixture-issue-1-attempt-2")
+    _planned(handler, change_set_id)
+    before = _state(handler, change_set_id)
+    # Attempt 1's release is delivered again after attempt 2 moved the ChangeSet on.
+    handler._release_delivery_leases(stopped)
+    assert _state(handler, change_set_id) == before
+    # Attempt 2's own stop is still recorded, once.
+    handler._release_delivery_leases(_validated(tmp_path, second, checker="REQUEST_CHANGES"))
+    state, version, recovery = _state(handler, change_set_id)
+    assert (state, version) == ("REQUEST_CHANGES", before[1] + 1)
+    assert recovery["correction_requested"]["run_ids"] == [first["run_id"], second["run_id"]]
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_a_first_release_from_a_superseded_attempt_never_writes(tmp_path: Path) -> None:
+    values = await _child(tmp_path)
+    _operations, _metadata, engineering, handler, payload, _registered, child = values
+    first = handler._load_confirmed_finding(child)
+    change_set_id = first["change_set_id"]
+    with handler.sessions.begin() as session:
+        session.get(ChangeSet, UUID(change_set_id)).state = "REQUEST_CHANGES"
+    _next_child(engineering, handler, payload, child, "backlog-fixture-issue-1-attempt-2")
+    _planned(handler, change_set_id)
+    before = _state(handler, change_set_id)
+    handler._release_delivery_leases(_validated(tmp_path, first, checker="REQUEST_CHANGES"))
+    assert _state(handler, change_set_id) == before
+    _dispose(values)
+
+
+def _keyword_terms() -> set[str]:
+    """Every literal keyword the backlog classifier passes to its matcher."""
+    tree = ast.parse(inspect.getsource(backlog))
+    terms: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_mentions"
+        ):
+            for argument in node.args[1:]:
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    terms.add(argument.value)
+    return terms
+
+
+def _regular_plural(term: str) -> str:
+    if term.endswith(("s", "x", "z", "ch", "sh")):
+        return term + "es"
+    if term.endswith("y") and term[-2] not in "aeiou":
+        return term[:-1] + "ies"
+    return term + "s"
+
+
+# The only substring matches dropped on purpose (other words that contain a keyword).
+INTENDED_DROPS = {
+    ("source-reproduction", "production"),
+    ("minimal reproduction", "production"),
+    ("reproducible", "producible"),
+    ("metadata", "meta"),
+    ("destructiveness", "destructive"),
+}
+
+
+def test_no_keyword_form_the_substring_matcher_caught_is_lost() -> None:
+    terms = _keyword_terms()
+    assert {"authorization bypass", "data loss", "production", "productionise"} <= terms
+    lost = []
+    for term in sorted(terms):
+        plural = _regular_plural(term)
+        forms = [term, plural, f"non-{term}", f"{term}-like", f"({plural})", f"the {term}."]
+        if plural.endswith("ies"):
+            forms = [form for form in forms if term not in form]  # never a substring match
+            forms.append(plural)
+        for form in forms:
+            if term in form and not backlog._mentions(form, term):
+                lost.append((form, term))
+    assert lost == []
+    for text, term in INTENDED_DROPS:
+        assert term in text and not backlog._mentions(text, term)
+
+
+def _classification(body: str, labels: tuple[str, ...]) -> tuple[Any, ...]:
+    record = classify_issue(
+        _issue("Report", body, labels), (), project="falcone", import_filter="all", evaluated_at=NOW
+    )
+    return (
+        record.issue_type,
+        record.severity,
+        record.calculated_risk,
+        record.reproduction_mode,
+        record.planned_wave,
+        record.documentation_levels,
+    )
+
+
+CORPUS = [
+    ("Authorization bypasses in the gateway.", ("bug",)),
+    ("Two data losses after restart.", ("bug",)),
+    ("Productionise the gateway before the rollout.", ("bug",)),
+    ("Productionized charts and productionizing jobs.", ("bug",)),
+    ("Data migrations are pending.", ("bug",)),
+    ("New ClusterRoles and ClusterRoleBindings.", ("bug",)),
+    ("Credential rotations and secret lifecycles.", ("bug",)),
+    ("Destructive cleanups.", ("bug",)),
+    ("Tenant isolation breaks.", ("bug",)),
+    ("Remote code execution in the parser.", ("bug",)),
+    ("Logins fail; http 401s and http 404s on staging.", ("bug",)),
+    ("Helm and ArgoCD gitops drift: degraded and outofsync.", ("bug",)),
+    ("Build blockers and runtime blockers.", ("bug",)),
+    ("Update the runbooks, the OpenAPI and the user guides for administrators.", ("bug",)),
+    ("Proposal only; needs product decision.", ("bug",)),
+    ("x", ("type:security",)),
+    ("x", ("area/ci", "tooling")),
+    ("x", ("docs",)),
+    ("x", ("operations",)),
+    ("x", ("duplicate",)),
+    ("x", ("wontfix",)),
+    ("x", ("questions",)),
+]
+
+
+def test_classification_matches_the_substring_classifier_except_false_positives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    new = [_classification(body, labels) for body, labels in CORPUS]
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            backlog, "_mentions", lambda text, *terms: any(term in text for term in terms)
+        )
+        old = [_classification(body, labels) for body, labels in CORPUS]
+        dropped = [
+            _classification(body, labels)
+            for body, labels in [
+                ("A source-reproduction is attached.", ("bug",)),
+                ("x", ("metadata",)),
+            ]
+        ]
+    assert new == old
+    assert new[0][0] is BacklogIssueType.SECURITY_DEFECT and new[0][2] == "R2"
+    assert new[1][1] == "critical"
+    assert new[2][2] == "R3"
+    assert dropped[0][2] == "R3"  # the substring false positive
+    assert _classification("A source-reproduction is attached.", ("bug",))[2] == "R1"
+    assert dropped[1][0] is BacklogIssueType.META_TOOLING
+    assert _classification("x", ("metadata",))[0] is BacklogIssueType.PRODUCT_BUG
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Productionise the gateway before the rollout.",
+        "Productionize the gateway.",
+        "The productionised chart.",
+        "Productionized images.",
+        "While productionising the API.",
+        "Productionizing the worker.",
+        "It productionises the queue.",
+    ],
+)
+def test_production_forms_stay_r3(body: str) -> None:
+    assert calculated_issue_risk("gntik-ai/falcone", ("bug",), "API returns 500", body) == "R3"
+
+
+def _loop_run(workflow_id: str, created_at: datetime, status: str = "PAUSED") -> Run:
+    return Run(
+        campaign_id=None,
+        change_set_id=None,
+        workflow_id=workflow_id,
+        run_type="existing-backlog-loop",
+        status=status,
+        project="falcone",
+        started_at=created_at,
+        created_at=created_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_amend_retry_prefers_the_loop_that_holds_the_issue_now(tmp_path: Path) -> None:
+    values = await _child(tmp_path)
+    operations, _metadata, engineering, _handler, payload, _registered, _child_payload = values
+    old_loop = f"backlog-loop-falcone-{CAMPAIGN_ID}-{uuid4()}"
+    with operations.sessions.begin() as session:
+        operation = session.scalar(select(OperationRequest))
+        issue_loop = issue_workflow_id(issue_request_from_operation(operation))
+        session.add(_loop_run(old_loop, NOW - timedelta(hours=2)))
+        session.add(_loop_run(issue_loop, NOW))
+    # The old campaign loop registered a child for this issue earlier.
+    engineering._register_backlog_child_run(
+        {
+            **payload,
+            "child_workflow_id": "backlog-old-issue-1-attempt-1",
+            "orchestration": {"workflow_id": old_loop},
+        }
+    )
+    with operations.sessions() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert retry_workflow_id(session, None, issue) == issue_loop
+    with operations.sessions.begin() as session:
+        loop = session.scalar(select(Run).where(Run.workflow_id == issue_loop))
+        loop.status, loop.finished_at = "STOPPED", NOW
+    with operations.sessions() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert retry_workflow_id(session, None, issue) == old_loop
+        # The old loop then registers a child for another issue: it moved on.
+        holder = session.scalar(select(Run).where(Run.workflow_id == old_loop))
+        holder_id = holder.id
+    with operations.sessions.begin() as session:
+        session.add(
+            Step(
+                run_id=holder_id,
+                name="delivery.issue_approval",
+                ordinal=0,
+                status="COMPLETE",
+                idempotency_key=f"new-128-{uuid4()}",
+                attempt=1,
+                result_json={
+                    "parent_workflow_id": old_loop,
+                    "issue_repository": "gntik-ai/falcone",
+                    "issue_number": 43,
+                },
+                created_at=datetime.now(UTC) + timedelta(minutes=5),
+            )
+        )
+    with operations.sessions() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert retry_workflow_id(session, None, issue) is None
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_amend_retry_never_picks_another_issues_start_loop(tmp_path: Path) -> None:
+    operations, metadata, handler, _request = await _approved_direct_request(tmp_path)
+    other = SolveIssueCommand(
+        project="falcone",
+        backlog_campaign_id=CAMPAIGN_ID,
+        repository="gntik-ai/falcone",
+        issue_number=43,
+        delivery_mode="source-pr",
+    )
+    operation = OperationRequest(
+        id=uuid4(),
+        action="solve_issue",
+        project="falcone",
+        target_type="github_issue",
+        target_id="gntik-ai/falcone#43",
+        payload_json=other.model_dump(mode="json"),
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key="new-128-other-issue",
+        binding_hash=hashlib.sha256(b"new-128").hexdigest(),
+        status="STARTED",
+        created_at=NOW,
+    )
+    other_loop = issue_workflow_id(issue_request_from_operation(operation))
+    with operations.sessions.begin() as session:
+        session.add(operation)
+        session.add(_loop_run(other_loop, NOW))
+    with operations.sessions() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        assert issue.issue_number == 42
+        # The campaign's only active loop is #43's issue-start loop: not this issue's.
+        assert retry_workflow_id(session, None, issue) is None
+    for item in (operations, metadata, handler):
+        item.engine.dispose()
