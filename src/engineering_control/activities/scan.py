@@ -1231,7 +1231,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         directory = self.settings.evidence_root / "scan" / "ui-inventory" / digest[:32]
         json_path = directory / "ui-inventory.json"
         markdown_path = directory / "ui-inventory.md"
-        verified = open_directory_no_follow(self.settings.evidence_root, directory)
+        verified = open_directory_no_follow(self.settings.evidence_root / "scan", directory)
         try:
             self._store_redacted_json(verified, json_path.name, document)
             write_text_at(verified, markdown_path.name, render_markdown(document))
@@ -1307,7 +1307,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         digest = str(document["snapshot_sha256"])
         directory = self.settings.evidence_root / "scan" / "ui-kit" / digest[:32]
         path = directory / "ui-kit-snapshot.json"
-        verified = open_directory_no_follow(self.settings.evidence_root, directory)
+        verified = open_directory_no_follow(self.settings.evidence_root / "scan", directory)
         try:
             self._store_redacted_json(verified, path.name, document)
         finally:

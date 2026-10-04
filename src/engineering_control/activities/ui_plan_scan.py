@@ -126,7 +126,7 @@ class UiPlanScanSteps:
         directory = self._ui_plan_input_directory(payload, base)
         files: dict[str, Any] = {}
         for label, source_directory, name, field, digest in sources:
-            raw = _read_no_follow(evidence, source_directory, name)
+            raw = _read_no_follow(evidence / "scan", source_directory, name)
             document = json.loads(raw)
             # The embedded digest alone proves nothing: recompute it from the content the
             # same way its producer did (ui_inventory.inventory_hash, ui_kit.snapshot_hash).
@@ -190,7 +190,7 @@ class UiPlanScanSteps:
         return {"status": "PUBLISHED", "files": written, "evidence": receipts}
 
     def _ui_plan_write_evidence(self, directory: Path, name: str, text: str) -> dict[str, Any]:
-        verified = open_directory_no_follow(self.settings.evidence_root, directory)
+        verified = open_directory_no_follow(self.settings.evidence_root / "scan", directory)
         try:
             write_text_at(verified, name, text)
         finally:
