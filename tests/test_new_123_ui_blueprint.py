@@ -20,8 +20,10 @@ from new_123_fixtures import (
 )
 from sqlalchemy import create_engine
 
+from engineering_control.activities.ui_plan import UiPlanActivityHandler
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES
 from engineering_control.agents.instructions import AgentInstructionPack
+from engineering_control.config import Settings
 from engineering_control.db import models  # noqa: F401
 from engineering_control.db.base import Base
 from engineering_control.db.change_requests import ChangeRequestRepository
@@ -51,6 +53,7 @@ from engineering_control.engineering.ui_blueprint import (
     item_context,
     item_description,
     load_schema,
+    render_item,
     render_item_proposal,
     render_markdown,
     schema_errors,
@@ -235,8 +238,9 @@ def _candidate(engine: Any) -> tuple[UiBlueprintRepository, UUID, str]:
         },
     )
     digest = repository.record_draft_sync(blueprint_id, 1, blueprint(), [])
+    repository.mark_reviewed_sync(blueprint_id, 1, digest)
     persisted = repository.persist_candidate_sync(
-        blueprint_id, digest, [{"decision": "APPROVE", "summary": "ok", "findings": []}], {}
+        blueprint_id, 1, digest, [{"decision": "APPROVE", "summary": "ok", "findings": []}], {}
     )
     assert persisted["status"] == "CANDIDATE"
     return repository, blueprint_id, persisted["approval_binding"]
@@ -248,6 +252,7 @@ def test_approval_binding_covers_blueprint_and_inputs(engine: Any) -> None:
         blueprint_id=str(blueprint_id),
         project="falcone",
         blueprint_sha256=canonical_sha256(blueprint()),
+        reviewed_sha256=canonical_sha256(blueprint()),
         inventory_sha256=INVENTORY_SHA,
         kit_snapshot_sha256=KIT_SHA,
         source_sha=SOURCE_SHA,
@@ -256,6 +261,7 @@ def test_approval_binding_covers_blueprint_and_inputs(engine: Any) -> None:
         blueprint_id=str(blueprint_id),
         project="falcone",
         blueprint_sha256=canonical_sha256(blueprint()),
+        reviewed_sha256=canonical_sha256(blueprint()),
         inventory_sha256=INVENTORY_SHA,
         kit_snapshot_sha256="f" * 64,
         source_sha=SOURCE_SHA,
@@ -299,6 +305,160 @@ def test_a_newer_candidate_supersedes_the_older_one(engine: Any) -> None:
     _second_repository, second, _ = _candidate(engine)
     assert repository.get_sync(first)["status"] == "SUPERSEDED"  # type: ignore[index]
     assert repository.get_sync(second)["status"] == "CANDIDATE"  # type: ignore[index]
+
+
+def test_draft_versions_are_immutable_and_only_the_reviewed_one_persists(engine: Any) -> None:
+    repository = UiBlueprintRepository(engine=engine)
+    created = repository.create_sync("falcone", "cli:engineering-ctl", None)
+    blueprint_id = UUID(created["id"])
+    repository.register_sync(blueprint_id, created["workflow_id"])
+    repository.record_inputs_sync(
+        blueprint_id,
+        {
+            "source_sha": SOURCE_SHA,
+            "inventory_sha256": INVENTORY_SHA,
+            "kit_snapshot_sha256": KIT_SHA,
+            "gntik_ui_version": KIT_VERSION,
+        },
+    )
+    first = repository.record_draft_sync(blueprint_id, 1, blueprint(), [])
+    changed = blueprint()
+    changed["pages"][0]["wave"] = "u3"
+    with pytest.raises(ValueError, match="immutable"):
+        repository.record_draft_sync(blueprint_id, 1, changed, [])
+    second = repository.record_draft_sync(blueprint_id, 2, changed, [])
+    # The reviewer read draft 1; draft 2 (or a draft-1 hash claimed for it) is refused.
+    with pytest.raises(ValueError, match="differs from the reviewed draft"):
+        repository.mark_reviewed_sync(blueprint_id, 2, first)
+    with pytest.raises(ValueError, match="changed after its review"):
+        repository.persist_candidate_sync(blueprint_id, 2, second, [], {})
+    repository.mark_reviewed_sync(blueprint_id, 1, first)
+    with pytest.raises(ValueError, match="changed after its review"):
+        repository.persist_candidate_sync(blueprint_id, 1, second, [], {})
+    persisted = repository.persist_candidate_sync(blueprint_id, 1, first, [], {})
+    assert persisted["blueprint_sha256"] == first
+    view = repository.get_sync(blueprint_id)
+    assert view is not None and view["reviewed_sha256"] == first
+    assert persisted["approval_binding"] == approval_binding(
+        blueprint_id=str(blueprint_id),
+        project="falcone",
+        blueprint_sha256=first,
+        reviewed_sha256=first,
+        inventory_sha256=INVENTORY_SHA,
+        kit_snapshot_sha256=KIT_SHA,
+        source_sha=SOURCE_SHA,
+    )
+    with pytest.raises(ValueError, match="only the reviewed blueprint"):
+        approval_binding(
+            blueprint_id=str(blueprint_id),
+            project="falcone",
+            blueprint_sha256=second,
+            reviewed_sha256=first,
+            inventory_sha256=INVENTORY_SHA,
+            kit_snapshot_sha256=KIT_SHA,
+            source_sha=SOURCE_SHA,
+        )
+
+
+def _words(prefix: str, length: int) -> str:
+    text = prefix
+    while len(text) < length:
+        text += " word"
+    return text[:length].rstrip()
+
+
+def _render_body(item: Any) -> str:
+    proposal, continued = render_item(item)
+    sha = canonical_sha256(blueprint())
+    context = item_context(
+        item,
+        blueprint_id="00000000-0000-4000-8000-000000000001",
+        blueprint_sha256=sha,
+        continued=continued,
+    )
+    return render_change_request(
+        change_request_id=str(item_change_request_id(sha, item.key)),
+        revision=1,
+        project="falcone",
+        target_repository=item.target_repository,
+        proposal=validate_proposal(proposal, "falcone", item.target_repository),
+        review=ChangeReviewRecord.from_rounds(
+            [ChangeReview(decision="APPROVE", summary="ok", findings=())]
+        ),
+        description_redacted=_words("UI migration item statement", 40),
+        ui_context=context,
+    ).body
+
+
+def test_schema_maxima_are_rendered_in_full_never_cut() -> None:
+    value = blueprint()
+    epic = value["foundation_epics"][0]
+    epic["scope"] = [_words(f"Scope {n:02d}", 600) for n in range(30)]
+    epic["acceptance_criteria"] = [_words(f"Accept {n:02d}", 600) for n in range(30)]
+    page = value["pages"][0]
+    page["parity_acceptance"] = [
+        {"check": "data", "criterion": _words(f"Parity {n:02d}", 1000), "fixtures": []}
+        for n in range(40)
+    ]
+    assert schema_errors(draft_output(value), blueprint_schema()) == []
+    items = {item.key: item for item in fanout_items(value)}
+    epic_body = _render_body(items["epic:u0-scaffold"])
+    for entry in [*epic["scope"], *epic["acceptance_criteria"]]:
+        assert entry in epic_body
+    assert "## UI migration: what_changes (continued, 30 entries)" in epic_body
+    assert "## UI migration: acceptance_criteria (continued, 30 entries)" in epic_body
+    page_body = _render_body(items["page:tenants"])
+    for entry in page["parity_acceptance"]:
+        assert f"- [ ] \\[data\\] {entry['criterion']}" in page_body
+    assert "acceptance_criteria (continued, 40 entries)" in page_body
+    # A list that fits stays in the proposal itself.
+    proposal, continued = render_item(items["epic:u0-console-api"])
+    assert continued == ()
+    assert proposal["what_changes"] == ["Deliver the console-api foundation."]
+
+
+def test_an_item_too_large_for_an_issue_fails_with_a_typed_blocker(engine: Any) -> None:
+    value = blueprint()
+    value["pages"][0]["parity_acceptance"] = [
+        {
+            "check": "data",
+            "criterion": _words(f"Parity {n:02d}", 1000),
+            "fixtures": [_words(f"fixture {n:02d} {m:02d}", 300) for m in range(20)],
+        }
+        for n in range(40)
+    ]
+    assert schema_errors(draft_output(value), blueprint_schema()) == []
+    repository = UiBlueprintRepository(engine=engine)
+    created = repository.create_sync("falcone", "cli:engineering-ctl", None)
+    blueprint_id = UUID(created["id"])
+    repository.register_sync(blueprint_id, created["workflow_id"])
+    repository.record_inputs_sync(
+        blueprint_id,
+        {
+            "source_sha": SOURCE_SHA,
+            "inventory_sha256": INVENTORY_SHA,
+            "kit_snapshot_sha256": KIT_SHA,
+        },
+    )
+    digest = repository.record_draft_sync(blueprint_id, 1, value, [])
+    repository.mark_reviewed_sync(blueprint_id, 1, digest)
+    persisted = repository.persist_candidate_sync(blueprint_id, 1, digest, [], {})
+    repository.approve_sync(
+        blueprint_id, persisted["approval_binding"], APPROVAL_PHRASE, "telegram:42"
+    )
+    handler = UiPlanActivityHandler(
+        Settings(), repository=repository, change_requests=ChangeRequestRepository(engine=engine)
+    )
+    result = handler._prepare_item(
+        {"blueprint_id": str(blueprint_id), "item_key": "page:tenants", "source_worktree": "/x"}
+    )
+    assert (result["status"], result["error_code"]) == (
+        "FAILED_RECORDED",
+        "RENDERED_BODY_TOO_LARGE",
+    )
+    stored = ChangeRequestRepository(engine=engine).get_sync(UUID(result["change_request_id"]))
+    assert stored is not None
+    assert (stored["status"], stored["error_code"]) == ("FAILED", "RENDERED_BODY_TOO_LARGE")
 
 
 def test_markdown_is_deterministic_and_inert() -> None:

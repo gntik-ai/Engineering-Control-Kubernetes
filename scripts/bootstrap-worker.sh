@@ -127,6 +127,11 @@ for repository in falcone falcone-charts musematic musematic-deploy llmwiki \
 done
 install -d -o scan-runner -g scan-runner -m 0755 \
   "${PLATFORM_ROOT}/worktrees/observability-canary"
+# NEW-123: flow A model inputs. scan-runner writes one directory per blueprint and grants
+# codex-runner and claude-runner read on it by ACL; here they may only traverse.
+install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/worktrees/ui-plan-inputs"
+setfacl --modify u:codex-runner:--x,u:claude-runner:--x \
+  "${PLATFORM_ROOT}/worktrees/ui-plan-inputs"
 for kind in codex claude browser scan delivery release; do
   owner="${kind}-runner"
   install -d -o "${owner}" -g "${owner}" -m 0750 "${STATE_ROOT}/workers/${kind}"

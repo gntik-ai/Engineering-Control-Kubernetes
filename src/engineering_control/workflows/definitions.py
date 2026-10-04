@@ -5187,6 +5187,13 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 "kit_snapshot_sha256": context.get("kit_snapshot_sha256"),
             },
         )
+        if staged.get("status") != "STAGED":
+            return await self._ui_plan_terminal(
+                context,
+                "BLOCKED",
+                str(staged.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
+                [str(staged.get("reason") or "")[:300]],
+            )
         context = {
             **context,
             "inputs": {
@@ -5229,6 +5236,10 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     "document": recorded.get("document"),
                 },
             )
+            if draft.get("status") != "STAGED":
+                return await self._ui_plan_terminal(
+                    context, "BLOCKED", str(draft.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE")
+                )
             context = {**context, "draft_file": draft.get("document")}
             if not await self._checkpoint("UI_PLAN_REVIEW"):
                 return await self._ui_plan_terminal(context, "FAILED", "UI_PLAN_CANCELLED")
@@ -5265,6 +5276,10 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     "document": reviewed.get("document"),
                 },
             )
+            if review.get("status") != "STAGED":
+                return await self._ui_plan_terminal(
+                    context, "BLOCKED", str(review.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE")
+                )
             context = {**context, "review_file": review.get("document")}
         if approved is None:
             return await self._ui_plan_terminal(context, "BLOCKED", "BLUEPRINT_REVIEW_UNRESOLVED")
@@ -5285,7 +5300,8 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             {
                 "blueprint_id": request.blueprint_id,
                 "project": request.project,
-                "blueprint_sha256": approved.get("blueprint_sha256"),
+                "draft_attempt": approved.get("draft_attempt"),
+                "reviewed_sha256": approved.get("reviewed_sha256"),
                 "review_rounds": context.get("review_rounds", []),
                 "evidence": published.get("evidence", []),
             },
@@ -5405,6 +5421,8 @@ class UiBlueprintFanOutWorkflow(ControlledWorkflow):
             )
             if context.get("status") == "SKIPPED":
                 return "skipped"
+            if context.get("status") == "FAILED_RECORDED":
+                return "failed"
             if context.get("status") not in {"DRAFT_READY", "PROPOSAL_READY"}:
                 return await self._fanout_item_failure(context, "draft")
             gap = context.get("status") == "DRAFT_READY"

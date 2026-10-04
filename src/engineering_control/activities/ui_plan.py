@@ -25,6 +25,8 @@ from engineering_control.db.ui_blueprints import UiBlueprintRepository
 from engineering_control.delivery_notifications import CTL, enqueue_milestone, literal
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.change_requests import (
+    MAXIMUM_ISSUE_BODY_CHARACTERS,
+    UiContinuedSection,
     change_review_schema,
     prepare_intake,
     validate_proposal,
@@ -48,7 +50,7 @@ from engineering_control.engineering.ui_blueprint import (
     item_change_request_id,
     item_context,
     item_description,
-    render_item_proposal,
+    render_item,
     render_markdown,
 )
 from engineering_control.models.core import AgentRequest
@@ -416,10 +418,18 @@ class UiPlanActivityHandler:
                     "blockers": rejected.details}  # fmt: skip
         rounds = [*(payload.get("review_rounds") or []), review]
         attempt = int(payload.get("draft_attempt") or 1)
+        # The reviewed hash is Hermes's own, computed by the scan worker from the exact file
+        # the reviewer read (never the model's echo); the stored version must match it.
+        staged = payload.get("draft_file") or {}
+        reviewed_sha256 = str(staged.get("blueprint_sha256") or "")
+        try:
+            stored = self.repository.mark_reviewed_sync(blueprint_id, attempt, reviewed_sha256)
+        except ValueError as error:
+            return {**base, "status": "REJECTED", "blocker": "REVIEWED_DRAFT_MISMATCH",
+                    "blockers": [str(error)]}  # fmt: skip
         self.repository.record_round_sync(blueprint_id, attempt, rounds)
-        result = {**base, "review_rounds": rounds}
+        result = {**base, "review_rounds": rounds, "reviewed_sha256": reviewed_sha256}
         if review["decision"] == "APPROVE":
-            stored = self.repository.draft_sync(blueprint_id)
             markdown = render_markdown(
                 stored["blueprint"],
                 blueprint_id=str(blueprint_id),
@@ -453,12 +463,19 @@ class UiPlanActivityHandler:
 
     def _persist(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
-        persisted = self.repository.persist_candidate_sync(
-            blueprint_id,
-            str(payload["blueprint_sha256"]),
-            list(payload.get("review_rounds") or []),
-            {"blueprint": payload.get("evidence") or []},
-        )
+        try:
+            persisted = self.repository.persist_candidate_sync(
+                blueprint_id,
+                int(payload.get("draft_attempt") or 0),
+                str(payload.get("reviewed_sha256") or ""),
+                list(payload.get("review_rounds") or []),
+                {"blueprint": payload.get("evidence") or []},
+            )
+        except ValueError as error:
+            # Only the exact reviewed draft version may become the candidate.
+            persisted = self.repository.record_terminal_sync(
+                blueprint_id, "BLOCKED", "REVIEWED_DRAFT_MISMATCH", [str(error)]
+            )
         if persisted["status"] == "CANDIDATE":
             binding = persisted["approval_binding"]
             with self.repository.sessions.begin() as session:
@@ -592,11 +609,27 @@ class UiPlanActivityHandler:
             item.target_repository,
         )
         change_request_id = item_change_request_id(digest, item.key)
+        # Deterministic items render every requirement (continued sections, never cut); a
+        # rendering that cannot fit the issue fails the item with a typed blocker.
+        rendered: dict[str, Any] | None = None
+        continued: tuple[UiContinuedSection, ...] = ()
+        render_error: str | None = None
+        if not item.is_gap:
+            try:
+                rendered, continued = render_item(item)
+            except BlueprintRejected as rejected:
+                render_error = rejected.code
+            else:
+                size = sum(len(entry) for section in continued for entry in section.entries)
+                if size > MAXIMUM_ISSUE_BODY_CHARACTERS:
+                    render_error, continued = "RENDERED_BODY_TOO_LARGE", ()
         created = self.change_requests.create_ui_item_sync(
             change_request_id,
             intake,
             str(loaded["decided_by"]),
-            item_context(item, blueprint_id=str(blueprint_id), blueprint_sha256=digest),
+            item_context(
+                item, blueprint_id=str(blueprint_id), blueprint_sha256=digest, continued=continued
+            ),
         )
         base: dict[str, Any] = {
             "blueprint_id": str(blueprint_id),
@@ -610,15 +643,17 @@ class UiPlanActivityHandler:
             "description_redacted": intake.description_redacted,
             "review_rounds": [],
             "dedupe_supported": item.target_repository in ALLOWED_REPOSITORIES,
+            "continued": [section.model_dump(mode="json") for section in continued],
         }
         if created["status"] != "DRAFTING" or int(created["revision"]) != 1:
             return {**base, "status": "SKIPPED", "current_status": created["status"]}
         if item.is_gap:
             return self._gap_request(base, item, 1, self._workflow_run(payload))
+        if render_error is not None:
+            failed = self.change_requests.record_failure_sync(change_request_id, 1, render_error)
+            return {**base, "status": "FAILED_RECORDED", "error_code": failed.get("error_code")}
         try:
-            proposal = validate_proposal(
-                render_item_proposal(item), project, item.target_repository
-            )
+            proposal = validate_proposal(rendered, project, item.target_repository)
         except ValueError:
             return {**base, "status": "FAILED", "blocker": "DRAFT_SCHEMA_INVALID"}
         return {**base, "status": "PROPOSAL_READY", "proposal": proposal.model_dump(mode="json")}
@@ -719,6 +754,15 @@ class UiPlanActivityHandler:
             f"\nItem: {payload['item_key']} ({payload['item_kind']})",
             _fenced("item statement", str(payload["description_redacted"])),
             _fenced("proposal", json.dumps(proposal, sort_keys=True)),
+            *(
+                (
+                    "Proposal lists too long for the proposal bounds, rendered in full in the "
+                    "issue body (review every entry):\n"
+                    + _fenced("continued", json.dumps(payload["continued"], sort_keys=True)),
+                )
+                if payload.get("continued")
+                else ()
+            ),
         ]
         request = AgentRequest(
             run_id=uuid5(
@@ -757,6 +801,8 @@ class UiPlanActivityHandler:
         self.repository.record_fanout_sync(blueprint_id, stats)
         orchestration = self._orchestration(payload)
         workflow_id = str(orchestration.get("workflow_id") or "")
+        # This fan-out no longer holds the blueprint's single active-fan-out marker.
+        self.repository.release_fanout_sync(blueprint_id, workflow_id)
         if not blocker:
             with self.repository.sessions.begin() as session:
                 enqueue_milestone(

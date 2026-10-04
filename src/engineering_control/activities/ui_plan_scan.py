@@ -18,12 +18,17 @@ from typing import Any
 from uuid import UUID
 
 from engineering_control.config import Settings
+from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.safe_files import open_directory_no_follow, write_text_at
+from engineering_control.engineering.ui_blueprint import blueprint_sha256
+from engineering_control.engineering.ui_inventory import inventory_hash
+from engineering_control.engineering.ui_kit import snapshot_hash
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.manager import GitWorktreeManager
 
 UI_PLAN_INPUT_DIRECTORY = "ui-plan-inputs"
 UI_PLAN_SCAN_STEPS = frozenset({"ui_plan.stage_inputs", "ui_plan.stage_document"})
+UI_PLAN_INPUT_DIRECTORY_MISSING = "UI_PLAN_INPUT_DIRECTORY_MISSING"
 _DOCUMENT_NAME = re.compile(r"^(draft|review)-[12]\.json$")
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
 _MODEL_READERS = ("codex-runner", "claude-runner")
@@ -64,12 +69,32 @@ class UiPlanScanSteps:
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
-    def _ui_plan_input_directory(self, payload: dict[str, Any]) -> Path:
-        blueprint_id = str(UUID(str(payload["blueprint_id"])))
-        return self.settings.worktree_root / UI_PLAN_INPUT_DIRECTORY / blueprint_id
+    def _ui_plan_input_base(self) -> Path | None:
+        """The bootstrap-provisioned input root (scan-runner owned); never created here.
 
-    def _ui_plan_write(self, directory: Path, name: str, text: str) -> dict[str, Any]:
-        verified = open_directory_no_follow(self.settings.worktree_root, directory)
+        /srv/engineering/worktrees itself is root-owned 0711, so a missing root is an
+        operator provisioning gap and fails closed instead of being created ad hoc."""
+        base = self.settings.worktree_root / UI_PLAN_INPUT_DIRECTORY
+        try:
+            info = base.lstat()
+        except FileNotFoundError:
+            return None
+        return base if stat.S_ISDIR(info.st_mode) else None
+
+    @staticmethod
+    def _ui_plan_missing_root() -> dict[str, Any]:
+        return {
+            "status": "BLOCKED",
+            "blocker": UI_PLAN_INPUT_DIRECTORY_MISSING,
+            "reason": f"provision /srv/engineering/worktrees/{UI_PLAN_INPUT_DIRECTORY} "
+            "(scan-runner 0700, traverse ACL for codex-runner and claude-runner)",
+        }
+
+    def _ui_plan_input_directory(self, payload: dict[str, Any], base: Path) -> Path:
+        return base / str(UUID(str(payload["blueprint_id"])))
+
+    def _ui_plan_write(self, base: Path, directory: Path, name: str, text: str) -> dict[str, Any]:
+        verified = open_directory_no_follow(base, directory)
         try:
             write_text_at(verified, name, text)
         finally:
@@ -95,14 +120,24 @@ class UiPlanScanSteps:
             ("kit", evidence / "scan" / "ui-kit" / kit[:32],
              "ui-kit-snapshot.json", "snapshot_sha256", kit),
         )  # fmt: skip
-        directory = self._ui_plan_input_directory(payload)
+        base = self._ui_plan_input_base()
+        if base is None:
+            return {**self._ui_plan_missing_root(), "blueprint_id": payload["blueprint_id"]}
+        directory = self._ui_plan_input_directory(payload, base)
         files: dict[str, Any] = {}
         for label, source_directory, name, field, digest in sources:
             raw = _read_no_follow(evidence, source_directory, name)
             document = json.loads(raw)
-            if not isinstance(document, dict) or document.get(field) != digest:
+            # The embedded digest alone proves nothing: recompute it from the content the
+            # same way its producer did (ui_inventory.inventory_hash, ui_kit.snapshot_hash).
+            recompute = inventory_hash if label == "inventory" else snapshot_hash
+            if (
+                not isinstance(document, dict)
+                or document.get(field) != digest
+                or recompute(document) != digest
+            ):
                 raise ValueError(f"ui plan {label} evidence does not match its digest")
-            files[label] = self._ui_plan_write(directory, name, raw.decode("utf-8"))
+            files[label] = self._ui_plan_write(base, directory, name, raw.decode("utf-8"))
         self._ui_plan_grant(directory)
         return {
             "status": "STAGED",
@@ -123,8 +158,18 @@ class UiPlanScanSteps:
             name = str(payload.get("name", ""))
             if not _DOCUMENT_NAME.fullmatch(name):
                 raise ValueError("ui plan document name is invalid")
-            directory = self._ui_plan_input_directory(payload)
-            staged = self._ui_plan_write(directory, name, text)
+            base = self._ui_plan_input_base()
+            if base is None:
+                return self._ui_plan_missing_root()
+            directory = self._ui_plan_input_directory(payload, base)
+            staged = self._ui_plan_write(base, directory, name, text)
+            if name.startswith("draft-"):
+                # Hermes's own record of exactly what the reviewer is given (not the model's).
+                written = json.loads(text)
+                if not isinstance(written.get("blueprint"), dict):
+                    raise ValueError("a staged ui plan draft carries no blueprint")
+                staged["document_sha256"] = canonical_sha256(written)
+                staged["blueprint_sha256"] = blueprint_sha256(written["blueprint"])
             self._ui_plan_grant(directory)
             return {"status": "STAGED", "document": staged}
         markdown = payload.get("markdown")

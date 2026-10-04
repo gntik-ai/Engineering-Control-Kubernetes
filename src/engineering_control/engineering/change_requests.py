@@ -129,6 +129,23 @@ class UiChangeDependency(ChangeRequestModel):
     item_key: str = Field(pattern=r"^(epic|page|cutover|gap):[a-z0-9][a-z0-9-]{0,99}$")
 
 
+class UiContinuedSection(ChangeRequestModel):
+    """NEW-123: a proposal list too long for the proposal bounds, rendered in full."""
+
+    field: Literal[
+        "what_changes",
+        "out_of_scope",
+        "acceptance_criteria",
+        "risks",
+        "rollout",
+        "kill_switch",
+        "open_questions",
+    ]
+    entries: tuple[Annotated[str, Field(min_length=1, max_length=20_000)], ...] = Field(
+        min_length=1, max_length=300
+    )
+
+
 class UiChangeContext(ChangeRequestModel):
     """NEW-123: the blueprint item a change request was fanned out from (rendered, bound)."""
 
@@ -141,6 +158,7 @@ class UiChangeContext(ChangeRequestModel):
         min_length=1, max_length=10
     )
     blocked_by: tuple[UiChangeDependency, ...] = Field(max_length=300)
+    continued: tuple[UiContinuedSection, ...] = Field(default=(), max_length=7)
 
 
 class ChangeRequestIntake(ChangeRequestModel):
@@ -451,6 +469,17 @@ def _ui_context_lines(context: UiChangeContext) -> list[str]:
         f"- Item: `{context.item_key}` ({context.item_kind}, wave {context.wave or 'none'})",
         "- Labels: " + ", ".join(f"`{label}`" for label in context.labels),
         *(["- Blocked by:", *blocked] if blocked else ["- Blocked by: none"]),
+        "",
+        *(line for section in context.continued for line in _continued_lines(section)),
+    ]
+
+
+def _continued_lines(section: UiContinuedSection) -> list[str]:
+    bullet = "- [ ] " if section.field == "acceptance_criteria" else "- "
+    return [
+        f"## UI migration: {section.field} (continued, {len(section.entries)} entries)",
+        "",
+        *(f"{bullet}{_line(entry)}" for entry in section.entries),
         "",
     ]
 

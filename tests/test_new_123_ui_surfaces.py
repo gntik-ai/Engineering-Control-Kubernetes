@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -24,10 +26,14 @@ from engineering_control.db import models  # noqa: F401
 from engineering_control.db.base import Base
 from engineering_control.db.change_requests import ChangeRequestRepository
 from engineering_control.db.ui_blueprints import UiBlueprintRepository
+from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.ui_blueprint import APPROVAL_PHRASE
+from engineering_control.engineering.ui_inventory import inventory_hash
+from engineering_control.engineering.ui_kit import snapshot_hash
 from engineering_control.workflows.definitions import ControlledWorkflow
 from engineering_control.workflows.worker_registry import ROLE_TASK_QUEUES
 
+ROOT = Path(__file__).parents[1]
 TOKEN = "x" * 32
 CLI = {"Authorization": f"Bearer {TOKEN}", "X-Engineering-Actor": "engineering-ctl:hermes"}
 
@@ -82,6 +88,7 @@ class Staging(UiPlanScanSteps):
         self.settings = settings
         self.manager = FakeManager()  # type: ignore[assignment]
         self.published: list[tuple[str, list[str]]] = []
+        self.digests: dict[str, str] = {}
 
     def _publish_reports(
         self,
@@ -98,29 +105,47 @@ class Staging(UiPlanScanSteps):
 BLUEPRINT_ID = "11111111-1111-4111-8111-111111111111"
 
 
-def staging(tmp_path: Path) -> Staging:
+def staging(tmp_path: Path, *, provisioned: bool = True) -> Staging:
+    """Evidence written exactly as the producers write it (digest recomputed from content)."""
     settings = Settings(evidence_root=tmp_path / "evidence", worktree_root=tmp_path / "worktrees")
-    for kind, name, field, digest in (
-        ("ui-inventory", "ui-inventory.json", "inventory_sha256", INVENTORY_SHA),
-        ("ui-kit", "ui-kit-snapshot.json", "snapshot_sha256", KIT_SHA),
+    inventory: dict[str, Any] = {"schema_version": 1, "pages": [{"file": "a.tsx"}]}
+    inventory["inventory_sha256"] = inventory_hash(inventory)
+    kit: dict[str, Any] = {"schema_version": 1, "calls": [{"tool": "list_kit", "text": "x"}]}
+    kit["snapshot_sha256"] = snapshot_hash(kit)
+    for kind, name, document, digest in (
+        ("ui-inventory", "ui-inventory.json", inventory, inventory["inventory_sha256"]),
+        ("ui-kit", "ui-kit-snapshot.json", kit, kit["snapshot_sha256"]),
     ):
         directory = settings.evidence_root / "scan" / kind / digest[:32]
         directory.mkdir(parents=True)
-        (directory / name).write_text(json.dumps({field: digest, "data": [1, 2]}))
-    return Staging(settings)
+        (directory / name).write_text(json.dumps(document))
+    if provisioned:
+        (settings.worktree_root / "ui-plan-inputs").mkdir(parents=True)
+    handler = Staging(settings)
+    handler.digests = {
+        "inventory_sha256": inventory["inventory_sha256"],
+        "kit_snapshot_sha256": kit["snapshot_sha256"],
+    }
+    return handler
+
+
+def test_bootstrap_provisions_the_input_root_for_scan_with_runner_traverse() -> None:
+    script = (ROOT / "scripts" / "bootstrap-worker.sh").read_text()
+    assert (
+        "install -d -o scan-runner -g scan-runner -m 0700 "
+        '"${PLATFORM_ROOT}/worktrees/ui-plan-inputs"' in script
+    )
+    assert "setfacl --modify u:codex-runner:--x,u:claude-runner:--x" in script
+    unit = (ROOT / "systemd" / "engineering-worker@.service").read_text()
+    # Inside the scan unit's existing writable root; read-only (ProtectSystem) for the others.
+    assert " /srv/engineering/worktrees " in unit
 
 
 def test_stage_inputs_copies_hash_verified_files_into_a_model_readable_directory(
     tmp_path: Path,
 ) -> None:
     handler = staging(tmp_path)
-    result = handler._ui_plan_stage_inputs(
-        {
-            "blueprint_id": BLUEPRINT_ID,
-            "inventory_sha256": INVENTORY_SHA,
-            "kit_snapshot_sha256": KIT_SHA,
-        }
-    )
+    result = handler._ui_plan_stage_inputs({"blueprint_id": BLUEPRINT_ID, **handler.digests})
     directory = tmp_path / "worktrees" / "ui-plan-inputs" / BLUEPRINT_ID
     assert result["input_directory"] == str(directory)
     inventory = Path(result["files"]["inventory"]["path"])
@@ -128,33 +153,49 @@ def test_stage_inputs_copies_hash_verified_files_into_a_model_readable_directory
     assert (
         result["files"]["inventory"]["sha256"] == hashlib.sha256(inventory.read_bytes()).hexdigest()
     )
-    assert (
-        json.loads(Path(result["files"]["kit"]["path"]).read_text())["snapshot_sha256"] == KIT_SHA
-    )
+    kit = json.loads(Path(result["files"]["kit"]["path"]).read_text())
+    assert kit["snapshot_sha256"] == handler.digests["kit_snapshot_sha256"]
     assert handler.manager.granted == [(directory, ("codex-runner", "claude-runner"))]  # type: ignore[attr-defined]
 
 
-def test_stage_inputs_refuses_evidence_that_does_not_match_its_digest(tmp_path: Path) -> None:
+def test_stage_inputs_fails_closed_without_the_provisioned_root(tmp_path: Path) -> None:
+    handler = staging(tmp_path, provisioned=False)
+    result = handler._ui_plan_stage_inputs({"blueprint_id": BLUEPRINT_ID, **handler.digests})
+    assert (result["status"], result["blocker"]) == ("BLOCKED", "UI_PLAN_INPUT_DIRECTORY_MISSING")
+    assert not (tmp_path / "worktrees" / "ui-plan-inputs").exists()
+    staged = handler._ui_plan_stage_document(
+        {"blueprint_id": BLUEPRINT_ID, "name": "draft-1.json", "document": {"blueprint": {}}}
+    )
+    assert staged["blocker"] == "UI_PLAN_INPUT_DIRECTORY_MISSING"
+
+
+@pytest.mark.parametrize("label", ["inventory", "kit"])
+def test_stage_inputs_recomputes_the_digest_from_the_content(tmp_path: Path, label: str) -> None:
     handler = staging(tmp_path)
-    forged = "e" * 64
-    directory = tmp_path / "evidence" / "scan" / "ui-inventory" / forged[:32]
-    directory.mkdir(parents=True)
-    (directory / "ui-inventory.json").write_text(json.dumps({"inventory_sha256": INVENTORY_SHA}))
+    kind, name = (
+        ("ui-inventory", "ui-inventory.json")
+        if label == "inventory"
+        else ("ui-kit", "ui-kit-snapshot.json")
+    )
+    digest = handler.digests["inventory_sha256" if label == "inventory" else "kit_snapshot_sha256"]
+    path = tmp_path / "evidence" / "scan" / kind / digest[:32] / name
+    altered = json.loads(path.read_text())
+    altered["schema_version"] = 2  # content changed, embedded digest field kept
+    path.write_text(json.dumps(altered))
     with pytest.raises(ValueError, match="does not match"):
-        handler._ui_plan_stage_inputs(
-            {
-                "blueprint_id": BLUEPRINT_ID,
-                "inventory_sha256": forged,
-                "kit_snapshot_sha256": KIT_SHA,
-            }
-        )
+        handler._ui_plan_stage_inputs({"blueprint_id": BLUEPRINT_ID, **handler.digests})
+
+
+def test_stage_inputs_refuses_a_symlinked_evidence_directory(tmp_path: Path) -> None:
+    handler = staging(tmp_path)
+    kit = handler.digests["kit_snapshot_sha256"]
     link = tmp_path / "evidence" / "scan" / "ui-kit" / ("f" * 32)
-    link.symlink_to(tmp_path / "evidence" / "scan" / "ui-kit" / KIT_SHA[:32])
+    link.symlink_to(tmp_path / "evidence" / "scan" / "ui-kit" / kit[:32])
     with pytest.raises(OSError):
         handler._ui_plan_stage_inputs(
             {
                 "blueprint_id": BLUEPRINT_ID,
-                "inventory_sha256": INVENTORY_SHA,
+                "inventory_sha256": handler.digests["inventory_sha256"],
                 "kit_snapshot_sha256": "f" * 64,
             }
         )
@@ -162,10 +203,15 @@ def test_stage_inputs_refuses_evidence_that_does_not_match_its_digest(tmp_path: 
 
 def test_stage_document_writes_named_inputs_and_publishes_the_blueprint(tmp_path: Path) -> None:
     handler = staging(tmp_path)
+    draft = {"mode": "draft", "blueprint": blueprint()}
     staged = handler._ui_plan_stage_document(
-        {"blueprint_id": BLUEPRINT_ID, "name": "draft-1.json", "document": {"a": 1}}
+        {"blueprint_id": BLUEPRINT_ID, "name": "draft-1.json", "document": draft}
     )
     assert Path(staged["document"]["path"]).name == "draft-1.json"
+    # Hermes hashes exactly the staged file the reviewer reads.
+    written = json.loads(Path(staged["document"]["path"]).read_text())
+    assert staged["document"]["blueprint_sha256"] == canonical_sha256(written["blueprint"])
+    assert staged["document"]["blueprint_sha256"] == canonical_sha256(blueprint())
     for name in ("../x.json", "draft-3.json", "notes.md"):
         with pytest.raises(ValueError, match="name is invalid"):
             handler._ui_plan_stage_document(
@@ -208,7 +254,8 @@ def candidate(repository: UiBlueprintRepository) -> tuple[UUID, str]:
         },
     )
     digest = repository.record_draft_sync(blueprint_id, 1, blueprint(), [])
-    persisted = repository.persist_candidate_sync(blueprint_id, digest, [], {})
+    repository.mark_reviewed_sync(blueprint_id, 1, digest)
+    persisted = repository.persist_candidate_sync(blueprint_id, 1, digest, [], {})
     return blueprint_id, persisted["approval_binding"]
 
 
@@ -224,10 +271,11 @@ def api(tmp_path: Path) -> tuple[TestClient, Mock, UiBlueprintRepository]:
         )
     )
     fake.start_ui_fanout = AsyncMock(
-        side_effect=lambda blueprint_id, max_items, sequence: OperationAccepted(
-            workflow_id=f"ui-blueprint-fanout-{blueprint_id}-{sequence}", run_id="fan"
+        side_effect=lambda blueprint_id, max_items, workflow_id: OperationAccepted(
+            workflow_id=workflow_id, run_id="fan"
         )
     )
+    fake.running_ui_fanout = AsyncMock(return_value=None)
     app = create_app(
         settings=Settings(),
         service=fake,
@@ -273,6 +321,7 @@ def test_api_starts_a_plan_for_falcone_only(api: Any) -> None:
 def test_api_approval_is_bound_and_starts_the_capped_fanout(api: Any) -> None:
     client, fake, repository = api
     blueprint_id, binding = candidate(repository)
+    first = f"ui-blueprint-fanout-{blueprint_id}-1"
     with client:
         markdown = client.get(f"/v1/ui-blueprints/{blueprint_id}/markdown", headers=CLI).json()
         assert markdown["markdown"].startswith("# UI migration blueprint: falcone")
@@ -302,18 +351,71 @@ def test_api_approval_is_bound_and_starts_the_capped_fanout(api: Any) -> None:
         )
         assert approved.status_code == 200
         assert approved.json()["status"] == "APPROVED"
-        assert approved.json()["fanout"]["max_items"] == 5
-        fake.start_ui_fanout.assert_awaited_once_with(blueprint_id, 5, 1)
-        replay = client.post(
-            f"/v1/ui-blueprints/{blueprint_id}/approve",
-            json={"approval_binding": binding, "typed_confirmation": APPROVAL_PHRASE},
-            headers=CLI,
+        assert approved.json()["fanout"] == {
+            "workflow_id": first,
+            "run_id": "fan",
+            "max_items": 5,
+            "joined": False,
+        }
+        fake.start_ui_fanout.assert_awaited_once_with(blueprint_id, 5, first)
+
+        def replay() -> dict[str, Any]:
+            response = client.post(
+                f"/v1/ui-blueprints/{blueprint_id}/approve",
+                json={"approval_binding": binding, "typed_confirmation": APPROVAL_PHRASE},
+                headers=CLI,
+            )
+            assert response.status_code == 200
+            assert response.json()["replayed"] is True
+            return dict(response.json()["fanout"])
+
+        # While fan-out 1 runs, every replay joins it and consumes no sequence.
+        fake.running_ui_fanout.return_value = OperationAccepted(workflow_id=first, run_id="r1")
+        for _ in range(3):
+            assert replay()["workflow_id"] == first
+        assert fake.start_ui_fanout.await_count == 1
+        assert repository.get_sync(blueprint_id)["fanout_sequence"] == 1  # type: ignore[index]
+        # Once it ended (without clearing its marker), the next replay starts fan-out 2.
+        fake.running_ui_fanout.return_value = None
+        resumed = replay()
+        assert (resumed["workflow_id"], resumed["joined"], resumed["max_items"]) == (
+            f"ui-blueprint-fanout-{blueprint_id}-2",
+            False,
+            80,
         )
-        assert replay.json()["replayed"] is True
-        assert replay.json()["fanout"]["max_items"] == 80
-        # A replay resumes as the next fan-out execution (its own workflow id and Run).
-        fake.start_ui_fanout.assert_awaited_with(blueprint_id, 80, 2)
-        assert replay.json()["fanout"]["workflow_id"].endswith("-2")
+        assert fake.start_ui_fanout.await_count == 2
+        view = repository.get_sync(blueprint_id)
+        assert view is not None and view["fanout_workflow_id"] == resumed["workflow_id"]
+
+
+def test_a_single_fanout_claim_wins_under_concurrent_approvals(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'claim.sqlite'}", connect_args={"timeout": 30})
+    Base.metadata.create_all(engine)
+    repository = UiBlueprintRepository(engine=engine)
+    blueprint_id, binding = candidate(repository)
+    repository.approve_sync(blueprint_id, binding, APPROVAL_PHRASE, "telegram:42")
+    barrier = threading.Barrier(8)
+
+    def claim() -> dict[str, Any]:
+        barrier.wait()
+        return repository.claim_fanout_sync(blueprint_id)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claims = list(pool.map(lambda _: claim(), range(8)))
+    started = [item for item in claims if item["action"] == "START"]
+    assert len(started) == 1
+    assert {item["workflow_id"] for item in claims} == {started[0]["workflow_id"]}
+    view = repository.get_sync(blueprint_id)
+    assert view is not None and view["fanout_sequence"] == 1
+    # Only the holder clears the marker; then exactly the next sequence is claimed.
+    assert repository.release_fanout_sync(blueprint_id, "ui-blueprint-fanout-other-9") is False
+    assert repository.release_fanout_sync(blueprint_id, started[0]["workflow_id"]) is True
+    following = repository.claim_fanout_sync(blueprint_id)
+    assert following == {
+        "action": "START",
+        "workflow_id": f"ui-blueprint-fanout-{blueprint_id}-2",
+        "sequence": 2,
+    }
 
 
 # CLI -------------------------------------------------------------------------------------

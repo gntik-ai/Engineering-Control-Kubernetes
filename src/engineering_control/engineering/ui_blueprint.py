@@ -26,6 +26,7 @@ from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.change_requests import (
     UiChangeContext,
     UiChangeDependency,
+    UiContinuedSection,
 )
 
 UI_PLAN_PROJECTS = frozenset({"falcone"})
@@ -322,14 +323,18 @@ def approval_binding(
     blueprint_id: str,
     project: str,
     blueprint_sha256: str,
+    reviewed_sha256: str,
     inventory_sha256: str,
     kit_snapshot_sha256: str,
     source_sha: str,
 ) -> str:
-    """sha256 of the canonical blueprint hash and every immutable input it was drafted from."""
+    """sha256 of the canonical blueprint hash, the hash of the draft the independent
+    reviewer read, and every immutable input the blueprint was drafted from."""
     if not _SHA.fullmatch(source_sha):
         raise ValueError("source SHA is invalid")
-    for value in (blueprint_sha256, inventory_sha256, kit_snapshot_sha256):
+    if reviewed_sha256 != blueprint_sha256:
+        raise ValueError("only the reviewed blueprint can be bound for approval")
+    for value in (blueprint_sha256, reviewed_sha256, inventory_sha256, kit_snapshot_sha256):
         if not _BINDING.fullmatch(value):
             raise ValueError("blueprint input hash is invalid")
     return canonical_sha256(
@@ -338,6 +343,7 @@ def approval_binding(
             "blueprint_id": blueprint_id,
             "project": project,
             "blueprint_sha256": blueprint_sha256,
+            "reviewed_sha256": reviewed_sha256,
             "inventory_sha256": inventory_sha256,
             "kit_snapshot_sha256": kit_snapshot_sha256,
             "source_sha": source_sha,
@@ -592,7 +598,15 @@ def item_change_request_id(blueprint_sha256: str, item_key: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"hermes-ui-blueprint:{blueprint_sha256}:{item_key}")
 
 
-def item_context(item: FanoutItem, *, blueprint_id: str, blueprint_sha256: str) -> UiChangeContext:
+def item_context(
+    item: FanoutItem,
+    *,
+    blueprint_id: str,
+    blueprint_sha256: str,
+    continued: tuple[UiContinuedSection, ...] | None = None,
+) -> UiChangeContext:
+    if continued is None:
+        continued = () if item.is_gap else render_item(item)[1]
     return UiChangeContext(
         blueprint_id=blueprint_id,
         blueprint_sha256=blueprint_sha256,
@@ -607,25 +621,32 @@ def item_context(item: FanoutItem, *, blueprint_id: str, blueprint_sha256: str) 
             )
             for key in item.blocked_by
         ),
+        continued=continued,
     )
 
 
-def _entry(value: Any, limit: int = 600) -> str:
-    text = " ".join(str(value).split())
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+def _entry(value: Any) -> str:
+    """One whitespace-normalised entry; never shortened."""
+    return " ".join(str(value).split())
 
 
-def _entries(values: list[str], limit: int = 15) -> list[str]:
-    return [entry for entry in (_entry(value) for value in values) if entry][:limit]
+def _all(values: list[Any]) -> str:
+    """Every value, comma-separated (deterministic rendering never drops one)."""
+    return ", ".join(str(value) for value in values) or "none"
 
 
 def _join(values: list[str], limit: int = 20) -> str:
+    """A summary list for the item statement only (the proposal lists every entry)."""
     shown = ", ".join(values[:limit])
     return shown + (f" and {len(values) - limit} more" if len(values) > limit else "") or "none"
 
 
+STATEMENT_MAX_BYTES = 7900
+
+
 def item_description(item: FanoutItem, *, blueprint_id: str) -> str:
-    """The bounded, human-readable item statement every drafter and reviewer works from."""
+    """The bounded, human-readable item statement (a summary: the complete requirements are
+    in the rendered proposal and its continued sections)."""
     spec = item.spec
     head = f"UI migration blueprint {blueprint_id}, item {item.key} ({item.kind}"
     head += f", wave {item.wave})." if item.wave else ")."
@@ -644,7 +665,7 @@ def item_description(item: FanoutItem, *, blueprint_id: str) -> str:
         ]
     elif item.kind == "epic":
         body = [f"Foundation epic {spec['id']} ({spec['kind']}): {spec['title']}."]
-        body += [f"Scope: {_join([_entry(s, 200) for s in spec['scope']], 10)}."]
+        body += [f"Scope: {len(spec['scope'])} entries, all listed in the proposal."]
     elif item.kind == "cutover":
         body = [
             "Cut over from apps/web-console to apps/web-console-next: "
@@ -657,14 +678,17 @@ def item_description(item: FanoutItem, *, blueprint_id: str) -> str:
     else:
         body = [
             f"{spec['type']} for {spec['target_repository']}: {spec['summary']}",
-            f"Evidence: {_join([_entry(e, 300) for e in spec['evidence']], 10)}.",
-            f"Blocks: {_join(list(spec['blocks']))}. Interim: {spec['interim'] or 'none'}.",
+            f"Evidence: {_all([_entry(e) for e in spec['evidence']])}.",
+            f"Blocks: {_all(list(spec['blocks']))}. Interim: {spec['interim'] or 'none'}.",
         ]
     if item.blocked_by:
-        body.append(f"Blocked by: {_join(list(item.blocked_by))}.")
+        body.append(f"Blocked by: {_all(list(item.blocked_by))}.")
     text = " ".join([head, *(" ".join(part.split()) for part in body)])
-    encoded = text.encode("utf-8")[:7900]
-    return encoded.decode("utf-8", errors="ignore")
+    if len(text.encode("utf-8")) <= STATEMENT_MAX_BYTES:
+        return text
+    marker = " [statement shortened; the complete item is in the proposal]"
+    budget = STATEMENT_MAX_BYTES - len(marker.encode("utf-8"))
+    return text.encode("utf-8")[:budget].decode("utf-8", errors="ignore") + marker
 
 
 def _title(text: str) -> str:
@@ -673,10 +697,56 @@ def _title(text: str) -> str:
 
 
 _EPIC_HIGH_RISK = frozenset({"console-api", "shell-navigation-auth", "csp-assets", "image-chart"})
+# The NEW-108 proposal bounds (ChangeProposal): a list that does not fit is rendered in full
+# in a "continued" section of the bound issue body instead (never silently cut).
+_PROPOSAL_LIST_FIELDS = (
+    "what_changes",
+    "out_of_scope",
+    "acceptance_criteria",
+    "risks",
+    "rollout",
+    "kill_switch",
+    "open_questions",
+)
+_PROPOSAL_MAX_ENTRIES = 15
+_PROPOSAL_MAX_ENTRY = 600
+_SCALAR_LIMITS = {"why": 3000, "risk_rationale": 1500}
 
 
 def render_item_proposal(item: FanoutItem) -> dict[str, Any]:
     """The deterministic NEW-108 proposal of an epic, page or cutover item."""
+    return render_item(item)[0]
+
+
+def render_item(item: FanoutItem) -> tuple[dict[str, Any], tuple[UiContinuedSection, ...]]:
+    """(proposal, continued sections): every requirement of the item, none dropped.
+
+    A list that fits the proposal bounds stays in the proposal; one that does not is
+    replaced by a pointer entry and rendered in full in a continued section. A scalar that
+    does not fit is a typed ITEM_RENDER_TOO_LARGE verdict, never a cut."""
+    full = _item_lists(item)
+    proposal = dict(full)
+    continued: list[UiContinuedSection] = []
+    for field_name in _PROPOSAL_LIST_FIELDS:
+        entries = [entry for entry in (_entry(value) for value in full[field_name]) if entry]
+        if len(entries) <= _PROPOSAL_MAX_ENTRIES and all(
+            len(entry) <= _PROPOSAL_MAX_ENTRY for entry in entries
+        ):
+            proposal[field_name] = entries
+            continue
+        proposal[field_name] = [
+            f"All {len(entries)} entries are listed under UI migration: {field_name} "
+            "(continued) below."
+        ]
+        continued.append(UiContinuedSection(field=field_name, entries=tuple(entries)))  # type: ignore[arg-type]
+    for field_name, limit in _SCALAR_LIMITS.items():
+        proposal[field_name] = _entry(proposal[field_name])
+        if len(proposal[field_name]) > limit:
+            raise BlueprintRejected("ITEM_RENDER_TOO_LARGE", [field_name])
+    return proposal, tuple(continued)
+
+
+def _item_lists(item: FanoutItem) -> dict[str, Any]:
     spec = item.spec
     if item.kind == "page":
         return _page_proposal(item, spec)
@@ -685,18 +755,13 @@ def render_item_proposal(item: FanoutItem) -> dict[str, Any]:
         return {
             "title": _title(f"UI u0: {spec['title']}"),
             "kind": "feature",
-            "why": _entry(
-                f"Foundation epic {spec['id']} ({spec['kind']}) of the approved UI migration "
-                "blueprint: every page migration builds on it.",
-                3000,
-            ),
-            "what_changes": _entries(list(spec["scope"])),
-            "out_of_scope": _entries(
-                [
-                    "Page migrations: one change request per page in waves u1 to u4.",
-                    "Deleting the legacy console: the u5 cutover.",
-                ]
-            ),
+            "why": f"Foundation epic {spec['id']} ({spec['kind']}) of the approved UI migration "
+            "blueprint: every page migration builds on it.",
+            "what_changes": list(spec["scope"]),
+            "out_of_scope": [
+                "Page migrations: one change request per page in waves u1 to u4.",
+                "Deleting the legacy console: the u5 cutover.",
+            ],
             "affected_repositories": [
                 {"repository": REPOSITORY_FALCONE, "role": "source"},
                 *(
@@ -705,30 +770,21 @@ def render_item_proposal(item: FanoutItem) -> dict[str, Any]:
                     else []
                 ),
             ],
-            "acceptance_criteria": _entries(list(spec["acceptance_criteria"])),
-            "risks": _entries(
-                [
-                    "The new console runs side by side; the legacy console is "
-                    "unchanged until the u5 cutover."
-                ]
-            ),
-            "rollout": _entries(
-                ["Merge behind the side-by-side /next/ path; no legacy route changes."]
-            ),
-            "kill_switch": _entries(
-                ["Stop serving /next/; the legacy console keeps serving every route."]
-            ),
+            "acceptance_criteria": list(spec["acceptance_criteria"]),
+            "risks": [
+                "The new console runs side by side; the legacy console is unchanged until "
+                "the u5 cutover."
+            ],
+            "rollout": ["Merge behind the side-by-side /next/ path; no legacy route changes."],
+            "kill_switch": ["Stop serving /next/; the legacy console keeps serving every route."],
             "open_questions": [],
             "proposed_risk": "R2" if spec["kind"] in _EPIC_HIGH_RISK else "R1",
-            "risk_rationale": _entry(
-                f"Foundation epic of kind {spec['kind']}: "
-                + (
-                    "it touches authentication, the API layer, CSP or the image and chart, "
-                    "which other pages depend on."
-                    if spec["kind"] in _EPIC_HIGH_RISK
-                    else "a bounded addition to the new console only."
-                ),
-                1500,
+            "risk_rationale": f"Foundation epic of kind {spec['kind']}: "
+            + (
+                "it touches authentication, the API layer, CSP or the image and chart, which "
+                "other pages depend on."
+                if spec["kind"] in _EPIC_HIGH_RISK
+                else "a bounded addition to the new console only."
             ),
         }
     return {
@@ -736,43 +792,34 @@ def render_item_proposal(item: FanoutItem) -> dict[str, Any]:
         "kind": "chore",
         "why": "The approved UI migration blueprint ends with a cutover once every migrated "
         "page passes its parity gate and i18n is complete in es and en.",
-        "what_changes": _entries([f"{s['action']}: {s['detail']}" for s in spec["steps"]]),
-        "out_of_scope": _entries(
-            [
-                "Any page migration or backend change: separate change "
-                "requests this cutover is blocked by."
-            ]
-        ),
+        "what_changes": [f"{s['action']}: {s['detail']}" for s in spec["steps"]],
+        "out_of_scope": [
+            "Any page migration or backend change: separate change requests this cutover is "
+            "blocked by."
+        ],
         "affected_repositories": [
             {"repository": REPOSITORY_FALCONE, "role": "source"},
             {"repository": REPOSITORY_FALCONE_CHARTS, "role": "deployment"},
         ],
-        "acceptance_criteria": _entries(
-            [
-                *spec["acceptance_criteria"],
-                f"Every one of the {len(spec['depends_on_pages'])} migrated pages has PARITY_PASS.",
-                "i18n is complete in es (default) and en.",
-            ]
-        ),
-        "risks": _entries(
-            ["Removing the legacy console is hard to reverse after the one-release grace period."]
-        ),
-        "rollout": _entries(
-            [
-                "Switch the default route, keep the legacy console for one "
-                "release, then delete it with the dead modules."
-            ]
-        ),
-        "kill_switch": _entries(
-            ["Until deletion, route the default path back to the legacy console."]
-        ),
-        "open_questions": _entries(
-            [
-                f"Gap {g['gap_id']} is {g['resolution']}: {g['reason']}"
-                for g in spec["blocking_gaps"]
-                if g["resolution"] == "DEFERRED"
-            ]
-        ),
+        "acceptance_criteria": [
+            *spec["acceptance_criteria"],
+            f"Every one of these {len(spec['depends_on_pages'])} migrated pages has "
+            f"PARITY_PASS: {_all(spec['depends_on_pages'])}.",
+            "i18n is complete in es (default) and en.",
+        ],
+        "risks": [
+            "Removing the legacy console is hard to reverse after the one-release grace period."
+        ],
+        "rollout": [
+            "Switch the default route, keep the legacy console for one release, then delete it "
+            "with the dead modules."
+        ],
+        "kill_switch": ["Until deletion, route the default path back to the legacy console."],
+        "open_questions": [
+            f"Gap {g['gap_id']} is {g['resolution']}: {g['reason']}"
+            for g in spec["blocking_gaps"]
+            if g["resolution"] == "DEFERRED"
+        ],
         "proposed_risk": "R2",
         "risk_rationale": "A cross-component switch of the default console and a deletion that "
         "is hard to reverse after the grace release.",
@@ -787,67 +834,62 @@ def _page_proposal(item: FanoutItem, page: dict[str, Any]) -> dict[str, Any]:
     states = [f"{s['state']}: {s['expected']}" for s in behaviour["states"]]
     guards = [f"{p['guard']}: {p['rule']}" for p in behaviour["permissions"]]
     validations = [f"{v['field']}: {v['rule']}" for v in behaviour["validations"]]
+    actions = [
+        f"{a['name']} ({a['trigger']}"
+        + (f", permission {a['permission']}" if a["permission"] else "")
+        + (f", endpoints {_all(a['endpoint_refs'])}" if a["endpoint_refs"] else "")
+        + ")"
+        for a in behaviour["actions"]
+    ]
     tests = list(page["legacy_tests"]["vitest"]) + list(page["legacy_tests"]["playwright_journeys"])
     what = [
         f"Build page {page['page_id']} (route {page['route'] or 'none'}) in "
         f"apps/web-console-next with template {target['template'] or 'none'} and layout "
         f"{target['layout'] or 'none'}: {target['justification']}",
-        f"Kit blocks {_join(target['blocks'])}; components {_join(target['components'])}.",
-        *([f"Wrap rather than rewrite: {_join(target['wrapped'])}."] if target["wrapped"] else []),
-        f"Preserve the actions {_join([a['name'] for a in behaviour['actions']])}.",
-        *([f"Preserve the validations {_join(validations, 10)}."] if validations else []),
-        *([f"Preserve the permission guards {_join(guards, 10)}."] if guards else []),
-        *([f"Render the states {_join(states, 10)}."] if states else []),
-        f"Keep the API calls identical: {_join(endpoints)}.",
+        f"Kit blocks {_all(target['blocks'])}; components {_all(target['components'])}.",
+        *([f"Wrap rather than rewrite: {_all(target['wrapped'])}."] if target["wrapped"] else []),
+        *([f"Preserve the actions {_all(actions)}."] if actions else []),
+        *([f"Preserve the validations {_all(validations)}."] if validations else []),
+        *([f"Preserve the permission guards {_all(guards)}."] if guards else []),
+        *([f"Render the states {_all(states)}."] if states else []),
+        f"Keep the API calls identical: {_all(endpoints)}.",
         f"i18n namespace {page['i18n']['namespace']}: {page['i18n']['string_scope']} "
         f"(about {page['i18n']['estimated_strings']} strings in es, default, and en).",
-        *([f"Port the legacy tests {_join(tests, 10)}."] if tests else []),
+        *([f"Port the legacy tests {_all(tests)}."] if tests else []),
     ]
     acceptance = [
         f"[{entry['check']}] {entry['criterion']}"
-        + (f" (fixtures: {_join(entry['fixtures'], 5)})" if entry["fixtures"] else "")
+        + (f" (fixtures: {_all(entry['fixtures'])})" if entry["fixtures"] else "")
         for entry in page["parity_acceptance"]
     ] or ["The page passes the flow C parity gate on the mocked backend."]
     return {
-        "title": _title(f"UI {item.wave}: migrate {page['page_id'][:60]} page to gntik-ui"),
+        "title": _title(f"UI {item.wave}: migrate {page['page_id']} page to gntik-ui"),
         "kind": "enhancement",
-        "why": _entry(
-            f"The approved UI migration blueprint moves the legacy console page "
-            f"{page['page_id']} to apps/web-console-next on gntik-ui ({page['disposition']}): "
-            f"{page['disposition_reason']}",
-            3000,
-        ),
-        "what_changes": _entries(what),
-        "out_of_scope": _entries(
-            [
-                "Backend changes: the backend-gap change requests this page is blocked by.",
-                "New kit components: kit-gap change requests in gntik-ai/gntik-ui.",
-                "Deleting the legacy page: the u5 cutover.",
-            ]
-        ),
+        "why": f"The approved UI migration blueprint moves the legacy console page "
+        f"{page['page_id']} to apps/web-console-next on gntik-ui ({page['disposition']}): "
+        f"{page['disposition_reason']}",
+        "what_changes": what,
+        "out_of_scope": [
+            "Backend changes: the backend-gap change requests this page is blocked by.",
+            "New kit components: kit-gap change requests in gntik-ai/gntik-ui.",
+            "Deleting the legacy page: the u5 cutover.",
+        ],
         "affected_repositories": [{"repository": REPOSITORY_FALCONE, "role": "source"}],
-        "acceptance_criteria": _entries(acceptance),
-        "risks": _entries(
-            [
-                "Behaviour drift from the legacy page; the flow C parity gate "
-                "compares both builds on identical mocked-backend fixtures."
-            ]
-        ),
-        "rollout": _entries(["Served under /next/ next to the legacy page until the u5 cutover."]),
-        "kill_switch": _entries(
-            [
-                "Keep using the legacy page; the new page is reachable only "
-                "under /next/ until the cutover."
-            ]
-        ),
+        "acceptance_criteria": acceptance,
+        "risks": [
+            "Behaviour drift from the legacy page; the flow C parity gate compares both builds "
+            "on identical mocked-backend fixtures."
+        ],
+        "rollout": ["Served under /next/ next to the legacy page until the u5 cutover."],
+        "kill_switch": [
+            "Keep using the legacy page; the new page is reachable only under /next/ until the "
+            "cutover."
+        ],
         "open_questions": [],
         "proposed_risk": "R1" if tier in {"S", "M"} else "R2",
-        "risk_rationale": _entry(
-            f"Complexity tier {tier} ({page['complexity']['page_loc']} page LOC, "
-            f"{page['complexity']['closure_loc']} closure LOC); built side by side without "
-            "changing the legacy page.",
-            1500,
-        ),
+        "risk_rationale": f"Complexity tier {tier} ({page['complexity']['page_loc']} page LOC, "
+        f"{page['complexity']['closure_loc']} closure LOC); built side by side without "
+        "changing the legacy page.",
     }
 
 

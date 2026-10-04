@@ -1368,8 +1368,9 @@ def create_app(
         limit = resolved.ui_blueprint_fanout_max_items
         max_items = min(body.max_items or limit, limit)
         try:
-            sequence = await repository.reserve_fanout(blueprint_id)
-            accepted = await service.start_ui_fanout(blueprint_id, max_items, sequence)
+            accepted, joined = await ui_fanout_start_or_join(
+                blueprint_id, max_items, service, repository
+            )
         except Exception as error:  # noqa: BLE001 - the approval stands; a replay resumes
             raise HTTPException(
                 status_code=503,
@@ -1383,8 +1384,33 @@ def create_app(
                 "workflow_id": accepted.workflow_id,
                 "run_id": accepted.run_id,
                 "max_items": max_items,
+                "joined": joined,
             },
         }
+
+    async def ui_fanout_start_or_join(
+        blueprint_id: UUID,
+        max_items: int,
+        service: ControlService,
+        repository: UiBlueprintRepository,
+    ) -> tuple[OperationAccepted, bool]:
+        """One fan-out per blueprint: join the active one, or win the claim and start.
+
+        A marker whose workflow is no longer running (it ended without clearing it) is
+        released once and the claim retried; a failed start keeps its marker, so the next
+        approval checks that workflow before anything else starts."""
+        for _ in range(2):
+            claim = await repository.claim_fanout(blueprint_id)
+            if claim["action"] == "START":
+                started = await service.start_ui_fanout(
+                    blueprint_id, max_items, str(claim["workflow_id"])
+                )
+                return started, False
+            running = await service.running_ui_fanout(str(claim["workflow_id"]))
+            if running is not None:
+                return running, True
+            await repository.release_fanout(blueprint_id, str(claim["workflow_id"]))
+        raise RuntimeError("ui fan-out claim did not settle")
 
     @app.get("/v1/change-requests", response_model=RecordList)
     async def change_request_list(

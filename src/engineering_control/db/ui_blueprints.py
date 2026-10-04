@@ -7,11 +7,11 @@ import hashlib
 import hmac
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import create_engine, select
-from sqlalchemy.engine import Engine
+from sqlalchemy import create_engine, select, update
+from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.db.models import Run, UiBlueprint
@@ -86,6 +86,8 @@ class UiBlueprintRepository:
                 evidence_json={},
                 blockers_json=[],
                 fanout_json={},
+                drafts_json=[],
+                fanout_sequence=0,
                 created_at=now,
                 updated_at=now,
             )
@@ -220,46 +222,85 @@ class UiBlueprintRepository:
         blueprint: dict[str, Any],
         rounds: list[dict[str, Any]],
     ) -> str:
-        """Keep the latest draft (never approvable while DRAFTING) for review and persist."""
+        """Append draft `draft_attempts` as a new immutable version (never overwritten)."""
         digest = blueprint_sha256(blueprint)
         with self.sessions.begin() as session:
             row = self._locked(session, blueprint_id)
             if row.status != "DRAFTING":
                 raise ValueError("ui blueprint is no longer drafting")
+            drafts = list(row.drafts_json or [])
+            if any(entry.get("attempt") == draft_attempts for entry in drafts):
+                raise ValueError("ui blueprint draft versions are immutable")
+            drafts.append(
+                {
+                    "attempt": draft_attempts,
+                    "blueprint": blueprint,
+                    "blueprint_sha256": digest,
+                    "reviewed_sha256": None,
+                }
+            )
+            row.drafts_json = drafts
             row.draft_attempts = draft_attempts
             row.review_json = {"rounds": rounds}
-            row.blueprint_json = blueprint
-            row.blueprint_sha256 = digest
         return digest
 
-    def draft_sync(self, blueprint_id: UUID) -> dict[str, Any]:
-        with self.sessions() as session:
-            row = session.get(UiBlueprint, blueprint_id)
-            if row is None:
-                raise UiBlueprintNotFoundError("ui blueprint not found")
-            if row.status != "DRAFTING" or not isinstance(row.blueprint_json, dict):
-                raise ValueError("ui blueprint has no current draft")
-            return {"blueprint": row.blueprint_json, "blueprint_sha256": row.blueprint_sha256}
+    def mark_reviewed_sync(
+        self, blueprint_id: UUID, draft_attempts: int, staged_sha256: str
+    ) -> dict[str, Any]:
+        """Bind draft version `draft_attempts` to the blueprint hash Hermes computed from
+        the exact file the reviewer read; refuse if the stored version differs from it."""
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            if row.status != "DRAFTING":
+                raise ValueError("ui blueprint is no longer drafting")
+            drafts = list(row.drafts_json or [])
+            entry = self._draft(drafts, draft_attempts)
+            digest = blueprint_sha256(entry["blueprint"])
+            if not (
+                hmac.compare_digest(digest, staged_sha256)
+                and hmac.compare_digest(str(entry.get("blueprint_sha256")), staged_sha256)
+            ):
+                raise ValueError("stored ui blueprint draft differs from the reviewed draft")
+            if entry.get("reviewed_sha256") not in {None, staged_sha256}:
+                raise ValueError("ui blueprint draft was already reviewed as other content")
+            entry["reviewed_sha256"] = staged_sha256
+            row.drafts_json = [
+                entry if item.get("attempt") == draft_attempts else item for item in drafts
+            ]
+            return {"blueprint": entry["blueprint"], "blueprint_sha256": digest}
+
+    @staticmethod
+    def _draft(drafts: list[dict[str, Any]], attempt: int) -> dict[str, Any]:
+        matches = [dict(entry) for entry in drafts if entry.get("attempt") == attempt]
+        if len(matches) != 1 or not isinstance(matches[0].get("blueprint"), dict):
+            raise ValueError("ui blueprint draft version does not exist")
+        return matches[0]
 
     def persist_candidate_sync(
         self,
         blueprint_id: UUID,
+        draft_attempts: int,
         reviewed_sha256: str,
         review_rounds: list[dict[str, Any]],
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
-        """Promote the reviewed draft to the approvable candidate under its binding."""
+        """Promote exactly the reviewed draft version to the approvable candidate."""
         with self.sessions.begin() as session:
             row = self._locked(session, blueprint_id)
             if row.status != "DRAFTING":
                 return {"status": "SUPERSEDED", "current_status": row.status}
             if not (row.source_sha and row.inventory_sha256 and row.kit_snapshot_sha256):
                 raise ValueError("ui blueprint inputs were never recorded")
-            if not isinstance(row.blueprint_json, dict):
-                raise ValueError("ui blueprint has no reviewed draft")
-            digest = blueprint_sha256(row.blueprint_json)
-            if not hmac.compare_digest(digest, reviewed_sha256) or digest != row.blueprint_sha256:
+            entry = self._draft(list(row.drafts_json or []), draft_attempts)
+            digest = blueprint_sha256(entry["blueprint"])
+            if not (
+                hmac.compare_digest(digest, reviewed_sha256)
+                and entry.get("reviewed_sha256") == reviewed_sha256
+            ):
                 raise ValueError("ui blueprint draft changed after its review")
+            row.blueprint_json = entry["blueprint"]
+            row.blueprint_sha256 = digest
+            row.reviewed_sha256 = reviewed_sha256
             row.review_json = {"rounds": review_rounds}
             row.evidence_json = {**(row.evidence_json or {}), **evidence}
             row.approval_binding_sha256 = self._binding(row)
@@ -279,14 +320,15 @@ class UiBlueprintRepository:
             for item in older:
                 item.status = "SUPERSEDED"
             session.flush()
+            blueprint = entry["blueprint"]
             return {
                 "status": "CANDIDATE",
                 "blueprint_sha256": digest,
                 "approval_binding": row.approval_binding_sha256,
                 "markdown_sha256": row.markdown_sha256,
                 "superseded": [str(item.id) for item in older],
-                "pages": len(row.blueprint_json.get("pages") or []),
-                "gaps": len(row.blueprint_json.get("gaps") or []),
+                "pages": len(blueprint.get("pages") or []),
+                "gaps": len(blueprint.get("gaps") or []),
             }
 
     def record_terminal_sync(
@@ -324,19 +366,67 @@ class UiBlueprintRepository:
                 "kit_snapshot_sha256": row.kit_snapshot_sha256,
             }
 
-    async def reserve_fanout(self, blueprint_id: UUID) -> int:
-        return await asyncio.to_thread(self.reserve_fanout_sync, blueprint_id)
+    async def claim_fanout(self, blueprint_id: UUID) -> dict[str, Any]:
+        return await asyncio.to_thread(self.claim_fanout_sync, blueprint_id)
 
-    def reserve_fanout_sync(self, blueprint_id: UUID) -> int:
-        """The next fan-out execution sequence of an APPROVED blueprint."""
-        with self.sessions.begin() as session:
-            row = self._locked(session, blueprint_id)
+    def claim_fanout_sync(self, blueprint_id: UUID) -> dict[str, Any]:
+        """At most one active fan-out per blueprint (a DB-level compare-and-set).
+
+        A new sequence is consumed only by the caller that wins the claim (START); every
+        other caller is told which fan-out is active (JOIN)."""
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            if row is None:
+                raise UiBlueprintNotFoundError("ui blueprint not found")
             if row.status != "APPROVED":
                 raise ValueError("only an APPROVED ui blueprint fans out")
-            fanout = dict(row.fanout_json or {})
-            sequence = int(fanout.get("sequence") or 0) + 1
-            row.fanout_json = {**fanout, "sequence": sequence}
-            return sequence
+            if row.active_fanout_workflow_id:
+                return {"action": "JOIN", "workflow_id": row.active_fanout_workflow_id}
+            seen = int(row.fanout_sequence or 0)
+        workflow_id = ui_fanout_workflow_id(str(blueprint_id), seen + 1)
+        with self.sessions.begin() as session:
+            claimed = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(UiBlueprint)
+                    .where(
+                        UiBlueprint.id == blueprint_id,
+                        UiBlueprint.status == "APPROVED",
+                        UiBlueprint.active_fanout_workflow_id.is_(None),
+                        UiBlueprint.fanout_sequence == seen,
+                    )
+                    .values(active_fanout_workflow_id=workflow_id, fanout_sequence=seen + 1)
+                    .execution_options(synchronize_session=False)
+                ),
+            ).rowcount
+        if claimed == 1:
+            return {"action": "START", "workflow_id": workflow_id, "sequence": seen + 1}
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            active = row.active_fanout_workflow_id if row is not None else None
+        if not active:
+            raise ValueError("ui fan-out claim raced; repeat the approval")
+        return {"action": "JOIN", "workflow_id": active}
+
+    async def release_fanout(self, blueprint_id: UUID, workflow_id: str) -> bool:
+        return await asyncio.to_thread(self.release_fanout_sync, blueprint_id, workflow_id)
+
+    def release_fanout_sync(self, blueprint_id: UUID, workflow_id: str) -> bool:
+        """Clear the active marker only if it still names this fan-out (compare-and-clear)."""
+        with self.sessions.begin() as session:
+            released = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(UiBlueprint)
+                    .where(
+                        UiBlueprint.id == blueprint_id,
+                        UiBlueprint.active_fanout_workflow_id == workflow_id,
+                    )
+                    .values(active_fanout_workflow_id=None)
+                    .execution_options(synchronize_session=False)
+                ),
+            ).rowcount
+        return bool(released == 1)
 
     def register_fanout_sync(self, blueprint_id: UUID, workflow_id: str) -> None:
         with self.sessions.begin() as session:
@@ -406,6 +496,7 @@ class UiBlueprintRepository:
             blueprint_id=str(row.id),
             project=row.project,
             blueprint_sha256=str(row.blueprint_sha256),
+            reviewed_sha256=str(row.reviewed_sha256),
             inventory_sha256=str(row.inventory_sha256),
             kit_snapshot_sha256=str(row.kit_snapshot_sha256),
             source_sha=str(row.source_sha),
@@ -416,8 +507,9 @@ class UiBlueprintRepository:
         """Tamper check: the stored blueprint and binding must recompute exactly."""
         if not isinstance(row.blueprint_json, dict) or not row.approval_binding_sha256:
             raise ValueError("stored ui blueprint is incomplete")
-        if blueprint_sha256(row.blueprint_json) != row.blueprint_sha256:
-            raise ValueError("stored ui blueprint no longer matches its hash")
+        digest = blueprint_sha256(row.blueprint_json)
+        if digest != row.blueprint_sha256 or digest != row.reviewed_sha256:
+            raise ValueError("stored ui blueprint no longer matches its reviewed hash")
         if not hmac.compare_digest(cls._binding(row), row.approval_binding_sha256):
             raise ValueError("stored ui blueprint no longer matches its approval binding")
 
@@ -492,9 +584,7 @@ class UiBlueprintRepository:
             "decided_at": cls._iso(row.decided_at),
             "decision_sequence": row.decision_sequence,
             "fanout": row.fanout_json,
-            "fanout_workflow_id": (
-                ui_fanout_workflow_id(str(row.id), int(row.fanout_json["sequence"]))
-                if (row.fanout_json or {}).get("sequence")
-                else None
-            ),
+            "fanout_workflow_id": row.active_fanout_workflow_id,
+            "fanout_sequence": row.fanout_sequence,
+            "reviewed_sha256": row.reviewed_sha256,
         }

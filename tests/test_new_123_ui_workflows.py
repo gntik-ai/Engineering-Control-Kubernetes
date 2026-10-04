@@ -40,6 +40,7 @@ from engineering_control.db import models
 from engineering_control.db.base import Base
 from engineering_control.db.change_requests import ChangeRequestRepository
 from engineering_control.db.ui_blueprints import UiBlueprintRepository
+from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.ui_blueprint import (
     APPROVAL_PHRASE,
     fanout_items,
@@ -219,7 +220,11 @@ def stage_document(payload: dict[str, Any]) -> dict[str, Any]:
         assert payload["markdown"].startswith("# UI migration blueprint: falcone")
         return {"status": "PUBLISHED", "evidence": [{"relative_path": "falcone/bp.json"}]}
     name = payload["name"]
-    return {"status": "STAGED", "document": {"path": f"/in/{name}", "sha256": "3" * 64, "bytes": 1}}
+    staged = {"path": f"/in/{name}", "sha256": "3" * 64, "bytes": 1}
+    if name.startswith("draft-"):
+        # As the scan worker does: Hermes hashes exactly what the reviewer will read.
+        staged["blueprint_sha256"] = canonical_sha256(payload["document"]["blueprint"])
+    return {"status": "STAGED", "document": staged}
 
 
 def reviewer(*decisions: str) -> Responder:
@@ -364,6 +369,40 @@ async def test_two_review_failures_block_with_the_findings(tmp_path: Path) -> No
     assert view["approve_command"] is None
 
 
+def substitute_stored_draft(harness: Harness, blueprint_id: str, attempt: int) -> None:
+    """An attacker with DB access rewrites the stored draft (and its stored hash)."""
+    changed = blueprint()
+    changed["pages"][0]["wave"] = "u3"
+    with harness.repository.sessions.begin() as session:
+        row = session.get(models.UiBlueprint, UUID(blueprint_id))
+        assert row is not None
+        row.drafts_json = [
+            {**entry, "blueprint": changed, "blueprint_sha256": canonical_sha256(changed)}
+            if entry["attempt"] == attempt
+            else entry
+            for entry in row.drafts_json
+        ]
+
+
+async def test_a_draft_substituted_during_review_never_becomes_a_candidate(
+    tmp_path: Path,
+) -> None:
+    harness, request, workflow_id = plan_harness(tmp_path)
+    approve = reviewer("APPROVE")
+
+    def review_while_substituting(payload: dict[str, Any]) -> dict[str, Any]:
+        substitute_stored_draft(harness, request.blueprint_id, 1)
+        return approve(payload)
+
+    harness.responses["ui_plan.review"] = review_while_substituting
+    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    assert (result["status"], result["error_code"]) == ("BLOCKED", "REVIEWED_DRAFT_MISMATCH")
+    assert "ui_plan.persist" not in harness.calls
+    view = harness.repository.get_sync(UUID(request.blueprint_id))
+    assert view is not None
+    assert (view["status"], view["approval_binding"]) == ("BLOCKED", None)
+
+
 async def test_a_draft_bound_to_other_inputs_is_blocked(tmp_path: Path) -> None:
     harness, request, workflow_id = plan_harness(tmp_path)
     wrong = draft_output()
@@ -392,7 +431,8 @@ def approved_blueprint(harness: Harness) -> tuple[str, str]:
         },
     )
     digest = repository.record_draft_sync(blueprint_id, 1, blueprint(), [])
-    persisted = repository.persist_candidate_sync(blueprint_id, digest, [], {})
+    repository.mark_reviewed_sync(blueprint_id, 1, digest)
+    persisted = repository.persist_candidate_sync(blueprint_id, 1, digest, [], {})
     repository.approve_sync(
         blueprint_id, persisted["approval_binding"], APPROVAL_PHRASE, "telegram:42"
     )

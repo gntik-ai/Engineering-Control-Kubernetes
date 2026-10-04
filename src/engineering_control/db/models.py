@@ -503,8 +503,12 @@ class UiBlueprint(UUIDPrimaryKey, Timestamps, Base):
     kit_image: Mapped[str | None] = mapped_column(String(300))
     draft_attempts: Mapped[int] = mapped_column(Integer, default=0)
     review_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Every draft version, immutable once recorded; the reviewed one becomes the candidate.
+    drafts_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
     blueprint_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     blueprint_sha256: Mapped[str | None] = mapped_column(String(64))
+    # Hermes's hash of the exact draft file the independent reviewer read.
+    reviewed_sha256: Mapped[str | None] = mapped_column(String(64))
     markdown_sha256: Mapped[str | None] = mapped_column(String(64))
     evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     approval_binding_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -514,6 +518,11 @@ class UiBlueprint(UUIDPrimaryKey, Timestamps, Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     decision_sequence: Mapped[int] = mapped_column(Integer, default=0)
     fanout_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # At most one active fan-out: set by compare-and-set, cleared when that fan-out ends.
+    fanout_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    active_fanout_workflow_id: Mapped[str | None] = mapped_column(
+        String(240), unique=True, index=True
+    )
     __table_args__ = (
         CheckConstraint(
             "status IN ('DRAFTING', 'BLOCKED', 'FAILED', 'CANDIDATE', 'APPROVED', 'SUPERSEDED')",

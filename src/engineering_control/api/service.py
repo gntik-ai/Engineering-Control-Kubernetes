@@ -39,7 +39,6 @@ from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.change_requests import change_request_workflow_id
 from engineering_control.engineering.models import CampaignPlan
 from engineering_control.engineering.ui_blueprint import (
-    ui_fanout_workflow_id,
     ui_plan_workflow_id,
 )
 from engineering_control.models.enums import Project
@@ -135,8 +134,9 @@ class ControlService(Protocol):
         self, blueprint_id: UUID, project: str, requested_by: str, source_sha: str | None
     ) -> OperationAccepted: ...
     async def start_ui_fanout(
-        self, blueprint_id: UUID, max_items: int, sequence: int
+        self, blueprint_id: UUID, max_items: int, workflow_id: str
     ) -> OperationAccepted: ...
+    async def running_ui_fanout(self, workflow_id: str) -> OperationAccepted | None: ...
 
 
 class TemporalControlService:
@@ -856,26 +856,30 @@ class TemporalControlService:
         )
 
     async def start_ui_fanout(
-        self, blueprint_id: UUID, max_items: int, sequence: int
+        self, blueprint_id: UUID, max_items: int, workflow_id: str
     ) -> OperationAccepted:
-        """NEW-123: start fan-out execution `sequence`, or join the previous one while it
-        still runs (one fan-out at a time). Every item is idempotent under its deterministic
-        id, so a later execution resumes with the items not yet drafted."""
-        if sequence > 1:
-            previous = ui_fanout_workflow_id(str(blueprint_id), sequence - 1)
-            try:
-                description = await self.client.get_workflow_handle(previous).describe()
-            except RPCError as error:
-                if error.status is not RPCStatusCode.NOT_FOUND:
-                    raise
-            else:
-                if description.status == WorkflowExecutionStatus.RUNNING:
-                    return OperationAccepted(workflow_id=previous, run_id=description.run_id)
+        """NEW-123: start the fan-out execution the caller claimed (the blueprint's single
+        active-fan-out marker). Every item is idempotent under its deterministic id, so a
+        later execution resumes with the items not yet drafted."""
+        if not workflow_id.startswith(f"ui-blueprint-fanout-{blueprint_id}-"):
+            raise ValueError("ui fan-out workflow id does not belong to the blueprint")
         return await self._start_once(
             WorkflowName.UI_BLUEPRINT_FANOUT.value,
             UiBlueprintFanOutInput(blueprint_id=str(blueprint_id), max_items=max_items),
-            ui_fanout_workflow_id(str(blueprint_id), sequence),
+            workflow_id,
         )
+
+    async def running_ui_fanout(self, workflow_id: str) -> OperationAccepted | None:
+        """The fan-out execution under `workflow_id` while it still runs (else None)."""
+        try:
+            description = await self.client.get_workflow_handle(workflow_id).describe()
+        except RPCError as error:
+            if error.status is RPCStatusCode.NOT_FOUND:
+                return None
+            raise
+        if description.status != WorkflowExecutionStatus.RUNNING:
+            return None
+        return OperationAccepted(workflow_id=workflow_id, run_id=description.run_id)
 
     async def _start_once(
         self, workflow: str, argument: Any, workflow_id: str

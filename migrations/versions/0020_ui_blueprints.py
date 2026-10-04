@@ -18,6 +18,7 @@ _INDEXES = {
     "ix_ui_blueprints_project": (["project"], False),
     "ix_ui_blueprints_status": (["status"], False),
     "ix_ui_blueprints_approval_binding_sha256": (["approval_binding_sha256"], False),
+    "ix_ui_blueprints_active_fanout_workflow_id": (["active_fanout_workflow_id"], True),
 }
 _COLUMNS = {
     "id",
@@ -34,8 +35,10 @@ _COLUMNS = {
     "kit_image",
     "draft_attempts",
     "review_json",
+    "drafts_json",
     "blueprint_json",
     "blueprint_sha256",
+    "reviewed_sha256",
     "markdown_sha256",
     "evidence_json",
     "approval_binding_sha256",
@@ -45,6 +48,8 @@ _COLUMNS = {
     "decided_at",
     "decision_sequence",
     "fanout_json",
+    "fanout_sequence",
+    "active_fanout_workflow_id",
     "created_at",
     "updated_at",
 }
@@ -92,8 +97,10 @@ def upgrade() -> None:
         sa.Column("kit_image", sa.String(300), nullable=True),
         sa.Column("draft_attempts", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("review_json", sa.JSON(), nullable=False),
+        sa.Column("drafts_json", sa.JSON(), nullable=False),
         sa.Column("blueprint_json", sa.JSON(), nullable=True),
         sa.Column("blueprint_sha256", sa.String(64), nullable=True),
+        sa.Column("reviewed_sha256", sa.String(64), nullable=True),
         sa.Column("markdown_sha256", sa.String(64), nullable=True),
         sa.Column("evidence_json", sa.JSON(), nullable=False),
         sa.Column("approval_binding_sha256", sa.String(64), nullable=True),
@@ -103,6 +110,8 @@ def upgrade() -> None:
         sa.Column("decided_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("decision_sequence", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("fanout_json", sa.JSON(), nullable=False),
+        sa.Column("fanout_sequence", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("active_fanout_workflow_id", sa.String(240), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(

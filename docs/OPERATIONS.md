@@ -260,26 +260,35 @@ The steps are:
 2. A read-only snapshot of main (`project.snapshot`), then `ui.inventory` and `ui.kit_snapshot`
    on the scan worker. A kit snapshot that is `BLOCKED UI_MCP_UNAVAILABLE` stops the run with
    that blocker; nothing is drafted without kit data.
-3. `ui_plan.stage_inputs` copies the hash-verified inventory and kit JSON into
-   `/srv/engineering/worktrees/ui-plan-inputs/<id>/`, which only the model workers can read.
+3. `ui_plan.stage_inputs` recomputes the inventory and kit snapshot hashes from their content
+   and copies them into `/srv/engineering/worktrees/ui-plan-inputs/<id>/`, which only the
+   model workers can read. `bootstrap-worker.sh` provisions that root (scan-runner 0700 with a
+   traverse ACL for codex-runner and claude-runner); without it the run is `BLOCKED
+   UI_PLAN_INPUT_DIRECTORY_MISSING`.
 4. Claude drafts the blueprint (`ui-migration-architect`, `plan-ui-migration` in draft mode,
    high effort, Read/Glob/Grep only). Codex reviews it with the same skill in review mode. A
    `REVISE` verdict gets one Claude redraft and a second review. A second `REVISE` ends
    `BLOCKED BLUEPRINT_REVIEW_UNRESOLVED` with the findings.
-5. The approved draft is published as evidence (JSON and Markdown) and stored as a `CANDIDATE`.
-   Its approval binding is the sha256 of the blueprint id, the canonical blueprint hash, the
-   inventory and kit snapshot hashes and the source SHA. A newer candidate for the project
+5. Every draft is an immutable version. Hermes hashes the exact draft file the reviewer read,
+   and only that version, unchanged, is published as evidence (JSON and Markdown) and stored as
+   a `CANDIDATE` (otherwise `BLOCKED REVIEWED_DRAFT_MISMATCH`). Its approval binding is the
+   sha256 of the blueprint id, the canonical blueprint hash, the reviewed hash, the inventory
+   and kit snapshot hashes and the source SHA. A newer candidate for the project
    supersedes an older, unapproved one. Telegram gets "UI blueprint ready for approval".
 
 Approval accepts only the CLI operator and allowlisted `telegram:<id>` actors. It then starts
-`UiBlueprintFanOutWorkflow` (`ui-blueprint-fanout-<id>-<n>`, a new `<n>` for each approval or
-replay; a replay joins a fan-out that is still running). The fan-out creates one change-request
+`UiBlueprintFanOutWorkflow` (`ui-blueprint-fanout-<id>-<n>`). A blueprint has at most one
+active fan-out (a compare-and-set marker in its row): a replay while it runs joins it, and only
+a replay after it ended consumes the next `<n>`. The fan-out creates one change-request
 draft for each foundation epic, page (u1 to u4), the u5 cutover and each gap. The id of each
 draft is derived from the blueprint hash and the item key.
 
 - Gaps are drafted by Claude with `triage-ui-gap`. Epics, pages and the cutover are rendered
   deterministically.
 - Codex reviews every draft, as in NEW-108.
+- Epic, page and cutover lists are rendered in full: a list beyond the proposal bounds goes to
+  a `UI migration: <field> (continued)` section of the bound body. An item whose body cannot
+  fit an issue fails with `RENDERED_BODY_TOO_LARGE`; no entry is ever dropped.
 - The issue body gains a `## UI migration` section with the labels (`ui-migration`, `wave:uN`
   and the item kind) and the `blocked by` change requests: a page is blocked by its backend gaps.
 - Kit gaps target `gntik-ai/gntik-ui`. The Hermes GitHub worker never searches or writes that
