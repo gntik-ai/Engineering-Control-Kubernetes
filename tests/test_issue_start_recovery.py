@@ -17,6 +17,9 @@ from engineering_control.db.models import (
     NotificationOutbox,
     OperationRequest,
 )
+
+# NEW-127: the fixture's child registration emits its own delivery-started milestone.
+from engineering_control.delivery_notifications import MILESTONE_TOPIC
 from engineering_control.operations.issue_start import ISSUE_START_UNCONFIRMED, issue_workflow_id
 from engineering_control.operations.models import parse_command
 from engineering_control.operations.service import TypedCommandBus, operation_dispatch_loop
@@ -79,7 +82,9 @@ async def test_lost_issue_start_reply_preserves_one_active_owner(tmp_path):
         assert client.start_workflow.await_count == 1
         client.get_workflow_handle.return_value.describe.assert_awaited_once()
         with operations.sessions() as session:
-            notices = session.scalars(select(NotificationOutbox)).all()
+            notices = session.scalars(
+                select(NotificationOutbox).where(NotificationOutbox.topic != MILESTONE_TOPIC)
+            ).all()
             assert len(notices) == 1 and notices[0].payload_json["phase"] == "LINKED"
             events = session.scalars(
                 select(DashboardEvent).where(DashboardEvent.entity_id == str(first.operation_id))
@@ -143,7 +148,9 @@ async def test_unverifiable_history_never_restarts_or_releases_issue(tmp_path, c
         assert current.safe_error == ISSUE_START_UNCONFIRMED
         client.start_workflow.assert_not_awaited()
         with operations.sessions() as session:
-            assert not session.scalars(select(NotificationOutbox)).all()
+            assert not session.scalars(
+                select(NotificationOutbox).where(NotificationOutbox.topic != MILESTONE_TOPIC)
+            ).all()
             assert (
                 len(
                     session.scalars(
@@ -221,7 +228,9 @@ async def test_changed_attempt_binding_during_observation_is_not_recorded(tmp_pa
         current = await operations.operation(request.issue_operation_id)
         assert current.status == "DISPATCHING" and current.workflow_id is None
         with operations.sessions() as session:
-            assert not session.scalars(select(NotificationOutbox)).all()
+            assert not session.scalars(
+                select(NotificationOutbox).where(NotificationOutbox.topic != MILESTONE_TOPIC)
+            ).all()
     finally:
         _dispose(values)
 

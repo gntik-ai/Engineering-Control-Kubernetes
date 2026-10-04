@@ -21,6 +21,7 @@ from engineering_control.db.models import (
     ChangeSet,
     ComponentLease,
     Issue,
+    NotificationOutbox,
     Run,
     WorktreeLease,
 )
@@ -272,6 +273,15 @@ async def test_publication_persists_both_prs_and_releases_implementation_leases(
         assert change_set.deployment_pr_url == results[1]["pr_url"]
         assert run is not None and run.status == "SUCCESS"
         assert lease is not None and lease.released_at is not None
+        # NEW-127: one "PRs published" milestone with both URLs, even on a retry.
+        (published,) = session.scalars(select(NotificationOutbox)).all()
+    assert published.topic == "telegram.engineering-delivery-milestone"
+    assert published.payload_json["event"] == "PRS_PUBLISHED"
+    assert published.payload_json["pull_requests"] == [
+        "https://github.com/gntik-ai/falcone/pull/1",
+        "https://github.com/gntik-ai/falcone-charts/pull/2",
+    ]
+    assert "falcone-charts/pull/2" in published.payload_json["message"]
 
 
 @pytest.mark.asyncio

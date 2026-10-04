@@ -16,6 +16,12 @@ from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.db.runtime_binding import _current_identity, new_bound_run
+from engineering_control.delivery_notifications import (
+    attempt_label,
+    enqueue_loop_state,
+    enqueue_milestone,
+    issue_for_finding,
+)
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BACKLOG_PROJECT_PAIRS,
@@ -2025,6 +2031,8 @@ class EngineeringActivityHandler:
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
+            # NEW-127: the state before this record decides whether it is a transition.
+            previous_status: str | None = campaign.status
             if isinstance(run_workflow_id, str) and run_workflow_id:
                 # NEW-16: the top-level loop run must reach a terminal Run.status
                 # here (whichever branch below returns) so OperationsRepository's
@@ -2033,6 +2041,7 @@ class EngineeringActivityHandler:
                 # forever and permanently blocks every future attempt.
                 run = session.scalar(select(db.Run).where(db.Run.workflow_id == run_workflow_id))
                 if run is not None:
+                    previous_status = run.status
                     run.status = status
                     # NEW-33b: a paused loop is still alive; only terminal states finish it.
                     run.finished_at = (
@@ -2088,6 +2097,7 @@ class EngineeringActivityHandler:
                     or global_campaign.id not in linked_global_ids
                 ):
                     raise ValueError("global child backlog binding is invalid")
+                self._enqueue_loop_state(session, payload, status, previous_status, completion)
                 return self._envelope(
                     "backlog.record_loop_state",
                     {**payload, "inventory_status_preserved": campaign.status},
@@ -2110,9 +2120,23 @@ class EngineeringActivityHandler:
                 }
             if completion is not None and not already_notified:
                 self._enqueue_nothing_delivered(session, payload)
+            self._enqueue_loop_state(session, payload, status, previous_status, completion)
         if deactivation is not None:
             self._write_policy_request(deactivation)
         return self._envelope("backlog.record_loop_state", payload, status)
+
+    @staticmethod
+    def _enqueue_loop_state(
+        session: Any,
+        payload: dict[str, Any],
+        status: str,
+        previous_status: str | None,
+        completion: Any,
+    ) -> None:
+        """NEW-127: tell the operator about every loop-state transition (once)."""
+        if completion is not None:
+            return  # NEW-114's nothing-delivered notification already reports it.
+        enqueue_loop_state(session, payload, status=status, previous=previous_status)
 
     @staticmethod
     def _nothing_delivered_summary(payload: dict[str, Any]) -> str:
@@ -2287,6 +2311,28 @@ class EngineeringActivityHandler:
             identifier = ci_repair_authorization_id(loop.id, change_set_id, ordinal, repair_round)
             existing = session.get(db.Step, identifier)
             if existing is None:
+                # NEW-127: tell the operator a CI-repair round starts and which checks fail.
+                failing = gitops.get("ci_regressions") if isinstance(gitops, dict) else None
+                checks = (
+                    [str(name)[:120] for name in failing[:8]] if isinstance(failing, list) else []
+                )
+                target = gitops.get("ci_regression_target") if isinstance(gitops, dict) else None
+                enqueue_milestone(
+                    session,
+                    event="CI_REPAIR_STARTED",
+                    dedupe_key=str(identifier),
+                    project=change_set.project if change_set is not None else None,
+                    issue=issue_for_finding(session, change_set.finding_id, campaign_id)
+                    if change_set is not None
+                    else None,
+                    workflow_id=workflow_id,
+                    detail=(
+                        f"round {repair_round} for {regression}"
+                        + (f" on the {target} PR" if target in {"source", "deployment"} else "")
+                        + (f"; failing checks: {', '.join(checks)}" if checks else "")
+                    ),
+                    extra={"repair_round": repair_round, "failing_checks": checks},
+                )
                 session.add(
                     db.Step(
                         id=identifier,
@@ -2490,6 +2536,19 @@ class EngineeringActivityHandler:
                 if child_kind == "issue-delivery"
                 else None
             )
+            if child_kind == "issue-delivery":
+                # NEW-127: one "delivery started (attempt N)" per delivery child.
+                enqueue_milestone(
+                    session,
+                    event="DELIVERY_STARTED",
+                    dedupe_key=child_workflow_id,
+                    project=finding.project,
+                    issue=issue_for_finding(
+                        session, finding.id, payload.get("backlog_campaign_id")
+                    ),
+                    workflow_id=child_workflow_id,
+                    detail=attempt_label(child_workflow_id),
+                )
             return self._envelope(
                 "backlog.register_child_run",
                 {

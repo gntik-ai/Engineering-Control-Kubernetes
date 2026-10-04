@@ -47,6 +47,7 @@ from engineering_control.adapters.github.client import (
 )
 from engineering_control.config import Settings
 from engineering_control.db import models as db
+from engineering_control.delivery_notifications import enqueue_milestone, explain_blocker
 from engineering_control.engineering.models import ProjectManifest
 from engineering_control.models.enums import ChangeSetState
 from engineering_control.models.reconciliation import StagingFlowPolicy
@@ -841,7 +842,75 @@ class GitOpsControllerHandler:
                     run.error_code = None if outcome == "STAGING_VERIFIED" else str(blocker)
                     run.finished_at = datetime.now(UTC)
             state = change_set.state
+            if not stale:
+                self._notify_result(session, plan, record, outcome, workflow_id)
         return {"status": "PERSISTED", "outcome": outcome, "change_set_state": state}
+
+    def _notify_result(
+        self,
+        session: Any,
+        plan: StagingGitOpsPlan,
+        record: dict[str, Any],
+        outcome: str,
+        workflow_id: str,
+    ) -> None:
+        """NEW-127: PRs merged, STAGING_VERIFIED or a staging blocker, once each."""
+        issue = f"{plan.issue_repository}#{plan.issue_number}" if plan.issue_number else None
+        common: dict[str, Any] = {
+            "project": plan.project,
+            "issue": issue,
+            "workflow_id": workflow_id or None,
+            "redactor": self.redactor,
+        }
+        merge_sha = record.get("merge_sha")
+        deployment_sha = record.get("deployment_merge_sha")
+        if merge_sha:
+            merged = [f"{plan.source_pr_url} at {str(merge_sha)[:12]}"]
+            if plan.deployment_pr_url and deployment_sha:
+                merged.append(f"{plan.deployment_pr_url} at {str(deployment_sha)[:12]}")
+            enqueue_milestone(
+                session,
+                event="PRS_MERGED",
+                dedupe_key=f"{plan.change_set_id}:{merge_sha}:{deployment_sha or ''}",
+                detail=" and ".join(merged),
+                extra={"merge_sha": merge_sha, "deployment_merge_sha": deployment_sha},
+                **common,
+            )
+        if outcome == "STAGING_VERIFIED":
+            enqueue_milestone(
+                session,
+                event="STAGING_VERIFIED",
+                dedupe_key=f"{plan.change_set_id}:{merge_sha or ''}",
+                detail=(
+                    "staging runs the merged change"
+                    + (f" (image {record['image_tag']})" if record.get("image_tag") else "")
+                    + (
+                        f", Argo revision {record['argo_revision']}"
+                        if record.get("argo_revision")
+                        else ""
+                    )
+                ),
+                **common,
+            )
+        elif outcome == "BLOCKED":
+            blocker = str(record.get("blocker") or "STAGING_GITOPS_FAILED")
+            checks = list(record.get("ci_regressions") or [])[:8]
+            enqueue_milestone(
+                session,
+                event="STAGING_BLOCKED",
+                dedupe_key=f"{plan.change_set_id}:{workflow_id}:{blocker}",
+                detail=(
+                    f"{blocker} - {explain_blocker(blocker)}"
+                    + (
+                        f"; failing checks on the {record.get('ci_regression_target')} PR: "
+                        + ", ".join(str(check)[:120] for check in checks)
+                        if checks
+                        else ""
+                    )
+                ),
+                extra={"blocker": blocker, "failing_checks": checks},
+                **common,
+            )
 
     # -- kubectl -------------------------------------------------------------------
 
