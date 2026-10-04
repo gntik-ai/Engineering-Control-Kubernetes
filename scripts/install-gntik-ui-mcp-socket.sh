@@ -297,7 +297,33 @@ pull_image() {
   docker_service pull --quiet "$REFERENCE" >/dev/null || die "pulling $REFERENCE failed"
   digests=$(docker_service image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
     "$REFERENCE") || die "$REFERENCE is not present on the local daemon"
-  grep -Fqx -- "$REFERENCE" <<<"$digests" || die "the local image does not carry $REFERENCE"
+  local wanted line
+  wanted=$(normalize_reference "$REFERENCE")
+  while IFS= read -r line; do
+    [[ -n $line && $(normalize_reference "$line") == "$wanted" ]] && return 0
+  done <<<"$digests"
+  die "the local image does not carry $REFERENCE"
+}
+
+normalize_reference() {
+  # Docker reports RepoDigests in familiar form (docker.io/library/x -> x,
+  # docker.io/team/x -> team/x); compare fully qualified names.
+  local ref=$1 name digest
+  name=${ref%@*}
+  digest=${ref##*@}
+  case "$name" in
+    */*/*) ;;                                   # registry/namespace/repo
+    */*)
+      if [[ ${name%%/*} == *.* || ${name%%/*} == *:* || ${name%%/*} == localhost ]]; then
+        :                                       # registry/repo
+      else
+        name="docker.io/$name"                  # namespace/repo on Docker Hub
+      fi
+      ;;
+    *) name="docker.io/library/$name" ;;        # an official Docker Hub image
+  esac
+  name=${name/#index.docker.io\//docker.io/}
+  printf '%s@%s\n' "${name,,}" "$digest"
 }
 
 uninstall() {

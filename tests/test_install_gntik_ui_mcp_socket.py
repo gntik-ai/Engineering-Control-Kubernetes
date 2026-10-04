@@ -299,3 +299,28 @@ def test_units_are_verified_before_systemd_reloads_them() -> None:
     assert main.index('ensure_root_dir "$DOCKER_CONFIG_DIR" 0700') < pull < installs
     assert installs < verify < reload
     assert '"$DOCKER" pull' not in text and "docker_service pull" in text
+
+
+def test_installer_normalizes_docker_hub_references_before_comparing_digests() -> None:
+    # Docker reports RepoDigests in familiar form (docker.io/team/x -> team/x).
+    probe = (
+        f'source <(sed -n "/^normalize_reference()/,/^}}/p" {SCRIPT}); '
+        'for r in "$@"; do normalize_reference "$r"; done'
+    )
+    refs = [
+        "docker.io/team/x@sha256:ab",
+        "team/x@sha256:ab",
+        "x@sha256:ab",
+        "index.docker.io/library/x@sha256:ab",
+        "ghcr.io/gntik-ai/gntik-ui-mcp@sha256:ab",
+    ]
+    result = subprocess.run(  # noqa: S603 - the fixed interpreter and script
+        [BASH, "-c", probe, "probe", *refs], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.split() == [
+        "docker.io/team/x@sha256:ab",
+        "docker.io/team/x@sha256:ab",
+        "docker.io/library/x@sha256:ab",
+        "docker.io/library/x@sha256:ab",
+        "ghcr.io/gntik-ai/gntik-ui-mcp@sha256:ab",
+    ]
