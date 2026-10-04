@@ -97,6 +97,10 @@ class ControlledWorkflow:
         self._ignored_signals: list[dict[str, str]] = []
         # NEW-114: why the last free-slot refill selected nothing (selection refused).
         self._refill_blocker: str | None = None
+        # NEW-127: the issue a backlog loop works on, named in its loop-state notices.
+        self._loop_issue: str | None = None
+        # NEW-127: whether this backlog loop registered its own Run (state only).
+        self._loop_register_run = False
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -152,6 +156,10 @@ class ControlledWorkflow:
             "ignored_signals": list(self._ignored_signals),
         }
 
+    def _loop_state_issue_patched(self) -> bool:
+        # NEW-127: histories recorded before this marker keep their activity input.
+        return workflow.patched("backlog-loop-state-issue-v1")
+
     def _note_ignored_signal(self, signal: str, value: str | None, awaited: str) -> None:
         """NEW-114: record (never act on) a signal naming an issue the loop does not await.
 
@@ -174,6 +182,14 @@ class ControlledWorkflow:
         timeout_minutes: int = 30,
         retry_policy: RetryPolicy = ACTIVITY_RETRY,
     ) -> dict[str, Any]:
+        if (
+            step == "backlog.record_loop_state"
+            and self._loop_issue is not None
+            and "issue" not in payload
+            and self._loop_state_issue_patched()
+        ):
+            # NEW-127: the loop-state notification names the issue (and its commands).
+            payload = {**payload, "issue": self._loop_issue}
         result = await workflow.execute_activity(
             "execute_control_step",
             {"step": step, "payload": payload},
@@ -2477,6 +2493,11 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
 
     _MERGE_ROUNDS = 20
     _REMEDIATION_ROUNDS = 3
+
+    def _notify_merged_patched(self) -> bool:
+        # NEW-127: histories recorded before this marker have no notify_merged step.
+        return workflow.patched("gitops-notify-merged-v1")
+
     # NEW-113: Argo CD sync remediation bounds (mirrored by activities/gitops.py).
     _SYNC_REMEDIATION_ROUNDS = 3
     _TRANSIENT_RESYNCS = 3
@@ -2627,6 +2648,12 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 return self._blocked(merged, "PROTECTED_MERGE_FAILED")
             key = "merge_sha" if target == "source" else "deployment_merge_sha"
             evidence[key] = str(merged.get("merge_sha", ""))
+            if self._notify_merged_patched():
+                # NEW-127: announce each merge now, not after hours of CI/image/Argo waits.
+                await self._step(
+                    "gitops.notify_merged",
+                    {**base, "target": target, "merge_sha": evidence[key]},
+                )
         merge_sha = evidence["merge_sha"]
         merged_base = {**base, "merge_sha": merge_sha}
 
@@ -3275,6 +3302,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         final_closure_enabled = workflow.patched("existing-backlog-final-closure-v1")
         global_child_blocker_return = workflow.patched("global-backlog-child-blocker-return-v1")
         register_run = workflow.patched("existing-backlog-register-run-v1")
+        self._loop_register_run = register_run
         context = await self._step("backlog.load_execution", _backlog_execution_payload(request))
         if context.get("status") == "BLOCKED":
             if register_run and self._blocked_start_closes_run_patched():
@@ -3359,6 +3387,8 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         for ordinal, item in enumerate(raw_items, start=1):
             if not isinstance(item, dict):
                 raise TypeError("existing backlog issue must be an object")
+            # NEW-127: workflow state only (no command); read by _step for loop-state notices.
+            self._loop_issue = f"{item.get('repository')}#{item.get('issue_number')}"
             continue_to_next_issue = False
             gate_skipped = False
             revalidation_round = 0
@@ -4424,11 +4454,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             self._phase = "STOPPED_AFTER_CURRENT"
             await self._step(
                 "backlog.record_loop_state",
-                {
-                    **_backlog_execution_payload(request),
-                    "loop_status": "STOPPED",
-                    "control_state": "STOPPED_AFTER_CURRENT",
-                },
+                self._boundary_state(
+                    request,
+                    {"loop_status": "STOPPED", "control_state": "STOPPED_AFTER_CURRENT"},
+                ),
             )
             return {"status": "STOPPED", "results": results}
         if not self._pause_after_current:
@@ -4438,20 +4467,36 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         self._phase = "PAUSED_AFTER_CURRENT"
         await self._step(
             "backlog.record_loop_state",
-            {
-                **_backlog_execution_payload(request),
-                "loop_status": "PAUSED",
-                "control_state": "PAUSED_AFTER_CURRENT",
-            },
+            self._boundary_state(
+                request, {"loop_status": "PAUSED", "control_state": "PAUSED_AFTER_CURRENT"}
+            ),
         )
         await workflow.wait_condition(lambda: not self._paused or self._cancelled)
         if not self._cancelled:
+            if self._boundary_records_run_patched():
+                # NEW-127: the resume is a transition the operator and watchdog must see.
+                await self._step(
+                    "backlog.record_loop_state",
+                    self._boundary_state(request, {"loop_status": "RUNNING"}),
+                )
             return None
         await self._step(
             "backlog.record_loop_state",
-            {**_backlog_execution_payload(request), "loop_status": "CANCELLED"},
+            self._boundary_state(request, {"loop_status": "CANCELLED"}),
         )
         return {"status": "CANCELLED", "results": results}
+
+    def _boundary_records_run_patched(self) -> bool:
+        # NEW-127: boundary states name the loop Run (finalizing it) and record resumes.
+        return workflow.patched("existing-backlog-boundary-records-run-v1")
+
+    def _boundary_state(
+        self, request: ExistingGitHubBacklogLoopInput, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        payload = {**_backlog_execution_payload(request), **state}
+        if self._loop_register_run and self._boundary_records_run_patched():
+            payload["workflow_id"] = workflow.info().workflow_id
+        return payload
 
     async def _loop_step(
         self,

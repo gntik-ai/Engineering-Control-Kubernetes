@@ -57,6 +57,14 @@ from engineering_control.db.models import (
     WorktreeLease,
 )
 from engineering_control.db.runtime_binding import new_bound_run
+from engineering_control.delivery_notifications import (
+    attempt_label,
+    checker_verdict,
+    enqueue_milestone,
+    explain_blocker,
+    issue_for_finding,
+    maker_failures,
+)
 from engineering_control.engineering.backlog import (
     BACKLOG_APPROVAL_PHRASE,
     BacklogApprovalBinding,
@@ -2914,6 +2922,7 @@ class MetadataActivityHandler:
                 run.error_code = "ISSUE_BODY_CHANGED_SINCE_APPROVAL"
                 run.finished_at = datetime.now(UTC)
             if run is not None:
+                self._notify_delivery_blocked(session, run, payload)
                 self._release_implementation_leases(session, run)
                 # NEW-32: worktree leases (8h) were never released on these stop
                 # paths, so every retry or correction attempt of the same ChangeSet
@@ -2942,6 +2951,39 @@ class MetadataActivityHandler:
                     ).all():
                         lease.released_at = now
         return {**payload, "status": "LEASES_RELEASED"}
+
+    _DELIVERY_STOP_STATUSES = frozenset(
+        {"BLOCKED", "FAILED", "TIMED_OUT", "RATE_LIMITED", "REQUEST_CHANGES"}
+    )
+
+    def _notify_delivery_blocked(self, session: Any, run: Run, payload: dict[str, Any]) -> None:
+        """NEW-127: one message per stopped delivery attempt, with the blocker detail."""
+        status = str(payload.get("status") or "")
+        if status not in self._DELIVERY_STOP_STATUSES:
+            return
+        blocker = str(payload.get("blocker") or status)
+        blocker = blocker if re.fullmatch(r"[A-Z][A-Z0-9_:]{0,119}", blocker) else status
+        details = [f"{status} {blocker} - {explain_blocker(blocker)}"]
+        last_step = str(payload.get("last_step") or "")
+        if re.fullmatch(r"[a-z_]{1,40}\.[a-z_]{1,60}", last_step):
+            details.append(f"at {last_step}")
+        failed = maker_failures(payload)
+        if failed:
+            details.append("maker FAIL: " + "; ".join(failed))
+        if blocker in {"MAKER_TEST_FAILURE", "INDEPENDENT_CHECKER_DID_NOT_PASS"}:
+            verdict = checker_verdict(payload)
+            if verdict:
+                details.append(f"checker: {verdict}")
+        enqueue_milestone(
+            session,
+            event="DELIVERY_BLOCKED",
+            dedupe_key=f"{run.id}:{status}:{blocker}",
+            project=run.project,
+            issue=issue_for_finding(session, payload.get("finding_id")),
+            workflow_id=run.workflow_id,
+            detail=f"{attempt_label(run.workflow_id)}: " + "; ".join(details),
+            extra={"blocker": blocker, "delivery_status": status, "maker_failures": failed},
+        )
 
     def _route_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
         risk = RiskClass(str(payload["risk_class"]))
@@ -4170,6 +4212,24 @@ class MetadataActivityHandler:
             )
             run.finished_at = datetime.now(UTC)
             self._release_implementation_leases(session, run)
+            # NEW-127: the operator learns the PR URLs as soon as they exist.
+            urls = [str(source["pr_url"])] + (
+                [str(deployment["pr_url"])] if deployment is not None else []
+            )
+            enqueue_milestone(
+                session,
+                event="PRS_PUBLISHED",
+                dedupe_key=(
+                    f"{change_set.id}:{change_set.source_head_sha}:"
+                    f"{change_set.deployment_head_sha if deployment is not None else ''}"
+                ),
+                project=change_set.project,
+                issue=issue_for_finding(session, change_set.finding_id),
+                workflow_id=run.workflow_id,
+                detail=" ".join(urls)
+                + ("" if deployment is not None else " (deployment PR waits for the image)"),
+                extra={"pull_requests": urls},
+            )
         return {
             **payload,
             "status": "SOURCE_PR",
