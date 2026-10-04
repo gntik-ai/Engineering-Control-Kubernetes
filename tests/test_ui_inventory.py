@@ -19,8 +19,8 @@ from engineering_control.cli import _ui_inventory_command
 from engineering_control.config import Settings
 from engineering_control.engineering.models import ProjectManifest, UiMigrationPolicy
 from engineering_control.engineering.ui_inventory import (
-    ANY_METHOD,
     SCHEMA_VERSION,
+    UNKNOWN_METHOD,
     EndpointUse,
     InventoryError,
     build_inventory,
@@ -227,8 +227,8 @@ export function legacy(id: string) {
     )
     assert uses == {
         ("POST", "/v1/plans"),
-        (ANY_METHOD, "/v1/plans/{}"),
-        (ANY_METHOD, "/v1/workspaces/docs"),
+        (UNKNOWN_METHOD, "/v1/plans/{}"),
+        (UNKNOWN_METHOD, "/v1/workspaces/docs"),
         ("GET", "/v1/tenants/{}"),
     }
 
@@ -504,3 +504,117 @@ def test_endpoint_use_orders_deterministically() -> None:
         EndpointUse("GET", "/v1/a"),
         EndpointUse("POST", "/v1/a"),
     ]
+
+
+# -- review fixes: symlink containment and top-level method extraction -----------------
+
+
+def test_a_src_directory_symlink_outside_the_checkout_is_refused(tmp_path: Path) -> None:
+    copy = tmp_path / "checkout"
+    shutil.copytree(FIXTURE, copy)
+    outside = tmp_path / "outside-src"
+    shutil.move(copy / "apps/web-console/src", outside)
+    (copy / "apps/web-console/src").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(InventoryError, match="escaped"):
+        _inventory(copy)
+    (copy / "apps/web-console/src").unlink()
+    (copy / "apps/web-console").rename(tmp_path / "outside-app")
+    (copy / "apps/web-console").symlink_to(tmp_path / "outside-app", target_is_directory=True)
+    with pytest.raises(InventoryError, match="escaped"):
+        _inventory(copy)
+
+
+def test_nested_directory_and_file_symlinks_are_skipped_and_recorded(tmp_path: Path) -> None:
+    copy = tmp_path / "checkout"
+    shutil.copytree(FIXTURE, copy)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    leaked = "export const leak = () => requestJson('/v1/secret')\n"
+    (outside / "leak.ts").write_text(leaked, encoding="utf-8")
+    (outside / "Leak.tsx").write_text("export function Leak() { return null }\n", "utf-8")
+    (outside / "leak.e2e.ts").write_text("page.goto('/console/backups')\n", "utf-8")
+    src = copy / "apps/web-console/src"
+    (src / "services/linked").symlink_to(outside, target_is_directory=True)
+    (src / "pages/Leak.tsx").symlink_to(outside / "Leak.tsx")
+    (copy / "apps/web-console/e2e/leak.e2e.ts").symlink_to(outside / "leak.e2e.ts")
+    # Even a symlink to a file inside the checkout is not followed.
+    (src / "pages/Alias.tsx").symlink_to(src / "pages/WelcomePage.tsx")
+    document = _inventory(copy)
+    assert document["skipped_symlinks"] == [
+        "apps/web-console/e2e/leak.e2e.ts",
+        "apps/web-console/src/pages/Alias.tsx",
+        "apps/web-console/src/pages/Leak.tsx",
+        "apps/web-console/src/services/linked",
+    ]
+    assert document["summary"]["skipped_symlinks"] == 4
+    assert not any(item["path"] == "/v1/secret" for item in document["endpoints"])
+    assert {page["component"] for page in document["pages"]} == {
+        "BackupsPage",
+        "LoginPage",
+        "OrphanPage",
+        "PlanDetailPage",
+        "PlansPage",
+        "WelcomePage",
+    }
+    backups = next(page for page in document["pages"] if page["component"] == "BackupsPage")
+    assert backups["tests"]["playwright"] == []
+    assert _inventory()["skipped_symlinks"] == []
+
+
+@pytest.mark.parametrize(
+    ("snippet", "method"),
+    [
+        ("const opts = { method: 'POST' }\nfetch('/v1/x', opts)", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { body: { method: 'DELETE' } })", "GET"),
+        ("requestJson('/v1/x', { headers: h, body: { method: 'DELETE' } })", "GET"),
+        ("requestJson('/v1/x', { ...base })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { ...base, method: 'PUT' })", "PUT"),
+        ("requestJson('/v1/x', { method })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: verb })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { 'method': 'PATCH' })", "PATCH"),
+        ("requestJson('/v1/x', { method: 'POST' } as const)", "POST"),
+        ("requestJson('/v1/x', buildOptions('POST'))", UNKNOWN_METHOD),
+        ("requestJson('/v1/x')", "GET"),
+        # spreads: a later spread can override the method; an earlier one cannot
+        ("requestJson('/v1/x', { method: 'GET', ...opts })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { ...opts, method: 'DELETE' })", "DELETE"),
+        # computed keys may name `method`
+        ("requestJson('/v1/x', { ['method']: 'DELETE' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { [key]: 'DELETE', body })", UNKNOWN_METHOD),
+        # only one complete string literal counts
+        ("requestJson('/v1/x', { method: 'PO' + 'ST' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: 'DELETE'.toUpperCase() })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: 'DELETE' || verb })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: cond ? 'GET' : 'POST' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: `${verb}` })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: `PUT` })", "PUT"),
+        ("requestJson('/v1/x', { method: 'post' })", "POST"),
+        ("requestJson('/v1/x', { method: 'GET', method: 'DELETE' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method: 'TRACE' })", UNKNOWN_METHOD),
+        ("requestJson('/v1/x', { method() { return 'GET' } })", UNKNOWN_METHOD),
+    ],
+)
+def test_the_method_comes_only_from_the_top_level_options_literal(
+    snippet: str, method: str
+) -> None:
+    assert _uses(snippet) == {(method, "/v1/x")}
+
+
+def test_an_unknown_method_is_never_ok_on_a_possible_mismatch() -> None:
+    from engineering_control.engineering.ui_inventory import load_route_tables
+
+    tables = load_route_tables(FIXTURE.resolve(), _policy())
+    # Every verb the control plane routes for /v1/plans (GET, POST) is published.
+    klass, evidence = tables.classify(EndpointUse(UNKNOWN_METHOD, "/v1/plans"))
+    assert klass.value == "OK"
+    assert evidence["method_unknown"] is True
+    assert evidence["routed_methods"] == ["GET", "POST"]
+    # DELETE /v1/plans/{planId} is routed but not published: the unknown call may be it.
+    klass, evidence = tables.classify(EndpointUse(UNKNOWN_METHOD, "/v1/plans/{}"))
+    assert klass.value == "ROUTED_NOT_PUBLISHED"
+    assert evidence["routed_methods"] == ["DELETE", "GET"]
+    assert tables.classify(EndpointUse("GET", "/v1/plans/{}"))[0].value == "OK"
+    assert tables.classify(EndpointUse("PUT", "/v1/plans/{}"))[0].value == "NO_ROUTE"
+    assert tables.classify(EndpointUse(UNKNOWN_METHOD, "/v1/events/topics"))[0].value == (
+        "GATEWAY_ONLY"
+    )

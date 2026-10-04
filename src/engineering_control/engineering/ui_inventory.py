@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -35,7 +36,8 @@ from engineering_control.engineering.models import UiMigrationPolicy
 SCHEMA_VERSION = 1
 GENERATOR = "engineering_control.engineering.ui_inventory"
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
-ANY_METHOD = "*"
+# The call site's method could not be determined (indirect or computed options).
+UNKNOWN_METHOD = "UNKNOWN"
 
 # Size tiers by the page file's own LOC, as in the research report (S/M/L/XL).
 TIER_THRESHOLDS: tuple[tuple[int, str], ...] = ((150, "small"), (500, "medium"), (1000, "large"))
@@ -364,7 +366,7 @@ def extract_endpoints(source: JsSource) -> set[EndpointUse]:
             uses.add(EndpointUse(method, path))
     for literal_start, path in paths.items():
         for method in attributed.get(literal_start, set()) or (
-            set() if literal_start in attributed else {ANY_METHOD}
+            set() if literal_start in attributed else {UNKNOWN_METHOD}
         ):
             uses.add(EndpointUse(method, path))
     return uses
@@ -427,15 +429,71 @@ def _request_calls(source: JsSource) -> Iterable[tuple[int, int, tuple[int, int]
 
 
 def _call_method(source: JsSource, arguments: tuple[int, int]) -> str:
-    region = source.masked[arguments[0] : arguments[1]]
-    match = re.search(r"(?<![\w$])method\s*:\s*", region)
-    if match is None:
+    """The verb from the call's own top-level options object literal, else UNKNOWN.
+
+    `fn(url)` is GET. `fn(url, {...})` is known only when the literal has exactly one
+    `method` property whose whole value is a complete string literal, no spread after it
+    and no computed key; with no `method` and no spread it is GET. Anything else -- a
+    nested `method`, indirect options (`fn(url, opts)`), a computed or partial value
+    (`'PO' + x`), a later `...opts`, `['method']` -- is UNKNOWN.
+    """
+    masked = source.masked
+    parts = _top_level_split(masked, *arguments)
+    if len(parts) < 2 or not masked[parts[1][0] : parts[1][1]].strip():
         return "GET"  # fetch() and requestJson() default to GET
-    literal = source.literal_at(arguments[0] + match.end())
-    if literal is None or literal.expressions:
-        return ANY_METHOD
-    method = literal.value.upper()
-    return method if method in HTTP_METHODS else ANY_METHOD
+    if len(parts) > 2 and any(masked[a:b].strip() for a, b in parts[2:]):
+        return UNKNOWN_METHOD
+    start, end = parts[1]
+    text = masked[start:end]
+    open_index = start + len(text) - len(text.lstrip())
+    if masked[open_index] != "{":
+        return UNKNOWN_METHOD
+    close = _matching(masked, open_index)
+    if close < 0 or close >= end:
+        return UNKNOWN_METHOD
+    if not re.fullmatch(r"\s*(?:as\s+const)?\s*", masked[close + 1 : end]):
+        return UNKNOWN_METHOD
+    method: str | None = None
+    methods = 0
+    spread_after_method = False
+    spread = False
+    for prop_start, prop_end in _top_level_split(masked, open_index + 1, close):
+        segment = masked[prop_start:prop_end]
+        stripped = segment.strip()
+        if not stripped:
+            continue
+        key_start = prop_start + len(segment) - len(segment.lstrip())
+        if stripped.startswith("..."):
+            spread = True
+            spread_after_method = spread_after_method or methods > 0
+            continue
+        if stripped.startswith("["):
+            return UNKNOWN_METHOD  # computed key: could be `method`
+        key = source.literal_at(key_start)
+        if key is not None:
+            name, key_end = key.value if not key.expressions else None, key.end
+        else:
+            identifier = re.match(r"[A-Za-z_$][\w$]*", stripped)
+            if identifier is None:
+                return UNKNOWN_METHOD
+            name, key_end = identifier.group(0), key_start + identifier.end()
+        if name is None:
+            return UNKNOWN_METHOD
+        if name != "method":
+            continue
+        methods += 1
+        colon = re.match(r"\s*:\s*", masked[key_end:prop_end])
+        if colon is None:
+            return UNKNOWN_METHOD  # shorthand `{ method }` or `method() {}`
+        value = source.literal_at(key_end + colon.end())
+        if value is None or value.expressions or masked[value.end : prop_end].strip():
+            return UNKNOWN_METHOD  # not one complete string literal
+        method = value.value.upper()
+    if methods == 0:
+        return UNKNOWN_METHOD if spread else "GET"
+    if methods > 1 or spread_after_method or method not in HTTP_METHODS:
+        return UNKNOWN_METHOD
+    return str(method)
 
 
 def _argument_literals(source: JsSource, call_start: int, argument: tuple[int, int]) -> set[int]:
@@ -693,7 +751,7 @@ def _matches(patterns: Sequence[RoutePattern], use: EndpointUse) -> list[RoutePa
     probe = use.path.replace("{}", "__param__")
     hits = []
     for pattern in patterns:
-        if use.method != ANY_METHOD and pattern.methods is not None:
+        if use.method != UNKNOWN_METHOD and pattern.methods is not None:
             if use.method not in pattern.methods:
                 continue
         if pattern.uri_condition is not None and not pattern.uri_condition.search(probe):
@@ -712,6 +770,30 @@ class RouteTables:
     digests: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def classify(self, use: EndpointUse) -> tuple[EndpointClass, dict[str, Any]]:
+        """Method-aware; an UNKNOWN method is never OK unless every verb the control plane
+        routes for the path is also published (conservative: no OK on a possible mismatch)."""
+        if use.method != UNKNOWN_METHOD:
+            klass, evidence = self._classify_exact(use)
+            return klass, {**evidence, "method_unknown": False}
+        candidates = sorted(
+            {
+                method
+                for pattern in _matches(self.control_plane, use)
+                for method in (pattern.methods or HTTP_METHODS)
+                if method in HTTP_METHODS
+            }
+        )
+        klass, evidence = self._classify_exact(use)
+        if candidates:
+            exact = [self._classify_exact(EndpointUse(m, use.path))[0] for m in candidates]
+            klass = (
+                EndpointClass.OK
+                if all(item is EndpointClass.OK for item in exact)
+                else EndpointClass.ROUTED_NOT_PUBLISHED
+            )
+        return klass, {**evidence, "method_unknown": True, "routed_methods": candidates}
+
+    def _classify_exact(self, use: EndpointUse) -> tuple[EndpointClass, dict[str, Any]]:
         control_plane = bool(_matches(self.control_plane, use))
         catalog = bool(_matches(self.catalog, use))
         openapi = bool(_matches(self.openapi, use))
@@ -797,6 +879,34 @@ def _inside(root: Path, relative: str) -> Path:
     return path
 
 
+def _safe_files(base: Path, root: Path, skipped: set[str]) -> list[Path]:
+    """Regular files under `base` (itself resolved inside `root`), never through a symlink.
+
+    Directory and file symlinks are not followed or read; they are recorded (repository-
+    relative) in `skipped`, so a repository cannot point the scan outside its checkout.
+    """
+    if base.is_symlink() or not base.resolve().is_relative_to(root):
+        raise InventoryError("inventory directory escaped the checkout")
+    found: list[Path] = []
+    for directory, dirnames, filenames in os.walk(base, followlinks=False):
+        current = Path(directory)
+        kept = []
+        for name in sorted(dirnames):
+            path = current / name
+            if path.is_symlink():
+                skipped.add(path.relative_to(root).as_posix())
+            elif name != "node_modules":
+                kept.append(name)
+        dirnames[:] = kept
+        for name in sorted(filenames):
+            path = current / name
+            if path.is_symlink():
+                skipped.add(path.relative_to(root).as_posix())
+            elif path.is_file() and path.resolve().is_relative_to(root):
+                found.append(path)
+    return sorted(found)
+
+
 def _is_test(relative: str) -> bool:
     name = relative.rsplit("/", 1)[-1]
     return ".test." in name or ".spec." in name or "/__tests__/" in f"/{relative}"
@@ -810,21 +920,16 @@ class ModuleGraph:
     named: dict[str, dict[str, str]]  # file -> local identifier -> imported module
 
     @classmethod
-    def build(cls, src: Path) -> ModuleGraph:
+    def build(cls, src: Path, root: Path, skipped: set[str] | None = None) -> ModuleGraph:
         files: dict[str, JsSource] = {}
-        root = src.resolve()
-        candidates = sorted(
+        candidates = [
             path
-            for path in src.rglob("*")
+            for path in _safe_files(src, root, skipped if skipped is not None else set())
             if path.suffix in SOURCE_SUFFIXES and not path.name.endswith(".d.ts")
-        )
+        ]
         if len(candidates) > MAX_SOURCE_FILES:
             raise InventoryError("legacy app has too many source files to inventory")
         for path in candidates:
-            if path.is_symlink() or not path.is_file():
-                continue
-            if not path.resolve().is_relative_to(root):
-                continue
             if path.stat().st_size > MAX_SOURCE_BYTES:
                 raise InventoryError(f"source file exceeds the size bound: {path.name}")
             relative = path.relative_to(src).as_posix()
@@ -1062,12 +1167,13 @@ def build_inventory(
     if not re.fullmatch(r"[a-f0-9]{40}", source_sha):
         raise InventoryError("source SHA must be a full 40-character commit")
     root = checkout.resolve()
-    app = _inside(root, policy.legacy_app)
-    src = app / "src"
+    _inside(root, policy.legacy_app)
+    src = _inside(root, f"{policy.legacy_app}/src")
     if not src.is_dir():
         raise InventoryError(f"legacy app has no src directory: {policy.legacy_app}")
     tables = load_route_tables(root, policy)
-    graph = ModuleGraph.build(src)
+    skipped: set[str] = set()
+    graph = ModuleGraph.build(src, root, skipped)
     entry = "main.tsx" if "main.tsx" in graph.files else "main.ts"
     if entry not in graph.files:
         raise InventoryError("legacy app has no src/main.tsx entry point")
@@ -1087,7 +1193,7 @@ def build_inventory(
         return classes[use][0]
 
     tests = sorted(name for name in graph.files if _is_test(name))
-    playwright = _playwright_specs(app, root)
+    playwright = _playwright_specs(_inside(root, f"{policy.legacy_app}/e2e"), root, skipped)
     page_files = sorted(
         name
         for name in graph.files
@@ -1190,6 +1296,7 @@ def build_inventory(
         "orphan_pages": len(orphan_pages),
         "dead_modules": len(dead),
         "dead_module_loc": sum(graph.loc(name) for name in dead),
+        "skipped_symlinks": len(skipped),
         "tiers": dict(sorted(Counter(page["tier"] for page in pages).items())),
         "endpoints": len(endpoints),
         "endpoint_paths": len({item["path"] for item in endpoints}),
@@ -1214,19 +1321,21 @@ def build_inventory(
             {"file": f"{policy.legacy_app}/src/{name}", "loc": graph.loc(name)} for name in dead
         ],
         "orphan_pages": orphan_pages,
+        "skipped_symlinks": sorted(skipped),
     }
     document["inventory_sha256"] = inventory_hash(document)
     return document
 
 
-def _playwright_specs(app: Path, root: Path) -> dict[str, tuple[set[str], str]]:
+def _playwright_specs(e2e: Path, root: Path, skipped: set[str]) -> dict[str, tuple[set[str], str]]:
     specs: dict[str, tuple[set[str], str]] = {}
-    e2e = app / "e2e"
     if not e2e.is_dir():
         return specs
-    for path in sorted(e2e.rglob("*.ts")):
-        if not re.search(r"\.(e2e|spec)\.ts$", path.name) or path.is_symlink():
+    for path in _safe_files(e2e, root, skipped):
+        if not re.search(r"\.(e2e|spec)\.ts$", path.name):
             continue
+        if path.stat().st_size > MAX_SOURCE_BYTES:
+            raise InventoryError(f"spec file exceeds the size bound: {path.name}")
         text = path.read_text(encoding="utf-8", errors="replace")
         source = scan_js(text)
         literals = {
@@ -1234,8 +1343,7 @@ def _playwright_specs(app: Path, root: Path) -> dict[str, tuple[set[str], str]]:
             for literal in source.literals
             if literal.value.startswith("/") and not literal.expressions
         }
-        if path.resolve().is_relative_to(root):
-            specs[path.relative_to(root).as_posix()] = (literals, source.code)
+        specs[path.relative_to(root).as_posix()] = (literals, source.code)
     return specs
 
 
