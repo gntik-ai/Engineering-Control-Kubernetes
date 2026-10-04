@@ -13,6 +13,14 @@ Isolation of the child:
 - the child runs in its own process group under a hard deadline; on timeout, cancellation
   or any error the whole group is killed and reaped and the named container removed.
 
+NEW-129: on the scan worker the manifest names `ui_migration.mcp.socket` and Hermes never
+runs Docker. A root-owned, fixed-command systemd socket service (`gntik-ui-mcp.socket`,
+`Accept=yes`) starts the same digest-pinned, isolated container per connection; Hermes
+checks the socket (a real socket, root-owned, in a root-owned directory nobody else can
+write; the peer is root), speaks the same JSON-RPC with the same allowlist and bounds, and
+records transport=socket with the configured digest as the expected one. The Docker stdio
+launch below remains for local CLI use when no socket is configured.
+
 Tool output is untrusted data: it is bounded, stored verbatim (after NUL removal) with its
 SHA-256, and never interpreted as instructions or parsed for control flow.
 """
@@ -27,12 +35,14 @@ import os
 import re
 import shutil
 import signal
+import socket
 import stat
+import struct
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from engineering_control.engineering.models import UiMigrationPolicy
 from engineering_control.security.redaction import SecretRedactor
@@ -78,6 +88,8 @@ TRUSTED_DOCKER_CANDIDATES = ("/usr/bin/docker", "/usr/local/bin/docker")
 KIT_SERVER_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_DEADLINE_SECONDS = 180.0
 MAX_LINE_BYTES = 4 * 1024 * 1024
+# Everything one session may receive (all lines, including skipped notifications).
+MAX_SESSION_BYTES = 64 * 1024 * 1024
 MAX_TOOL_TEXT_BYTES = 512 * 1024
 MAX_SNAPSHOT_TEXT_BYTES = 8 * 1024 * 1024
 MAX_PAGE_SOURCE_BYTES = 256 * 1024
@@ -236,91 +248,45 @@ def _bounded_text(value: str, limit: int) -> tuple[str, bool]:
     return data[:limit].decode("utf-8", errors="ignore"), True
 
 
-class GntikUiKitClient:
-    """One MCP stdio session with a hard deadline; use as an async context manager."""
+class KitSession:
+    """One MCP JSON-RPC session over a newline-delimited stream with a hard deadline.
+
+    The transport (a Docker stdio child or the root-owned service socket) only opens and
+    shuts down the stream; the allowlist, the bounds and the deadline are shared."""
+
+    transport_kind = ""
 
     def __init__(
         self,
-        argv: Sequence[str],
         *,
-        environment: Mapping[str, str],
         deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
-        preflight: Sequence[str] | None = None,
-        cleanup: Sequence[str] | None = None,
-        cwd: str = "/",
-        private_dirs: Sequence[str] = (),
         shutdown_seconds: float = _REAP_SECONDS,
     ) -> None:
-        if not argv or not os.path.isabs(argv[0]):
-            raise ValueError("the kit server command must be an absolute executable")
-        self.argv = list(argv)
-        self.environment = dict(environment)
         self.deadline_seconds = deadline_seconds
-        self.preflight = list(preflight) if preflight else None
-        self.cleanup_argv = list(cleanup) if cleanup else None
-        self.cwd = cwd
-        self.private_dirs = list(private_dirs)
         self.shutdown_seconds = shutdown_seconds
-        self.removed_container = False
-        self.process: asyncio.subprocess.Process | None = None
         self.server_info: dict[str, Any] = {}
         self.protocol_version = ""
         self.tools: list[str] = []
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._received = 0
         self._next_id = 0
-        self._stderr = bytearray()
-        self._stderr_task: asyncio.Task[None] | None = None
         self._deadline = 0.0
         self._escalate = asyncio.Event()
         self._closed = False
-        self._launch_attempted = False
 
-    @classmethod
-    def pinned(
-        cls,
-        image: str,
-        digest: str,
-        *,
-        docker_executable: str | None = None,
-        deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
-    ) -> GntikUiKitClient:
-        docker = docker_executable or trusted_docker_executable()
-        if docker is None:
-            raise KitUnavailable(
-                "no root-owned docker CLI found (/usr/bin/docker, /usr/local/bin/docker)"
-            )
-        endpoint = docker_endpoint()
-        config_dir = private_docker_config()
-        name = f"hermes-ui-kit-{uuid.uuid4().hex[:16]}"
-        flags = docker_global_flags(endpoint, config_dir)
-        try:
-            argv = kit_command(
-                docker, image, digest, name=name, endpoint=endpoint, config_dir=config_dir
-            )
-        except BaseException:
-            shutil.rmtree(config_dir, ignore_errors=True)
-            raise
-        return cls(
-            argv,
-            environment=kit_environment(endpoint, config_dir),
-            deadline_seconds=deadline_seconds,
-            preflight=[docker, *flags, "image", "inspect", "--format", "{{.Id}}", argv[-2]],
-            cleanup=[docker, *flags, "rm", "-f", name],
-            private_dirs=[config_dir],
-        )
-
-    @classmethod
-    def from_policy(cls, policy: UiMigrationPolicy, **kwargs: Any) -> GntikUiKitClient:
-        return cls.pinned(policy.mcp.image, policy.mcp.digest, **kwargs)
+    @property
+    def transport(self) -> dict[str, Any]:
+        """How the server was reached, recorded in the snapshot evidence."""
+        return {"kind": self.transport_kind}
 
     # -- lifecycle -----------------------------------------------------------------------
 
-    async def __aenter__(self) -> GntikUiKitClient:
+    async def __aenter__(self) -> Self:
         loop = asyncio.get_running_loop()
         self._deadline = loop.time() + self.deadline_seconds
         try:
-            if self.preflight is not None:
-                await self._run_preflight()
-            await self._start()
+            await self._open()
             await self._initialize()
         except BaseException:
             await self.close(force=True)
@@ -336,59 +302,11 @@ class GntikUiKitClient:
             raise TimeoutError("gntik-ui kit session exceeded its deadline")
         return remaining
 
-    async def _run_preflight(self) -> None:
-        assert self.preflight is not None
-        process = await asyncio.create_subprocess_exec(
-            *self.preflight,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=self.environment,
-            cwd=self.cwd,
-            start_new_session=True,
-        )
-        try:
-            _stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=min(30.0, self._remaining())
-            )
-        except BaseException:
-            await _kill_group(process)
-            raise
-        if process.returncode == 0:
-            return
-        detail = stderr.decode("utf-8", errors="replace").strip().lower()
-        if "permission denied" in detail:
-            reason = "the worker user has no access to the docker daemon"
-        elif "cannot connect" in detail or "is the docker daemon running" in detail:
-            reason = "the docker daemon is unreachable"
-        elif "no such image" in detail:
-            reason = f"image {self.preflight[-1]} is not pre-pulled"
-        else:
-            reason = "docker image inspect failed"
-        raise KitUnavailable(reason)
+    async def _open(self) -> None:
+        raise NotImplementedError
 
-    async def _start(self) -> None:
-        # NEW-120 review 2: a cancellation can land after the Docker CLI was spawned but
-        # before `self.process` is assigned; the launch attempt alone makes cleanup remove
-        # the named container.
-        self._launch_attempted = True
-        self.process = await asyncio.create_subprocess_exec(
-            *self.argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self.environment,
-            cwd=self.cwd,
-            start_new_session=True,  # its own process group, killed as a whole
-            limit=MAX_LINE_BYTES,
-        )
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
-
-    async def _drain_stderr(self) -> None:
-        assert self.process is not None and self.process.stderr is not None
-        while chunk := await self.process.stderr.read(4096):
-            self._stderr.extend(chunk)
-            del self._stderr[:-_STDERR_TAIL_BYTES]
+    async def _shutdown(self) -> None:
+        raise NotImplementedError
 
     async def close(self, *, force: bool = False) -> None:
         """Stop the session. Cancellation-safe: every cleanup step completes (shielded) and
@@ -410,69 +328,28 @@ class GntikUiKitClient:
             raise asyncio.CancelledError
         shutdown.result()
 
-    async def _shutdown(self) -> None:
-        process = self.process
-        clean = process is not None
-        if process is not None:
-            if process.returncode is None and not self._escalate.is_set():
-                if process.stdin is not None:
-                    with contextlib.suppress(OSError, RuntimeError):
-                        process.stdin.close()
-                await self._wait_or_escalate(process)
-            if process.returncode is None:
-                await _kill_group(process)
-            clean = process.returncode == 0 and not self._escalate.is_set()
-        if self._stderr_task is not None:
-            self._stderr_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._stderr_task
-            self._stderr_task = None
-        try:
-            # `--rm` removes only an exited container: whenever the CLI had to be killed,
-            # failed or the session was aborted, remove the named container explicitly.
-            launched = process is not None or self._launch_attempted
-            if launched and not clean and self.cleanup_argv is not None:
-                await _best_effort(self.cleanup_argv, self.environment, self.cwd)
-                self.removed_container = True
-        finally:
-            for directory in self.private_dirs:
-                shutil.rmtree(directory, ignore_errors=True)
-
-    async def _wait_or_escalate(self, process: asyncio.subprocess.Process) -> None:
-        waiter = asyncio.ensure_future(process.wait())
-        escalation = asyncio.ensure_future(self._escalate.wait())
-        try:
-            await asyncio.wait(
-                {waiter, escalation},
-                timeout=self.shutdown_seconds,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            for pending in (waiter, escalation):
-                pending.cancel()
-            await asyncio.gather(waiter, escalation, return_exceptions=True)
-
     # -- JSON-RPC ------------------------------------------------------------------------
 
     async def _send(self, message: dict[str, Any]) -> None:
-        assert self.process is not None and self.process.stdin is not None
-        self.process.stdin.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
-        await asyncio.wait_for(self.process.stdin.drain(), timeout=self._remaining())
+        assert self._writer is not None
+        self._writer.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+        await asyncio.wait_for(self._writer.drain(), timeout=self._remaining())
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._next_id += 1
         request_id = self._next_id
         await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        assert self.process is not None and self.process.stdout is not None
+        assert self._reader is not None
         while True:
             try:
-                line = await asyncio.wait_for(
-                    self.process.stdout.readline(), timeout=self._remaining()
-                )
+                line = await asyncio.wait_for(self._reader.readline(), timeout=self._remaining())
             except ValueError as error:  # a line over MAX_LINE_BYTES
                 raise KitProtocolError("kit server message exceeds the size bound") from error
             if not line:
                 raise KitProtocolError("kit server closed the session")
+            self._received += len(line)
+            if self._received > MAX_SESSION_BYTES:
+                raise KitProtocolError("kit server exceeded the session size bound")
             try:
                 message = json.loads(line)
             except json.JSONDecodeError as error:
@@ -543,6 +420,330 @@ class GntikUiKitClient:
         }
 
 
+class GntikUiKitClient(KitSession):
+    """The Docker stdio transport: Hermes runs the pinned image itself (local CLI use)."""
+
+    transport_kind = "docker"
+
+    def __init__(
+        self,
+        argv: Sequence[str],
+        *,
+        environment: Mapping[str, str],
+        deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+        preflight: Sequence[str] | None = None,
+        cleanup: Sequence[str] | None = None,
+        cwd: str = "/",
+        private_dirs: Sequence[str] = (),
+        shutdown_seconds: float = _REAP_SECONDS,
+    ) -> None:
+        if not argv or not os.path.isabs(argv[0]):
+            raise ValueError("the kit server command must be an absolute executable")
+        super().__init__(deadline_seconds=deadline_seconds, shutdown_seconds=shutdown_seconds)
+        self.argv = list(argv)
+        self.environment = dict(environment)
+        self.preflight = list(preflight) if preflight else None
+        self.cleanup_argv = list(cleanup) if cleanup else None
+        self.cwd = cwd
+        self.private_dirs = list(private_dirs)
+        self.removed_container = False
+        self.process: asyncio.subprocess.Process | None = None
+        self._stderr = bytearray()
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._launch_attempted = False
+
+    @classmethod
+    def pinned(
+        cls,
+        image: str,
+        digest: str,
+        *,
+        docker_executable: str | None = None,
+        deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+    ) -> GntikUiKitClient:
+        docker = docker_executable or trusted_docker_executable()
+        if docker is None:
+            raise KitUnavailable(
+                "no root-owned docker CLI found (/usr/bin/docker, /usr/local/bin/docker)"
+            )
+        endpoint = docker_endpoint()
+        config_dir = private_docker_config()
+        name = f"hermes-ui-kit-{uuid.uuid4().hex[:16]}"
+        flags = docker_global_flags(endpoint, config_dir)
+        try:
+            argv = kit_command(
+                docker, image, digest, name=name, endpoint=endpoint, config_dir=config_dir
+            )
+        except BaseException:
+            shutil.rmtree(config_dir, ignore_errors=True)
+            raise
+        return cls(
+            argv,
+            environment=kit_environment(endpoint, config_dir),
+            deadline_seconds=deadline_seconds,
+            preflight=[docker, *flags, "image", "inspect", "--format", "{{.Id}}", argv[-2]],
+            cleanup=[docker, *flags, "rm", "-f", name],
+            private_dirs=[config_dir],
+        )
+
+    @classmethod
+    def from_policy(cls, policy: UiMigrationPolicy, **kwargs: Any) -> KitSession:
+        """NEW-129: the manifest's service socket when one is configured (Hermes then never
+        runs Docker), otherwise the local Docker stdio launch."""
+        if policy.mcp.socket is not None:
+            return GntikUiSocketClient.from_policy(policy, **kwargs)
+        return cls.pinned(policy.mcp.image, policy.mcp.digest, **kwargs)
+
+    # -- lifecycle -----------------------------------------------------------------------
+
+    async def _open(self) -> None:
+        if self.preflight is not None:
+            await self._run_preflight()
+        await self._start()
+
+    async def _run_preflight(self) -> None:
+        assert self.preflight is not None
+        process = await asyncio.create_subprocess_exec(
+            *self.preflight,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=self.environment,
+            cwd=self.cwd,
+            start_new_session=True,
+        )
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=min(30.0, self._remaining())
+            )
+        except BaseException:
+            await _kill_group(process)
+            raise
+        if process.returncode == 0:
+            return
+        detail = stderr.decode("utf-8", errors="replace").strip().lower()
+        if "permission denied" in detail:
+            reason = "the worker user has no access to the docker daemon"
+        elif "cannot connect" in detail or "is the docker daemon running" in detail:
+            reason = "the docker daemon is unreachable"
+        elif "no such image" in detail:
+            reason = f"image {self.preflight[-1]} is not pre-pulled"
+        else:
+            reason = "docker image inspect failed"
+        raise KitUnavailable(reason)
+
+    async def _start(self) -> None:
+        # NEW-120 review 2: a cancellation can land after the Docker CLI was spawned but
+        # before `self.process` is assigned; the launch attempt alone makes cleanup remove
+        # the named container.
+        self._launch_attempted = True
+        self.process = await asyncio.create_subprocess_exec(
+            *self.argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self.environment,
+            cwd=self.cwd,
+            start_new_session=True,  # its own process group, killed as a whole
+            limit=MAX_LINE_BYTES,
+        )
+        self._reader, self._writer = self.process.stdout, self.process.stdin
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def _drain_stderr(self) -> None:
+        assert self.process is not None and self.process.stderr is not None
+        while chunk := await self.process.stderr.read(4096):
+            self._stderr.extend(chunk)
+            del self._stderr[:-_STDERR_TAIL_BYTES]
+
+    async def _shutdown(self) -> None:
+        process = self.process
+        clean = process is not None
+        if process is not None:
+            if process.returncode is None and not self._escalate.is_set():
+                if process.stdin is not None:
+                    with contextlib.suppress(OSError, RuntimeError):
+                        process.stdin.close()
+                await self._wait_or_escalate(process)
+            if process.returncode is None:
+                await _kill_group(process)
+            clean = process.returncode == 0 and not self._escalate.is_set()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._stderr_task
+            self._stderr_task = None
+        try:
+            # `--rm` removes only an exited container: whenever the CLI had to be killed,
+            # failed or the session was aborted, remove the named container explicitly.
+            launched = process is not None or self._launch_attempted
+            if launched and not clean and self.cleanup_argv is not None:
+                await _best_effort(self.cleanup_argv, self.environment, self.cwd)
+                self.removed_container = True
+        finally:
+            for directory in self.private_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+
+    async def _wait_or_escalate(self, process: asyncio.subprocess.Process) -> None:
+        waiter = asyncio.ensure_future(process.wait())
+        escalation = asyncio.ensure_future(self._escalate.wait())
+        try:
+            await asyncio.wait(
+                {waiter, escalation},
+                timeout=self.shutdown_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for pending in (waiter, escalation):
+                pending.cancel()
+            await asyncio.gather(waiter, escalation, return_exceptions=True)
+
+
+# --------------------------------------------------------------------------------------
+# NEW-129: the root-owned service socket
+# --------------------------------------------------------------------------------------
+
+
+SOCKET_SERVICE = "gntik-ui-mcp@.service (root-owned, fixed command, pinned by digest)"
+_SOCKET_CONNECT_SECONDS = 30.0
+
+
+def socket_preflight(path: str, *, trusted_uid: int = 0) -> None:
+    """The service socket must be a real socket (never a symlink) owned by root, in a
+    root-owned directory nobody else can write; otherwise BLOCKED (UI_MCP_UNAVAILABLE).
+
+    `trusted_uid` is root in production; tests substitute their own uid."""
+    parts = path.split("/")
+    if not path.startswith("/") or any(part in {"", ".", ".."} for part in parts[1:]):
+        raise KitUnavailable("the gntik-ui MCP socket path must be a normalised absolute path")
+    parent = os.path.dirname(path)
+    if os.path.realpath(parent) != parent:
+        raise KitUnavailable(f"the gntik-ui MCP socket directory {parent} is reached via a symlink")
+    try:
+        directory = os.lstat(parent)
+    except FileNotFoundError:
+        raise KitUnavailable(
+            f"{parent} does not exist (is gntik-ui-mcp.socket installed and active?)"
+        ) from None
+    except OSError:
+        raise KitUnavailable(f"the worker user cannot inspect {parent}") from None
+    if not stat.S_ISDIR(directory.st_mode):
+        raise KitUnavailable(f"{parent} is not a directory")
+    if directory.st_uid != trusted_uid:
+        raise KitUnavailable(f"{parent} is not owned by root")
+    if directory.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise KitUnavailable(f"{parent} is writable by group or others")
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        raise KitUnavailable(
+            f"{path} does not exist (is gntik-ui-mcp.socket installed and active?)"
+        ) from None
+    except OSError:
+        raise KitUnavailable(f"the worker user cannot traverse {parent}") from None
+    if stat.S_ISLNK(entry.st_mode):
+        raise KitUnavailable(f"{path} is a symlink, not the service socket")
+    if not stat.S_ISSOCK(entry.st_mode):
+        raise KitUnavailable(f"{path} is not a socket")
+    if entry.st_uid != trusted_uid:
+        raise KitUnavailable(f"{path} is not owned by root")
+
+
+def _peer_uid(writer: asyncio.StreamWriter) -> int | None:
+    connection = writer.get_extra_info("socket")
+    if connection is None or not hasattr(socket, "SO_PEERCRED"):
+        return None
+    raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    return int(uid)
+
+
+class GntikUiSocketClient(KitSession):
+    """NEW-129: the scan worker's transport. Hermes connects to the root-owned, fixed-command
+    gntik-ui MCP service socket and never runs Docker; the service (root-owned unit) runs
+    the digest-pinned image and removes its container. Hermes cannot observe the digest
+    itself, so the snapshot records transport=socket with the configured digest as the
+    expected one."""
+
+    transport_kind = "socket"
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        image: str,
+        digest: str,
+        deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+        shutdown_seconds: float = _REAP_SECONDS,
+        trusted_uid: int = 0,
+    ) -> None:
+        super().__init__(deadline_seconds=deadline_seconds, shutdown_seconds=shutdown_seconds)
+        self.path = path
+        self.expected_image = kit_reference(image, digest)
+        self.expected_digest = digest
+        self.trusted_uid = trusted_uid
+        self.peer_uid: int | None = None
+        self.connection_closed = False
+
+    @classmethod
+    def from_policy(cls, policy: UiMigrationPolicy, **kwargs: Any) -> GntikUiSocketClient:
+        if policy.mcp.socket is None:
+            raise ValueError("the manifest configures no gntik-ui MCP socket")
+        kwargs.pop("docker_executable", None)
+        return cls(policy.mcp.socket, image=policy.mcp.image, digest=policy.mcp.digest, **kwargs)
+
+    @property
+    def transport(self) -> dict[str, Any]:
+        return {
+            "kind": self.transport_kind,
+            "socket": self.path,
+            "expected": {"image": self.expected_image, "digest": self.expected_digest},
+            "digest_enforced_by": SOCKET_SERVICE,
+            "peer_uid": self.peer_uid,
+        }
+
+    async def _open(self) -> None:
+        await asyncio.to_thread(socket_preflight, self.path, trusted_uid=self.trusted_uid)
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self.path, limit=MAX_LINE_BYTES),
+                timeout=min(_SOCKET_CONNECT_SECONDS, self._remaining()),
+            )
+        except PermissionError:
+            raise KitUnavailable(
+                "the worker user may not connect to the gntik-ui MCP socket"
+            ) from None
+        except (FileNotFoundError, ConnectionRefusedError):
+            raise KitUnavailable(
+                "the gntik-ui MCP socket refused the connection (is gntik-ui-mcp.socket active?)"
+            ) from None
+        except TimeoutError:
+            raise
+        except OSError as error:
+            raise KitUnavailable(
+                f"could not connect to the gntik-ui MCP socket ({error.strerror or 'error'})"
+            ) from None
+        self._reader, self._writer = reader, writer
+        # The listening socket belongs to PID 1: the peer of an accepted connection is root.
+        self.peer_uid = _peer_uid(writer)
+        if self.peer_uid != self.trusted_uid:  # unknown credentials fail closed too
+            raise KitUnavailable("the gntik-ui MCP socket is not served by root")
+
+    async def _shutdown(self) -> None:
+        """Close the connection (aborted when forced); the service removes the container
+        once its stdin reaches EOF. Bounded: a peer that never acknowledges is abandoned."""
+        writer = self._writer
+        if writer is None:
+            return
+        if self._escalate.is_set():
+            writer.transport.abort()
+        else:
+            writer.close()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(writer.wait_closed(), timeout=self.shutdown_seconds)
+        self.connection_closed = True
+
+
 async def _kill_group(process: asyncio.subprocess.Process) -> None:
     """SIGKILL the whole process group (the child and anything it spawned), then reap."""
     with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -597,7 +798,7 @@ def snapshot_hash(document: Mapping[str, Any]) -> str:
 
 
 async def collect_kit_snapshot(
-    client: GntikUiKitClient,
+    client: KitSession,
     *,
     image: str,
     digest: str,
@@ -619,6 +820,7 @@ async def collect_kit_snapshot(
         "image": kit_reference(image, digest),
         "digest": digest,
         "gntik_ui_version": gntik_ui_version,
+        "transport": client.transport,
         "server_info": client.server_info,
         "protocol_version": client.protocol_version,
         "tools_available": client.tools,
@@ -648,7 +850,7 @@ def finalize_snapshot(document: dict[str, Any]) -> dict[str, Any]:
 
 
 async def validate_page(
-    client: GntikUiKitClient, source: str, *, filename: str | None = None
+    client: KitSession, source: str, *, filename: str | None = None
 ) -> dict[str, Any]:
     """Run the kit's `validate_page` rule check on one page source (deterministic).
 

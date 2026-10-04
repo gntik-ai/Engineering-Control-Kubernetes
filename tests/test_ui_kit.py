@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
+import socket as _socket
 import stat
 import sys
+import threading
 from argparse import Namespace
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +30,7 @@ from engineering_control.engineering.safe_files import write_text_no_follow
 from engineering_control.engineering.ui_kit import (
     READ_ONLY_TOOLS,
     GntikUiKitClient,
+    GntikUiSocketClient,
     KitProtocolError,
     KitToolRefused,
     KitUnavailable,
@@ -32,6 +38,7 @@ from engineering_control.engineering.ui_kit import (
     kit_command,
     snapshot_hash,
     snapshot_plan,
+    socket_preflight,
     trusted_docker_executable,
     validate_page,
 )
@@ -719,3 +726,399 @@ def test_writes_stay_in_the_verified_directory_after_a_parent_swap(tmp_path: Pat
         os.close(verified)
     assert (tmp_path / "moved" / "abc" / "ui-kit-snapshot.json").read_text() == "{}\n"
     assert not (outside / "abc" / "ui-kit-snapshot.json").exists()
+
+
+# -- NEW-129: the root-owned service socket ----------------------------------------------
+
+
+SERVICE_SOCKET = "/run/gntik-ui-mcp/mcp.sock"
+
+
+class _SocketService:
+    """A stand-in for gntik-ui-mcp.socket (Accept=yes): each connection becomes the stdin
+    and stdout of one stub server process, exactly like StandardInput/Output=socket."""
+
+    def __init__(self, path: Path, mode: str, log: Path) -> None:
+        self.path, self.mode, self.log = path, mode, log
+        self.processes: list[Any] = []
+        self.eof = threading.Event()
+        self.listener = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        self.listener.bind(str(path))
+        self.listener.listen(4)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        import subprocess
+
+        while True:
+            try:
+                connection, _address = self.listener.accept()
+            except OSError:
+                return
+            if self.mode == "silent":  # never answers; records the client's close
+                threading.Thread(target=self._silent, args=(connection,), daemon=True).start()
+                continue
+            if self.mode == "oversize":
+                threading.Thread(target=self._oversize, args=(connection,), daemon=True).start()
+                continue
+            self.processes.append(
+                subprocess.Popen(  # noqa: S603 - the fixed stub server
+                    [sys.executable, str(STUB), self.mode, str(self.log)],
+                    stdin=connection.fileno(),
+                    stdout=connection.fileno(),
+                    start_new_session=True,
+                )
+            )
+            connection.close()
+
+    def _silent(self, connection: _socket.socket) -> None:
+        with connection:
+            while connection.recv(65536):
+                pass
+        self.eof.set()
+
+    def _oversize(self, connection: _socket.socket) -> None:
+        with connection:
+            connection.recv(65536)
+            with contextlib.suppress(OSError):
+                connection.sendall(b'{"jsonrpc":"2.0","id":1,"x":"' + b"x" * (5 << 20) + b'"}\n')
+            while connection.recv(65536):
+                pass
+        self.eof.set()
+
+    def stop(self) -> None:
+        self.listener.close()
+        for process in self.processes:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, 9)
+            process.wait(timeout=10)
+
+
+@contextmanager
+def _service(tmp_path: Path, mode: str = "ok") -> Iterator[tuple[_SocketService, str]]:
+    directory = tmp_path / "run"
+    directory.mkdir(mode=0o750)
+    directory.chmod(0o750)
+    path = directory / "mcp.sock"
+    service = _SocketService(path, mode, tmp_path / f"{mode}.log")
+    try:
+        yield service, str(path)
+    finally:
+        service.stop()
+
+
+def _socket_client(path: str, **kwargs: Any) -> GntikUiSocketClient:
+    return GntikUiSocketClient(path, image=IMAGE, digest=DIGEST, trusted_uid=os.geteuid(), **kwargs)
+
+
+def test_manifest_accepts_only_a_normalised_absolute_socket_path() -> None:
+    policy = _policy()
+    assert policy.mcp.socket == SERVICE_SOCKET
+    value = policy.model_dump(mode="json")
+    value["mcp"].pop("socket")
+    assert UiMigrationPolicy.model_validate(value).mcp.socket is None
+    for bad in (
+        "run/gntik-ui-mcp/mcp.sock",
+        "/run/gntik-ui-mcp/../mcp.sock",
+        "/run/./mcp.sock",
+        "/run//mcp.sock",
+        "/run/gntik-ui-mcp/",
+        "/run/a b.sock",
+        "/" + "x" * 120,
+        "",
+    ):
+        value["mcp"]["socket"] = bad
+        with pytest.raises(ValueError, match="socket"):
+            UiMigrationPolicy.model_validate(value)
+
+
+def test_a_configured_socket_never_runs_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_docker(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("docker must not be used with a service socket")
+
+    monkeypatch.setattr(ui_kit, "trusted_docker_executable", no_docker)
+    monkeypatch.setattr(GntikUiKitClient, "pinned", classmethod(no_docker))
+    client = GntikUiKitClient.from_policy(_policy())
+    assert isinstance(client, GntikUiSocketClient)
+    assert client.path == SERVICE_SOCKET and client.trusted_uid == 0
+    assert client.transport["expected"] == {"image": f"{IMAGE}@{DIGEST}", "digest": DIGEST}
+
+
+def test_without_a_socket_the_docker_transport_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = _policy().model_dump(mode="json")
+    value["mcp"].pop("socket")
+    policy = UiMigrationPolicy.model_validate(value)
+    seen: list[tuple[str, str]] = []
+
+    def pinned(cls: Any, image: str, digest: str, **kwargs: Any) -> str:
+        seen.append((image, digest))
+        return "pinned"
+
+    monkeypatch.setattr(GntikUiKitClient, "pinned", classmethod(pinned))
+    assert GntikUiKitClient.from_policy(policy) == "pinned"
+    assert seen == [(IMAGE, DIGEST)]
+
+
+async def test_socket_session_snapshot_matches_the_docker_one(tmp_path: Path) -> None:
+    plan = snapshot_plan(templates=["home-dashboard"], components=["button"])
+    (tmp_path / "d").mkdir()
+    docker_client, _log_path = _stub(tmp_path / "d")
+    async with docker_client:
+        via_docker = await collect_kit_snapshot(
+            docker_client, image=IMAGE, digest=DIGEST, gntik_ui_version=VERSION, plan=plan
+        )
+    with _service(tmp_path) as (service, path):
+        client = _socket_client(path)
+        async with client:
+            via_socket = await collect_kit_snapshot(
+                client, image=IMAGE, digest=DIGEST, gntik_ui_version=VERSION, plan=plan
+            )
+        (process,) = service.processes
+        assert process.wait(timeout=10) == 0  # the server saw EOF: the connection closed
+    assert client.connection_closed is True
+    assert via_docker["transport"] == {"kind": "docker"}
+    assert via_socket["transport"] == {
+        "kind": "socket",
+        "socket": path,
+        "expected": {"image": f"{IMAGE}@{DIGEST}", "digest": DIGEST},
+        "digest_enforced_by": ui_kit.SOCKET_SERVICE,
+        "peer_uid": os.geteuid(),
+    }
+    strip = ("transport", "snapshot_sha256")
+    assert {k: v for k, v in via_docker.items() if k not in strip} == {
+        k: v for k, v in via_socket.items() if k not in strip
+    }
+    assert via_socket["snapshot_sha256"] == snapshot_hash(via_socket)
+
+
+async def test_socket_session_keeps_the_read_only_allowlist(tmp_path: Path) -> None:
+    with _service(tmp_path) as (_service_handle, path):
+        async with _socket_client(path) as client:
+            for tool in ("sync_design_system", "scaffold_page", "overview"):
+                with pytest.raises(KitToolRefused):
+                    await client.call(tool)
+            assert (await client.call("get_rules"))["text"] == "ruleone"
+    called = [
+        entry["params"]["name"]
+        for entry in _log(tmp_path / "ok.log")
+        if entry["method"] == "tools/call"
+    ]
+    assert called == ["get_rules"]
+
+
+async def test_socket_session_deadline_closes_the_connection(tmp_path: Path) -> None:
+    with _service(tmp_path, "silent") as (service, path):
+        client = _socket_client(path, deadline_seconds=1.0)
+        with pytest.raises(TimeoutError):
+            async with client:
+                pass
+        assert client.connection_closed is True
+        assert await asyncio.to_thread(service.eof.wait, 10)
+
+
+async def test_socket_session_cancellation_closes_the_connection(tmp_path: Path) -> None:
+    with _service(tmp_path, "silent") as (service, path):
+        client = _socket_client(path, deadline_seconds=60)
+
+        async def session() -> None:
+            async with client:
+                pass
+
+        task = asyncio.create_task(session())
+        for _ in range(200):
+            if client._writer is not None:
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=20)
+        assert client.connection_closed is True
+        assert client._writer is not None and client._writer.transport.is_closing()
+        assert await asyncio.to_thread(service.eof.wait, 10)
+
+
+async def test_socket_session_refuses_an_oversize_line(tmp_path: Path) -> None:
+    with _service(tmp_path, "oversize") as (service, path):
+        client = _socket_client(path)
+        with pytest.raises(KitProtocolError, match="size bound"):
+            async with client:
+                pass
+        assert client.connection_closed is True
+        assert await asyncio.to_thread(service.eof.wait, 10)
+
+
+async def test_socket_session_enforces_the_total_byte_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ui_kit, "MAX_SESSION_BYTES", 64 * 1024)
+    with _service(tmp_path) as (_service_handle, path):
+        async with _socket_client(path) as client:
+            with pytest.raises(KitProtocolError, match="session size bound"):
+                await client.call("get_tokens", {"theme": "all", "format": "json"})
+
+
+def _preflight_dir(tmp_path: Path) -> Path:
+    directory = tmp_path / "run"
+    directory.mkdir(mode=0o750)
+    directory.chmod(0o750)
+    return directory
+
+
+def test_socket_preflight_refuses_a_regular_file_or_symlink(tmp_path: Path) -> None:
+    directory = _preflight_dir(tmp_path)
+    regular = directory / "mcp.sock"
+    regular.write_text("", encoding="utf-8")
+    with pytest.raises(KitUnavailable, match="is not a socket"):
+        socket_preflight(str(regular), trusted_uid=os.geteuid())
+    regular.unlink()
+    real = tmp_path / "elsewhere.sock"
+    listener = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    listener.bind(str(real))
+    try:
+        regular.symlink_to(real)
+        with pytest.raises(KitUnavailable, match="is a symlink"):
+            socket_preflight(str(regular), trusted_uid=os.geteuid())
+    finally:
+        listener.close()
+    regular.unlink()
+    with pytest.raises(KitUnavailable, match="does not exist"):
+        socket_preflight(str(regular), trusted_uid=os.geteuid())
+    with pytest.raises(KitUnavailable, match="does not exist"):
+        socket_preflight("/nonexistent-new129/mcp.sock")
+    linked = tmp_path / "linked"
+    linked.symlink_to(directory, target_is_directory=True)
+    with pytest.raises(KitUnavailable, match="symlink"):
+        socket_preflight(str(linked / "mcp.sock"), trusted_uid=os.geteuid())
+
+
+def test_socket_preflight_requires_root_ownership_and_a_closed_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _preflight_dir(tmp_path)
+    path = directory / "mcp.sock"
+    listener = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    listener.bind(str(path))
+    try:
+        socket_preflight(str(path), trusted_uid=os.geteuid())  # the trusted shape passes
+        # Production trusts root only: a directory owned by this user is refused.
+        with pytest.raises(KitUnavailable, match=f"{directory} is not owned by root"):
+            socket_preflight(str(path))
+        directory.chmod(0o770)
+        with pytest.raises(KitUnavailable, match="writable by group or others"):
+            socket_preflight(str(path), trusted_uid=os.geteuid())
+        directory.chmod(0o757)
+        with pytest.raises(KitUnavailable, match="writable by group or others"):
+            socket_preflight(str(path), trusted_uid=os.geteuid())
+        directory.chmod(0o750)
+        # A socket owned by someone else (simulated: no chown without root).
+        real_lstat = os.lstat
+
+        def foreign_socket(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            result = real_lstat(target, *args, **kwargs)
+            if str(target) == str(path):
+                fields = list(result)
+                fields[stat.ST_UID] = os.geteuid() + 4242
+                return os.stat_result(fields)
+            return result
+
+        monkeypatch.setattr(ui_kit.os, "lstat", foreign_socket)
+        with pytest.raises(KitUnavailable, match=f"{path} is not owned by root"):
+            socket_preflight(str(path), trusted_uid=os.geteuid())
+    finally:
+        listener.close()
+
+
+async def test_socket_session_is_blocked_by_preflight_peer_and_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _preflight_dir(tmp_path)
+    stale = directory / "mcp.sock"
+    listener = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    listener.bind(str(stale))  # bound, never listening: connect is refused
+    try:
+        with pytest.raises(KitUnavailable, match="refused the connection"):
+            async with _socket_client(str(stale)):
+                pass
+    finally:
+        listener.close()
+        stale.unlink()
+    (tmp_path / "svc").mkdir()
+    with _service(tmp_path / "svc") as (_service_handle, path):
+        monkeypatch.setattr(ui_kit, "_peer_uid", lambda writer: os.geteuid() + 4242)
+        client = _socket_client(path)
+        with pytest.raises(KitUnavailable, match="not served by root"):
+            async with client:
+                pass
+        assert client.connection_closed is True
+        # Production trusts root only: the same socket owned by this user is refused.
+        with pytest.raises(KitUnavailable, match="not owned by root"):
+            async with GntikUiSocketClient(path, image=IMAGE, digest=DIGEST):
+                pass
+
+
+async def test_scan_step_is_blocked_while_the_service_socket_is_missing(
+    tmp_path: Path,
+) -> None:
+    if os.path.lexists(SERVICE_SOCKET):  # noqa: ASYNC240
+        pytest.skip("the gntik-ui MCP socket is installed on this host")
+    settings = Settings(
+        worktree_root=tmp_path / "worktrees",
+        evidence_root=tmp_path / "evidence",
+        project_config_root=PROJECTS,
+    )
+    result = await ScanActivityHandler(settings).handle("ui.kit_snapshot", {"project": "falcone"})
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "UI_MCP_UNAVAILABLE"
+    assert result["transport"] == "socket"
+    assert "gntik-ui-mcp.socket installed and active" in result["reason"]
+
+
+async def test_scan_step_reports_the_socket_transport(tmp_path: Path) -> None:
+    with _service(tmp_path) as (_service_handle, path):
+        result = await _handler(tmp_path, lambda policy: _socket_client(path)).handle(
+            "ui.kit_snapshot", {"project": "falcone"}
+        )
+    assert result["status"] == "UI_KIT_SNAPSHOT_PASS"
+    assert result["transport"] == "socket"
+    stored = json.loads(
+        (
+            tmp_path
+            / "evidence/scan/ui-kit"
+            / result["snapshot_sha256"][:32]
+            / "ui-kit-snapshot.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert stored["transport"]["kind"] == "socket"
+    assert stored["transport"]["expected"]["digest"] == DIGEST
+
+
+def test_cli_docker_flag_forces_the_local_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(cls: Any, policy: UiMigrationPolicy) -> Any:
+        raise AssertionError("--docker must bypass the manifest socket")
+
+    seen: list[tuple[str, str]] = []
+
+    def pinned(cls: Any, image: str, digest: str, **kwargs: Any) -> GntikUiKitClient:
+        seen.append((image, digest))
+        return _stub(tmp_path)[0]
+
+    monkeypatch.setattr(GntikUiKitClient, "from_policy", classmethod(refuse))
+    monkeypatch.setattr(GntikUiKitClient, "pinned", classmethod(pinned))
+    arguments = Namespace(
+        project="falcone",
+        manifest=PROJECTS / "falcone.yaml",
+        templates=[],
+        blocks=[],
+        components=[],
+        output_dir=None,
+        docker=True,
+    )
+    result = _ui_kit_snapshot_command(arguments)
+    assert result["status"] == "UI_KIT_SNAPSHOT_PASS" and result["transport"] == "docker"
+    assert seen == [(IMAGE, DIGEST)]

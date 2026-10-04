@@ -326,6 +326,22 @@ def _repository_path(value: str) -> str:
 RepositoryPath = Annotated[str, AfterValidator(_repository_path)]
 
 
+def _unix_socket_path(value: str) -> str:
+    """An absolute, normalised filesystem socket path within the sun_path limit."""
+    parts = value.split("/")
+    if (
+        not value.startswith("/")
+        or len(value.encode("utf-8")) > 107
+        or not re.fullmatch(r"(?:/[A-Za-z0-9_][A-Za-z0-9_.@-]*)+", value)
+        or any(part in {".", ".."} for part in parts[1:])
+    ):
+        raise ValueError("the MCP socket must be a normalised absolute path (no ..)")
+    return value
+
+
+UnixSocketPath = Annotated[str, AfterValidator(_unix_socket_path)]
+
+
 class GntikUiPackagePin(EngineeringModel):
     """NEW-120: the exact gntik-ui release the migrated console consumes (no ranges)."""
 
@@ -342,6 +358,9 @@ class GntikUiMcpPin(EngineeringModel):
         max_length=200,
     )
     digest: Digest
+    # NEW-129: the root-owned, fixed-command socket of the gntik-ui MCP service on the scan
+    # worker. When set, Hermes connects to it and never runs Docker itself.
+    socket: UnixSocketPath | None = None
 
     def reference(self) -> str:
         return f"{self.image}@{self.digest}"

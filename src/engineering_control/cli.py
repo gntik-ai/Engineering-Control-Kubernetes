@@ -379,6 +379,11 @@ def parser() -> argparse.ArgumentParser:
     for kind in ("template", "block", "component"):
         ui_kit.add_argument(f"--{kind}", action="append", default=[], dest=f"{kind}s")
     ui_kit.add_argument("--output-dir", type=Path)
+    ui_kit.add_argument(
+        "--docker",
+        action="store_true",
+        help="run the pinned image locally even when the manifest names an MCP socket",
+    )
     dashboard = commands.add_parser("dashboard")
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
     for name in ("init-password", "reset-password"):
@@ -932,7 +937,8 @@ def _ui_migration_policy(arguments: argparse.Namespace) -> Any:
 
 
 def _ui_kit_snapshot_command(arguments: argparse.Namespace) -> dict[str, Any]:
-    """Run the pinned gntik-ui image locally and write the kit snapshot (read-only tools)."""
+    """Write the gntik-ui kit snapshot (read-only tools) from the manifest's MCP socket, or
+    from the pinned image run locally (no socket configured, or --docker)."""
     import asyncio
 
     from engineering_control.engineering.safe_files import write_text_no_follow
@@ -950,7 +956,12 @@ def _ui_kit_snapshot_command(arguments: argparse.Namespace) -> dict[str, Any]:
     )
 
     async def collect() -> dict[str, Any]:
-        async with GntikUiKitClient.from_policy(policy) as client:
+        session = (
+            GntikUiKitClient.pinned(policy.mcp.image, policy.mcp.digest)
+            if getattr(arguments, "docker", False)
+            else GntikUiKitClient.from_policy(policy)
+        )
+        async with session as client:
             return await collect_kit_snapshot(
                 client,
                 image=policy.mcp.image,
@@ -967,6 +978,7 @@ def _ui_kit_snapshot_command(arguments: argparse.Namespace) -> dict[str, Any]:
         "status": "UI_KIT_SNAPSHOT_PASS",
         "snapshot_sha256": document["snapshot_sha256"],
         "image": document["image"],
+        "transport": document["transport"]["kind"],
         "gntik_ui_version": document["gntik_ui_version"],
         "summary": document["summary"],
     }
