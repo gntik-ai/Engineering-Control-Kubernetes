@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +35,7 @@ from engineering_control.engineering.models import (
     ProjectPairSnapshot,
     ToolchainPolicy,
     ToolchainTestCommand,
+    UiMigrationPolicy,
 )
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
@@ -44,6 +45,13 @@ from engineering_control.engineering.toolchain import (
     render_argv,
 )
 from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
+from engineering_control.engineering.ui_kit import (
+    UI_MCP_UNAVAILABLE,
+    GntikUiKitClient,
+    KitUnavailable,
+    collect_kit_snapshot,
+    snapshot_plan,
+)
 from engineering_control.evidence.transfer import EvidencePublisher
 from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
@@ -164,6 +172,7 @@ class ScanActivityHandler:
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
             "ui.inventory",
+            "ui.kit_snapshot",
         }
     )
     _repositories = {
@@ -184,8 +193,11 @@ class ScanActivityHandler:
         dependency_runner: SafeCommandRunner | None = None,
         git_runner: SafeCommandRunner | None = None,
         baseline_runner: SafeCommandRunner | None = None,
+        kit_client_factory: Callable[[UiMigrationPolicy], GntikUiKitClient] | None = None,
     ) -> None:
         self.settings = settings
+        # NEW-121 v2: Hermes itself queries the pinned gntik-ui MCP image (no model).
+        self.kit_client_factory = kit_client_factory or GntikUiKitClient.from_policy
         self.manager = manager or GitWorktreeManager(
             mirror_root=settings.mirror_root,
             worktree_root=settings.worktree_root,
@@ -292,6 +304,10 @@ class ScanActivityHandler:
                 return await asyncio.to_thread(self._cleanup_observability_workspace, payload)
             if step == "ui.inventory":
                 return await asyncio.to_thread(self._ui_inventory, payload)
+            if step == "ui.kit_snapshot":
+                return await self._with_heartbeat(
+                    self._ui_kit_snapshot(payload), phase="ui_kit_snapshot"
+                )
         except PermissionError as error:
             raise ApplicationError(
                 "runtime observer credential violates least-privilege policy",
@@ -1203,6 +1219,73 @@ class ScanActivityHandler:
             "inventory_sha256": digest,
             "summary": document["summary"],
             "route_tables": document["route_tables"],
+            "evidence": receipts,
+        }
+
+    async def _ui_kit_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-121 v2: a versioned gntik-ui kit snapshot from the digest-pinned image.
+
+        Deterministic and model-free: the scan worker runs the container itself (no
+        network, read-only, no capabilities) and calls only read-only allowlisted tools.
+        A missing docker or image is a BLOCKED result (UI_MCP_UNAVAILABLE), not a retry.
+        """
+        project = Project(str(payload["project"]))
+        policy = (await asyncio.to_thread(self.catalog.project, project.value)).ui_migration
+        if policy is None:
+            raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {project.value} has no ui_migration")
+        selection: dict[str, list[str]] = {}
+        for kind in ("templates", "blocks", "components"):
+            value = payload.get(kind, [])
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"ui kit snapshot {kind} must be a list of ids")
+            if len(value) > 100:
+                raise ValueError(f"ui kit snapshot {kind} exceeds 100 ids")
+            selection[kind] = value
+        plan = snapshot_plan(**selection)
+        try:
+            async with self.kit_client_factory(policy) as client:
+                document = await collect_kit_snapshot(
+                    client,
+                    image=policy.mcp.image,
+                    digest=policy.mcp.digest,
+                    gntik_ui_version=policy.gntik_ui.version,
+                    plan=plan,
+                )
+        except KitUnavailable as error:
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": UI_MCP_UNAVAILABLE,
+                "reason": str(error)[:300],
+                "image": f"{policy.mcp.image}@{policy.mcp.digest}",
+            }
+        except TimeoutError as error:
+            raise ApplicationError(
+                "gntik-ui kit snapshot exceeded its deadline", type="UiKitTimeout"
+            ) from error
+        return await asyncio.to_thread(self._store_kit_snapshot, payload, document)
+
+    def _store_kit_snapshot(
+        self, payload: dict[str, Any], document: dict[str, Any]
+    ) -> dict[str, Any]:
+        digest = str(document["snapshot_sha256"])
+        directory = self.settings.evidence_root / "scan" / "ui-kit" / digest[:32]
+        directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        path = directory / "ui-kit-snapshot.json"
+        self._atomic_text(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+        receipts = self._publish_reports(
+            payload, [path], filename_prefix=f"ui-kit-{digest[:12]}", category="snapshot"
+        )
+        return {
+            **payload,
+            "status": "UI_KIT_SNAPSHOT_PASS",
+            "schema_version": document["schema_version"],
+            "snapshot_sha256": digest,
+            "image": document["image"],
+            "gntik_ui_version": document["gntik_ui_version"],
+            "server_info": document["server_info"],
+            "tools_available": document["tools_available"],
+            "summary": document["summary"],
             "evidence": receipts,
         }
 

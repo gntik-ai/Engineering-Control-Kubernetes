@@ -368,6 +368,17 @@ def parser() -> argparse.ArgumentParser:
     )
     ui_inventory.add_argument("--source-sha", help="default: the checkout's HEAD commit")
     ui_inventory.add_argument("--output-dir", type=Path)
+    # NEW-121 v2: local gntik-ui kit snapshot from the digest-pinned image (no model).
+    ui_kit = commands.add_parser("ui-kit-snapshot")
+    ui_kit.add_argument("--project", choices=("falcone",), default="falcone")
+    ui_kit.add_argument(
+        "--manifest",
+        type=Path,
+        help="project manifest (default: /etc/engineering-control/projects.d/<project>.yaml)",
+    )
+    for kind in ("template", "block", "component"):
+        ui_kit.add_argument(f"--{kind}", action="append", default=[], dest=f"{kind}s")
+    ui_kit.add_argument("--output-dir", type=Path)
     dashboard = commands.add_parser("dashboard")
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
     for name in ("init-password", "reset-password"):
@@ -834,10 +845,14 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
 
 def main() -> None:
     arguments = parser().parse_args()
-    if arguments.command == "ui-inventory":
+    if arguments.command in {"ui-inventory", "ui-kit-snapshot"}:
         try:
-            result = _ui_inventory_command(arguments)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            result = (
+                _ui_inventory_command(arguments)
+                if arguments.command == "ui-inventory"
+                else _ui_kit_snapshot_command(arguments)
+            )
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(f"engineering-ctl: {error}", file=sys.stderr)
             raise SystemExit(1) from error
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -859,24 +874,12 @@ def main() -> None:
 
 def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
     """Inventory a local checkout read-only; writes only the requested output directory."""
-    import yaml
-
-    from engineering_control.engineering.models import ProjectManifest
     from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
 
     checkout = Path(arguments.checkout).resolve(strict=True)
     if not checkout.is_dir():
         raise ValueError("--checkout must be a directory")
-    manifest_path = arguments.manifest or Path(
-        f"/etc/engineering-control/projects.d/{arguments.project}.yaml"
-    )
-    manifest = ProjectManifest.model_validate(
-        yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8"))
-    )
-    if manifest.project != arguments.project:
-        raise ValueError("the manifest belongs to another project")
-    if manifest.ui_migration is None:
-        raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {arguments.project} has no ui_migration")
+    policy = _ui_migration_policy(arguments)
     source_sha = (
         arguments.source_sha
         or subprocess.run(  # noqa: S603
@@ -887,9 +890,7 @@ def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
             timeout=30,
         ).stdout.strip()
     )
-    document = build_inventory(
-        checkout, manifest.ui_migration, source_sha=source_sha, project=arguments.project
-    )
+    document = build_inventory(checkout, policy, source_sha=source_sha, project=arguments.project)
     result: dict[str, Any] = {
         "schema_version": document["schema_version"],
         "project": document["project"],
@@ -908,6 +909,71 @@ def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
         json_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", "utf-8")
         markdown_path.write_text(render_markdown(document), encoding="utf-8")
         result["outputs"] = [str(json_path), str(markdown_path)]
+    return result
+
+
+def _ui_migration_policy(arguments: argparse.Namespace) -> Any:
+    import yaml
+
+    from engineering_control.engineering.models import ProjectManifest
+
+    manifest_path = arguments.manifest or Path(
+        f"/etc/engineering-control/projects.d/{arguments.project}.yaml"
+    )
+    manifest = ProjectManifest.model_validate(
+        yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8"))
+    )
+    if manifest.project != arguments.project:
+        raise ValueError("the manifest belongs to another project")
+    if manifest.ui_migration is None:
+        raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {arguments.project} has no ui_migration")
+    return manifest.ui_migration
+
+
+def _ui_kit_snapshot_command(arguments: argparse.Namespace) -> dict[str, Any]:
+    """Run the pinned gntik-ui image locally and write the kit snapshot (read-only tools)."""
+    import asyncio
+
+    from engineering_control.engineering.ui_kit import (
+        UI_MCP_UNAVAILABLE,
+        GntikUiKitClient,
+        KitUnavailable,
+        collect_kit_snapshot,
+        snapshot_plan,
+    )
+
+    policy = _ui_migration_policy(arguments)
+    plan = snapshot_plan(
+        templates=arguments.templates, blocks=arguments.blocks, components=arguments.components
+    )
+
+    async def collect() -> dict[str, Any]:
+        async with GntikUiKitClient.from_policy(policy) as client:
+            return await collect_kit_snapshot(
+                client,
+                image=policy.mcp.image,
+                digest=policy.mcp.digest,
+                gntik_ui_version=policy.gntik_ui.version,
+                plan=plan,
+            )
+
+    try:
+        document = asyncio.run(collect())
+    except KitUnavailable as error:
+        return {"status": "BLOCKED", "blocker": UI_MCP_UNAVAILABLE, "reason": str(error)}
+    result: dict[str, Any] = {
+        "status": "UI_KIT_SNAPSHOT_PASS",
+        "snapshot_sha256": document["snapshot_sha256"],
+        "image": document["image"],
+        "gntik_ui_version": document["gntik_ui_version"],
+        "summary": document["summary"],
+    }
+    if arguments.output_dir is not None:
+        output = Path(arguments.output_dir).resolve()
+        output.mkdir(parents=True, exist_ok=True)
+        path = output / f"ui-kit-snapshot-{document['snapshot_sha256'][:12]}.json"
+        path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", "utf-8")
+        result["outputs"] = [str(path)]
     return result
 
 

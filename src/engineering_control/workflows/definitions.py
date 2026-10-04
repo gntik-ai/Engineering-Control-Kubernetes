@@ -468,6 +468,7 @@ class ControlledWorkflow:
             "observability.prepare_workspace",
             "observability.cleanup_workspace",
             "ui.inventory",
+            "ui.kit_snapshot",
         }:
             return task_queue_for("scan")
         if step == "finding.reproduce":
