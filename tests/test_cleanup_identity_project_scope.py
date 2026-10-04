@@ -84,8 +84,18 @@ def _preview(project: str) -> dict:
 class Fixture:
     """Candidates for every removal set, two projects plus platform and unattributable."""
 
-    def __init__(self, blockers: dict[str, str], *, only: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        blockers: dict[str, str],
+        *,
+        only: set[str] | None = None,
+        recover_blockers: dict[str, str] | None = None,
+        recover_status: str | None = None,
+    ) -> None:
         self.blockers = blockers
+        self.recover_blockers = recover_blockers or {}
+        self.recover_status = recover_status
+        self.order: list[str] = []
         wanted = only or {"falcone", "musematic", "platform", "unattributable"}
         self.worktrees: list[dict] = []
         self.components: list[dict] = []
@@ -128,6 +138,7 @@ class Fixture:
     def step(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         """The scripted activity result, mirroring the keys the real activities return."""
         self.calls[name] = payload
+        self.order.append(name)
         result = dict(payload)
         if name == "cleanup.discover":
             result.update(
@@ -179,10 +190,15 @@ class Fixture:
                 ],
             )
         elif name == "identity.recover_stale":
-            result["recovered_managed_identities"] = {
-                project: [item["id"] for item in items]
-                for project, items in payload["stale_identity_candidates"].items()
-            }
+            result.update(
+                status=self.recover_status or ("BLOCKED" if self.recover_blockers else "PASS"),
+                identity_recovery_blockers=self.recover_blockers,
+                recovered_managed_identities={
+                    project: [item["id"] for item in items]
+                    for project, items in payload["stale_identity_candidates"].items()
+                    if project not in self.recover_blockers
+                },
+            )
         elif name == "cleanup.execute":
             result.update(
                 removed_lease_ids=[value["lease_id"] for value in payload["authorized_candidates"]],
@@ -254,6 +270,7 @@ async def _run_scripted(
         payload = {**payload, "orchestration": {"workflow_id": workflow_id}}
         if name == "cleanup.finalize":
             fixture.calls[name] = payload
+            fixture.order.append(name)
             return await handler.handle(name, payload)
         return fixture.step(name, payload)
 
@@ -288,6 +305,12 @@ async def test_musematic_blocker_cleans_falcone_and_protects_musematic(tmp_path:
     assert [p["project"] for p in authorized["inspected_preview_namespace_candidates"]] == [
         "falcone"
     ]
+    # Recovery runs before the first removal on the scoped path.
+    assert fixture.order.index("identity.recover_stale") < fixture.order.index(
+        "cleanup.execute_evidence_files"
+    )
+    assert fixture.order.count("identity.recover_stale") == 1
+    assert fixture.order.count("cleanup.authorize") == 1
     recover = fixture.calls["identity.recover_stale"]
     assert recover["stale_identity_candidates"] == {"falcone": fixture.identities["falcone"]}
     assert recover["cleanup_blocked_projects"] == MUSEMATIC_BLOCKED
@@ -373,6 +396,117 @@ async def test_unscopable_blockers_still_block_everything(
         assert (run.status, run.error_code) == ("BLOCKED", "CLEANUP_IDENTITY_INSPECTION_BLOCKED")
         assert len(list(session.scalars(select(NotificationOutbox)))) == 1
     handler.engine.dispose()
+
+
+async def test_a_recovery_time_blocker_withholds_that_project_before_any_removal(
+    tmp_path: Path,
+) -> None:
+    falcone_failed = {"falcone": "SUPERADMIN_TARGET_INVALID"}
+    fixture = Fixture(
+        MUSEMATIC_BLOCKED,
+        only={"falcone", "musematic", "platform"},
+        recover_blockers=falcone_failed,
+    )
+    result, handler, identifier = await _run_scripted(tmp_path, fixture)
+
+    assert result["status"] == "PARTIAL"
+    assert result["blocked_projects"] == {**MUSEMATIC_BLOCKED, **falcone_failed}
+    assert fixture.order.count("cleanup.authorize") == 2
+    assert fixture.order.index("identity.recover_stale") < fixture.order.index(
+        "cleanup.execute_evidence_files"
+    )
+    reauthorized = fixture.calls["cleanup.authorize"]
+    assert reauthorized["eligible_candidates"] == []
+    assert reauthorized["component_lease_cleanup_candidates"] == []
+    assert _ids(reauthorized["inspected_file_candidates"], "candidate_id") == {"d" * 64}
+    assert reauthorized["inspected_preview_namespace_candidates"] == []
+    executed = fixture.calls["cleanup.execute"]
+    assert executed["authorized_candidates"] == []
+    protected = fixture.calls["cleanup.finalize"]["identity_blocked_candidates"]
+    assert {(value["kind"], value["project"]) for value in protected} >= {
+        ("worktree", "falcone"),
+        ("worktree", "musematic"),
+        ("file", "falcone"),
+        ("preview-namespace", "musematic"),
+    }
+    with handler.sessions() as session:
+        run = session.get(Run, identifier)
+        assert run is not None
+        assert (run.status, run.error_code) == ("PARTIAL", "CLEANUP_IDENTITY_BLOCKED_PROJECTS")
+        assert identity_blocked_projects_from_summary(run.summary) == {
+            **MUSEMATIC_BLOCKED,
+            **falcone_failed,
+        }
+        assert all(lease.released_at is None for lease in session.scalars(select(WorktreeLease)))
+    handler.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("only", "recover_blockers", "recover_status"),
+    [
+        ({"falcone", "musematic", "platform"}, {"global": "SUPERADMIN_UNAVAILABLE"}, None),
+        ({"falcone", "musematic", "platform"}, {}, "BLOCKED"),
+        ({"falcone", "musematic", "platform"}, {}, "FAILED"),
+        ({"falcone", "musematic"}, {"falcone": "SUPERADMIN_TARGET_INVALID"}, None),
+    ],
+    ids=["unattributable", "blocked-without-blocker", "failed", "every-remaining-project"],
+)
+async def test_an_unscopable_recovery_failure_blocks_before_any_removal(
+    tmp_path: Path,
+    only: set[str],
+    recover_blockers: dict[str, str],
+    recover_status: str | None,
+) -> None:
+    fixture = Fixture(
+        MUSEMATIC_BLOCKED,
+        only=only,
+        recover_blockers=recover_blockers,
+        recover_status=recover_status,
+    )
+    result, handler, identifier = await _run_scripted(tmp_path, fixture)
+
+    assert result["status"] == "BLOCKED"
+    assert not any(".execute" in name for name in fixture.order)
+    assert fixture.order[-1] == "cleanup.finalize"
+    with handler.sessions() as session:
+        run = session.get(Run, identifier)
+        assert run is not None
+        assert (run.status, run.error_code) == ("BLOCKED", "CLEANUP_IDENTITY_RECOVERY_BLOCKED")
+    handler.engine.dispose()
+
+
+def test_pruning_excludes_every_leased_and_protected_path(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+
+    from engineering_control.activities.scan import ScanActivityHandler
+
+    handler = ScanActivityHandler(
+        Settings(worktree_root=tmp_path / "worktrees", cleanup_execution_enabled=True)
+    )
+    handler.manager = MagicMock()
+    handler.manager.prune_orphan_worktrees.return_value = {"removed": [], "kept": []}
+    # The NEW-119 review case: an old detached falcone checkout whose lease branch names
+    # musematic, kept by inspection as BRANCH_IDENTITY_MISMATCH while musematic is blocked.
+    mismatched = _worktree("falcone", "falcone", branch_project="musematic")
+    eligible = _worktree("falcone-charts", "falcone")
+    handler._prune_orphan_worktrees(
+        {
+            "dry_run": False,
+            "leased_worktree_paths": [f"{ROOT}/llmwiki/leased"],
+            "cleanup_candidates": [mismatched, eligible],
+            "eligible_candidates": [eligible],
+            "protected_candidates": [{**mismatched, "protection": "BRANCH_IDENTITY_MISMATCH"}],
+            "cleanup_identity_blocked_repositories": ["musematic", "musematic-deploy"],
+        }
+    )
+
+    kwargs = handler.manager.prune_orphan_worktrees.call_args.kwargs
+    assert kwargs["excluded_repositories"] == frozenset({"musematic", "musematic-deploy"})
+    assert kwargs["excluded_paths"] == frozenset(
+        {f"{ROOT}/llmwiki/leased", mismatched["worktree_path"], eligible["worktree_path"]}
+    )
+    with pytest.raises(ValueError, match="lacks its path"):
+        handler._prune_orphan_worktrees({"protected_candidates": [{"lease_id": "x"}]})
 
 
 def test_an_undeterminable_candidate_is_protected_not_removed() -> None:

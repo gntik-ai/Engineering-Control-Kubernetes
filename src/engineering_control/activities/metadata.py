@@ -7585,6 +7585,10 @@ class MetadataActivityHandler:
                 run.status = "RUNNING"
                 run.started_at = run.started_at or now
             leases = session.scalars(select(WorktreeLease)).all()
+            # NEW-119: orphan pruning never touches a path an unreleased lease tracks.
+            leased_worktree_paths = sorted(
+                lease.worktree_path for lease in leases if lease.released_at is None
+            )
             for lease in leases:
                 reason = self._cleanup_lease_eligibility(session, lease, now)
                 if reason is None:
@@ -7673,6 +7677,7 @@ class MetadataActivityHandler:
             **payload,
             "status": "CLEANUP_CANDIDATES_DISCOVERED",
             "cleanup_candidates": sorted(candidates, key=lambda value: value["lease_id"]),
+            "leased_worktree_paths": leased_worktree_paths,
             "component_lease_cleanup_candidates": component_candidates,
             "file_cleanup_candidates": file_candidates,
             "file_cleanup_candidate_projects": file_candidate_projects,

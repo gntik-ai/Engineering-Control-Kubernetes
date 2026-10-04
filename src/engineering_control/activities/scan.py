@@ -687,8 +687,28 @@ class ScanActivityHandler:
         excluded = payload.get("cleanup_identity_blocked_repositories", [])
         if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
             raise ValueError("identity-blocked cleanup repositories are invalid")
+        # A leased or inspection-protected path is excluded explicitly, so an
+        # unattributable protected checkout is never taken for an orphan snapshot.
+        raw_leased = payload.get("leased_worktree_paths", [])
+        if not isinstance(raw_leased, list) or not all(
+            isinstance(item, str) for item in raw_leased
+        ):
+            raise ValueError("leased worktree paths are invalid")
+        excluded_paths = set(raw_leased)
+        for key in ("cleanup_candidates", "eligible_candidates", "protected_candidates"):
+            records = payload.get(key, [])
+            if not isinstance(records, list):
+                raise ValueError("cleanup worktree records are invalid")
+            for record in records:
+                path = record.get("worktree_path") if isinstance(record, dict) else None
+                if not isinstance(path, str) or not path:
+                    raise ValueError("cleanup worktree record lacks its path")
+                excluded_paths.add(path)
         result = self.manager.prune_orphan_worktrees(
-            older_than=cutoff, dry_run=dry_run, excluded_repositories=frozenset(excluded)
+            older_than=cutoff,
+            dry_run=dry_run,
+            excluded_repositories=frozenset(excluded),
+            excluded_paths=frozenset(excluded_paths),
         )
         return {
             **payload,

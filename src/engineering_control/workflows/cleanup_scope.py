@@ -237,3 +237,36 @@ def scope_identity_blockers(context: dict[str, Any]) -> IdentityBlockerScope:
     return IdentityBlockerScope(
         blocked_all=False, blocked_projects=blocked, context=scoped, protected=protected
     )
+
+
+def rescope_after_recovery(
+    context: dict[str, Any], blocked_projects: dict[str, str]
+) -> IdentityBlockerScope:
+    """Fold blockers found by ``identity.recover_stale`` into an already scoped context.
+
+    Recovery runs before any removal on the scoped path. A recovery failure that names
+    a known project withholds that project's remaining candidates too; a failure that
+    names no project, or that reports no blocker at all, blocks the whole run.
+    """
+    raw = context.get("identity_recovery_blockers")
+    status = context.get("status")
+    if not isinstance(raw, dict) or status not in {"PASS", "BLOCKED"}:
+        return IdentityBlockerScope(blocked_all=True, blocked_projects={}, context=context)
+    if status == "BLOCKED" and not raw:
+        return IdentityBlockerScope(blocked_all=True, blocked_projects={}, context=context)
+    if not raw:
+        return IdentityBlockerScope(
+            blocked_all=False, blocked_projects=dict(blocked_projects), context=context
+        )
+    merged = {**{str(key): _reason(value) for key, value in raw.items()}, **blocked_projects}
+    scope = scope_identity_blockers({**context, "identity_recovery_blockers": merged})
+    if scope.blocked_all:
+        return scope
+    previous = context.get("identity_blocked_candidates")
+    protected = [*(previous if isinstance(previous, list) else []), *scope.protected]
+    return IdentityBlockerScope(
+        blocked_all=False,
+        blocked_projects=scope.blocked_projects,
+        context={**scope.context, "identity_blocked_candidates": protected},
+        protected=protected,
+    )

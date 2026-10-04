@@ -901,6 +901,7 @@ class GitWorktreeManager:
         dry_run: bool,
         limit: int = 200,
         excluded_repositories: frozenset[str] = frozenset(),
+        excluded_paths: frozenset[str] = frozenset(),
     ) -> dict[str, list[dict[str, str]]]:
         """NEW-85: remove worktree directories no lease ever tracks.
 
@@ -913,6 +914,9 @@ class GitWorktreeManager:
         are reported, never raised.
         """
         root = self.worktree_root.resolve()
+        # NEW-119: a path a lease tracks or that cleanup inspection protected is never
+        # pruned, whatever the project scoping says.
+        excluded = {Path(path).resolve(strict=False) for path in excluded_paths}
         removed: list[dict[str, str]] = []
         kept: list[dict[str, str]] = []
         slugs = sorted(
@@ -931,6 +935,8 @@ class GitWorktreeManager:
                 except ValueError:
                     continue
                 if target.is_symlink() or not target.is_dir():
+                    continue
+                if target in excluded or target.resolve() in excluded:
                     continue
                 modified = datetime.fromtimestamp(target.stat().st_mtime, UTC)
                 if modified > older_than:
