@@ -655,3 +655,45 @@ def test_evidence_and_cli_writes_never_follow_a_destination_symlink(
     with pytest.raises(ValueError, match="symlink"):
         _ui_kit_snapshot_command(arguments)
     assert victim.read_text(encoding="utf-8") == "original\n"
+
+
+# -- review round 4 (orchestrator) -------------------------------------------------------
+
+
+async def test_cancellation_before_the_process_is_assigned_still_removes_the_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "rm-ran"
+    client, _log_path = _stub(tmp_path, cleanup=["/bin/sh", "-c", f"touch {marker}"])
+    real_exec = asyncio.create_subprocess_exec
+    calls = {"n": 0}
+
+    async def spawn_then_cancel(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if args and "touch" in " ".join(map(str, args)):
+            return await real_exec(*args, **kwargs)  # the cleanup command itself
+        raise asyncio.CancelledError  # the CLI was spawned; `self.process` never assigned
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_then_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        async with client:
+            await client.call("get_rules")
+    assert client.process is None
+    assert client.removed_container is True and marker.exists()
+
+
+def test_evidence_directories_refuse_a_symlink_at_any_component(tmp_path: Path) -> None:
+    from engineering_control.engineering.safe_files import ensure_directory_no_follow
+
+    root = tmp_path / "evidence"
+    (root / "scan").mkdir(parents=True)
+    outside = tmp_path / "checkout"
+    outside.mkdir()
+    (root / "scan" / "ui-kit").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        ensure_directory_no_follow(root, root / "scan" / "ui-kit" / "abc")
+    assert not (outside / "abc").exists()
+    ensure_directory_no_follow(root, root / "scan" / "ui-inventory" / "abc")
+    assert (root / "scan" / "ui-inventory" / "abc").is_dir()
+    with pytest.raises(ValueError):
+        ensure_directory_no_follow(root, root / "scan" / ".." / "x")

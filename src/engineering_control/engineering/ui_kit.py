@@ -272,6 +272,7 @@ class GntikUiKitClient:
         self._deadline = 0.0
         self._escalate = asyncio.Event()
         self._closed = False
+        self._launch_attempted = False
 
     @classmethod
     def pinned(
@@ -367,6 +368,10 @@ class GntikUiKitClient:
         raise KitUnavailable(reason)
 
     async def _start(self) -> None:
+        # NEW-120 review 2: a cancellation can land after the Docker CLI was spawned but
+        # before `self.process` is assigned; the launch attempt alone makes cleanup remove
+        # the named container.
+        self._launch_attempted = True
         self.process = await asyncio.create_subprocess_exec(
             *self.argv,
             stdin=asyncio.subprocess.PIPE,
@@ -425,7 +430,8 @@ class GntikUiKitClient:
         try:
             # `--rm` removes only an exited container: whenever the CLI had to be killed,
             # failed or the session was aborted, remove the named container explicitly.
-            if process is not None and not clean and self.cleanup_argv is not None:
+            launched = process is not None or self._launch_attempted
+            if launched and not clean and self.cleanup_argv is not None:
                 await _best_effort(self.cleanup_argv, self.environment, self.cwd)
                 self.removed_container = True
         finally:

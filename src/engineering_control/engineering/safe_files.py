@@ -8,6 +8,33 @@ import uuid
 from pathlib import Path
 
 
+def ensure_directory_no_follow(root: Path, directory: Path, *, mode: int = 0o750) -> None:
+    """Create `directory` under the trusted `root`, refusing a symlink at EVERY component.
+
+    NEW-120 review 2: O_NOFOLLOW on the final component alone let a symlink at an
+    intermediate component (e.g. scan/ui-kit) redirect creation and writes. Each component
+    below `root` is created with mkdir(dir_fd=...) and opened with O_DIRECTORY|O_NOFOLLOW
+    relative to its already-opened parent, so no component can be a symlink."""
+    relative = directory.relative_to(root)
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"refusing a non-canonical evidence path: {relative}")
+    # The root is trusted configuration (settings.evidence_root): created if missing and
+    # opened normally; every component BELOW it must be a real directory.
+    root.mkdir(parents=True, exist_ok=True, mode=mode)
+    current = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in relative.parts:
+            try:
+                os.mkdir(part, mode, dir_fd=current)
+            except FileExistsError:
+                pass
+            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            os.close(current)
+            current = following
+    finally:
+        os.close(current)
+
+
 def write_text_no_follow(path: Path, text: str, *, mode: int = 0o640) -> None:
     """Write `text` to `path` via a temporary file in the same directory and `os.replace`.
 

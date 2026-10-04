@@ -37,7 +37,10 @@ from engineering_control.engineering.models import (
     ToolchainTestCommand,
     UiMigrationPolicy,
 )
-from engineering_control.engineering.safe_files import write_text_no_follow
+from engineering_control.engineering.safe_files import (
+    ensure_directory_no_follow,
+    write_text_no_follow,
+)
 from engineering_control.engineering.toolchain import (
     enabled_toolchain,
     load_toolchain_policy,
@@ -1218,7 +1221,7 @@ class ScanActivityHandler:
         document = build_inventory(worktree, policy, source_sha=source_sha, project=project.value)
         digest = str(document["inventory_sha256"])
         directory = self.settings.evidence_root / "scan" / "ui-inventory" / digest[:32]
-        directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        ensure_directory_no_follow(self.settings.evidence_root, directory)
         json_path = directory / "ui-inventory.json"
         markdown_path = directory / "ui-inventory.md"
         self._store_redacted_json(json_path, document)
@@ -1289,7 +1292,7 @@ class ScanActivityHandler:
     ) -> dict[str, Any]:
         digest = str(document["snapshot_sha256"])
         directory = self.settings.evidence_root / "scan" / "ui-kit" / digest[:32]
-        directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        ensure_directory_no_follow(self.settings.evidence_root, directory)
         path = directory / "ui-kit-snapshot.json"
         self._store_redacted_json(path, document)
         receipts = self._publish_reports(
