@@ -347,20 +347,43 @@ trust_level = "trusted"
 """
 
 
-def _prune(config: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+def _prune(
+    config: Path, *extra: str, codex_running: bool = False, concurrent_edit: bool = False
+) -> subprocess.CompletedProcess[str]:
+    # A pgrep stub keeps the quiescence check deterministic on hosts running Codex.
+    stub = config.parent.parent / f"pgrep-stub-{codex_running}"
+    stub.mkdir(exist_ok=True)
+    (stub / "pgrep").write_text(f"#!/bin/sh\nexit {0 if codex_running else 1}\n")
+    (stub / "pgrep").chmod(0o755)
+    environment = {**os.environ, "PATH": f"{stub}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+    if concurrent_edit:
+        environment["PRUNE_CODEX_TRUST_TEST_CONCURRENT_EDIT"] = "1"
     return subprocess.run(  # noqa: S603 - repository script on a temporary file
         ["/bin/bash", str(PRUNE), "--config", str(config), *extra],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
+        env=environment,
     )
+
+
+def _files(directory: Path) -> list[str]:
+    lock = "config.toml.prune.lock"
+    return sorted(item.name for item in directory.iterdir() if item.name != lock)
+
+
+def _config(tmp_path: Path, content: str) -> Path:
+    directory = tmp_path / "home"
+    directory.mkdir()
+    config = directory / "config.toml"
+    config.write_text(content, encoding="utf-8")
+    return config
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
 def test_prune_script_dry_run_changes_nothing(tmp_path: Path) -> None:
-    config = tmp_path / "config.toml"
-    config.write_text(_SAMPLE, encoding="utf-8")
+    config = _config(tmp_path, _SAMPLE)
 
     result = _prune(config, "--dry-run")
 
@@ -369,13 +392,12 @@ def test_prune_script_dry_run_changes_nothing(tmp_path: Path) -> None:
     assert "prune: /srv/engineering/worktrees/llmwiki/def" in result.stdout
     assert "2 of 4 project entries" in result.stdout
     assert config.read_text(encoding="utf-8") == _SAMPLE
-    assert list(tmp_path.iterdir()) == [config]
+    assert _files(config.parent) == ["config.toml"]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
 def test_prune_script_removes_only_worktree_entries(tmp_path: Path) -> None:
-    config = tmp_path / "config.toml"
-    config.write_text(_SAMPLE, encoding="utf-8")
+    config = _config(tmp_path, _SAMPLE)
     config.chmod(0o640)
     before = tomllib.loads(_SAMPLE)
 
@@ -389,10 +411,12 @@ def test_prune_script_removes_only_worktree_entries(tmp_path: Path) -> None:
     assert after == expected
     assert "# operator note" in config.read_text(encoding="utf-8")
     assert config.stat().st_mode & 0o777 == 0o640
-    [backup] = [item for item in tmp_path.iterdir() if item.name.startswith("config.toml.bak-")]
+    [backup] = [
+        item for item in config.parent.iterdir() if item.name.startswith("config.toml.bak-")
+    ]
     assert backup.read_text(encoding="utf-8") == _SAMPLE
     assert backup.stat().st_mode & 0o777 == 0o600
-    assert sorted(item.name for item in tmp_path.iterdir()) == ["config.toml", backup.name]
+    assert _files(config.parent) == ["config.toml", backup.name]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
@@ -404,11 +428,198 @@ def test_prune_script_removes_only_worktree_entries(tmp_path: Path) -> None:
     ],
 )
 def test_prune_script_refuses_invalid_or_unusual_layouts(tmp_path: Path, content: str) -> None:
-    config = tmp_path / "config.toml"
-    config.write_text(content, encoding="utf-8")
+    config = _config(tmp_path, content)
 
     result = _prune(config)
 
     assert result.returncode != 0
     assert config.read_text(encoding="utf-8") == content
-    assert list(tmp_path.iterdir()) == [config]
+    assert _files(config.parent) == ["config.toml"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
+def test_prune_script_refuses_a_concurrent_edit(tmp_path: Path) -> None:
+    config = _config(tmp_path, _SAMPLE)
+
+    result = _prune(config, concurrent_edit=True)
+
+    assert result.returncode == 3
+    assert "changed since it was read; nothing written" in result.stderr
+    # Only the simulated concurrent writer's line was added; nothing was pruned.
+    assert config.read_text(encoding="utf-8") == _SAMPLE + "# concurrent edit\n"
+    assert _files(config.parent) == ["config.toml"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
+def test_prune_script_refuses_while_codex_runs(tmp_path: Path) -> None:
+    config = _config(tmp_path, _SAMPLE)
+
+    result = _prune(config, codex_running=True)
+
+    assert result.returncode == 3
+    assert "codex process is running" in result.stderr
+    assert config.read_text(encoding="utf-8") == _SAMPLE
+    assert _files(config.parent) == ["config.toml"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the prune script refuses to run as root")
+def test_prune_script_refuses_while_another_prune_holds_the_lock(tmp_path: Path) -> None:
+    config = _config(tmp_path, _SAMPLE)
+    lock = config.parent / "config.toml.prune.lock"
+    with lock.open("a") as handle:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _prune(config)
+
+    assert result.returncode == 3
+    assert config.read_text(encoding="utf-8") == _SAMPLE
+
+
+def _base_repo(tmp_path: Path, files: dict[str, str], links: dict[str, str]) -> tuple[Path, str]:
+    repo = tmp_path / "worktrees" / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q")
+    for name, content in {"app.py": "x = 1\n", **files}.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(content, encoding="utf-8")
+    for name, target in links.items():
+        (repo / name).symlink_to(target)
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+    base = subprocess.run(  # noqa: S603 - fixed Git executable in the test harness
+        [GIT, "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo, base
+
+
+def _commit(repo: Path) -> None:
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "change")
+
+
+def _agent_paths(tmp_path: Path, repo: Path, base: str) -> list[str]:
+    from engineering_control.worktrees.manager import GitWorktreeManager
+
+    manager = GitWorktreeManager(
+        mirror_root=tmp_path / "mirrors",
+        worktree_root=tmp_path / "worktrees",
+        lease_root=tmp_path / "leases",
+        metadata_root=tmp_path / "metadata",
+    )
+    summary, _ = manager.change_evidence(repo, base_sha=base)
+    reported = summary["agent_config_paths"]
+    assert isinstance(reported, list)
+    return [str(item) for item in reported]
+
+
+def test_git_non_ascii_agent_config_name_is_refused(tmp_path: Path) -> None:
+    repo, base = _base_repo(tmp_path, {}, {})
+    (repo / ".codex" / "agents").mkdir(parents=True)
+    (repo / ".codex" / "agents" / "é.toml").write_text('model = "x"\n', encoding="utf-8")
+    _commit(repo)
+
+    assert _agent_paths(tmp_path, repo, base) == [".codex/agents/é.toml"]
+
+
+def test_git_rename_out_of_codex_is_refused(tmp_path: Path) -> None:
+    repo, base = _base_repo(tmp_path, {".codex/config.toml": 'model = "m"\n'}, {})
+    (repo / ".codex" / "config.toml").rename(repo / "agent-settings.toml")
+    _commit(repo)
+
+    assert _agent_paths(tmp_path, repo, base) == [".codex/config.toml"]
+
+
+def test_git_deleting_mcp_json_is_refused(tmp_path: Path) -> None:
+    repo, base = _base_repo(tmp_path, {"sub/.mcp.json": "{}\n"}, {})
+    (repo / "sub" / ".mcp.json").unlink()
+    _commit(repo)
+
+    assert _agent_paths(tmp_path, repo, base) == ["sub/.mcp.json"]
+
+
+def test_git_symlink_named_codex_is_refused(tmp_path: Path) -> None:
+    repo, base = _base_repo(tmp_path, {}, {})
+    (repo / "agent-settings").mkdir()
+    (repo / "agent-settings" / "config.toml").write_text('model = "x"\n', encoding="utf-8")
+    (repo / ".codex").symlink_to("agent-settings")
+    _commit(repo)
+
+    assert ".codex" in _agent_paths(tmp_path, repo, base)
+
+
+@pytest.mark.parametrize("commit", [True, False])
+def test_git_symlink_alias_to_agent_config_is_refused(tmp_path: Path, commit: bool) -> None:
+    repo, base = _base_repo(tmp_path, {".claude/settings.json": "{}\n"}, {})
+    (repo / "docs").mkdir()
+    (repo / "docs" / "alias").symlink_to("../.claude")
+    if commit:
+        _commit(repo)
+
+    assert _agent_paths(tmp_path, repo, base) == [
+        "docs/alias -> ../.claude",
+        "docs/alias -> .claude",
+    ]
+
+
+def test_git_existing_symlink_onto_changed_file_is_refused(tmp_path: Path) -> None:
+    repo, base = _base_repo(tmp_path, {"conf/config.toml": 'model = "m"\n'}, {".codex": "conf"})
+    (repo / "conf" / "config.toml").write_text('model = "evil"\n', encoding="utf-8")
+    _commit(repo)
+
+    assert _agent_paths(tmp_path, repo, base) == [".codex -> conf"]
+
+
+def test_git_ordinary_change_beside_shipped_agent_config_passes(tmp_path: Path) -> None:
+    # musematic ships .codex/; changing other files must still deliver.
+    repo, base = _base_repo(
+        tmp_path, {".codex/config.toml": 'model = "m"\n', ".codex/agents/a.toml": "x = 1\n"}, {}
+    )
+    (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+    (repo / "é.py").write_text("y = 1\n", encoding="utf-8")
+    _commit(repo)
+
+    assert _agent_paths(tmp_path, repo, base) == []
+
+
+def test_validation_uses_the_manager_git_agent_config_report(tmp_path: Path) -> None:
+    class Reporting(_Manager):
+        def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, Any], str]:
+            summary, diff = super().change_evidence(path, base_sha=base_sha)
+            # git C-quotes this name in changed_paths; the manager reports it raw.
+            if path.name == "source":
+                summary["agent_config_paths"] = [".codex/agents/é.toml"]
+            return summary, diff
+
+    changed = {"source": ['".codex/agents/\\303\\251.toml"'], "deployment": ["values.yaml"]}
+    manager = Reporting(changed)
+    (tmp_path / "projects").mkdir()
+    handler = ScanActivityHandler(
+        Settings(
+            worktree_root=tmp_path / "worktrees",
+            evidence_root=tmp_path / "evidence",
+            project_config_root=tmp_path / "projects",
+        ),
+        manager,  # type: ignore[arg-type]
+        scanner=_Scanner("source"),  # type: ignore[arg-type]
+        publisher=_Publisher(),  # type: ignore[arg-type]
+    )
+    passed: dict[str, Any] = {"structured_result": {"tests": []}}
+    validated = handler._validate_changeset(
+        {
+            "project": "musematic",
+            "change_set_id": str(uuid4()),
+            "source_worktree": str(tmp_path / "worktrees" / "source"),
+            "deployment_worktree": str(tmp_path / "worktrees" / "deployment"),
+            "source_repository": "musematic",
+            "deployment_repository": "musematic-deploy",
+            "source_base_sha": "a" * 40,
+            "deployment_base_sha": "b" * 40,
+            "agent_result": {"structured_result": {"decision": "PASS"}},
+            "source_maker_result": passed,
+            "deployment_maker_result": passed,
+        }
+    )
+
+    assert validated["blocker"] == "AGENT_CONFIG_CHANGE_REFUSED"
+    assert validated["agent_config_paths"] == ["source: .codex/agents/é.toml"]

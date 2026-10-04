@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -62,6 +62,7 @@ from engineering_control.identity.attestation import observer_contract_hash
 from engineering_control.models.enums import Project, Provider, RedactionStatus
 from engineering_control.models.reconciliation import PromotionPlan
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.worktrees.agent_config import is_agent_config_path
 from engineering_control.worktrees.manager import (
     GitWorktreeManager,
     WorktreeAccess,
@@ -2616,7 +2617,11 @@ class ScanActivityHandler:
                 # findings. git clean -X never touches tracked or non-ignored files.
                 self._clean_ignored_toolchain_artifacts(worktree)
             summary, diff = self.manager.change_evidence(worktree, base_sha=str(payload[base_key]))
-            refused = self._agent_config_paths(summary.get("changed_paths"))
+            reported = summary.get("agent_config_paths")
+            refused = sorted(
+                set(self._agent_config_paths(summary.get("changed_paths")))
+                | {str(item) for item in (reported if isinstance(reported, list) else [])}
+            )
             if refused:
                 return {
                     **payload,
@@ -2730,18 +2735,13 @@ class ScanActivityHandler:
 
         Codex loads every `.codex/` folder between its cwd and the project root, Claude
         Code loads `.claude/` and `.mcp.json`; a maker that writes them could start an
-        MCP server or hook in a later run. Matches any directory level.
+        MCP server or hook in a later run. Any component, including the last, matches.
+        The worktree manager adds what a path list cannot show (NUL-delimited raw
+        names, renames split, symlink targets and aliases) as `agent_config_paths`.
         """
         if not isinstance(changed_paths, list):
             return []
-        refused: list[str] = []
-        for path in changed_paths:
-            parts = PurePosixPath(str(path)).parts
-            if any(part in {".codex", ".claude"} for part in parts[:-1]) or (
-                parts and parts[-1] == ".mcp.json"
-            ):
-                refused.append(str(path))
-        return sorted(refused)
+        return sorted(str(path) for path in changed_paths if is_agent_config_path(str(path)))
 
     @staticmethod
     def _classify_release_impact(

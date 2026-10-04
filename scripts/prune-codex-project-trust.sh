@@ -21,6 +21,12 @@
 #           --prefix /srv/engineering/worktrees.
 # A real run first copies the file to <config>.bak-<UTC timestamp> (mode 0600), then
 # replaces it atomically (same directory temp file, fsync, rename) keeping its mode.
+#
+# Codex rewrites this file itself (it adds trust entries), so run it only when no
+# delivery is active on the worker and no Codex process runs as the runner user. The
+# script refuses while one does (pgrep), holds an exclusive flock on
+# <config>.prune.lock, and re-verifies the file's sha256 and mtime immediately before
+# the rename: if anything changed it since it was read, nothing is written (exit 3).
 set -euo pipefail
 umask 077
 
@@ -59,7 +65,19 @@ if [[ "$(stat -c %u -- "$config")" != "$(id -u)" ]]; then
   exit 2
 fi
 
+# The runner's codex binary is named codex (not this script, nor a .codex/ path).
+if pgrep -u "$(id -u)" -f '(^|/)codex( |$)' >/dev/null; then
+  echo "a codex process is running as $(id -un); retry when no delivery is active" >&2
+  exit 3
+fi
+exec 9>>"$config.prune.lock"
+if ! flock -n 9; then
+  echo "another prune holds $config.prune.lock" >&2
+  exit 3
+fi
+
 exec "${PYTHON:-python3}" - "$config" "$prefix" "$dry_run" <<'PY'
+import hashlib
 import os
 import posixpath
 import re
@@ -70,8 +88,20 @@ from datetime import UTC, datetime
 
 config, prefix, dry_run = sys.argv[1], posixpath.normpath(sys.argv[2]), sys.argv[3] == "1"
 
-with open(config, "rb") as handle:
-    raw = handle.read()
+def fingerprint() -> tuple[str, int, int, bytes]:
+    """sha256, mtime_ns and size of the current file, read between two stats."""
+    first = os.stat(config)
+    with open(config, "rb") as handle:
+        content = handle.read()
+    second = os.stat(config)
+    if (first.st_mtime_ns, first.st_size, first.st_ino) != (
+        second.st_mtime_ns, second.st_size, second.st_ino
+    ):
+        sys.exit("config changed while it was read; nothing written")
+    return hashlib.sha256(content).hexdigest(), second.st_mtime_ns, second.st_ino, content
+
+
+source_sha, source_mtime, source_inode, raw = fingerprint()
 text = raw.decode("utf-8")
 try:
     before = tomllib.loads(text)
@@ -152,6 +182,15 @@ try:
     with open(temporary, "rb") as handle:
         if tomllib.loads(handle.read().decode("utf-8")) != after:
             sys.exit("written temp file does not match the validated result; nothing replaced")
+    if os.environ.get("PRUNE_CODEX_TRUST_TEST_CONCURRENT_EDIT") == "1":
+        # Test hook only: simulate a concurrent writer between read and replace.
+        with open(config, "ab") as handle:
+            handle.write(b"# concurrent edit\n")
+    # Lost-update guard: the source must be exactly what was read and validated.
+    if fingerprint()[:3] != (source_sha, source_mtime, source_inode):
+        os.unlink(backup)
+        print(f"config changed since it was read; nothing written: {config}", file=sys.stderr)
+        sys.exit(3)
     os.replace(temporary, config)
 except BaseException:
     if os.path.exists(temporary):
