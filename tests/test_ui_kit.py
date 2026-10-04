@@ -1193,3 +1193,25 @@ async def test_cancellation_during_a_graceful_close_aborts_the_connection(
         assert writer.get_extra_info("socket").fileno() == -1
         service.release.set()
         assert await asyncio.to_thread(service.eof.wait, 10)
+
+
+def test_evidence_writes_work_under_a_traverse_only_shared_root(tmp_path: Path) -> None:
+    # Hotfix 2026-10-04: on the worker /srv/engineering/evidence is traverse-only for the
+    # scan worker, which writes only below its own evidence/scan directory.
+    from engineering_control.engineering.safe_files import open_directory_no_follow, write_text_at
+
+    shared = tmp_path / "evidence"
+    own = shared / "scan"
+    own.mkdir(parents=True)
+    shared.chmod(0o311)  # write+traverse for the owner only in tests; no read (no listing)
+    try:
+        verified = open_directory_no_follow(own, own / "ui-kit" / "abc")
+        try:
+            write_text_at(verified, "ui-kit-snapshot.json", "{}\n")
+        finally:
+            os.close(verified)
+        assert (own / "ui-kit" / "abc" / "ui-kit-snapshot.json").read_text() == "{}\n"
+        with pytest.raises(PermissionError):
+            os.close(open_directory_no_follow(shared, own / "ui-kit" / "def"))
+    finally:
+        shared.chmod(0o755)

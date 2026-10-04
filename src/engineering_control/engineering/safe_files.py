@@ -18,9 +18,12 @@ def open_directory_no_follow(root: Path, directory: Path, *, mode: int = 0o750) 
     relative = directory.relative_to(root)
     if any(part in {"", ".", ".."} for part in relative.parts):
         raise ValueError(f"refusing a non-canonical evidence path: {relative}")
-    # The root is trusted configuration (settings.evidence_root): created if missing and
-    # opened normally; every component BELOW it must be a real directory.
-    root.mkdir(parents=True, exist_ok=True, mode=mode)
+    # The root is the worker's own trusted evidence directory: created only if missing (a
+    # shared parent such as /srv/engineering/evidence is traverse-only for the worker, so
+    # it is never opened or created here) and opened as a path handle; every component
+    # BELOW it must be a real directory.
+    if not root.is_dir():
+        root.mkdir(parents=True, exist_ok=True, mode=mode)
     current = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in relative.parts:
