@@ -944,6 +944,11 @@ def test_prune_orphan_worktrees_removes_only_old_untracked_directories(tmp_path:
     from datetime import UTC, datetime, timedelta
 
     cutoff = datetime.now(UTC) - timedelta(days=14)
+    # NEW-119: an identity-blocked project's repositories are not walked at all.
+    withheld = manager.prune_orphan_worktrees(
+        older_than=cutoff, dry_run=False, excluded_repositories=frozenset({"falcone"})
+    )
+    assert withheld == {"removed": [], "kept": []} and snapshot.path.exists()
     dry = manager.prune_orphan_worktrees(older_than=cutoff, dry_run=True)
     assert {item["path"] for item in dry["removed"]} == {str(snapshot.path)}
     assert snapshot.path.exists() and unowned.exists()

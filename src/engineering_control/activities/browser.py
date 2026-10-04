@@ -141,7 +141,13 @@ class BrowserActivityHandler:
             self.settings.browser_credential_root,
             production_permissions=self.settings.environment == "production",
         )
+        # NEW-119: a project whose identity inspection was blocked is not recovered (its
+        # candidates were withheld) and not logged into again during this cleanup.
+        withheld = payload.get("cleanup_blocked_projects")
+        skipped = set(withheld) if step == "identity.recover_stale" and withheld else set()
         for project in ("falcone", "musematic"):
+            if project in skipped:
+                continue
             try:
                 credential = loader.load(project)
                 if not self._superadmin_target_valid(project, credential.base_url):

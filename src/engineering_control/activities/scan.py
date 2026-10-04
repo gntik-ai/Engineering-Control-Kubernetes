@@ -683,7 +683,13 @@ class ScanActivityHandler:
         """NEW-85: snapshots/acceptance leftovers no lease tracks (dry-run reports only)."""
         dry_run = payload.get("dry_run") is not False or not self.settings.cleanup_execution_enabled
         cutoff = datetime.now(UTC) - timedelta(days=self.settings.cleanup_retention_days)
-        result = self.manager.prune_orphan_worktrees(older_than=cutoff, dry_run=dry_run)
+        # NEW-119: an identity-blocked project's repositories are left untouched.
+        excluded = payload.get("cleanup_identity_blocked_repositories", [])
+        if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
+            raise ValueError("identity-blocked cleanup repositories are invalid")
+        result = self.manager.prune_orphan_worktrees(
+            older_than=cutoff, dry_run=dry_run, excluded_repositories=frozenset(excluded)
+        )
         return {
             **payload,
             "status": "ORPHAN_WORKTREES_INSPECTED" if dry_run else "ORPHAN_WORKTREES_PRUNED",

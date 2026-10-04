@@ -115,6 +115,13 @@ from engineering_control.retention_limits import (
     NOTIFICATION_OUTBOX_PENDING_STATUS,
 )
 from engineering_control.security.redaction import SecretRedactor
+from engineering_control.workflows.cleanup_scope import (
+    CLEANUP_IDENTITY_BLOCKED_PROJECTS,
+    CLEANUP_IDENTITY_BLOCKED_SUMMARY,
+    CLEANUP_PROJECTS,
+    IDENTITY_BLOCKED_PROTECTION,
+    PROJECT_UNATTRIBUTABLE_PROTECTION,
+)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -7608,6 +7615,15 @@ class MetadataActivityHandler:
                 )
             component_candidates = self._component_cleanup_candidates(session, now)
             file_candidates = self._file_cleanup_candidates(session, now)
+            # NEW-119: the owning Run's project lets an identity blocker withhold only
+            # that project's files; a candidate missing here is protected, not removed.
+            file_candidate_projects: dict[str, str] = {}
+            for file_candidate in file_candidates:
+                owner_run = session.get(Run, UUID(str(file_candidate["run_id"])))
+                if owner_run is not None:
+                    file_candidate_projects[str(file_candidate["candidate_id"])] = str(
+                        owner_run.project
+                    )
             preview_candidates = self._preview_namespace_cleanup_candidates(session, now)
             event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
             dashboard_event_cleanup_count = int(
@@ -7659,6 +7675,7 @@ class MetadataActivityHandler:
             "cleanup_candidates": sorted(candidates, key=lambda value: value["lease_id"]),
             "component_lease_cleanup_candidates": component_candidates,
             "file_cleanup_candidates": file_candidates,
+            "file_cleanup_candidate_projects": file_candidate_projects,
             "preview_namespace_cleanup_candidates": preview_candidates,
             "dashboard_event_cleanup_count": dashboard_event_cleanup_count,
             "dashboard_session_revocation_cleanup_count": (
@@ -8117,8 +8134,11 @@ class MetadataActivityHandler:
     def _finalize_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
         workflow_id = str(payload["orchestration"]["workflow_id"])
         terminal = str(payload.get("terminal_status", ""))
-        if terminal not in {"DRY_RUN", "COMPLETE", "BLOCKED"}:
+        if terminal not in {"DRY_RUN", "COMPLETE", "PARTIAL", "BLOCKED"}:
             raise ValueError("cleanup terminal status is not allowlisted")
+        blocked_projects, identity_blocked = self._identity_blocked_cleanup_evidence(
+            payload, terminal
+        )
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
             run = session.scalar(
@@ -8128,7 +8148,7 @@ class MetadataActivityHandler:
                 raise ValueError("cleanup finalization Run is missing")
             if run.finished_at is not None:
                 return {**payload, "status": terminal}
-            if terminal == "COMPLETE":
+            if terminal in {"COMPLETE", "PARTIAL"}:
                 raw_authorized = payload.get("authorized_candidates")
                 raw_authorized_files = payload.get("authorized_file_candidates")
                 raw_authorized_components = payload.get("authorized_component_lease_candidates")
@@ -8224,6 +8244,24 @@ class MetadataActivityHandler:
                 }
                 if {str(value) for value in cleaned_previews} != expected_preview_deployments:
                     raise ValueError("preview cleanup tombstones do not match authorization")
+                # NEW-119: an identity-blocked candidate is withheld before authorization,
+                # so it must appear in no authorized or completed set.
+                withheld_ids = {str(value["candidate_id"]) for value in identity_blocked}
+                if withheld_ids & (
+                    authorized_ids
+                    | completed_ids
+                    | authorized_file_ids
+                    | completed_file_ids
+                    | authorized_component_ids
+                    | authorized_preview_ids
+                    | completed_preview_ids
+                ):
+                    raise ValueError("an identity-blocked cleanup candidate was authorized")
+                recovered_identities = payload.get("recovered_managed_identities", {})
+                if isinstance(recovered_identities, dict) and any(
+                    recovered_identities.get(project) for project in blocked_projects
+                ):
+                    raise ValueError("an identity-blocked project's identities were recovered")
 
                 run.status = "SUCCESS"
                 run.summary = (
@@ -8245,6 +8283,19 @@ class MetadataActivityHandler:
                     run.summary = (
                         f"{run.summary}; {len(protected_ids)} protected worktrees retained "
                         f"for the operator: {details}"
+                    )
+                if terminal == "PARTIAL":
+                    # NEW-119: the other projects were cleaned; the blocked projects'
+                    # candidates stay in place until their identity recovery works again.
+                    run.status = "PARTIAL"
+                    run.error_code = CLEANUP_IDENTITY_BLOCKED_PROJECTS
+                    run.summary = (
+                        f"{run.summary}; {CLEANUP_IDENTITY_BLOCKED_SUMMARY}: "
+                        + ", ".join(
+                            f"{project}={reason}"
+                            for project, reason in sorted(blocked_projects.items())
+                        )
+                        + f" ({len(identity_blocked)} candidates protected)"
                     )
             elif terminal == "DRY_RUN":
                 run.status = "SUCCESS"
@@ -8307,6 +8358,51 @@ class MetadataActivityHandler:
                     )
             run.finished_at = now
         return {**payload, "status": terminal}
+
+    @staticmethod
+    def _identity_blocked_cleanup_evidence(
+        payload: dict[str, Any], terminal: str
+    ) -> tuple[dict[str, str], list[dict[str, Any]]]:
+        """NEW-119: validate the projects and candidates withheld by an identity blocker."""
+        raw_projects = payload.get("cleanup_blocked_projects", {})
+        raw_candidates = payload.get("identity_blocked_candidates", [])
+        if terminal != "PARTIAL":
+            if terminal == "COMPLETE" and (raw_projects or raw_candidates):
+                raise ValueError("a cleanup with identity-blocked projects is not complete")
+            return {}, []
+        if (
+            not isinstance(raw_projects, dict)
+            or not raw_projects
+            or not all(
+                isinstance(project, str)
+                and project in CLEANUP_PROJECTS
+                and isinstance(reason, str)
+                and reason
+                for project, reason in raw_projects.items()
+            )
+        ):
+            raise ValueError("partial cleanup requires attributable identity-blocked projects")
+        if not isinstance(raw_candidates, list):
+            raise ValueError("identity-blocked cleanup evidence is invalid")
+        for value in raw_candidates:
+            if (
+                not isinstance(value, dict)
+                or value.get("kind")
+                not in {"worktree", "component-lease", "file", "preview-namespace", "identity"}
+                or not isinstance(value.get("candidate_id"), str)
+                or not value["candidate_id"]
+                or not str(value.get("protection", "")).startswith(
+                    f"{IDENTITY_BLOCKED_PROTECTION}:"
+                )
+            ):
+                raise ValueError("identity-blocked cleanup evidence is invalid")
+            project = value.get("project")
+            if value["protection"] != PROJECT_UNATTRIBUTABLE_PROTECTION and (
+                project not in raw_projects
+                or value["protection"] != f"{IDENTITY_BLOCKED_PROTECTION}:{raw_projects[project]}"
+            ):
+                raise ValueError("identity-blocked cleanup candidate names no blocked project")
+        return dict(raw_projects), raw_candidates
 
     def _cleanup_lease_eligibility(
         self, session: Any, lease: WorktreeLease, now: datetime

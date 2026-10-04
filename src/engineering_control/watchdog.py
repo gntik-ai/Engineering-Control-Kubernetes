@@ -16,7 +16,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 import structlog
-from sqlalchemy import create_engine, desc, select
+from sqlalchemy import and_, create_engine, desc, or_, select
 from sqlalchemy.orm import Session
 
 from engineering_control.config import Settings, get_settings
@@ -29,6 +29,10 @@ from engineering_control.db.models import (
 from engineering_control.logging import configure_logging
 from engineering_control.notifier import NotificationSink
 from engineering_control.operations.projection_health import projection_connection_status
+from engineering_control.workflows.cleanup_scope import (
+    CLEANUP_IDENTITY_BLOCKED_PROJECTS,
+    identity_blocked_projects_from_summary,
+)
 from engineering_control.workflows.worker_registry import ROLE_WORKER_REGISTRY
 
 logger = structlog.get_logger()
@@ -299,7 +303,17 @@ class OperationalWatchdog:
                 )
                 latest_cleanup_success = session.scalar(
                     select(Run)
-                    .where(Run.run_type == "cleanup", Run.status == "SUCCESS")
+                    .where(
+                        Run.run_type == "cleanup",
+                        or_(
+                            Run.status == "SUCCESS",
+                            # NEW-119: identity-blocked projects only; the rest was cleaned.
+                            and_(
+                                Run.status == "PARTIAL",
+                                Run.error_code == CLEANUP_IDENTITY_BLOCKED_PROJECTS,
+                            ),
+                        ),
+                    )
                     .order_by(desc(Run.finished_at), desc(Run.updated_at))
                     .limit(1)
                 )
@@ -345,6 +359,17 @@ class OperationalWatchdog:
                 else cleanup.finished_at or cleanup.updated_at
             )
             age = max(0, int((now - _utc(observed)).total_seconds()))
+            # NEW-119: a PARTIAL run whose only reason is identity-blocked projects is a
+            # success for freshness; the blocked projects are still reported below.
+            blocked_projects = (
+                identity_blocked_projects_from_summary(cleanup.summary)
+                if cleanup.status == "PARTIAL"
+                and cleanup.error_code == CLEANUP_IDENTITY_BLOCKED_PROJECTS
+                else {}
+            )
+            if latest_cleanup_success is not None and latest_cleanup_success.status == "PARTIAL":
+                if not identity_blocked_projects_from_summary(latest_cleanup_success.summary):
+                    latest_cleanup_success = None
             success_observed = (
                 latest_cleanup_success.finished_at or latest_cleanup_success.updated_at
                 if latest_cleanup_success is not None
@@ -356,7 +381,7 @@ class OperationalWatchdog:
                 <= self.settings.watchdog_cleanup_max_age_seconds
             )
             cleanup_ok = (
-                cleanup.status == "SUCCESS"
+                (cleanup.status == "SUCCESS" or bool(blocked_projects))
                 and age <= self.settings.watchdog_cleanup_max_age_seconds
             ) or (
                 cleanup.status == "RUNNING"
@@ -369,7 +394,18 @@ class OperationalWatchdog:
                     "cleanup-schedule",
                     cleanup_ok,
                     "CURRENT_OR_RUNNING" if cleanup_ok else "FAILED_OR_MISSED",
-                    "latest cleanup run is current with a recent successful baseline"
+                    (
+                        "latest cleanup run is current with a recent successful baseline"
+                        + (
+                            "; identity-blocked projects retained: "
+                            + ", ".join(
+                                f"{project}={reason}"
+                                for project, reason in sorted(blocked_projects.items())
+                            )
+                            if blocked_projects
+                            else ""
+                        )
+                    )
                     if cleanup_ok
                     else "cleanup failed, lacks a recent success, or exceeded its freshness bound",
                 )
