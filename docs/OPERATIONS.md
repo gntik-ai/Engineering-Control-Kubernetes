@@ -231,6 +231,27 @@ fresh delivery remains. ChangeSet worktrees in `REQUEST_CHANGES` are kept by the
 until neither the ChangeSet nor any of its runs changed for `cleanup_retention_days` (14 days by
 default); preview namespaces are cleaned only for terminal ChangeSets.
 
+## Retry after a provider outage (NEW-137)
+
+When a delivery attempt's spec, maker or checker call fails for a transient provider reason,
+the attempt's lease release records `REQUEST_CHANGES` on its `PLANNED`/`IMPLEMENTING` ChangeSet
+(`recovery_json.correction_requested.blocker = PROVIDER_UNAVAILABLE`, with `provider`,
+`error_code`, `provider_step` and `role`), once per attempt and only for the ChangeSet's latest
+attempt. The loop pauses with `DELIVERY_FAILED:PROVIDER_UNAVAILABLE` (a `RATE_LIMITED` child
+status pauses as `RATE_LIMITED`), and once the provider is back a plain
+`engineering-ctl backlog-retry <loop_workflow_id> <repository> <issue>` binds the next attempt
+without any database fix. Each retry is one child of the bounded correction lineage; no extra
+allowance is granted.
+
+Converted (explicit allowlist): a provider result `RATE_LIMITED`/`PROVIDER_RATE_LIMIT`,
+`FAILED`/`PROVIDER_MODEL_AT_CAPACITY`, or `FAILED`/`PROVIDER_EXIT_NONZERO` whose provider error
+text names an unavailable service (`API Error: 5xx`, overloaded, service unavailable, connection
+reset, ...); a typed `RATE_LIMITED` activity error; and `PROVIDER_ACTIVITY_FAILED` only after a
+heartbeat or schedule-to-start timeout (the provider worker stopped answering). Never converted:
+policy, schema, authentication, missing CLI, max turns/budget, sandbox, `PROVIDER_TIMEOUT`, any
+other activity error, or exit text that also names one of those causes; those still need an
+operator decision.
+
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved

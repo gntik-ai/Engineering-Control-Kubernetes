@@ -131,6 +131,7 @@ from engineering_control.workflows.cleanup_scope import (
     IDENTITY_BLOCKED_PROTECTION,
     PROJECT_UNATTRIBUTABLE_PROTECTION,
 )
+from engineering_control.workflows.provider_stops import provider_unavailable_stop
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -2969,9 +2970,18 @@ class MetadataActivityHandler:
         status = str(payload.get("status") or "")
         if status not in self._DELIVERY_STOP_STATUSES:
             return
-        blocker = str(payload.get("blocker") or status)
+        provider_stop = provider_unavailable_stop(payload)
+        blocker = (
+            provider_stop["blocker"] if provider_stop else str(payload.get("blocker") or status)
+        )
         blocker = blocker if re.fullmatch(r"[A-Z][A-Z0-9_:]{0,119}", blocker) else status
         details = [f"{status} {blocker} - {explain_blocker(blocker)}"]
+        if provider_stop:
+            # NEW-137: which provider call, and its allowlisted error code.
+            details.append(
+                f"{provider_stop['provider']} {provider_stop['provider_step']}: "
+                f"{provider_stop['error_code']}"
+            )
         last_step = str(payload.get("last_step") or "")
         if re.fullmatch(r"[a-z_]{1,40}\.[a-z_]{1,60}", last_step):
             details.append(f"at {last_step}")
@@ -9655,6 +9665,10 @@ def _record_correction_state(
 ) -> None:
     """NEW-128: persist REQUEST_CHANGES when a delivery attempt stops for a correction.
 
+    NEW-137: also when a provider call stopped it for an allowlisted transient reason
+    (blocker PROVIDER_UNAVAILABLE, with the provider and its error code), so a bounded
+    retry binds after a provider outage without a database fix.
+
     The bounded correction child (and an operator retry) may bind only to a ChangeSet in
     REQUEST_CHANGES, but the validation verdict was never persisted, so every automatic
     correction failed with "another delivery child requires an explicit correction state".
@@ -9664,8 +9678,14 @@ def _record_correction_state(
     moved the ChangeSet back to PLANNED) never changes it.
     """
     stop = (str(payload.get("status") or ""), str(payload.get("blocker") or ""))
+    provider_stop: dict[str, str] | None = None
     if stop not in _CORRECTION_STOPS:
-        return
+        # NEW-137: a provider call of the attempt (spec, maker or checker) failed for an
+        # allowlisted transient reason (falcone #1012: checker 529 Overloaded).
+        provider_stop = provider_unavailable_stop(payload)
+        if provider_stop is None:
+            return
+        stop = (provider_stop["status"], provider_stop["blocker"])
     if str(payload.get("change_set_id") or "") != str(change_set.id):
         return
     if change_set.state not in _CORRECTION_SOURCE_STATES:
@@ -9687,6 +9707,10 @@ def _record_correction_state(
         "blocker": stop[1],
         "recorded_at": datetime.now(UTC).isoformat(),
     }
+    if provider_stop is not None:
+        recovery["correction_requested"].update(
+            {key: provider_stop[key] for key in ("provider", "error_code", "provider_step", "role")}
+        )
     change_set.recovery_json = recovery
 
 

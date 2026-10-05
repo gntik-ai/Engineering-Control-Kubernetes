@@ -9,6 +9,7 @@ from uuid import UUID, uuid5
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, ChildWorkflowError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from engineering_control.workflows.cleanup_scope import (
     rescope_after_recovery,
@@ -43,6 +44,10 @@ from engineering_control.workflows.inputs import (
     StagingGitOpsDeliveryInput,
     UiBlueprintFanOutInput,
     UiMigrationPlanInput,
+)
+from engineering_control.workflows.provider_stops import (
+    PROVIDER_UNAVAILABLE,
+    provider_unavailable_stop,
 )
 from engineering_control.workflows.worker_registry import (
     CONTROL_TASK_QUEUE,
@@ -430,6 +435,11 @@ class ControlledWorkflow:
                 else "PROVIDER_ACTIVITY_FAILED"
             )
             failed: dict[str, Any] = {**started, "status": "FAILED", "blocker": blocker}
+            if blocker == "PROVIDER_ACTIVITY_FAILED":
+                # NEW-137: the bounded failure type (e.g. TIMEOUT_HEARTBEAT) tells a provider
+                # worker that stopped answering from a non-transient activity error. Data
+                # only (no command), so replay is unchanged.
+                failed["provider_failure_type"] = _provider_failure_type(cause)
             details = cause.details if isinstance(cause, ApplicationError) else ()
             if blocker == "SchemaViolation" and details and isinstance(details[0], dict):
                 # Usage of a call whose output failed its schema (numbers only).
@@ -3267,6 +3277,15 @@ def _child_failure_code(error: BaseException) -> str:
     return "CHILD_WORKFLOW_FAILED"
 
 
+def _provider_failure_type(cause: BaseException | None) -> str:
+    """NEW-137: bounded type of a provider activity failure (TIMEOUT_HEARTBEAT, ...)."""
+    if isinstance(cause, ActivityTimeoutError) and cause.type is not None:
+        return f"TIMEOUT_{cause.type.name}"
+    if isinstance(cause, ApplicationError) and cause.type:
+        return _failure_code(cause.type)
+    return _failure_code(type(cause).__name__) if cause is not None else "UNKNOWN"
+
+
 def _delivery_failure_blocker(delivery: dict[str, Any]) -> str:
     code = delivery.get("failure_code") or delivery.get("blocker") or "FAILED"
     return f"DELIVERY_FAILED:{_failure_code(str(code))}"
@@ -3771,6 +3790,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                     ) == "FAILED" and self._child_failure_pauses_patched(ordinal)
                     if delivery_failed:
                         blocker = _delivery_failure_blocker(delivery)
+                        if self._provider_unavailable_pause(delivery, ordinal, delivery_round):
+                            # NEW-137: the release recorded REQUEST_CHANGES; a retry binds.
+                            blocker = f"DELIVERY_FAILED:{PROVIDER_UNAVAILABLE}"
                     if global_child_blocker_return and request.global_campaign_id is not None:
                         await self._step(
                             "backlog.record_loop_state",
@@ -4691,6 +4713,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         if budget.get("status") != "EXHAUSTED":
             return None
         return str(budget.get("blocker") or "CORRECTION_LIMIT_EXHAUSTED")
+
+    @staticmethod
+    def _provider_unavailable_pause(
+        delivery: dict[str, Any], ordinal: int, delivery_round: int
+    ) -> bool:
+        """NEW-137: the FAILED child stopped because a provider call was unavailable.
+
+        The marker is asked only for such a child, and per issue and retry round (Temporal
+        memoizes a patch for the whole execution): a replayed pre-deploy pause keeps its
+        DELIVERY_FAILED:<code> blocker, while a later round of the same loop is named."""
+        if provider_unavailable_stop(delivery.get("context")) is None:
+            return False
+        return workflow.patched(
+            f"existing-backlog-provider-unavailable-pause-v1-{ordinal}-{delivery_round}"
+        )
 
     @staticmethod
     def _child_failure_pauses_patched(ordinal: int) -> bool:
