@@ -9,6 +9,7 @@ against the current class; the batched flow is tested in test_new_131_ui_batched
 
 from __future__ import annotations
 
+import inspect
 import shutil
 from collections.abc import Callable
 from contextlib import AsyncExitStack
@@ -108,10 +109,13 @@ class Harness:
             if scripted is None:
                 raise AssertionError(f"unscripted step {step!r}")
             if callable(scripted):
-                return scripted(payload)
-            if not scripted:
+                answer = scripted(payload)
+            elif not scripted:
                 raise AssertionError(f"no response left for {step!r}")
-            return scripted.pop(0)(payload)
+            else:
+                answer = scripted.pop(0)(payload)
+            # NEW-132: a responder may be a real (async) activity handler.
+            return await answer if inspect.isawaitable(answer) else answer
 
         return execute_control_step
 

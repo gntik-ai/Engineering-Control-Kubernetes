@@ -86,7 +86,7 @@ _PROVIDER_RESULT_KEYS = frozenset(
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
 # NEW-131: parts of the batched plan carried between steps but never into the next request.
 _PART_TRANSIENT_KEYS = frozenset(
-    {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief"}
+    {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief", "rejected_usage"}
 )
 
 # Design sections 7 and 10 (2026-10-04), given to the drafter and the reviewer as data.
@@ -741,6 +741,17 @@ class UiPlanActivityHandler:
     def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
         attempt = payload.get("draft_attempt")
+        rejected = payload.get("rejected_usage")
+        if isinstance(rejected, dict):
+            # NEW-132: the usage of a draft the provider boundary refused (schema).
+            entry = usage_entry(
+                rejected.get("agent_result"),
+                part_id=str(rejected.get("part_id")),
+                phase="draft",
+                attempt=int(rejected.get("attempt") or 1),
+            )
+            if entry is not None:
+                self.repository.record_usage_sync(self._blueprint_id(payload), entry)
         part_id, kind, part = self._part_identity(payload)
         base = {**self._part_base(payload), "part_id": part_id, "part_kind": kind}
         if attempt == 1:
@@ -781,7 +792,18 @@ class UiPlanActivityHandler:
         ]
         if kind == BATCH:
             sections.append(self._frame_section(blueprint_id, payload))
-        if attempt == 2:
+        rejection = payload.get("rejection")
+        if attempt == 2 and isinstance(rejection, dict):
+            # NEW-132: Hermes rejected the first draft deterministically; no review ran.
+            sections.append(
+                "This is the single redraft of this part. Hermes rejected your previous draft "
+                f"deterministically ({rejection.get('code')}): it violates the output schema "
+                "or the reference rules. Fix every finding below while keeping every hard "
+                "rule; a gap's blocks lists only epic IDs, page keys or u5-cutover. A second "
+                "rejection blocks the plan.\n"
+                + _fenced("hermes findings", _bounded_json(rejection.get("details") or [], 40_000))
+            )
+        elif attempt == 2:
             rounds = payload.get("part_rounds") or []
             sections.append(
                 "This is the single redraft of this part. An independent reviewer asked for "

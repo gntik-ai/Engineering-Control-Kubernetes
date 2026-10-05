@@ -279,7 +279,11 @@ The steps are:
    judgement fields of its pages), with `plan-ui-migration` (high effort, Read/Glob/Grep only,
    1800 s per call). Codex reviews every part with the same skill in review mode against the
    same slice. A `REVISE` redrafts only that part, once; a second `REVISE` ends `BLOCKED
-   BLUEPRINT_PART_REVIEW_UNRESOLVED`, naming the part, its pages and the findings. The complete
+   BLUEPRINT_PART_REVIEW_UNRESOLVED`, naming the part, its pages and the findings. NEW-132: a
+   first draft Hermes rejects (`DRAFT_SCHEMA_INVALID` or `DRAFT_STRUCTURE_INVALID`) uses that
+   single redraft too, with Hermes's findings and no review of the rejected draft; a second
+   rejection ends `BLOCKED` with the details. A gap's `blocks` holds only epic IDs, page keys
+   or `u5-cutover` (schema pattern; pack 1.5.1). The complete
    reviewed frame is staged as a file every batch drafter and reviewer reads. Part ids are
    deterministic (inventory, kit, pages, the reviewed frame, and the provenance: the skill and
    role instruction sources, profile and schemas): a later plan with the same inputs reuses

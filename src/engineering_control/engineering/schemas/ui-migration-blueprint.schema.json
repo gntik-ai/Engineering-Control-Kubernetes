@@ -791,7 +791,7 @@
           "maxItems": 100,
           "items": {
             "type": "string",
-            "minLength": 1,
+            "pattern": "^(u0-[a-z0-9][a-z0-9-]{0,63}|u5-cutover|[a-z0-9][a-z0-9-]{0,99})$",
             "maxLength": 100
           }
         },
