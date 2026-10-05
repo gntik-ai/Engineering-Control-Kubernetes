@@ -512,8 +512,15 @@ class ProviderActivityHandler:
             Draft202012Validator.check_schema(request.output_schema)
             Draft202012Validator(request.output_schema).validate(result.structured_result)
         except (SchemaError, ValidationError) as error:
+            # NEW-131 review 2: the call consumed tokens even though its output is refused;
+            # carry its reported usage (numbers only) so it is still accounted for.
             raise ApplicationError(
                 "provider result failed its immutable output schema",
+                {
+                    "usage": result.usage.model_dump(mode="json"),
+                    "provider": result.provider.value,
+                    "run_id": str(result.run_id),
+                },
                 type="SchemaViolation",
                 non_retryable=True,
             ) from error

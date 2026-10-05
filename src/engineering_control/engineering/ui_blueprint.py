@@ -121,6 +121,24 @@ def _version(value: Any) -> tuple[int, ...] | None:
     return tuple(int(part) for part in value.split("."))
 
 
+# NEW-131: from this profile on, plan-ui-migration drafts the blueprint in parts only.
+AGENT_PACK_PARTS_VERSION = (1, 5, 0)
+
+
+def agent_pack_parts_only(root: Path) -> bool:
+    """Whether the released pack's plan-ui-migration skill is parts-only (profile >= 1.5.0).
+
+    NEW-131 review 2: a whole-blueprint (pre-NEW-131) execution resumed under such a pack
+    would request output its instructions forbid, so it stops instead (start a new plan)."""
+    profile = _pack_bytes(root, "profiles/engineering.yaml")
+    try:
+        parsed = yaml.safe_load(profile) if profile is not None else None
+    except yaml.YAMLError:
+        return False
+    version = _version(parsed.get("version")) if isinstance(parsed, dict) else None
+    return version is not None and version >= AGENT_PACK_PARTS_VERSION
+
+
 def agent_pack_problems(root: Path, skills: tuple[str, ...] | None = None) -> list[str]:
     """What the released agent pack lacks for flow A (empty when it is usable).
 

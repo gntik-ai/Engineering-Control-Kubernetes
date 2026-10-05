@@ -649,3 +649,54 @@ def test_graph_rejects_a_dependency_on_a_deleted_page() -> None:
     details = _graph_rejection(blueprint, mechanical)
     assert f"{routed[2]} -> {orphan}: depends on a deleted page" in details
     check_assembled(_assembled()[0], INPUTS, mechanical)  # the untouched graph passes
+
+
+def test_legacy_whole_blueprint_steps_stop_under_the_parts_only_pack(tmp_path: Path) -> None:
+    # NEW-131 review 2: a pre-NEW-131 execution resumed under profile >= 1.5.0 must not
+    # request whole-blueprint output its instructions now forbid.
+    from unittest.mock import Mock
+
+    from engineering_control.activities.ui_plan import UiPlanActivityHandler
+    from engineering_control.config import Settings
+    from engineering_control.engineering.ui_blueprint import agent_pack_parts_only
+
+    old = build_fake_pack(tmp_path / "old", version="1.4.0")
+    new = build_fake_pack(tmp_path / "new", version="1.5.0")
+    assert (agent_pack_parts_only(old), agent_pack_parts_only(new)) == (False, True)
+    handler = UiPlanActivityHandler(
+        Settings(agent_pack_root=new), repository=Mock(), change_requests=Mock()
+    )
+    payload = {
+        "blueprint_id": "00000000-0000-4000-8000-000000000001",
+        "draft_attempt": 1,
+        "source_worktree": "/x",
+    }
+    for prepared in (handler._prepare_draft(payload), handler._prepare_review(payload)):
+        assert (prepared["status"], prepared["blocker"]) == (
+            "BLOCKED",
+            "UI_PLAN_LEGACY_SUPERSEDED",
+        )
+
+
+def test_schema_violation_usage_is_still_recorded() -> None:
+    # NEW-131 review 2: a refused (schema-violating) output still consumed tokens.
+    from engineering_control.workflows.definitions import UiMigrationPlanWorkflow
+
+    usage = {"input_tokens": 1234, "output_tokens": 567, "source": "provider_event"}
+    outcome = {
+        "status": "FAILED",
+        "blocker": "SchemaViolation",
+        "part_id": "batch-1",
+        "provider_step": "ui_plan.draft",
+        "draft_attempt": 1,
+        "failed_agent_usage": {"usage": usage, "provider": "claude", "run_id": "r"},
+    }
+    recorded = UiMigrationPlanWorkflow._part_usage(outcome)
+    assert recorded is not None
+    entry = usage_entry(recorded["agent_result"], part_id="batch-1", phase="draft", attempt=1)
+    assert entry is not None
+    assert (entry["input_tokens"], entry["output_tokens"], entry["provider"]) == (
+        1234,
+        567,
+        "claude",
+    )

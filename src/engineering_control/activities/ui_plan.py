@@ -39,6 +39,7 @@ from engineering_control.engineering.ui_blueprint import (
     BlueprintRejected,
     FanoutItem,
     PlanInputs,
+    agent_pack_parts_only,
     agent_pack_problems,
     blueprint_schema,
     check_draft,
@@ -323,6 +324,9 @@ class UiPlanActivityHandler:
 
     def _prepare_draft(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
+        if agent_pack_parts_only(self.settings.agent_pack_root):
+            # A pre-NEW-131 whole-blueprint execution resumed under the parts-only pack.
+            return {**payload, "status": "BLOCKED", "blocker": "UI_PLAN_LEGACY_SUPERSEDED"}
         attempt = payload.get("draft_attempt")
         if attempt not in {1, 2} or not payload.get("source_worktree"):
             return {**payload, "status": "FAILED", "blocker": "DRAFT_INPUT_INVALID"}
@@ -394,6 +398,9 @@ class UiPlanActivityHandler:
 
     def _prepare_review(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
+        if agent_pack_parts_only(self.settings.agent_pack_root):
+            # A pre-NEW-131 whole-blueprint execution resumed under the parts-only pack.
+            return {**payload, "status": "BLOCKED", "blocker": "UI_PLAN_LEGACY_SUPERSEDED"}
         attempt = int(payload.get("draft_attempt") or 1)
         draft = payload.get("draft_file") or {}
         sections = [

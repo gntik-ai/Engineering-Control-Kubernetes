@@ -429,10 +429,14 @@ class ControlledWorkflow:
                 }
                 else "PROVIDER_ACTIVITY_FAILED"
             )
-            return await self._step(
-                "agent.persist_result",
-                {**started, "status": "FAILED", "blocker": blocker},
-            )
+            failed: dict[str, Any] = {**started, "status": "FAILED", "blocker": blocker}
+            details = cause.details if isinstance(cause, ApplicationError) else ()
+            if blocker == "SchemaViolation" and details and isinstance(details[0], dict):
+                # Usage of a call whose output failed its schema (numbers only).
+                failed["failed_agent_usage"] = {
+                    key: details[0].get(key) for key in ("usage", "provider", "run_id")
+                }
+            return await self._step("agent.persist_result", failed)
         return await self._step("agent.persist_result", result)
 
     async def _deployment_failure(
@@ -5454,6 +5458,8 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
     def _part_usage(outcome: dict[str, Any]) -> dict[str, Any] | None:
         """A failed part's last provider result, so its token usage is still recorded."""
         result = outcome.get("agent_result")
+        if not isinstance(result, dict):
+            result = outcome.get("failed_agent_usage")
         if not isinstance(result, dict) or outcome.get("status") == "SUCCESS":
             return None
         step = str(outcome.get("provider_step") or "")
