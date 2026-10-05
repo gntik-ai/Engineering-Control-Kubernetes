@@ -130,7 +130,7 @@ class ClaudeCLIAdapter:
         else:
             raw_status, error_code = classify_failure(process_result)
             error_kind = provider_error_kind(
-                process_result.events, process_result.stderr, timed_out=process_result.timed_out
+                process_result.events, timed_out=process_result.timed_out
             )
             status = RunStatus(raw_status)
             if not summary:

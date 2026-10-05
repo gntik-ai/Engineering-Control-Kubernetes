@@ -444,7 +444,23 @@ _CLAUDE_529 = {
             "SERVER_ERROR",
             id="codex-turn-failed-503",
         ),
-        pytest.param((), "Error: read ECONNRESET", "CONNECTION_ERROR", id="stderr-connection"),
+        # NEW-137 review 2: stderr is not provider-owned (tool errors, quoted patch lines),
+        # so it never classifies, in either direction.
+        pytest.param((), "Error: read ECONNRESET", None, id="stderr-ignored"),
+        pytest.param((), "API Error: 500 Internal Server Error", None, id="stderr-quote-ignored"),
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "result": "API Error: 529 Overloaded",
+                },
+            ),
+            "invalid patch line: schema",
+            "OVERLOADED",
+            id="stderr-cannot-hide-529",
+        ),
         # Finding 2: transient errors before an excluded terminal subtype.
         pytest.param(
             (
@@ -543,8 +559,9 @@ _CLAUDE_529 = {
 def test_provider_error_kind_reads_provider_owned_diagnostics_only(
     events: tuple[dict[str, Any], ...], stderr: str, kind: str | None
 ) -> None:
-    assert provider_error_kind(events, stderr) == kind
-    assert provider_error_kind(events, stderr, timed_out=True) is None
+    assert provider_error_kind(events) == kind
+    assert provider_error_kind(events, timed_out=True) is None
+    del stderr  # deliberately ignored (review 2)
 
 
 def _from_agent_result(loaded: dict[str, Any], result: Any) -> dict[str, Any]:

@@ -4,8 +4,10 @@ The Claude and Codex adapters set AgentResult.provider_error_kind for a failed c
 their own parsing of the CLI's diagnostics: the terminal result's subtype and structured
 error fields (Claude ``api_error_status``, ``errors``, ``error``, and the CLI's own
 ``API Error: ...`` result of an ``is_error`` envelope), Claude ``system/api_retry`` events,
-Codex ``error`` / ``turn.failed`` events, and the adapter's captured stderr. Model output
-(an agent's final message, a Codex last-message file) is never read.
+and Codex ``error`` / ``turn.failed`` events. Model output (an agent's final message, a
+Codex last-message file) is never read, and neither is raw stderr (NEW-137 review 2): the
+CLIs log tool-dispatch errors and quote model-authored patch lines there, so it is not
+provider-owned.
 
 The terminal state wins: an excluded terminal subtype (max turns, structured-output
 retries, budget, ...) or any non-transient cause anywhere in these diagnostics
@@ -61,9 +63,7 @@ _CONNECTION_TEXT = re.compile(
 )
 
 
-def provider_error_kind(
-    events: Iterable[dict[str, Any]], stderr: str, *, timed_out: bool = False
-) -> str | None:
+def provider_error_kind(events: Iterable[dict[str, Any]], *, timed_out: bool = False) -> str | None:
     """The typed kind of a failed provider call, or None without a provider-owned signal."""
     if timed_out:
         return None
@@ -94,8 +94,6 @@ def provider_error_kind(
             _collect(event.get("message"), texts)
     if terminal is not None and terminal not in _NEUTRAL_TERMINAL_SUBTYPES:
         return NON_TRANSIENT
-    if stderr:
-        texts.append(stderr[-4000:])
     joined = "\n".join(texts)
     if not joined and not statuses:
         return None
