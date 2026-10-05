@@ -1400,7 +1400,7 @@ class _PreCorrectionBudgetLoopWorkflow(ExistingGitHubBacklogLoopWorkflow):
     async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
         return await super().run(request)
 
-    def _correction_budget_patched(self) -> bool:
+    def _correction_budget_patched(self, ordinal: int, delivery_round: int) -> bool:
         return False
 
 
@@ -1454,7 +1454,7 @@ async def test_an_extended_retry_round_stops_after_its_one_attempt() -> None:
         for event in history.events
         if event.HasField("marker_recorded_event_attributes")
     ]
-    assert any(b"existing-backlog-retry-correction-budget-v1" in marker for marker in markers)
+    assert any(b"existing-backlog-retry-correction-budget-v1-1-1" in marker for marker in markers)
     await Replayer(workflows=workflows).replay_workflow(history)
 
 
@@ -1496,6 +1496,99 @@ async def test_a_pre_budget_loop_history_replays_on_the_current_loop() -> None:
     await Replayer(
         workflows=[ExistingGitHubBacklogLoopWorkflow, _ValidationBlockedIssueDeliveryStub]
     ).replay_workflow(history)
+
+
+async def _wait_for_pauses(handle: Any, count: int) -> None:
+    for _ in range(300):
+        history = await handle.fetch_history()
+        if len(_paused_blockers(history)) >= count:
+            state = await handle.query("status")
+            if str(state.get("phase", "")).startswith("AWAITING_OPERATOR"):
+                return
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"the loop did not pause {count} times")
+
+
+async def test_a_post_deploy_retry_of_an_old_paused_loop_checks_its_budget() -> None:
+    # Codex review of NEW-133: Temporal memoizes a patch decision per execution. A loop
+    # that ran a retry round before the deploy (replayed unpatched) must still check its
+    # budget in the post-deploy retry round after the operator's correction extension.
+    activity_fn = _scripted_execute_control_step(
+        _correction_script({"status": "EXHAUSTED", "blocker": "CORRECTION_EXTENSION_USED"})
+    )
+    current: list[type] = [ExistingGitHubBacklogLoopWorkflow, _ValidationBlockedIssueDeliveryStub]
+    old: list[type] = [_PreCorrectionBudgetLoopWorkflow, _ValidationBlockedIssueDeliveryStub]
+
+    def workers(env: Any, workflows: list[type]) -> tuple[Worker, Worker]:
+        return (
+            Worker(
+                env.client,
+                task_queue=CONTROL_TASK_QUEUE,
+                workflows=workflows,
+                activities=[activity_fn],
+                max_cached_workflows=0,
+            ),
+            Worker(
+                env.client,
+                task_queue=GITHUB_TASK_QUEUE,
+                workflows=workflows,
+                activities=[activity_fn],
+                max_cached_workflows=0,
+            ),
+        )
+
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        control, github = workers(env, old)
+        async with control, github:
+            handle = await env.client.start_workflow(
+                ExistingGitHubBacklogLoopWorkflow.run,
+                ExistingGitHubBacklogLoopInput(
+                    project="musematic",
+                    backlog_campaign_id="camp-1",
+                    maximum_risk="R2",
+                    delivery_mode="full-delivery",
+                    continue_after_blocked_issue=False,
+                ),
+                id=f"replay-test-extension-upgrade-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=2),
+            )
+            await _wait_for_pauses(handle, 1)
+            # The pre-deploy retry round: no budget check, a refused second child.
+            await handle.signal("retry", "gntik-ai/musematic#1026")
+            await _wait_for_pauses(handle, 2)
+        control, github = workers(env, current)
+        async with control, github:
+            # Deployed; the operator granted the extension and retries again.
+            await handle.signal("retry", "gntik-ai/musematic#1026")
+            await _wait_for_pauses(handle, 3)
+            await handle.signal("skip", "gntik-ai/musematic#1026|OPERATOR")
+            result = await handle.result()
+            history = await handle.fetch_history()
+
+    assert result["status"] == "COMPLETE"
+    assert _paused_blockers(history) == [
+        "CORRECTION_LIMIT_EXHAUSTED",
+        "DELIVERY_FAILED:POLICY_VIOLATION",
+        "CORRECTION_EXTENSION_USED",
+    ]
+    children = [
+        event.start_child_workflow_execution_initiated_event_attributes.workflow_id
+        for event in history.events
+        if event.HasField("start_child_workflow_execution_initiated_event_attributes")
+    ]
+    assert [child.rsplit("-issue-", 1)[1] for child in children][-3:] == [
+        "1-retry-1-attempt-1",
+        "1-retry-1-attempt-2",
+        "1-retry-2-attempt-1",
+    ]
+    budgets = [
+        request["payload"]["change_set_id"]
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.correction_budget"
+    ]
+    assert budgets == [_EXTENSION_CHANGE_SET]
+    await Replayer(workflows=current).replay_workflow(history)
 
 
 # -- NEW-118: deterministic CI-pin convergence ------------------------------------------

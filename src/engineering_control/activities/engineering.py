@@ -55,6 +55,7 @@ from engineering_control.identity.attestation import (
 )
 from engineering_control.models.core import AgentRequest, resolve_agent_effort
 from engineering_control.models.enums import ModelClass, Project, Provider
+from engineering_control.operations.correction_extension import record_loop_pause_target
 from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
@@ -2050,6 +2051,9 @@ class EngineeringActivityHandler:
                 if run is not None:
                     previous_status = run.status
                     run.status = status
+                    if run.run_type == "existing-backlog-loop":
+                        # NEW-133: the issue the loop is paused on, for operator grants.
+                        record_loop_pause_target(session, run, status, payload)
                     # NEW-33b: a paused loop is still alive; only terminal states finish it.
                     run.finished_at = (
                         datetime.now(UTC)

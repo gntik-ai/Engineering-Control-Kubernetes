@@ -213,7 +213,9 @@ a `CORRECTION_EXTENSION_*` code unless all hold:
   `CHANGESET_VALIDATION_FINDINGS` (`NOT_VALIDATION_BLOCKED`), with non-empty
   `recovery_json.validation_findings` recorded during that attempt (`FINDINGS_MISSING`), and
   that attempt's checker invocation (`code-reviewer`) decided PASS (`CHECKER_NOT_PASS`);
-- the loop Run is `PAUSED` and its newest child is for this issue (`LOOP_NOT_PAUSED`);
+- the loop Run is `PAUSED` on this issue, as recorded by the loop itself in its
+  `backlog.loop_pause_target` Step at every loop-state change (`LOOP_NOT_PAUSED`; a loop
+  paused before this record existed needs one `backlog-retry` to re-pause and record it);
 - no extension was ever granted to this ChangeSet (`ALREADY_GRANTED`).
 
 The grant is stored in `ChangeSet.recovery_json.correction_extension` (operator, time, the

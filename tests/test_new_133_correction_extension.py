@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -193,6 +193,20 @@ def _stop_attempt(
     handler._release_delivery_leases({**loaded, "status": status, "blocker": blocker})
 
 
+def _loop_state(engineering: Any, status: str, issue: str | None, blocker: str | None) -> None:
+    payload: dict[str, Any] = {
+        "project": "falcone",
+        "backlog_campaign_id": str(CAMPAIGN_ID),
+        "loop_status": status,
+        "workflow_id": LOOP,
+    }
+    if issue is not None:
+        payload["issue"] = issue
+    if blocker is not None and status == "PAUSED":
+        payload["blocker"] = blocker
+    engineering._record_backlog_loop_state(payload)
+
+
 async def _exhausted(
     tmp_path: Path,
     *,
@@ -228,13 +242,13 @@ async def _exhausted(
             Run(
                 workflow_id=LOOP,
                 run_type="existing-backlog-loop",
-                status=loop_status,
+                status="RUNNING",
                 project="falcone",
                 temporal_first_execution_run_id="loop-first-run",
             )
         )
-        # A paused loop pauses its campaign, which voids the current-approval check.
-        session.get(GitHubBacklogCampaign, CAMPAIGN_ID).status = "PAUSED"
+    # The loop's own record (a pause also pauses the campaign, voiding its approval).
+    _loop_state(engineering, loop_status, "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED")
     return {
         "values": values,
         "handler": handler,
@@ -343,17 +357,15 @@ def _corrupt_origin(fixture: dict[str, Any]) -> None:
         origin.result_json = {**origin.result_json, "issue_number": 43}
 
 
-def _loop_on_another_issue(fixture: dict[str, Any]) -> None:
-    with fixture["handler"].sessions.begin() as session:
-        session.add(
-            Run(
-                workflow_id=f"{LOOP}-issue-2-revalidate-43",
-                run_type="finding-verification",
-                status="SUCCESS",
-                project="falcone",
-                created_at=datetime.now(UTC) + timedelta(minutes=5),
-            )
-        )
+def _skipped_then_paused_on_the_next_issue(fixture: dict[str, Any]) -> None:
+    # Codex review: #42 is skipped and #43 pauses (APPROVAL_EXPIRED) before registering
+    # any child, so #42's attempt is still the loop's newest child Run.
+    _loop_state(fixture["engineering"], "RUNNING", "gntik-ai/falcone#42", None)
+    _loop_state(fixture["engineering"], "PAUSED", "gntik-ai/falcone#43", "APPROVAL_EXPIRED")
+
+
+def _paused_without_an_issue(fixture: dict[str, Any]) -> None:
+    _loop_state(fixture["engineering"], "PAUSED", None, "LOOP_STEP_FAILED_X")
 
 
 def _drop_checker(fixture: dict[str, Any]) -> None:
@@ -389,7 +401,8 @@ def _drop_checker(fixture: dict[str, Any]) -> None:
         ({"checker": "REQUEST_CHANGES"}, None, {}, "CHECKER_NOT_PASS"),
         ({}, _drop_checker, {}, "CHECKER_NOT_PASS"),
         ({"loop_status": "RUNNING"}, None, {}, "LOOP_NOT_PAUSED"),
-        ({}, _loop_on_another_issue, {}, "LOOP_NOT_PAUSED"),
+        ({}, _skipped_then_paused_on_the_next_issue, {}, "LOOP_NOT_PAUSED"),
+        ({}, _paused_without_an_issue, {}, "LOOP_NOT_PAUSED"),
     ],
 )
 async def test_every_unmet_precondition_refuses_the_extension(

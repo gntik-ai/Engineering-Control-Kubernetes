@@ -3731,7 +3731,12 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         if delivery.get("status") != "REQUEST_CHANGES":
                             break
                         budget_blocker = await self._retry_round_budget_blocker(
-                            request, item, delivery, delivery_round, register_run=register_run
+                            request,
+                            item,
+                            delivery,
+                            ordinal,
+                            delivery_round,
+                            register_run=register_run,
                         )
                         if budget_blocker is not None:
                             break
@@ -4641,16 +4646,21 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             }
         return result
 
-    def _correction_budget_patched(self) -> bool:
+    def _correction_budget_patched(self, ordinal: int, delivery_round: int) -> bool:
         # NEW-133: a retry round checks the ChangeSet's correction budget after each
-        # REQUEST_CHANGES attempt (an overridable seam for the pre-patch replay test).
-        return workflow.patched("existing-backlog-retry-correction-budget-v1")
+        # REQUEST_CHANGES attempt. Temporal memoizes a patch decision for the whole
+        # execution, so the marker is per issue and retry round: a replayed pre-deploy
+        # round stays unpatched while a later round of the same loop is checked.
+        return workflow.patched(
+            f"existing-backlog-retry-correction-budget-v1-{ordinal}-{delivery_round}"
+        )
 
     async def _retry_round_budget_blocker(
         self,
         request: ExistingGitHubBacklogLoopInput,
         item: dict[str, Any],
         delivery: dict[str, Any],
+        ordinal: int,
         delivery_round: int,
         *,
         register_run: bool,
@@ -4669,7 +4679,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         change_set_id = context.get("change_set_id") if isinstance(context, dict) else None
         if not isinstance(change_set_id, str) or not change_set_id:
             return None
-        if not self._correction_budget_patched():
+        if not self._correction_budget_patched(ordinal, delivery_round):
             return None
         budget = await self._loop_step(
             request,

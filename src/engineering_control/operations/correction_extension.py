@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -26,6 +26,7 @@ from engineering_control.db.models import (
     ChangeSet,
     DashboardEvent,
     Run,
+    Step,
 )
 from engineering_control.engineering.backlog import BACKLOG_PROJECT_PAIRS, canonical_sha256
 from engineering_control.models.enums import ChangeSetState
@@ -41,7 +42,9 @@ from engineering_control.operations.issue_start import backlog_issue_signal_bloc
 EXTENSION_EVENT_TYPE = "correction_extension_granted"
 VALIDATION_BLOCKER = "CHANGESET_VALIDATION_FINDINGS"
 CHECKER_ROLE = "code-reviewer"
-_LOOP_CHILD = re.compile(r"-issue-(?P<ordinal>[1-9][0-9]{0,5})-")
+# Durable record of the issue a backlog loop Run is paused on (NEW-133).
+LOOP_PAUSE_TARGET_STEP = "backlog.loop_pause_target"
+_ISSUE_REF = re.compile(r"gntik-ai/[a-z][a-z-]{0,60}#[1-9][0-9]{0,9}")
 
 
 class CorrectionExtensionBlocked(ValueError):
@@ -61,11 +64,55 @@ def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _issue_ordinal(loop_workflow_id: str, child_workflow_id: str) -> int | None:
-    if not child_workflow_id.startswith(loop_workflow_id):
-        return None
-    match = _LOOP_CHILD.match(child_workflow_id[len(loop_workflow_id) :])
-    return int(match["ordinal"]) if match is not None else None
+def loop_pause_target_id(loop_run_id: UUID) -> UUID:
+    return uuid5(NAMESPACE_URL, f"backlog-loop-pause-target:{loop_run_id}")
+
+
+def record_loop_pause_target(
+    session: Session,
+    run: Run,
+    status: str,
+    payload: dict[str, Any],
+    now: datetime | None = None,
+) -> None:
+    """Keep the issue (and blocker) a backlog loop Run is PAUSED on, or that it is not.
+
+    Written by backlog.record_loop_state with every loop-state transition of the loop's
+    own Run. The issue comes from the loop's NEW-127 loop-state payload; a pause without a
+    well-formed issue records none, so nothing can be granted against it (fail closed)."""
+    issue = payload.get("issue")
+    blocker = payload.get("blocker")
+    value = {
+        "version": 1,
+        "loop_run_id": str(run.id),
+        "loop_status": status,
+        "issue": (
+            issue
+            if status == "PAUSED" and isinstance(issue, str) and _ISSUE_REF.fullmatch(issue)
+            else None
+        ),
+        "blocker": str(blocker)[:120] if status == "PAUSED" and blocker else None,
+        "recorded_at": (now or datetime.now(UTC)).isoformat(),
+    }
+    identifier = loop_pause_target_id(run.id)
+    record = session.get(Step, identifier)
+    if record is None:
+        session.add(
+            Step(
+                id=identifier,
+                run_id=run.id,
+                name=LOOP_PAUSE_TARGET_STEP,
+                ordinal=0,
+                status="COMPLETE",
+                idempotency_key=f"backlog-loop-pause-target:{run.id}",
+                attempt=1,
+                result_json=value,
+            )
+        )
+    elif record.run_id == run.id and record.name == LOOP_PAUSE_TARGET_STEP:
+        record.result_json = value
+    else:
+        raise ValueError("backlog loop pause record binding changed")
 
 
 def grant_correction_extension(
@@ -224,21 +271,22 @@ def grant_correction_extension(
             "CORRECTION_EXTENSION_LOOP_NOT_PAUSED",
             "the backlog loop is not PAUSED",
         )
-    ordinal = _issue_ordinal(loop_workflow_id, str(latest_run.workflow_id))
-    newest_child = session.scalar(
-        select(Run)
-        .where(Run.workflow_id.startswith(f"{loop_workflow_id}-issue-", autoescape=True))
-        .order_by(Run.created_at.desc(), Run.id.desc())
-        .limit(1)
-    )
+    # The loop's own durable pause record names the issue it waits on. Child Runs do not:
+    # after a skip the next issue may pause (e.g. APPROVAL_EXPIRED) before registering any.
+    target = f"{issue_repository}#{issue_number}"
+    pause = session.get(Step, loop_pause_target_id(loops[0].id))
+    paused = pause.result_json if pause is not None else None
     if (
-        ordinal is None
-        or newest_child is None
-        or _issue_ordinal(loop_workflow_id, str(newest_child.workflow_id)) != ordinal
+        pause is None
+        or pause.name != LOOP_PAUSE_TARGET_STEP
+        or pause.run_id != loops[0].id
+        or not isinstance(paused, dict)
+        or paused.get("loop_status") != "PAUSED"
+        or paused.get("issue") != target
     ):
         raise CorrectionExtensionBlocked(
             "CORRECTION_EXTENSION_LOOP_NOT_PAUSED",
-            "the backlog loop is not paused on this issue",
+            f"the backlog loop is not paused on {target}",
         )
     record: dict[str, Any] = {
         "version": 1,
