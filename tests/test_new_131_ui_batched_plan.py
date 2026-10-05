@@ -729,3 +729,50 @@ async def test_provider_refuses_a_legacy_whole_blueprint_call_under_the_parts_on
     handler.instruction_pack.enrich.side_effect = ValueError("stop here")
     batched = await handler.handle("ui_plan.draft", {"draft_request": {}, "part": {"id": "p"}})
     assert batched["blocker"] == "AGENT_PACK_INVALID"  # it went past the legacy guard
+
+
+def test_part_ids_change_when_the_operator_decisions_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NEW-134: a part approved under different operator decisions is never reused.
+    from engineering_control.activities import ui_plan
+
+    base = ui_plan.part_provenance("p" * 64)
+    assert base == ui_plan.part_provenance("p" * 64)
+    assert base != ui_plan.part_provenance("q" * 64)
+    monkeypatch.setattr(ui_plan, "OPERATOR_DECISIONS", ui_plan.OPERATOR_DECISIONS + " Changed.")
+    changed = ui_plan.part_provenance("p" * 64)
+    assert changed != base
+    assert frame_part_id("i" * 64, "k" * 64, ["a"], changed) != frame_part_id(
+        "i" * 64, "k" * 64, ["a"], base
+    )
+    assert "no /legacy path" in ui_plan.OPERATOR_DECISIONS
+
+
+def test_a_plan_whose_decisions_changed_never_drafts_or_reviews(tmp_path: Path) -> None:
+    # NEW-134 review: parts fixed under other (or unrecorded) decisions never draft or
+    # review under the current ones; a pre-NEW-134 plan carries no decisions hash at all.
+    from unittest.mock import Mock
+
+    from engineering_control.activities import ui_plan
+    from engineering_control.config import Settings
+
+    handler = ui_plan.UiPlanActivityHandler(
+        Settings(agent_pack_root=build_fake_pack(tmp_path / "pack", version="1.5.1")),
+        repository=Mock(),
+        change_requests=Mock(),
+    )
+    for stale in ({}, {"decisions_sha256": "0" * 64}):
+        payload = {
+            "blueprint_id": "00000000-0000-4000-8000-000000000001",
+            # A schema-refused draft's usage must not be written for a stale plan either.
+            "rejected_usage": {"agent_result": {"usage": {"output_tokens": 9}}, "part_id": "x"},
+            **stale,
+        }
+        for prepared in (handler._prepare_part(payload), handler._prepare_part_review(payload)):
+            assert (prepared["status"], prepared["blocker"]) == (
+                "BLOCKED",
+                "UI_PLAN_DECISIONS_CHANGED",
+            )
+    handler.repository.record_usage_sync.assert_not_called()
+    assert ui_plan.decisions_sha256() == ui_plan.decisions_sha256()
