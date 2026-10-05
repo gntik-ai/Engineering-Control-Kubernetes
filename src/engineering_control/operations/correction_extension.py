@@ -84,6 +84,20 @@ def loop_state_fence(payload: dict[str, Any]) -> dict[str, Any] | None:
     return {"workflow_run_id": run_id, "activity_seq": int(sequence)}
 
 
+def _seen_runs(recorded: Any) -> list[str]:
+    """The workflow runs that wrote this loop's state, oldest first. A record without that
+    history (written before it was kept) still names its last writer in its fence, which
+    seeds it, so a reset run never forgets the run it superseded (NEW-133 review 4)."""
+    if not isinstance(recorded, dict):
+        return []
+    seen = recorded.get("workflow_runs")
+    runs = [str(item) for item in seen if isinstance(item, str)] if isinstance(seen, list) else []
+    fence = recorded.get("fence")
+    if not runs and isinstance(fence, dict) and isinstance(fence.get("workflow_run_id"), str):
+        runs = [fence["workflow_run_id"]]
+    return runs
+
+
 def loop_state_is_stale(session: Session, run: Run, payload: dict[str, Any]) -> bool:
     """Whether this loop-state delivery is older than the one already applied to the Run.
 
@@ -95,12 +109,8 @@ def loop_state_is_stale(session: Session, run: Run, payload: dict[str, Any]) -> 
         return False
     # NEW-133 review 3: a run superseded by a newer one (e.g. after a Temporal reset, which
     # keeps the first execution run id) never writes again.
-    seen = record.result_json.get("workflow_runs")
-    if (
-        isinstance(seen, list)
-        and fence["workflow_run_id"] in seen
-        and fence["workflow_run_id"] != seen[-1]
-    ):
+    seen = _seen_runs(record.result_json)
+    if fence["workflow_run_id"] in seen and fence["workflow_run_id"] != seen[-1]:
         return True
     applied = record.result_json.get("fence")
     return (
@@ -141,8 +151,7 @@ def record_loop_pause_target(
     identifier = loop_pause_target_id(run.id)
     record = session.get(Step, identifier)
     # The order in which this loop's workflow runs first wrote a state (bounded).
-    seen = record.result_json.get("workflow_runs") if record is not None else None
-    runs = [str(item) for item in seen if isinstance(item, str)] if isinstance(seen, list) else []
+    runs = _seen_runs(record.result_json if record is not None else None)
     fence = value["fence"]
     if isinstance(fence, dict) and fence["workflow_run_id"] not in runs:
         runs = [*runs, fence["workflow_run_id"]][-20:]

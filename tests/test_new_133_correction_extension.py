@@ -411,6 +411,29 @@ def _reset_run_completed_then_a_superseded_pause_arrives(fixture: dict[str, Any]
     assert late == {"status": "STALE_LOOP_STATE_IGNORED"}
 
 
+def _reset_after_a_record_without_run_history(fixture: dict[str, Any]) -> None:
+    # Codex review 4: a record that has a fence but no workflow_runs (written before the
+    # history was kept) must still make its writer count as superseded after a reset.
+    engineering = fixture["engineering"]
+    with fixture["handler"].sessions.begin() as session:
+        loop = session.scalar(select(Run).where(Run.workflow_id == LOOP))
+        from engineering_control.operations.correction_extension import loop_pause_target_id
+
+        record = session.get(Step, loop_pause_target_id(loop.id))
+        record.result_json = {
+            key: value for key, value in record.result_json.items() if key != "workflow_runs"
+        }
+    _loop_state(engineering, "RUNNING", None, None, seq=5, run_id="loop-run-2")
+    late = _loop_state(
+        engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=9999
+    )
+    assert late == {"status": "STALE_LOOP_STATE_IGNORED"}
+    # The reset run's own later deliveries are still applied.
+    assert _loop_state(engineering, "RUNNING", None, None, seq=6, run_id="loop-run-2") != {
+        "status": "STALE_LOOP_STATE_IGNORED"
+    }
+
+
 def _paused_without_an_issue(fixture: dict[str, Any]) -> None:
     _loop_state(fixture["engineering"], "PAUSED", None, "LOOP_STEP_FAILED_X")
 
@@ -452,6 +475,7 @@ def _drop_checker(fixture: dict[str, Any]) -> None:
         ({}, _paused_without_an_issue, {}, "LOOP_NOT_PAUSED"),
         ({}, _stale_pause_delivered_after_the_next_issue_paused, {}, "LOOP_NOT_PAUSED"),
         ({}, _reset_run_completed_then_a_superseded_pause_arrives, {}, "LOOP_NOT_PAUSED"),
+        ({}, _reset_after_a_record_without_run_history, {}, "LOOP_NOT_PAUSED"),
         # Temporal unreadable or the loop closed: no proof of the current run.
         ({}, None, {"current_workflow_run_id": None}, "LOOP_NOT_PAUSED"),
         # The pause was recorded by a run that is no longer the loop's current one.
