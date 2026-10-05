@@ -68,6 +68,40 @@ def loop_pause_target_id(loop_run_id: UUID) -> UUID:
     return uuid5(NAMESPACE_URL, f"backlog-loop-pause-target:{loop_run_id}")
 
 
+def loop_state_fence(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The scheduling order of one backlog.record_loop_state delivery (NEW-133 review 2).
+
+    The SDK numbers a workflow run's activities in scheduling order, so within one run a
+    larger activity id is a later loop state. A late attempt of an older activity (one
+    delayed past its timeout and retried) carries its original, smaller id."""
+    orchestration = payload.get("orchestration")
+    if not isinstance(orchestration, dict):
+        return None
+    run_id = orchestration.get("workflow_run_id")
+    sequence = str(orchestration.get("activity_id") or "")
+    if not isinstance(run_id, str) or not run_id or not sequence.isdigit():
+        return None
+    return {"workflow_run_id": run_id, "activity_seq": int(sequence)}
+
+
+def loop_state_is_stale(session: Session, run: Run, payload: dict[str, Any]) -> bool:
+    """Whether this loop-state delivery is older than the one already applied to the Run.
+
+    Same workflow run only (a new run of the loop supersedes); an equal sequence is the
+    same activity's retry, which rewrites the same state."""
+    fence = loop_state_fence(payload)
+    record = session.get(Step, loop_pause_target_id(run.id))
+    if fence is None or record is None or not isinstance(record.result_json, dict):
+        return False
+    applied = record.result_json.get("fence")
+    return (
+        isinstance(applied, dict)
+        and applied.get("workflow_run_id") == fence["workflow_run_id"]
+        and isinstance(applied.get("activity_seq"), int)
+        and fence["activity_seq"] < applied["activity_seq"]
+    )
+
+
 def record_loop_pause_target(
     session: Session,
     run: Run,
@@ -93,6 +127,7 @@ def record_loop_pause_target(
         ),
         "blocker": str(blocker)[:120] if status == "PAUSED" and blocker else None,
         "recorded_at": (now or datetime.now(UTC)).isoformat(),
+        "fence": loop_state_fence(payload),
     }
     identifier = loop_pause_target_id(run.id)
     record = session.get(Step, identifier)

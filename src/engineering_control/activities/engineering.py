@@ -55,7 +55,10 @@ from engineering_control.identity.attestation import (
 )
 from engineering_control.models.core import AgentRequest, resolve_agent_effort
 from engineering_control.models.enums import ModelClass, Project, Provider
-from engineering_control.operations.correction_extension import record_loop_pause_target
+from engineering_control.operations.correction_extension import (
+    loop_state_is_stale,
+    record_loop_pause_target,
+)
 from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
@@ -2047,7 +2050,20 @@ class EngineeringActivityHandler:
                 # self-heal can ever recognize this operation as finished. Without
                 # this, an operation record keyed on this workflow stays STARTED
                 # forever and permanently blocks every future attempt.
-                run = session.scalar(select(db.Run).where(db.Run.workflow_id == run_workflow_id))
+                # NEW-133 review 2: the row lock serializes concurrent loop-state
+                # deliveries, so the stale check below and the write are atomic.
+                run = session.scalar(
+                    select(db.Run).where(db.Run.workflow_id == run_workflow_id).with_for_update()
+                )
+                if (
+                    run is not None
+                    and run.run_type == "existing-backlog-loop"
+                    and loop_state_is_stale(session, run, payload)
+                ):
+                    # NEW-133 review 2: a late attempt of an older loop-state activity
+                    # (delayed past its timeout, then retried) must not restore an earlier
+                    # status or pause target after the loop moved on.
+                    return {"status": "STALE_LOOP_STATE_IGNORED"}
                 if run is not None:
                     previous_status = run.status
                     run.status = status

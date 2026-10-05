@@ -193,18 +193,28 @@ def _stop_attempt(
     handler._release_delivery_leases({**loaded, "status": status, "blocker": blocker})
 
 
-def _loop_state(engineering: Any, status: str, issue: str | None, blocker: str | None) -> None:
+def _loop_state(
+    engineering: Any,
+    status: str,
+    issue: str | None,
+    blocker: str | None,
+    *,
+    seq: int | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "project": "falcone",
         "backlog_campaign_id": str(CAMPAIGN_ID),
         "loop_status": status,
         "workflow_id": LOOP,
     }
+    if seq is not None:
+        # As core.ControlActivities attaches it: the SDK's per-run activity sequence.
+        payload["orchestration"] = {"workflow_run_id": "loop-run-1", "activity_id": str(seq)}
     if issue is not None:
         payload["issue"] = issue
     if blocker is not None and status == "PAUSED":
         payload["blocker"] = blocker
-    engineering._record_backlog_loop_state(payload)
+    return engineering._record_backlog_loop_state(payload)  # type: ignore[no-any-return]
 
 
 async def _exhausted(
@@ -364,6 +374,20 @@ def _skipped_then_paused_on_the_next_issue(fixture: dict[str, Any]) -> None:
     _loop_state(fixture["engineering"], "PAUSED", "gntik-ai/falcone#43", "APPROVAL_EXPIRED")
 
 
+def _stale_pause_delivered_after_the_next_issue_paused(fixture: dict[str, Any]) -> None:
+    # Codex review 2: #42's PAUSED activity (seq 10) is delayed past its timeout and
+    # retried; the loop skips to #43, which pauses (seq 20); then the late #42 attempt
+    # commits. It must neither restore PAUSED #42 nor its pause target.
+    engineering = fixture["engineering"]
+    _loop_state(engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=10)
+    _loop_state(engineering, "RUNNING", "gntik-ai/falcone#42", None, seq=15)
+    _loop_state(engineering, "PAUSED", "gntik-ai/falcone#43", "APPROVAL_EXPIRED", seq=20)
+    late = _loop_state(
+        engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=10
+    )
+    assert late == {"status": "STALE_LOOP_STATE_IGNORED"}
+
+
 def _paused_without_an_issue(fixture: dict[str, Any]) -> None:
     _loop_state(fixture["engineering"], "PAUSED", None, "LOOP_STEP_FAILED_X")
 
@@ -403,6 +427,7 @@ def _drop_checker(fixture: dict[str, Any]) -> None:
         ({"loop_status": "RUNNING"}, None, {}, "LOOP_NOT_PAUSED"),
         ({}, _skipped_then_paused_on_the_next_issue, {}, "LOOP_NOT_PAUSED"),
         ({}, _paused_without_an_issue, {}, "LOOP_NOT_PAUSED"),
+        ({}, _stale_pause_delivered_after_the_next_issue_paused, {}, "LOOP_NOT_PAUSED"),
     ],
 )
 async def test_every_unmet_precondition_refuses_the_extension(
@@ -675,3 +700,14 @@ async def test_the_repository_grants_only_for_an_allowlisted_operator(tmp_path: 
     result = await operations.extend_change_set_correction(*arguments, "cli:engineering-ctl")
     assert result["status"] == "CORRECTION_EXTENDED"
     _dispose(fixture["values"])
+
+
+def test_loop_state_fence_orders_deliveries_within_one_workflow_run() -> None:
+    from engineering_control.operations.correction_extension import loop_state_fence
+
+    def payload(run: str, seq: str) -> dict[str, Any]:
+        return {"orchestration": {"workflow_run_id": run, "activity_id": seq}}
+
+    assert loop_state_fence(payload("r", "12")) == {"workflow_run_id": "r", "activity_seq": 12}
+    assert loop_state_fence({}) is None
+    assert loop_state_fence(payload("r", "custom-id")) is None
