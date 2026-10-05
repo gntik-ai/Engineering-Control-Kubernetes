@@ -24,6 +24,7 @@ from engineering_control.engineering.ui_inventory import (
     EndpointUse,
     InventoryError,
     build_inventory,
+    check_git_scan_roots,
     extract_endpoints,
     git_legacy_app_tree,
     inventory_content_key,
@@ -581,13 +582,80 @@ def test_a_src_directory_symlink_outside_the_checkout_is_refused(tmp_path: Path)
     outside = tmp_path / "outside-src"
     shutil.move(copy / "apps/web-console/src", outside)
     (copy / "apps/web-console/src").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(InventoryError, match="escaped"):
+    with pytest.raises(InventoryError, match="UI_INVENTORY_SYMLINK_ROOT"):
         _inventory(copy)
     (copy / "apps/web-console/src").unlink()
     (copy / "apps/web-console").rename(tmp_path / "outside-app")
     (copy / "apps/web-console").symlink_to(tmp_path / "outside-app", target_is_directory=True)
-    with pytest.raises(InventoryError, match="escaped"):
+    with pytest.raises(InventoryError, match="UI_INVENTORY_SYMLINK_ROOT"):
         _inventory(copy)
+
+
+def _commit_all(repo: Path) -> str:
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@e.invalid", "commit", "-qm", "c")
+    return _git(repo, "rev-parse", "HEAD").strip()
+
+
+def _object_type(repo: Path, sha: str) -> Any:
+    def object_type(relative: str) -> str | None:
+        found = subprocess.run(  # noqa: S603
+            [GIT, "-C", str(repo), "cat-file", "-t", f"{sha}:{relative}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return found.stdout.strip() if found.returncode == 0 else None
+
+    return object_type
+
+
+@pytest.mark.parametrize(
+    ("link", "target"),
+    [
+        # The review's case: an in-repository src symlink to another copy of the console.
+        ("apps/web-console/src", "../web-console-shadow/src"),
+        ("apps/web-console", "web-console-shadow"),
+        ("apps/web-console/e2e", "../web-console-shadow/e2e"),
+    ],
+)
+def test_a_symlinked_console_scan_root_is_refused_on_disk_and_in_git(
+    tmp_path: Path, link: str, target: str
+) -> None:
+    # NEW-136 review: the legacy app's tree id hashes only a link, so a page changed behind
+    # a symlinked root would keep the content key; the inventory fails closed instead.
+    handler, payload, _sha = _snapshot(tmp_path)
+    repo = Path(payload["snapshot"]["source_worktree"])
+    shutil.copytree(repo / "apps/web-console", repo / "apps/web-console-shadow")
+    shutil.rmtree(repo / link)
+    (repo / link).symlink_to(target, target_is_directory=True)
+    sha = _commit_all(repo)
+    assert (repo / link).is_symlink() and (repo / link).resolve().is_dir()
+    with pytest.raises(InventoryError, match="UI_INVENTORY_SYMLINK_ROOT"):
+        _inventory(repo, sha)
+    with pytest.raises(InventoryError, match="UI_INVENTORY_SYMLINK_ROOT"):
+        check_git_scan_roots(_object_type(repo, sha), "apps/web-console")
+    assert handler.manager.snapshot_object_type(repo, expected_sha=sha, relative=link) == "blob"
+
+
+async def test_the_scan_step_blocks_on_a_symlinked_src_root(tmp_path: Path) -> None:
+    handler, payload, _sha = _snapshot(tmp_path)
+    repo = Path(payload["snapshot"]["source_worktree"])
+    shutil.copytree(repo / "apps/web-console", repo / "apps/web-console-shadow")
+    shutil.rmtree(repo / "apps/web-console/src")
+    (repo / "apps/web-console/src").symlink_to("../web-console-shadow/src")
+    sha = _commit_all(repo)
+    snapshot = {**payload["snapshot"], "source_sha": sha}
+    result = await handler.handle("ui.inventory", {**payload, "snapshot": snapshot})
+    assert (result["status"], result["blocker"]) == ("BLOCKED", "UI_INVENTORY_SYMLINK_ROOT")
+    assert "apps/web-console/src" in result["reason"]
+    assert not (tmp_path / "evidence/scan/ui-inventory").exists()
+    # The real directories pass, in Git and on disk; an absent optional e2e is fine.
+    clean, clean_payload, clean_sha = _snapshot(tmp_path / "clean")
+    clean_repo = Path(clean_payload["snapshot"]["source_worktree"])
+    check_git_scan_roots(_object_type(clean_repo, clean_sha), "apps/web-console")
+    shutil.rmtree(clean_repo / "apps/web-console/e2e")
+    check_git_scan_roots(_object_type(clean_repo, _commit_all(clean_repo)), "apps/web-console")
 
 
 def test_nested_directory_and_file_symlinks_are_skipped_and_recorded(tmp_path: Path) -> None:

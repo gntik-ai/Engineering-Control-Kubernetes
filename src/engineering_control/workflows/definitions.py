@@ -5223,6 +5223,16 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             "ui.inventory", {"project": request.project, "snapshot": source}
         )
         if inventory.get("status") != "UI_INVENTORY_PASS":
+            if inventory.get("status") == "BLOCKED" and workflow.patched(
+                self._INVENTORY_BLOCKED_PATCH
+            ):
+                # NEW-136 review: e.g. a symlinked console scan root (fail closed).
+                return await self._ui_plan_terminal(
+                    context,
+                    "BLOCKED",
+                    str(inventory.get("blocker") or "UI_INVENTORY_BLOCKED"),
+                    [str(inventory.get("reason") or "")[:300]],
+                )
             return await self._ui_plan_terminal(context, "FAILED", "UI_INVENTORY_FAILED")
         kit = await self._step("ui.kit_snapshot", {"project": request.project})
         if kit.get("status") == "BLOCKED":
@@ -5395,6 +5405,9 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
         }
 
     _BATCHED_PATCH = "ui-plan-batched-blueprint-v1"
+    # NEW-136 review: a BLOCKED inventory ends the plan BLOCKED with the inventory's blocker
+    # (before: FAILED UI_INVENTORY_FAILED; the inventory step never returned BLOCKED then).
+    _INVENTORY_BLOCKED_PATCH = "ui-plan-inventory-blocked-v1"
     # NEW-132: a first draft Hermes rejects (schema or structure) gets the part's redraft.
     _STRUCTURAL_REDRAFT_PATCH = "new-132-structural-redraft"
     _STRUCTURAL_REJECTIONS = frozenset({"DRAFT_SCHEMA_INVALID", "DRAFT_STRUCTURE_INVALID"})

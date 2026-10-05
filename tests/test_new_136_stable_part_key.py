@@ -9,6 +9,7 @@ Drafts and reviews still bind the full `inventory_sha256` and `legacy_source_sha
 from __future__ import annotations
 
 import copy
+import shutil
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -371,3 +372,50 @@ def test_stage_parts_keys_the_parts_and_refuses_an_inventory_without_a_tree(tmp_
     old["inventory_sha256"] = inventory_hash(old)
     blocked = stage(old)
     assert (blocked["status"], blocked["blocker"]) == ("BLOCKED", "UI_PLAN_INVENTORY_KEY_MISSING")
+
+
+# Workflow: a BLOCKED inventory (NEW-136 review, patch ui-plan-inventory-blocked-v1) ---------
+
+
+def _symlink_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **payload,
+        "status": "BLOCKED",
+        "blocker": "UI_INVENTORY_SYMLINK_ROOT",
+        "reason": "UI_INVENTORY_SYMLINK_ROOT: apps/web-console/src",
+    }
+
+
+@pytest.mark.skipif(shutil.which("temporal") is None, reason="requires the `temporal` CLI")
+async def test_a_symlinked_scan_root_blocks_the_plan_and_old_histories_replay(
+    tmp_path: Path,
+) -> None:
+    from pre_new_132_ui_plan_workflow import ParentBatchedUiMigrationPlanWorkflow
+    from temporalio.worker import Replayer
+    from test_new_131_ui_batched_workflow import batched_harness, markers
+
+    from engineering_control.workflows.definitions import UiMigrationPlanWorkflow
+
+    patch = UiMigrationPlanWorkflow._INVENTORY_BLOCKED_PATCH
+    (tmp_path / "new").mkdir()
+    (tmp_path / "old").mkdir()
+    harness, request, workflow_id = batched_harness(tmp_path / "new")
+    harness.responses["ui.inventory"] = _symlink_inventory
+    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    assert (result["status"], result["error_code"]) == ("BLOCKED", "UI_INVENTORY_SYMLINK_ROOT")
+    assert "ui.kit_snapshot" not in harness.calls
+    assert any(patch in marker for marker in markers(harness.history))
+    # A history recorded by the deployed code (no marker) replays unchanged on the new code.
+    old, old_request, old_id = batched_harness(tmp_path / "old")
+    old.responses["ui.inventory"] = _symlink_inventory
+    previous = await old.run(
+        ParentBatchedUiMigrationPlanWorkflow, old_request, old_id, replay=UiMigrationPlanWorkflow
+    )
+    assert (previous["status"], previous["error_code"]) == ("FAILED", "UI_INVENTORY_FAILED")
+    assert not any(patch in marker for marker in markers(old.history))
+    await Replayer(workflows=[UiMigrationPlanWorkflow]).replay_workflow(old.history)
+    # And the new history needs the new code: the patch is real.
+    with pytest.raises(Exception):  # noqa: B017 - any nondeterminism error
+        await Replayer(workflows=[ParentBatchedUiMigrationPlanWorkflow]).replay_workflow(
+            harness.history
+        )

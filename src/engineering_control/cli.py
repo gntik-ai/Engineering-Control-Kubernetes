@@ -962,6 +962,7 @@ def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
     from engineering_control.engineering.safe_files import write_text_no_follow
     from engineering_control.engineering.ui_inventory import (
         build_inventory,
+        check_git_scan_roots,
         git_legacy_app_tree,
         inventory_content_key,
         render_markdown,
@@ -981,6 +982,18 @@ def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
             timeout=30,
         ).stdout.strip()
     )
+
+    def object_type(relative: str) -> str | None:
+        found = subprocess.run(  # noqa: S603
+            ["git", "-C", str(checkout), "cat-file", "-t", f"{source_sha}:{relative}"],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return found.stdout.strip() if found.returncode == 0 else None
+
+    check_git_scan_roots(object_type, policy.legacy_app)
     tree = git_legacy_app_tree(
         lambda git_arguments: (
             subprocess.run(  # noqa: S603

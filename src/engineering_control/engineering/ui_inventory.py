@@ -26,7 +26,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -36,6 +36,8 @@ from engineering_control.security.redaction import SecretRedactor
 
 # 2 (NEW-136): records `legacy_app_tree`, the Git tree id of the legacy app directory.
 SCHEMA_VERSION = 2
+# NEW-136 review: a console scan root that is (or traverses) a symlink; the plan blocks.
+SYMLINK_ROOT = "UI_INVENTORY_SYMLINK_ROOT"
 GENERATOR = "engineering_control.engineering.ui_inventory"
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 # The call site's method could not be determined (indirect or computed options).
@@ -887,8 +889,22 @@ def load_route_tables(root: Path, policy: UiMigrationPolicy) -> RouteTables:
 
 
 def _inside(root: Path, relative: str) -> Path:
+    """`relative` inside the checkout, never reached through a symlink (NEW-136 review).
+
+    A scan root that is or traverses a symlink is refused: the legacy app's Git tree id
+    covers only the link, so a symlinked root would let console changes bypass the reuse
+    key. Symlinks below a root are skipped and recorded (`_safe_files`)."""
     resolved_root = root.resolve()
-    path = (resolved_root / relative).resolve()
+    current = resolved_root
+    for part in PurePosixPath(relative).parts:
+        if part in {"/", ".", ".."}:
+            raise InventoryError("inventory path escaped the checkout")
+        current = current / part
+        if current.is_symlink():
+            raise InventoryError(
+                f"{SYMLINK_ROOT}: inventory root is or traverses a symlink: {relative}"
+            )
+    path = current.resolve()
     if not path.is_relative_to(resolved_root):
         raise InventoryError("inventory path escaped the checkout")
     return path
@@ -1400,6 +1416,28 @@ def inventory_content_key(document: dict[str, Any]) -> str:
     body = {key: value for key, value in document.items() if key not in CONTENT_KEY_EXCLUDED}
     payload = {"version": CONTENT_KEY_VERSION, "inventory": body}
     return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def console_scan_roots(legacy_app: str) -> tuple[tuple[str, bool], ...]:
+    """(path, required) of every console directory the inventory scans from."""
+    return ((legacy_app, True), (f"{legacy_app}/src", True), (f"{legacy_app}/e2e", False))
+
+
+def check_git_scan_roots(object_type: Callable[[str], str | None], legacy_app: str) -> None:
+    """Fail closed unless every console scan root is a Git tree at the snapshot commit.
+
+    `object_type(path)` is `git cat-file -t <sha>:<path>`, or None when the path does not
+    resolve (absent, or below a symlink: Git never follows one). A symlink is a blob (mode
+    120000), so a symlinked root is refused here as well as on the filesystem (`_inside`)."""
+    for relative, required in console_scan_roots(legacy_app):
+        kind = object_type(relative)
+        if kind is None and not required:
+            continue
+        if kind != "tree":
+            raise InventoryError(
+                f"{SYMLINK_ROOT}: console scan root is not a directory at the snapshot "
+                f"commit (missing, a symlink, or below one): {relative}"
+            )
 
 
 def git_legacy_app_tree(run: Callable[[list[str]], str], source_sha: str, legacy_app: str) -> str:

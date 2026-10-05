@@ -848,9 +848,7 @@ class GitWorktreeManager:
             "tracked_files_sha256": hashlib.sha256(canonical).hexdigest(),
         }
 
-    def snapshot_tree(self, path: Path, *, expected_sha: str, relative: str) -> str:
-        """NEW-136: the Git tree id of `relative` (a directory) at the snapshot commit,
-        read from the object store (independent of the checked-out files)."""
+    def _snapshot_object(self, path: Path, expected_sha: str, relative: str) -> Path:
         root = self.worktree_root.resolve()
         resolved = path.resolve()
         if resolved == root or not resolved.is_dir() or not resolved.is_relative_to(root):
@@ -861,6 +859,22 @@ class GitWorktreeManager:
             r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", relative
         ) or ".." in relative.split("/"):
             raise ValueError(f"snapshot tree path is invalid: {relative}")
+        return resolved
+
+    def snapshot_object_type(self, path: Path, *, expected_sha: str, relative: str) -> str | None:
+        """NEW-136 review: the Git object type of `relative` at the snapshot commit ('tree',
+        'blob' -- a symlink is a blob -- ...), or None when it does not resolve (absent, or
+        below a symlink, which Git never follows)."""
+        resolved = self._snapshot_object(path, expected_sha, relative)
+        try:
+            return self._run(["git", "cat-file", "-t", f"{expected_sha}:{relative}"], resolved)
+        except WorktreeError:
+            return None
+
+    def snapshot_tree(self, path: Path, *, expected_sha: str, relative: str) -> str:
+        """NEW-136: the Git tree id of `relative` (a directory) at the snapshot commit,
+        read from the object store (independent of the checked-out files)."""
+        resolved = self._snapshot_object(path, expected_sha, relative)
         tree = self._run(
             ["git", "rev-parse", "--verify", "--quiet", f"{expected_sha}:{relative}"], resolved
         )
