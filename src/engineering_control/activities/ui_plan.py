@@ -145,6 +145,73 @@ def _bounded_json(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " [truncated]"
 
 
+# NEW-139: review convergence. Every review of a part is exhaustive, and every redraft and
+# re-review carries all earlier findings on that part (labelled by round), bounded.
+PRIOR_FINDINGS_MAX = 60
+PRIOR_FINDINGS_CHARS = 40_000
+
+
+def _finding_text(item: Any) -> str:
+    if isinstance(item, dict):
+        text = (
+            f"[{item.get('category') or '-'}] {item.get('subject') or '-'}: "
+            f"{item.get('detail') or ''}"
+        )
+    else:
+        text = str(item)
+    return " ".join(text.split())[:2_000]
+
+
+def cumulative_findings(
+    reviews: list[dict[str, Any]], rejections: list[dict[str, Any]], before: int
+) -> tuple[list[str], int]:
+    """Every REVISE finding and Hermes rejection finding on drafts 1..before-1 of a part,
+    deduplicated (a repeated finding lists every round it was raised in) and labelled by
+    round, oldest first. Past PRIOR_FINDINGS_MAX findings or PRIOR_FINDINGS_CHARS
+    characters the oldest are omitted (the newest rounds are kept whole); returns the
+    lines and the number omitted."""
+    raised: list[tuple[int, str, str]] = []
+    for review in reviews:
+        attempt = int(review.get("attempt") or 0)
+        if 1 <= attempt < before and review.get("decision") == "REVISE":
+            raised += [
+                (attempt, "review", _finding_text(item)) for item in review.get("findings") or []
+            ]
+    for rejection in rejections:
+        attempt = int(rejection.get("attempt") or 0)
+        if 1 <= attempt < before:
+            source = f"Hermes rejection {rejection.get('code') or ''}".strip()
+            raised += [
+                (attempt, source, _finding_text(item)) for item in rejection.get("details") or []
+            ]
+    rounds: dict[str, list[str]] = {}
+    for attempt, source, text in sorted(raised, key=lambda item: item[0]):
+        label = f"round {attempt} ({source} of draft {attempt})"
+        if label not in rounds.setdefault(text, []):
+            rounds[text].append(label)
+    lines = [f"- [{'; '.join(labels)}] {text}" for text, labels in rounds.items()]
+    kept: list[str] = []
+    size = 0
+    for line in reversed(lines):
+        if len(kept) >= PRIOR_FINDINGS_MAX or size + len(line) + 1 > PRIOR_FINDINGS_CHARS:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    kept.reverse()
+    return kept, len(lines) - len(kept)
+
+
+def _findings_block(label: str, lines: list[str], omitted: int) -> str:
+    note = (
+        f"\n({omitted} older findings are omitted past the bound of {PRIOR_FINDINGS_MAX} "
+        f"findings or {PRIOR_FINDINGS_CHARS} characters; they are in the earlier review "
+        "files of this part in the input directory and still apply.)"
+        if omitted
+        else ""
+    )
+    return _fenced(label, "\n".join(lines) + note)
+
+
 def decisions_sha256() -> str:
     """NEW-134 review: the decision inputs a plan's parts are drafted and reviewed under."""
     return canonical_sha256({"decisions": OPERATOR_DECISIONS, "seed": SEED_FINDINGS})
@@ -620,6 +687,45 @@ class UiPlanActivityHandler:
         "output schema has no place for them. Your output is only the judgement fields."
     )
 
+    # NEW-139: reviews sampled different rules each round (live plan ee4f7a59, batch 2), so
+    # the drafter never converged; every review is an exhaustive checklist pass instead.
+    _EXHAUSTIVE_REVIEW = {
+        BATCH: (
+            "Review exhaustively, never by sampling. Before deciding, run a systematic "
+            "checklist pass, page by page: check every page of this batch against every "
+            "numbered global decision of the reviewed frame in turn (page x decision), "
+            "against the kit catalogue (every template, layout, block, component and variant "
+            "you see must exist in it) and against every contract rule of the skill "
+            "(disposition, target, behaviour and endpoint_refs, i18n, wave, "
+            "parity_acceptance, gap_ids and depends_on). Report every violation you find, "
+            "all of them in this single review, one finding each: the complete list, not a "
+            "sample or the first few. A later review of the redraft must not find a "
+            "violation that was already present in this draft. APPROVE only when the "
+            "checklist finds none."
+        ),
+        FRAME: (
+            "Review exhaustively, never by sampling. Before deciding, run a systematic "
+            "checklist pass: check every foundation epic, every gap, the cutover steps and "
+            "criteria and every global decision against every contract rule of the skill, "
+            "the inventory summary and the kit catalogue (every kit id you see must exist in "
+            "it). Report every violation you find, all of them in this single review, one "
+            "finding each: the complete list, not a sample or the first few. A later review "
+            "of the redraft must not find a violation that was already present in this "
+            "draft. APPROVE only when the checklist finds none."
+        ),
+    }
+
+    def _prior_findings(
+        self, blueprint_id: UUID, part_id: str, payload: dict[str, Any], before: int
+    ) -> tuple[list[str], int]:
+        """NEW-139: all earlier findings on this part, from the durable part reviews and the
+        Hermes rejections the plan carries (part_rejections)."""
+        reviews = self.repository.part_reviews_sync(blueprint_id, part_id)
+        rejections = [
+            item for item in payload.get("part_rejections") or [] if isinstance(item, dict)
+        ]
+        return cumulative_findings(reviews, rejections, before)
+
     @staticmethod
     def _part_base(payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -890,6 +996,32 @@ class UiPlanActivityHandler:
         if kind == BATCH:
             sections.append(self._frame_section(blueprint_id, payload))
         rejection = payload.get("rejection")
+        if attempt >= 2 and isinstance(rejection, dict):
+            # NEW-139: keep every Hermes rejection of this part, not only the latest (the
+            # workflow drops `rejection` after a REVISE); data only, carried with the plan.
+            entry = {
+                "attempt": attempt - 1,
+                "code": str(rejection.get("code") or ""),
+                "details": [str(item) for item in rejection.get("details") or []][:50],
+            }
+            rejections = [
+                item for item in payload.get("part_rejections") or [] if isinstance(item, dict)
+            ]
+            if not any(item.get("attempt") == entry["attempt"] for item in rejections):
+                base["part_rejections"] = [*rejections, entry]
+        history, omitted = (
+            self._prior_findings(blueprint_id, part_id, {**payload, **base}, attempt)
+            if attempt >= 2
+            else ([], 0)
+        )
+        cumulative = (
+            "Every finding on this part so far, from every earlier round, labelled by round "
+            "(deduplicated). Resolve all of them in this draft, not only the latest round's, "
+            "and do not regress any earlier fix: a finding fixed in an earlier redraft must "
+            "stay fixed.\n" + _findings_block("review findings", history, omitted)
+            if history
+            else ""
+        )
         # NEW-138: up to two redrafts per part (one for a plan from before the patch).
         which = (
             "the single redraft"
@@ -910,6 +1042,7 @@ class UiPlanActivityHandler:
                     else "Another rejection uses the next redraft.\n"
                 )
                 + _fenced("hermes findings", _bounded_json(rejection.get("details") or [], 40_000))
+                + (f"\n\n{cumulative}" if cumulative else "")
             )
         elif attempt >= 2:
             rounds = payload.get("part_rounds") or []
@@ -919,7 +1052,12 @@ class UiPlanActivityHandler:
                 f"); its review is {(payload.get('review_file') or {}).get('path')}. Address "
                 "every finding while keeping every hard rule; do not add pages, endpoints or "
                 "kit items that are not in the inputs.\n"
-                + _fenced("review findings", _bounded_json(rounds[-1] if rounds else {}, 40_000))
+                + (
+                    cumulative
+                    or _fenced(
+                        "review findings", _bounded_json(rounds[-1] if rounds else {}, 40_000)
+                    )
+                )
             )
         request = AgentRequest(
             run_id=uuid5(
@@ -1070,6 +1208,22 @@ class UiPlanActivityHandler:
         ]
         if kind == BATCH:
             sections.append(self._frame_section(blueprint_id, payload))
+        sections.append(self._EXHAUSTIVE_REVIEW[kind])
+        history, omitted = (
+            self._prior_findings(blueprint_id, part_id, payload, attempt)
+            if attempt >= 2
+            else ([], 0)
+        )
+        if history:
+            # NEW-139: a re-review first verifies every earlier finding, then the checklist.
+            sections.append(
+                f"This is the review of draft {attempt} of this part. Earlier drafts of it "
+                "drew the findings below (every round, labelled). First verify each one "
+                "against this draft: report every one that is not fully resolved as a "
+                "finding again, naming the round it was raised in. Then run the complete "
+                "checklist above and report every remaining violation, exhaustively.\n"
+                + _findings_block("prior findings", history, omitted)
+            )
         request = AgentRequest(
             run_id=uuid5(
                 NAMESPACE_URL,
