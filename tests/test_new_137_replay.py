@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 _INVOCATION = "6f1a7a52-0d4e-4a43-9a3c-1370000000a1"
 
 
-def _checker_context(summary: str, error_code: str = "PROVIDER_EXIT_NONZERO") -> dict[str, Any]:
+def _checker_context(summary: str, kind: str) -> dict[str, Any]:
     return {
         "change_set_id": "43b4dc63-0000-4000-8000-000000000137",
         "status": "FAILED",
@@ -50,8 +50,9 @@ def _checker_context(summary: str, error_code: str = "PROVIDER_EXIT_NONZERO") ->
             "provider": "claude",
             "role": "code-reviewer",
             "status": "FAILED",
-            "error_code": error_code,
+            "error_code": "PROVIDER_EXIT_NONZERO",
             "summary": summary,
+            "provider_error_kind": kind,
         },
     }
 
@@ -62,7 +63,10 @@ class _ProviderOverloadedDeliveryStub:
 
     @workflow.run
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
-        return {"status": "FAILED", "context": _checker_context("API Error: 529 Overloaded")}
+        return {
+            "status": "FAILED",
+            "context": _checker_context("API Error: 529 Overloaded", "OVERLOADED"),
+        }
 
 
 @workflow.defn(name="IssueDeliveryWorkflow", sandboxed=False)
@@ -71,7 +75,7 @@ class _CheckerAuthFailureDeliveryStub:
     async def run(self, request: IssueDeliveryInput) -> dict[str, Any]:
         return {
             "status": "FAILED",
-            "context": _checker_context("API Error: 401 authentication_error"),
+            "context": _checker_context("API Error: 401 authentication_error", "NON_TRANSIENT"),
         }
 
 
@@ -197,6 +201,8 @@ async def test_a_checker_activity_error_carries_its_bounded_type_and_replays() -
     assert len(failed) == 1
     assert failed[0]["blocker"] == "PROVIDER_ACTIVITY_FAILED"
     assert failed[0]["provider_failure_type"] == "NOT_CONFIGURED"
+    # NEW-137 review: the previous call's result never travels into persist_result.
+    assert "agent_result" not in failed[0]
     released = [
         request["payload"]
         for request in _scheduled_steps(history)

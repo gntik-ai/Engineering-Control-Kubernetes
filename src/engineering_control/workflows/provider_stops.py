@@ -8,15 +8,17 @@ falcone #1012: a retry child's Claude checker call failed with PROVIDER_EXIT_NON
 stayed PLANNED, and the next operator retry was refused ("another delivery child
 requires an explicit correction state") until a manual database fix.
 
-Only an explicit allowlist of transient provider signals qualifies. Policy, schema,
+Only an explicit allowlist of transient provider signals qualifies, read from
+provider-owned diagnostics (never model output). Policy, schema,
 authentication, missing-CLI, budget (max turns), sandbox, timeout and every other
 failure stays as it is.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
+
+from engineering_control.provider_error_kinds import TRANSIENT_PROVIDER_ERROR_KINDS
 
 PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 
@@ -28,39 +30,18 @@ DELIVERY_PROVIDER_REQUESTS: dict[str, str] = {
     "delivery.invoke_checker": "checker_request",
 }
 
-# Provider results (adapters.process.classify_failure) that are transient by
-# classification: the provider's own rate limit, and a model at capacity after the
-# provider activity's bounded same-model retries.
+# Provider result error codes (adapters.process.classify_failure) that may be transient.
+# Each qualifies only with a transient provider_error_kind, which the adapter derives
+# from provider-owned diagnostics alone (engineering_control.provider_error_kinds): never
+# from the summary, which can be model output (Codex keeps the agent's final message).
+# The kind gives the terminal result precedence, so a capacity error seen before an
+# error_max_turns / structured-output-retries terminal result is not transient.
 _TRANSIENT_RESULTS = frozenset(
     {
         ("RATE_LIMITED", "PROVIDER_RATE_LIMIT"),
         ("FAILED", "PROVIDER_MODEL_AT_CAPACITY"),
+        ("FAILED", "PROVIDER_EXIT_NONZERO"),
     }
-)
-# PROVIDER_EXIT_NONZERO is the catch-all of a non-zero CLI exit. It qualifies only when
-# the provider's own error text names an unavailable service, and never when it names a
-# non-transient cause (max turns, structured-output retries, authentication, budget...).
-_EXIT_NONZERO = ("FAILED", "PROVIDER_EXIT_NONZERO")
-_UNAVAILABLE_TEXT = re.compile(
-    r"\b(?:api error|http|status(?: code)?)\W{0,3}5\d\d\b"
-    r"|\boverloaded\b"
-    r"|\bservice unavailable\b"
-    r"|\bbad gateway\b"
-    r"|\bgateway timeout\b"
-    r"|\binternal server error\b"
-    r"|\btemporarily unavailable\b"
-    r"|\bhigh demand\b"
-    r"|\bconnection (?:error|reset|refused)\b"
-    r"|\beconnreset\b"
-    r"|\betimedout\b"
-    r"|\bstream disconnected\b",
-    re.IGNORECASE,
-)
-_NON_TRANSIENT_TEXT = re.compile(
-    r"error_max_turns|max_turns|error_max_structured_output_retries|structured.output"
-    r"|\bbudget\b|\bauth\w*|\bunauthori[sz]ed\b|\bforbidden\b|\bcredential\w*"
-    r"|\blog ?in\b|\bapi key\b|\bsandbox\w*|\bpolic(?:y|ies)\b|\bschema\b|\b40[13]\b",
-    re.IGNORECASE,
 )
 # _agent_step's exception path: the activity raised and no provider result exists.
 # RATE_LIMITED is the provider's own typed rate-limit error. PROVIDER_ACTIVITY_FAILED
@@ -95,40 +76,36 @@ def provider_unavailable_stop(payload: Any) -> dict[str, str] | None:
     if isinstance(result, dict) and str(result.get("run_id")) == str(invocation_id):
         # The stopping call's own provider result.
         code = result.get("error_code")
-        if result.get("status") != status or not isinstance(code, str):
+        kind = result.get("provider_error_kind")
+        if result.get("status") != status or (status, code) not in _TRANSIENT_RESULTS:
             return None
-        if (status, code) not in _TRANSIENT_RESULTS:
-            text = str(result.get("summary") or "")
-            if (status, code) != _EXIT_NONZERO or not _UNAVAILABLE_TEXT.search(text):
-                return None
-            if _NON_TRANSIENT_TEXT.search(text):
-                return None
-        return _stop(step, status, code, result.get("provider"), result.get("role"))
+        if kind not in TRANSIENT_PROVIDER_ERROR_KINDS:
+            return None  # no provider-owned transient signal: fail closed
+        return _stop(step, status, code, kind, result.get("provider"), result.get("role"))
     blocker = payload.get("blocker")
     if status != "FAILED" or str(request.get("run_id")) != str(invocation_id):
         return None
     if blocker == "RATE_LIMITED":
-        return _stop(step, status, blocker, request.get("provider"), request.get("role"))
+        return _stop(
+            step, status, blocker, "RATE_LIMITED", request.get("provider"), request.get("role")
+        )
     failure = payload.get("provider_failure_type")
     if blocker == "PROVIDER_ACTIVITY_FAILED" and failure in _TRANSIENT_ACTIVITY_FAILURES:
-        return _stop(
-            step,
-            status,
-            f"{blocker}:{failure}",
-            request.get("provider"),
-            request.get("role"),
-        )
+        return _stop(step, status, blocker, failure, request.get("provider"), request.get("role"))
     return None
 
 
-def _stop(step: str, status: str, code: str, provider: Any, role: Any) -> dict[str, str] | None:
+def _stop(
+    step: str, status: str, code: Any, kind: Any, provider: Any, role: Any
+) -> dict[str, str] | None:
     if provider not in _PROVIDERS:
         return None
     return {
         "status": status,
         "blocker": PROVIDER_UNAVAILABLE,
         "provider": str(provider),
-        "error_code": code[:120],
+        "error_code": str(code)[:120],
+        "provider_error_kind": str(kind)[:60],
         "provider_step": step,
         "role": str(role or "")[:80],
     }

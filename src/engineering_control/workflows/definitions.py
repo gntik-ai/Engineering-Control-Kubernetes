@@ -418,38 +418,7 @@ class ControlledWorkflow:
         try:
             result = await self._step(step, started, timeout_minutes=timeout_minutes)
         except ActivityError as error:
-            cause = error.cause
-            blocker = (
-                cause.type
-                if isinstance(cause, ApplicationError)
-                and cause.type
-                in {
-                    "MANUAL_AUTH_REQUIRED_CODEX",
-                    "MANUAL_AUTH_REQUIRED_CLAUDE",
-                    "PROVIDER_CLI_MISSING_CODEX",
-                    "PROVIDER_CLI_MISSING_CLAUDE",
-                    "RATE_LIMITED",
-                    "SchemaViolation",
-                    "PolicyViolation",
-                }
-                else "PROVIDER_ACTIVITY_FAILED"
-            )
-            failed: dict[str, Any] = {**started, "status": "FAILED", "blocker": blocker}
-            if blocker == "PROVIDER_ACTIVITY_FAILED":
-                # NEW-137: the bounded failure type (e.g. TIMEOUT_HEARTBEAT) tells a provider
-                # worker that stopped answering from a non-transient activity error. Data
-                # only (no command), so replay is unchanged.
-                failed["provider_failure_type"] = _provider_failure_type(cause)
-            details = cause.details if isinstance(cause, ApplicationError) else ()
-            if blocker == "SchemaViolation" and details and isinstance(details[0], dict):
-                # Usage of a call whose output failed its schema (numbers only).
-                failed["failed_agent_usage"] = {
-                    key: details[0].get(key) for key in ("usage", "provider", "run_id")
-                }
-                findings = details[0].get("findings")
-                if isinstance(findings, list) and findings:
-                    # NEW-132: the bounded, redacted schema errors (input only, no command).
-                    failed["failed_schema_findings"] = [str(item)[:400] for item in findings[:20]]
+            failed = _agent_failure_payload(started, error.cause)
             return await self._step("agent.persist_result", failed)
         return await self._step("agent.persist_result", result)
 
@@ -3275,6 +3244,54 @@ def _child_failure_code(error: BaseException) -> str:
                 return _failure_code(current.type)
         current = current.__cause__
     return "CHILD_WORKFLOW_FAILED"
+
+
+_AGENT_STEP_BLOCKERS = frozenset(
+    {
+        "MANUAL_AUTH_REQUIRED_CODEX",
+        "MANUAL_AUTH_REQUIRED_CLAUDE",
+        "PROVIDER_CLI_MISSING_CODEX",
+        "PROVIDER_CLI_MISSING_CLAUDE",
+        "RATE_LIMITED",
+        "SchemaViolation",
+        "PolicyViolation",
+    }
+)
+# A previous provider call's result in the context (e.g. the spec's, when the maker
+# raised): agent.persist_result would read it as this call's result and reject its
+# identity, so the attempt crashed before its stop was recorded (NEW-137 review).
+_PREVIOUS_PROVIDER_RESULT_KEYS = frozenset(
+    {"agent_result", "agent_invocation_id", "agent_invocation_status"}
+)
+
+
+def _agent_failure_payload(started: dict[str, Any], cause: BaseException | None) -> dict[str, Any]:
+    """agent.persist_result's input after a provider activity raised (no result)."""
+    blocker = (
+        cause.type
+        if isinstance(cause, ApplicationError) and cause.type in _AGENT_STEP_BLOCKERS
+        else "PROVIDER_ACTIVITY_FAILED"
+    )
+    failed: dict[str, Any] = {
+        key: value for key, value in started.items() if key not in _PREVIOUS_PROVIDER_RESULT_KEYS
+    }
+    failed.update({"status": "FAILED", "blocker": blocker})
+    if blocker == "PROVIDER_ACTIVITY_FAILED":
+        # NEW-137: the bounded failure type (e.g. TIMEOUT_HEARTBEAT) tells a provider
+        # worker that stopped answering from a non-transient activity error. Data only
+        # (no command), so replay is unchanged.
+        failed["provider_failure_type"] = _provider_failure_type(cause)
+    details = cause.details if isinstance(cause, ApplicationError) else ()
+    if blocker == "SchemaViolation" and details and isinstance(details[0], dict):
+        # Usage of a call whose output failed its schema (numbers only).
+        failed["failed_agent_usage"] = {
+            key: details[0].get(key) for key in ("usage", "provider", "run_id")
+        }
+        findings = details[0].get("findings")
+        if isinstance(findings, list) and findings:
+            # NEW-132: the bounded, redacted schema errors (input only, no command).
+            failed["failed_schema_findings"] = [str(item)[:400] for item in findings[:20]]
+    return failed
 
 
 def _provider_failure_type(cause: BaseException | None) -> str:

@@ -17,6 +17,7 @@ from engineering_control.adapters.process import (
 )
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
+from engineering_control.provider_error_kinds import provider_error_kind
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -196,8 +197,12 @@ class CodexCLIAdapter:
             if process_result.exit_code == 0 and not process_result.timed_out:
                 status = RunStatus.SUCCESS
                 error_code = None
+                error_kind = None
             else:
                 raw_status, error_code = classify_failure(process_result)
+                error_kind = provider_error_kind(
+                    process_result.events, process_result.stderr, timed_out=process_result.timed_out
+                )
                 status = RunStatus(raw_status)
                 if not summary:
                     summary = self._failure_summary(process_result.events, process_result.stderr)
@@ -214,6 +219,7 @@ class CodexCLIAdapter:
                 finished_at=datetime.now(UTC),
                 exit_code=process_result.exit_code,
                 error_code=error_code,
+                provider_error_kind=error_kind,
             )
 
     def _run_temp_parent(self, run_id: UUID) -> Path:

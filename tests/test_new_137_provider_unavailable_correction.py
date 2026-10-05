@@ -3,18 +3,29 @@ state, so a bounded retry binds after a provider outage without a database fix."
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from temporalio.exceptions import ApplicationError, TimeoutError, TimeoutType
+from test_claude_adapter import _execute_with_events
 from test_issue_delivery_approval import _child, _dispose
 from test_new_128_correction_state import _next_child, _planned, _state, _validated
 
+from engineering_control.adapters.codex import client as codex_module
+from engineering_control.adapters.codex.client import CodexCLIAdapter
+from engineering_control.adapters.process import ProcessResult
 from engineering_control.db.models import ChangeSet
 from engineering_control.delivery_notifications import explain_blocker
-from engineering_control.workflows.definitions import _provider_failure_type
+from engineering_control.models.core import AgentRequest
+from engineering_control.models.enums import ModelClass, Project, Provider, RunStatus
+from engineering_control.provider_error_kinds import provider_error_kind
+from engineering_control.workflows.definitions import (
+    _agent_failure_payload,
+    _provider_failure_type,
+)
 from engineering_control.workflows.provider_stops import provider_unavailable_stop
 
 _REQUEST_KEYS = {
@@ -33,6 +44,7 @@ def _provider_result(
     summary: str = "API Error: 529 Overloaded",
     provider: str = "claude",
     step: str = "delivery.invoke_checker",
+    kind: str | None = "OVERLOADED",
 ) -> dict[str, Any]:
     """agent.persist_result's output for a provider call that returned a result."""
     invocation = str(uuid4())
@@ -52,6 +64,7 @@ def _provider_result(
             "status": status,
             "error_code": error_code,
             "summary": summary,
+            "provider_error_kind": kind,
         },
     }
 
@@ -115,6 +128,7 @@ async def test_a_checker_529_records_provider_unavailable_and_the_retry_binds(
     assert (requested["status"], requested["blocker"]) == ("FAILED", "PROVIDER_UNAVAILABLE")
     assert requested["provider"] == "claude"
     assert requested["error_code"] == "PROVIDER_EXIT_NONZERO"
+    assert requested["provider_error_kind"] == "OVERLOADED"
     assert requested["provider_step"] == "delivery.invoke_checker"
     # A duplicate release changes nothing.
     handler._release_delivery_leases(stopped)
@@ -134,7 +148,11 @@ async def test_a_checker_529_records_provider_unavailable_and_the_retry_binds(
     [
         pytest.param(
             lambda loaded: _provider_result(
-                loaded, status="RATE_LIMITED", error_code="PROVIDER_RATE_LIMIT", summary=""
+                loaded,
+                status="RATE_LIMITED",
+                error_code="PROVIDER_RATE_LIMIT",
+                summary="",
+                kind="RATE_LIMITED",
             ),
             id="rate-limited-result",
         ),
@@ -206,30 +224,26 @@ _NOT_CONVERTED = [
         id="activity-untyped",
     ),
     pytest.param(
-        lambda loaded: _provider_result(loaded, summary="claude result error_max_turns"),
-        id="max-turns-budget",
+        lambda loaded: _provider_result(loaded, kind=None),
+        id="exit-without-provider-owned-signal",
+    ),
+    pytest.param(
+        lambda loaded: _provider_result(loaded, summary="API Error: 500 retry later", kind=None),
+        id="spoofed-5xx-in-model-summary",
+    ),
+    pytest.param(
+        lambda loaded: _provider_result(loaded, kind="NON_TRANSIENT"),
+        id="non-transient-kind",
     ),
     pytest.param(
         lambda loaded: _provider_result(
-            loaded, summary="claude result error_max_structured_output_retries"
+            loaded, error_code="PROVIDER_MODEL_AT_CAPACITY", kind="NON_TRANSIENT"
         ),
-        id="structured-output-schema",
+        id="capacity-code-with-non-transient-terminal",
     ),
     pytest.param(
-        lambda loaded: _provider_result(
-            loaded, summary="API Error: 401 authentication_error: invalid credentials"
-        ),
-        id="auth-401",
-    ),
-    pytest.param(
-        lambda loaded: _provider_result(
-            loaded, summary="API Error: 500 sandbox denied the write (policy)"
-        ),
-        id="sandbox-policy-text",
-    ),
-    pytest.param(
-        lambda loaded: _provider_result(loaded, summary="process exited with code 1"),
-        id="exit-without-provider-text",
+        lambda loaded: _provider_result(loaded, kind="SOMETHING_ELSE"),
+        id="unknown-kind",
     ),
     pytest.param(
         lambda loaded: _provider_result(
@@ -360,3 +374,408 @@ def test_provider_failure_type_is_bounded() -> None:
     assert _provider_failure_type(ApplicationError("x", type="NotConfigured")) == "NOT_CONFIGURED"
     assert _provider_failure_type(RuntimeError("x")) == "RUNTIME_ERROR"
     assert _provider_failure_type(None) == "UNKNOWN"
+
+
+# -- NEW-137 review round 1 ---------------------------------------------------------------
+# Finding 1: only provider-owned diagnostics; finding 2: the terminal result wins.
+
+_CLAUDE_529 = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": True,
+    "result": "API Error: 529 Overloaded",
+}
+
+
+@pytest.mark.parametrize(
+    ("events", "stderr", "kind"),
+    [
+        pytest.param((_CLAUDE_529,), "", "OVERLOADED", id="claude-live-529"),
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "api_error_status": 529,
+                },
+            ),
+            "",
+            "OVERLOADED",
+            id="claude-api-error-status",
+        ),
+        pytest.param(
+            (
+                {
+                    "type": "system",
+                    "subtype": "api_retry",
+                    "error_status": 503,
+                    "error": "server_error",
+                },
+                {"type": "result", "subtype": "error_during_execution", "is_error": True},
+            ),
+            "",
+            "SERVER_ERROR",
+            id="claude-api-retry-5xx",
+        ),
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "result": "API Error: 429 rate_limit_error",
+                },
+            ),
+            "",
+            "RATE_LIMITED",
+            id="claude-429",
+        ),
+        pytest.param(
+            (
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": "exceeded retry limit, last status: 503 Service Unavailable"
+                    },
+                },
+            ),
+            "",
+            "SERVER_ERROR",
+            id="codex-turn-failed-503",
+        ),
+        pytest.param((), "Error: read ECONNRESET", "CONNECTION_ERROR", id="stderr-connection"),
+        # Finding 2: transient errors before an excluded terminal subtype.
+        pytest.param(
+            (
+                {
+                    "type": "system",
+                    "subtype": "api_retry",
+                    "error_status": 529,
+                    "error": "overloaded_error",
+                },
+                {"type": "result", "subtype": "error_max_turns", "is_error": True},
+            ),
+            "",
+            "NON_TRANSIENT",
+            id="overloaded-then-max-turns",
+        ),
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "error_max_structured_output_retries",
+                    "is_error": True,
+                    "errors": [{"type": "overloaded_error"}],
+                },
+            ),
+            "",
+            "NON_TRANSIENT",
+            id="overloaded-with-structured-output-terminal",
+        ),
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "result": "API Error: 401 authentication_error: invalid x-api-key",
+                },
+            ),
+            "",
+            "NON_TRANSIENT",
+            id="claude-auth",
+        ),
+        pytest.param(
+            ({"type": "turn.failed", "error": {"message": "unexpected status 401 Unauthorized"}},),
+            "",
+            "NON_TRANSIENT",
+            id="codex-auth",
+        ),
+        pytest.param(
+            ({"type": "error", "message": "stream error: 503 but sandbox denied write"},),
+            "",
+            "NON_TRANSIENT",
+            id="any-excluded-cause-wins",
+        ),
+        # Model text is never read.
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "API Error: 529 Overloaded",
+                },
+            ),
+            "",
+            None,
+            id="non-error-result-text",
+        ),
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "result": "The upstream API was overloaded (HTTP 503)",
+                },
+            ),
+            "",
+            None,
+            id="error-result-model-text",
+        ),
+        pytest.param(
+            (
+                {"type": "assistant", "message": {"content": "API Error: 500"}},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "status 503 overloaded"},
+                },
+            ),
+            "",
+            None,
+            id="agent-messages",
+        ),
+        pytest.param((), "", None, id="no-diagnostics"),
+    ],
+)
+def test_provider_error_kind_reads_provider_owned_diagnostics_only(
+    events: tuple[dict[str, Any], ...], stderr: str, kind: str | None
+) -> None:
+    assert provider_error_kind(events, stderr) == kind
+    assert provider_error_kind(events, stderr, timed_out=True) is None
+
+
+def _from_agent_result(loaded: dict[str, Any], result: Any) -> dict[str, Any]:
+    """agent.persist_result's output for a real adapter result (checker call)."""
+    agent_result = result.model_dump(mode="json")
+    invocation = agent_result["run_id"]
+    return {
+        **loaded,
+        "status": agent_result["status"],
+        "provider_step": "delivery.invoke_checker",
+        "checker_request": {
+            "run_id": invocation,
+            "provider": agent_result["provider"],
+            "role": agent_result["role"],
+        },
+        "agent_invocation_id": invocation,
+        "agent_invocation_status": agent_result["status"],
+        "agent_result": agent_result,
+    }
+
+
+async def _codex_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    final_message: str,
+    events: tuple[dict[str, Any], ...],
+) -> Any:
+    working_directory = tmp_path / "codex-worktree"
+    working_directory.mkdir(exist_ok=True)
+
+    async def fake_run(command: list[str], **kwargs: Any) -> ProcessResult:
+        final_path = Path(command[command.index("--output-last-message") + 1])
+        final_path.write_text(final_message, encoding="utf-8")  # noqa: ASYNC240
+        return ProcessResult(exit_code=1, events=events, stderr="")
+
+    monkeypatch.setattr(codex_module, "run_jsonl_process", fake_run)
+    request = AgentRequest(
+        project=Project.FALCONE,
+        role="code-reviewer",
+        provider=Provider.CODEX,
+        model_class=ModelClass.JUDGE,
+        prompt="review a bounded synthetic change",
+        working_directory=str(working_directory),
+        output_schema={"type": "object"},
+        skip_git_repository_check=True,
+    )
+    return await CodexCLIAdapter(temp_root=str(tmp_path / "codex-temp")).execute(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("events", "converted"),
+    [
+        pytest.param(
+            ({"type": "turn.failed", "error": {"message": "unexpected status 401 Unauthorized"}},),
+            False,
+            id="auth-failure",
+        ),
+        pytest.param((), False, id="no-provider-diagnostics"),
+        pytest.param(
+            ({"type": "error", "message": "exceeded retry limit, last status: 503"},),
+            True,
+            id="real-503",
+        ),
+    ],
+)
+async def test_a_model_summary_claiming_a_5xx_is_never_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, events: Any, converted: bool
+) -> None:
+    # Codex keeps the agent's final message as the summary: a model claiming "API
+    # Error: 500" on an authentication failure must not become a retryable correction.
+    result = await _codex_result(
+        tmp_path,
+        monkeypatch,
+        final_message="API Error: 500 Internal Server Error, the provider is overloaded",
+        events=events,
+    )
+    assert result.status is RunStatus.FAILED
+    assert result.error_code == "PROVIDER_EXIT_NONZERO"
+    assert "API Error: 500" in result.summary
+    values = await _child(tmp_path)
+    handler, child = values[3], values[6]
+    first = handler._load_confirmed_finding(child)
+    _planned(handler, first["change_set_id"])
+    handler._release_delivery_leases(_from_agent_result(first, result))
+    state, _, recovery = _state(handler, first["change_set_id"])
+    if converted:
+        assert state == "REQUEST_CHANGES"
+        requested = recovery["correction_requested"]
+        assert requested["error_code"] == "PROVIDER_EXIT_NONZERO"
+        assert requested["provider_error_kind"] == "SERVER_ERROR"
+    else:
+        assert state == "PLANNED"
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("events", "error_code", "converted"),
+    [
+        pytest.param((_CLAUDE_529,), "PROVIDER_EXIT_NONZERO", True, id="live-529"),
+        pytest.param(
+            (
+                {"type": "system", "subtype": "api_retry", "error": "overloaded_error"},
+                {
+                    "type": "result",
+                    "subtype": "error_max_turns",
+                    "is_error": True,
+                    "errors": [{"type": "overloaded_error", "message": "Overloaded"}],
+                },
+            ),
+            "PROVIDER_MODEL_AT_CAPACITY",
+            False,
+            id="capacity-then-max-turns",
+        ),
+        pytest.param(
+            (
+                {
+                    "type": "result",
+                    "subtype": "error_max_structured_output_retries",
+                    "is_error": True,
+                    "errors": [{"type": "overloaded_error", "message": "Overloaded"}],
+                },
+            ),
+            "PROVIDER_MODEL_AT_CAPACITY",
+            False,
+            id="capacity-then-structured-output-retries",
+        ),
+    ],
+)
+async def test_the_terminal_claude_result_wins_over_earlier_transient_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    events: Any,
+    error_code: str,
+    converted: bool,
+) -> None:
+    result, _ = await _execute_with_events(tmp_path, monkeypatch, events)
+    assert result.status is RunStatus.FAILED
+    assert result.error_code == error_code
+    values = await _child(tmp_path)
+    handler, child = values[3], values[6]
+    first = handler._load_confirmed_finding(child)
+    _planned(handler, first["change_set_id"])
+    handler._release_delivery_leases(_from_agent_result(first, result))
+    state = _state(handler, first["change_set_id"])[0]
+    assert state == ("REQUEST_CHANGES" if converted else "PLANNED")
+    _dispose(values)
+
+
+# Finding 3: the real agent.persist_result after a maker/checker activity error.
+
+
+def _stale_spec_result() -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "run_id": str(uuid4()),
+        "provider": "claude",
+        "role": "product-spec-architect",
+        "status": "SUCCESS",
+        "usage": {},
+        "started_at": now,
+        "finished_at": now,
+    }
+
+
+def _provider_request(step: str, provider: str, role: str, model_class: str) -> dict[str, Any]:
+    return {
+        "run_id": str(uuid4()),
+        "project": "falcone",
+        "role": role,
+        "provider": provider,
+        "model_class": model_class,
+        "prompt": "Make one bounded synthetic change.",
+        "working_directory": "/srv/engineering/worktrees/falcone/synthetic",
+        "output_schema": {"type": "object"},
+        "timeout_seconds": 60,
+        "writable": step != "delivery.invoke_checker",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "provider", "role", "model_class"),
+    [
+        ("delivery.invoke_maker", "codex", "implementer", "worker"),
+        ("delivery.invoke_deployment_maker", "codex", "implementer", "worker"),
+        ("delivery.invoke_checker", "claude", "code-reviewer", "judge"),
+    ],
+)
+async def test_a_heartbeat_timeout_is_persisted_by_the_real_activity_and_recorded(
+    tmp_path: Path, step: str, provider: str, role: str, model_class: str
+) -> None:
+    values = await _child(tmp_path)
+    _operations, _metadata, engineering, handler, payload, _registered, child = values
+    first = handler._load_confirmed_finding(child)
+    change_set_id = first["change_set_id"]
+    _planned(handler, change_set_id)
+    stale = _stale_spec_result()
+    context = {
+        **first,
+        # The previous provider call (the spec) left its result in the context.
+        "agent_result": stale,
+        "agent_invocation_id": stale["run_id"],
+        "agent_invocation_status": "SUCCESS",
+        _REQUEST_KEYS[step]: _provider_request(step, provider, role, model_class),
+    }
+    started = await handler.handle("agent.record_start", {**context, "provider_step": step})
+    heartbeat = TimeoutError("lost", type=TimeoutType.HEARTBEAT, last_heartbeat_details=[])
+    # Before the fix the stale result travelled into persist_result, which refused it.
+    with pytest.raises(ApplicationError):
+        await handler.handle(
+            "agent.persist_result",
+            {**started, "status": "FAILED", "blocker": "PROVIDER_ACTIVITY_FAILED"},
+        )
+    failed = _agent_failure_payload(started, heartbeat)
+    assert "agent_result" not in failed
+    assert failed["provider_failure_type"] == "TIMEOUT_HEARTBEAT"
+    persisted = await handler.handle("agent.persist_result", failed)
+    assert persisted["agent_invocation_status"] == "FAILED"
+    handler._release_delivery_leases(persisted)
+    state, _, recovery = _state(handler, change_set_id)
+    assert state == "REQUEST_CHANGES"
+    requested = recovery["correction_requested"]
+    assert requested["blocker"] == "PROVIDER_UNAVAILABLE"
+    assert requested["error_code"] == "PROVIDER_ACTIVITY_FAILED"
+    assert requested["provider_error_kind"] == "TIMEOUT_HEARTBEAT"
+    assert (requested["provider"], requested["provider_step"]) == (provider, step)
+    retried = _next_child(
+        engineering, handler, payload, child, "backlog-fixture-issue-1-retry-1-attempt-1"
+    )
+    assert retried["status"] == "CONFIRMED_LOADED"
+    _dispose(values)

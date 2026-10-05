@@ -236,20 +236,25 @@ default); preview namespaces are cleaned only for terminal ChangeSets.
 When a delivery attempt's spec, maker or checker call fails for a transient provider reason,
 the attempt's lease release records `REQUEST_CHANGES` on its `PLANNED`/`IMPLEMENTING` ChangeSet
 (`recovery_json.correction_requested.blocker = PROVIDER_UNAVAILABLE`, with `provider`,
-`error_code`, `provider_step` and `role`), once per attempt and only for the ChangeSet's latest
-attempt. The loop pauses with `DELIVERY_FAILED:PROVIDER_UNAVAILABLE` (a `RATE_LIMITED` child
+`error_code`, `provider_error_kind`, `provider_step` and `role`), once per attempt and only for
+the ChangeSet's latest attempt. The loop pauses with `DELIVERY_FAILED:PROVIDER_UNAVAILABLE` (a `RATE_LIMITED` child
 status pauses as `RATE_LIMITED`), and once the provider is back a plain
 `engineering-ctl backlog-retry <loop_workflow_id> <repository> <issue>` binds the next attempt
 without any database fix. Each retry is one child of the bounded correction lineage; no extra
 allowance is granted.
 
 Converted (explicit allowlist): a provider result `RATE_LIMITED`/`PROVIDER_RATE_LIMIT`,
-`FAILED`/`PROVIDER_MODEL_AT_CAPACITY`, or `FAILED`/`PROVIDER_EXIT_NONZERO` whose provider error
-text names an unavailable service (`API Error: 5xx`, overloaded, service unavailable, connection
-reset, ...); a typed `RATE_LIMITED` activity error; and `PROVIDER_ACTIVITY_FAILED` only after a
-heartbeat or schedule-to-start timeout (the provider worker stopped answering). Never converted:
-policy, schema, authentication, missing CLI, max turns/budget, sandbox, `PROVIDER_TIMEOUT`, any
-other activity error, or exit text that also names one of those causes; those still need an
+`FAILED`/`PROVIDER_MODEL_AT_CAPACITY` or `FAILED`/`PROVIDER_EXIT_NONZERO` only when the adapter's
+`provider_error_kind` is `OVERLOADED`, `RATE_LIMITED`, `SERVER_ERROR` or `CONNECTION_ERROR`; a
+typed `RATE_LIMITED` activity error; and `PROVIDER_ACTIVITY_FAILED` only after a heartbeat or
+schedule-to-start timeout (the provider worker stopped answering). The kind is derived from
+provider-owned diagnostics only (Claude's terminal result subtype, `api_error_status`, `errors`,
+`api_retry` events and its own `API Error: ...` envelope; Codex `error`/`turn.failed` events;
+captured stderr), never from the summary or any agent output. The terminal result wins: an
+`error_max_turns`, structured-output-retries or other excluded terminal subtype, or any
+authentication, permission, policy, sandbox, schema or budget cause in those diagnostics, is never
+converted, whatever transient errors came before. No provider-owned signal means no conversion.
+Policy, schema, auth, missing CLI, `PROVIDER_TIMEOUT` and any other activity error still need an
 operator decision.
 
 ## Operator change requests (NEW-108)

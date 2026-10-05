@@ -9709,7 +9709,16 @@ def _record_correction_state(
     }
     if provider_stop is not None:
         recovery["correction_requested"].update(
-            {key: provider_stop[key] for key in ("provider", "error_code", "provider_step", "role")}
+            {
+                key: provider_stop[key]
+                for key in (
+                    "provider",
+                    "error_code",
+                    "provider_error_kind",
+                    "provider_step",
+                    "role",
+                )
+            }
         )
     change_set.recovery_json = recovery
 

@@ -126,6 +126,9 @@ class AgentResult(StrictModel):
     # NEW-53: the CLI gave up on structured output, but its last candidate passed the
     # original Draft 2020-12 output schema and was accepted by the adapter.
     recovered_from_structured_retry: bool = False
+    # NEW-137 review: typed kind of a failed call, set by the adapter from provider-owned
+    # diagnostics only (engineering_control.provider_error_kinds); never from model text.
+    provider_error_kind: str | None = Field(default=None, max_length=40)
 
 
 class ArtifactMetadata(StrictModel):
