@@ -540,10 +540,12 @@ class ProviderActivityHandler:
         findings = []
         for error in specific[: self._SCHEMA_FINDINGS]:
             path = "/".join(str(part) for part in error.absolute_path) or "<root>"
-            message = " ".join(str(error.message).split())[: self._SCHEMA_FINDING_MESSAGE]
-            findings.append(
-                self.redactor.redact_text(f"{path} [{error.validator}]: {message}").value
-            )
+            # Redact the complete text first (path and message both carry model output);
+            # truncating first could cut a secret below the redactor's pattern.
+            text = self.redactor.redact_text(
+                f"{path} [{error.validator}]: {' '.join(str(error.message).split())}"
+            ).value
+            findings.append(text[: self._SCHEMA_FINDING_MESSAGE])
         return findings
 
     def _validate_result_schema(self, request: AgentRequest, result: AgentResult) -> None:

@@ -301,3 +301,44 @@ def test_schema_refusal_details_carry_bounded_redacted_findings(tmp_path: Path) 
     (finding,) = again.value.details[0]["findings"]
     assert finding.startswith("token [type]: ") and len(finding) <= 330
     assert secret not in finding
+
+
+def test_a_secret_straddling_the_finding_cutoff_is_fully_redacted(tmp_path: Path) -> None:
+    # NEW-132 review 2: redact the complete message before truncating it.
+    from temporalio.exceptions import ApplicationError
+
+    handler = ProviderActivityHandler(
+        Settings(worktree_root=tmp_path / "worktrees", run_root=tmp_path / "runs"),
+        "claude",
+        ProseThenValidClaude(0),  # type: ignore[arg-type]
+        PassThroughPack(),  # type: ignore[arg-type]
+    )
+    schema = {"type": "object", "additionalProperties": False, "properties": {}}
+    secret = "ghp_" + "B" * 36
+    # The unexpected property name puts the token across the 300-character cutoff.
+    name = "p" * 213 + "-" + secret  # the token starts at offset 285 of the finding
+    request = AgentRequest(
+        project=Project.FALCONE,
+        role="ui-migration-architect",
+        provider=Provider.CLAUDE,
+        model_class=ModelClass.WORKER,
+        prompt="Draft.",
+        working_directory=str(tmp_path),
+        output_schema=schema,
+    )
+    now = datetime.now(UTC)
+    result = AgentResult(
+        run_id=request.run_id,
+        provider=Provider.CLAUDE,
+        role=request.role,
+        status=RunStatus.SUCCESS,
+        structured_result={name: 1},
+        usage=ProviderUsage(output_tokens=1),
+        started_at=now,
+        finished_at=now,
+    )
+    with pytest.raises(ApplicationError) as refused:
+        handler._validate_result_schema(request, result)
+    findings = refused.value.details[0]["findings"]
+    assert findings and all(len(item) <= 300 for item in findings)
+    assert not any("ghp_" in item or "BBBBBBBBBB" in item for item in findings)
