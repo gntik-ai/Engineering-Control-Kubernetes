@@ -96,7 +96,18 @@ OPERATOR_DECISIONS = (
     "mocked-backend Playwright harness (no credentials); gntik-ui is consumed as an exact "
     "pinned canary from GitHub Packages; i18n with es (default) and en, strings migrated per "
     "page; dead modules are deleted, not migrated; gntik-ui gaps go through the same draft, "
-    "review and publish path; waves u0 (foundation) to u5 (cutover)."
+    "review and publish path; waves u0 (foundation) to u5 (cutover). "
+    # NEW-134 (2026-10-05): the cutover's legacy retention and build ownership.
+    "Cutover (2026-10-05): at cutover / serves apps/web-console-next and the legacy console "
+    "is no longer served anywhere (no /legacy path, no legacy routing to rebase); the "
+    "one-release retention is rollback by release only, i.e. redeploying the previous chart "
+    "and image release; the legacy app and its dead modules are deleted in the following "
+    "release. Before that deletion, the image build and serving configuration (Dockerfile, "
+    "static server, nginx and CSP) move from apps/web-console to apps/web-console-next (or "
+    "shared deploy tooling), with release-image and test references updated; the image name "
+    "in-falcone-web-console and the chart key webConsole stay unchanged, and the image after "
+    "deletion must serve the new console's deep links, assets, /v1 and /healthz under the "
+    "same CSP."
 )
 SEED_FINDINGS = (
     "Seed findings (design section 7), by reference: gntik-ui has no stable release (all "
@@ -128,6 +139,15 @@ def _fenced(label: str, content: str) -> str:
 def _bounded_json(value: Any, limit: int) -> str:
     text = json.dumps(value, sort_keys=True, ensure_ascii=False)
     return text if len(text) <= limit else text[:limit] + " [truncated]"
+
+
+def part_provenance(pack_provenance: str) -> str:
+    """NEW-134: part ids bind the operator decisions and seed findings as well as the pack
+    provenance; both are drafting and review input, so a part approved under different
+    decisions is never reused."""
+    return canonical_sha256(
+        {"pack": pack_provenance, "decisions": OPERATOR_DECISIONS, "seed": SEED_FINDINGS}
+    )
 
 
 class UiPlanActivityHandler:
@@ -621,7 +641,9 @@ class UiPlanActivityHandler:
             blueprint_id, mechanical, str(payload.get("mechanical_sha256") or "")
         )
         # NEW-131 review: part ids bind the skill, role, profile and schema provenance.
-        provenance = plan_provenance(self.settings.agent_pack_root, str(payload["project"]))
+        provenance = part_provenance(
+            plan_provenance(self.settings.agent_pack_root, str(payload["project"]))
+        )
         frame_id = frame_part_id(
             str(payload["inventory_sha256"]),
             str(payload["kit_snapshot_sha256"]),

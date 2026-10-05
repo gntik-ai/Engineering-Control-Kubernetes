@@ -729,3 +729,21 @@ async def test_provider_refuses_a_legacy_whole_blueprint_call_under_the_parts_on
     handler.instruction_pack.enrich.side_effect = ValueError("stop here")
     batched = await handler.handle("ui_plan.draft", {"draft_request": {}, "part": {"id": "p"}})
     assert batched["blocker"] == "AGENT_PACK_INVALID"  # it went past the legacy guard
+
+
+def test_part_ids_change_when_the_operator_decisions_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NEW-134: a part approved under different operator decisions is never reused.
+    from engineering_control.activities import ui_plan
+
+    base = ui_plan.part_provenance("p" * 64)
+    assert base == ui_plan.part_provenance("p" * 64)
+    assert base != ui_plan.part_provenance("q" * 64)
+    monkeypatch.setattr(ui_plan, "OPERATOR_DECISIONS", ui_plan.OPERATOR_DECISIONS + " Changed.")
+    changed = ui_plan.part_provenance("p" * 64)
+    assert changed != base
+    assert frame_part_id("i" * 64, "k" * 64, ["a"], changed) != frame_part_id(
+        "i" * 64, "k" * 64, ["a"], base
+    )
+    assert "no /legacy path" in ui_plan.OPERATOR_DECISIONS
