@@ -423,6 +423,24 @@ class UiBlueprintRepository:
             row.drafts_json = drafts
         return digest
 
+    def part_reviews_sync(self, blueprint_id: UUID, part_id: str) -> list[dict[str, Any]]:
+        """NEW-139: this blueprint's own reviews of every drafted version of a part, by
+        attempt (durable; adopted approvals from earlier blueprints are not included)."""
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            if row is None:
+                raise UiBlueprintNotFoundError("ui blueprint not found")
+            drafts = list(row.drafts_json or [])
+        reviews = [
+            {"attempt": int(entry["part_attempt"]), **entry["review"]}
+            for entry in drafts
+            if entry.get("part") == part_id
+            and not entry.get("reused_from")
+            and isinstance(entry.get("part_attempt"), int)
+            and isinstance(entry.get("review"), dict)
+        ]
+        return sorted(reviews, key=lambda item: item["attempt"])
+
     def mark_part_reviewed_sync(
         self,
         blueprint_id: UUID,
