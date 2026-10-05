@@ -172,7 +172,7 @@ def register_child_issue_approval(
 
 
 def validate_child_issue_approval(
-    session: Session, approval_id: UUID, *, finding: Finding, run: Run
+    session: Session, approval_id: UUID, *, finding: Finding, run: Run, current: bool = True
 ) -> Step:
     record = session.get(Step, approval_id)
     if (
@@ -207,6 +207,11 @@ def validate_child_issue_approval(
     ):
         raise ValueError("durable delivery child approval binding changed")
     request = ExistingBacklogLoopStart.model_validate(value["request"])
+    if not current:
+        # NEW-133: custody only (record integrity and run binding). A PAUSED loop has
+        # paused its campaign, which voids the current-approval check; the next delivery
+        # child re-proves the full current approval when it binds after the resume.
+        return record
     issue, campaign, snapshot = _current_snapshot(session, request, finding)
     if (
         value["issue_repository"] != issue.repository
@@ -342,10 +347,70 @@ def _verify_ci_repair_child(
         raise ValueError("CI-repair child exceeds the approved repair bound")
 
 
-def _lineage_within_bounds(records: list[Step], request: ExistingBacklogLoopStart) -> bool:
+def _lineage_within_bounds(
+    records: list[Step], request: ExistingBacklogLoopStart, extension: int = 0
+) -> bool:
+    """Correction attempts stay within correction_limit + 1, plus at most one attempt
+    granted by an operator correction extension (NEW-133). CI-repair rounds keep their
+    own bound, which an extension never changes."""
     attempts = request.correction_limit + 1
     repairs = sum(1 for record in records if _claims_ci_repair(record.result_json))
-    return len(records) - repairs <= attempts and repairs <= MAX_CI_REPAIR_ROUNDS * attempts
+    return (
+        len(records) - repairs <= attempts + min(max(extension, 0), 1)
+        and repairs <= MAX_CI_REPAIR_ROUNDS * attempts
+    )
+
+
+# NEW-133: ChangeSet.recovery_json key of the one operator-granted extra correction attempt.
+CORRECTION_EXTENSION_KEY = "correction_extension"
+_CORRECTION_EXTENSION_FIELDS = frozenset(
+    {
+        "version",
+        "change_set_id",
+        "origin_approval_id",
+        "loop_workflow_id",
+        "issue_repository",
+        "issue_number",
+        "extends_attempt",
+        "extended_attempt_limit",
+        "latest_attempt_run_id",
+        "latest_attempt_child_workflow_id",
+        "checker_invocation_id",
+        "validation_findings_sha256",
+        "validation_findings_count",
+        "granted_by",
+        "granted_at",
+        "binding_sha256",
+    }
+)
+
+
+def correction_extension_binding(value: dict[str, Any]) -> str:
+    return canonical_sha256({key: item for key, item in value.items() if key != "binding_sha256"})
+
+
+def correction_extension_allowance(change_set: ChangeSet, request: ExistingBacklogLoopStart) -> int:
+    """1 if the ChangeSet holds a well-formed operator correction extension, else 0.
+
+    The record is bound to this ChangeSet, its originating approval and the attempt
+    bound it extends; anything else (absent, malformed, altered) grants nothing."""
+    recovery = change_set.recovery_json or {}
+    value = recovery.get(CORRECTION_EXTENSION_KEY)
+    origin = recovery.get("issue_execution_approval")
+    if not isinstance(value, dict) or not isinstance(origin, dict):
+        return 0
+    attempts = request.correction_limit + 1
+    if (
+        set(value) != _CORRECTION_EXTENSION_FIELDS
+        or value["version"] != 1
+        or value["change_set_id"] != str(change_set.id)
+        or value["origin_approval_id"] != origin.get("approval_id")
+        or value["extends_attempt"] != attempts
+        or value["extended_attempt_limit"] != attempts + 1
+        or value["binding_sha256"] != correction_extension_binding(value)
+    ):
+        return 0
+    return 1
 
 
 def bind_change_set_issue_approval(
@@ -385,7 +450,9 @@ def bind_change_set_issue_approval(
     if reference not in children:
         recorded = [session.get(Step, UUID(str(child["approval_id"]))) for child in children]
         if any(item is None for item in recorded) or not _lineage_within_bounds(
-            [*[item for item in recorded if item is not None], record], request
+            [*[item for item in recorded if item is not None], record],
+            request,
+            correction_extension_allowance(change_set, request),
         ):
             raise ValueError("ChangeSet exceeds the approved correction limit")
         # A correction child starts from REQUEST_CHANGES. A CI-repair child, proven from
@@ -409,7 +476,7 @@ def bind_change_set_issue_approval(
 
 
 def validate_change_set_issue_approval(
-    session: Session, change_set_id: UUID
+    session: Session, change_set_id: UUID, *, current: bool = True
 ) -> dict[str, str] | None:
     change_set = session.get(ChangeSet, change_set_id)
     if change_set is None:
@@ -436,17 +503,18 @@ def validate_change_set_issue_approval(
     if run is None or run.change_set_id != change_set.id:
         raise ValueError("ChangeSet issue approval run binding changed")
     valid = validate_child_issue_approval(
-        session, UUID(reference["approval_id"]), finding=finding, run=run
+        session, UUID(reference["approval_id"]), finding=finding, run=run, current=current
     )
     if approval_reference(valid) != reference:
         raise ValueError("ChangeSet issue approval digest changed")
     children = (change_set.recovery_json or {}).get("issue_execution_approval_children")
     request = ExistingBacklogLoopStart.model_validate(valid.result_json["request"])
+    extension = correction_extension_allowance(change_set, request)
     if (
         not isinstance(children, list)
         or not children
         or children[0] != reference
-        or len(children) > (MAX_CI_REPAIR_ROUNDS + 1) * (request.correction_limit + 1)
+        or len(children) > (MAX_CI_REPAIR_ROUNDS + 1) * (request.correction_limit + 1) + extension
     ):
         raise ValueError("ChangeSet correction approval lineage is malformed")
     seen = set()
@@ -463,7 +531,7 @@ def validate_change_set_issue_approval(
         if child_run is None or child_run.change_set_id != change_set.id:
             raise ValueError("ChangeSet correction run binding changed")
         child_record = validate_child_issue_approval(
-            session, child_id, finding=finding, run=child_run
+            session, child_id, finding=finding, run=child_run, current=current
         )
         if approval_reference(child_record) != child or _approval_scope(
             child_record.result_json
@@ -472,6 +540,46 @@ def validate_change_set_issue_approval(
         if _claims_ci_repair(child_record.result_json):
             _verify_ci_repair_child(session, change_set, valid, child_record.result_json)
         lineage.append(child_record)
-    if not _lineage_within_bounds(lineage, request):
+    if not _lineage_within_bounds(lineage, request, extension):
         raise ValueError("ChangeSet correction approval lineage is malformed")
     return approval_reference(valid)
+
+
+def correction_lineage(
+    session: Session, change_set: ChangeSet
+) -> tuple[Step, ExistingBacklogLoopStart, list[Step]]:
+    """The originating approval, its request and the ChangeSet's recorded child lineage.
+
+    Callers validate the custody first (validate_change_set_issue_approval)."""
+    recovery = change_set.recovery_json or {}
+    origin = session.get(Step, UUID(str(recovery["issue_execution_approval"]["approval_id"])))
+    if origin is None:
+        raise ValueError("ChangeSet originating approval is missing")
+    request = ExistingBacklogLoopStart.model_validate(origin.result_json["request"])
+    lineage: list[Step] = []
+    for child in recovery.get("issue_execution_approval_children") or []:
+        record = session.get(Step, UUID(str(child["approval_id"])))
+        if record is None:
+            raise ValueError("ChangeSet correction approval lineage is malformed")
+        lineage.append(record)
+    return origin, request, lineage
+
+
+def correction_attempt_budget(session: Session, change_set: ChangeSet) -> dict[str, Any]:
+    """NEW-133: how many more correction attempts the ChangeSet's lineage may bind.
+
+    Read-only; the binding itself (bind_change_set_issue_approval) stays the authority."""
+    _origin, request, lineage = correction_lineage(session, change_set)
+    extension = correction_extension_allowance(change_set, request)
+    used = sum(1 for record in lineage if not _claims_ci_repair(record.result_json))
+    bound = request.correction_limit + 1 + extension
+    return {
+        "attempts_used": used,
+        "attempt_bound": bound,
+        "remaining": max(bound - used, 0),
+        "extension_granted": bool(extension),
+    }
+
+
+def claims_ci_repair(record: Step) -> bool:
+    return _claims_ci_repair(record.result_json)

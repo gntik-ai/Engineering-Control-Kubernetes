@@ -3493,7 +3493,19 @@ class MetadataActivityHandler:
                 )
             ) + "".join(f"- {item}\n" for item in correction)
         # NEW-76: findings the platform validation attributed to the previous attempt.
-        validation_findings = [] if deployment else self._validation_findings(change_set_id)
+        # NEW-133: each maker gets its own repository's findings ("deployment: ..." go to
+        # the deployment maker; falcone #1053's only finding was a falcone-charts
+        # workflow, which the source maker cannot fix).
+        recorded_findings = self._validation_findings(change_set_id)
+        validation_findings = [
+            item for item in recorded_findings if item.startswith("deployment:") == deployment
+        ]
+        if recorded_findings and not validation_findings and not deployment:
+            derived_content += (
+                "The platform validation of the previous attempt found NEW findings only in "
+                "the deployment repository; the deployment maker fixes them. Keep the "
+                "existing source commits unless a fix needs a source change.\n"
+            )
         if validation_findings:
             derived_content += (
                 "The platform validation of the previous attempt found these NEW findings "

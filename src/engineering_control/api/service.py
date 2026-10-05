@@ -83,6 +83,8 @@ class ControlService(Protocol):
     async def start_finding_verification(self, finding_id: UUID) -> OperationAccepted: ...
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
+    async def current_open_run_id(self, workflow_id: str) -> str | None: ...
+
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
     async def observe_issue_body(self, repository: str, issue_number: int) -> dict[str, Any]: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
@@ -359,6 +361,17 @@ class TemporalControlService:
             raise ValueError("unsupported control signal")
         handle = self.client.get_workflow_handle(workflow_id)
         await handle.signal(signal, argument)
+
+    async def current_open_run_id(self, workflow_id: str) -> str | None:
+        """NEW-133 review 3: the run id of the workflow's current (latest) execution if it is
+        still open, else None (also when Temporal cannot be read, so callers fail closed)."""
+        try:
+            described = await self.client.get_workflow_handle(workflow_id).describe()
+        except Exception:  # noqa: BLE001 - unreadable means no proof of the current run
+            return None
+        if described.status != WorkflowExecutionStatus.RUNNING:
+            return None
+        return str(described.run_id) if described.run_id else None
 
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None:
         """NEW-114: refuse an issue-bound retry/skip the loop would silently ignore.
