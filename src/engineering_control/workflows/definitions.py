@@ -5332,6 +5332,9 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
         }
 
     _BATCHED_PATCH = "ui-plan-batched-blueprint-v1"
+    # NEW-132: a first draft Hermes rejects (schema or structure) gets the part's redraft.
+    _STRUCTURAL_REDRAFT_PATCH = "new-132-structural-redraft"
+    _STRUCTURAL_REJECTIONS = frozenset({"DRAFT_SCHEMA_INVALID", "DRAFT_STRUCTURE_INVALID"})
     # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s);
     # the activity bound leaves room for the CLI's start-up and result handling.
     _PART_TIMEOUT_MINUTES = 40
@@ -5496,6 +5499,21 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 return {**current, "blocker": self._ui_provider_blocker("DRAFT", current)}
             recorded = await self._step("ui_plan.record_part_draft", current)
             if recorded.get("status") != "DRAFT_RECORDED":
+                if (
+                    attempt == 1
+                    and recorded.get("blocker") in self._STRUCTURAL_REJECTIONS
+                    and workflow.patched(self._STRUCTURAL_REDRAFT_PATCH)
+                ):
+                    # NEW-132: Hermes's own deterministic findings use the part's single
+                    # redraft, like a REVISE (no review of the rejected draft).
+                    current = {
+                        **{k: v for k, v in recorded.items() if k not in {"status", "document"}},
+                        "rejection": {
+                            "code": recorded.get("blocker"),
+                            "details": list(recorded.get("blockers") or [])[:50],
+                        },
+                    }
+                    continue
                 return {
                     **recorded,
                     "blocker": str(recorded.get("blocker") or "DRAFT_SCHEMA_INVALID"),

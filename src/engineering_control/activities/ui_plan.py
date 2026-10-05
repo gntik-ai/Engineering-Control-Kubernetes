@@ -781,7 +781,18 @@ class UiPlanActivityHandler:
         ]
         if kind == BATCH:
             sections.append(self._frame_section(blueprint_id, payload))
-        if attempt == 2:
+        rejection = payload.get("rejection")
+        if attempt == 2 and isinstance(rejection, dict):
+            # NEW-132: Hermes rejected the first draft deterministically; no review ran.
+            sections.append(
+                "This is the single redraft of this part. Hermes rejected your previous draft "
+                f"deterministically ({rejection.get('code')}): it violates the output schema "
+                "or the reference rules. Fix every finding below while keeping every hard "
+                "rule; a gap's blocks lists only epic IDs, page keys or u5-cutover. A second "
+                "rejection blocks the plan.\n"
+                + _fenced("hermes findings", _bounded_json(rejection.get("details") or [], 40_000))
+            )
+        elif attempt == 2:
             rounds = payload.get("part_rounds") or []
             sections.append(
                 "This is the single redraft of this part. An independent reviewer asked for "
