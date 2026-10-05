@@ -700,3 +700,32 @@ def test_schema_violation_usage_is_still_recorded() -> None:
         567,
         "claude",
     )
+
+
+@pytest.mark.asyncio
+async def test_provider_refuses_a_legacy_whole_blueprint_call_under_the_parts_only_pack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NEW-131 review 3: a legacy call prepared before the upgrade and replayed afterwards
+    # must not reach a model; a batched call (payload carries its part) still proceeds.
+    from unittest.mock import Mock
+
+    from engineering_control.activities.provider import ProviderActivityHandler
+    from engineering_control.config import Settings
+
+    pack = build_fake_pack(tmp_path / "pack", version="1.5.0")
+    adapter = Mock()
+    adapter.provider = Provider.CLAUDE
+    handler = ProviderActivityHandler(
+        Settings(agent_pack_root=pack, run_root=tmp_path / "runs"),
+        Provider.CLAUDE.value,
+        adapter=adapter,
+        instruction_pack=Mock(),
+    )
+    monkeypatch.setattr(handler, "_request", lambda step, payload: Mock())
+    monkeypatch.setattr(handler, "_validate_boundary", lambda step, request: None)
+    legacy = await handler.handle("ui_plan.draft", {"draft_request": {}})
+    assert (legacy["status"], legacy["blocker"]) == ("BLOCKED", "UI_PLAN_LEGACY_SUPERSEDED")
+    handler.instruction_pack.enrich.side_effect = ValueError("stop here")
+    batched = await handler.handle("ui_plan.draft", {"draft_request": {}, "part": {"id": "p"}})
+    assert batched["blocker"] == "AGENT_PACK_INVALID"  # it went past the legacy guard
