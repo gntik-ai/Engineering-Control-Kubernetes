@@ -888,12 +888,25 @@ class UiPlanActivityHandler:
                 "ui plan batch has no reviewed frame", type="PolicyViolation", non_retryable=True
             )
         content = frame["content"]
+        # NEW-135: a batch failed review twice on one global decision it never applied
+        # (forms without validation-summary), so the decisions are restated here verbatim
+        # and numbered (schema-bounded: at most 30 of 600 characters) as a checklist.
+        decisions = "\n".join(
+            f"{index}. {decision}"
+            for index, decision in enumerate(content["global_decisions"], start=1)
+        )
         return (
             "The reviewed frame, complete (independently approved; Read it, reference its "
             "epic and gap ids, follow its global decisions, never change it): "
             f"{brief.get('path')} (file sha256 {brief.get('sha256')}, {brief.get('bytes')} "
             f"bytes). Summary only: {len(content['foundation_epics'])} foundation epics, "
             f"{len(content['gaps'])} gaps, {len(content['global_decisions'])} global decisions."
+            "\n\nThe frame's global decisions, verbatim (the same text as in the frame file). "
+            "Every page in this batch must satisfy every one that applies to it. Before "
+            "returning, check each page's target, behaviour and parity criteria against each "
+            "numbered decision in turn, for example every form's required blocks, and fix "
+            "any page that misses one:\n"
+            f"{decisions}"
         )
 
     def _part_check_context(
