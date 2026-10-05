@@ -436,6 +436,10 @@ class ControlledWorkflow:
                 failed["failed_agent_usage"] = {
                     key: details[0].get(key) for key in ("usage", "provider", "run_id")
                 }
+                findings = details[0].get("findings")
+                if isinstance(findings, list) and findings:
+                    # NEW-132: the bounded, redacted schema errors (input only, no command).
+                    failed["failed_schema_findings"] = [str(item)[:400] for item in findings[:20]]
             return await self._step("agent.persist_result", failed)
         return await self._step("agent.persist_result", result)
 
@@ -5458,6 +5462,31 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
         }
 
     @staticmethod
+    def _structural_redraft(
+        current: dict[str, Any], code: str, details: list[Any], usage: Any
+    ) -> dict[str, Any]:
+        """The context for attempt 2 after Hermes refused attempt 1 (no review ran)."""
+        dropped = {
+            "status",
+            "document",
+            "blocker",
+            "failed_agent_usage",
+            "failed_schema_findings",
+            "agent_result",
+        }
+        redraft = {key: value for key, value in current.items() if key not in dropped}
+        redraft["rejection"] = {"code": code, "details": [str(item) for item in details[:50]]}
+        if isinstance(usage, dict):
+            # Recorded by ui_plan.prepare_part (the refused call consumed tokens).
+            redraft["rejected_usage"] = {
+                "agent_result": usage,
+                "part_id": current.get("part_id"),
+                "phase": "draft",
+                "attempt": current.get("draft_attempt"),
+            }
+        return redraft
+
+    @staticmethod
     def _part_usage(outcome: dict[str, Any]) -> dict[str, Any] | None:
         """A failed part's last provider result, so its token usage is still recorded."""
         result = outcome.get("agent_result")
@@ -5496,6 +5525,34 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 "ui_plan.draft", current, timeout_minutes=self._PART_TIMEOUT_MINUTES
             )
             if current.get("status") != "SUCCESS":
+                if (
+                    attempt == 1
+                    and current.get("blocker") == "SchemaViolation"
+                    and workflow.patched(self._STRUCTURAL_REDRAFT_PATCH)
+                ):
+                    # NEW-132: the provider boundary refused the output against the same
+                    # schema; its findings use the part's single redraft.
+                    current = self._structural_redraft(
+                        current,
+                        "DRAFT_SCHEMA_INVALID",
+                        list(current.get("failed_schema_findings") or []),
+                        current.get("failed_agent_usage"),
+                    )
+                    continue
+                if (
+                    attempt == 2
+                    and current.get("blocker") == "SchemaViolation"
+                    and ("rejection" in current)
+                ):
+                    # NEW-132: the redraft was refused again; report its schema findings.
+                    return {
+                        **current,
+                        "blocker": "DRAFT_SCHEMA_INVALID",
+                        "blockers": [
+                            f"{current.get('part_id')}: {item}"
+                            for item in current.get("failed_schema_findings") or []
+                        ][:50],
+                    }
                 return {**current, "blocker": self._ui_provider_blocker("DRAFT", current)}
             recorded = await self._step("ui_plan.record_part_draft", current)
             if recorded.get("status") != "DRAFT_RECORDED":
@@ -5506,13 +5563,12 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 ):
                     # NEW-132: Hermes's own deterministic findings use the part's single
                     # redraft, like a REVISE (no review of the rejected draft).
-                    current = {
-                        **{k: v for k, v in recorded.items() if k not in {"status", "document"}},
-                        "rejection": {
-                            "code": recorded.get("blocker"),
-                            "details": list(recorded.get("blockers") or [])[:50],
-                        },
-                    }
+                    current = self._structural_redraft(
+                        recorded,
+                        str(recorded.get("blocker")),
+                        list(recorded.get("blockers") or []),
+                        None,
+                    )
                     continue
                 return {
                     **recorded,

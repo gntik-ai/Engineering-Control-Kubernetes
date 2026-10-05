@@ -86,7 +86,7 @@ _PROVIDER_RESULT_KEYS = frozenset(
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
 # NEW-131: parts of the batched plan carried between steps but never into the next request.
 _PART_TRANSIENT_KEYS = frozenset(
-    {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief"}
+    {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief", "rejected_usage"}
 )
 
 # Design sections 7 and 10 (2026-10-04), given to the drafter and the reviewer as data.
@@ -741,6 +741,17 @@ class UiPlanActivityHandler:
     def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
         attempt = payload.get("draft_attempt")
+        rejected = payload.get("rejected_usage")
+        if isinstance(rejected, dict):
+            # NEW-132: the usage of a draft the provider boundary refused (schema).
+            entry = usage_entry(
+                rejected.get("agent_result"),
+                part_id=str(rejected.get("part_id")),
+                phase="draft",
+                attempt=int(rejected.get("attempt") or 1),
+            )
+            if entry is not None:
+                self.repository.record_usage_sync(self._blueprint_id(payload), entry)
         part_id, kind, part = self._part_identity(payload)
         base = {**self._part_base(payload), "part_id": part_id, "part_kind": kind}
         if attempt == 1:

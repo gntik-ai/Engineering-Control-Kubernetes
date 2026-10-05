@@ -518,8 +518,35 @@ class ProviderActivityHandler:
                 non_retryable=True,
             )
 
-    @staticmethod
-    def _validate_result_schema(request: AgentRequest, result: AgentResult) -> None:
+    _SCHEMA_FINDINGS = 20
+    _SCHEMA_FINDING_MESSAGE = 300
+
+    def _schema_findings(self, request: AgentRequest, result: AgentResult) -> list[str]:
+        """NEW-132: bounded, redacted validation errors (JSON path, validator keyword and a
+        short message), so the drafter's single redraft can fix them."""
+        try:
+            validator = Draft202012Validator(request.output_schema)
+            errors = sorted(
+                validator.iter_errors(result.structured_result),
+                key=lambda item: [str(part) for part in item.absolute_path],
+            )
+        except Exception:  # noqa: BLE001 - findings are best effort; the refusal stands
+            return []
+        specific: list[Any] = []
+        for error in errors:
+            # An anyOf failure (e.g. the part or null) reports its deepest branch errors.
+            nested = sorted(error.context or (), key=lambda item: -len(item.absolute_path))
+            specific.extend([item for item in nested if item.absolute_path][:3] or [error])
+        findings = []
+        for error in specific[: self._SCHEMA_FINDINGS]:
+            path = "/".join(str(part) for part in error.absolute_path) or "<root>"
+            message = " ".join(str(error.message).split())[: self._SCHEMA_FINDING_MESSAGE]
+            findings.append(
+                self.redactor.redact_text(f"{path} [{error.validator}]: {message}").value
+            )
+        return findings
+
+    def _validate_result_schema(self, request: AgentRequest, result: AgentResult) -> None:
         try:
             Draft202012Validator.check_schema(request.output_schema)
             Draft202012Validator(request.output_schema).validate(result.structured_result)
@@ -532,6 +559,11 @@ class ProviderActivityHandler:
                     "usage": result.usage.model_dump(mode="json"),
                     "provider": result.provider.value,
                     "run_id": str(result.run_id),
+                    "findings": (
+                        self._schema_findings(request, result)
+                        if isinstance(error, ValidationError)
+                        else []
+                    ),
                 },
                 type="SchemaViolation",
                 non_retryable=True,
