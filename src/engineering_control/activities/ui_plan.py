@@ -141,6 +141,11 @@ def _bounded_json(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " [truncated]"
 
 
+def decisions_sha256() -> str:
+    """NEW-134 review: the decision inputs a plan's parts are drafted and reviewed under."""
+    return canonical_sha256({"decisions": OPERATOR_DECISIONS, "seed": SEED_FINDINGS})
+
+
 def part_provenance(pack_provenance: str) -> str:
     """NEW-134: part ids bind the operator decisions and seed findings as well as the pack
     provenance; both are drafting and review input, so a part approved under different
@@ -663,6 +668,7 @@ class UiPlanActivityHandler:
         return {
             **base,
             "part_provenance": provenance,
+            "decisions_sha256": decisions_sha256(),
             "status": "PARTS_RECORDED",
             "parts": plan,
             "batch_count": len(plan) - 1,
@@ -760,6 +766,16 @@ class UiPlanActivityHandler:
             "cutover_reason."
         )
 
+    def _decisions_changed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-134 review: a plan whose parts were fixed under other operator decisions (or
+        before decisions were recorded) never drafts or reviews under the current ones, so
+        one plan never mixes decisions under unchanged part ids. Start a new plan."""
+        return {
+            **self._part_base(payload),
+            "status": "BLOCKED",
+            "blocker": "UI_PLAN_DECISIONS_CHANGED",
+        }
+
     def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
         attempt = payload.get("draft_attempt")
@@ -774,6 +790,8 @@ class UiPlanActivityHandler:
             )
             if entry is not None:
                 self.repository.record_usage_sync(self._blueprint_id(payload), entry)
+        if payload.get("decisions_sha256") != decisions_sha256():
+            return self._decisions_changed(payload)
         part_id, kind, part = self._part_identity(payload)
         base = {**self._part_base(payload), "part_id": part_id, "part_kind": kind}
         if attempt == 1:
@@ -941,6 +959,8 @@ class UiPlanActivityHandler:
         }
 
     def _prepare_part_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("decisions_sha256") != decisions_sha256():
+            return self._decisions_changed(payload)
         blueprint_id = self._blueprint_id(payload)
         attempt = int(payload.get("draft_attempt") or 1)
         part_id, kind, part = self._part_identity(payload)

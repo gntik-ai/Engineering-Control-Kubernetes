@@ -747,3 +747,27 @@ def test_part_ids_change_when_the_operator_decisions_change(
         "i" * 64, "k" * 64, ["a"], base
     )
     assert "no /legacy path" in ui_plan.OPERATOR_DECISIONS
+
+
+def test_a_plan_whose_decisions_changed_never_drafts_or_reviews(tmp_path: Path) -> None:
+    # NEW-134 review: parts fixed under other (or unrecorded) decisions never draft or
+    # review under the current ones; a pre-NEW-134 plan carries no decisions hash at all.
+    from unittest.mock import Mock
+
+    from engineering_control.activities import ui_plan
+    from engineering_control.config import Settings
+
+    handler = ui_plan.UiPlanActivityHandler(
+        Settings(agent_pack_root=build_fake_pack(tmp_path / "pack", version="1.5.1")),
+        repository=Mock(),
+        change_requests=Mock(),
+    )
+    for stale in ({}, {"decisions_sha256": "0" * 64}):
+        payload = {"blueprint_id": "00000000-0000-4000-8000-000000000001", **stale}
+        for prepared in (handler._prepare_part(payload), handler._prepare_part_review(payload)):
+            assert (prepared["status"], prepared["blocker"]) == (
+                "BLOCKED",
+                "UI_PLAN_DECISIONS_CHANGED",
+            )
+    handler.repository.record_usage_sync.assert_not_called()
+    assert ui_plan.decisions_sha256() == ui_plan.decisions_sha256()
