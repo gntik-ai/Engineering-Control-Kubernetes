@@ -23,10 +23,10 @@ import json
 import os
 import re
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -34,7 +34,10 @@ import yaml
 from engineering_control.engineering.models import UiMigrationPolicy
 from engineering_control.security.redaction import SecretRedactor
 
-SCHEMA_VERSION = 1
+# 2 (NEW-136): records `legacy_app_tree`, the Git tree id of the legacy app directory.
+SCHEMA_VERSION = 2
+# NEW-136 review: a console scan root that is (or traverses) a symlink; the plan blocks.
+SYMLINK_ROOT = "UI_INVENTORY_SYMLINK_ROOT"
 GENERATOR = "engineering_control.engineering.ui_inventory"
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 # The call site's method could not be determined (indirect or computed options).
@@ -886,8 +889,22 @@ def load_route_tables(root: Path, policy: UiMigrationPolicy) -> RouteTables:
 
 
 def _inside(root: Path, relative: str) -> Path:
+    """`relative` inside the checkout, never reached through a symlink (NEW-136 review).
+
+    A scan root that is or traverses a symlink is refused: the legacy app's Git tree id
+    covers only the link, so a symlinked root would let console changes bypass the reuse
+    key. Symlinks below a root are skipped and recorded (`_safe_files`)."""
     resolved_root = root.resolve()
-    path = (resolved_root / relative).resolve()
+    current = resolved_root
+    for part in PurePosixPath(relative).parts:
+        if part in {"/", ".", ".."}:
+            raise InventoryError("inventory path escaped the checkout")
+        current = current / part
+        if current.is_symlink():
+            raise InventoryError(
+                f"{SYMLINK_ROOT}: inventory root is or traverses a symlink: {relative}"
+            )
+    path = current.resolve()
     if not path.is_relative_to(resolved_root):
         raise InventoryError("inventory path escaped the checkout")
     return path
@@ -1177,9 +1194,14 @@ def build_inventory(
     *,
     source_sha: str,
     project: str,
+    legacy_app_tree: str,
 ) -> dict[str, Any]:
+    """`legacy_app_tree`: the Git tree id of `policy.legacy_app` at `source_sha` (see
+    `legacy_app_tree`); it changes exactly when a file of the legacy app changes."""
     if not re.fullmatch(r"[a-f0-9]{40}", source_sha):
         raise InventoryError("source SHA must be a full 40-character commit")
+    if not _GIT_OBJECT.fullmatch(legacy_app_tree):
+        raise InventoryError("legacy app tree must be a full Git object id")
     root = checkout.resolve()
     _inside(root, policy.legacy_app)
     src = _inside(root, f"{policy.legacy_app}/src")
@@ -1325,6 +1347,7 @@ def build_inventory(
         "project": project,
         "source_sha": source_sha,
         "legacy_app": policy.legacy_app,
+        "legacy_app_tree": legacy_app_tree,
         "target_app": policy.target_app,
         "route_tables": dict(sorted(tables.digests.items())),
         "summary": summary,
@@ -1372,6 +1395,66 @@ def inventory_hash(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(body)).hexdigest()
 
 
+_GIT_OBJECT = re.compile(r"[a-f0-9]{40}|[a-f0-9]{64}")
+CONTENT_KEY_VERSION = "ui-inventory-content-v1"
+# Fields the content key ignores: the evidence hash itself and the legacy repository
+# commit, which moves with every unrelated commit (backend fixes, docs, CI).
+CONTENT_KEY_EXCLUDED = frozenset({"inventory_sha256", "source_sha"})
+
+
+def inventory_content_key(document: dict[str, Any]) -> str:
+    """NEW-136: the reuse identity of an inventory's content, stable across unrelated commits.
+
+    sha256 over the document without `inventory_sha256` and `source_sha`, which includes
+    `legacy_app_tree`: the inventory captures the console's structure and route-table
+    digests but not its file contents, so the tree id invalidates the key on any change to
+    a legacy console file. Evidence and approvals keep binding the full `inventory_sha256`.
+    """
+    tree = document.get("legacy_app_tree")
+    if not isinstance(tree, str) or not _GIT_OBJECT.fullmatch(tree):
+        raise InventoryError("inventory records no legacy app tree (schema before NEW-136)")
+    body = {key: value for key, value in document.items() if key not in CONTENT_KEY_EXCLUDED}
+    payload = {"version": CONTENT_KEY_VERSION, "inventory": body}
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def console_scan_roots(legacy_app: str) -> tuple[tuple[str, bool], ...]:
+    """(path, required) of every console directory the inventory scans from."""
+    return ((legacy_app, True), (f"{legacy_app}/src", True), (f"{legacy_app}/e2e", False))
+
+
+def check_git_scan_roots(object_type: Callable[[str], str | None], legacy_app: str) -> None:
+    """Fail closed unless every console scan root is a Git tree at the snapshot commit.
+
+    `object_type(path)` is `git cat-file -t <sha>:<path>`, or None when the path does not
+    resolve (absent, or below a symlink: Git never follows one). A symlink is a blob (mode
+    120000), so a symlinked root is refused here as well as on the filesystem (`_inside`)."""
+    for relative, required in console_scan_roots(legacy_app):
+        kind = object_type(relative)
+        if kind is None and not required:
+            continue
+        if kind != "tree":
+            raise InventoryError(
+                f"{SYMLINK_ROOT}: console scan root is not a directory at the snapshot "
+                f"commit (missing, a symlink, or below one): {relative}"
+            )
+
+
+def git_legacy_app_tree(run: Callable[[list[str]], str], source_sha: str, legacy_app: str) -> str:
+    """The Git tree id of the legacy app directory at `source_sha`, from the object store
+    (`run` executes git with these arguments in the checkout and returns its stdout)."""
+    if not re.fullmatch(r"[a-f0-9]{40}", source_sha):
+        raise InventoryError("source SHA must be a full 40-character commit")
+    if not re.fullmatch(
+        r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", legacy_app
+    ) or ".." in legacy_app.split("/"):
+        raise InventoryError(f"legacy app path is invalid: {legacy_app}")
+    tree = run(["rev-parse", "--verify", "--quiet", f"{source_sha}:{legacy_app}"]).strip()
+    if not _GIT_OBJECT.fullmatch(tree) or run(["cat-file", "-t", tree]).strip() != "tree":
+        raise InventoryError(f"legacy app is not a directory at {source_sha}: {legacy_app}")
+    return tree
+
+
 def render_markdown(document: dict[str, Any]) -> str:
     summary = document["summary"]
     classes = summary["endpoint_classes"]
@@ -1379,6 +1462,7 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"# UI inventory: {document['project']} `{document['legacy_app']}`",
         "",
         f"- Source: `{document['source_sha']}`",
+        f"- Legacy app tree: `{document.get('legacy_app_tree')}`",
         f"- Schema version: {document['schema_version']}",
         f"- Inventory SHA-256: `{document['inventory_sha256']}`",
         f"- Target app: `{document['target_app']}`",

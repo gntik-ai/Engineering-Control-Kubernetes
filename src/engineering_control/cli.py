@@ -960,7 +960,13 @@ def main() -> None:
 def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
     """Inventory a local checkout read-only; writes only the requested output directory."""
     from engineering_control.engineering.safe_files import write_text_no_follow
-    from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
+    from engineering_control.engineering.ui_inventory import (
+        build_inventory,
+        check_git_scan_roots,
+        git_legacy_app_tree,
+        inventory_content_key,
+        render_markdown,
+    )
 
     checkout = Path(arguments.checkout).resolve(strict=True)
     if not checkout.is_dir():
@@ -976,12 +982,41 @@ def _ui_inventory_command(arguments: argparse.Namespace) -> dict[str, Any]:
             timeout=30,
         ).stdout.strip()
     )
-    document = build_inventory(checkout, policy, source_sha=source_sha, project=arguments.project)
+
+    def object_type(relative: str) -> str | None:
+        found = subprocess.run(  # noqa: S603
+            ["git", "-C", str(checkout), "cat-file", "-t", f"{source_sha}:{relative}"],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return found.stdout.strip() if found.returncode == 0 else None
+
+    check_git_scan_roots(object_type, policy.legacy_app)
+    tree = git_legacy_app_tree(
+        lambda git_arguments: (
+            subprocess.run(  # noqa: S603
+                ["git", "-C", str(checkout), *git_arguments],  # noqa: S607
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            ).stdout
+        ),
+        source_sha,
+        policy.legacy_app,
+    )
+    document = build_inventory(
+        checkout, policy, source_sha=source_sha, project=arguments.project, legacy_app_tree=tree
+    )
     result: dict[str, Any] = {
         "schema_version": document["schema_version"],
         "project": document["project"],
         "source_sha": document["source_sha"],
+        "legacy_app_tree": tree,
         "inventory_sha256": document["inventory_sha256"],
+        "inventory_content_key": inventory_content_key(document),
         "summary": document["summary"],
     }
     if arguments.output_dir is not None:

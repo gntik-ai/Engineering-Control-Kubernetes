@@ -29,19 +29,28 @@ from engineering_control.engineering.ui_blueprint_parts import (
     part_content_sha256,
     stage_plan,
 )
-from engineering_control.engineering.ui_inventory import inventory_hash
+from engineering_control.engineering.ui_inventory import (
+    InventoryError,
+    inventory_content_key,
+    inventory_hash,
+)
 from engineering_control.engineering.ui_kit import snapshot_hash
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.manager import GitWorktreeManager
 
 UI_PLAN_INPUT_DIRECTORY = "ui-plan-inputs"
+# NEW-136: an inventory recorded before the legacy app tree has no stable reuse key.
+UI_PLAN_INVENTORY_KEY_MISSING = "UI_PLAN_INVENTORY_KEY_MISSING"
 UI_PLAN_SCAN_STEPS = frozenset(
     {"ui_plan.stage_inputs", "ui_plan.stage_document", "ui_plan.stage_parts"}
 )
 UI_PLAN_INPUT_DIRECTORY_MISSING = "UI_PLAN_INPUT_DIRECTORY_MISSING"
 _DOCUMENT_NAME = re.compile(r"^(draft|review)-[12]\.json$")
 # NEW-131: one part version or its review, e.g. part-b003-0123456789abcdef-draft-1.json.
-_PART_DOCUMENT_NAME = re.compile(r"^part-(frame|b[0-9]{3})-[a-f0-9]{16}-(draft|review)-[12]\.json$")
+# NEW-138: up to three drafts and reviews per part.
+_PART_DOCUMENT_NAME = re.compile(
+    r"^part-(frame|b[0-9]{3})-[a-f0-9]{16}-(draft|review)-[123]\.json$"
+)
 # NEW-131 review: the complete reviewed frame every batch drafter and reviewer reads.
 _FRAME_BRIEF_NAME = re.compile(r"^part-frame-[a-f0-9]{16}-brief\.json$")
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
@@ -183,6 +192,16 @@ class UiPlanScanSteps:
         if base is None:
             return {**self._ui_plan_missing_root(), "blueprint_id": payload["blueprint_id"]}
         verified = self._ui_plan_verified_sources(payload)
+        try:
+            # NEW-136: the parts' reuse identity, stable across unrelated legacy commits.
+            content_key = inventory_content_key(verified["inventory"][2])
+        except InventoryError as error:
+            return {
+                "status": "BLOCKED",
+                "blocker": UI_PLAN_INVENTORY_KEY_MISSING,
+                "reason": str(error)[:300],
+                "blueprint_id": payload["blueprint_id"],
+            }
         directory = self._ui_plan_input_directory(payload, base)
         plan = stage_plan(verified["inventory"][2], verified["kit"][2], batch_pages)
         written = {
@@ -197,7 +216,13 @@ class UiPlanScanSteps:
             "blueprint_id": payload["blueprint_id"],
             "mechanical": plan["mechanical"],
             "mechanical_sha256": plan["mechanical_sha256"],
-            "parts": [{**part, "input": written[part["input"]]} for part in plan["parts"]],
+            "inventory_content_key": content_key,
+            # Carried on every part: the workflow forwards the parts to ui_plan.record_parts
+            # verbatim, so the key reaches the controller without a workflow change.
+            "parts": [
+                {**part, "input": written[part["input"]], "content_key": content_key}
+                for part in plan["parts"]
+            ],
             "kit_slice": written[plan["kit_slice"]],
         }
 

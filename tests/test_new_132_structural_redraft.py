@@ -106,13 +106,17 @@ async def test_a_schema_rejected_frame_is_redrafted_with_hermes_findings(tmp_pat
     assert view["usage"]["providers"]["claude"]["calls"] == 9  # the rejected call counts
 
 
-async def test_a_structure_rejected_frame_rejected_again_blocks(tmp_path: Path) -> None:
+async def test_a_structure_rejected_frame_rejected_on_every_attempt_blocks(
+    tmp_path: Path,
+) -> None:
+    # NEW-138: rejections share the part's budget of three drafts.
     harness, request, workflow_id = batched_harness(tmp_path)
-    harness.responses["ui_plan.draft"] = frame_drafter(["u0-unknown"], ["u0-unknown"])
+    unknown = ["u0-unknown"]
+    harness.responses["ui_plan.draft"] = frame_drafter(unknown, unknown, unknown)
     result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
     assert (result["status"], result["error_code"]) == ("BLOCKED", "DRAFT_STRUCTURE_INVALID")
     assert any("blocks unknown u0-unknown" in item for item in result["blockers"])
-    assert [d["draft_attempt"] for d in frame_drafts(harness)] == [1, 2]
+    assert [d["draft_attempt"] for d in frame_drafts(harness)] == [1, 2, 3]
     assert "ui_plan.review" not in harness.calls
 
 
@@ -236,17 +240,17 @@ async def test_a_provider_schema_refusal_is_redrafted_with_its_findings(tmp_path
     assert view["usage"]["providers"]["claude"]["calls"] == 9
 
 
-async def test_a_second_provider_schema_refusal_blocks_with_its_findings(tmp_path: Path) -> None:
+async def test_a_third_provider_schema_refusal_blocks_with_its_findings(tmp_path: Path) -> None:
     harness, request, workflow_id = batched_harness(tmp_path)
-    adapter, draft = provider_boundary(tmp_path, harness, prose=2)
+    adapter, draft = provider_boundary(tmp_path, harness, prose=3)
     harness.responses["ui_plan.draft"] = draft
     result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
     assert (result["status"], result["error_code"]) == ("BLOCKED", "DRAFT_SCHEMA_INVALID")
-    assert adapter.calls == [FRAME, FRAME]
+    assert adapter.calls == [FRAME, FRAME, FRAME]
     assert any("frame/gaps/1/blocks/0 [pattern]" in item for item in result["blockers"])
     assert "ui_plan.review" not in harness.calls
     view = harness.repository.get_sync(UUID(request.blueprint_id))
-    assert view is not None and view["usage"]["providers"]["claude"]["calls"] == 2
+    assert view is not None and view["usage"]["providers"]["claude"]["calls"] == 3
 
 
 def test_schema_refusal_details_carry_bounded_redacted_findings(tmp_path: Path) -> None:

@@ -16,6 +16,8 @@ from new_123_fixtures import (
 from engineering_control.engineering.ui_blueprint_parts import BATCH, FRAME, batch_gap_prefix
 
 LEGACY = "apps/web-console"
+# NEW-136: the Git tree id of the legacy app (inventory schema 2).
+LEGACY_TREE = "7" * 40
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "UNKNOWN")
 CLASSES = ("OK", "ROUTED_NOT_PUBLISHED", "NO_ROUTE", "GATEWAY_ONLY")
 ROUTED_PAGES = 50
@@ -97,10 +99,11 @@ def inventory_document() -> dict[str, Any]:
         )
     pages.sort(key=lambda page: page["file"])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "project": "falcone",
         "source_sha": SOURCE_SHA,
         "legacy_app": LEGACY,
+        "legacy_app_tree": LEGACY_TREE,
         "target_app": "apps/web-console-next",
         "summary": {"page_files": len(pages), "routed_pages": ROUTED_PAGES, "endpoints": ENDPOINTS},
         "routes": [

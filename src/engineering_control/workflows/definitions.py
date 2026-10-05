@@ -5134,7 +5134,8 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
 
     NEW-131 (patch ui-plan-batched-blueprint-v1): Hermes fills the mechanical fields from the
     inventory; Claude drafts a frame, then page batches; Codex reviews each part (one redraft
-    per part); Hermes assembles the reviewed parts into the blueprint candidate.
+    per part; NEW-138, patch new-138-two-redrafts-<part>: two); Hermes assembles the reviewed
+    parts into the blueprint candidate.
     """
 
     @workflow.run
@@ -5223,6 +5224,16 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             "ui.inventory", {"project": request.project, "snapshot": source}
         )
         if inventory.get("status") != "UI_INVENTORY_PASS":
+            if inventory.get("status") == "BLOCKED" and workflow.patched(
+                self._INVENTORY_BLOCKED_PATCH
+            ):
+                # NEW-136 review: e.g. a symlinked console scan root (fail closed).
+                return await self._ui_plan_terminal(
+                    context,
+                    "BLOCKED",
+                    str(inventory.get("blocker") or "UI_INVENTORY_BLOCKED"),
+                    [str(inventory.get("reason") or "")[:300]],
+                )
             return await self._ui_plan_terminal(context, "FAILED", "UI_INVENTORY_FAILED")
         kit = await self._step("ui.kit_snapshot", {"project": request.project})
         if kit.get("status") == "BLOCKED":
@@ -5395,9 +5406,14 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
         }
 
     _BATCHED_PATCH = "ui-plan-batched-blueprint-v1"
+    # NEW-136 review: a BLOCKED inventory ends the plan BLOCKED with the inventory's blocker
+    # (before: FAILED UI_INVENTORY_FAILED; the inventory step never returned BLOCKED then).
+    _INVENTORY_BLOCKED_PATCH = "ui-plan-inventory-blocked-v1"
     # NEW-132: a first draft Hermes rejects (schema or structure) gets the part's redraft.
     _STRUCTURAL_REDRAFT_PATCH = "new-132-structural-redraft"
     _STRUCTURAL_REJECTIONS = frozenset({"DRAFT_SCHEMA_INVALID", "DRAFT_STRUCTURE_INVALID"})
+    # NEW-138 (operator, 2026-10-05): two redrafts per part; the id is suffixed per part.
+    _TWO_REDRAFTS_PATCH = "new-138-two-redrafts"
     # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s);
     # the activity bound leaves room for the CLI's start-up and result handling.
     _PART_TIMEOUT_MINUTES = 40
@@ -5564,13 +5580,24 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
     async def _ui_plan_part(
         self, request: UiMigrationPlanInput, context: dict[str, Any], part: dict[str, Any]
     ) -> dict[str, Any]:
-        """Draft (Claude) and review (Codex) one part; at most one redraft of that part."""
+        """Draft (Claude) and review (Codex) one part; at most two redrafts of that part
+        (NEW-138; one before the per-part patch)."""
         current: dict[str, Any] = {**context, "part": part, "part_rounds": []}
-        for attempt in (1, 2):
+        max_attempts = 2
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            if attempt == 2 and workflow.patched(
+                f"{self._TWO_REDRAFTS_PATCH}-{part.get('kind')}-{part.get('index')}"
+            ):
+                # NEW-138: scoped per part, so a part replayed from before the deploy (no
+                # marker, memoized false) never limits the parts that follow it.
+                max_attempts = 3
             if not await self._checkpoint("UI_PLAN_PART_DRAFT"):
                 return {**current, "terminal": "FAILED", "blocker": "UI_PLAN_CANCELLED"}
             current = await self._step(
-                "ui_plan.prepare_part", {**current, "draft_attempt": attempt}
+                "ui_plan.prepare_part",
+                {**current, "draft_attempt": attempt, "max_draft_attempts": max_attempts},
             )
             if current.get("status") == "PART_REUSED":
                 return {**current, "status": "PART_APPROVED"}
@@ -5585,12 +5612,12 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             )
             if current.get("status") != "SUCCESS":
                 if (
-                    attempt == 1
+                    attempt < max_attempts
                     and current.get("blocker") == "SchemaViolation"
                     and workflow.patched(self._STRUCTURAL_REDRAFT_PATCH)
                 ):
                     # NEW-132: the provider boundary refused the output against the same
-                    # schema; its findings use the part's single redraft.
+                    # schema; its findings use one of the part's redrafts.
                     current = self._structural_redraft(
                         current,
                         "DRAFT_SCHEMA_INVALID",
@@ -5599,11 +5626,14 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     )
                     continue
                 if (
-                    attempt == 2
+                    attempt == max_attempts
                     and current.get("blocker") == "SchemaViolation"
-                    and ("rejection" in current)
+                    and (max_attempts == 3 or "rejection" in current)
                 ):
-                    # NEW-132: the redraft was refused again; report its schema findings.
+                    # NEW-132: the last redraft was refused again; report its schema findings.
+                    # NEW-138: on a part's third attempt, whatever came before it (an
+                    # intervening REVISE clears the earlier rejection). Before the patch,
+                    # unchanged. Only the returned blocker differs: no workflow command.
                     return {
                         **current,
                         "blocker": "DRAFT_SCHEMA_INVALID",
@@ -5616,12 +5646,12 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             recorded = await self._step("ui_plan.record_part_draft", current)
             if recorded.get("status") != "DRAFT_RECORDED":
                 if (
-                    attempt == 1
+                    attempt < max_attempts
                     and recorded.get("blocker") in self._STRUCTURAL_REJECTIONS
                     and workflow.patched(self._STRUCTURAL_REDRAFT_PATCH)
                 ):
-                    # NEW-132: Hermes's own deterministic findings use the part's single
-                    # redraft, like a REVISE (no review of the rejected draft).
+                    # NEW-132: Hermes's own deterministic findings use one of the part's
+                    # redrafts, like a REVISE (no review of the rejected draft).
                     current = self._structural_redraft(
                         recorded,
                         str(recorded.get("blocker")),
@@ -5687,7 +5717,11 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     **current,
                     "blocker": str(review.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
                 }
-            current = {**current, "review_file": review.get("document")}
+            # A REVISE redraft answers this review, not an earlier structural rejection.
+            current = {
+                **{key: value for key, value in current.items() if key != "rejection"},
+                "review_file": review.get("document"),
+            }
         return {**current, "blocker": "BLUEPRINT_PART_REVIEW_UNRESOLVED"}
 
     @staticmethod

@@ -441,7 +441,15 @@ def repository(tmp_path: Path) -> UiBlueprintRepository:
     return UiBlueprintRepository(engine=engine)
 
 
-def _drafting(repository: UiBlueprintRepository, inventory: str = INVENTORY_SHA) -> UUID:
+CONTENT_KEY = "c" * 64
+
+
+def _drafting(
+    repository: UiBlueprintRepository,
+    inventory: str = INVENTORY_SHA,
+    content_key: str | None = CONTENT_KEY,
+    mechanical: dict[str, Any] | None = None,
+) -> UUID:
     created = repository.create_sync("falcone", "cli:engineering-ctl", None)
     identity = UUID(created["id"])
     repository.register_sync(identity, created["workflow_id"])
@@ -449,6 +457,12 @@ def _drafting(repository: UiBlueprintRepository, inventory: str = INVENTORY_SHA)
         identity,
         {"source_sha": SOURCE_SHA, "inventory_sha256": inventory, "kit_snapshot_sha256": KIT_SHA},
     )
+    if content_key is not None:
+        # NEW-136: the reuse key is recorded with the mechanical fields.
+        fields = mechanical or {"pages": [], "dead_modules": []}
+        repository.record_mechanical_sync(
+            identity, fields, canonical_sha256(fields), content_key=content_key
+        )
     return identity
 
 
@@ -484,7 +498,7 @@ def test_an_approved_part_is_reused_by_a_later_blueprint_with_the_same_inputs(
     assert reused is not None and reused["reused_from"] == str(first)
     assert reused["content_sha256"] == digest
     assert part_id in repository.parts_sync(second)["approved"]
-    other = _drafting(repository, inventory="9" * 64)
+    other = _drafting(repository, content_key="9" * 64)
     assert repository.reuse_part_sync(other, part_id) is None
     assert repository.reuse_part_sync(second, "frame-" + "c" * 16) is None
 

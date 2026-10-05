@@ -49,7 +49,14 @@ from engineering_control.engineering.toolchain import (
     prepare_executables,
     render_argv,
 )
-from engineering_control.engineering.ui_inventory import build_inventory, render_markdown
+from engineering_control.engineering.ui_inventory import (
+    SYMLINK_ROOT,
+    InventoryError,
+    build_inventory,
+    check_git_scan_roots,
+    inventory_content_key,
+    render_markdown,
+)
 from engineering_control.engineering.ui_kit import (
     UI_MCP_UNAVAILABLE,
     GntikUiKitClient,
@@ -1229,7 +1236,32 @@ class ScanActivityHandler(UiPlanScanSteps):
         policy = self.catalog.project(project.value).ui_migration
         if policy is None:
             raise ValueError(f"UI_MIGRATION_NOT_CONFIGURED: {project.value} has no ui_migration")
-        document = build_inventory(worktree, policy, source_sha=source_sha, project=project.value)
+        try:
+            # NEW-136 review: every console scan root must be a real directory, in Git and
+            # on disk, or the tree id would cover only a link and miss console changes.
+            check_git_scan_roots(
+                lambda relative: self.manager.snapshot_object_type(
+                    worktree, expected_sha=source_sha, relative=relative
+                ),
+                policy.legacy_app,
+            )
+            # NEW-136: the legacy app's tree id makes the reuse key change with console files.
+            tree = self.manager.snapshot_tree(
+                worktree, expected_sha=source_sha, relative=policy.legacy_app
+            )
+            document = build_inventory(
+                worktree, policy, source_sha=source_sha, project=project.value, legacy_app_tree=tree
+            )
+        except InventoryError as error:
+            if not str(error).startswith(SYMLINK_ROOT):
+                raise
+            return {
+                **payload,
+                "status": "BLOCKED",
+                "blocker": SYMLINK_ROOT,
+                "reason": str(error)[:300],
+                "source_sha": source_sha,
+            }
         digest = str(document["inventory_sha256"])
         directory = self.settings.evidence_root / "scan" / "ui-inventory" / digest[:32]
         json_path = directory / "ui-inventory.json"
@@ -1253,6 +1285,8 @@ class ScanActivityHandler(UiPlanScanSteps):
             "source_sha": source_sha,
             "source_inspection": inspection,
             "inventory_sha256": digest,
+            "legacy_app_tree": tree,
+            "inventory_content_key": inventory_content_key(document),
             "summary": document["summary"],
             "route_tables": document["route_tables"],
             "evidence": receipts,
