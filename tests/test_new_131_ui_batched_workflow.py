@@ -274,16 +274,17 @@ async def test_a_revise_redrafts_only_that_batch(tmp_path: Path) -> None:
     assert result["review_rounds"] == 9
 
 
-async def test_a_second_revise_blocks_with_the_batch_and_its_findings(tmp_path: Path) -> None:
+async def test_a_third_revise_blocks_with_the_batch_and_its_findings(tmp_path: Path) -> None:
+    # NEW-138: two redrafts per part; the third REVISE blocks.
     harness, request, workflow_id = batched_harness(tmp_path)
-    harness.responses["ui_plan.review"] = part_reviewer({2: 2})
+    harness.responses["ui_plan.review"] = part_reviewer({2: 3})
     result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
     assert (result["status"], result["error_code"]) == (
         "BLOCKED",
         "BLUEPRINT_PART_REVIEW_UNRESOLVED",
     )
     parts = drafted_parts(harness)
-    assert [part.split("-")[0] for part in parts] == ["frame", "b001", "b002", "b002"]
+    assert [part.split("-")[0] for part in parts] == ["frame", "b001", "b002", "b002", "b002"]
     assert result["blockers"][0].startswith(f"part {parts[-1]}, batch 2 (")
     assert any(f"The 403 state is missing in {parts[-1]}." in item for item in result["blockers"])
     assert "ui_plan.assemble" not in harness.calls and "ui_plan.persist" not in harness.calls
@@ -294,7 +295,7 @@ async def test_a_second_revise_blocks_with_the_batch_and_its_findings(tmp_path: 
 
 async def test_a_new_plan_reuses_every_part_already_reviewed(tmp_path: Path) -> None:
     harness, request, workflow_id = batched_harness(tmp_path)
-    harness.responses["ui_plan.review"] = part_reviewer({4: 2})
+    harness.responses["ui_plan.review"] = part_reviewer({4: 3})
     first = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
     assert first["status"] == "BLOCKED"
     reviewed = drafted_parts(harness)[:4]

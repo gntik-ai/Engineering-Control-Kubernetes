@@ -690,6 +690,13 @@ class UiPlanActivityHandler:
         }
 
     @staticmethod
+    def _max_part_attempts(payload: dict[str, Any]) -> int | None:
+        """NEW-138: the part's draft budget, set by the workflow (3 under its per-part
+        patch, 2 before it; absent on attempt 1 of a plan from before NEW-138)."""
+        value = payload.get("max_draft_attempts", 2)
+        return value if type(value) is int and value in {2, 3} else None
+
+    @staticmethod
     def _content_key(payload: dict[str, Any]) -> str:
         value = payload.get("inventory_content_key")
         if not isinstance(value, str) or not _CONTENT_KEY.fullmatch(value):
@@ -856,8 +863,15 @@ class UiPlanActivityHandler:
                         {"frame_brief": self._frame_brief(part_id, reused)} if kind == FRAME else {}
                     ),
                 }
-        if attempt not in {1, 2} or not payload.get("source_worktree"):
+        maximum = self._max_part_attempts(payload)
+        if (
+            maximum is None
+            or type(attempt) is not int
+            or attempt not in range(1, maximum + 1)
+            or not payload.get("source_worktree")
+        ):
             return {**base, "status": "FAILED", "blocker": "DRAFT_INPUT_INVALID"}
+        redrafts = maximum - 1
         sections = [
             f"Draft the {kind} part of the gntik-ui migration blueprint with the "
             f"plan-ui-migration skill ({kind} part, mode draft). You work read-only: do not "
@@ -876,20 +890,31 @@ class UiPlanActivityHandler:
         if kind == BATCH:
             sections.append(self._frame_section(blueprint_id, payload))
         rejection = payload.get("rejection")
-        if attempt == 2 and isinstance(rejection, dict):
-            # NEW-132: Hermes rejected the first draft deterministically; no review ran.
+        # NEW-138: up to two redrafts per part (one for a plan from before the patch).
+        which = (
+            "the single redraft"
+            if redrafts == 1
+            else f"redraft {attempt - 1} of at most {redrafts}"
+        )
+        final = attempt == maximum
+        if attempt >= 2 and isinstance(rejection, dict):
+            # NEW-132: Hermes rejected the previous draft deterministically; no review ran.
             sections.append(
-                "This is the single redraft of this part. Hermes rejected your previous draft "
+                f"This is {which} of this part. Hermes rejected your previous draft "
                 f"deterministically ({rejection.get('code')}): it violates the output schema "
                 "or the reference rules. Fix every finding below while keeping every hard "
-                "rule; a gap's blocks lists only epic IDs, page keys or u5-cutover. A second "
-                "rejection blocks the plan.\n"
+                "rule; a gap's blocks lists only epic IDs, page keys or u5-cutover. "
+                + (
+                    "Another rejection blocks the plan.\n"
+                    if final
+                    else "Another rejection uses the next redraft.\n"
+                )
                 + _fenced("hermes findings", _bounded_json(rejection.get("details") or [], 40_000))
             )
-        elif attempt == 2:
+        elif attempt >= 2:
             rounds = payload.get("part_rounds") or []
             sections.append(
-                "This is the single redraft of this part. An independent reviewer asked for "
+                f"This is {which} of this part. An independent reviewer asked for "
                 f"revisions of your previous draft ({(payload.get('draft_file') or {}).get('path')}"
                 f"); its review is {(payload.get('review_file') or {}).get('path')}. Address "
                 "every finding while keeping every hard rule; do not add pages, endpoints or "
@@ -1104,7 +1129,8 @@ class UiPlanActivityHandler:
                 entry = self.repository.parts_sync(blueprint_id)["approved"][part_id]
                 result["frame_brief"] = self._frame_brief(part_id, entry)
             return {**result, "status": "PART_APPROVED"}
-        if attempt >= 2:
+        maximum = self._max_part_attempts(payload)
+        if maximum is None or attempt >= maximum:
             scope = (
                 f"batch {part['index']} ({', '.join(part['page_ids'])})"
                 if kind == BATCH

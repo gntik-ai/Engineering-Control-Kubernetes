@@ -47,7 +47,10 @@ UI_PLAN_SCAN_STEPS = frozenset(
 UI_PLAN_INPUT_DIRECTORY_MISSING = "UI_PLAN_INPUT_DIRECTORY_MISSING"
 _DOCUMENT_NAME = re.compile(r"^(draft|review)-[12]\.json$")
 # NEW-131: one part version or its review, e.g. part-b003-0123456789abcdef-draft-1.json.
-_PART_DOCUMENT_NAME = re.compile(r"^part-(frame|b[0-9]{3})-[a-f0-9]{16}-(draft|review)-[12]\.json$")
+# NEW-138: up to three drafts and reviews per part.
+_PART_DOCUMENT_NAME = re.compile(
+    r"^part-(frame|b[0-9]{3})-[a-f0-9]{16}-(draft|review)-[123]\.json$"
+)
 # NEW-131 review: the complete reviewed frame every batch drafter and reviewer reads.
 _FRAME_BRIEF_NAME = re.compile(r"^part-frame-[a-f0-9]{16}-brief\.json$")
 _MAX_INPUT_BYTES = 8 * 1024 * 1024

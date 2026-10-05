@@ -978,7 +978,8 @@ def review_digest(rounds: Any) -> dict[str, Any] | None:
         "decision": "APPROVE" if approved else "REVISE",
         "summary": (
             f"{len(final)} parts (the frame and {len(final) - 1} page batches) independently "
-            f"reviewed by the opposite provider; {len(revised)} redrafted once after REVISE; "
+            f"reviewed by the opposite provider; {len(revised)} redrafted after REVISE "
+            "(at most twice each); "
             f"{reused} reused from an earlier blueprint with identical inputs; "
             + ("every part APPROVED." if approved else "not every part is approved.")
         ),
