@@ -181,6 +181,54 @@ generic shell/kubectl arguments, active work, and protected evidence have no ove
 completion is safe to retry from fresh discovery. This retention workflow is distinct from the
 bootstrap software cleanup plan gated by `APPROVE CLEANUP`.
 
+## Extra correction attempt for validation findings (NEW-133)
+
+A backlog delivery may use `correction_limit + 1` attempts per ChangeSet. When the last of them
+was PASSed by the independent checker and stopped only by Hermes's own deterministic validation
+(`CHANGESET_VALIDATION_FINDINGS`, e.g. a semgrep finding the change introduced), the loop pauses
+with `CORRECTION_LIMIT_EXHAUSTED` and a plain `backlog-retry` fails with `POLICY_VIOLATION`
+("ChangeSet exceeds the approved correction limit"). The operator may grant that ChangeSet exactly
+one more attempt, once ever:
+
+```bash
+engineering-ctl change-extend-correction <loop_workflow_id> <project> <issue_number> \
+  <change_set_id> EXTEND_CORRECTION_ONCE_<first 8 hex of the ChangeSet ID, upper case>
+
+# falcone #1053
+engineering-ctl change-extend-correction \
+  backlog-loop-falcone-16979310-af9c-4f78-8d0e-2a6830e12421-operation-83ba57bb-5bd9-4942-80db-06d54ce35ec9 \
+  falcone 1053 98345e77-680f-56ce-bbb1-390a72484290 EXTEND_CORRECTION_ONCE_98345E77
+engineering-ctl backlog-retry <loop_workflow_id> <repository> 1053
+```
+
+The API route is `POST /v1/change-sets/extend-correction` (operator channel only, like
+`r3-approve`). The controller re-reads every precondition from durable records and refuses with
+a `CORRECTION_EXTENSION_*` code unless all hold:
+
+- the ChangeSet exists in that project, belongs to that loop and issue, and its originating
+  delivery approval and correction lineage are intact (`APPROVAL_INVALID`, `TARGET_MISMATCH`);
+- the ChangeSet is `REQUEST_CHANGES` (`STATE`) and its lineage used exactly
+  `correction_limit + 1` attempts (`LINEAGE_NOT_EXHAUSTED`: use `backlog-retry` instead);
+- the latest attempt's recorded stop (`recovery_json.correction_requested`) is
+  `CHANGESET_VALIDATION_FINDINGS` (`NOT_VALIDATION_BLOCKED`), with non-empty
+  `recovery_json.validation_findings` recorded during that attempt (`FINDINGS_MISSING`), and
+  that attempt's checker invocation (`code-reviewer`) decided PASS (`CHECKER_NOT_PASS`);
+- the loop Run is `PAUSED` and its newest child is for this issue (`LOOP_NOT_PAUSED`);
+- no extension was ever granted to this ChangeSet (`ALREADY_GRANTED`).
+
+The grant is stored in `ChangeSet.recovery_json.correction_extension` (operator, time, the
+SHA-256 of the validation findings, the attempt it extends) and audited as a
+`correction_extension_granted` dashboard event. The bounded lineage then admits
+`correction_limit + 2` attempts for that ChangeSet only; CI-repair bounds are unchanged.
+
+`backlog-retry` resumes the loop. The retry round's first attempt resumes the existing ChangeSet
+worktree and each maker is told its own repository's recorded findings (`deployment: ...`
+findings go to the deployment maker). If that attempt is again sent back, the retry round does
+not start another child: it pauses with `CORRECTION_EXTENSION_USED`, and only `backlog-skip` or a
+fresh delivery remains. ChangeSet worktrees in `REQUEST_CHANGES` are kept by the nightly cleanup
+until neither the ChangeSet nor any of its runs changed for `cleanup_retention_days` (14 days by
+default); preview namespaces are cleaned only for terminal ChangeSets.
+
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved

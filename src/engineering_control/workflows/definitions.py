@@ -3704,6 +3704,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 issue_prefix = f"{workflow.info().workflow_id}-issue-{ordinal}"
                 if delivery_round:
                     issue_prefix = f"{issue_prefix}-retry-{delivery_round}"
+                budget_blocker: str | None = None
                 if sequential_source_pr:
                     delivery = {"status": "FAILED", "blocker": "DELIVERY_NOT_STARTED"}
                     for attempt in range(1, request.correction_limit + 2):
@@ -3728,6 +3729,11 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         )
                         results.append({**delivery, "attempt": attempt})
                         if delivery.get("status") != "REQUEST_CHANGES":
+                            break
+                        budget_blocker = await self._retry_round_budget_blocker(
+                            request, item, delivery, delivery_round, register_run=register_run
+                        )
+                        if budget_blocker is not None:
                             break
                 else:
                     delivery_workflow_id = issue_prefix
@@ -3780,21 +3786,23 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         break
                     pause_blocker = blocker
                 elif sequential_source_pr and delivery.get("status") == "REQUEST_CHANGES":
+                    # NEW-133: a retry round stops once its ChangeSet's lineage is used up.
+                    exhausted = budget_blocker or "CORRECTION_LIMIT_EXHAUSTED"
                     if global_child_blocker_return and request.global_campaign_id is not None:
                         await self._step(
                             "backlog.record_loop_state",
                             {
                                 **_backlog_execution_payload(request),
                                 "loop_status": "PAUSED",
-                                "blocker": "CORRECTION_LIMIT_EXHAUSTED",
+                                "blocker": exhausted,
                             },
                         )
                         return {
                             "status": "BLOCKED",
-                            "blocker": "CORRECTION_LIMIT_EXHAUSTED",
+                            "blocker": exhausted,
                             "results": results,
                         }
-                    pause_blocker = "CORRECTION_LIMIT_EXHAUSTED"
+                    pause_blocker = exhausted
                 if pause_blocker is None:
                     break
                 paused_state = {
@@ -4632,6 +4640,47 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 "failure_code": _child_failure_code(error),
             }
         return result
+
+    def _correction_budget_patched(self) -> bool:
+        # NEW-133: a retry round checks the ChangeSet's correction budget after each
+        # REQUEST_CHANGES attempt (an overridable seam for the pre-patch replay test).
+        return workflow.patched("existing-backlog-retry-correction-budget-v1")
+
+    async def _retry_round_budget_blocker(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        item: dict[str, Any],
+        delivery: dict[str, Any],
+        delivery_round: int,
+        *,
+        register_run: bool,
+    ) -> str | None:
+        """NEW-133: the blocker that ends an operator retry round, or None to continue.
+
+        Only a retry round asks: the first round is bounded by its own attempt range.
+        After an operator correction extension the round's first attempt is the one
+        extra attempt; instead of starting a second child that the bounded approval
+        lineage refuses (a POLICY_VIOLATION child failure), the loop pauses with
+        CORRECTION_EXTENSION_USED (or CORRECTION_LIMIT_EXHAUSTED without an extension).
+        """
+        if not delivery_round:
+            return None
+        context = delivery.get("context")
+        change_set_id = context.get("change_set_id") if isinstance(context, dict) else None
+        if not isinstance(change_set_id, str) or not change_set_id:
+            return None
+        if not self._correction_budget_patched():
+            return None
+        budget = await self._loop_step(
+            request,
+            item,
+            "backlog.correction_budget",
+            {**_backlog_execution_payload(request), "change_set_id": change_set_id},
+            register_run=register_run,
+        )
+        if budget.get("status") != "EXHAUSTED":
+            return None
+        return str(budget.get("blocker") or "CORRECTION_LIMIT_EXHAUSTED")
 
     @staticmethod
     def _child_failure_pauses_patched(ordinal: int) -> bool:

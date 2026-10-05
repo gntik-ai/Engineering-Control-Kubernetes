@@ -64,6 +64,7 @@ from engineering_control.operations.issue_delivery_approval import (
     CI_REPAIR_REGRESSIONS,
     MAX_CI_REPAIR_ROUNDS,
     ci_repair_authorization_id,
+    correction_attempt_budget,
     register_child_issue_approval,
 )
 
@@ -80,6 +81,7 @@ _TERMINAL_GLOBAL_BLOCKERS = frozenset(
         "LLMWIKI_FULL_DELIVERY_INPUTS_UNRESOLVED",
         "BLOCKED_AUTONOMOUS_REPAIR_EXHAUSTED",
         "CORRECTION_LIMIT_EXHAUSTED",
+        "CORRECTION_EXTENSION_USED",
         "NEEDS_PRODUCT_DECISION",
     }
 )
@@ -155,6 +157,7 @@ class EngineeringActivityHandler:
             "backlog.register_child_run",
             "backlog.register_run",
             "backlog.record_ci_repair",
+            "backlog.correction_budget",
             "global_backlog.register",
             "global_backlog.select_next",
             "global_backlog.record_result",
@@ -297,6 +300,8 @@ class EngineeringActivityHandler:
             return self._register_backlog_run(payload)
         if step == "backlog.record_ci_repair":
             return self._record_backlog_ci_repair(payload)
+        if step == "backlog.correction_budget":
+            return self._backlog_correction_budget(payload)
         if step == "global_backlog.register":
             return self._register_global_backlog(payload)
         if step == "global_backlog.select_next":
@@ -2227,6 +2232,36 @@ class EngineeringActivityHandler:
                 {**payload, "run_id": str(run.id)},
                 "REGISTERED",
             )
+
+    def _backlog_correction_budget(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """NEW-133: whether a retry round may start another correction attempt.
+
+        Read-only. The ChangeSet's bound approval lineage decides: once it is used up the
+        loop pauses with an explicit blocker instead of starting a delivery child that its
+        binding would refuse. CORRECTION_EXTENSION_USED names the case where the one
+        operator-granted extra attempt was the one just used."""
+        step = "backlog.correction_budget"
+        change_set_id = UUID(str(payload["change_set_id"]))
+        with self.sessions.begin() as session:
+            change_set = session.get(db.ChangeSet, change_set_id)
+            if change_set is None:
+                raise ValueError("correction budget ChangeSet is missing")
+            if not (change_set.recovery_json or {}).get("issue_execution_approval"):
+                return {**payload, "status": "AVAILABLE", "last_step": step}
+            budget = correction_attempt_budget(session, change_set)
+        if budget["remaining"] > 0:
+            return {**payload, **budget, "status": "AVAILABLE", "last_step": step}
+        return {
+            **payload,
+            **budget,
+            "status": "EXHAUSTED",
+            "blocker": (
+                "CORRECTION_EXTENSION_USED"
+                if budget["extension_granted"]
+                else "CORRECTION_LIMIT_EXHAUSTED"
+            ),
+            "last_step": step,
+        }
 
     def _record_backlog_ci_repair(self, payload: dict[str, Any]) -> dict[str, Any]:
         """NEW-112 review: durably record the CI-repair round the loop is about to start.

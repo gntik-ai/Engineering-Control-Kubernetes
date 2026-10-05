@@ -266,6 +266,16 @@ class R3IssueApprovalRequest(APIModel):
     )
 
 
+class CorrectionExtensionRequest(APIModel):
+    """NEW-133: grant one extra correction attempt to a validation-blocked ChangeSet."""
+
+    loop_workflow_id: str = Field(pattern=r"^backlog-loop-[A-Za-z0-9._:-]{1,227}$")
+    project: Literal["falcone", "musematic", "llmwiki"]
+    issue_number: int = Field(ge=1, le=2_147_483_647)
+    change_set_id: UUID
+    confirmation_phrase: str = Field(pattern=r"^EXTEND_CORRECTION_ONCE_[A-F0-9]{8}$")
+
+
 class IssueAmendRequest(APIModel):
     """NEW-115: preview (no confirm) or confirm one backlog issue body amendment."""
 

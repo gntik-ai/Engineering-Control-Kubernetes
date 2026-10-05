@@ -63,6 +63,7 @@ from engineering_control.operations.connection_status import (
     provider_connection_status,
     provider_observation_current,
 )
+from engineering_control.operations.correction_extension import grant_correction_extension
 from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
 from engineering_control.operations.issue_amend import amend_issue, resolve_amend_target
 from engineering_control.operations.issue_approval import current_issue_approval_binding
@@ -621,6 +622,50 @@ class OperationsRepository:
             "approved_by": approved_by,
             "production": False,
         }
+
+    async def extend_change_set_correction(
+        self,
+        loop_workflow_id: str,
+        project: str,
+        issue_number: int,
+        change_set_id: UUID,
+        phrase: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._extend_change_set_correction,
+            loop_workflow_id,
+            project,
+            issue_number,
+            change_set_id,
+            phrase,
+            actor,
+        )
+
+    def _extend_change_set_correction(
+        self,
+        loop_workflow_id: str,
+        project: str,
+        issue_number: int,
+        change_set_id: UUID,
+        phrase: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        """NEW-133: one extra correction attempt; every precondition re-read durably."""
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("correction extension requires an allowlisted operator channel")
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            return grant_correction_extension(
+                session,
+                loop_workflow_id=loop_workflow_id,
+                project=project,
+                issue_number=issue_number,
+                change_set_id=change_set_id,
+                confirmation=phrase,
+                actor=actor,
+            )
 
     async def issue_amend_precheck(
         self, project: str, repository: str, issue_number: int

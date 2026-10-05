@@ -82,6 +82,9 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     ),
     "INDEPENDENT_CHECKER_DID_NOT_PASS": "the independent checker did not PASS the change",
     "CORRECTION_LIMIT_EXHAUSTED": "every correction attempt ended with REQUEST_CHANGES",
+    "CORRECTION_EXTENSION_USED": (
+        "the one operator-granted extra correction attempt also ended with REQUEST_CHANGES"
+    ),
     "CHANGESET_VALIDATION_FINDINGS": "deterministic validation found problems in the change",
     "AGENT_CONFIG_CHANGE_REFUSED": (
         "the change adds or modifies agent configuration (.codex/, .claude/ or .mcp.json); "

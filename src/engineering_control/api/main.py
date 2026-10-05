@@ -33,6 +33,7 @@ from engineering_control.api.schemas import (
     ChangeRequestPublication,
     ChangeRequestRejection,
     ChangeRequestRevision,
+    CorrectionExtensionRequest,
     DeliveryReconcile,
     DeliveryStart,
     DeploymentPrepare,
@@ -751,6 +752,30 @@ def create_app(
                 body.binding,
                 body.confirmation_phrase,
                 approval_actor(subject),
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/change-sets/extend-correction")
+    async def change_set_extend_correction(
+        body: CorrectionExtensionRequest,
+        subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+    ) -> dict[str, Any]:
+        """NEW-133: grant one extra correction attempt to a validation-blocked ChangeSet.
+
+        Same trust model as /v1/r3-issues/approve: the bearer-authenticated channel asserts
+        the actor, which must be a canonical operator. Every precondition is re-read from
+        durable records; the operator then resumes the loop with backlog-retry."""
+        actor = approval_actor(subject)
+        try:
+            return await repository.extend_change_set_correction(
+                body.loop_workflow_id,
+                body.project,
+                body.issue_number,
+                body.change_set_id,
+                body.confirmation_phrase,
+                actor,
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

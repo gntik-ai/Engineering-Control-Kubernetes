@@ -210,6 +210,14 @@ def parser() -> argparse.ArgumentParser:
     issue_amend.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     issue_amend.add_argument("--confirm", metavar="SHA_PREFIX", default=None)
     issue_amend.add_argument("--retry", action="store_true")
+    # NEW-133: one operator-approved extra correction attempt for a ChangeSet blocked only
+    # by deterministic validation findings; backlog-retry then resumes the loop.
+    extend_correction = commands.add_parser("change-extend-correction")
+    extend_correction.add_argument("loop_workflow_id")
+    extend_correction.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    extend_correction.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
+    extend_correction.add_argument("change_set_id", type=UUID)
+    extend_correction.add_argument("confirmation_phrase")
     commands.add_parser("findings").add_argument("--limit", type=int, default=50)
     for name in ("status", "run"):
         commands.add_parser(name).add_argument("workflow_id")
@@ -575,6 +583,18 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "surface": arguments.surface,
                 "issue_number": arguments.issue_number,
                 "binding": arguments.binding,
+                "confirmation_phrase": arguments.confirmation_phrase,
+            },
+        )
+    if command == "change-extend-correction":
+        return client.request(
+            "POST",
+            "/v1/change-sets/extend-correction",
+            {
+                "loop_workflow_id": arguments.loop_workflow_id,
+                "project": arguments.project,
+                "issue_number": arguments.issue_number,
+                "change_set_id": str(arguments.change_set_id),
                 "confirmation_phrase": arguments.confirmation_phrase,
             },
         )
