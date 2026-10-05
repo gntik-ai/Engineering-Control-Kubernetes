@@ -41,7 +41,8 @@ FRAME = "frame"
 BATCH = "batch"
 PART_SCHEMAS = dict(UI_PLAN_PART_SCHEMAS["plan-ui-migration"])
 PART_ID_PATTERN = r"^(frame|b[0-9]{3})-[a-f0-9]{16}$"
-PART_ID_VERSION = "ui-plan-part-v1"
+# v2 (NEW-136): ids bind the inventory content key instead of inventory_sha256.
+PART_ID_VERSION = "ui-plan-part-v2"
 DEFAULT_BATCH_PAGES = 8
 MAX_BATCH_PAGES = 25
 MAX_BATCH_GAPS = 100
@@ -396,30 +397,31 @@ def _short(*parts: str) -> str:
 
 
 def frame_part_id(
-    inventory_sha256: str, kit_snapshot_sha256: str, routed: list[str], provenance: str
+    content_key: str, kit_snapshot_sha256: str, routed: list[str], provenance: str
 ) -> str:
-    """Deterministic: the inventory, the kit, the routed pages and the provenance (skill,
-    role, profile and schemas, see ui_blueprint.plan_provenance)."""
-    digest = _short(FRAME, inventory_sha256, kit_snapshot_sha256, ",".join(routed), provenance)
+    """Deterministic: the inventory content key (NEW-136: ui_inventory.inventory_content_key,
+    stable across unrelated legacy commits), the kit, the routed pages and the provenance
+    (skill, role, profile and schemas, see ui_blueprint.plan_provenance)."""
+    digest = _short(FRAME, content_key, kit_snapshot_sha256, ",".join(routed), provenance)
     return f"frame-{digest}"
 
 
 def batch_part_id(
     index: int,
-    inventory_sha256: str,
+    content_key: str,
     kit_snapshot_sha256: str,
     identities: list[str],
     frame_sha256: str,
     provenance: str,
 ) -> str:
-    """Deterministic: the inventory, the kit, the batch's pages, the reviewed frame the
-    batch was drafted against and the provenance. A reviewed batch with this id is never
-    drafted again."""
+    """Deterministic: the inventory content key, the kit, the batch's pages, the reviewed
+    frame the batch was drafted against and the provenance. A reviewed batch with this id
+    is never drafted again."""
     if not 1 <= index <= 999:
         raise ValueError("ui plan batch index is out of range")
     digest = _short(
         BATCH,
-        inventory_sha256,
+        content_key,
         kit_snapshot_sha256,
         ",".join(identities),
         frame_sha256,

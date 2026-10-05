@@ -848,6 +848,29 @@ class GitWorktreeManager:
             "tracked_files_sha256": hashlib.sha256(canonical).hexdigest(),
         }
 
+    def snapshot_tree(self, path: Path, *, expected_sha: str, relative: str) -> str:
+        """NEW-136: the Git tree id of `relative` (a directory) at the snapshot commit,
+        read from the object store (independent of the checked-out files)."""
+        root = self.worktree_root.resolve()
+        resolved = path.resolve()
+        if resolved == root or not resolved.is_dir() or not resolved.is_relative_to(root):
+            raise WorktreeError("snapshot tree lookup escaped the bounded worktree root")
+        if not re.fullmatch(r"[a-f0-9]{40}", expected_sha):
+            raise ValueError("snapshot tree lookup needs a full Git SHA")
+        if not re.fullmatch(
+            r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", relative
+        ) or ".." in relative.split("/"):
+            raise ValueError(f"snapshot tree path is invalid: {relative}")
+        tree = self._run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{expected_sha}:{relative}"], resolved
+        )
+        if (
+            not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", tree)
+            or self._run(["git", "cat-file", "-t", tree], resolved) != "tree"
+        ):
+            raise WorktreeError(f"snapshot has no directory {relative} at {expected_sha}")
+        return tree
+
     def change_evidence(self, path: Path, *, base_sha: str) -> tuple[dict[str, object], str]:
         root = self.worktree_root.resolve()
         resolved = path.resolve()

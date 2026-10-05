@@ -43,6 +43,7 @@ from engineering_control.engineering.ui_blueprint_parts import (
     routed_page_ids,
     stage_plan,
 )
+from engineering_control.engineering.ui_inventory import inventory_content_key
 from engineering_control.workflows.definitions import UiMigrationPlanWorkflow
 from engineering_control.workflows.inputs import UiMigrationPlanInput
 
@@ -70,13 +71,19 @@ def _meta(name: str, document: Any) -> dict[str, Any]:
 
 def stage_parts(payload: dict[str, Any]) -> dict[str, Any]:
     plan = stage_plan(inventory_document(), kit_document(), int(payload["batch_pages"]))
+    key = inventory_content_key(inventory_document())
     return {
         "status": "STAGED",
         "blueprint_id": payload["blueprint_id"],
         "mechanical": plan["mechanical"],
         "mechanical_sha256": plan["mechanical_sha256"],
+        "inventory_content_key": key,
         "parts": [
-            {**part, "input": _meta(part["input"], plan["files"][part["input"]])}
+            {
+                **part,
+                "input": _meta(part["input"], plan["files"][part["input"]]),
+                "content_key": key,
+            }
             for part in plan["parts"]
         ],
         "kit_slice": _meta(plan["kit_slice"], plan["files"][plan["kit_slice"]]),

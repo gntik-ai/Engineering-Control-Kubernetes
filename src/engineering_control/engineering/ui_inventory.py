@@ -23,7 +23,7 @@ import json
 import os
 import re
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -34,7 +34,8 @@ import yaml
 from engineering_control.engineering.models import UiMigrationPolicy
 from engineering_control.security.redaction import SecretRedactor
 
-SCHEMA_VERSION = 1
+# 2 (NEW-136): records `legacy_app_tree`, the Git tree id of the legacy app directory.
+SCHEMA_VERSION = 2
 GENERATOR = "engineering_control.engineering.ui_inventory"
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 # The call site's method could not be determined (indirect or computed options).
@@ -1177,9 +1178,14 @@ def build_inventory(
     *,
     source_sha: str,
     project: str,
+    legacy_app_tree: str,
 ) -> dict[str, Any]:
+    """`legacy_app_tree`: the Git tree id of `policy.legacy_app` at `source_sha` (see
+    `legacy_app_tree`); it changes exactly when a file of the legacy app changes."""
     if not re.fullmatch(r"[a-f0-9]{40}", source_sha):
         raise InventoryError("source SHA must be a full 40-character commit")
+    if not _GIT_OBJECT.fullmatch(legacy_app_tree):
+        raise InventoryError("legacy app tree must be a full Git object id")
     root = checkout.resolve()
     _inside(root, policy.legacy_app)
     src = _inside(root, f"{policy.legacy_app}/src")
@@ -1325,6 +1331,7 @@ def build_inventory(
         "project": project,
         "source_sha": source_sha,
         "legacy_app": policy.legacy_app,
+        "legacy_app_tree": legacy_app_tree,
         "target_app": policy.target_app,
         "route_tables": dict(sorted(tables.digests.items())),
         "summary": summary,
@@ -1372,6 +1379,44 @@ def inventory_hash(document: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(body)).hexdigest()
 
 
+_GIT_OBJECT = re.compile(r"[a-f0-9]{40}|[a-f0-9]{64}")
+CONTENT_KEY_VERSION = "ui-inventory-content-v1"
+# Fields the content key ignores: the evidence hash itself and the legacy repository
+# commit, which moves with every unrelated commit (backend fixes, docs, CI).
+CONTENT_KEY_EXCLUDED = frozenset({"inventory_sha256", "source_sha"})
+
+
+def inventory_content_key(document: dict[str, Any]) -> str:
+    """NEW-136: the reuse identity of an inventory's content, stable across unrelated commits.
+
+    sha256 over the document without `inventory_sha256` and `source_sha`, which includes
+    `legacy_app_tree`: the inventory captures the console's structure and route-table
+    digests but not its file contents, so the tree id invalidates the key on any change to
+    a legacy console file. Evidence and approvals keep binding the full `inventory_sha256`.
+    """
+    tree = document.get("legacy_app_tree")
+    if not isinstance(tree, str) or not _GIT_OBJECT.fullmatch(tree):
+        raise InventoryError("inventory records no legacy app tree (schema before NEW-136)")
+    body = {key: value for key, value in document.items() if key not in CONTENT_KEY_EXCLUDED}
+    payload = {"version": CONTENT_KEY_VERSION, "inventory": body}
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def git_legacy_app_tree(run: Callable[[list[str]], str], source_sha: str, legacy_app: str) -> str:
+    """The Git tree id of the legacy app directory at `source_sha`, from the object store
+    (`run` executes git with these arguments in the checkout and returns its stdout)."""
+    if not re.fullmatch(r"[a-f0-9]{40}", source_sha):
+        raise InventoryError("source SHA must be a full 40-character commit")
+    if not re.fullmatch(
+        r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", legacy_app
+    ) or ".." in legacy_app.split("/"):
+        raise InventoryError(f"legacy app path is invalid: {legacy_app}")
+    tree = run(["rev-parse", "--verify", "--quiet", f"{source_sha}:{legacy_app}"]).strip()
+    if not _GIT_OBJECT.fullmatch(tree) or run(["cat-file", "-t", tree]).strip() != "tree":
+        raise InventoryError(f"legacy app is not a directory at {source_sha}: {legacy_app}")
+    return tree
+
+
 def render_markdown(document: dict[str, Any]) -> str:
     summary = document["summary"]
     classes = summary["endpoint_classes"]
@@ -1379,6 +1424,7 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"# UI inventory: {document['project']} `{document['legacy_app']}`",
         "",
         f"- Source: `{document['source_sha']}`",
+        f"- Legacy app tree: `{document.get('legacy_app_tree')}`",
         f"- Schema version: {document['schema_version']}",
         f"- Inventory SHA-256: `{document['inventory_sha256']}`",
         f"- Target app: `{document['target_app']}`",

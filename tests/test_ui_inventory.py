@@ -25,6 +25,8 @@ from engineering_control.engineering.ui_inventory import (
     InventoryError,
     build_inventory,
     extract_endpoints,
+    git_legacy_app_tree,
+    inventory_content_key,
     inventory_hash,
     render_markdown,
     scan_js,
@@ -38,6 +40,7 @@ PROJECTS = ROOT / "config" / "projects"
 FIXTURE = ROOT / "tests" / "fixtures" / "ui_inventory_falcone"
 GIT = shutil.which("git") or "git"
 SHA = "a" * 40
+TREE = "e" * 40
 
 
 def _manifest(project: str = "falcone") -> dict[str, Any]:
@@ -69,8 +72,8 @@ def _with(**changes: Any) -> dict[str, Any]:
 _DELETE = object()
 
 
-def _inventory(root: Path = FIXTURE, sha: str = SHA) -> dict[str, Any]:
-    return build_inventory(root, _policy(), source_sha=sha, project="falcone")
+def _inventory(root: Path = FIXTURE, sha: str = SHA, tree: str = TREE) -> dict[str, Any]:
+    return build_inventory(root, _policy(), source_sha=sha, project="falcone", legacy_app_tree=tree)
 
 
 def _endpoint(document: dict[str, Any], method: str, path: str) -> dict[str, Any]:
@@ -384,6 +387,60 @@ def test_output_is_versioned_and_deterministic(tmp_path: Path) -> None:
     assert _inventory(sha="b" * 40)["inventory_sha256"] != first["inventory_sha256"]
 
 
+def test_content_key_ignores_the_commit_but_not_the_console_tree_or_content(
+    tmp_path: Path,
+) -> None:
+    # NEW-136: an unrelated legacy commit moves source_sha and the evidence hash, but not
+    # the reuse key; a console file change (tree) or an inventory change does move it.
+    first = _inventory()
+    moved = _inventory(sha="b" * 40)
+    assert moved["inventory_sha256"] != first["inventory_sha256"]
+    assert inventory_content_key(moved) == inventory_content_key(first)
+    assert inventory_content_key(_inventory(tree="f" * 40)) != inventory_content_key(first)
+    copy = tmp_path / "checkout"
+    shutil.copytree(FIXTURE, copy)
+    page = copy / "apps/web-console/src/pages/WelcomePage.tsx"
+    page.write_text(page.read_text(encoding="utf-8") + "// changed\n", encoding="utf-8")
+    assert inventory_content_key(_inventory(copy)) != inventory_content_key(first)
+    legacy = {key: value for key, value in first.items() if key != "legacy_app_tree"}
+    with pytest.raises(InventoryError, match="legacy app tree"):
+        inventory_content_key(legacy)
+    with pytest.raises(InventoryError, match="Git object id"):
+        _inventory(tree="main")
+
+
+def test_legacy_app_tree_moves_only_with_console_files(tmp_path: Path) -> None:
+    _handler, payload, sha = _snapshot(tmp_path)
+    repo = Path(payload["snapshot"]["source_worktree"])
+
+    def run(arguments: list[str]) -> str:
+        return _git(repo, *arguments)
+
+    def commit(path: str) -> str:
+        target = repo / path
+        target.write_text(target.read_text(encoding="utf-8") + "// x\n", encoding="utf-8")
+        _git(repo, "-c", "user.name=t", "-c", "user.email=t@e.invalid", "commit", "-qam", "c")
+        return _git(repo, "rev-parse", "HEAD").strip()
+
+    tree = git_legacy_app_tree(run, sha, "apps/web-console")
+    unrelated = commit("deploy/kind/apisix/apisix.yaml")
+    assert git_legacy_app_tree(run, unrelated, "apps/web-console") == tree
+    console = commit("apps/web-console/src/pages/WelcomePage.tsx")
+    assert git_legacy_app_tree(run, console, "apps/web-console") != tree
+    with pytest.raises(InventoryError, match="invalid"):
+        git_legacy_app_tree(run, sha, "../outside")
+    with pytest.raises(subprocess.CalledProcessError):
+        git_legacy_app_tree(run, sha, "apps/missing")
+    with pytest.raises(InventoryError, match="not a directory"):
+        git_legacy_app_tree(run, sha, "deploy/kind/apisix/apisix.yaml")
+    handler = ScanActivityHandler(
+        Settings(worktree_root=tmp_path / "worktrees", evidence_root=tmp_path / "e")
+    )
+    assert handler.manager.snapshot_tree(repo, expected_sha=sha, relative="apps/web-console") == (
+        tree
+    )
+
+
 def test_markdown_summary_reports_counts_and_classes() -> None:
     document = _inventory()
     markdown = render_markdown(document)
@@ -448,11 +505,15 @@ async def test_ui_inventory_step_publishes_evidence_and_returns_a_bounded_result
 ) -> None:
     handler, payload, sha = _snapshot(tmp_path)
     result = await handler.handle("ui.inventory", payload)
+    source = Path(payload["snapshot"]["source_worktree"])
+    tree = _git(source, "rev-parse", f"{sha}:apps/web-console").strip()
     expected = build_inventory(
-        Path(payload["snapshot"]["source_worktree"]), _policy(), source_sha=sha, project="falcone"
+        source, _policy(), source_sha=sha, project="falcone", legacy_app_tree=tree
     )
     assert result["status"] == "UI_INVENTORY_PASS"
+    assert expected["legacy_app_tree"] == result["legacy_app_tree"] == tree
     assert result["inventory_sha256"] == expected["inventory_sha256"]
+    assert result["inventory_content_key"] == inventory_content_key(expected)
     assert result["summary"] == expected["summary"]
     assert "pages" not in result and "endpoints" not in result
     directory = tmp_path / "evidence/scan/ui-inventory" / expected["inventory_sha256"][:32]
@@ -477,21 +538,26 @@ async def test_ui_inventory_step_fails_closed(tmp_path: Path) -> None:
 
 
 def test_cli_inventories_a_local_checkout_read_only(tmp_path: Path) -> None:
+    _handler, payload, sha = _snapshot(tmp_path)
+    checkout = Path(payload["snapshot"]["source_worktree"])
     arguments = Namespace(
-        checkout=FIXTURE,
+        checkout=checkout,
         project="falcone",
         manifest=PROJECTS / "falcone.yaml",
-        source_sha=SHA,
+        source_sha=sha,
         output_dir=tmp_path / "out",
     )
     result = _ui_inventory_command(arguments)
-    expected = _inventory()
+    tree = _git(checkout, "rev-parse", f"{sha}:apps/web-console").strip()
+    expected = _inventory(checkout, sha, tree)
+    assert result["legacy_app_tree"] == tree
+    assert result["inventory_content_key"] == inventory_content_key(expected)
     assert result["inventory_sha256"] == expected["inventory_sha256"]
     assert result["summary"] == expected["summary"]
     json_path, markdown_path = (Path(item) for item in result["outputs"])
     assert json.loads(json_path.read_text(encoding="utf-8")) == expected
     assert markdown_path.read_text(encoding="utf-8") == render_markdown(expected)
-    inside = Namespace(**{**vars(arguments), "output_dir": FIXTURE / "out"})
+    inside = Namespace(**{**vars(arguments), "output_dir": checkout / "out"})
     with pytest.raises(ValueError, match="outside the checkout"):
         _ui_inventory_command(inside)
     wrong = Namespace(**{**vars(arguments), "manifest": PROJECTS / "musematic.yaml"})
@@ -642,19 +708,19 @@ def test_an_unknown_method_is_never_ok_on_a_possible_mismatch() -> None:
 
 
 def test_cli_never_follows_a_symlink_planted_at_its_output_name(tmp_path: Path) -> None:
-    checkout = tmp_path / "checkout"
-    shutil.copytree(FIXTURE, checkout)
+    _handler, payload, sha = _snapshot(tmp_path)
+    checkout = Path(payload["snapshot"]["source_worktree"])
     victim = checkout / "apps/web-console/src/main.tsx"
     original = victim.read_text(encoding="utf-8")
     output = tmp_path / "out"
     output.mkdir()
     for suffix in ("json", "md"):
-        (output / f"ui-inventory-falcone-{SHA[:12]}.{suffix}").symlink_to(victim)
+        (output / f"ui-inventory-falcone-{sha[:12]}.{suffix}").symlink_to(victim)
     arguments = Namespace(
         checkout=checkout,
         project="falcone",
         manifest=PROJECTS / "falcone.yaml",
-        source_sha=SHA,
+        source_sha=sha,
         output_dir=output,
     )
     with pytest.raises(ValueError, match="symlink"):

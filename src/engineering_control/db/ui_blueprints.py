@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -41,6 +41,9 @@ from engineering_control.engineering.ui_blueprint_parts import (
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _SHA = re.compile(r"^[a-f0-9]{40}$")
 _RUN_PREFIXES = ("ui-plan-", "ui-blueprint-fanout-")
+
+# NEW-136: the inventory content key, stored on the mechanical entry of drafts_json.
+CONTENT_KEY_FIELD = "inventory_content_key"
 
 
 class UiBlueprintNotFoundError(ValueError):
@@ -291,8 +294,16 @@ class UiBlueprintRepository:
     # every immutable version of the frame and of each page batch with its review.
 
     def record_mechanical_sync(
-        self, blueprint_id: UUID, mechanical: dict[str, Any], mechanical_sha256: str
+        self,
+        blueprint_id: UUID,
+        mechanical: dict[str, Any],
+        mechanical_sha256: str,
+        *,
+        content_key: str | None = None,
     ) -> str:
+        """Record the mechanical fields once, with (NEW-136) the inventory content key the
+        part ids bind: the reuse lookup matches earlier blueprints on it. It is stored on
+        the mechanical entry of drafts_json (no schema migration)."""
         digest = part_content_sha256(mechanical)
         if not hmac.compare_digest(digest, mechanical_sha256):
             raise ValueError("ui blueprint mechanical fields do not match their hash")
@@ -303,14 +314,53 @@ class UiBlueprintRepository:
             drafts = list(row.drafts_json or [])
             existing = [entry for entry in drafts if entry.get("part") == MECHANICAL_PART]
             if existing:
-                if existing[0].get("content_sha256") != digest:
+                entry = dict(existing[0])
+                if entry.get("content_sha256") != digest:
                     raise ValueError("ui blueprint mechanical fields are immutable")
+                recorded = entry.get(CONTENT_KEY_FIELD)
+                if content_key is not None and recorded not in {None, content_key}:
+                    raise ValueError("ui blueprint inventory content key is immutable")
+                if content_key is not None and recorded is None:
+                    entry[CONTENT_KEY_FIELD] = content_key
+                    row.drafts_json = [entry if e is existing[0] else e for e in drafts]
                 return digest
             drafts.append(
-                {"part": MECHANICAL_PART, "content": mechanical, "content_sha256": digest}
+                {
+                    "part": MECHANICAL_PART,
+                    "content": mechanical,
+                    "content_sha256": digest,
+                    **({CONTENT_KEY_FIELD: content_key} if content_key is not None else {}),
+                }
             )
             row.drafts_json = drafts
         return digest
+
+    @staticmethod
+    def _mechanical_entry(row: UiBlueprint) -> dict[str, Any] | None:
+        found = [e for e in row.drafts_json or [] if e.get("part") == MECHANICAL_PART]
+        return found[0] if found and isinstance(found[0].get("content"), dict) else None
+
+    @classmethod
+    def _content_key(cls, row: UiBlueprint) -> str | None:
+        entry = cls._mechanical_entry(row)
+        value = entry.get(CONTENT_KEY_FIELD) if entry is not None else None
+        return value if isinstance(value, str) and value else None
+
+    @classmethod
+    def _page_records(cls, row: UiBlueprint, pages: Sequence[str]) -> dict[str, Any] | None:
+        """The mechanical (inventory-derived) records of these pages, or None if one is
+        missing: route, legacy files, endpoints, complexity and legacy tests."""
+        entry = cls._mechanical_entry(row)
+        if entry is None:
+            return None
+        by_id = {
+            str(page.get("page_id")): page
+            for page in entry["content"].get("pages") or []
+            if isinstance(page, dict)
+        }
+        if any(page not in by_id for page in pages):
+            return None
+        return {page: by_id[page] for page in pages}
 
     def parts_sync(self, blueprint_id: UUID) -> dict[str, Any]:
         """The mechanical fields and the approved part versions recorded so far."""
@@ -423,11 +473,18 @@ class UiBlueprintRepository:
         blueprint_id: UUID,
         part_id: str,
         validate: Callable[[Any], list[str]] | None = None,
+        pages: Sequence[str] = (),
     ) -> dict[str, Any] | None:
-        """NEW-131 resumability: an approved version of this exact part (same inventory,
-        kit, pages and frame by construction of its id), from this blueprint or an earlier
-        one of the same project and inputs, is adopted instead of being drafted again -- only
-        if it still passes `validate` (the current part schema and references)."""
+        """NEW-131 resumability: an approved version of this exact part (same inventory
+        content, kit, pages and frame by construction of its id), from this blueprint or an
+        earlier one of the same project and inputs, is adopted instead of being drafted
+        again -- only if it still passes `validate` (the current part schema and references).
+
+        NEW-136: earlier blueprints match on the inventory content key (recorded with the
+        mechanical fields), not on inventory_sha256, which moves with every legacy commit.
+        An approval from an earlier blueprint is adopted only if the mechanical records of
+        `pages` (a batch's pages) are identical in both blueprints, so a batch whose pages
+        or endpoints changed is redrafted rather than adopted."""
         with self.sessions.begin() as session:
             row = self._locked(session, blueprint_id)
             if row.status != "DRAFTING":
@@ -443,17 +500,24 @@ class UiBlueprintRepository:
             own = [e for e in row.drafts_json or [] if usable(e)]
             if own:
                 return dict(own[-1])
+            key = self._content_key(row)
+            current_pages = self._page_records(row, pages)
+            if key is None or current_pages is None:
+                return None
             earlier = session.scalars(
                 select(UiBlueprint)
                 .where(
                     UiBlueprint.project == row.project,
-                    UiBlueprint.inventory_sha256 == row.inventory_sha256,
                     UiBlueprint.kit_snapshot_sha256 == row.kit_snapshot_sha256,
                     UiBlueprint.id != row.id,
                 )
                 .order_by(UiBlueprint.created_at.desc())
             ).all()
             for other in earlier:
+                if self._content_key(other) != key or (
+                    self._page_records(other, pages) != current_pages
+                ):
+                    continue
                 found = [e for e in other.drafts_json or [] if usable(e)]
                 if not found:
                     continue

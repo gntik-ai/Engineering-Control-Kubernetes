@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -85,6 +86,9 @@ _PROVIDER_RESULT_KEYS = frozenset(
 )
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
 # NEW-131: parts of the batched plan carried between steps but never into the next request.
+# NEW-136: the inventory content key binds the part ids; see ui_inventory.
+UI_PLAN_REUSE_KEY_MISSING = "UI_PLAN_REUSE_KEY_MISSING"
+_CONTENT_KEY = re.compile(r"[a-f0-9]{64}")
 _PART_TRANSIENT_KEYS = frozenset(
     {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief", "rejected_usage"}
 )
@@ -642,15 +646,23 @@ class UiPlanActivityHandler:
             or sorted(planned) != sorted(routed)
         ):
             return {**base, "status": "FAILED", "blocker": "UI_PLAN_PARTS_INVALID"}
+        # NEW-136: the parts' reuse identity, staged by the scan worker on every part.
+        keys = {part.get("content_key") for part in parts}
+        content_key = next(iter(keys)) if len(keys) == 1 else None
+        if not isinstance(content_key, str) or not _CONTENT_KEY.fullmatch(content_key):
+            return {**base, "status": "FAILED", "blocker": UI_PLAN_REUSE_KEY_MISSING}
         self.repository.record_mechanical_sync(
-            blueprint_id, mechanical, str(payload.get("mechanical_sha256") or "")
+            blueprint_id,
+            mechanical,
+            str(payload.get("mechanical_sha256") or ""),
+            content_key=content_key,
         )
         # NEW-131 review: part ids bind the skill, role, profile and schema provenance.
         provenance = part_provenance(
             plan_provenance(self.settings.agent_pack_root, str(payload["project"]))
         )
         frame_id = frame_part_id(
-            str(payload["inventory_sha256"]),
+            content_key,
             str(payload["kit_snapshot_sha256"]),
             routed,
             provenance,
@@ -669,12 +681,24 @@ class UiPlanActivityHandler:
             **base,
             "part_provenance": provenance,
             "decisions_sha256": decisions_sha256(),
+            "inventory_content_key": content_key,
             "status": "PARTS_RECORDED",
             "parts": plan,
             "batch_count": len(plan) - 1,
             "pages": len(mechanical.get("pages") or []),
             "routed_pages": len(routed),
         }
+
+    @staticmethod
+    def _content_key(payload: dict[str, Any]) -> str:
+        value = payload.get("inventory_content_key")
+        if not isinstance(value, str) or not _CONTENT_KEY.fullmatch(value):
+            raise ApplicationError(
+                "ui plan parts carry no inventory content key",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        return value
 
     def _part_identity(self, payload: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
         raw = payload.get("part")
@@ -689,7 +713,7 @@ class UiPlanActivityHandler:
             )
         identity = batch_part_id(
             int(part["index"]),
-            str(payload["inventory_sha256"]),
+            self._content_key(payload),
             str(payload["kit_snapshot_sha256"]),
             list(part["page_ids"]),
             str(frames[0]["content_sha256"]),
@@ -776,9 +800,25 @@ class UiPlanActivityHandler:
             "blocker": "UI_PLAN_DECISIONS_CHANGED",
         }
 
-    def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _part_gate(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """NEW-134 decisions gate and its NEW-136 analogue: a plan whose parts were fixed
+        before the inventory content key (part ids bound to inventory_sha256) never drafts
+        or reviews under the new identity. Start a new plan."""
         if payload.get("decisions_sha256") != decisions_sha256():
             return self._decisions_changed(payload)
+        key = payload.get("inventory_content_key")
+        if not isinstance(key, str) or not _CONTENT_KEY.fullmatch(key):
+            return {
+                **self._part_base(payload),
+                "status": "BLOCKED",
+                "blocker": UI_PLAN_REUSE_KEY_MISSING,
+            }
+        return None
+
+    def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
+        gated = self._part_gate(payload)
+        if gated is not None:
+            return gated
         blueprint_id = self._blueprint_id(payload)
         attempt = payload.get("draft_attempt")
         rejected = payload.get("rejected_usage")
@@ -797,11 +837,14 @@ class UiPlanActivityHandler:
         if attempt == 1:
             context = self._part_check_context(blueprint_id, kind, part, payload)
             # An approval is adopted only if it still validates against the current part
-            # schema and references (its id already binds the provenance).
+            # schema and references (its id already binds the provenance), and (NEW-136) a
+            # batch only if its pages' inventory-derived fields, endpoints included, are
+            # unchanged in the current blueprint.
             reused = self.repository.reuse_part_sync(
                 blueprint_id,
                 part_id,
                 validate=lambda content: part_content_problems(kind, content, context),
+                pages=list(part["page_ids"]) if kind == BATCH else (),
             )
             if reused is not None:
                 return {
@@ -972,8 +1015,9 @@ class UiPlanActivityHandler:
         }
 
     def _prepare_part_review(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if payload.get("decisions_sha256") != decisions_sha256():
-            return self._decisions_changed(payload)
+        gated = self._part_gate(payload)
+        if gated is not None:
+            return gated
         blueprint_id = self._blueprint_id(payload)
         attempt = int(payload.get("draft_attempt") or 1)
         part_id, kind, part = self._part_identity(payload)
