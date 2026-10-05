@@ -15,6 +15,7 @@ from engineering_control.adapters.process import (
 )
 from engineering_control.models.core import AgentRequest, AgentResult, ProviderUsage
 from engineering_control.models.enums import Provider, RunStatus
+from engineering_control.provider_error_kinds import provider_error_kind
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -113,12 +114,14 @@ class ClaudeCLIAdapter:
         if process_result.exit_code == 0 and not process_result.timed_out:
             status = RunStatus.SUCCESS
             error_code = None
+            error_kind = None
         elif recovered is not None:
             # NEW-53: the CLI exhausted its structured-output retries, but its last
             # candidate satisfies the ORIGINAL schema (validated again at the provider
             # boundary), so the attempt is not burned on the CLI's stricter verdict.
             status = RunStatus.SUCCESS
             error_code = None
+            error_kind = None
             structured_result = recovered
             summary = (
                 "recovered_from_structured_retry: accepted the last StructuredOutput "
@@ -126,6 +129,9 @@ class ClaudeCLIAdapter:
             )[:4000]
         else:
             raw_status, error_code = classify_failure(process_result)
+            error_kind = provider_error_kind(
+                process_result.events, timed_out=process_result.timed_out
+            )
             status = RunStatus(raw_status)
             if not summary:
                 summary = process_result.stderr[-4000:]
@@ -143,6 +149,7 @@ class ClaudeCLIAdapter:
             exit_code=process_result.exit_code,
             error_code=error_code,
             recovered_from_structured_retry=recovered is not None,
+            provider_error_kind=error_kind,
         )
 
     _STRUCTURED_RETRY_SUBTYPE = "error_max_structured_output_retries"

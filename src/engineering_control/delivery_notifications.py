@@ -47,6 +47,11 @@ _PROJECTS = frozenset({"falcone", "musematic", "llmwiki"})
 
 # One line per known blocker. Prefix families are matched below.
 BLOCKER_EXPLANATIONS: dict[str, str] = {
+    "PROVIDER_UNAVAILABLE": (
+        "a provider call (spec, maker or checker) failed for a transient provider reason "
+        "(overloaded, rate limited or unavailable); the ChangeSet is in REQUEST_CHANGES, "
+        "so a backlog-retry runs a bounded correction attempt"
+    ),
     "CURRENT_REVALIDATION_FLAKY": (
         "the current-source reproduction was flaky: it neither reproduced nor cleared "
         "the issue reliably"
