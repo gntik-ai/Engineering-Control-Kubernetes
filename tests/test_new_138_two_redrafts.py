@@ -172,3 +172,35 @@ def test_part_document_names_and_draft_bounds_accept_a_third_attempt(tmp_path: P
     assert maximum({}) == 2 and maximum({"max_draft_attempts": 3}) == 3
     assert maximum({"max_draft_attempts": 4}) is None
     assert maximum({"max_draft_attempts": True}) is None
+
+
+@temporal
+async def test_a_schema_reject_revise_then_schema_reject_blocks_with_its_findings(
+    tmp_path: Path,
+) -> None:
+    # NEW-138 round 1: the REVISE clears the first rejection; the third (final) provider
+    # schema refusal still ends BLOCKED DRAFT_SCHEMA_INVALID with its own findings.
+    from test_new_132_structural_redraft import provider_boundary
+
+    harness, request, workflow_id = batched_harness(tmp_path)
+    adapter, draft = provider_boundary(tmp_path, harness, prose=1)
+
+    async def drafter(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload["part"]["kind"] == FRAME and payload["draft_attempt"] == 3:
+            adapter.prose = 1  # refused again on the last attempt
+        result: dict[str, Any] = await draft(payload)
+        return result
+
+    harness.responses["ui_plan.draft"] = drafter
+    harness.responses["ui_plan.review"] = part_reviewer({0: 1})
+    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    assert (result["status"], result["error_code"]) == ("BLOCKED", "DRAFT_SCHEMA_INVALID")
+    assert adapter.calls == [FRAME, FRAME, FRAME]
+    assert result["blockers"] and all(item.startswith("frame-") for item in result["blockers"])
+    assert any("frame/gaps/1/blocks/0 [pattern]" in item for item in result["blockers"])
+    third = _drafts(harness, FRAME, 0)[2]["draft_request"]["prompt"]
+    assert "--- BEGIN REVIEW FINDINGS ---" in third and "Hermes rejected" not in third
+    usage = _usage(harness, request.blueprint_id)
+    assert usage["providers"]["claude"]["calls"] == 3  # both refused calls count
+    assert usage["providers"]["codex"]["calls"] == 1
+    await Replayer(workflows=[UiMigrationPlanWorkflow]).replay_workflow(harness.history)

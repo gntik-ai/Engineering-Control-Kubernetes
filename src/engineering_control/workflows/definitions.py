@@ -5628,9 +5628,12 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 if (
                     attempt == max_attempts
                     and current.get("blocker") == "SchemaViolation"
-                    and ("rejection" in current)
+                    and (max_attempts == 3 or "rejection" in current)
                 ):
                     # NEW-132: the last redraft was refused again; report its schema findings.
+                    # NEW-138: on a part's third attempt, whatever came before it (an
+                    # intervening REVISE clears the earlier rejection). Before the patch,
+                    # unchanged. Only the returned blocker differs: no workflow command.
                     return {
                         **current,
                         "blocker": "DRAFT_SCHEMA_INVALID",
