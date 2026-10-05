@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -193,6 +194,10 @@ def _stop_attempt(
     handler._release_delivery_leases({**loaded, "status": status, "blocker": blocker})
 
 
+LOOP_RUN = "loop-run-1"
+_ACTIVITY_SEQ = itertools.count(1000)
+
+
 def _loop_state(
     engineering: Any,
     status: str,
@@ -200,6 +205,7 @@ def _loop_state(
     blocker: str | None,
     *,
     seq: int | None = None,
+    run_id: str = LOOP_RUN,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "project": "falcone",
@@ -207,9 +213,12 @@ def _loop_state(
         "loop_status": status,
         "workflow_id": LOOP,
     }
-    if seq is not None:
-        # As core.ControlActivities attaches it: the SDK's per-run activity sequence.
-        payload["orchestration"] = {"workflow_run_id": "loop-run-1", "activity_id": str(seq)}
+    # As core.ControlActivities attaches it: the loop's Temporal run and the SDK's per-run
+    # activity sequence (scheduling order).
+    payload["orchestration"] = {
+        "workflow_run_id": run_id,
+        "activity_id": str(seq if seq is not None else next(_ACTIVITY_SEQ)),
+    }
     if issue is not None:
         payload["issue"] = issue
     if blocker is not None and status == "PAUSED":
@@ -280,6 +289,7 @@ def _grant(fixture: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         "change_set_id": change_set_id,
         "confirmation": confirmation_phrase(change_set_id),
         "actor": "cli:engineering-ctl",
+        "current_workflow_run_id": LOOP_RUN,
         **overrides,
     }
     with fixture["handler"].sessions.begin() as session:
@@ -375,15 +385,28 @@ def _skipped_then_paused_on_the_next_issue(fixture: dict[str, Any]) -> None:
 
 
 def _stale_pause_delivered_after_the_next_issue_paused(fixture: dict[str, Any]) -> None:
-    # Codex review 2: #42's PAUSED activity (seq 10) is delayed past its timeout and
-    # retried; the loop skips to #43, which pauses (seq 20); then the late #42 attempt
+    # Codex review 2: #42's PAUSED activity (seq ...010) is delayed past its timeout and
+    # retried; the loop skips to #43, which pauses (seq ...020); then the late #42 attempt
     # commits. It must neither restore PAUSED #42 nor its pause target.
     engineering = fixture["engineering"]
-    _loop_state(engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=10)
-    _loop_state(engineering, "RUNNING", "gntik-ai/falcone#42", None, seq=15)
-    _loop_state(engineering, "PAUSED", "gntik-ai/falcone#43", "APPROVAL_EXPIRED", seq=20)
+    _loop_state(
+        engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=10_000_010
+    )
+    _loop_state(engineering, "RUNNING", "gntik-ai/falcone#42", None, seq=10_000_015)
+    _loop_state(engineering, "PAUSED", "gntik-ai/falcone#43", "APPROVAL_EXPIRED", seq=10_000_020)
     late = _loop_state(
-        engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=10
+        engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=10_000_010
+    )
+    assert late == {"status": "STALE_LOOP_STATE_IGNORED"}
+
+
+def _reset_run_completed_then_a_superseded_pause_arrives(fixture: dict[str, Any]) -> None:
+    # Codex review 3: after a Temporal reset (same first execution run id) the new run
+    # runs on; a delayed delivery from the superseded run must not restore PAUSED #42.
+    engineering = fixture["engineering"]
+    _loop_state(engineering, "RUNNING", None, None, seq=5, run_id="loop-run-2")
+    late = _loop_state(
+        engineering, "PAUSED", "gntik-ai/falcone#42", "CORRECTION_LIMIT_EXHAUSTED", seq=9999
     )
     assert late == {"status": "STALE_LOOP_STATE_IGNORED"}
 
@@ -428,6 +451,11 @@ def _drop_checker(fixture: dict[str, Any]) -> None:
         ({}, _skipped_then_paused_on_the_next_issue, {}, "LOOP_NOT_PAUSED"),
         ({}, _paused_without_an_issue, {}, "LOOP_NOT_PAUSED"),
         ({}, _stale_pause_delivered_after_the_next_issue_paused, {}, "LOOP_NOT_PAUSED"),
+        ({}, _reset_run_completed_then_a_superseded_pause_arrives, {}, "LOOP_NOT_PAUSED"),
+        # Temporal unreadable or the loop closed: no proof of the current run.
+        ({}, None, {"current_workflow_run_id": None}, "LOOP_NOT_PAUSED"),
+        # The pause was recorded by a run that is no longer the loop's current one.
+        ({}, None, {"current_workflow_run_id": "loop-run-2"}, "LOOP_NOT_PAUSED"),
     ],
 )
 async def test_every_unmet_precondition_refuses_the_extension(
@@ -627,10 +655,12 @@ def test_cli_change_extend_correction_parses_into_the_api_request() -> None:
 def _api(operations: Any) -> TestClient:
     bus = Mock()
     bus.dispatch_pending = AsyncMock(return_value=False)
+    service = Mock()
+    service.current_open_run_id = AsyncMock(return_value=LOOP_RUN)
     return TestClient(
         create_app(
             settings=Settings(),
-            service=Mock(),
+            service=service,
             token=TOKEN,
             operations_repository=operations,
             command_bus=bus,
@@ -682,6 +712,7 @@ def test_api_grants_through_the_operator_channel_and_refuses_others() -> None:
         UUID(change_set_id),
         body["confirmation_phrase"],
         "cli:engineering-ctl",
+        LOOP_RUN,  # the loop's current Temporal run, read by the API (review 3)
     )
 
 
@@ -697,7 +728,9 @@ async def test_the_repository_grants_only_for_an_allowlisted_operator(tmp_path: 
     )
     with pytest.raises(ValueError, match="allowlisted operator channel"):
         await operations.extend_change_set_correction(*arguments, "engineering-ctl")
-    result = await operations.extend_change_set_correction(*arguments, "cli:engineering-ctl")
+    result = await operations.extend_change_set_correction(
+        *arguments, "cli:engineering-ctl", LOOP_RUN
+    )
     assert result["status"] == "CORRECTION_EXTENDED"
     _dispose(fixture["values"])
 

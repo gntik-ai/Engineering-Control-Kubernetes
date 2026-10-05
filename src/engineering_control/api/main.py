@@ -761,6 +761,7 @@ def create_app(
         body: CorrectionExtensionRequest,
         subject: str = auth_dependency,
         repository: OperationsRepository = operations_dependency,
+        service: ControlService = control_dependency,
     ) -> dict[str, Any]:
         """NEW-133: grant one extra correction attempt to a validation-blocked ChangeSet.
 
@@ -768,6 +769,9 @@ def create_app(
         the actor, which must be a canonical operator. Every precondition is re-read from
         durable records; the operator then resumes the loop with backlog-retry."""
         actor = approval_actor(subject)
+        # NEW-133 review 3: the loop's current Temporal run, which must still be open; the
+        # pause the grant relies on must have been recorded by that run.
+        current_run_id = await service.current_open_run_id(body.loop_workflow_id)
         try:
             return await repository.extend_change_set_correction(
                 body.loop_workflow_id,
@@ -776,6 +780,7 @@ def create_app(
                 body.change_set_id,
                 body.confirmation_phrase,
                 actor,
+                current_run_id,
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

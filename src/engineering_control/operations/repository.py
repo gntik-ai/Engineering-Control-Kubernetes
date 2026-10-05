@@ -631,6 +631,7 @@ class OperationsRepository:
         change_set_id: UUID,
         phrase: str,
         actor: str,
+        current_workflow_run_id: str | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._extend_change_set_correction,
@@ -640,6 +641,7 @@ class OperationsRepository:
             change_set_id,
             phrase,
             actor,
+            current_workflow_run_id,
         )
 
     def _extend_change_set_correction(
@@ -650,6 +652,7 @@ class OperationsRepository:
         change_set_id: UUID,
         phrase: str,
         actor: str,
+        current_workflow_run_id: str | None = None,
     ) -> dict[str, Any]:
         """NEW-133: one extra correction attempt; every precondition re-read durably."""
         if not is_reauthenticated_backlog_operator(actor):
@@ -665,6 +668,7 @@ class OperationsRepository:
                 change_set_id=change_set_id,
                 confirmation=phrase,
                 actor=actor,
+                current_workflow_run_id=current_workflow_run_id,
             )
 
     async def issue_amend_precheck(

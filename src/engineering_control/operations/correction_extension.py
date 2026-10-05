@@ -93,6 +93,15 @@ def loop_state_is_stale(session: Session, run: Run, payload: dict[str, Any]) -> 
     record = session.get(Step, loop_pause_target_id(run.id))
     if fence is None or record is None or not isinstance(record.result_json, dict):
         return False
+    # NEW-133 review 3: a run superseded by a newer one (e.g. after a Temporal reset, which
+    # keeps the first execution run id) never writes again.
+    seen = record.result_json.get("workflow_runs")
+    if (
+        isinstance(seen, list)
+        and fence["workflow_run_id"] in seen
+        and fence["workflow_run_id"] != seen[-1]
+    ):
+        return True
     applied = record.result_json.get("fence")
     return (
         isinstance(applied, dict)
@@ -131,6 +140,13 @@ def record_loop_pause_target(
     }
     identifier = loop_pause_target_id(run.id)
     record = session.get(Step, identifier)
+    # The order in which this loop's workflow runs first wrote a state (bounded).
+    seen = record.result_json.get("workflow_runs") if record is not None else None
+    runs = [str(item) for item in seen if isinstance(item, str)] if isinstance(seen, list) else []
+    fence = value["fence"]
+    if isinstance(fence, dict) and fence["workflow_run_id"] not in runs:
+        runs = [*runs, fence["workflow_run_id"]][-20:]
+    value["workflow_runs"] = runs
     if record is None:
         session.add(
             Step(
@@ -159,9 +175,14 @@ def grant_correction_extension(
     change_set_id: UUID,
     confirmation: str,
     actor: str | None,
+    current_workflow_run_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Grant one extra correction attempt, or raise CorrectionExtensionBlocked.
+
+    `current_workflow_run_id` is the loop's current (latest) Temporal run, read from
+    Temporal by the caller; the pause must have been recorded by that run (NEW-133
+    review 3), so no state a superseded run wrote can authorize a grant.
 
     Runs in the caller's transaction and locks the ChangeSet row first, so two grants
     (or a grant racing a delivery child's binding) serialize on it."""
@@ -318,6 +339,9 @@ def grant_correction_extension(
         or not isinstance(paused, dict)
         or paused.get("loop_status") != "PAUSED"
         or paused.get("issue") != target
+        or not current_workflow_run_id
+        or not isinstance(paused.get("fence"), dict)
+        or paused["fence"].get("workflow_run_id") != current_workflow_run_id
     ):
         raise CorrectionExtensionBlocked(
             "CORRECTION_EXTENSION_LOOP_NOT_PAUSED",
