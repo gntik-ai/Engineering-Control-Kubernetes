@@ -39,6 +39,7 @@ from engineering_control.engineering.ui_blueprint import (
     BlueprintRejected,
     FanoutItem,
     PlanInputs,
+    agent_pack_parts_only,
     agent_pack_problems,
     blueprint_schema,
     check_draft,
@@ -50,8 +51,24 @@ from engineering_control.engineering.ui_blueprint import (
     item_change_request_id,
     item_context,
     item_description,
+    plan_provenance,
     render_item,
     render_markdown,
+)
+from engineering_control.engineering.ui_blueprint_parts import (
+    BATCH,
+    FRAME,
+    PART_TIMEOUT_SECONDS,
+    batch_gap_prefix,
+    batch_part_id,
+    check_part_draft,
+    check_part_review,
+    frame_part_id,
+    part_content_problems,
+    part_schema,
+    review_digest,
+    routed_page_ids,
+    usage_entry,
 )
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
@@ -67,6 +84,10 @@ _PROVIDER_RESULT_KEYS = frozenset(
     }
 )
 _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
+# NEW-131: parts of the batched plan carried between steps but never into the next request.
+_PART_TRANSIENT_KEYS = frozenset(
+    {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief"}
+)
 
 # Design sections 7 and 10 (2026-10-04), given to the drafter and the reviewer as data.
 OPERATOR_DECISIONS = (
@@ -123,6 +144,12 @@ class UiPlanActivityHandler:
             "ui_plan.persist",
             "ui_plan.record_terminal",
             "ui_plan.finalize_run",
+            "ui_plan.record_parts",
+            "ui_plan.prepare_part",
+            "ui_plan.record_part_draft",
+            "ui_plan.prepare_part_review",
+            "ui_plan.record_part_review",
+            "ui_plan.assemble",
             "ui_fanout.plan",
             "ui_fanout.prepare_item",
             "ui_fanout.record_gap_draft",
@@ -157,6 +184,12 @@ class UiPlanActivityHandler:
             "ui_plan.persist": self._persist,
             "ui_plan.record_terminal": self._record_terminal,
             "ui_plan.finalize_run": self._finalize_run,
+            "ui_plan.record_parts": self._record_parts,
+            "ui_plan.prepare_part": self._prepare_part,
+            "ui_plan.record_part_draft": self._record_part_draft,
+            "ui_plan.prepare_part_review": self._prepare_part_review,
+            "ui_plan.record_part_review": self._record_part_review,
+            "ui_plan.assemble": self._assemble,
             "ui_fanout.plan": self._fanout_plan,
             "ui_fanout.prepare_item": self._prepare_item,
             "ui_fanout.record_gap_draft": self._record_gap_draft,
@@ -265,7 +298,7 @@ class UiPlanActivityHandler:
                 "gntik_ui_version",
             )
             if key in payload
-        } | {"status": "INPUTS_RECORDED"}
+        } | {"status": "INPUTS_RECORDED", "batch_pages": self.settings.ui_plan_batch_pages}
 
     def _input_section(self, payload: dict[str, Any]) -> str:
         inputs = payload.get("inputs") or {}
@@ -291,6 +324,9 @@ class UiPlanActivityHandler:
 
     def _prepare_draft(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
+        if agent_pack_parts_only(self.settings.agent_pack_root):
+            # A pre-NEW-131 whole-blueprint execution resumed under the parts-only pack.
+            return {**payload, "status": "BLOCKED", "blocker": "UI_PLAN_LEGACY_SUPERSEDED"}
         attempt = payload.get("draft_attempt")
         if attempt not in {1, 2} or not payload.get("source_worktree"):
             return {**payload, "status": "FAILED", "blocker": "DRAFT_INPUT_INVALID"}
@@ -362,6 +398,9 @@ class UiPlanActivityHandler:
 
     def _prepare_review(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
+        if agent_pack_parts_only(self.settings.agent_pack_root):
+            # A pre-NEW-131 whole-blueprint execution resumed under the parts-only pack.
+            return {**payload, "status": "BLOCKED", "blocker": "UI_PLAN_LEGACY_SUPERSEDED"}
         attempt = int(payload.get("draft_attempt") or 1)
         draft = payload.get("draft_file") or {}
         sections = [
@@ -507,6 +546,17 @@ class UiPlanActivityHandler:
     def _record_terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
         status = "BLOCKED" if payload.get("terminal_status") == "BLOCKED" else "FAILED"
+        usage = payload.get("part_usage")
+        if isinstance(usage, dict):
+            # NEW-131 review: a failed or rate-limited provider call still counts.
+            entry = usage_entry(
+                usage.get("agent_result"),
+                part_id=str(usage.get("part_id")),
+                phase=str(usage.get("phase")),
+                attempt=int(usage.get("attempt") or 1),
+            )
+            if entry is not None:
+                self.repository.record_usage_sync(blueprint_id, entry)
         result = self.repository.record_terminal_sync(
             blueprint_id,
             status,
@@ -529,6 +579,458 @@ class UiPlanActivityHandler:
             str(error_code)[:120] if error_code else None,
         )
         return {"status": status, "run_finalized": finalized}
+
+    # Flow A, batched (NEW-131) -------------------------------------------------------------
+
+    _MECHANICAL_RULE = (
+        "Hermes fills every mechanical field itself, exactly, from the inventory: page ids, "
+        "routes, legacy files, reachability, the endpoint lists (method, path, cross-check "
+        "class and inventory_ref, verbatim), the i18n namespace and locales, LOC and tiers, "
+        "legacy tests, orphan pages (deleted), dead modules (deleted), the cutover's fixed "
+        "fields and its page list, and the inputs block. Never emit or restate them: the "
+        "output schema has no place for them. Your output is only the judgement fields."
+    )
+
+    @staticmethod
+    def _part_base(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in UiPlanActivityHandler._without_provider_results(payload).items()
+            if key not in _PART_TRANSIENT_KEYS
+        }
+
+    def _record_parts(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist Hermes's mechanical fields and fix the part plan (frame, then batches)."""
+        blueprint_id = self._blueprint_id(payload)
+        base = {key: value for key, value in self._part_base(payload).items() if key != "parts"}
+        mechanical = payload.get("mechanical")
+        parts = payload.get("parts")
+        if not isinstance(mechanical, dict) or not isinstance(parts, list) or not parts:
+            return {**base, "status": "FAILED", "blocker": "UI_PLAN_PARTS_INVALID"}
+        routed = routed_page_ids(mechanical)
+        planned = [page for part in parts[1:] for page in part.get("page_ids") or []]
+        if (
+            parts[0].get("kind") != FRAME
+            or any(part.get("kind") != BATCH for part in parts[1:])
+            or [part.get("index") for part in parts] != list(range(len(parts)))
+            or len(planned) != len(set(planned))
+            or sorted(planned) != sorted(routed)
+        ):
+            return {**base, "status": "FAILED", "blocker": "UI_PLAN_PARTS_INVALID"}
+        self.repository.record_mechanical_sync(
+            blueprint_id, mechanical, str(payload.get("mechanical_sha256") or "")
+        )
+        # NEW-131 review: part ids bind the skill, role, profile and schema provenance.
+        provenance = plan_provenance(self.settings.agent_pack_root, str(payload["project"]))
+        frame_id = frame_part_id(
+            str(payload["inventory_sha256"]),
+            str(payload["kit_snapshot_sha256"]),
+            routed,
+            provenance,
+        )
+        plan = [
+            {
+                "kind": part["kind"],
+                "index": part["index"],
+                "page_ids": list(part.get("page_ids") or []),
+                "input": part.get("input"),
+                **({"part_id": frame_id} if part["kind"] == FRAME else {}),
+            }
+            for part in parts
+        ]
+        return {
+            **base,
+            "part_provenance": provenance,
+            "status": "PARTS_RECORDED",
+            "parts": plan,
+            "batch_count": len(plan) - 1,
+            "pages": len(mechanical.get("pages") or []),
+            "routed_pages": len(routed),
+        }
+
+    def _part_identity(self, payload: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+        raw = payload.get("part")
+        part: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        kind = str(part.get("kind"))
+        if kind == FRAME:
+            return str(part.get("part_id")), kind, part
+        frames = [item for item in payload.get("approved_parts") or [] if item.get("kind") == FRAME]
+        if kind != BATCH or len(frames) != 1:
+            raise ApplicationError(
+                "ui plan part has no reviewed frame", type="PolicyViolation", non_retryable=True
+            )
+        identity = batch_part_id(
+            int(part["index"]),
+            str(payload["inventory_sha256"]),
+            str(payload["kit_snapshot_sha256"]),
+            list(part["page_ids"]),
+            str(frames[0]["content_sha256"]),
+            str(payload.get("part_provenance") or ""),
+        )
+        return identity, kind, part
+
+    @staticmethod
+    def _frame_brief(part_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+        """The complete reviewed frame, staged as a file every batch drafter and reviewer
+        reads (never truncated into a prompt)."""
+        return {
+            "kind": "reviewed-frame",
+            "part_id": part_id,
+            "content_sha256": entry["content_sha256"],
+            "frame": entry["content"],
+        }
+
+    def _part_section(self, payload: dict[str, Any], part_id: str, part: dict[str, Any]) -> str:
+        inputs = payload.get("inputs") or {}
+        files = inputs.get("files") or {}
+        own = part.get("input") or {}
+        if part.get("kind") == FRAME:
+            kit = files.get("kit") or {}
+            kit_line = (
+                f"gntik-ui kit snapshot JSON (Read it): {kit.get('path')} (file sha256 "
+                f"{kit.get('sha256')}, {kit.get('bytes')} bytes)"
+            )
+        else:
+            kit = payload.get("kit_slice") or {}
+            kit_line = (
+                f"gntik-ui kit catalogue, the list_kit outputs of the snapshot (Read it): "
+                f"{kit.get('path')} (file sha256 {kit.get('sha256')}, {kit.get('bytes')} bytes)"
+            )
+        return (
+            f"Project: {payload['project']}\n"
+            f"Legacy source snapshot (read-only, your working directory): "
+            f"{payload['source_worktree']}\n"
+            f"Part: {part_id}\n"
+            f"Part input JSON, this part's inventory slice (Read it): {own.get('path')} (file "
+            f"sha256 {own.get('sha256')}, {own.get('bytes')} bytes)\n"
+            f"{kit_line}\n"
+            f"Bind inputs.inventory_sha256 = {payload['inventory_sha256']}, "
+            f"inputs.legacy_source_sha = {payload['source_sha']}, inputs.kit_source = "
+            f"snapshot, inputs.kit_snapshot_sha256 = {payload['kit_snapshot_sha256']}, "
+            f"inputs.gntik_ui_version = {payload.get('gntik_ui_version')}, inputs.part_id = "
+            f"{part_id}"
+        )
+
+    def _part_task(self, kind: str, part: dict[str, Any], payload: dict[str, Any]) -> str:
+        if kind == FRAME:
+            return (
+                "The frame holds: foundation_epics (the seven u0 kinds, once each); the "
+                "cross-page gaps (BACKEND_GAP to gntik-ai/falcone, KIT_GAP to gntik-ai/gntik-ui;"
+                " ids never start with gap-b followed by digits), each with its "
+                "cutover_resolution (RESOLVED or DEFERRED) and cutover_reason; the cutover's "
+                "three ordered steps and its acceptance criteria; and global_decisions, the "
+                "cross-page conventions every page batch must follow (navigation, shared "
+                "templates and blocks, wave assignment). The page batches are drafted after "
+                "you, against your reviewed frame; page-specific gaps belong to them."
+            )
+        count = int(payload.get("batch_count") or 0)
+        return (
+            f"This is page batch {part['index']} of {count}. Return one entry per page, "
+            f"exactly these pages: {', '.join(part['page_ids'])}. Per page: disposition and "
+            "disposition_reason; target (template, layout, blocks, components, wrapped, "
+            "justification; kit ids only from the kit catalogue); behaviour (actions whose "
+            "endpoint_refs cite 'METHOD path' of that page's inventoried endpoints, "
+            "validations, permissions, states); i18n string_scope and estimated_strings; wave "
+            "(null for DELETE); parity_acceptance (exactly one per check for MIGRATE or WRAP, "
+            "none for DELETE); gap_ids; depends_on (epic ids and page ids from the inputs). "
+            "gap_ids name the frame's gaps or the new gaps you add in gaps, whose ids start "
+            f"with {batch_gap_prefix(int(part['index']))}, each with cutover_resolution and "
+            "cutover_reason."
+        )
+
+    def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
+        blueprint_id = self._blueprint_id(payload)
+        attempt = payload.get("draft_attempt")
+        part_id, kind, part = self._part_identity(payload)
+        base = {**self._part_base(payload), "part_id": part_id, "part_kind": kind}
+        if attempt == 1:
+            context = self._part_check_context(blueprint_id, kind, part, payload)
+            # An approval is adopted only if it still validates against the current part
+            # schema and references (its id already binds the provenance).
+            reused = self.repository.reuse_part_sync(
+                blueprint_id,
+                part_id,
+                validate=lambda content: part_content_problems(kind, content, context),
+            )
+            if reused is not None:
+                return {
+                    **base,
+                    "status": "PART_REUSED",
+                    "content_sha256": reused["content_sha256"],
+                    "reused_from": reused.get("reused_from"),
+                    **(
+                        {"frame_brief": self._frame_brief(part_id, reused)} if kind == FRAME else {}
+                    ),
+                }
+        if attempt not in {1, 2} or not payload.get("source_worktree"):
+            return {**base, "status": "FAILED", "blocker": "DRAFT_INPUT_INVALID"}
+        sections = [
+            f"Draft the {kind} part of the gntik-ui migration blueprint with the "
+            f"plan-ui-migration skill ({kind} part, mode draft). You work read-only: do not "
+            "modify files, run mutating commands, publish, approve or implement anything. "
+            f"Return mode draft, status COMPLETE, the {kind}, review null and the inputs "
+            "bound exactly as stated below (draft_sha256 null). If an input file is missing "
+            "or unreadable, return status BLOCKED with blockers instead. "
+            f"{_STRUCTURED_OUTPUT_JSON_RULES}",
+            self._MECHANICAL_RULE,
+            self._part_task(kind, part, payload),
+            _DATA_RULE,
+            self._part_section(payload, part_id, part),
+            OPERATOR_DECISIONS,
+            SEED_FINDINGS,
+        ]
+        if kind == BATCH:
+            sections.append(self._frame_section(blueprint_id, payload))
+        if attempt == 2:
+            rounds = payload.get("part_rounds") or []
+            sections.append(
+                "This is the single redraft of this part. An independent reviewer asked for "
+                f"revisions of your previous draft ({(payload.get('draft_file') or {}).get('path')}"
+                f"); its review is {(payload.get('review_file') or {}).get('path')}. Address "
+                "every finding while keeping every hard rule; do not add pages, endpoints or "
+                "kit items that are not in the inputs.\n"
+                + _fenced("review findings", _bounded_json(rounds[-1] if rounds else {}, 40_000))
+            )
+        request = AgentRequest(
+            run_id=uuid5(
+                NAMESPACE_URL,
+                f"ui-plan-part-draft:{blueprint_id}:{part_id}:{attempt}:{self._workflow_run(payload)}",
+            ),
+            project=Project(str(payload["project"])),
+            role="ui-migration-architect",
+            provider=Provider.CLAUDE,
+            model_class=ModelClass.WORKER,
+            prompt="\n\n".join(sections),
+            working_directory=str(payload["source_worktree"]),
+            output_schema=part_schema(kind),
+            timeout_seconds=PART_TIMEOUT_SECONDS,
+            effort="high",
+            model=self.settings.claude_spec_model,
+            writable=False,
+            allowed_tools=("Read", "Glob", "Grep"),
+        )
+        return {
+            **base,
+            "status": "DRAFT_READY",
+            "provider": Provider.CLAUDE.value,
+            "draft_request": request.model_dump(mode="json"),
+        }
+
+    def _frame_section(self, blueprint_id: UUID, payload: dict[str, Any]) -> str:
+        frames = [item for item in payload.get("approved_parts") or [] if item.get("kind") == FRAME]
+        stored = self.repository.parts_sync(blueprint_id)["approved"]
+        frame = stored.get(str(frames[0]["part_id"])) if frames else None
+        brief = payload.get("frame_brief_file")
+        if frame is None or not isinstance(brief, dict) or not brief.get("path"):
+            raise ApplicationError(
+                "ui plan batch has no reviewed frame", type="PolicyViolation", non_retryable=True
+            )
+        content = frame["content"]
+        return (
+            "The reviewed frame, complete (independently approved; Read it, reference its "
+            "epic and gap ids, follow its global decisions, never change it): "
+            f"{brief.get('path')} (file sha256 {brief.get('sha256')}, {brief.get('bytes')} "
+            f"bytes). Summary only: {len(content['foundation_epics'])} foundation epics, "
+            f"{len(content['gaps'])} gaps, {len(content['global_decisions'])} global decisions."
+        )
+
+    def _part_check_context(
+        self, blueprint_id: UUID, kind: str, part: dict[str, Any], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        stored = self.repository.parts_sync(blueprint_id)
+        mechanical = stored["mechanical"] or {"pages": []}
+        context: dict[str, Any] = {
+            "all_page_ids": [page["page_id"] for page in mechanical["pages"]],
+        }
+        if kind == BATCH:
+            frames = [
+                item for item in payload.get("approved_parts") or [] if item.get("kind") == FRAME
+            ]
+            frame = stored["approved"].get(str(frames[0]["part_id"])) if frames else None
+            if frame is None:
+                raise ApplicationError(
+                    "ui plan batch has no reviewed frame",
+                    type="PolicyViolation",
+                    non_retryable=True,
+                )
+            context.update(index=part["index"], page_ids=part["page_ids"], frame=frame["content"])
+        return context
+
+    def _record_part_usage(self, blueprint_id: UUID, payload: dict[str, Any], phase: str) -> None:
+        entry = usage_entry(
+            payload.get("agent_result"),
+            part_id=str(payload.get("part_id")),
+            phase=phase,
+            attempt=int(payload.get("draft_attempt") or 1),
+        )
+        if entry is not None:
+            self.repository.record_usage_sync(blueprint_id, entry)
+
+    def _record_part_draft(self, payload: dict[str, Any]) -> dict[str, Any]:
+        blueprint_id = self._blueprint_id(payload)
+        self._record_part_usage(blueprint_id, payload, "draft")
+        structured = self._structured(payload)
+        base = self._part_base(payload)
+        part_id, kind, part = self._part_identity(payload)
+        if part_id != payload.get("part_id"):
+            raise ApplicationError(
+                "ui plan part identity changed", type="PolicyViolation", non_retryable=True
+            )
+        try:
+            content = check_part_draft(
+                structured,
+                kind,
+                self._inputs(payload),
+                part_id,
+                context=self._part_check_context(blueprint_id, kind, part, payload),
+            )
+        except BlueprintRejected as rejected:
+            return {**base, "status": "REJECTED", "blocker": rejected.code,
+                    "blockers": rejected.details}  # fmt: skip
+        attempt = int(payload.get("draft_attempt") or 1)
+        self.repository.record_part_sync(blueprint_id, part_id, kind, attempt, content)
+        return {
+            **base,
+            "status": "DRAFT_RECORDED",
+            "draft_sha256": canonical_sha256(structured),
+            "document": structured,
+        }
+
+    def _prepare_part_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        blueprint_id = self._blueprint_id(payload)
+        attempt = int(payload.get("draft_attempt") or 1)
+        part_id, kind, part = self._part_identity(payload)
+        draft = payload.get("draft_file") or {}
+        sections = [
+            f"Independently review the drafted {kind} part of the gntik-ui migration "
+            f"blueprint with the plan-ui-migration skill ({kind} part, mode review). You are "
+            "the opposite provider and the checker: do not modify files, publish, approve on "
+            "the operator's behalf or implement anything. Re-derive every claim from this "
+            "part's inventory slice and the kit catalogue; never trust the draft. Return mode "
+            f"review, status COMPLETE, {kind} null and a review with APPROVE or REVISE; each "
+            "REVISE finding names its page, epic or gap id and the rule it breaks. Review "
+            "only the judgement fields: Hermes fills the mechanical fields from the inventory "
+            "and they are not in the draft. Bind the inputs exactly as stated below and "
+            f"inputs.draft_sha256 = {payload['draft_sha256']}. Keep the output under 40000 "
+            f"characters. {_STRUCTURED_OUTPUT_JSON_RULES}",
+            self._part_task(kind, part, payload),
+            _DATA_RULE,
+            self._part_section(payload, part_id, part),
+            f"Draft under review (Read it): {draft.get('path')} (file sha256 "
+            f"{draft.get('sha256')}, {draft.get('bytes')} bytes; draft_sha256 "
+            f"{payload['draft_sha256']}).",
+            OPERATOR_DECISIONS,
+            SEED_FINDINGS,
+        ]
+        if kind == BATCH:
+            sections.append(self._frame_section(blueprint_id, payload))
+        request = AgentRequest(
+            run_id=uuid5(
+                NAMESPACE_URL,
+                f"ui-plan-part-review:{blueprint_id}:{part_id}:{attempt}:"
+                f"{self._workflow_run(payload)}",
+            ),
+            project=Project(str(payload["project"])),
+            role="ui-migration-architect",
+            provider=Provider.CODEX,
+            model_class=ModelClass.WORKER,
+            prompt="\n\n".join(sections),
+            working_directory=str(payload["source_worktree"]),
+            output_schema=part_schema(kind),
+            timeout_seconds=PART_TIMEOUT_SECONDS,
+            effort="high",
+            writable=False,
+            allowed_tools=("Read", "Glob", "Grep"),
+        )
+        return {
+            **self._part_base(payload),
+            "status": "REVIEW_READY",
+            "provider": Provider.CODEX.value,
+            "review_request": request.model_dump(mode="json"),
+        }
+
+    def _record_part_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        blueprint_id = self._blueprint_id(payload)
+        self._record_part_usage(blueprint_id, payload, "review")
+        base = self._part_base(payload)
+        part_id, kind, part = self._part_identity(payload)
+        try:
+            review = check_part_review(
+                self._structured(payload),
+                kind,
+                self._inputs(payload),
+                part_id,
+                str(payload["draft_sha256"]),
+            )
+        except BlueprintRejected as rejected:
+            return {**base, "status": "REJECTED", "blocker": rejected.code,
+                    "blockers": rejected.details}  # fmt: skip
+        attempt = int(payload.get("draft_attempt") or 1)
+        # As for a whole draft (NEW-123): the reviewed hash is Hermes's own, computed by the
+        # scan worker from the exact part file the reviewer read; the stored version matches.
+        reviewed_sha256 = str((payload.get("draft_file") or {}).get("part_sha256") or "")
+        try:
+            self.repository.mark_part_reviewed_sync(
+                blueprint_id, part_id, attempt, reviewed_sha256, review
+            )
+        except ValueError as error:
+            return {**base, "status": "REJECTED", "blocker": "REVIEWED_DRAFT_MISMATCH",
+                    "blockers": [f"{part_id}: {error}"]}  # fmt: skip
+        rounds = [*(payload.get("part_rounds") or []), review]
+        result = {**base, "part_rounds": rounds, "content_sha256": reviewed_sha256}
+        if review["decision"] == "APPROVE":
+            if kind == FRAME:
+                entry = self.repository.parts_sync(blueprint_id)["approved"][part_id]
+                result["frame_brief"] = self._frame_brief(part_id, entry)
+            return {**result, "status": "PART_APPROVED"}
+        if attempt >= 2:
+            scope = (
+                f"batch {part['index']} ({', '.join(part['page_ids'])})"
+                if kind == BATCH
+                else "frame"
+            )
+            findings = [
+                f"[{item['category']}] {item.get('subject') or '-'}: {item['detail']}"
+                for item in review["findings"]
+            ]
+            return {
+                **result,
+                "status": "PART_UNRESOLVED",
+                "blocker": "BLUEPRINT_PART_REVIEW_UNRESOLVED",
+                "blockers": [f"part {part_id}, {scope}: {review['summary']}", *findings][:50],
+            }
+        return {**result, "status": "PART_REVISE", "document": review}
+
+    def _assemble(self, payload: dict[str, Any]) -> dict[str, Any]:
+        blueprint_id = self._blueprint_id(payload)
+        base = self._part_base(payload)
+        part_ids = [str(item.get("part_id")) for item in payload.get("approved_parts") or []]
+        try:
+            assembled = self.repository.assemble_sync(blueprint_id, part_ids, self._inputs(payload))
+        except BlueprintRejected as rejected:
+            return {**base, "status": "REJECTED", "blocker": rejected.code,
+                    "blockers": rejected.details}  # fmt: skip
+        markdown = render_markdown(
+            assembled["blueprint"],
+            blueprint_id=str(blueprint_id),
+            project=str(payload["project"]),
+            source_sha=str(payload["source_sha"]),
+            inventory_sha256=str(payload["inventory_sha256"]),
+            kit_snapshot_sha256=str(payload["kit_snapshot_sha256"]),
+            gntik_ui_version=payload.get("gntik_ui_version"),
+            blueprint_sha256=assembled["blueprint_sha256"],
+            review=review_digest(assembled["rounds"]),
+        )
+        return {
+            **base,
+            "status": "ASSEMBLED",
+            "draft_attempt": 1,
+            "blueprint_sha256": assembled["blueprint_sha256"],
+            "reviewed_sha256": assembled["blueprint_sha256"],
+            "review_rounds": assembled["rounds"],
+            "document": assembled["blueprint"],
+            "markdown": markdown,
+        }
 
     # Fan-out -----------------------------------------------------------------------------
 

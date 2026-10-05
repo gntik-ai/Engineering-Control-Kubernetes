@@ -2,7 +2,9 @@
 
 Controller steps run the real UiPlanActivityHandler and ChangeRequestActivityHandler against
 SQLite; snapshot, scan, provider and GitHub steps are scripted. Every recorded history is
-replayed against the current workflow code.
+replayed against the current workflow code. NEW-131: the whole-blueprint flow A tests run
+the pre-NEW-131 workflow (tests/pre_new_131_ui_plan_workflow.py) and replay its histories
+against the current class; the batched flow is tested in test_new_131_ui_batched_plan.py.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from new_123_fixtures import (
     gap_output,
     review_output,
 )
+from pre_new_131_ui_plan_workflow import ParentUiMigrationPlanWorkflow
 from sqlalchemy import create_engine, select, update
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
@@ -112,7 +115,9 @@ class Harness:
 
         return execute_control_step
 
-    async def run(self, workflow_cls: type, argument: Any, workflow_id: str) -> Any:
+    async def run(
+        self, workflow_cls: type, argument: Any, workflow_id: str, *, replay: type | None = None
+    ) -> Any:
         assert _TEMPORAL_CLI is not None
         if workflow_cls is UiBlueprintFanOutWorkflow and getattr(self, "own_fanout", True):
             # The approval API claims the active marker before it starts a fan-out (the
@@ -148,7 +153,8 @@ class Harness:
                 )
                 result = await handle.result()
                 history = await handle.fetch_history()
-        await Replayer(workflows=[workflow_cls]).replay_workflow(history)
+        await Replayer(workflows=[replay or workflow_cls]).replay_workflow(history)
+        self.history = history
         return result
 
     def notifications(self) -> list[dict[str, Any]]:
@@ -270,7 +276,9 @@ def provider_steps(calls: list[str]) -> list[str]:
 async def test_plan_happy_path_persists_an_approvable_candidate(tmp_path: Path) -> None:
     harness, request, workflow_id = plan_harness(tmp_path)
     harness.responses["ui_plan.review"] = reviewer("APPROVE")
-    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    result = await harness.run(
+        ParentUiMigrationPlanWorkflow, request, workflow_id, replay=UiMigrationPlanWorkflow
+    )
     assert result["status"] == "CANDIDATE"
     assert provider_steps(harness.calls) == [
         "ui_plan.register",
@@ -347,7 +355,9 @@ async def test_review_requests_changes_then_one_redraft_passes(tmp_path: Path) -
     harness, request, workflow_id = plan_harness(tmp_path)
     harness.responses["ui_plan.draft"] = [agent(draft_output()), agent(draft_output())]
     harness.responses["ui_plan.review"] = reviewer("REVISE", "APPROVE")
-    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    result = await harness.run(
+        ParentUiMigrationPlanWorkflow, request, workflow_id, replay=UiMigrationPlanWorkflow
+    )
     assert result["status"] == "CANDIDATE"
     assert result["review_rounds"] == 2
     assert harness.calls.count("ui_plan.draft") == 2
@@ -363,7 +373,9 @@ async def test_two_review_failures_block_with_the_findings(tmp_path: Path) -> No
     harness, request, workflow_id = plan_harness(tmp_path)
     harness.responses["ui_plan.draft"] = [agent(draft_output()), agent(draft_output())]
     harness.responses["ui_plan.review"] = reviewer("REVISE", "REVISE")
-    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    result = await harness.run(
+        ParentUiMigrationPlanWorkflow, request, workflow_id, replay=UiMigrationPlanWorkflow
+    )
     assert (result["status"], result["error_code"]) == ("BLOCKED", "BLUEPRINT_REVIEW_UNRESOLVED")
     assert harness.calls.count("ui_plan.review") == 2
     assert "ui_plan.persist" not in harness.calls
@@ -400,7 +412,9 @@ async def test_a_draft_substituted_during_review_never_becomes_a_candidate(
         return approve(payload)
 
     harness.responses["ui_plan.review"] = review_while_substituting
-    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    result = await harness.run(
+        ParentUiMigrationPlanWorkflow, request, workflow_id, replay=UiMigrationPlanWorkflow
+    )
     assert (result["status"], result["error_code"]) == ("BLOCKED", "REVIEWED_DRAFT_MISMATCH")
     assert "ui_plan.persist" not in harness.calls
     view = harness.repository.get_sync(UUID(request.blueprint_id))
@@ -413,7 +427,9 @@ async def test_a_draft_bound_to_other_inputs_is_blocked(tmp_path: Path) -> None:
     wrong = draft_output()
     wrong["inputs"] = {**wrong["inputs"], "inventory_sha256": "9" * 64}
     harness.responses["ui_plan.draft"] = agent(wrong)
-    result = await harness.run(UiMigrationPlanWorkflow, request, workflow_id)
+    result = await harness.run(
+        ParentUiMigrationPlanWorkflow, request, workflow_id, replay=UiMigrationPlanWorkflow
+    )
     assert (result["status"], result["error_code"]) == ("BLOCKED", "DRAFT_BINDING_MISMATCH")
     assert "ui_plan.review" not in harness.calls
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -62,7 +63,11 @@ from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
 
 ROOT = Path(__file__).parents[1]
-LOCAL_PACK = ROOT.parent / "engineering-agent-pack"
+# The local agent-pack checkout (its schemas must equal Hermes's); a pack branch under review
+# can be named with ENGINEERING_AGENT_PACK_CHECKOUT.
+LOCAL_PACK = Path(
+    os.environ.get("ENGINEERING_AGENT_PACK_CHECKOUT") or ROOT.parent / "engineering-agent-pack"
+)
 INPUTS = PlanInputs("falcone", SOURCE_SHA, INVENTORY_SHA, KIT_SHA, KIT_VERSION)
 
 

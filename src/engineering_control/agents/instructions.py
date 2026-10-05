@@ -71,7 +71,7 @@ class AgentInstructionPack:
             if request.provider.value == "claude"
             else f"generated/codex/agents/{request.role}.toml"
         )
-        source_names = (
+        source_names: tuple[str, ...] = (
             f"roles/{request.role}.yaml",
             "skills/catalog.yaml",
             f"skills/{skill}/SKILL.md",
@@ -100,7 +100,17 @@ class AgentInstructionPack:
         if step == "reconcile.invoke_release_reviewer" and request.output_schema != schema:
             raise ValueError("release review request drifted from its canonical output schema")
         if step in self._pinned_schema_steps and request.output_schema != schema:
-            raise ValueError("ui plan request drifted from the released skill output schema")
+            # NEW-131: a batched plan part sends one of the skill's released part schemas.
+            part = self._part_schema(catalog, skill, request.output_schema)
+            if part is None:
+                raise ValueError("ui plan request drifted from the released skill output schema")
+            name, payload, schema = part
+            try:
+                Draft202012Validator.check_schema(schema)
+            except Exception as error:  # noqa: BLE001 - normalized at the trust boundary
+                raise ValueError("agent-pack output schema is invalid") from error
+            sources[name] = payload
+            source_names = (*source_names, name)
 
         digest = self._digest(sources)
         allowed_tools = tuple(
@@ -136,6 +146,28 @@ class AgentInstructionPack:
             sources=source_names,
             allowed_tools=allowed_tools,
         )
+
+    _part_schema_name = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}\.schema\.json$")
+
+    def _part_schema(
+        self, catalog: dict[str, Any], skill: str, requested: Any
+    ) -> tuple[str, bytes, dict[str, Any]] | None:
+        """The released part schema (catalog `part_output_schemas`) the request sends."""
+        records = [
+            record
+            for record in catalog.get("skills") or []
+            if isinstance(record, dict) and record.get("id") == skill
+        ]
+        parts = records[0].get("part_output_schemas") if len(records) == 1 else None
+        for name in parts.values() if isinstance(parts, dict) else []:
+            if not isinstance(name, str) or not self._part_schema_name.fullmatch(name):
+                raise ValueError("agent-pack part schema name is invalid")
+            relative = f"skills/{skill}/references/{name}"
+            payload = self._read(relative)
+            schema = json.loads(payload.decode("utf-8"))
+            if isinstance(schema, dict) and schema == requested:
+                return relative, payload, schema
+        return None
 
     def _skill(self, step: str) -> str:
         try:

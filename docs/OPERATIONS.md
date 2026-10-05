@@ -255,7 +255,8 @@ engineering-ctl ui-blueprint-approve <id> <binding> APPROVE_UI_BLUEPRINT [--max-
 The steps are:
 
 1. `ui_plan.register` checks that the released agent pack (`agent_pack_root`) has profile 1.4.0
-   or later and the `plan-ui-migration` and `triage-ui-gap` skills with Hermes's synced schemas.
+   or later and the `plan-ui-migration` (with its frame and batch part schemas, pack 1.5.0) and
+   `triage-ui-gap` skills with Hermes's synced schemas.
    Otherwise the run is `BLOCKED AGENT_PACK_SKILL_MISSING` and lists what is missing.
 2. A read-only snapshot of main (`project.snapshot`), then `ui.inventory` and `ui.kit_snapshot`
    on the scan worker. A kit snapshot that is `BLOCKED UI_MCP_UNAVAILABLE` stops the run with
@@ -265,16 +266,38 @@ The steps are:
    model workers can read. `bootstrap-worker.sh` provisions that root (scan-runner 0700 with a
    traverse ACL for codex-runner and claude-runner); without it the run is `BLOCKED
    UI_PLAN_INPUT_DIRECTORY_MISSING`.
-4. Claude drafts the blueprint (`ui-migration-architect`, `plan-ui-migration` in draft mode,
-   high effort, Read/Glob/Grep only). Codex reviews it with the same skill in review mode. A
-   `REVISE` verdict gets one Claude redraft and a second review. A second `REVISE` ends
-   `BLOCKED BLUEPRINT_REVIEW_UNRESOLVED` with the findings.
-5. Every draft is an immutable version. Hermes hashes the exact draft file the reviewer read,
-   and only that version, unchanged, is published as evidence (JSON and Markdown) and stored as
-   a `CANDIDATE` (otherwise `BLOCKED REVIEWED_DRAFT_MISMATCH`). Its approval binding is the
-   sha256 of the blueprint id, the canonical blueprint hash, the reviewed hash, the inventory
-   and kit snapshot hashes and the source SHA. A newer candidate for the project
-   supersedes an older, unapproved one. Telegram gets "UI blueprint ready for approval".
+4. NEW-131: the blueprint is drafted in parts. `ui_plan.stage_parts` (scan worker) fills every
+   mechanical field from the inventory: page ids, routes, legacy files, reachability, the
+   endpoint lists copied verbatim (method, path, cross-check class, `inventory_ref`), the i18n
+   namespace and locales, LOC and tiers, legacy tests, orphan pages (`DELETE`), dead modules
+   (`DELETE`), the cutover's fixed fields and page list, and the inputs. It splits the routed
+   pages into batches of `ui_plan_batch_pages` (default 8; Falcone: 50 routed pages, 7 batches)
+   and writes each part a small input file (its inventory slice; the batches get the kit's
+   `list_kit` outputs, the frame the whole kit snapshot).
+5. Claude drafts the frame first (foundation epics, cross-page gaps with their cutover
+   decision, the cutover steps and criteria, global decisions), then each page batch (only the
+   judgement fields of its pages), with `plan-ui-migration` (high effort, Read/Glob/Grep only,
+   1800 s per call). Codex reviews every part with the same skill in review mode against the
+   same slice. A `REVISE` redrafts only that part, once; a second `REVISE` ends `BLOCKED
+   BLUEPRINT_PART_REVIEW_UNRESOLVED`, naming the part, its pages and the findings. The complete
+   reviewed frame is staged as a file every batch drafter and reviewer reads. Part ids are
+   deterministic (inventory, kit, pages, the reviewed frame, and the provenance: the skill and
+   role instruction sources, profile and schemas): a later plan with the same inputs reuses
+   every part already approved, after revalidating it against the current schema, instead of
+   drafting it again; a skill or schema change forces a redraft.
+6. Every part version is immutable; Hermes hashes the exact part file the reviewer read. Hermes
+   then assembles the reviewed parts and the mechanical fields into the full blueprint,
+   validates it against the full schema and a cross-batch dependency graph check (no cycles,
+   no dependency on a later wave or a deleted page, consistent cutover gaps; otherwise `BLOCKED
+   BLUEPRINT_GRAPH_INVALID` listing the offending edges), and publishes and stores it as a `CANDIDATE`. Its
+   approval binding is the sha256 of the blueprint id, the canonical blueprint hash, the
+   reviewed hash (the assembled blueprint), the inventory and kit snapshot hashes and the
+   source SHA. A newer candidate for the project supersedes an older, unapproved one.
+   Telegram gets "UI blueprint ready for approval". `ui-blueprint-show` ends with the token
+   usage of every drafting and review call (failed calls included), per provider and in total.
+
+Histories started before NEW-131 (patch `ui-plan-batched-blueprint-v1` absent) keep the
+whole-blueprint draft and review: one Claude draft, a Codex review, at most one redraft.
 
 Approval accepts only the CLI operator and allowlisted `telegram:<id>` actors. It then starts
 `UiBlueprintFanOutWorkflow` (`ui-blueprint-fanout-<id>-<n>`). A blueprint has at most one

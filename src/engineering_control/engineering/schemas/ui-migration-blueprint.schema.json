@@ -544,7 +544,8 @@
                   "POST",
                   "PUT",
                   "PATCH",
-                  "DELETE"
+                  "DELETE",
+                  "UNKNOWN"
                 ]
               },
               "path": {

@@ -22,6 +22,7 @@ from engineering_control.adapters.process import (
 )
 from engineering_control.agents.instructions import AgentInstructionPack, InstructionBundle
 from engineering_control.config import Settings
+from engineering_control.engineering.ui_blueprint import agent_pack_parts_only
 from engineering_control.handoff.store import HandoffStore
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import Provider, RunStatus
@@ -121,6 +122,17 @@ class ProviderActivityHandler:
             return dict(payload)
         request = self._request(step, payload)
         self._validate_boundary(step, request)
+        if (
+            step in {"ui_plan.draft", "ui_plan.review"}
+            and "part" not in payload
+            and agent_pack_parts_only(self.settings.agent_pack_root)
+        ):
+            # NEW-131 review 3: a pre-NEW-131 whole-blueprint call (prepared before the
+            # upgrade, replayed now) never reaches a model under the parts-only pack.
+            return self._blocked(
+                self._without_prompt(payload, self._request_keys[step]),
+                "UI_PLAN_LEGACY_SUPERSEDED",
+            )
         # F-14: request.prompt (up to 200_000 chars) is already fully captured on `request`
         # above -- nothing reads it back out of this activity's own echoed result (verified:
         # instructions.py/the CLI adapters consume it from `request` during this same call;
@@ -512,8 +524,15 @@ class ProviderActivityHandler:
             Draft202012Validator.check_schema(request.output_schema)
             Draft202012Validator(request.output_schema).validate(result.structured_result)
         except (SchemaError, ValidationError) as error:
+            # NEW-131 review 2: the call consumed tokens even though its output is refused;
+            # carry its reported usage (numbers only) so it is still accounted for.
             raise ApplicationError(
                 "provider result failed its immutable output schema",
+                {
+                    "usage": result.usage.model_dump(mode="json"),
+                    "provider": result.provider.value,
+                    "run_id": str(result.run_id),
+                },
                 type="SchemaViolation",
                 non_retryable=True,
             ) from error
