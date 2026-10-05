@@ -129,7 +129,8 @@ def test_findings_are_deduplicated_labelled_and_bounded() -> None:
         before=3,
     )
     assert omitted == 0
-    assert lines[0] == "- [round 1 (review of draft 1); round 2 (review of draft 2)] [c] s: same"
+    assert "- [round 1 (review of draft 1); round 2 (review of draft 2)] [c] s: same" in lines
+    assert lines[0].endswith("s: one")  # ordered by latest occurrence
     assert any("Hermes rejection DRAFT_STRUCTURE_INVALID of draft 1" in line for line in lines)
     assert not any("later" in line for line in lines)  # draft 3 is the one being written
     many = [review(1, [f"old {n}" for n in range(50)]), review(2, [f"new {n}" for n in range(30)])]
@@ -142,6 +143,27 @@ def test_findings_are_deduplicated_labelled_and_bounded() -> None:
     assert sum(len(line) + 1 for line in lines) <= ui_plan.PRIOR_FINDINGS_CHARS and omitted > 0
     block = ui_plan._findings_block("review findings", lines, omitted)
     assert f"({omitted} older findings are omitted past the bound" in block
+
+
+def test_a_finding_repeated_in_the_latest_round_survives_the_bound() -> None:
+    # NEW-139 review: 60 findings in round 1, 31 in round 2 of which one repeats a round-1
+    # finding (still unresolved). Ordered by latest occurrence, it is kept with round 2.
+    def review(attempt: int, details: list[str]) -> dict[str, Any]:
+        findings = [{"category": "c", "subject": "s", "detail": item} for item in details]
+        return {"attempt": attempt, "decision": "REVISE", "findings": findings}
+
+    first = [f"old {n}" for n in range(60)]
+    second = [f"new {n}" for n in range(30)] + ["old 0"]
+    lines, omitted = ui_plan.cumulative_findings(
+        [review(1, first), review(2, second)], [], before=3
+    )
+    text = "\n".join(lines)
+    assert len(lines) == ui_plan.PRIOR_FINDINGS_MAX and omitted == 30
+    assert "- [round 1 (review of draft 1); round 2 (review of draft 2)] [c] s: old 0" in lines
+    assert all(f"[c] s: new {n}\n" in text + "\n" for n in range(30))
+    assert lines[-1].endswith("old 0")  # last raised most recently
+    # The 30 findings last raised longest ago (round 1 only, old 1..old 30) are omitted.
+    assert "[c] s: old 30\n" not in text + "\n" and "[c] s: old 31\n" in text + "\n"
 
 
 def test_part_ids_and_provenance_are_unchanged() -> None:

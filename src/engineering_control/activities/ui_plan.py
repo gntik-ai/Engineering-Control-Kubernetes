@@ -167,9 +167,10 @@ def cumulative_findings(
 ) -> tuple[list[str], int]:
     """Every REVISE finding and Hermes rejection finding on drafts 1..before-1 of a part,
     deduplicated (a repeated finding lists every round it was raised in) and labelled by
-    round, oldest first. Past PRIOR_FINDINGS_MAX findings or PRIOR_FINDINGS_CHARS
-    characters the oldest are omitted (the newest rounds are kept whole); returns the
-    lines and the number omitted."""
+    round, ordered by each finding's latest occurrence. Past PRIOR_FINDINGS_MAX findings or
+    PRIOR_FINDINGS_CHARS characters the findings last raised longest ago are omitted (the
+    newest rounds, repeats included, are kept whole); returns the lines and the number
+    omitted."""
     raised: list[tuple[int, str, str]] = []
     for review in reviews:
         attempt = int(review.get("attempt") or 0)
@@ -185,11 +186,16 @@ def cumulative_findings(
                 (attempt, source, _finding_text(item)) for item in rejection.get("details") or []
             ]
     rounds: dict[str, list[str]] = {}
-    for attempt, source, text in sorted(raised, key=lambda item: item[0]):
+    latest: dict[str, int] = {}
+    for position, (attempt, source, text) in enumerate(sorted(raised, key=lambda x: x[0])):
         label = f"round {attempt} ({source} of draft {attempt})"
         if label not in rounds.setdefault(text, []):
             rounds[text].append(label)
-    lines = [f"- [{'; '.join(labels)}] {text}" for text, labels in rounds.items()]
+        latest[text] = position
+    # NEW-139 review: order by each finding's latest occurrence, so a finding repeated in
+    # the newest round (still unresolved) is kept before older round-only findings.
+    order = sorted(rounds, key=lambda text: latest[text])
+    lines = [f"- [{'; '.join(rounds[text])}] {text}" for text in order]
     kept: list[str] = []
     size = 0
     for line in reversed(lines):
