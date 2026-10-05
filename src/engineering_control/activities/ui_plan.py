@@ -777,6 +777,8 @@ class UiPlanActivityHandler:
         }
 
     def _prepare_part(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("decisions_sha256") != decisions_sha256():
+            return self._decisions_changed(payload)
         blueprint_id = self._blueprint_id(payload)
         attempt = payload.get("draft_attempt")
         rejected = payload.get("rejected_usage")
@@ -790,8 +792,6 @@ class UiPlanActivityHandler:
             )
             if entry is not None:
                 self.repository.record_usage_sync(self._blueprint_id(payload), entry)
-        if payload.get("decisions_sha256") != decisions_sha256():
-            return self._decisions_changed(payload)
         part_id, kind, part = self._part_identity(payload)
         base = {**self._part_base(payload), "part_id": part_id, "part_kind": kind}
         if attempt == 1:

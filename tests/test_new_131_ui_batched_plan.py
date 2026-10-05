@@ -763,7 +763,12 @@ def test_a_plan_whose_decisions_changed_never_drafts_or_reviews(tmp_path: Path) 
         change_requests=Mock(),
     )
     for stale in ({}, {"decisions_sha256": "0" * 64}):
-        payload = {"blueprint_id": "00000000-0000-4000-8000-000000000001", **stale}
+        payload = {
+            "blueprint_id": "00000000-0000-4000-8000-000000000001",
+            # A schema-refused draft's usage must not be written for a stale plan either.
+            "rejected_usage": {"agent_result": {"usage": {"output_tokens": 9}}, "part_id": "x"},
+            **stale,
+        }
         for prepared in (handler._prepare_part(payload), handler._prepare_part_review(payload)):
             assert (prepared["status"], prepared["blocker"]) == (
                 "BLOCKED",
