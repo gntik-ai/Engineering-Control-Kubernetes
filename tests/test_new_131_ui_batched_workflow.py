@@ -375,6 +375,9 @@ async def test_a_large_frame_reaches_every_batch_complete_as_a_file(tmp_path: Pa
         prompt = payload[request_key]["prompt"]
         assert f"/in/{briefs[0]['name']}" in prompt
         assert "45 gaps, 30 global decisions" in prompt
+        # NEW-135: every global decision is restated verbatim and numbered, as a checklist.
+        for index, decision in enumerate(frame["global_decisions"], start=1):
+            assert f"\n{index}. {decision}" in prompt
 
 
 async def test_a_failed_provider_call_still_counts_in_the_usage(tmp_path: Path) -> None:
