@@ -5223,6 +5223,7 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
         blockers: list[Any] | None = None,
         *,
         usage: dict[str, Any] | None = None,
+        rejection: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         recorded = await self._step(
             "ui_plan.record_terminal",
@@ -5234,6 +5235,9 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 "blockers": list(blockers or [])[:50],
                 # NEW-131 review: input only (no new command), so replay is unaffected.
                 **({"part_usage": usage} if usage else {}),
+                # NEW-142 review: a final-attempt provider schema refusal, kept durably
+                # (input only, like part_usage).
+                **({"part_rejection": rejection} if rejection else {}),
             },
         )
         return {
@@ -5468,6 +5472,8 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
     _STRUCTURAL_REJECTIONS = frozenset({"DRAFT_SCHEMA_INVALID", "DRAFT_STRUCTURE_INVALID"})
     # NEW-138 (operator, 2026-10-05): two redrafts per part; the id is suffixed per part.
     _TWO_REDRAFTS_PATCH = "new-138-two-redrafts"
+    # NEW-142: a part continues an earlier run's unresolved draft; suffixed per part.
+    _CONTINUATION_PATCH = "new-142-continuation"
     # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s);
     # the activity bound leaves room for the CLI's start-up and result handling.
     _PART_TIMEOUT_MINUTES = 40
@@ -5520,6 +5526,7 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     str(outcome.get("blocker") or "UI_PLAN_PART_FAILED"),
                     outcome.get("blockers"),
                     usage=self._part_usage(outcome),
+                    rejection=self._part_rejection(outcome),
                 )
             if part.get("kind") == "frame":
                 # The complete reviewed frame, as a file every batch reads (never truncated).
@@ -5631,6 +5638,21 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
             "attempt": outcome.get("draft_attempt"),
         }
 
+    @staticmethod
+    def _part_rejection(outcome: dict[str, Any]) -> dict[str, Any] | None:
+        """NEW-142 review: the provider schema refusal that ended a part (its findings), so
+        a later plan continuing the part sees it; Hermes's own rejections are recorded by
+        ui_plan.record_part_draft."""
+        findings = outcome.get("failed_schema_findings")
+        if outcome.get("blocker") != "DRAFT_SCHEMA_INVALID" or not isinstance(findings, list):
+            return None
+        return {
+            "part_id": outcome.get("part_id"),
+            "attempt": outcome.get("draft_attempt"),
+            "code": "DRAFT_SCHEMA_INVALID",
+            "details": [str(item) for item in findings][:50],
+        }
+
     async def _ui_plan_part(
         self, request: UiMigrationPlanInput, context: dict[str, Any], part: dict[str, Any]
     ) -> dict[str, Any]:
@@ -5649,9 +5671,19 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                 max_attempts = 3
             if not await self._checkpoint("UI_PLAN_PART_DRAFT"):
                 return {**current, "terminal": "FAILED", "blocker": "UI_PLAN_CANCELLED"}
+            # NEW-142 review: prepare_part offers a continuation only to a workflow that
+            # stages it (data only; the marker is per part, so replays stay unchanged).
+            capable = attempt == 1 and workflow.patched(
+                f"{self._CONTINUATION_PATCH}-{part.get('kind')}-{part.get('index')}"
+            )
             current = await self._step(
                 "ui_plan.prepare_part",
-                {**current, "draft_attempt": attempt, "max_draft_attempts": max_attempts},
+                {
+                    **current,
+                    "draft_attempt": attempt,
+                    "max_draft_attempts": max_attempts,
+                    "continuation_capable": capable,
+                },
             )
             if current.get("status") == "PART_REUSED":
                 return {**current, "status": "PART_APPROVED"}
@@ -5661,6 +5693,30 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     "terminal": "FAILED",
                     "blocker": str(current.get("blocker") or "DRAFT_INPUT_INVALID"),
                 }
+            continued = current.get("continuation")
+            if (
+                capable
+                and isinstance(current.get("continuation_document"), dict)
+                and isinstance(continued, dict)
+            ):
+                # NEW-142: stage the earlier run's last reviewed draft the prompt continues
+                # (hash-verified against what ui_plan.prepare_part bound into the prompt).
+                previous = await self._step(
+                    "ui_plan.stage_document",
+                    {
+                        "project": request.project,
+                        "blueprint_id": request.blueprint_id,
+                        "name": str((continued.get("file") or {}).get("name")),
+                        "document": current.get("continuation_document"),
+                    },
+                )
+                if (previous.get("document") or {}).get("sha256") != (
+                    continued.get("file") or {}
+                ).get("sha256"):
+                    return {
+                        **current,
+                        "blocker": str(previous.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
+                    }
             current = await self._agent_step(
                 "ui_plan.draft", current, timeout_minutes=self._PART_TIMEOUT_MINUTES
             )

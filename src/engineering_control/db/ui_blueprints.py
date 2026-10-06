@@ -44,6 +44,8 @@ _RUN_PREFIXES = ("ui-plan-", "ui-blueprint-fanout-")
 
 # NEW-136: the inventory content key, stored on the mechanical entry of drafts_json.
 CONTENT_KEY_FIELD = "inventory_content_key"
+# NEW-142: a Hermes rejection of a part draft, kept in drafts_json (not a part version).
+REJECTION_FIELD = "rejection_of"
 
 
 class UiBlueprintNotFoundError(ValueError):
@@ -389,9 +391,19 @@ class UiBlueprintRepository:
         return entry.get("content_sha256") == digest and entry.get("reviewed_sha256") == digest
 
     def record_part_sync(
-        self, blueprint_id: UUID, part_id: str, kind: str, attempt: int, content: dict[str, Any]
+        self,
+        blueprint_id: UUID,
+        part_id: str,
+        kind: str,
+        attempt: int,
+        content: dict[str, Any],
+        *,
+        continued_from: dict[str, Any] | None = None,
     ) -> str:
-        """Append part version `attempt` (immutable; an identical retry is accepted)."""
+        """Append part version `attempt` (immutable; an identical retry is accepted).
+
+        NEW-142: `continued_from` records the earlier blueprint and draft a continuation
+        revised (blueprint id, attempt and content hash)."""
         if kind not in {FRAME, BATCH}:
             raise ValueError("ui blueprint part kind is invalid")
         digest = part_content_sha256(content)
@@ -418,10 +430,116 @@ class UiBlueprintRepository:
                     "content_sha256": digest,
                     "reviewed_sha256": None,
                     "decision": None,
+                    **({"continued_from": dict(continued_from)} if continued_from else {}),
                 }
             )
             row.drafts_json = drafts
         return digest
+
+    def record_part_rejection_sync(
+        self, blueprint_id: UUID, part_id: str, attempt: int, code: str, details: list[str]
+    ) -> None:
+        """NEW-142: a Hermes rejection (NEW-132) of draft `attempt` of a part, kept durably so
+        a later plan continuing the part sees it (idempotent per part and attempt)."""
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            if row.status != "DRAFTING":
+                return
+            drafts = list(row.drafts_json or [])
+            if any(
+                entry.get(REJECTION_FIELD) == part_id and entry.get("rejected_attempt") == attempt
+                for entry in drafts
+            ):
+                return
+            # Never an "attempt" key: whole-blueprint draft versions are matched on it.
+            drafts.append(
+                {
+                    REJECTION_FIELD: part_id,
+                    "rejected_attempt": attempt,
+                    "code": str(code)[:80],
+                    "details": [str(item)[:2_000] for item in details[:50]],
+                }
+            )
+            row.drafts_json = drafts
+
+    @staticmethod
+    def _part_rejections(row: UiBlueprint, part_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "attempt": int(entry["rejected_attempt"]),
+                "code": entry.get("code"),
+                "details": list(entry.get("details") or []),
+            }
+            for entry in row.drafts_json or []
+            if entry.get(REJECTION_FIELD) == part_id
+            and isinstance(entry.get("rejected_attempt"), int)
+        ]
+
+    def previous_unresolved_sync(self, blueprint_id: UUID, part_id: str) -> dict[str, Any] | None:
+        """NEW-142: the most recent earlier blueprint of the project that drafted this exact
+        part (same id: same inputs, kit, frame and provenance) and ended without approving
+        it, with the part's last reviewed draft and every review and Hermes rejection of it
+        in that run. None when the latest such blueprint approved the part (reuse wins), or
+        never reviewed a draft of it."""
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            if row is None:
+                raise UiBlueprintNotFoundError("ui blueprint not found")
+            earlier = session.scalars(
+                select(UiBlueprint)
+                .where(
+                    UiBlueprint.project == row.project,
+                    UiBlueprint.id != row.id,
+                    UiBlueprint.status != "DRAFTING",
+                    UiBlueprint.created_at <= row.created_at,
+                )
+                .order_by(UiBlueprint.created_at.desc())
+            ).all()
+            for other in earlier:
+                entries = [
+                    entry
+                    for entry in other.drafts_json or []
+                    if entry.get("part") == part_id and not entry.get("reused_from")
+                ]
+                if not entries:
+                    continue
+                if any(self._approved_part(entry) for entry in entries):
+                    return None
+                reviewed = [
+                    entry
+                    for entry in entries
+                    if entry.get("decision") == "REVISE"
+                    and entry.get("reviewed_sha256")
+                    and isinstance(entry.get("part_attempt"), int)
+                    and isinstance(entry.get("content"), dict)
+                ]
+                if not reviewed:
+                    return None
+                last = max(reviewed, key=lambda entry: int(entry["part_attempt"]))
+                reviews = [
+                    {"attempt": int(entry["part_attempt"]), **entry["review"]}
+                    for entry in entries
+                    if isinstance(entry.get("review"), dict)
+                    and isinstance(entry.get("part_attempt"), int)
+                ]
+                return {
+                    "blueprint_id": str(other.id),
+                    "status": other.status,
+                    "attempt": int(last["part_attempt"]),
+                    "content": last["content"],
+                    "content_sha256": last.get("content_sha256"),
+                    "reviewed_sha256": last.get("reviewed_sha256"),
+                    "reviews": sorted(reviews, key=lambda item: item["attempt"]),
+                    "rejections": self._part_rejections(other, part_id),
+                }
+            return None
+
+    def part_rejections_sync(self, blueprint_id: UUID, part_id: str) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            if row is None:
+                raise UiBlueprintNotFoundError("ui blueprint not found")
+            return self._part_rejections(row, part_id)
 
     def part_reviews_sync(self, blueprint_id: UUID, part_id: str) -> list[dict[str, Any]]:
         """NEW-139: this blueprint's own reviews of every drafted version of a part, by
