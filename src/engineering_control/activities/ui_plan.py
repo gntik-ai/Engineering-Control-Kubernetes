@@ -1665,7 +1665,11 @@ class UiPlanActivityHandler:
             item_context(
                 item, blueprint_id=str(blueprint_id), blueprint_sha256=digest, continued=continued
             ),
+            # NEW-146 review 1: the ownership fence again, atomic with the row write.
+            fanout_writer=workflow_id,
         )
+        if created.get("status") == "SUPERSEDED":
+            return {"status": "SKIPPED", "blocker": "UI_FANOUT_SUPERSEDED"}
         base: dict[str, Any] = {
             "blueprint_id": str(blueprint_id),
             "item_key": item.key,
@@ -1685,7 +1689,11 @@ class UiPlanActivityHandler:
         if item.is_gap:
             return self._gap_request(base, item, 1, self._workflow_run(payload))
         if render_error is not None:
-            failed = self.change_requests.record_failure_sync(change_request_id, 1, render_error)
+            failed = self.change_requests.record_failure_sync(
+                change_request_id, 1, render_error, fanout_writer=workflow_id
+            )
+            if failed.get("status") == "SUPERSEDED":
+                return {**base, "status": "SKIPPED", "blocker": "UI_FANOUT_SUPERSEDED"}
             return {**base, "status": "FAILED_RECORDED", "error_code": failed.get("error_code")}
         try:
             proposal = validate_proposal(rendered, project, item.target_repository)

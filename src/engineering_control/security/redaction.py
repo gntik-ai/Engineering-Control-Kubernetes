@@ -206,7 +206,9 @@ def bounded_detail(
 ) -> str:
     """One redacted line of at most ``limit`` characters.
 
-    Redacted before it is cut, so a cut never leaves part of a secret unrecognised."""
+    Redacted before it is cut, so a cut never leaves part of a secret unrecognised. A caller
+    that puts a label in front of a message must redact the message on its own first: the
+    line-anchored rules (``password=...``, ``token: ...``) no longer match behind a label."""
     redacted = str((redactor or SecretRedactor()).redact_text(text).value)
     line = " ".join(redacted.split())
     if len(line) > limit:

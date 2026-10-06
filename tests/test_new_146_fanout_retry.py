@@ -16,7 +16,7 @@ from uuid import UUID
 
 import pytest
 from new_123_fixtures import blueprint
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select, update
 from temporalio import workflow
@@ -39,11 +39,17 @@ from engineering_control.db import models
 from engineering_control.db.change_requests import ChangeRequestRepository
 from engineering_control.db.models import ChangeRequest, DashboardEvent, UiBlueprint
 from engineering_control.db.ui_blueprints import UiBlueprintRepository, UiFanoutActiveError
+from engineering_control.engineering.change_requests import (
+    ChangeReview,
+    ChangeReviewRecord,
+    validate_proposal,
+)
 from engineering_control.engineering.ui_blueprint import (
     APPROVAL_PHRASE,
     RETRY_FANOUT_PHRASE,
     fanout_items,
     item_change_request_id,
+    render_item_proposal,
     ui_fanout_workflow_id,
 )
 from engineering_control.models.core import AgentRequest
@@ -83,6 +89,42 @@ def test_a_pydantic_error_is_summarised_without_its_input() -> None:
     assert detail.startswith("ValidationError: 2 validation error(s) for _Strict: prompt: ")
     assert "effort: " in detail
     assert "never echo" not in detail and TOKEN not in detail
+
+
+CREDENTIAL = "synthetic-credential-123"
+ANCHORED = {
+    "password": f"password={CREDENTIAL}",
+    "token": f"token: {CREDENTIAL}",
+    "bearer": f"Authorization: Bearer {CREDENTIAL}",
+    "multi-line": f"agent pack rejected\npassword={CREDENTIAL}\ntoken: {CREDENTIAL}\nend",
+}
+
+
+@pytest.mark.parametrize("message", list(ANCHORED.values()), ids=list(ANCHORED))
+def test_line_anchored_credentials_are_redacted_before_the_type_label(message: str) -> None:
+    # NEW-146 review 1: "ValueError: password=..." no longer starts its line, so the message
+    # is redacted on its own before the label is put in front of it.
+    detail = error_detail(ValueError(message))
+    assert detail.startswith("ValueError: ")
+    assert CREDENTIAL not in detail and REDACTED in detail
+    assert "\n" not in detail
+
+
+class _Checked(BaseModel):
+    pack: str
+
+    @field_validator("pack")
+    @classmethod
+    def _reject(cls, value: str) -> str:
+        raise ValueError(f"\npassword={CREDENTIAL}")
+
+
+def test_pydantic_summary_pieces_are_redacted_before_they_are_joined() -> None:
+    with pytest.raises(PydanticValidationError) as raised:
+        _Checked.model_validate({"pack": "x"})
+    detail = error_detail(raised.value)
+    assert detail.startswith("ValidationError: 1 validation error(s) for _Checked: pack: ")
+    assert CREDENTIAL not in detail
 
 
 class _LeakyPack:
@@ -142,6 +184,7 @@ def test_a_recorded_failure_keeps_its_blocker_and_bounded_detail(tmp_path: Path)
             "failure_phase": "draft",
             "blocker": "AGENT_PACK_INVALID",
             "blocker_detail": f"ValueError: {TOKEN} " + "w" * 1000,
+            "orchestration": {"workflow_id": ui_fanout_workflow_id(blueprint_id, 1)},
         }
     )
     assert (recorded["status"], recorded["error_code"]) == ("FAILED", "DRAFT_PROVIDER_UNAVAILABLE")
@@ -589,3 +632,88 @@ async def test_a_pre_new_146_fanout_history_replays_on_the_current_class(tmp_pat
         if payload.get("failure_phase") == "draft"
     ]
     assert recorded and all("blocker_detail" not in payload for payload in recorded)
+
+
+# Ownership fence: a stale writer of an earlier fan-out cannot touch a retried item --------
+
+
+def test_a_stale_fanout_writer_is_a_no_op_after_a_retry(tmp_path: Path) -> None:
+    """NEW-146 review 1: a cancelled or timed-out activity of fan-out 1 keeps running in its
+    thread after a retry reset the item and fan-out 2 claimed the blueprint; its writes are
+    refused atomically, while the owner and operator revisions still write."""
+    harness = Harness(tmp_path)
+    blueprint_id, digest = approved_blueprint(harness)
+    identity = UUID(blueprint_id)
+    old, new = ui_fanout_workflow_id(blueprint_id, 1), ui_fanout_workflow_id(blueprint_id, 2)
+    page = next(item for item in fanout_items(blueprint()) if item.key == "page:tenants")
+    proposal = validate_proposal(render_item_proposal(page), "falcone", page.target_repository)
+    review = ChangeReviewRecord.from_rounds(
+        [ChangeReview(decision="APPROVE", summary="ok", findings=())]
+    )
+
+    def prepare(key: str, writer: str) -> dict[str, Any]:
+        return harness.ui._prepare_item(
+            {
+                "blueprint_id": blueprint_id,
+                "item_key": key,
+                "source_worktree": "/srv/x",
+                "orchestration": {"workflow_id": writer},
+            }
+        )
+
+    def fail(change_request_id: str, writer: str, revision: int = 1) -> dict[str, Any]:
+        return harness.change._record_failure(
+            {
+                "change_request_id": change_request_id,
+                "revision": revision,
+                "failure_phase": "draft",
+                "blocker": "AGENT_PACK_INVALID",
+                "orchestration": {"workflow_id": writer},
+            }
+        )
+
+    def status(key: str) -> str:
+        view = harness.change_requests.get_sync(item_change_request_id(digest, key))
+        assert view is not None
+        return str(view["status"])
+
+    # Fan-out 1 owns the blueprint and records both items FAILED, then ends.
+    assert harness.repository.claim_fanout_sync(identity)["workflow_id"] == old
+    gap = prepare(GAPS[0], old)["change_request_id"]
+    tenants = prepare("page:tenants", old)["change_request_id"]
+    assert fail(gap, old)["status"] == "FAILED"
+    assert fail(tenants, old)["status"] == "FAILED"
+    assert harness.repository.release_fanout_sync(identity, old)
+    binding = harness.repository.get_sync(identity)["approval_binding"]  # type: ignore[index]
+    retried = harness.repository.retry_fanout_sync(
+        identity, binding, RETRY_FANOUT_PHRASE, "telegram:42"
+    )
+    assert retried["reset_count"] == 2
+    # Between the reset and the next claim no fan-out owns the blueprint: still refused.
+    assert fail(gap, old) == {
+        "change_request_id": gap,
+        "revision": 1,
+        "status": "SUPERSEDED",
+        "current_status": "DRAFTING",
+        "blocker": "UI_FANOUT_SUPERSEDED",
+    }
+    assert harness.repository.claim_fanout_sync(identity)["workflow_id"] == new
+    # Fan-out 1's leftover failure, candidate and item writes are no-ops reporting that.
+    assert fail(gap, old)["status"] == "SUPERSEDED"
+    stale = harness.change_requests.persist_candidate_sync(
+        UUID(tenants), 1, proposal, review, {}, fanout_writer=old
+    )
+    assert (stale["status"], stale["blocker"]) == ("SUPERSEDED", "UI_FANOUT_SUPERSEDED")
+    assert prepare(GAPS[1], old) == {"status": "SKIPPED", "blocker": "UI_FANOUT_SUPERSEDED"}
+    assert (status(GAPS[0]), status("page:tenants")) == ("DRAFTING", "DRAFTING")
+    assert harness.change_requests.get_sync(item_change_request_id(digest, GAPS[1])) is None
+    # The owner writes as before.
+    persisted = harness.change_requests.persist_candidate_sync(
+        UUID(tenants), 1, proposal, review, {}, fanout_writer=new
+    )
+    assert persisted["status"] == "CANDIDATE"
+    assert fail(gap, new)["status"] == "FAILED"
+    # An operator revision (ChangeRequestWorkflow, revision 2) is not a fan-out write.
+    harness.change_requests.revise_sync(UUID(gap), "Try the draft again.", "telegram:42")
+    revised = fail(gap, f"change-request-{gap}-2", revision=2)
+    assert (revised["status"], revised["revision"]) == ("FAILED", 2)

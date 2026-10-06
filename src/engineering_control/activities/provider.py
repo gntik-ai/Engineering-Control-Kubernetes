@@ -42,16 +42,24 @@ def error_detail(error: BaseException, redactor: SecretRedactor | None = None) -
 
     A pydantic ValidationError (a ValueError) is summarised by location and message only:
     its str() embeds the offending input values, which can be a whole prompt."""
+    # NEW-146 review 1: every piece is redacted on its own, before any label is put in front
+    # of it: the line-anchored credential rules (password=..., token: ...) match only text
+    # that still starts its line.
+    redactor = redactor or SecretRedactor()
+
+    def safe(text: str) -> str:
+        return str(redactor.redact_text(text).value)
+
     if isinstance(error, PydanticValidationError):
         problems = error.errors(include_url=False, include_context=False, include_input=False)
         shown = "; ".join(
-            f"{'.'.join(str(part) for part in problem.get('loc', ())) or '<root>'}: "
-            f"{problem.get('msg', problem.get('type', 'invalid'))}"
+            f"{safe('.'.join(str(part) for part in problem.get('loc', ()))) or '<root>'}: "
+            f"{safe(str(problem.get('msg', problem.get('type', 'invalid'))))}"
             for problem in problems[:5]
         )
-        message = f"{error.error_count()} validation error(s) for {error.title}: {shown}"
+        message = f"{error.error_count()} validation error(s) for {safe(error.title)}: {shown}"
     else:
-        message = str(error) or "(no message)"
+        message = safe(str(error)) or "(no message)"
     return bounded_detail(f"{type(error).__name__}: {message}", redactor)
 
 

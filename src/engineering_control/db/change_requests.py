@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
-from engineering_control.db.models import ChangeRequest, Run
+from engineering_control.db.models import ChangeRequest, Run, UiBlueprint
 from engineering_control.engineering.backlog import (
     is_reauthenticated_backlog_operator,
 )
@@ -39,6 +39,10 @@ _ISSUE_URL = re.compile(
     r"(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
     r"/issues/([1-9][0-9]*)$"
 )
+
+
+# NEW-146 review 1: what a fan-out item write that no longer owns its blueprint returns.
+UI_FANOUT_SUPERSEDED = "UI_FANOUT_SUPERSEDED"
 
 
 class ChangeRequestNotFoundError(ValueError):
@@ -107,16 +111,23 @@ class ChangeRequestRepository:
         intake: ChangeRequestIntake,
         requested_by: str,
         ui_context: UiChangeContext,
+        *,
+        fanout_writer: str | None = None,
     ) -> dict[str, Any]:
         """NEW-123: one fanned-out blueprint item, idempotent under its deterministic id.
 
         A repeated (resumed) fan-out finds the existing row and never creates a second one;
-        a row under the same id for a different item is refused."""
+        a row under the same id for a different item is refused. NEW-146: with a
+        ``fanout_writer``, only the blueprint's active fan-out may create or load it."""
         if not is_reauthenticated_backlog_operator(requested_by):
             raise ValueError("change requests require an allowlisted operator channel")
         context = ui_context.model_dump(mode="json")
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
+            if fanout_writer is not None and not self._fanout_owns(
+                session, str(context["blueprint_id"]), fanout_writer
+            ):
+                return {"status": "SUPERSEDED", "blocker": UI_FANOUT_SUPERSEDED}
             row = session.get(ChangeRequest, change_request_id, with_for_update=True)
             if row is not None:
                 stored = row.ui_context_json if isinstance(row.ui_context_json, dict) else {}
@@ -378,8 +389,12 @@ class ChangeRequestRepository:
         proposal: ChangeProposal,
         review: ChangeReviewRecord,
         dedupe: dict[str, Any],
+        *,
+        fanout_writer: str | None = None,
     ) -> dict[str, Any]:
         with self.sessions.begin() as session:
+            if not self._fanout_fence(session, change_request_id, revision, fanout_writer):
+                return self._fanout_superseded(session, change_request_id)
             row = self._locked(session, change_request_id)
             if row.status != "DRAFTING" or row.revision != revision:
                 return {"status": "SUPERSEDED", "current_status": row.status}
@@ -426,6 +441,7 @@ class ChangeRequestRepository:
         phase: str | None = None,
         blocker: str | None = None,
         detail: str | None = None,
+        fanout_writer: str | None = None,
     ) -> dict[str, Any]:
         code = error_code if _ERROR_CODE.fullmatch(error_code) else "CHANGE_REQUEST_FAILED"
         # NEW-146: what failed, kept with the request (review_json is empty until a
@@ -439,6 +455,8 @@ class ChangeRequestRepository:
         if detail:
             failure["detail"] = bounded_detail(detail)
         with self.sessions.begin() as session:
+            if not self._fanout_fence(session, change_request_id, revision, fanout_writer):
+                return self._fanout_superseded(session, change_request_id)
             row = self._locked(session, change_request_id)
             if row.status != "DRAFTING" or row.revision != revision:
                 return {"status": "SUPERSEDED", "current_status": row.status}
@@ -484,6 +502,54 @@ class ChangeRequestRepository:
                     }
                 )
             return failures
+
+    # NEW-146 review 1: the fan-out ownership fence -----------------------------------------
+
+    @classmethod
+    def _fanout_fence(
+        cls,
+        session: Any,
+        change_request_id: UUID,
+        revision: int,
+        fanout_writer: str | None,
+    ) -> bool:
+        """May this writer change the request? Checked in the write's own transaction.
+
+        Revision 1 of a fanned-out item belongs to the fan-out that holds its blueprint's
+        active marker: a write from any other execution (a cancelled or timed-out activity of
+        an earlier fan-out still running in its thread, after a retry reset the item) is
+        refused. Callers that are not activities (``fanout_writer`` None), operator requests
+        and operator revisions (revision 2 or later, ChangeRequestWorkflow) are not fenced.
+        The blueprint row is locked before the request row, the order the retry uses."""
+        if fanout_writer is None or revision != 1:
+            return True
+        context = session.scalar(
+            select(ChangeRequest.ui_context_json).where(ChangeRequest.id == change_request_id)
+        )
+        blueprint_id = context.get("blueprint_id") if isinstance(context, dict) else None
+        if not blueprint_id:
+            return True
+        return cls._fanout_owns(session, str(blueprint_id), fanout_writer)
+
+    @staticmethod
+    def _fanout_owns(session: Any, blueprint_id: str, fanout_writer: str) -> bool:
+        try:
+            identity = UUID(blueprint_id)
+        except ValueError:
+            return False
+        marker = session.scalar(
+            select(UiBlueprint.active_fanout_workflow_id)
+            .where(UiBlueprint.id == identity)
+            .with_for_update()
+        )
+        return bool(fanout_writer) and marker == fanout_writer
+
+    @staticmethod
+    def _fanout_superseded(session: Any, change_request_id: UUID) -> dict[str, Any]:
+        status = session.scalar(
+            select(ChangeRequest.status).where(ChangeRequest.id == change_request_id)
+        )
+        return {"status": "SUPERSEDED", "current_status": status, "blocker": UI_FANOUT_SUPERSEDED}
 
     @staticmethod
     def _failure(row: ChangeRequest) -> dict[str, Any]:

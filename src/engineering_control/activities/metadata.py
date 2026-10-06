@@ -1305,7 +1305,12 @@ class MetadataActivityHandler:
                     )
                 # NEW-146: the step's bounded, redacted message rides along in the summary.
                 detail = payload.get("blocker_detail")
-                summary = bounded_detail(f"{blocker}: {detail}") if detail else blocker
+                # Redacted on its own first: a label in front would hide line-anchored rules.
+                summary = (
+                    bounded_detail(f"{blocker}: {SecretRedactor().redact_text(str(detail)).value}")
+                    if detail
+                    else blocker
+                )
                 invocation.status = status
                 invocation.summary = summary
                 invocation.error_code = blocker

@@ -568,6 +568,10 @@ engineering-ctl ui-blueprint-fanout-retry <blueprint> <binding> RETRY_UI_FANOUT 
   operator `change-revise` (revision 2 or later). Ids stay the same (blueprint hash plus item
   key). The reset is recorded in `fanout.retries` and as a `ui_fanout.retry_requested`
   dashboard event.
+- Every write to a fan-out item at revision 1 (item creation, failure, candidate) is fenced
+  in its own transaction on the blueprint's active fan-out marker: a leftover activity of an
+  earlier fan-out cannot change a reset item; it is a no-op that reports
+  `SUPERSEDED UI_FANOUT_SUPERSEDED`.
 - It then starts the next fan-out (`ui-blueprint-fanout-<id>-<n+1>`) with `--max-items` as
   its cap, which drafts and reviews the reset items like any other pending item. A repeat finds
   nothing left to reset; if the start fails (503), repeat the retry or the approval to resume.
