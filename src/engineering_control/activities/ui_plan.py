@@ -181,6 +181,8 @@ def cumulative_findings(
     rejections: list[dict[str, Any]],
     before: int,
     previous: dict[str, Any] | None = None,
+    *,
+    bounded: bool = True,
 ) -> tuple[list[str], int]:
     """Every REVISE finding and Hermes rejection finding on drafts 1..before-1 of a part,
     deduplicated (a repeated finding lists every round it was raised in) and labelled by
@@ -233,6 +235,9 @@ def cumulative_findings(
     # the newest round (still unresolved) is kept before older round-only findings.
     order = sorted(rounds, key=lambda text: latest[text])
     lines = [f"- [{'; '.join(rounds[text])}] {text}" for text in order]
+    if not bounded:
+        # NEW-142 review: the complete list, staged with a continued draft.
+        return lines, 0
     kept: list[str] = []
     size = 0
     for line in reversed(lines):
@@ -244,15 +249,32 @@ def cumulative_findings(
     return kept, len(lines) - len(kept)
 
 
-def _findings_block(label: str, lines: list[str], omitted: int) -> str:
+def _findings_block(
+    label: str, lines: list[str], omitted: int, previous_file: str | None = None
+) -> str:
+    """NEW-142 review: when a previous run's findings are part of the list, the complete
+    list of them is in the staged continuation file (`previous_file`), field
+    prior_findings; this run's own are in its review files."""
+    where = (
+        f"this run's are in the earlier review files of this part in the input directory, "
+        f"and the complete list from the previous run is in {previous_file} (field "
+        "prior_findings)"
+        if previous_file
+        else "they are in the earlier review files of this part in the input directory"
+    )
     note = (
         f"\n({omitted} older findings are omitted past the bound of {PRIOR_FINDINGS_MAX} "
-        f"findings or {PRIOR_FINDINGS_CHARS} characters; they are in the earlier review "
-        "files of this part in the input directory and still apply.)"
+        f"findings or {PRIOR_FINDINGS_CHARS} characters; {where}, and they still apply.)"
         if omitted
         else ""
     )
     return _fenced(label, "\n".join(lines) + note)
+
+
+def _previous_file(payload: dict[str, Any]) -> str | None:
+    continuation = payload.get("continuation")
+    staged = continuation.get("file") if isinstance(continuation, dict) else None
+    return str(staged.get("path")) if isinstance(staged, dict) and staged.get("path") else None
 
 
 def decisions_sha256() -> str:
@@ -696,6 +718,17 @@ class UiPlanActivityHandler:
             )
             if entry is not None:
                 self.repository.record_usage_sync(blueprint_id, entry)
+        rejection = payload.get("part_rejection")
+        if isinstance(rejection, dict) and isinstance(rejection.get("attempt"), int):
+            # NEW-142 review: a final-attempt provider schema refusal has no next draft
+            # preparation to record it; keep it durably before the plan ends.
+            self.repository.record_part_rejection_sync(
+                blueprint_id,
+                str(rejection.get("part_id")),
+                int(rejection["attempt"]),
+                str(rejection.get("code") or "DRAFT_SCHEMA_INVALID"),
+                [str(item) for item in rejection.get("details") or []],
+            )
         result = self.repository.record_terminal_sync(
             blueprint_id,
             status,
@@ -815,6 +848,7 @@ class UiPlanActivityHandler:
         elif not isinstance(directory, str) or not directory:
             reason = "the plan has no staged input directory"
         else:
+            prior, _omitted = cumulative_findings([], [], 1, previous, bounded=False)
             document = {
                 "kind": "previous-part-draft",
                 "part_id": part_id,
@@ -822,6 +856,11 @@ class UiPlanActivityHandler:
                 "previous_attempt": previous["attempt"],
                 "content_sha256": previous["content_sha256"],
                 kind: content,
+                # NEW-142 review: every finding of that run (all rounds, all rejections),
+                # complete and hash-bound with the draft; the prompt's list is bounded.
+                "prior_findings": prior,
+                "prior_reviews": list(previous.get("reviews") or []),
+                "prior_rejections": list(previous.get("rejections") or []),
             }
             text = json.dumps(document, indent=2, sort_keys=True) + "\n"
             name = f"part-{part_id}-previous.json"
@@ -1089,11 +1128,15 @@ class UiPlanActivityHandler:
                         {"frame_brief": self._frame_brief(part_id, reused)} if kind == FRAME else {}
                     ),
                 }
-            # NEW-142: no approval to adopt; continue an earlier run's unresolved draft.
-            continuation, document, skipped = self._continuation(
-                blueprint_id, kind, part_id, context, payload
+            # NEW-142: no approval to adopt; continue an earlier run's unresolved draft --
+            # only for a workflow that stages it (review: a pre-NEW-142 workflow never does).
+            continuation, document, skipped = (
+                self._continuation(blueprint_id, kind, part_id, context, payload)
+                if payload.get("continuation_capable") is True
+                else (None, None, None)
             )
             base.pop("continuation", None)
+            base.pop("continuation_skipped", None)
             if continuation is not None:
                 base["continuation"] = continuation
                 base["continuation_document"] = document
@@ -1160,14 +1203,17 @@ class UiPlanActivityHandler:
                 f"part content sha256 {continuation['content_sha256']}). Read it and revise "
                 "that draft, do not draft from scratch: resolve every finding below, from "
                 "every round of that run, and do not regress anything the draft already does "
-                "right. This plan's draft budget is unchanged.\n"
-                + _findings_block("previous run findings", history, omitted)
+                "right. This plan's draft budget is unchanged. The same file holds the "
+                "complete list of that run's findings (field prior_findings, every round "
+                "and rejection); the list below is bounded.\n"
+                + _findings_block("previous run findings", history, omitted, _previous_file(base))
             )
         cumulative = (
             "Every finding on this part so far, from every earlier round, labelled by round "
             "(deduplicated). Resolve all of them in this draft, not only the latest round's, "
             "and do not regress any earlier fix: a finding fixed in an earlier redraft must "
-            "stay fixed.\n" + _findings_block("review findings", history, omitted)
+            "stay fixed.\n"
+            + _findings_block("review findings", history, omitted, _previous_file(base))
             if history
             else ""
         )
@@ -1398,7 +1444,7 @@ class UiPlanActivityHandler:
                 "against this draft: report every one that is not fully resolved as a "
                 "finding again, naming the round it was raised in. Then run the complete "
                 "checklist above and report every remaining violation, exhaustively.\n"
-                + _findings_block("prior findings", history, omitted)
+                + _findings_block("prior findings", history, omitted, _previous_file(payload))
             )
         request = AgentRequest(
             run_id=uuid5(

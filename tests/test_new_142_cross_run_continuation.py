@@ -140,6 +140,12 @@ async def test_pre_new_142_histories_replay_and_new_ones_need_the_patch(tmp_path
     )
     assert result["status"] == "CANDIDATE"
     assert not any(PATCH in marker for marker in markers(harness.history))
+    # NEW-142 review: a workflow that never stages a continuation is never offered one.
+    b002 = _prompts(harness, "ui_plan.draft", 2)[0]["draft_request"]["prompt"]
+    assert "continues an earlier plan run" not in b002 and "previous run" not in b002
+    assert not any(
+        "previous" in str(p.get("name")) for p in harness.payloads["ui_plan.stage_document"]
+    )
     await Replayer(workflows=[UiMigrationPlanWorkflow]).replay_workflow(harness.history)
     # A new history that staged the continuation needs the new code.
     (tmp_path / "again").mkdir()
@@ -155,6 +161,109 @@ async def test_pre_new_142_histories_replay_and_new_ones_need_the_patch(tmp_path
     assert any(PATCH in marker for marker in markers(newer.history))
     with pytest.raises(Exception):  # noqa: B017 - any nondeterminism error
         await Replayer(workflows=[PreNew142UiMigrationPlanWorkflow]).replay_workflow(newer.history)
+
+
+def many_findings_reviewer(index: int, last: int) -> Any:
+    """REVISE part `index` three times: one finding in rounds 1 and 2, `last` in round 3."""
+    rounds = {"n": 0}
+
+    def respond(payload: dict[str, Any]) -> dict[str, Any]:
+        from new_131_fixtures import part_review
+        from test_new_123_ui_workflows import agent
+        from test_new_131_ui_batched_workflow import with_usage
+
+        part = payload["part"]
+        decision = "APPROVE"
+        count = 0
+        if int(part["index"]) == index and rounds["n"] < 3:
+            rounds["n"] += 1
+            decision = "REVISE"
+            count = 1 if rounds["n"] < 3 else last
+        output = part_review(part["kind"], payload["part_id"], payload["draft_sha256"], decision)
+        if decision == "REVISE":
+            output["review"]["findings"] = [
+                {
+                    "category": "other",
+                    "subject": f"page-{n}",
+                    "detail": f"Round {rounds['n']} finding {n} of {count}.",
+                    "reference": "pages[0]",
+                }
+                for n in range(count)
+            ]
+        return with_usage(agent(output), 4_000)(payload)
+
+    return respond
+
+
+@temporal
+async def test_every_prior_finding_is_staged_even_past_the_prompt_bound(tmp_path: Path) -> None:
+    # Review: 61 final-review findings; the bounded prompt drops the oldest, so the
+    # complete list must be in the staged, hash-bound continuation file.
+    harness, first, first_id = batched_harness(tmp_path)
+    harness.responses["ui_plan.review"] = many_findings_reviewer(2, 61)
+    assert (await harness.run(UiMigrationPlanWorkflow, first, first_id))["status"] == "BLOCKED"
+    harness, second, second_id = batched_harness(tmp_path, harness)
+    harness.responses["ui_plan.review"] = rule_reviewer({})
+    assert (await harness.run(UiMigrationPlanWorkflow, second, second_id))["status"] == (
+        "CANDIDATE"
+    )
+    prompt = _prompts(harness, "ui_plan.draft", 2)[-1]["draft_request"]["prompt"]
+    staged = next(
+        p for p in harness.payloads["ui_plan.stage_document"] if "previous" in str(p["name"])
+    )
+    path = f"/srv/engineering/worktrees/ui-plan-inputs/x/{staged['name']}"
+    assert "Round 3 finding 0 of 61." not in prompt  # past the bound of 60 (63 in all)
+    assert "Round 3 finding 60 of 61." in prompt
+    assert "3 older findings are omitted" in prompt
+    assert f"the complete list from the previous run is in {path} (field prior_findings)" in (
+        prompt
+    )
+    prior = "\n".join(staged["document"]["prior_findings"])
+    assert len(staged["document"]["prior_findings"]) == 63
+    for text in ("Round 1 finding 0 of 1.", "Round 2 finding 0 of 1.", "Round 3 finding 0 of 61."):
+        assert text in prior
+    assert [r["attempt"] for r in staged["document"]["prior_reviews"]] == [1, 2, 3]
+
+
+@temporal
+async def test_a_final_provider_schema_refusal_is_kept_and_continued(tmp_path: Path) -> None:
+    # Review: REVISE -> REVISE -> provider SchemaViolation left no durable rejection.
+    from test_new_132_structural_redraft import provider_boundary
+
+    harness, first, first_id = batched_harness(tmp_path)
+    harness.responses["ui_plan.stage_document"] = staging
+    adapter, draft = provider_boundary(tmp_path, harness, prose=0)
+
+    async def drafter(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload["part"]["kind"] == "frame" and payload["draft_attempt"] == 3:
+            adapter.prose = 1
+        result: dict[str, Any] = await draft(payload)
+        return result
+
+    harness.responses["ui_plan.draft"] = drafter
+    harness.responses["ui_plan.review"] = rule_reviewer({0: 2})
+    result = await harness.run(UiMigrationPlanWorkflow, first, first_id)
+    assert (result["status"], result["error_code"]) == ("BLOCKED", "DRAFT_SCHEMA_INVALID")
+    frame_id = harness.payloads["ui_plan.draft"][0]["part_id"]
+    durable = harness.repository.part_rejections_sync(UUID(first.blueprint_id), frame_id)
+    assert [(item["attempt"], item["code"]) for item in durable] == [(3, "DRAFT_SCHEMA_INVALID")]
+    assert any("frame/gaps/1/blocks/0 [pattern]" in item for item in durable[0]["details"])
+    # The next plan continues draft 2 with every finding, the refusal included.
+    harness, second, second_id = batched_harness(tmp_path, harness)
+    harness.responses["ui_plan.stage_document"] = staging
+    harness.responses["ui_plan.review"] = rule_reviewer({})
+    assert (await harness.run(UiMigrationPlanWorkflow, second, second_id))["status"] == (
+        "CANDIDATE"
+    )
+    prompt = _prompts(harness, "ui_plan.draft", 0)[-1]["draft_request"]["prompt"]
+    short = first.blueprint_id[:8]
+    assert f"previous run {short}, round 3 (Hermes rejection DRAFT_SCHEMA_INVALID" in prompt
+    assert f"previous run {short}, round 2 (review of draft 2)" in prompt
+    staged = next(
+        p for p in harness.payloads["ui_plan.stage_document"] if "previous" in str(p["name"])
+    )
+    assert staged["document"]["previous_attempt"] == 2
+    assert staged["document"]["prior_rejections"][0]["attempt"] == 3
 
 
 # Activities and repository ------------------------------------------------------------------
