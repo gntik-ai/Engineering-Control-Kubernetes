@@ -2039,6 +2039,11 @@ class EngineeringActivityHandler:
         # An activity retry after a committed attempt must not notify twice.
         already_notified = False
         with self.sessions.begin() as session:
+            # NEW-143 review 3: the shared approval lock first (same order as approvals,
+            # issue-reapprove and registration), so a cancellation never reads an approval
+            # that a concurrent re-approval is replacing and then disables with a stale one.
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
