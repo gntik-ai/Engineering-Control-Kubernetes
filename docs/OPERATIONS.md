@@ -351,6 +351,15 @@ is `git_push` and no effect of its publication intent created a PR
 MERGED, still on its recorded head branch and base (`PR_RETARGETED`), at exactly its recorded
 head (`HEAD_MISMATCH`, `PR_NOT_OPEN`, `PR_MISSING`).
 
+An `UNKNOWN` receipt does not prove the push is over: a timed-out command kills only its parent
+process, and a git transport child can outlive it. Reconciliation therefore also requires the
+publisher's systemd service (`engineering-github-worker.service` for `github-runner`, read
+on the controller, never supplied by the client) to run with `KillMode=control-group` and to
+have started after the receipt was committed (`PUBLISHER_NOT_SETTLED`,
+`PUBLISHER_SETTLEMENT_UNVERIFIABLE`). If it has not restarted since, restart it (or let the
+next deploy do so) and run the command again. A `delivery-runner` effect (worker host) is
+refused as unverifiable here.
+
 In one transaction under the publication locks it then sets the effect to the terminal status
 `RECONCILED` (the receipt is kept; a `reconciliation` record holds the operator, time, method,
 recorded and observed heads), writes a `publication_effect_reconciled` dashboard event, and

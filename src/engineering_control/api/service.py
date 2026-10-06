@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import subprocess
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -85,6 +86,8 @@ class ControlService(Protocol):
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
     async def current_open_run_id(self, workflow_id: str) -> str | None: ...
+
+    async def publisher_settlement(self, subject: str) -> dict[str, Any] | None: ...
     async def awaited_operator_issue(self, workflow_id: str, run_id: str) -> str | None: ...
 
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
@@ -382,6 +385,48 @@ class TemporalControlService:
             raise ValueError("unsupported control signal")
         handle = self.client.get_workflow_handle(workflow_id)
         await handle.signal(signal, argument)
+
+    # NEW-145 review 2: publishers whose systemd service runs on this (controller) host.
+    _PUBLISHER_UNITS = {"github-runner": "engineering-github-worker.service"}
+
+    async def publisher_settlement(self, subject: str) -> dict[str, Any] | None:
+        """The publishing service's current start time and KillMode, read from systemd on
+        this host; None when the publisher is not a local unit or systemd cannot be read."""
+        unit = self._PUBLISHER_UNITS.get(subject)
+        if unit is None:
+            return None
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "systemctl",
+                    "show",
+                    unit,
+                    "--property=ExecMainStartTimestamp,KillMode,ActiveState",
+                    "--timestamp=unix",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+        stamp = values.get("ExecMainStartTimestamp", "")
+        if values.get("ActiveState") != "active" or not stamp.startswith("@"):
+            return None
+        try:
+            started = datetime.fromtimestamp(int(stamp[1:]), UTC)
+        except ValueError:
+            return None
+        return {
+            "unit": unit,
+            "started_at": started.isoformat(),
+            "kill_mode": values.get("KillMode", ""),
+        }
 
     async def current_open_run_id(self, workflow_id: str) -> str | None:
         """NEW-133 review 3: the run id of the workflow's current (latest) execution if it is

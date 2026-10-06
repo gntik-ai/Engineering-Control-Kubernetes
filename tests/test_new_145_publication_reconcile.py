@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from test_issue_delivery_approval import _dispose as _dispose_untyped
 
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.api.main import create_app
+from engineering_control.api.service import TemporalControlService
 from engineering_control.cli import dispatch, parser
 from engineering_control.config import Settings
 from engineering_control.db import runtime_binding
@@ -38,6 +40,12 @@ DEPLOYMENT_PR = "https://github.com/gntik-ai/falcone-charts/pull/61"
 SOURCE_HEAD = "ac3e1fe0" + "a" * 32
 DEPLOYMENT_HEAD = "1c4380db" + "b" * 32
 ACTOR = "cli:engineering-ctl"
+# The GitHub worker's service restarted (whole cgroup killed) after the UNKNOWN receipt.
+SETTLED = {
+    "unit": "engineering-github-worker.service",
+    "started_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    "kill_mode": "control-group",
+}
 TOKEN = "fixture-token-" + "x" * 40
 
 
@@ -82,6 +90,7 @@ class _Effect:
         *,
         phrase: str | None = None,
         actor: str = ACTOR,
+        settlement: dict[str, Any] | None = SETTLED,
     ) -> dict[str, Any]:
         confirmation = phrase or reconcile_phrase(self.effect_id)
         plan: dict[str, Any] = await self.operations.plan_publication_reconcile(
@@ -95,6 +104,7 @@ class _Effect:
             actor,
             plan,
             self.observed() if observed is None else observed,
+            settlement,
         )
         return result
 
@@ -192,6 +202,7 @@ def _effect_step(
         "admission_number": 1,
     }
     if status != "STARTED":
+        result["received_at"] = (now - timedelta(minutes=50)).isoformat()
         result["receipt"] = PublicationEffectReceipt(
             effect_id=effect_id,
             claim_id=claim_id,
@@ -538,6 +549,7 @@ def test_api_reads_the_live_heads_through_the_github_worker() -> None:
     service.observe_pull_request_heads = AsyncMock(
         side_effect=[observed, RuntimeError("GitHub unavailable")]
     )
+    service.publisher_settlement = AsyncMock(return_value=SETTLED)
     bus = Mock()
     bus.dispatch_pending = AsyncMock(return_value=False)
     body = {"effect_id": effect_id, "confirmation_phrase": "RECONCILE_PUBLICATION_BA4A87AD"}
@@ -575,5 +587,56 @@ def test_api_reads_the_live_heads_through_the_github_worker() -> None:
     assert already.json()["status"] == "ALREADY_RECONCILED"
     service.observe_pull_request_heads.assert_awaited_with([SOURCE_PR, DEPLOYMENT_PR])
     operations.reconcile_publication_effect.assert_awaited_once_with(
-        UUID(effect_id), body["confirmation_phrase"], ACTOR, plan, observed
+        UUID(effect_id), body["confirmation_phrase"], ACTOR, plan, observed, SETTLED
     )
+    # The restart evidence is read on the server for the plan's publisher, never sent.
+    service.publisher_settlement.assert_awaited_once_with("")
+
+
+@pytest.mark.parametrize(
+    ("settlement", "blocker"),
+    [
+        (None, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
+        ({**SETTLED, "kill_mode": "process"}, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
+        ({**SETTLED, "started_at": "not a time"}, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
+        (
+            {**SETTLED, "started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat()},
+            "PUBLISHER_NOT_SETTLED",
+        ),
+    ],
+)
+async def test_a_publisher_not_proven_restarted_after_the_receipt_is_refused(
+    tmp_path: Path, settlement: dict[str, Any] | None, blocker: str
+) -> None:
+    """Review 2: a timed-out push's transport child can outlive the UNKNOWN receipt; only a
+    control-group restart of the publisher's service after the receipt proves it is gone."""
+    effect = await _effect(tmp_path)
+    with pytest.raises(PublicationReconcileBlocked) as refused:
+        await effect.reconcile(settlement=settlement)
+    assert refused.value.blocker == f"PUBLICATION_RECONCILE_{blocker}"
+    with effect.handler.sessions() as session:
+        assert session.get(Step, effect.effect_id).status == "UNKNOWN"
+    _dispose(effect.values)
+
+
+async def test_publisher_settlement_reads_systemd_on_the_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    stdout = "ExecMainStartTimestamp=@1791284796\nKillMode=control-group\nActiveState=active\n"
+
+    def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    service = TemporalControlService(Mock(), "fixture-only", Mock())
+    assert await service.publisher_settlement("github-runner") == {
+        "unit": "engineering-github-worker.service",
+        "started_at": datetime.fromtimestamp(1791284796, UTC).isoformat(),
+        "kill_mode": "control-group",
+    }
+    assert calls[0][:3] == ["systemctl", "show", "engineering-github-worker.service"]
+    assert await service.publisher_settlement("delivery-runner") is None
+    stdout = "ExecMainStartTimestamp=n/a\nKillMode=control-group\nActiveState=inactive\n"
+    assert await service.publisher_settlement("github-runner") is None

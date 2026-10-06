@@ -211,7 +211,41 @@ def plan_publication_reconcile(
             for item in publications
         },
         "pull_request_urls": list(recorded),
+        # NEW-145 review 2: who published, and when its UNKNOWN receipt committed; the
+        # publisher must have restarted (its cgroup killed) after that before reconciling.
+        "subject": str(effect.result_json.get("subject") or ""),
+        "receipt_received_at": str(effect.result_json.get("received_at") or ""),
     }
+
+
+def _require_publisher_settled(plan: dict[str, Any], settlement: dict[str, Any] | None) -> None:
+    """NEW-145 review 2: a committed UNKNOWN receipt does not prove the push is over (a
+    timed-out command kills only its parent; a transport child may survive). Settlement is
+    proven only by the publishing service having restarted after the receipt under systemd
+    KillMode=control-group, which kills every process of the old service cgroup."""
+    if not isinstance(settlement, dict):
+        raise _refuse(
+            "PUBLISHER_SETTLEMENT_UNVERIFIABLE",
+            f"the {plan['subject'] or 'unknown'} publisher's restart cannot be verified here",
+        )
+    if settlement.get("kill_mode") != "control-group":
+        raise _refuse(
+            "PUBLISHER_SETTLEMENT_UNVERIFIABLE",
+            "the publisher's service does not kill its whole cgroup on restart",
+        )
+    try:
+        started = datetime.fromisoformat(str(settlement.get("started_at")))
+        received = datetime.fromisoformat(plan["receipt_received_at"])
+    except ValueError as error:
+        raise _refuse(
+            "PUBLISHER_SETTLEMENT_UNVERIFIABLE", "the restart or receipt time is unreadable"
+        ) from error
+    if started <= received:
+        raise _refuse(
+            "PUBLISHER_NOT_SETTLED",
+            "the publisher has not restarted since the UNKNOWN receipt; restart its service "
+            "(or wait for the next deploy) and run again",
+        )
 
 
 def reconcile_publication_effect(
@@ -222,6 +256,7 @@ def reconcile_publication_effect(
     planned: dict[str, Any],
     observed: list[dict[str, Any]],
     now: datetime | None = None,
+    settlement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Re-check under the publication locks, compare the live heads, and resolve."""
     current = now or datetime.now(UTC)
@@ -234,6 +269,7 @@ def reconcile_publication_effect(
         raise _refuse(
             "CHANGED", "the effect or its ChangeSet changed since the PR heads were read; run again"
         )
+    _require_publisher_settled(plan, settlement)
     by_url = {str(item.get("url")): item for item in observed if isinstance(item, dict)}
     checked: list[dict[str, Any]] = []
     for url, recorded in plan["recorded"].items():

@@ -840,9 +840,12 @@ def create_app(
                 detail="PUBLICATION_RECONCILE_PR_HEADS_UNAVAILABLE: the pull requests could "
                 "not be read; try again",
             ) from error
+        # NEW-145 review 2: the publisher's restart evidence, read here from systemd (never
+        # from the client), proves no process of the UNKNOWN claim can still push.
+        settlement = await service.publisher_settlement(str(plan.get("subject") or ""))
         try:
             return await repository.reconcile_publication_effect(
-                body.effect_id, body.confirmation_phrase, actor, plan, observed
+                body.effect_id, body.confirmation_phrase, actor, plan, observed, settlement
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

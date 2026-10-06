@@ -707,9 +707,16 @@ class OperationsRepository:
         actor: str,
         planned: dict[str, Any],
         observed: list[dict[str, Any]],
+        settlement: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._reconcile_publication_effect, effect_id, phrase, actor, planned, observed
+            self._reconcile_publication_effect,
+            effect_id,
+            phrase,
+            actor,
+            planned,
+            observed,
+            settlement,
         )
 
     def _reconcile_publication_effect(
@@ -719,6 +726,7 @@ class OperationsRepository:
         actor: str,
         planned: dict[str, Any],
         observed: list[dict[str, Any]],
+        settlement: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """NEW-145: resolve the effect, audit it and release its run's leases, atomically."""
         if not is_reauthenticated_backlog_operator(actor):
@@ -727,7 +735,7 @@ class OperationsRepository:
             if session.bind is not None and session.bind.dialect.name == "postgresql":
                 session.execute(text("SET LOCAL lock_timeout = '5s'"))
             return reconcile_publication_effect(
-                session, effect_id, phrase, actor, planned, observed
+                session, effect_id, phrase, actor, planned, observed, settlement=settlement
             )
 
     async def issue_amend_precheck(
