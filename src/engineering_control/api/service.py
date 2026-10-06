@@ -84,6 +84,7 @@ class ControlService(Protocol):
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
     async def current_open_run_id(self, workflow_id: str) -> str | None: ...
+    async def awaited_operator_issue(self, workflow_id: str) -> str | None: ...
 
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
     async def observe_issue_body(self, repository: str, issue_number: int) -> dict[str, Any]: ...
@@ -372,6 +373,18 @@ class TemporalControlService:
         if described.status != WorkflowExecutionStatus.RUNNING:
             return None
         return str(described.run_id) if described.run_id else None
+
+    async def awaited_operator_issue(self, workflow_id: str) -> str | None:
+        """NEW-143: the issue the open loop waits on (AWAITING_OPERATOR:<issue>:...), read
+        from its status query; None when it waits on nothing or cannot be read."""
+        try:
+            state = await self.client.get_workflow_handle(workflow_id).query("status")
+        except Exception:  # noqa: BLE001 - unreadable means no proof (callers fail closed)
+            return None
+        phase = str(state.get("phase", "")) if isinstance(state, dict) else ""
+        if not phase.startswith("AWAITING_OPERATOR:"):
+            return None
+        return phase.split(":", 2)[1] or None
 
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None:
         """NEW-114: refuse an issue-bound retry/skip the loop would silently ignore.

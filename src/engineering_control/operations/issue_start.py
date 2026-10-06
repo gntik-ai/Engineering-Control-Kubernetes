@@ -32,6 +32,28 @@ class IssueStartUnconfirmedError(RuntimeError):
         super().__init__(ISSUE_START_UNCONFIRMED)
 
 
+def issue_start_request(
+    command: SolveIssueCommand, operation_id: UUID, binding_hash: str
+) -> ExistingBacklogLoopStart:
+    """The loop request issue-start executes for one approved operation (NEW-143: shared
+    with issue-reapprove, which must rebuild exactly the same request)."""
+    return ExistingBacklogLoopStart(
+        project=command.project.value,
+        backlog_campaign_id=command.backlog_campaign_id,
+        maximum_risk=command.maximum_risk,
+        delivery_mode=command.delivery_mode,
+        maximum_items=1,
+        target_repository=command.repository,
+        target_issue_number=command.issue_number,
+        continue_after_blocked_issue=False,
+        correction_limit=command.correction_limit,
+        runtime_proof=command.runtime_proof,
+        r3_approval_binding=command.r3_approval_binding,
+        issue_operation_id=operation_id,
+        issue_approval_binding=binding_hash,
+    )
+
+
 def issue_request_from_operation(operation: OperationRequest) -> ExistingBacklogLoopStart:
     """Reconstruct the immutable attempted scope, not a new execution approval.
 

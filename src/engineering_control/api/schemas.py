@@ -276,6 +276,16 @@ class CorrectionExtensionRequest(APIModel):
     confirmation_phrase: str = Field(pattern=r"^EXTEND_CORRECTION_ONCE_[A-F0-9]{8}$")
 
 
+class IssueReapprovalRequest(APIModel):
+    """NEW-143: re-create a voided per-issue approval for the loop's existing operation."""
+
+    loop_workflow_id: str = Field(pattern=r"^backlog-loop-[A-Za-z0-9._:-]{1,227}$")
+    project: Literal["falcone", "musematic", "llmwiki"]
+    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"]
+    issue_number: int = Field(ge=1, le=2_147_483_647)
+    confirmation_phrase: str = Field(pattern=r"^REAPPROVE_ISSUE_[A-F0-9]{8}$")
+
+
 class IssueAmendRequest(APIModel):
     """NEW-115: preview (no confirm) or confirm one backlog issue body amendment."""
 
