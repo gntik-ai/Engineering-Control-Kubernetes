@@ -307,6 +307,14 @@ and waits for the policy reconciler's promotion. A rerun reports `ALREADY_APPROV
 changing anything; like every activation wait (issue-start too), it first re-enqueues the policy
 activation request if none is pending, so a failed request write is never left stuck.
 
+The loop's ChangeSet keeps its original issue-start approval as custody. Its next delivery or
+CI-repair child, registered under the re-issued campaign approval, continues that custody
+(NEW-144) only if everything but the campaign approval is identical (operation, operation
+binding, request, loop, issue snapshot) and the `issue_approval_reissued` event names that
+campaign approval for the operation and loop. The move is recorded once in the ChangeSet's
+`recovery_json.issue_execution_approval_reissued` (from/to binding, audit event); correction and
+CI-repair bounds keep counting the whole lineage.
+
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved

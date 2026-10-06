@@ -14,6 +14,7 @@ from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.db.models import (
     BacklogIssueRecord,
     ChangeSet,
+    DashboardEvent,
     Finding,
     GitHubBacklogCampaign,
     Run,
@@ -29,6 +30,7 @@ from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
 )
+from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 
 STEP_NAME = "delivery.issue_approval"
 
@@ -172,8 +174,18 @@ def register_child_issue_approval(
 
 
 def validate_child_issue_approval(
-    session: Session, approval_id: UUID, *, finding: Finding, run: Run, current: bool = True
+    session: Session,
+    approval_id: UUID,
+    *,
+    finding: Finding,
+    run: Run,
+    current: bool = True,
+    custody_bindings: list[str] | None = None,
 ) -> Step:
+    """``custody_bindings``: a ChangeSet's campaign approval bindings, oldest first (its
+    origin's, then each recorded NEW-144 re-issue). A record bound to any of them is still
+    current while the campaign holds the newest one; without it only the campaign's
+    current approval binding is."""
     record = session.get(Step, approval_id)
     if (
         record is None
@@ -217,7 +229,14 @@ def validate_child_issue_approval(
         value["issue_repository"] != issue.repository
         or value["issue_number"] != issue.issue_number
         or value["issue_snapshot_sha256"] != snapshot
-        or value["campaign_approval_binding"] != campaign.approval_binding
+        or not (
+            value["campaign_approval_binding"] == campaign.approval_binding
+            or (
+                custody_bindings is not None
+                and campaign.approval_binding == custody_bindings[-1]
+                and value["campaign_approval_binding"] in custody_bindings
+            )
+        )
     ):
         raise ValueError("delivery issue revision or campaign approval changed")
     return record
@@ -233,6 +252,257 @@ def _approval_scope(value: dict[str, Any]) -> dict[str, Any]:
         for key, item in value.items()
         if key not in {"child_workflow_id", "binding_sha256"}
     }
+
+
+# NEW-144: ChangeSet.recovery_json record of each move of its custody to a NEW-143
+# re-issued campaign approval of the same issue operation (from -> to campaign binding).
+REISSUE_CUSTODY_KEY = "issue_execution_approval_reissued"
+
+
+def custody_referenced_event_ids(session: Session) -> list[int]:
+    """NEW-144 review 2: the audit events some ChangeSet's custody chain references.
+
+    Only these re-issue events must outlive dashboard-event retention (custody re-proves
+    each recorded move against its event); unreferenced or superseded re-issue events age
+    out like every other event, so the table stays bounded."""
+    referenced: set[int] = set()
+    for recovery in session.scalars(
+        select(ChangeSet.recovery_json).where(ChangeSet.recovery_json.is_not(None))
+    ):
+        moves = recovery.get(REISSUE_CUSTODY_KEY) if isinstance(recovery, dict) else None
+        for move in moves if isinstance(moves, list) else []:
+            event_id = move.get("audit_event_id") if isinstance(move, dict) else None
+            if type(event_id) is int:
+                referenced.add(event_id)
+    return sorted(referenced)
+
+
+def expired_unreferenced_reissue_event_ids(
+    session: Session, cutoff: datetime, limit: int | None = None
+) -> list[int]:
+    """NEW-144 review 3: expired retained-type (re-issue) events no custody references.
+
+    The referenced ids stay a Python set (never a SQL parameter list, which a large
+    history would push past the driver's parameter limit); only the bounded population of
+    expired re-issue events is read and filtered here."""
+    if limit is not None and limit <= 0:
+        return []
+    referenced = set(custody_referenced_event_ids(session))
+    found: list[int] = []
+    for event_id in session.scalars(
+        select(DashboardEvent.id)
+        .where(
+            DashboardEvent.occurred_at < cutoff,
+            DashboardEvent.event_type.in_(RETAINED_DASHBOARD_EVENT_TYPES),
+        )
+        .order_by(DashboardEvent.id)
+    ):
+        if event_id not in referenced:
+            found.append(int(event_id))
+            if limit is not None and len(found) >= limit:
+                break
+    return found
+
+
+# The audit event NEW-143's issue-reapprove writes in its approval transaction.
+REISSUE_EVENT_TYPE = "issue_approval_reissued"
+_REISSUE_MOVE_FIELDS = frozenset(
+    {
+        "version",
+        "from",
+        "to",
+        "issue_operation_id",
+        "issue_approval_binding",
+        "loop_workflow_id",
+        "approval_id",
+        "audit_event_id",
+        "recorded_at",
+        "binding_sha256",
+    }
+)
+
+
+def _custody_scope(value: dict[str, Any]) -> dict[str, Any]:
+    """The approval scope without the campaign approval it was registered under."""
+    return {
+        key: item
+        for key, item in _approval_scope(value).items()
+        if key != "campaign_approval_binding"
+    }
+
+
+def _utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _reissue_event(
+    session: Session,
+    event: DashboardEvent | None,
+    origin_value: dict[str, Any],
+    to_binding: str,
+) -> DashboardEvent:
+    """The audit event of a NEW-143 re-issue of the origin's own approval to ``to_binding``."""
+    request = origin_value.get("request")
+    recorded = event.metadata_json if event is not None else None
+    if (
+        event is None
+        or not isinstance(request, dict)
+        or not request.get("issue_operation_id")
+        or not request.get("issue_approval_binding")
+        or event.event_type != REISSUE_EVENT_TYPE
+        or event.entity_type != "operation_request"
+        or event.entity_id != str(request["issue_operation_id"])
+        or event.workflow_id != origin_value.get("parent_workflow_id")
+        or not isinstance(recorded, dict)
+        or recorded.get("approval_binding") != to_binding
+        or recorded.get("issue_approval_binding", request["issue_approval_binding"])
+        != request["issue_approval_binding"]
+    ):
+        raise ValueError("ChangeSet already belongs to another issue approval")
+    return event
+
+
+def _reissued_approval(
+    session: Session, record: Step | None, origin: Step, to_binding: str
+) -> Step:
+    """A delivery child approval registered under the re-issued campaign approval, with
+    exactly the origin's scope otherwise."""
+    value = record.result_json if record is not None else None
+    if (
+        record is None
+        or record.name != STEP_NAME
+        or record.status != "COMPLETE"
+        or not isinstance(value, dict)
+        or value.get("binding_sha256")
+        != canonical_sha256({key: item for key, item in value.items() if key != "binding_sha256"})
+        or value.get("campaign_approval_binding") != to_binding
+        or _custody_scope(value) != _custody_scope(origin.result_json)
+    ):
+        raise ValueError("ChangeSet already belongs to another issue approval")
+    return record
+
+
+def _custody_chain(
+    session: Session, change_set: ChangeSet, origin: Step
+) -> tuple[list[str], tuple[int, datetime]]:
+    """The campaign approval bindings the ChangeSet's custody holds, oldest first, and the
+    (audit event id, time) every next move must strictly follow.
+
+    Each recorded move is re-proven from the authority it names on every read: its audit
+    event and its child approval Step must exist and match the origin's operation, loop and
+    scope; the moves continue each other and their audit events strictly increase (id and
+    time) after the origin. The move's own hash only detects corruption; it proves nothing."""
+    origin_value = origin.result_json
+    bindings = [str(origin_value["campaign_approval_binding"])]
+    last = (0, _utc(origin.created_at))
+    moves = (change_set.recovery_json or {}).get(REISSUE_CUSTODY_KEY)
+    if moves is None:
+        return bindings, last
+    request = origin_value.get("request")
+    if not isinstance(moves, list) or not isinstance(request, dict):
+        raise ValueError("ChangeSet approval re-issue record is malformed")
+    for move in moves:
+        if (
+            not isinstance(move, dict)
+            or set(move) != _REISSUE_MOVE_FIELDS
+            or move["version"] != 1
+            or move["from"] != bindings[-1]
+            or move["to"] in bindings
+            or move["issue_operation_id"] != request.get("issue_operation_id")
+            or move["issue_approval_binding"] != request.get("issue_approval_binding")
+            or move["loop_workflow_id"] != origin_value.get("parent_workflow_id")
+            or type(move["audit_event_id"]) is not int
+            or move["binding_sha256"]
+            != canonical_sha256(
+                {key: item for key, item in move.items() if key != "binding_sha256"}
+            )
+        ):
+            raise ValueError("ChangeSet approval re-issue record is malformed")
+        try:
+            event = _reissue_event(
+                session,
+                session.get(DashboardEvent, move["audit_event_id"]),
+                origin_value,
+                move["to"],
+            )
+            _reissued_approval(
+                session, session.get(Step, UUID(str(move["approval_id"]))), origin, move["to"]
+            )
+        except ValueError as error:
+            raise ValueError("ChangeSet approval re-issue record is not proven") from error
+        occurred = _utc(event.occurred_at)
+        if event.id <= last[0] or occurred <= last[1]:
+            raise ValueError("ChangeSet approval re-issue record is out of order")
+        bindings.append(str(move["to"]))
+        last = (int(event.id), occurred)
+    return bindings, last
+
+
+def custody_bindings(session: Session, change_set: ChangeSet, origin: Step) -> list[str]:
+    """The campaign approval bindings the ChangeSet's custody holds, oldest first."""
+    return _custody_chain(session, change_set, origin)[0]
+
+
+def _prove_reissue(
+    session: Session,
+    origin: Step,
+    record: Step,
+    from_binding: str,
+    after: tuple[int, datetime] | None = None,
+) -> dict[str, Any]:
+    """NEW-144: prove that ``record`` was registered under a NEW-143 re-issue of the
+    ChangeSet's own issue approval; returns the custody move to record.
+
+    Only the campaign approval may differ: the same issue operation, operation binding,
+    request (risk, mode, project, repository, issue, limits), loop, finding and issue
+    snapshot. The re-issued campaign approval must be the one an issue_approval_reissued
+    audit event, written in NEW-143's approval transaction, names for that operation and
+    loop, and that event must strictly follow the custody's latest move (``after``: event
+    id and time), so an older re-issue can never be replayed over a newer one."""
+    origin_value, value = origin.result_json, record.result_json
+    request = origin_value.get("request")
+    if (
+        _custody_scope(origin_value) != _custody_scope(value)
+        or not isinstance(request, dict)
+        or not request.get("issue_operation_id")
+        or not request.get("issue_approval_binding")
+    ):
+        raise ValueError("ChangeSet already belongs to another issue approval")
+    to_binding = str(value["campaign_approval_binding"])
+    loop = str(origin_value["parent_workflow_id"])
+    floor = after or (0, _utc(origin.created_at))
+    event = _reissue_event(
+        session,
+        session.scalar(
+            select(DashboardEvent)
+            .where(
+                DashboardEvent.event_type == REISSUE_EVENT_TYPE,
+                DashboardEvent.entity_type == "operation_request",
+                DashboardEvent.entity_id == str(request["issue_operation_id"]),
+                DashboardEvent.workflow_id == loop,
+                DashboardEvent.metadata_json["approval_binding"].as_string() == to_binding,
+            )
+            .order_by(DashboardEvent.id.desc())
+            .limit(1)
+        ),
+        origin_value,
+        to_binding,
+    )
+    if event.id <= floor[0] or _utc(event.occurred_at) <= floor[1]:
+        raise ValueError("ChangeSet already belongs to another issue approval")
+    move: dict[str, Any] = {
+        "version": 1,
+        "from": from_binding,
+        "to": to_binding,
+        "issue_operation_id": request["issue_operation_id"],
+        "issue_approval_binding": request["issue_approval_binding"],
+        "loop_workflow_id": loop,
+        "approval_id": str(record.id),
+        "audit_event_id": int(event.id),
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    move["binding_sha256"] = canonical_sha256(move)
+    return move
 
 
 # Main's backlog loop (NEW-99/101/102/103) re-delivers a published ChangeSet after a
@@ -431,17 +701,34 @@ def bind_change_set_issue_approval(
         recovery["issue_execution_approval_children"] = [reference]
         change_set.recovery_json = recovery
         return reference
+    origin = session.get(Step, UUID(previous["approval_id"]))
+    if origin is None or not isinstance(origin.result_json, dict):
+        raise ValueError("ChangeSet originating approval is missing")
+    try:
+        bindings, latest = _custody_chain(session, change_set, origin)
+    except (KeyError, ValueError) as error:
+        raise ValueError("ChangeSet already belongs to another issue approval") from error
+    if record.result_json.get("campaign_approval_binding") not in bindings:
+        # NEW-144: a child registered under a NEW-143 re-issue of this very approval
+        # continues the custody (the move is recorded first, then everything revalidated).
+        move = _prove_reissue(session, origin, record, bindings[-1], latest)
+        moves = recovery.get(REISSUE_CUSTODY_KEY)
+        recovery[REISSUE_CUSTODY_KEY] = [*(moves if isinstance(moves, list) else []), move]
+        change_set.recovery_json = recovery
+        recovery = dict(recovery)
+        bindings.append(move["to"])
     try:
         validated = validate_change_set_issue_approval(session, change_set.id)
     except ValueError as error:
         raise ValueError("ChangeSet already belongs to another issue approval") from error
     if validated is None or validated != previous:
         raise ValueError("ChangeSet already belongs to another issue approval")
-    origin = session.get(Step, UUID(previous["approval_id"]))
-    if origin is None:
-        raise ValueError("ChangeSet originating approval is missing")
-    # Child/run IDs change for bounded corrections; their authority must not.
-    if _approval_scope(origin.result_json) != _approval_scope(record.result_json):
+    # Child/run IDs change for bounded corrections; their authority must not (only the
+    # campaign approval may move, along the ChangeSet's recorded re-issues).
+    if (
+        _custody_scope(origin.result_json) != _custody_scope(record.result_json)
+        or record.result_json.get("campaign_approval_binding") not in bindings
+    ):
         raise ValueError("ChangeSet already belongs to another issue approval")
     children = recovery.get("issue_execution_approval_children")
     if not isinstance(children, list) or not children or children[0] != previous:
@@ -502,8 +789,19 @@ def validate_change_set_issue_approval(
     run = session.get(Run, record.run_id) if record is not None else None
     if run is None or run.change_set_id != change_set.id:
         raise ValueError("ChangeSet issue approval run binding changed")
+    if record is None or not isinstance(record.result_json, dict):
+        raise ValueError("ChangeSet issue approval run binding changed")
+    try:
+        bindings = custody_bindings(session, change_set, record)
+    except KeyError as error:
+        raise ValueError("ChangeSet issue approval reference is malformed") from error
     valid = validate_child_issue_approval(
-        session, UUID(reference["approval_id"]), finding=finding, run=run, current=current
+        session,
+        UUID(reference["approval_id"]),
+        finding=finding,
+        run=run,
+        current=current,
+        custody_bindings=bindings,
     )
     if approval_reference(valid) != reference:
         raise ValueError("ChangeSet issue approval digest changed")
@@ -531,11 +829,18 @@ def validate_change_set_issue_approval(
         if child_run is None or child_run.change_set_id != change_set.id:
             raise ValueError("ChangeSet correction run binding changed")
         child_record = validate_child_issue_approval(
-            session, child_id, finding=finding, run=child_run, current=current
+            session,
+            child_id,
+            finding=finding,
+            run=child_run,
+            current=current,
+            custody_bindings=bindings,
         )
-        if approval_reference(child_record) != child or _approval_scope(
-            child_record.result_json
-        ) != _approval_scope(valid.result_json):
+        if (
+            approval_reference(child_record) != child
+            or _custody_scope(child_record.result_json) != _custody_scope(valid.result_json)
+            or child_record.result_json.get("campaign_approval_binding") not in bindings
+        ):
             raise ValueError("ChangeSet correction authority changed")
         if _claims_ci_repair(child_record.result_json):
             _verify_ci_repair_child(session, change_set, valid, child_record.result_json)

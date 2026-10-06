@@ -112,6 +112,7 @@ from engineering_control.observability.agent import normalize_agent_role
 from engineering_control.operations.issue_amend import record_consumed_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     bind_change_set_issue_approval,
+    expired_unreferenced_reissue_event_ids,
     validate_change_set_issue_approval,
     validate_child_issue_approval,
 )
@@ -122,6 +123,7 @@ from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapsho
 from engineering_control.retention_limits import (
     DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
     NOTIFICATION_OUTBOX_PENDING_STATUS,
+    RETAINED_DASHBOARD_EVENT_TYPES,
 )
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.workflows.cleanup_scope import (
@@ -7754,14 +7756,17 @@ class MetadataActivityHandler:
                     )
             preview_candidates = self._preview_namespace_cleanup_candidates(session, now)
             event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
+            # NEW-144 review 3: ordinary events counted in SQL; expired re-issue events
+            # filtered against the custody references in Python (no SQL id list).
             dashboard_event_cleanup_count = int(
                 session.scalar(
                     select(func.count(DashboardEvent.id)).where(
-                        DashboardEvent.occurred_at < event_cutoff
+                        DashboardEvent.occurred_at < event_cutoff,
+                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
                     )
                 )
                 or 0
-            )
+            ) + len(expired_unreferenced_reissue_event_ids(session, event_cutoff))
             dashboard_session_revocation_cleanup_count = int(
                 session.scalar(
                     select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
@@ -8175,12 +8180,24 @@ class MetadataActivityHandler:
                 cleaned_previews.append(str(deployment.id))
 
             event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
-            expired_events = session.scalars(
-                select(DashboardEvent)
-                .where(DashboardEvent.occurred_at < event_cutoff)
-                .order_by(DashboardEvent.id)
-                .limit(10_000)
-            ).all()
+            expired_events = list(
+                session.scalars(
+                    select(DashboardEvent)
+                    .where(
+                        DashboardEvent.occurred_at < event_cutoff,
+                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                    )
+                    .order_by(DashboardEvent.id)
+                    .limit(10_000)
+                ).all()
+            )
+            # NEW-144 review 3: plus expired re-issue events no custody references.
+            for event_id in expired_unreferenced_reissue_event_ids(
+                session, event_cutoff, limit=max(0, 10_000 - len(expired_events))
+            ):
+                stale = session.get(DashboardEvent, event_id)
+                if stale is not None:
+                    expired_events.append(stale)
             for event in expired_events:
                 session.delete(event)
             deleted_dashboard_events = len(expired_events)

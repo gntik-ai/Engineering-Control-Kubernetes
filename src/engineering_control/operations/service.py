@@ -307,6 +307,7 @@ class TypedCommandBus:
                     approval_binding=str(approved["approval_binding"]),
                     approval_status=str(approved["status"]),
                     actor=actor,
+                    issue_approval_binding=request.issue_approval_binding,
                 )
 
             approval = await self.metadata.reissue_issue_approval(
