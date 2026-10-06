@@ -2457,6 +2457,8 @@ async def test_solve_waits_for_the_policy_reconciler_before_starting(tmp_path: P
     metadata.approve_backlog_campaign = AsyncMock(
         return_value={"status": "APPROVED_POLICY_PENDING"}
     )
+    # NEW-143 review: a missing activation request is re-enqueued before waiting.
+    metadata.ensure_policy_activation = AsyncMock(return_value="ACTIVATION_PENDING")
     metadata.get_backlog_campaign = AsyncMock(side_effect=campaign)
     bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
     bus.policy_activation_poll_seconds = 0
@@ -2485,6 +2487,8 @@ async def test_solve_blocks_instead_of_starting_without_an_active_write_policy(
     metadata.approve_backlog_campaign = AsyncMock(
         return_value={"status": "APPROVED_POLICY_PENDING"}
     )
+    # NEW-143 review: a missing activation request is re-enqueued before waiting.
+    metadata.ensure_policy_activation = AsyncMock(return_value="ACTIVATION_PENDING")
     metadata.get_backlog_campaign = AsyncMock(return_value={"status": "APPROVED_POLICY_PENDING"})
     bus = TypedCommandBus(control, metadata, repository)  # type: ignore[arg-type]
     bus.policy_activation_timeout_seconds = 0

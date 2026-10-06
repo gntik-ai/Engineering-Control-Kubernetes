@@ -298,11 +298,14 @@ refused with an `ISSUE_REAPPROVE_*` code unless:
 - no other loop of the campaign is open and the current approval is not bound to another open
   issue operation (`CAMPAIGN_IN_USE`, `CAMPAIGN_BOUND_TO_OTHER_ISSUE`).
 
-It then runs issue-start's own approval path (`prepare_backlog_approval` with the issue request,
-`approve_backlog_campaign`), so the approval has the same one-item, issue-bound shape, goes
-`APPROVED_POLICY_PENDING` and waits for the policy reconciler's promotion. An
-`issue_approval_reissued` dashboard event records the operator and the new approval binding. A
-rerun reports `ALREADY_APPROVED` without changing anything (and still waits for activation).
+It then runs issue-start's own approval steps (prepare with the issue request, approve) in one
+transaction that holds the campaign approval and row locks, re-checks every precondition first
+(a campaign approval or status changed since the first check refuses with `CAMPAIGN_CHANGED`) and
+writes the `issue_approval_reissued` dashboard event (operator, new approval binding) with the
+approval. The approval has the same one-item, issue-bound shape, goes `APPROVED_POLICY_PENDING`
+and waits for the policy reconciler's promotion. A rerun reports `ALREADY_APPROVED` without
+changing anything; like every activation wait (issue-start too), it first re-enqueues the policy
+activation request if none is pending, so a failed request write is never left stuck.
 
 ## Operator change requests (NEW-108)
 

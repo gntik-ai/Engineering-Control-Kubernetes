@@ -31,6 +31,7 @@ from engineering_control.db.models import (
     Run,
     Step,
 )
+from engineering_control.models.enums import RiskClass
 from engineering_control.operations.issue_reapproval import (
     IssueReapprovalBlocked,
     reapproval_phrase,
@@ -64,8 +65,9 @@ class _Live:
         original = metadata.get_backlog_campaign
 
         async def promoted(campaign_id: UUID) -> Any:
-            # The root policy reconciler promotes a pending campaign.
-            self.set_campaign(status="APPROVED", only_from="APPROVED_POLICY_PENDING")
+            # The root policy reconciler promotes a pending campaign it has a request for.
+            if (Path(metadata.github_policy_request_root) / "activate.json").exists():
+                self.set_campaign(status="APPROVED", only_from="APPROVED_POLICY_PENDING")
             return await original(campaign_id)
 
         metadata.get_backlog_campaign = promoted
@@ -511,3 +513,129 @@ def test_api_reapproves_through_the_operator_channel_only() -> None:
         "REAPPROVE_ISSUE_E2535599",
         "cli:engineering-ctl",
     )
+
+
+def _after_first_check(live: _Live, change: Callable[[], Awaitable[None] | None]) -> None:
+    """Run ``change`` between the read-only check and the approving transaction."""
+    original = live.operations.plan_issue_reapproval
+
+    async def planned(**arguments: Any) -> dict[str, Any]:
+        plan: dict[str, Any] = await original(**arguments)
+        changed = change()
+        if changed is not None:
+            await changed
+        return plan
+
+    live.operations.plan_issue_reapproval = planned
+
+
+async def test_a_newer_campaign_approval_after_the_check_is_never_overwritten(
+    tmp_path: Path,
+) -> None:
+    # Codex review: a newer R1 approval between the check and the approval was replaced
+    # by the issue's R2 one.
+    live = await _voided(tmp_path)
+
+    async def approve_r1() -> None:
+        candidate = await live.metadata.prepare_backlog_approval(
+            CAMPAIGN_ID,
+            BacklogApprovalCandidateRequest(
+                project="falcone",
+                delivery_mode=live.request.delivery_mode,
+                maximum_risk=RiskClass.R1,
+                maximum_items=5,
+            ),
+        )
+        await live.metadata.approve_backlog_campaign(
+            CAMPAIGN_ID, "falcone", candidate["approval_binding"], "cli:engineering-ctl"
+        )
+
+    _after_first_check(live, approve_r1)
+    with pytest.raises(IssueReapprovalBlocked) as refused:
+        await live.reapprove()
+    assert refused.value.blocker in {
+        "ISSUE_REAPPROVE_CAMPAIGN_CHANGED",
+        "ISSUE_REAPPROVE_POLICY_EXCEEDED",
+    }
+    binding = live.approval()[1]["binding"]
+    assert binding["maximum_risk"] == "R1" and binding.get("issue_approval") is None
+    live.dispose()
+
+
+async def test_a_loop_opened_after_the_check_refuses_the_approval(tmp_path: Path) -> None:
+    live = await _voided(tmp_path)
+    before = live.approval()
+    _after_first_check(live, lambda: _another_open_loop(live))
+    with pytest.raises(IssueReapprovalBlocked, match="CAMPAIGN_IN_USE"):
+        await live.reapprove()
+    assert live.approval() == before
+    live.dispose()
+
+
+async def test_a_lost_activation_request_is_enqueued_again_by_a_rerun(tmp_path: Path) -> None:
+    # Codex review: the approval commits before its activation request is written; a failed
+    # write left ALREADY_APPROVED reruns waiting forever with nothing enqueued.
+    live = await _voided(tmp_path)
+    original = live.metadata._write_github_policy_request
+    writes: list[str] = []
+
+    def failing(request: dict[str, Any]) -> None:
+        writes.append("attempt")
+        if len(writes) <= 2:
+            raise ValueError("GitHub policy request directory is unavailable or insecure")
+        original(request)
+
+    live.metadata._write_github_policy_request = failing
+    live.bus.policy_activation_timeout_seconds = 0.2
+    with pytest.raises(ValueError):
+        await live.reapprove()
+    assert live.approval()[0] == "APPROVED_POLICY_PENDING"
+    assert len(writes) == 2  # the approval's write and one re-enqueue, both failed
+
+    result = await live.reapprove()
+    assert result["status"] == "ALREADY_APPROVED"
+    assert len(writes) == 3
+    assert live.approval()[0] == "APPROVED"
+    live.dispose()
+
+
+async def test_a_failed_audit_record_rolls_the_approval_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from engineering_control.operations import service
+
+    live = await _voided(tmp_path)
+    before = live.approval()
+
+    def broken(*_args: Any, **_kwargs: Any) -> int:
+        raise RuntimeError("audit store unavailable")
+
+    monkeypatch.setattr(service, "record_issue_reapproval", broken)
+    with pytest.raises(RuntimeError, match="audit store unavailable"):
+        await live.reapprove()
+    assert live.approval() == before
+    with live.operations.sessions() as session:
+        assert (
+            session.scalar(
+                select(DashboardEvent).where(DashboardEvent.event_type == "issue_approval_reissued")
+            )
+            is None
+        )
+    live.dispose()
+
+
+async def test_the_status_query_is_pinned_to_the_open_run() -> None:
+    from temporalio.common import QueryRejectCondition
+
+    from engineering_control.api.service import TemporalControlService
+
+    client = Mock()
+    handle = client.get_workflow_handle.return_value
+    handle.query = AsyncMock(return_value={"phase": f"AWAITING_OPERATOR:{ISSUE}:X"})
+    service = TemporalControlService(client, "isolated-recorder-only", Mock())
+    assert await service.awaited_operator_issue("loop-1", "run-7") == ISSUE
+    client.get_workflow_handle.assert_called_with("loop-1", run_id="run-7")
+    assert handle.query.await_args.kwargs["reject_condition"] == QueryRejectCondition.NOT_OPEN
+    # A closed run's query is rejected by Temporal: no proof.
+    handle.query = AsyncMock(side_effect=RuntimeError("query rejected: workflow closed"))
+    assert await service.awaited_operator_issue("loop-1", "run-7") is None

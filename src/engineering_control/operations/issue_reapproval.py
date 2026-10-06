@@ -127,8 +127,12 @@ def plan_issue_reapproval(
     confirmation: str,
     current_run_id: str | None,
     awaited_issue: str | None,
+    validated: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Every precondition, re-read from durable records; returns the loop's request.
+
+    ``validated`` is an earlier plan's campaign identity: re-run inside the approving
+    transaction, the campaign must still have exactly that approval and status.
 
     ``status`` is REAPPROVE (run issue-start's approval path) or ALREADY_APPROVED (the
     current campaign approval is already this operation's: an idempotent rerun)."""
@@ -235,7 +239,8 @@ def plan_issue_reapproval(
         and campaign.status in _APPROVED_CAMPAIGN_STATES
         and isinstance(campaign.approval_json.get("approval"), dict)
     ):
-        return {"status": "ALREADY_APPROVED", "request": request, "campaign": campaign.status}
+        plan = {"status": "ALREADY_APPROVED", "request": request, "campaign": campaign.status}
+        return _unchanged(plan, campaign, validated)
     if reference is not None and reference.operation_id != str(operation.id):
         other = session.get(OperationRequest, UUID(reference.operation_id))
         if other is not None and other.status in _OPEN_OPERATION_STATES:
@@ -243,7 +248,24 @@ def plan_issue_reapproval(
                 "CAMPAIGN_BOUND_TO_OTHER_ISSUE",
                 f"the campaign approval belongs to the open issue operation {other.id}",
             )
-    return {"status": "REAPPROVE", "request": request, "campaign": campaign.status}
+    plan = {"status": "REAPPROVE", "request": request, "campaign": campaign.status}
+    return _unchanged(plan, campaign, validated)
+
+
+def _unchanged(
+    plan: dict[str, Any], campaign: GitHubBacklogCampaign, validated: dict[str, Any] | None
+) -> dict[str, Any]:
+    plan["approval_binding"] = campaign.approval_binding
+    if validated is not None and (
+        plan["status"] != validated["status"]
+        or plan["campaign"] != validated["campaign"]
+        or plan["approval_binding"] != validated["approval_binding"]
+    ):
+        raise _refuse(
+            "CAMPAIGN_CHANGED",
+            "the campaign approval or ownership changed since it was validated; run again",
+        )
+    return plan
 
 
 def record_issue_reapproval(

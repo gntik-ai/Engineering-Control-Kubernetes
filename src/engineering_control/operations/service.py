@@ -27,6 +27,10 @@ from engineering_control.api.service import ControlService
 from engineering_control.db.repository import MetadataRepository
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.operations.connections import ConnectionHealthProjector
+from engineering_control.operations.issue_reapproval import (
+    plan_issue_reapproval,
+    record_issue_reapproval,
+)
 from engineering_control.operations.issue_start import (
     IssueStartUnconfirmedError,
     issue_start_request,
@@ -252,22 +256,32 @@ class TypedCommandBus:
         """NEW-143: re-create a voided per-issue campaign approval for the loop's existing
         issue operation, through issue-start's own approval path.
 
-        The request is rebuilt from durable records only (plan_issue_reapproval). A rerun
-        after the approval reports ALREADY_APPROVED (and still awaits policy activation)."""
+        The request is rebuilt from durable records only (plan_issue_reapproval). The
+        preconditions are checked, then re-checked inside the one transaction that prepares,
+        approves and audits, under the campaign approval and row locks; any change of the
+        campaign's approval in between refuses. A rerun after the approval reports
+        ALREADY_APPROVED, re-enqueues a missing policy activation and awaits it."""
         current_run_id = await self.control.current_open_run_id(loop_workflow_id)
-        awaited_issue = await self.control.awaited_operator_issue(loop_workflow_id)
-        plan = await self.operations.plan_issue_reapproval(
-            loop_workflow_id,
-            project,
-            repository,
-            issue_number,
-            phrase,
-            actor,
-            current_run_id,
-            awaited_issue,
+        awaited_issue = (
+            await self.control.awaited_operator_issue(loop_workflow_id, current_run_id)
+            if current_run_id
+            else None
         )
+        arguments: dict[str, Any] = {
+            "loop_workflow_id": loop_workflow_id,
+            "project": project,
+            "repository": repository,
+            "issue_number": issue_number,
+            "confirmation": phrase,
+            "current_run_id": current_run_id,
+            "awaited_issue": awaited_issue,
+        }
+        plan = await self.operations.plan_issue_reapproval(actor=actor, **arguments)
         request: ExistingBacklogLoopStart = plan["request"]
         campaign_id = request.backlog_campaign_id
+        operation_id = request.issue_operation_id
+        if operation_id is None:
+            raise ValueError("issue re-approval requires the loop's issue operation")
         issue_ref = f"{request.target_repository}#{request.target_issue_number}"
         result: dict[str, Any] = {
             "loop_workflow_id": loop_workflow_id,
@@ -279,29 +293,28 @@ class TypedCommandBus:
             approval: dict[str, Any] = {"status": plan["campaign"]}
             result["status"] = "ALREADY_APPROVED"
         else:
-            candidate = await self.metadata.prepare_backlog_approval(
-                campaign_id,
-                BacklogApprovalCandidateRequest(
-                    project=request.project,
-                    delivery_mode=request.delivery_mode,
-                    maximum_risk=request.maximum_risk,
-                    maximum_items=1,
-                ),
-                issue_request=request,
-            )
-            approval = await self.metadata.approve_backlog_campaign(
-                campaign_id, request.project, str(candidate["approval_binding"]), actor
+            validated = {key: plan[key] for key in ("status", "campaign", "approval_binding")}
+
+            def validate(session: Any) -> None:
+                plan_issue_reapproval(session, validated=validated, **arguments)
+
+            def audit(session: Any, approved: dict[str, Any]) -> int:
+                return record_issue_reapproval(
+                    session,
+                    loop_workflow_id=loop_workflow_id,
+                    operation_id=operation_id,
+                    issue_ref=issue_ref,
+                    approval_binding=str(approved["approval_binding"]),
+                    approval_status=str(approved["status"]),
+                    actor=actor,
+                )
+
+            approval = await self.metadata.reissue_issue_approval(
+                request, actor, validate=validate, audit=audit
             )
             result["status"] = "REAPPROVED"
-            result["approval_binding"] = str(candidate["approval_binding"])
-            result["audit_event_id"] = await self.operations.record_issue_reapproval(
-                loop_workflow_id=loop_workflow_id,
-                operation_id=request.issue_operation_id,
-                issue_ref=issue_ref,
-                approval_binding=str(candidate["approval_binding"]),
-                approval_status=str(approval.get("status")),
-                actor=actor,
-            )
+            result["approval_binding"] = str(approval["approval_binding"])
+            result["audit_event_id"] = approval["audit_event_id"]
         await self._await_policy_activation(campaign_id, approval)
         short = str(request.target_repository).removeprefix("gntik-ai/")
         result["next"] = (
@@ -316,6 +329,10 @@ class TypedCommandBus:
         # enabled (NEW-26). Start only once the reconciler has promoted the campaign.
         if approval.get("status") != "APPROVED_POLICY_PENDING":
             return
+        # NEW-143 review: the approval commits before its activation request is written; a
+        # failed write or a stopped process must not leave it waiting forever, so a missing
+        # request is (re-)enqueued (a no-op while one is pending).
+        await self.metadata.ensure_policy_activation(campaign_id)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.policy_activation_timeout_seconds
         while True:
