@@ -84,6 +84,17 @@ UNHEALTHY_POD_REASONS = frozenset({"CrashLoopBackOff", "ImagePullBackOff", "ErrI
 MAXIMUM_POD_DELETIONS = 25
 _SHA = re.compile(r"[a-f0-9]{40}")
 _KUBERNETES_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
+# NEW-145b: the head branches a publication reconciliation may list PRs for.
+_LISTING_REPOSITORIES = frozenset(
+    {
+        "gntik-ai/falcone",
+        "gntik-ai/falcone-charts",
+        "gntik-ai/musematic",
+        "gntik-ai/musematic-deploy",
+        "gntik-ai/llmwiki",
+    }
+)
+_AGENT_BRANCH = re.compile(r"agent/(?:falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}")
 _PR_URL = re.compile(
     r"https://github\.com/(gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki))"
     r"/pull/([1-9][0-9]*)"
@@ -2190,7 +2201,41 @@ class GitOpsGitHubHandler:
                     "base_branch": str(pull_request.get("baseRefName") or ""),
                 }
             )
-        return {"status": "OK", "heads": heads}
+        result: dict[str, Any] = {"status": "OK", "heads": heads}
+        listings = payload.get("branch_listings")
+        if listings is not None:
+            result["listings"] = self._branch_listings(listings)
+        return result
+
+    def _branch_listings(self, raw: Any) -> list[dict[str, Any]]:
+        """NEW-145b: every PR (any state, any base) whose head is each named branch."""
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 2:
+            raise ValueError("pull request branch listing request is invalid")
+        listings: list[dict[str, Any]] = []
+        for item in raw:
+            repository = str(item.get("repository") if isinstance(item, dict) else "")
+            branch = str(item.get("branch") if isinstance(item, dict) else "")
+            if repository not in _LISTING_REPOSITORIES or not _AGENT_BRANCH.fullmatch(branch):
+                raise ValueError("pull request branch listing is outside the allowlist")
+            pull_requests = []
+            for value in self.broker.pull_requests_by_head(repository, branch):
+                state = str(value.get("state") or "").upper()
+                if state == "CLOSED" and value.get("merged_at"):
+                    state = "MERGED"
+                pull_requests.append(
+                    {
+                        "number": value.get("number"),
+                        "url": str(value.get("url") or ""),
+                        "state": state,
+                        "base_branch": str(value.get("base_ref") or ""),
+                        "head_sha": str(value.get("head_sha") or ""),
+                        "created_at": str(value.get("created_at") or ""),
+                    }
+                )
+            listings.append(
+                {"repository": repository, "branch": branch, "pull_requests": pull_requests}
+            )
+        return listings
 
     def _deployment_pr_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
         """NEW-103: the deployment PR's CI must pass before either PR merges.

@@ -839,7 +839,10 @@ def create_app(
         if settlement is not None:
             settlement = {**settlement, "heads_read_from": datetime.now(UTC).isoformat()}
         try:
-            observed = await service.observe_pull_request_heads(plan["pull_request_urls"])
+            # NEW-145b: with the intent's PR creations, also every PR on each head branch.
+            observation = await service.observe_pull_request_heads(
+                plan["pull_request_urls"], plan.get("branch_listings") or None
+            )
         except Exception as error:  # noqa: BLE001 - one bounded operator-facing failure
             raise HTTPException(
                 status_code=503,
@@ -848,7 +851,13 @@ def create_app(
             ) from error
         try:
             return await repository.reconcile_publication_effect(
-                body.effect_id, body.confirmation_phrase, actor, plan, observed, settlement
+                body.effect_id,
+                body.confirmation_phrase,
+                actor,
+                plan,
+                observation["heads"],
+                settlement,
+                observation["listings"],
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

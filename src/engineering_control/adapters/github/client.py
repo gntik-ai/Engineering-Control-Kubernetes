@@ -380,6 +380,49 @@ class GhCliBroker:
         )
         return self._list(value, "pull request list")
 
+    # NEW-145b: a head-branch listing that reaches this many PRs is refused, never cut.
+    PULL_REQUESTS_BY_HEAD_CAP = 1000
+
+    def pull_requests_by_head(self, repository: str, branch: str) -> list[dict[str, Any]]:
+        """Every pull request (any state, any base) whose head is ``owner:branch``.
+
+        Read-only and complete: the REST listing is paginated to its end (``--paginate``),
+        and a listing that reaches the cap is refused rather than evaluated."""
+        repository = self._batch(repository)
+        branch = self._value(branch, "pull request head branch", maximum=200)
+        owner = repository.split("/", 1)[0]
+        raw = self._run(
+            [
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repository}/pulls",
+                "-f",
+                f"head={owner}:{branch}",
+                "-f",
+                "state=all",
+                "-f",
+                "per_page=100",
+                "--paginate",
+                "--jq",
+                (
+                    ".[] | {number: .number, url: .html_url, state: .state, "
+                    "merged_at: .merged_at, head_label: .head.label, head_sha: .head.sha, "
+                    "base_ref: .base.ref, created_at: .created_at} | @json"
+                ),
+            ]
+        ).stdout
+        entries = [line for line in raw.splitlines() if line.strip()]
+        if len(entries) >= self.PULL_REQUESTS_BY_HEAD_CAP:
+            raise GhCliPolicyError("pull request head listing reached its cap")
+        listed: list[dict[str, Any]] = []
+        for entry in entries:
+            value = self._json(entry, "pull request head listing")
+            if not isinstance(value, dict) or value.get("head_label") != f"{owner}:{branch}":
+                raise GhCliPolicyError("pull request head listing returned another head")
+            listed.append(value)
+        return listed
+
     def workflow_run(self, repository: str, run_id: int) -> dict[str, Any]:
         repository = self._batch(repository)
         if run_id < 1:

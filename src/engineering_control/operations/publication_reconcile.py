@@ -12,8 +12,18 @@ unrecorded change. The effect then moves to the terminal status RECONCILED with 
 Only the provably safe case is covered (NEW-145 review): an effect whose publisher
 returned a committed UNKNOWN receipt for its current claim (nothing still runs under that
 claim) and whose action is a ``git_push`` of the recorded branch of an already-bound,
-pre-existing PR. A STARTED effect (a publisher may still be running) and any PR creation
-(a replacement PR the bound URLs would never show) need another, fenced resolution.
+pre-existing PR, or (NEW-145b) a ``pr_create`` for it. A STARTED effect (a publisher may
+still be running) needs another, fenced resolution.
+
+PR creation (NEW-145b). A created PR need not be one of the bound URLs (e.g. a replacement
+at the configured base after the bound PR was retargeted), so every ``pr_create`` effect
+of the effect's publication intent, whatever its status, needs listing evidence: the
+GitHub worker lists every PR (any state, any base, paginated to the end) whose head is the
+plan's branch in that repository. The listing must be exactly the ChangeSet's bound PR for
+that repository. For an UNKNOWN (or NOT_ATTEMPTED) creation the bound PR must have been
+created before the effect's admission, so this claim created nothing; for a COMPLETE
+creation the PR it created must be the bound one (created at or after its admission).
+Anything else is refused.
 """
 
 from __future__ import annotations
@@ -42,8 +52,11 @@ RECONCILED = RECONCILED_EFFECT_STATE
 REMOTE_SETTLE = timedelta(minutes=30)
 RECONCILE_EVENT_TYPE = "publication_effect_reconciled"
 RECONCILE_METHOD = "LIVE_PR_HEADS_EQUAL_RECORDED_PUBLICATION"
-# The only action whose effect the bound PRs' live heads and branches fully show.
-RECONCILABLE_ACTION = "git_push"
+# Actions whose effect the bound PRs' live heads, branches and the complete head-branch
+# PR listing (NEW-145b, pr_create) fully show.
+RECONCILABLE_ACTIONS = frozenset({"git_push", "pr_create"})
+# pr_create effects of the intent whose outcome the listing can settle.
+_SETTLEABLE_CREATE_STATES = frozenset({"UNKNOWN", "NOT_ATTEMPTED", "COMPLETE"})
 _ACTIVE_RUN_STATES = frozenset({"QUEUED", "RUNNING", "RATE_LIMITED", "AWAITING_APPROVAL"})
 _SHA = re.compile(r"[0-9a-f]{40}")
 _PR_URL = re.compile(
@@ -167,26 +180,6 @@ def plan_publication_reconcile(
         isinstance(item, dict) for item in publications
     ):
         raise _refuse("EFFECT_CUSTODY_INVALID", "the effect's publication plan is unavailable")
-    # Any PR creation under this intent (this effect's or another's) may have left a
-    # replacement PR that the recorded PR URLs never show.
-    created = [
-        item["repository"]
-        for item in publications
-        if session.get(
-            Step,
-            uuid5(
-                NAMESPACE_URL,
-                f"publication-effect:{intent.id}:{item.get('repository')}:pr_create",
-            ),
-        )
-        is not None
-    ]
-    if action != RECONCILABLE_ACTION or created:
-        raise _refuse(
-            "EFFECT_ACTION_UNSUPPORTED",
-            "only a git push to an already-bound PR is reconcilable; this publication "
-            f"{'created a PR' if created else f'is a {action}'}",
-        )
     by_repository = {
         match.group(1): (url, value)
         for url, value in recorded.items()
@@ -194,6 +187,11 @@ def plan_publication_reconcile(
     }
     publication = next((item for item in publications if item.get("repository") == target), None)
     bound = by_repository.get(str(target))
+    if action not in RECONCILABLE_ACTIONS:
+        raise _refuse(
+            "EFFECT_ACTION_UNSUPPORTED",
+            f"only a git push or PR creation for an already-bound PR is reconcilable, not {action}",
+        )
     if (
         bound is None
         or publication is None
@@ -202,8 +200,46 @@ def plan_publication_reconcile(
     ):
         raise _refuse(
             "EFFECT_TARGET_UNBOUND",
-            f"the effect's push target ({target}) is not exactly the ChangeSet's recorded PRs",
+            f"the effect's target ({target}) is not exactly the ChangeSet's recorded PRs",
         )
+    # NEW-145b: every PR creation under this intent (this effect's or another's) may have
+    # left a PR the bound URLs never show; each needs a complete head-branch listing.
+    creations: dict[str, dict[str, str]] = {}
+    latest_receipt = str(effect.result_json.get("received_at") or "")
+    for item in publications:
+        repository = str(item.get("repository"))
+        created = session.get(
+            Step, uuid5(NAMESPACE_URL, f"publication-effect:{intent.id}:{repository}:pr_create")
+        )
+        if created is None:
+            continue
+        if (
+            created.name != EFFECT_STEP
+            or created.run_id != effect.run_id
+            or not isinstance(created.result_json, dict)
+        ):
+            raise _refuse("EFFECT_CUSTODY_INVALID", f"the {repository} PR creation is malformed")
+        if created.status not in _SETTLEABLE_CREATE_STATES:
+            raise _refuse(
+                "EFFECT_ACTION_UNSUPPORTED",
+                f"the {repository} PR creation is {created.status}; its publisher may still run",
+            )
+        if created.status == "UNKNOWN":
+            # Its publisher must have settled too (same subject, restart after its receipt).
+            if created.result_json.get("subject") != effect.result_json.get("subject"):
+                raise _refuse(
+                    "EFFECT_CUSTODY_INVALID", f"the {repository} PR creation had another publisher"
+                )
+            received = str(created.result_json.get("received_at") or "")
+            if received > latest_receipt:
+                latest_receipt = received
+        creations[repository] = {
+            "effect_id": str(created.id),
+            "status": str(created.status),
+            "admitted_at": str(created.result_json.get("admitted_at") or ""),
+            "bound_url": by_repository[repository][0],
+            "branch": by_repository[repository][1]["branch"],
+        }
     return {
         "status": "RECONCILE",
         "effect_id": str(effect.id),
@@ -216,10 +252,17 @@ def plan_publication_reconcile(
             for item in publications
         },
         "pull_request_urls": list(recorded),
+        # NEW-145b: the intent's PR creations, each settled by its head-branch listing.
+        "creations": creations,
+        "branch_listings": [
+            {"repository": repository, "branch": creation["branch"]}
+            for repository, creation in sorted(creations.items())
+        ],
         # NEW-145 review 2: who published, and when its UNKNOWN receipt committed; the
         # publisher must have restarted (its cgroup killed) after that before reconciling.
         "subject": str(effect.result_json.get("subject") or ""),
-        "receipt_received_at": str(effect.result_json.get("received_at") or ""),
+        # NEW-145b: the latest UNKNOWN receipt of the effect and the intent's PR creations.
+        "receipt_received_at": latest_receipt,
     }
 
 
@@ -264,6 +307,75 @@ def _require_publisher_settled(plan: dict[str, Any], settlement: dict[str, Any] 
         )
 
 
+def _require_no_unrecorded_pull_request(
+    plan: dict[str, Any], listings: list[dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """NEW-145b: each PR creation of the intent is settled by the complete listing of every
+    PR whose head is its branch: exactly the bound PR, created before an uncertain (or
+    unattempted) creation's admission, or at/after a completed one's (it is that PR)."""
+    by_repository = {
+        str(item.get("repository")): item for item in listings or [] if isinstance(item, dict)
+    }
+    evidence: list[dict[str, Any]] = []
+    for repository, creation in sorted(plan["creations"].items()):
+        listing = by_repository.get(repository)
+        pulls = listing.get("pull_requests") if isinstance(listing, dict) else None
+        if (
+            listing is None
+            or listing.get("branch") != creation["branch"]
+            or not isinstance(pulls, list)
+        ):
+            raise _refuse(
+                "PR_LISTING_MISSING",
+                f"no complete PR listing of {repository} head {creation['branch']}",
+            )
+        others = [
+            item
+            for item in pulls
+            if not isinstance(item, dict) or item.get("url") != creation["bound_url"]
+        ]
+        if others or len(pulls) != 1:
+            urls = ", ".join(str(item.get("url")) for item in others if isinstance(item, dict))
+            raise _refuse(
+                "PR_CREATED_UNRECORDED",
+                f"{repository} head {creation['branch']} has PRs besides the bound "
+                f"{creation['bound_url']}: {urls or 'duplicates'}",
+            )
+        bound = pulls[0]
+        try:
+            created_at = datetime.fromisoformat(str(bound.get("created_at")).replace("Z", "+00:00"))
+            admitted_at = datetime.fromisoformat(creation["admitted_at"])
+        except ValueError as error:
+            raise _refuse(
+                "PR_LISTING_MISSING", f"the creation time of {creation['bound_url']} is unreadable"
+            ) from error
+        if creation["status"] == "COMPLETE":
+            if created_at < admitted_at:
+                raise _refuse(
+                    "PR_CREATED_UNRECORDED",
+                    f"{repository}: the completed PR creation did not create the bound "
+                    f"{creation['bound_url']} (created before its admission)",
+                )
+        elif created_at >= admitted_at:
+            raise _refuse(
+                "BOUND_PR_CREATED_AFTER_ADMISSION",
+                f"{creation['bound_url']} was created at {created_at.isoformat()}, after the "
+                f"uncertain PR creation was admitted ({admitted_at.isoformat()})",
+            )
+        evidence.append(
+            {
+                "repository": repository,
+                "branch": creation["branch"],
+                "creation_effect_id": creation["effect_id"],
+                "creation_status": creation["status"],
+                "pull_requests": [str(bound.get("url"))],
+                "bound_created_at": created_at.isoformat(),
+                "admitted_at": admitted_at.isoformat(),
+            }
+        )
+    return evidence
+
+
 def reconcile_publication_effect(
     session: Session,
     effect_id: UUID,
@@ -273,6 +385,7 @@ def reconcile_publication_effect(
     observed: list[dict[str, Any]],
     now: datetime | None = None,
     settlement: dict[str, Any] | None = None,
+    listings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Re-check under the publication locks, compare the live heads, and resolve."""
     current = now or datetime.now(UTC)
@@ -322,6 +435,7 @@ def reconcile_publication_effect(
                 "state": state,
             }
         )
+    listed = _require_no_unrecorded_pull_request(plan, listings)
     effect = session.get(Step, effect_id)
     run = session.get(Run, effect.run_id) if effect is not None else None
     if effect is None or run is None:
@@ -335,6 +449,7 @@ def reconcile_publication_effect(
         "change_set_id": plan["change_set_id"],
         "change_set_version": plan["change_set_version"],
         "pull_requests": checked,
+        "pr_create_listings": listed,
     }
     event = DashboardEvent(
         occurred_at=current,
@@ -357,6 +472,7 @@ def reconcile_publication_effect(
             "previous_status": effect.status,
             "method": RECONCILE_METHOD,
             "pull_requests": checked,
+            "pr_create_listings": listed,
         },
     )
     session.add(event)
