@@ -467,6 +467,14 @@ def reconcile_publication_effect(
         live = str(item.get("head_sha") or "")
         if state not in {"OPEN", "MERGED"}:
             raise _refuse("PR_NOT_OPEN", f"{url} is {state or 'unknown'}")
+        match = _PR_URL.fullmatch(url)
+        if match is None or item.get("head_repository") != match.group(1):
+            # NEW-147 review: the head branch must be the repository's own (not a fork's).
+            raise _refuse(
+                "PR_HEAD_FOREIGN",
+                f"{url}'s head repository is {item.get('head_repository') or 'unknown'}, "
+                f"not {match.group(1) if match else 'its own'}",
+            )
         if (
             item.get("head_branch") != recorded["branch"]
             or item.get("base_branch") != plan["base_branch"][url]

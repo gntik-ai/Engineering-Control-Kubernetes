@@ -19,7 +19,12 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
-from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker, GhCliPolicyError
+from engineering_control.adapters.github.client import (
+    GhCliAuthError,
+    GhCliBroker,
+    GhCliPolicyError,
+    same_repository_pull_request,
+)
 from engineering_control.adapters.publication_authority import (
     PublicationAuthorityClient,
     PublicationAuthorityError,
@@ -966,6 +971,8 @@ class DeliveryActivityHandler:
                 plan.repository, head=plan.branch, state="merged"
             )
             if item.get("baseRefName") == plan.base_branch
+            # NEW-147 review: a fork's PR from a same-named branch is not this branch's.
+            and self._own_pull_request(item, plan)
         ]
         if any(item.get("headRefOid") != plan.head_sha for item in merged):
             raise ValueError("a merged pull request's branch cannot be republished")
@@ -1185,15 +1192,32 @@ class DeliveryActivityHandler:
             "draft": bound["isDraft"],
         }
 
+    @staticmethod
+    def _own_pull_request(item: Any, plan: RepositoryPublication) -> bool:
+        """NEW-147 review: ``gh pr list --head`` matches the branch name in forks too. Only
+        a PR whose head repository is exactly the publication's own (not cross-repository)
+        is this branch's; a PR whose head repository is unknown is refused."""
+        if not isinstance(item, dict):
+            raise ValueError("a GitHub PR for this publication is malformed")
+        try:
+            return same_repository_pull_request(item, plan.repository)
+        except GhCliPolicyError as error:
+            raise ValueError(
+                "a GitHub PR for this publication has no known head repository"
+            ) from error
+
     def _publication_pull_requests(self, plan: RepositoryPublication) -> list[dict[str, Any]]:
-        """Every PR (any state) from this head branch into this base; never a cut list."""
+        """Every PR (any state) from this repository's head branch into this base; never a
+        cut list. Fork PRs from a same-named branch are foreign: never bound, and they do not
+        block creating this repository's own PR (GitHub allows both, and NEW-145b's complete
+        listing of ``owner:branch`` never includes them either)."""
         value = self.broker.list_pull_requests(plan.repository, head=plan.branch, state="all")
         if len(value) >= _PR_BIND_LIST_LIMIT:
             raise ValueError("too many GitHub PRs share this publication head to bind safely")
         return [
             item
             for item in value
-            if isinstance(item, dict) and item.get("baseRefName") == plan.base_branch
+            if self._own_pull_request(item, plan) and item.get("baseRefName") == plan.base_branch
         ]
 
     def _bindable_pull_request(self, plan: RepositoryPublication) -> dict[str, Any] | None:

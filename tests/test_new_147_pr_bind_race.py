@@ -75,8 +75,16 @@ class _RaceRunner(FakePublicationRunner):
         return super().run(executable, arguments, cwd=cwd, **kwargs)
 
 
-def _pr(number: int, head: str, *, state: str = "OPEN", base: str = "main") -> dict[str, Any]:
-    return {
+def _pr(
+    number: int,
+    head: str,
+    *,
+    state: str = "OPEN",
+    base: str = "main",
+    owner: str | None = "gntik-ai",
+) -> dict[str, Any]:
+    """One `gh pr list` entry; ``owner`` other than gntik-ai is a fork's same-named branch."""
+    value: dict[str, Any] = {
         "number": number,
         "url": f"https://github.com/gntik-ai/falcone/pull/{number}",
         "state": state,
@@ -84,6 +92,13 @@ def _pr(number: int, head: str, *, state: str = "OPEN", base: str = "main") -> d
         "headRefOid": head,
         "baseRefName": base,
     }
+    if owner is not None:
+        value.update(
+            headRepository={"name": "falcone"},
+            headRepositoryOwner={"login": owner},
+            isCrossRepository=owner != "gntik-ai",
+        )
+    return value
 
 
 class _PassThrough:
@@ -294,4 +309,55 @@ async def test_a_git_push_effect_never_uses_the_pushed_head_basis(tmp_path: Path
     assert SOURCE_HEAD != PUSHED_HEAD
     with pytest.raises(PublicationReconcileBlocked, match="HEAD_MISMATCH"):
         await effect.reconcile(effect.observed(source={"head_sha": PUSHED_HEAD}))
+    _dispose(effect.values)
+
+
+def test_a_fork_pr_on_the_same_branch_name_is_never_bound(tmp_path: Path) -> None:
+    # Codex review: gh pr list --head matches same-named fork branches; a lone fork PR at the
+    # old SHA must not become the binding candidate, and its copy of the pushed SHA never binds.
+    fork = _pr(2000, OLD_HEAD, owner="attacker")
+    fork_copied = _pr(2000, PUSHED_HEAD, owner="attacker")
+    handler, runner, _clock, plan, authority = _binder(
+        tmp_path, [[fork], [fork_copied], [fork_copied, _pr(1, PUSHED_HEAD)]]
+    )
+    bound = handler._bind_pull_request(plan, (authority, {}, {}))  # type: ignore[arg-type]
+    assert bound["pr_number"] == 1  # this repository's own PR, created and bound
+    assert runner.create_calls == 1
+    assert authority.effects == [("gntik-ai/falcone", "pr_create")]
+
+
+def test_a_fork_copying_the_pushed_sha_mid_poll_never_binds(tmp_path: Path) -> None:
+    own = _pr(1068, OLD_HEAD)
+    fork = _pr(2000, PUSHED_HEAD, owner="attacker")
+    handler, runner, _clock, plan, authority = _binder(
+        tmp_path, [[own], [own, fork], [own, fork], [_pr(1068, PUSHED_HEAD), fork]]
+    )
+    assert handler._bind_pull_request(plan, (authority, {}, {}))["pr_number"] == 1068  # type: ignore[arg-type]
+    assert runner.create_calls == 0
+    # A fork alone, even at the pushed head, never satisfies the wait for the created PR.
+    handler, runner, _clock, plan, authority = _binder(tmp_path / "alone", [[], [fork]])
+    with pytest.raises(PullRequestHeadNotConverged):
+        handler._bind_pull_request(plan, (authority, {}, {}))  # type: ignore[arg-type]
+    assert runner.create_calls == 1
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["headRepository", "headRepositoryOwner", "isCrossRepository"],
+)
+def test_a_pr_without_its_head_repository_is_refused(tmp_path: Path, missing: str) -> None:
+    pr = _pr(1068, PUSHED_HEAD)
+    del pr[missing]
+    handler, runner, _clock, plan, authority = _binder(tmp_path, [[pr]])
+    with pytest.raises(ValueError, match="no known head repository"):
+        handler._bind_pull_request(plan, (authority, {}, {}))  # type: ignore[arg-type]
+    assert runner.create_calls == 0
+
+
+async def test_reconciliation_refuses_a_bound_pr_with_a_foreign_head(tmp_path: Path) -> None:
+    effect = await _race_shape(tmp_path)
+    with pytest.raises(PublicationReconcileBlocked, match="PR_HEAD_FOREIGN"):
+        await effect.reconcile(
+            effect.observed(source={"head_sha": PUSHED_HEAD, "head_repository": "attacker/falcone"})
+        )
     _dispose(effect.values)

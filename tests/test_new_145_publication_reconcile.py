@@ -87,6 +87,8 @@ class _Effect:
                 "state": "OPEN",
                 "head_branch": BRANCH_TEMPLATE.format(change_set_id=self.change_set_id),
                 "base_branch": "main",
+                # NEW-147 review: the PR's head branch is the repository's own.
+                "head_repository": url.split("/pull/")[0].removeprefix("https://github.com/"),
             }
             for url, head in ((SOURCE_PR, SOURCE_HEAD), (DEPLOYMENT_PR, DEPLOYMENT_HEAD))
         }

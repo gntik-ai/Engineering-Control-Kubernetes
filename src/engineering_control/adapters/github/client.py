@@ -50,6 +50,28 @@ class GhIdentity:
     account_type: str
 
 
+def pull_request_head_repository(value: dict[str, Any]) -> str | None:
+    """NEW-147 review: ``owner/name`` of a PR's head repository from gh's JSON, or None
+    when it is unknown (a deleted fork, or fields the response lacks)."""
+    owner = value.get("headRepositoryOwner")
+    repository = value.get("headRepository")
+    login = owner.get("login") if isinstance(owner, dict) else None
+    name = repository.get("name") if isinstance(repository, dict) else None
+    if not isinstance(login, str) or not login or not isinstance(name, str) or not name:
+        return None
+    return f"{login}/{name}"
+
+
+def same_repository_pull_request(value: dict[str, Any], repository: str) -> bool:
+    """NEW-147 review: the PR's head branch lives in ``repository`` itself (not a fork).
+    Raises when the head repository cannot be established."""
+    head = pull_request_head_repository(value)
+    cross = value.get("isCrossRepository")
+    if head is None or not isinstance(cross, bool):
+        raise GhCliPolicyError("pull request head repository is unknown")
+    return head.lower() == repository.lower() and not cross
+
+
 class GhCliBroker:
     """Typed GitHub broker that never extracts or handles an OAuth token."""
 
@@ -220,7 +242,8 @@ class GhCliBroker:
                     "--json",
                     (
                         "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
-                        "mergeStateStatus,reviewDecision,statusCheckRollup,mergedAt,mergeCommit"
+                        "mergeStateStatus,reviewDecision,statusCheckRollup,mergedAt,mergeCommit,"
+                        "headRepository,headRepositoryOwner,isCrossRepository"
                     ),
                 ]
             ).stdout,
@@ -371,7 +394,12 @@ class GhCliBroker:
                     "--state",
                     state,
                     "--json",
-                    "number,url,state,isDraft,headRefOid,baseRefName",
+                    # NEW-147 review: `--head` matches the branch name in forks too; the
+                    # head repository lets callers keep only this repository's PRs.
+                    (
+                        "number,url,state,isDraft,headRefOid,baseRefName,"
+                        "headRepository,headRepositoryOwner,isCrossRepository"
+                    ),
                     "--limit",
                     "10",
                 ]

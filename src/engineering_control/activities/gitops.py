@@ -44,6 +44,7 @@ from engineering_control.adapters.github.client import (
     GhCliAuthError,
     GhCliBroker,
     GhCliPolicyError,
+    pull_request_head_repository,
 )
 from engineering_control.config import Settings
 from engineering_control.db import models as db
@@ -2199,6 +2200,12 @@ class GitOpsGitHubHandler:
                     # NEW-145: a reconciliation proves the PR still targets these.
                     "head_branch": str(pull_request.get("headRefName") or ""),
                     "base_branch": str(pull_request.get("baseRefName") or ""),
+                    # NEW-147 review: and that its head branch is the repository's own.
+                    "head_repository": (
+                        pull_request_head_repository(pull_request) or ""
+                        if pull_request.get("isCrossRepository") is False
+                        else ""
+                    ),
                 }
             )
         result: dict[str, Any] = {"status": "OK", "heads": heads}
