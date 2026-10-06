@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import and_, create_engine, or_, select
+from sqlalchemy import and_, create_engine, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.activities.gitops import StagingFlowBlocked, enabled_staging_flow
@@ -2039,6 +2039,11 @@ class EngineeringActivityHandler:
         # An activity retry after a committed attempt must not notify twice.
         already_notified = False
         with self.sessions.begin() as session:
+            # NEW-143 review 3: the shared approval lock first (same order as approvals,
+            # issue-reapprove and registration), so a cancellation never reads an approval
+            # that a concurrent re-approval is replacing and then disables with a stale one.
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
             campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
@@ -2214,7 +2219,12 @@ class EngineeringActivityHandler:
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,240}", workflow_id):
             raise ValueError("backlog run workflow identity is invalid")
         with self.sessions.begin() as session:
-            campaign = session.get(db.GitHubBacklogCampaign, campaign_id)
+            # NEW-143 review 2: registration takes the campaign approval lock and the
+            # campaign row lock, so it serializes with issue-reapprove (and approvals); a
+            # loop cannot register in the window between a re-approval's checks and commit.
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
+            campaign = session.get(db.GitHubBacklogCampaign, campaign_id, with_for_update=True)
             if campaign is None:
                 raise ValueError("backlog campaign disappeared")
             existing = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id))
@@ -2224,6 +2234,28 @@ class EngineeringActivityHandler:
                     {**payload, "run_id": str(existing.id)},
                     "REGISTERED",
                 )
+            operation_id = payload.get("issue_operation_id")
+            if operation_id and not payload.get("closed_blocker"):
+                # The approval this issue loop loaded must still be the campaign's: a
+                # re-approval for another operation committed meanwhile refuses it.
+                approval = _current_backlog_approval(
+                    campaign,
+                    delivery_mode=str(payload.get("delivery_mode")),
+                    # As backlog.load_execution: a global campaign's base risk is R2.
+                    maximum_risk=(
+                        "R2"
+                        if payload.get("global_campaign_id") is not None
+                        else str(payload.get("maximum_risk", "R1"))
+                    ),
+                    now=datetime.now(UTC),
+                )
+                reference = approval.issue_approval if approval is not None else None
+                if (
+                    reference is None
+                    or reference.operation_id != str(operation_id)
+                    or reference.binding_sha256 != payload.get("issue_approval_binding")
+                ):
+                    raise ValueError("issue loop approval changed before registration")
             # NEW-97: a loop whose start was blocked at selection registers its Run already
             # closed, so its operation ends and the issue can be started again.
             closed_blocker = payload.get("closed_blocker")

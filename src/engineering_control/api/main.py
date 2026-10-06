@@ -46,6 +46,7 @@ from engineering_control.api.schemas import (
     GitHubBacklogImportRequest,
     IssueAmendRequest,
     IssueLoopStart,
+    IssueReapprovalRequest,
     LLMWikiBootstrapExecuteRequest,
     LLMWikiBootstrapPlanRequest,
     LoopPlanDispatch,
@@ -781,6 +782,30 @@ def create_app(
                 body.confirmation_phrase,
                 actor,
                 current_run_id,
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/issues/reapprove")
+    async def issue_reapprove(
+        body: IssueReapprovalRequest,
+        subject: str = auth_dependency,
+        bus: TypedCommandBus = commands_dependency,
+    ) -> dict[str, Any]:
+        """NEW-143: re-create the voided per-issue campaign approval of an issue loop.
+
+        Same trust model as /v1/r3-issues/approve: the bearer-authenticated channel asserts
+        the actor, which must be a canonical operator. The loop's request is rebuilt from
+        durable records; the operator then resumes the loop with backlog-retry."""
+        actor = approval_actor(subject)
+        try:
+            return await bus.reapprove_issue(
+                body.loop_workflow_id,
+                body.project,
+                body.repository,
+                body.issue_number,
+                body.confirmation_phrase,
+                actor,
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

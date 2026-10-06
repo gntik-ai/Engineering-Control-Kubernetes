@@ -4,13 +4,14 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID, uuid4, uuid5
 
 from sqlalchemy import case, create_engine, func, or_, select, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.api.schemas import (
     ApprovalRecord,
@@ -172,6 +173,15 @@ class MetadataRepository(Protocol):
     async def release_backlog_ownership(
         self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
     ) -> dict[str, Any]: ...
+    async def reissue_issue_approval(
+        self,
+        request: ExistingBacklogLoopStart,
+        actor: str,
+        *,
+        validate: Callable[[Session], None],
+        audit: Callable[[Session, dict[str, Any]], int],
+    ) -> dict[str, Any]: ...
+    async def ensure_policy_activation(self, campaign_id: UUID) -> str: ...
     async def validate_issue_operation_approval(
         self, request: ExistingBacklogLoopStart
     ) -> None: ...
@@ -954,57 +964,69 @@ class SQLMetadataRepository:
         issue_request: ExistingBacklogLoopStart | None = None,
     ) -> dict[str, Any]:
         with self.sessions.begin() as session:
-            if issue_request is not None:
-                require_issue_request_approval(session, issue_request)
-                if (
-                    campaign_id != issue_request.backlog_campaign_id
-                    or request.project != issue_request.project
-                    or request.delivery_mode != issue_request.delivery_mode
-                    or request.maximum_risk != issue_request.maximum_risk
-                    or request.maximum_items != 1
-                ):
-                    raise ValueError("issue approval campaign request changed scope")
-            campaign = session.get(GitHubBacklogCampaign, campaign_id)
-            if campaign is None or campaign.project != request.project:
-                raise ValueError("backlog approval campaign does not exist")
-            binding = approval_binding(
-                campaign_id=str(campaign.id),
-                project=request.project,
-                import_filter=campaign.import_filter,  # type: ignore[arg-type]
-                source_head=campaign.source_head_at_import,
-                deployment_head=campaign.deployment_head_at_import,
-                dependency_plan_hash=campaign.plan_hash,
-                maximum_risk=request.maximum_risk.value,
-                maximum_items=request.maximum_items,
-                delivery_mode=request.delivery_mode,
-                include_enhancements=campaign.import_filter == "enhancements",
+            return self._prepare_backlog_approval_in(
+                session, campaign_id, request, issue_request=issue_request
             )
-            if issue_request is not None:
-                binding = BacklogApprovalBinding.model_validate(
-                    {
-                        **binding.model_dump(mode="json"),
-                        "issue_approval": {
-                            "operation_id": str(issue_request.issue_operation_id),
-                            "binding_sha256": issue_request.issue_approval_binding,
-                        },
-                    }
-                )
-            digest = binding.sha256()
-            campaign.approval_binding = digest
-            campaign.approval_json = {"binding": binding.model_dump(mode="json")}
-            campaign.maximum_risk = request.maximum_risk.value
-            campaign.maximum_items = request.maximum_items
-            campaign.maximum_concurrency = 1
-            campaign.delivery_mode = request.delivery_mode
-            campaign.include_enhancements = binding.include_enhancements
-            campaign.status = "AWAITING_APPROVAL"
-            return {
-                "status": "AWAITING_APPROVAL",
-                "backlog_campaign_id": str(campaign.id),
-                "approval_binding": digest,
-                "approval_candidate": binding.model_dump(mode="json"),
-                "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
-            }
+
+    @staticmethod
+    def _prepare_backlog_approval_in(
+        session: Session,
+        campaign_id: UUID,
+        request: BacklogApprovalCandidateRequest,
+        *,
+        issue_request: ExistingBacklogLoopStart | None = None,
+    ) -> dict[str, Any]:
+        if issue_request is not None:
+            require_issue_request_approval(session, issue_request)
+            if (
+                campaign_id != issue_request.backlog_campaign_id
+                or request.project != issue_request.project
+                or request.delivery_mode != issue_request.delivery_mode
+                or request.maximum_risk != issue_request.maximum_risk
+                or request.maximum_items != 1
+            ):
+                raise ValueError("issue approval campaign request changed scope")
+        campaign = session.get(GitHubBacklogCampaign, campaign_id)
+        if campaign is None or campaign.project != request.project:
+            raise ValueError("backlog approval campaign does not exist")
+        binding = approval_binding(
+            campaign_id=str(campaign.id),
+            project=request.project,
+            import_filter=campaign.import_filter,  # type: ignore[arg-type]
+            source_head=campaign.source_head_at_import,
+            deployment_head=campaign.deployment_head_at_import,
+            dependency_plan_hash=campaign.plan_hash,
+            maximum_risk=request.maximum_risk.value,
+            maximum_items=request.maximum_items,
+            delivery_mode=request.delivery_mode,
+            include_enhancements=campaign.import_filter == "enhancements",
+        )
+        if issue_request is not None:
+            binding = BacklogApprovalBinding.model_validate(
+                {
+                    **binding.model_dump(mode="json"),
+                    "issue_approval": {
+                        "operation_id": str(issue_request.issue_operation_id),
+                        "binding_sha256": issue_request.issue_approval_binding,
+                    },
+                }
+            )
+        digest = binding.sha256()
+        campaign.approval_binding = digest
+        campaign.approval_json = {"binding": binding.model_dump(mode="json")}
+        campaign.maximum_risk = request.maximum_risk.value
+        campaign.maximum_items = request.maximum_items
+        campaign.maximum_concurrency = 1
+        campaign.delivery_mode = request.delivery_mode
+        campaign.include_enhancements = binding.include_enhancements
+        campaign.status = "AWAITING_APPROVAL"
+        return {
+            "status": "AWAITING_APPROVAL",
+            "backlog_campaign_id": str(campaign.id),
+            "approval_binding": digest,
+            "approval_candidate": binding.model_dump(mode="json"),
+            "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+        }
 
     async def approve_backlog_campaign(
         self, campaign_id: UUID, project: str, binding: str, actor: str
@@ -1018,133 +1040,263 @@ class SQLMetadataRepository:
     ) -> dict[str, Any]:
         if not is_reauthenticated_backlog_operator(actor):
             raise ValueError("existing-backlog approval requires a reauthenticated operator")
-        result: dict[str, Any]
-        request: dict[str, Any] | None = None
         with self.sessions.begin() as session:
-            if session.get_bind().dialect.name == "postgresql":
-                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
-            campaign = session.get(GitHubBacklogCampaign, campaign_id)
-            if (
-                campaign is None
-                or campaign.project != project
-                or campaign.approval_binding != binding
-                or campaign.status not in {"AWAITING_APPROVAL", "APPROVED_POLICY_PENDING"}
-            ):
-                raise ValueError("existing-backlog approval binding is not current")
-            now = datetime.now(UTC)
-            pending_owner = session.scalar(
-                select(GitHubBacklogCampaign).where(
-                    GitHubBacklogCampaign.id != campaign.id,
-                    GitHubBacklogCampaign.status == "APPROVED_POLICY_PENDING",
-                )
+            result, request = self._approve_backlog_campaign_in(
+                session, campaign_id, project, binding, actor
             )
-            if pending_owner is not None:
-                nested_pending_binding = pending_owner.approval_json.get("binding")
-                pending_binding = (
-                    nested_pending_binding
-                    if isinstance(nested_pending_binding, dict)
-                    else pending_owner.approval_json
-                )
-                try:
-                    pending_expiry = datetime.fromisoformat(str(pending_binding.get("expires_at")))
-                except (TypeError, ValueError) as error:
-                    raise ValueError(
-                        "pending backlog campaign policy activation evidence is malformed"
-                    ) from error
-                if pending_expiry.tzinfo is None:
-                    pending_expiry = pending_expiry.replace(tzinfo=UTC)
-                if pending_expiry > now:
-                    raise ValueError("another backlog campaign policy activation is pending")
-                pending_owner.status = "EXPIRED"
-            active_campaigns = session.scalars(
-                select(GitHubBacklogCampaign).where(
-                    GitHubBacklogCampaign.id != campaign.id,
-                    GitHubBacklogCampaign.status.in_(
-                        {"APPROVED_INVENTORY", "APPROVED", "RUNNING", "PAUSED"}
-                    ),
-                )
-            ).all()
-            active_owners: list[UUID] = []
-            expired_owner = False
-            for candidate in active_campaigns:
-                if candidate.approval_json.get("policy_role") not in {None, "owner"}:
-                    continue
-                candidate_binding = candidate.approval_json.get("binding")
-                candidate_binding = (
-                    candidate_binding
-                    if isinstance(candidate_binding, dict)
-                    else candidate.approval_json
-                )
-                try:
-                    candidate_expiry = datetime.fromisoformat(
-                        str(candidate_binding.get("expires_at"))
-                    )
-                    if candidate_expiry.tzinfo is None:
-                        candidate_expiry = candidate_expiry.replace(tzinfo=UTC)
-                except (TypeError, ValueError):
-                    candidate_expiry = now
-                if candidate_expiry <= now:
-                    candidate.status = "EXPIRED"
-                    expired_owner = True
-                    continue
-                active_owners.append(candidate.id)
-            if expired_owner or not active_owners:
-                for candidate in active_campaigns:
-                    if candidate.approval_json.get("policy_role") == "inventory":
-                        candidate.status = "EXPIRED"
-            if len(active_owners) > 1:
-                raise ValueError("multiple backlog campaigns claim GitHub write policy ownership")
-            active_owner = active_owners[0] if active_owners else None
-            raw_binding = campaign.approval_json.get("binding")
-            if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
-                raise ValueError("existing-backlog approval candidate changed")
-            require_backlog_issue_approval(
-                session, BacklogApprovalBinding.model_validate(raw_binding)
-            )
-            expires_at = datetime.fromisoformat(str(raw_binding["expires_at"]))
-            if expires_at <= now:
-                raise ValueError("existing-backlog approval candidate expired")
-            campaign.status = (
-                "APPROVED_INVENTORY" if active_owner is not None else "APPROVED_POLICY_PENDING"
-            )
-            campaign.approval_json = {
-                "binding": raw_binding,
-                "policy_role": "inventory" if active_owner is not None else "owner",
-                "approval": {
-                    "approved_by": actor,
-                    "approved_at": datetime.now(UTC).isoformat(),
-                    "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
-                },
-            }
-            if active_owner is None:
-                request = {
-                    "action": "enable-existing-backlog",
-                    "backlog_campaign_id": str(campaign.id),
-                    "project": project,
-                    "approval_binding": binding,
-                    "safe_repositories": [
-                        "gntik-ai/falcone",
-                        "gntik-ai/falcone-charts",
-                        "gntik-ai/musematic",
-                        "gntik-ai/musematic-deploy",
-                        "gntik-ai/llmwiki",
-                    ],
-                    "requested_by": actor,
-                    "requested_at": datetime.now(UTC).isoformat(),
-                }
-            result = {
-                "status": campaign.status,
-                "backlog_campaign_id": str(campaign.id),
-                "approval_binding": binding,
-                "policy_activation": (
-                    "EXISTING_ACTIVE_POLICY"
-                    if active_owner is not None
-                    else "QUEUED_ROOT_RECONCILER"
-                ),
-            }
         if request is not None:
             self._write_github_policy_request(request)
         return result
+
+    @staticmethod
+    def _policy_activation_request(
+        campaign: GitHubBacklogCampaign, project: str, binding: str, actor: str
+    ) -> dict[str, Any]:
+        return {
+            "action": "enable-existing-backlog",
+            "backlog_campaign_id": str(campaign.id),
+            "project": project,
+            "approval_binding": binding,
+            "safe_repositories": [
+                "gntik-ai/falcone",
+                "gntik-ai/falcone-charts",
+                "gntik-ai/musematic",
+                "gntik-ai/musematic-deploy",
+                "gntik-ai/llmwiki",
+            ],
+            "requested_by": actor,
+            "requested_at": datetime.now(UTC).isoformat(),
+        }
+
+    def _approve_backlog_campaign_in(
+        self, session: Session, campaign_id: UUID, project: str, binding: str, actor: str
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Approve inside the caller's transaction; returns the policy activation request
+        to write after it commits (None when another owner's policy is already active)."""
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("existing-backlog approval requires a reauthenticated operator")
+        result: dict[str, Any]
+        request: dict[str, Any] | None = None
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
+        campaign = session.get(GitHubBacklogCampaign, campaign_id)
+        if (
+            campaign is None
+            or campaign.project != project
+            or campaign.approval_binding != binding
+            or campaign.status not in {"AWAITING_APPROVAL", "APPROVED_POLICY_PENDING"}
+        ):
+            raise ValueError("existing-backlog approval binding is not current")
+        now = datetime.now(UTC)
+        pending_owner = session.scalar(
+            select(GitHubBacklogCampaign).where(
+                GitHubBacklogCampaign.id != campaign.id,
+                GitHubBacklogCampaign.status == "APPROVED_POLICY_PENDING",
+            )
+        )
+        if pending_owner is not None:
+            nested_pending_binding = pending_owner.approval_json.get("binding")
+            pending_binding = (
+                nested_pending_binding
+                if isinstance(nested_pending_binding, dict)
+                else pending_owner.approval_json
+            )
+            try:
+                pending_expiry = datetime.fromisoformat(str(pending_binding.get("expires_at")))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "pending backlog campaign policy activation evidence is malformed"
+                ) from error
+            if pending_expiry.tzinfo is None:
+                pending_expiry = pending_expiry.replace(tzinfo=UTC)
+            if pending_expiry > now:
+                raise ValueError("another backlog campaign policy activation is pending")
+            pending_owner.status = "EXPIRED"
+        active_campaigns = session.scalars(
+            select(GitHubBacklogCampaign).where(
+                GitHubBacklogCampaign.id != campaign.id,
+                GitHubBacklogCampaign.status.in_(
+                    {"APPROVED_INVENTORY", "APPROVED", "RUNNING", "PAUSED"}
+                ),
+            )
+        ).all()
+        active_owners: list[UUID] = []
+        expired_owner = False
+        for candidate in active_campaigns:
+            if candidate.approval_json.get("policy_role") not in {None, "owner"}:
+                continue
+            candidate_binding = candidate.approval_json.get("binding")
+            candidate_binding = (
+                candidate_binding
+                if isinstance(candidate_binding, dict)
+                else candidate.approval_json
+            )
+            try:
+                candidate_expiry = datetime.fromisoformat(str(candidate_binding.get("expires_at")))
+                if candidate_expiry.tzinfo is None:
+                    candidate_expiry = candidate_expiry.replace(tzinfo=UTC)
+            except (TypeError, ValueError):
+                candidate_expiry = now
+            if candidate_expiry <= now:
+                candidate.status = "EXPIRED"
+                expired_owner = True
+                continue
+            active_owners.append(candidate.id)
+        if expired_owner or not active_owners:
+            for candidate in active_campaigns:
+                if candidate.approval_json.get("policy_role") == "inventory":
+                    candidate.status = "EXPIRED"
+        if len(active_owners) > 1:
+            raise ValueError("multiple backlog campaigns claim GitHub write policy ownership")
+        active_owner = active_owners[0] if active_owners else None
+        raw_binding = campaign.approval_json.get("binding")
+        if not isinstance(raw_binding, dict) or canonical_sha256(raw_binding) != binding:
+            raise ValueError("existing-backlog approval candidate changed")
+        require_backlog_issue_approval(session, BacklogApprovalBinding.model_validate(raw_binding))
+        expires_at = datetime.fromisoformat(str(raw_binding["expires_at"]))
+        if expires_at <= now:
+            raise ValueError("existing-backlog approval candidate expired")
+        campaign.status = (
+            "APPROVED_INVENTORY" if active_owner is not None else "APPROVED_POLICY_PENDING"
+        )
+        campaign.approval_json = {
+            "binding": raw_binding,
+            "policy_role": "inventory" if active_owner is not None else "owner",
+            "approval": {
+                "approved_by": actor,
+                "approved_at": datetime.now(UTC).isoformat(),
+                "typed_confirmation": BACKLOG_APPROVAL_PHRASE,
+            },
+        }
+        if active_owner is None:
+            request = self._policy_activation_request(campaign, project, binding, actor)
+        result = {
+            "status": campaign.status,
+            "backlog_campaign_id": str(campaign.id),
+            "approval_binding": binding,
+            "policy_activation": (
+                "EXISTING_ACTIVE_POLICY" if active_owner is not None else "QUEUED_ROOT_RECONCILER"
+            ),
+        }
+        return result, request
+
+    async def reissue_issue_approval(
+        self,
+        request: ExistingBacklogLoopStart,
+        actor: str,
+        *,
+        validate: Callable[[Session], None],
+        audit: Callable[[Session, dict[str, Any]], int],
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._reissue_issue_approval, request, actor, validate, audit
+        )
+
+    def _reissue_issue_approval(
+        self,
+        request: ExistingBacklogLoopStart,
+        actor: str,
+        validate: Callable[[Session], None],
+        audit: Callable[[Session, dict[str, Any]], int],
+    ) -> dict[str, Any]:
+        """NEW-143: issue-start's approval (prepare + approve) for an existing issue
+        operation, in ONE transaction with its preconditions and audit record.
+
+        The campaign approval lock and the campaign row lock are held from validation to
+        commit, so no approval, ownership or loop-start change can slip between the checks
+        and the mutation; ``validate`` re-runs every precondition inside it."""
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("existing-backlog approval requires a reauthenticated operator")
+        with self.sessions.begin() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
+            session.scalar(
+                select(GitHubBacklogCampaign)
+                .where(GitHubBacklogCampaign.id == request.backlog_campaign_id)
+                .with_for_update()
+            )
+            validate(session)
+            prepared = self._prepare_backlog_approval_in(
+                session,
+                request.backlog_campaign_id,
+                BacklogApprovalCandidateRequest(
+                    project=request.project,
+                    delivery_mode=request.delivery_mode,
+                    maximum_risk=request.maximum_risk,
+                    maximum_items=1,
+                ),
+                issue_request=request,
+            )
+            result, activation = self._approve_backlog_campaign_in(
+                session,
+                request.backlog_campaign_id,
+                request.project,
+                str(prepared["approval_binding"]),
+                actor,
+            )
+            result["audit_event_id"] = audit(session, result)
+        if activation is not None:
+            # After the commit (the root reconciler validates the committed campaign), under
+            # the approval lock and only while this exact approval is still pending
+            # (NEW-143 review 2). A failed write is retried by ensure_policy_activation.
+            try:
+                outcome = self._ensure_policy_activation(
+                    request.backlog_campaign_id, expected_binding=str(prepared["approval_binding"])
+                )
+            except (OSError, ValueError):
+                outcome = "ACTIVATION_REQUEST_RETRY"
+            if outcome not in {"ACTIVATION_REQUEUED", "ACTIVATION_PENDING"}:
+                result["policy_activation"] = (
+                    "ACTIVATION_REQUEST_RETRY" if outcome == "ACTIVATION_REQUEST_RETRY" else outcome
+                )
+        return result
+
+    async def ensure_policy_activation(self, campaign_id: UUID) -> str:
+        return await asyncio.to_thread(self._ensure_policy_activation, campaign_id)
+
+    def _ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str:
+        """NEW-143 review: (re-)enqueue the policy activation of an approved owner campaign
+        that still waits for it and has no request pending (e.g. the request write failed or
+        the process stopped after the approval committed). Idempotent.
+
+        NEW-143 review 2: the request is written while the approval lock and the campaign
+        row lock are held, after re-reading that the campaign is still pending (and, when
+        given, still under ``expected_binding``), so a cancellation, replacement approval
+        or completed activation can never be overtaken by an obsolete request."""
+        with self.sessions.begin() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
+            campaign = session.get(GitHubBacklogCampaign, campaign_id, with_for_update=True)
+            if campaign is None:
+                raise ValueError("backlog campaign does not exist")
+            approval = campaign.approval_json.get("approval")
+            actor = approval.get("approved_by") if isinstance(approval, dict) else None
+            if (
+                campaign.status != "APPROVED_POLICY_PENDING"
+                or campaign.approval_json.get("policy_role") != "owner"
+                or campaign.approval_binding is None
+                or not isinstance(actor, str)
+            ):
+                return str(campaign.status)
+            if expected_binding is not None and campaign.approval_binding != expected_binding:
+                return "APPROVAL_SUPERSEDED"
+            request = self._policy_activation_request(
+                campaign, campaign.project, campaign.approval_binding, actor
+            )
+            # Written inside the transaction: the locks are held until commit, and this
+            # transaction changes no campaign state, so the reconciler (which reads the
+            # committed campaign) sees exactly the state checked above.
+            if (self.github_policy_request_root / "activate.json").exists():
+                return "ACTIVATION_PENDING"
+            try:
+                self._write_github_policy_request(request)
+            except ValueError as error:
+                if "pending" in str(error):
+                    return "ACTIVATION_PENDING"
+                raise
+        return "ACTIVATION_REQUEUED"
 
     async def release_backlog_ownership(
         self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
@@ -2008,6 +2160,19 @@ class EmptyMetadataRepository:
     async def release_backlog_ownership(
         self, campaign_id: UUID, project: str, typed_confirmation: str, actor: str
     ) -> dict[str, Any]:
+        raise ValueError("backlog metadata store is unavailable")
+
+    async def reissue_issue_approval(
+        self,
+        request: ExistingBacklogLoopStart,
+        actor: str,
+        *,
+        validate: Callable[[Session], None],
+        audit: Callable[[Session, dict[str, Any]], int],
+    ) -> dict[str, Any]:
+        raise ValueError("backlog metadata store is unavailable")
+
+    async def ensure_policy_activation(self, campaign_id: UUID) -> str:
         raise ValueError("backlog metadata store is unavailable")
 
     async def validate_issue_operation_approval(self, request: ExistingBacklogLoopStart) -> None:

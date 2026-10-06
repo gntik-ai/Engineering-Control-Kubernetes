@@ -257,6 +257,56 @@ converted, whatever transient errors came before. No provider-owned signal means
 Policy, schema, auth, missing CLI, `PROVIDER_TIMEOUT` and any other activity error still need an
 operator decision.
 
+## Voided issue approval of an issue-start loop (NEW-143)
+
+> **Warning:** do not use `backlog-pause` on a loop started with `issue-start` (for example
+> during a GitHub outage). Pausing the campaign voids its per-issue approval; the general
+> `backlog-approval-candidate` / `backlog-approve` then re-approves the campaign **without** the
+> issue reference, and the loop's next delivery child is refused ("direct child campaign approval
+> differs from its operation", pause blocker `LOOP_STEP_FAILED_BACKLOG_REGISTER_CHILD_RUN`). Let
+> the loop stop on its own blocked pause instead and resume it with `backlog-retry`. A new
+> `issue-start` cannot replace the loop: its ChangeSet belongs to the existing operation.
+
+Recovery re-creates the per-issue approval for the loop's **existing** issue operation:
+
+```bash
+engineering-ctl issue-reapprove <loop_workflow_id> <project> <repository> <issue_number> \
+  REAPPROVE_ISSUE_<first 8 hex of the loop's operation ID, upper case>
+
+# falcone #972
+engineering-ctl issue-reapprove \
+  backlog-loop-falcone-b8a7e731-4304-43de-8c33-26e139bbc9f7-operation-e2535599-198d-46e3-b9f6-e8e2ad8da088 \
+  falcone falcone 972 REAPPROVE_ISSUE_E2535599
+engineering-ctl backlog-retry <loop_workflow_id> falcone 972
+```
+
+The API route is `POST /v1/issues/reapprove` (operator channel only, like `r3-approve`). The
+loop's request is rebuilt from the operation's stored command and binding and must equal the
+request the loop recorded in its delivery child approvals; nothing comes from the client. It is
+refused with an `ISSUE_REAPPROVE_*` code unless:
+
+- the loop is an issue-start loop of that project and its operation is that issue's
+  `solve_issue` operation, still `DISPATCHING`/`STARTED` (`LOOP_INVALID`, `OPERATION_MISMATCH`,
+  `OPERATION_FINISHED`, `LOOP_REQUEST_MISMATCH`);
+- the operation's binding still matches the issue snapshot (`STALE_BINDING`: run `issue-amend`
+  first) and its full issue approval still verifies (`OPERATION_APPROVAL_INVALID`);
+- the loop Run is `PAUSED` on that issue, proven by its durable pause record written by the open
+  Temporal run or, for a loop paused before that record existed, by its `AWAITING_OPERATOR`
+  status query (`LOOP_NOT_PAUSED`);
+- the operation's risk and delivery mode are within the campaign's recorded approval policy and
+  the issue's risk within the operation's (`POLICY_EXCEEDED`, `POLICY_UNAVAILABLE`);
+- no other loop of the campaign is open and the current approval is not bound to another open
+  issue operation (`CAMPAIGN_IN_USE`, `CAMPAIGN_BOUND_TO_OTHER_ISSUE`).
+
+It then runs issue-start's own approval steps (prepare with the issue request, approve) in one
+transaction that holds the campaign approval and row locks, re-checks every precondition first
+(a campaign approval or status changed since the first check refuses with `CAMPAIGN_CHANGED`) and
+writes the `issue_approval_reissued` dashboard event (operator, new approval binding) with the
+approval. The approval has the same one-item, issue-bound shape, goes `APPROVED_POLICY_PENDING`
+and waits for the policy reconciler's promotion. A rerun reports `ALREADY_APPROVED` without
+changing anything; like every activation wait (issue-start too), it first re-enqueues the policy
+activation request if none is pending, so a failed request write is never left stuck.
+
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved

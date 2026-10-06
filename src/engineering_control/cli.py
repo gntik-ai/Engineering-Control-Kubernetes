@@ -218,6 +218,13 @@ def parser() -> argparse.ArgumentParser:
     extend_correction.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     extend_correction.add_argument("change_set_id", type=UUID)
     extend_correction.add_argument("confirmation_phrase")
+    # NEW-143: re-create a voided per-issue approval for an issue loop's existing operation.
+    issue_reapprove = commands.add_parser("issue-reapprove")
+    issue_reapprove.add_argument("loop_workflow_id")
+    issue_reapprove.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    issue_reapprove.add_argument("repository", choices=_CHANGE_REPOSITORIES)
+    issue_reapprove.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
+    issue_reapprove.add_argument("confirmation_phrase")
     commands.add_parser("findings").add_argument("--limit", type=int, default=50)
     for name in ("status", "run"):
         commands.add_parser(name).add_argument("workflow_id")
@@ -595,6 +602,18 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "project": arguments.project,
                 "issue_number": arguments.issue_number,
                 "change_set_id": str(arguments.change_set_id),
+                "confirmation_phrase": arguments.confirmation_phrase,
+            },
+        )
+    if command == "issue-reapprove":
+        return client.request(
+            "POST",
+            "/v1/issues/reapprove",
+            {
+                "loop_workflow_id": arguments.loop_workflow_id,
+                "project": arguments.project,
+                "repository": arguments.repository,
+                "issue_number": arguments.issue_number,
                 "confirmation_phrase": arguments.confirmation_phrase,
             },
         )

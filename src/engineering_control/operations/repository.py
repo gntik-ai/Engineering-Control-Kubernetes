@@ -67,6 +67,7 @@ from engineering_control.operations.correction_extension import grant_correction
 from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
 from engineering_control.operations.issue_amend import amend_issue, resolve_amend_target
 from engineering_control.operations.issue_approval import current_issue_approval_binding
+from engineering_control.operations.issue_reapproval import plan_issue_reapproval
 from engineering_control.operations.issue_start import (
     ISSUE_START_UNCONFIRMED,
     backlog_issue_signal_blocker,
@@ -670,6 +671,16 @@ class OperationsRepository:
                 actor=actor,
                 current_workflow_run_id=current_workflow_run_id,
             )
+
+    async def plan_issue_reapproval(self, *, actor: str, **arguments: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._plan_issue_reapproval, actor, arguments)
+
+    def _plan_issue_reapproval(self, actor: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """NEW-143: read-only first check; the approving transaction re-runs it."""
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("issue re-approval requires an allowlisted operator channel")
+        with self.sessions() as session:
+            return plan_issue_reapproval(session, **arguments)
 
     async def issue_amend_precheck(
         self, project: str, repository: str, issue_number: int
