@@ -359,7 +359,7 @@ the end; a listing of 1000 or more is refused, never truncated). The listing mus
 ChangeSet's bound PR for that repository (`PR_CREATED_UNRECORDED`, `PR_LISTING_MISSING`):
 
 - an `UNKNOWN` or `NOT_ATTEMPTED` creation: the bound PR was created before that effect's
-  admission, so the uncertain claim created nothing (`BOUND_PR_CREATED_AFTER_ADMISSION`);
+  admission, so the uncertain claim created nothing (`BOUND_PR_CREATED_AFTER_ADMISSION`; GitHub reports `created_at` in whole seconds, so a creation within the admission's own second is refused as `PR_CREATION_ORDER_AMBIGUOUS`);
 - a `COMPLETE` creation: the PR it created must be the bound one, so the bound PR was created
   at or after its admission (an older bound PR means the created PR is unrecorded:
   `PR_CREATED_UNRECORDED`);

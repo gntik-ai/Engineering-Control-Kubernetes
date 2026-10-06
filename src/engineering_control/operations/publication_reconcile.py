@@ -349,14 +349,30 @@ def _require_no_unrecorded_pull_request(
             raise _refuse(
                 "PR_LISTING_MISSING", f"the creation time of {creation['bound_url']} is unreadable"
             ) from error
+        # NEW-145b review 1: GitHub reports created_at in whole seconds while admitted_at has
+        # microseconds, so the creation lies somewhere in [second, second + 1s). Only an
+        # ordering that holds for every instant in that interval is accepted.
+        created_from = created_at.replace(microsecond=0)
+        created_before = created_from + timedelta(seconds=1)
+        if created_before <= admitted_at:
+            created_after_admission = False
+        elif created_from > admitted_at:
+            created_after_admission = True
+        else:
+            raise _refuse(
+                "PR_CREATION_ORDER_AMBIGUOUS",
+                f"{creation['bound_url']} was created within the second of the PR creation's "
+                f"admission ({admitted_at.isoformat()}); GitHub's whole-second creation time "
+                "cannot order them",
+            )
         if creation["status"] == "COMPLETE":
-            if created_at < admitted_at:
+            if not created_after_admission:
                 raise _refuse(
                     "PR_CREATED_UNRECORDED",
                     f"{repository}: the completed PR creation did not create the bound "
                     f"{creation['bound_url']} (created before its admission)",
                 )
-        elif created_at >= admitted_at:
+        elif created_after_admission:
             raise _refuse(
                 "BOUND_PR_CREATED_AFTER_ADMISSION",
                 f"{creation['bound_url']} was created at {created_at.isoformat()}, after the "

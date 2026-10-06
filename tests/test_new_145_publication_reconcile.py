@@ -924,3 +924,35 @@ def test_the_worker_listing_normalizes_states_and_stays_allowlisted() -> None:
                 "branch_listings": [{"repository": "gntik-ai/falcone", "branch": "main"}],
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("offset", "outcome"),
+    [
+        # GitHub's whole-second created_at in the admission's own second: either order is
+        # possible, so it is refused rather than read as "before".
+        (timedelta(0), "PR_CREATION_ORDER_AMBIGUOUS"),
+        # The previous whole second ends no later than the admission: provably before.
+        (timedelta(seconds=-1), "RECONCILED"),
+    ],
+)
+async def test_a_creation_in_the_admissions_second_is_ambiguous(
+    tmp_path: Path, offset: timedelta, outcome: str
+) -> None:
+    """Review 1 of NEW-145b: created_at is whole seconds, admitted_at has microseconds."""
+    effect = await _live_972(tmp_path)
+    plan = await effect.operations.plan_publication_reconcile(
+        effect.effect_id, reconcile_phrase(effect.effect_id), ACTOR
+    )
+    admitted = datetime.fromisoformat(effect.effect()[1]["admitted_at"])
+    second = admitted.replace(microsecond=0) + offset
+    created = second.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    listings = effect.listings(plan, created_at=created)
+    if outcome == "RECONCILED":
+        assert (await effect.reconcile(listings=listings))["status"] == "RECONCILED"
+    else:
+        with pytest.raises(PublicationReconcileBlocked) as refused:
+            await effect.reconcile(listings=listings)
+        assert refused.value.blocker == f"PUBLICATION_RECONCILE_{outcome}"
+        assert effect.effect()[0] == "UNKNOWN"
+    _dispose(effect.values)
