@@ -1236,25 +1236,39 @@ class SQLMetadataRepository:
             )
             result["audit_event_id"] = audit(session, result)
         if activation is not None:
-            # After the commit (the root reconciler validates the committed campaign). A
-            # failed write is retried by ensure_policy_activation; never lost.
+            # After the commit (the root reconciler validates the committed campaign), under
+            # the approval lock and only while this exact approval is still pending
+            # (NEW-143 review 2). A failed write is retried by ensure_policy_activation.
             try:
-                self._write_github_policy_request(activation)
+                outcome = self._ensure_policy_activation(
+                    request.backlog_campaign_id, expected_binding=str(prepared["approval_binding"])
+                )
             except (OSError, ValueError):
-                result["policy_activation"] = "ACTIVATION_REQUEST_RETRY"
+                outcome = "ACTIVATION_REQUEST_RETRY"
+            if outcome not in {"ACTIVATION_REQUEUED", "ACTIVATION_PENDING"}:
+                result["policy_activation"] = (
+                    "ACTIVATION_REQUEST_RETRY" if outcome == "ACTIVATION_REQUEST_RETRY" else outcome
+                )
         return result
 
     async def ensure_policy_activation(self, campaign_id: UUID) -> str:
         return await asyncio.to_thread(self._ensure_policy_activation, campaign_id)
 
-    def _ensure_policy_activation(self, campaign_id: UUID) -> str:
+    def _ensure_policy_activation(
+        self, campaign_id: UUID, *, expected_binding: str | None = None
+    ) -> str:
         """NEW-143 review: (re-)enqueue the policy activation of an approved owner campaign
         that still waits for it and has no request pending (e.g. the request write failed or
-        the process stopped after the approval committed). Idempotent."""
+        the process stopped after the approval committed). Idempotent.
+
+        NEW-143 review 2: the request is written while the approval lock and the campaign
+        row lock are held, after re-reading that the campaign is still pending (and, when
+        given, still under ``expected_binding``), so a cancellation, replacement approval
+        or completed activation can never be overtaken by an obsolete request."""
         with self.sessions.begin() as session:
             if session.get_bind().dialect.name == "postgresql":
                 session.execute(text("SELECT pg_advisory_xact_lock(706958327441)"))
-            campaign = session.get(GitHubBacklogCampaign, campaign_id)
+            campaign = session.get(GitHubBacklogCampaign, campaign_id, with_for_update=True)
             if campaign is None:
                 raise ValueError("backlog campaign does not exist")
             approval = campaign.approval_json.get("approval")
@@ -1266,17 +1280,22 @@ class SQLMetadataRepository:
                 or not isinstance(actor, str)
             ):
                 return str(campaign.status)
+            if expected_binding is not None and campaign.approval_binding != expected_binding:
+                return "APPROVAL_SUPERSEDED"
             request = self._policy_activation_request(
                 campaign, campaign.project, campaign.approval_binding, actor
             )
-        if (self.github_policy_request_root / "activate.json").exists():
-            return "ACTIVATION_PENDING"
-        try:
-            self._write_github_policy_request(request)
-        except ValueError as error:
-            if "pending" in str(error):
+            # Written inside the transaction: the locks are held until commit, and this
+            # transaction changes no campaign state, so the reconciler (which reads the
+            # committed campaign) sees exactly the state checked above.
+            if (self.github_policy_request_root / "activate.json").exists():
                 return "ACTIVATION_PENDING"
-            raise
+            try:
+                self._write_github_policy_request(request)
+            except ValueError as error:
+                if "pending" in str(error):
+                    return "ACTIVATION_PENDING"
+                raise
         return "ACTIVATION_REQUEUED"
 
     async def release_backlog_ownership(

@@ -639,3 +639,39 @@ async def test_the_status_query_is_pinned_to_the_open_run() -> None:
     # A closed run's query is rejected by Temporal: no proof.
     handle.query = AsyncMock(side_effect=RuntimeError("query rejected: workflow closed"))
     assert await service.awaited_operator_issue("loop-1", "run-7") is None
+
+
+async def test_a_loop_registering_after_a_reapproval_for_another_operation_is_refused(
+    tmp_path: Path,
+) -> None:
+    # Codex review 2: a second loop that loaded the campaign before the re-approval must
+    # not register (and run) after it under an approval that is no longer its own.
+    live = await _voided(tmp_path)
+    assert (await live.reapprove())["status"] == "REAPPROVED"
+    other = {
+        **live.request.model_dump(mode="json"),
+        "workflow_id": f"backlog-loop-falcone-{CAMPAIGN_ID}-operation-{uuid4()}",
+        "issue_operation_id": str(uuid4()),
+        "issue_approval_binding": "f" * 64,
+    }
+    with pytest.raises(ValueError, match="approval changed before registration"):
+        live.engineering._register_backlog_run(other)
+    # The re-approved loop's own registration (an existing Run) is unaffected.
+    own = {**live.request.model_dump(mode="json"), "workflow_id": live.loop}
+    assert live.engineering._register_backlog_run(own)["status"] == "REGISTERED"
+    live.dispose()
+
+
+async def test_no_activation_request_is_written_for_a_superseded_approval(
+    tmp_path: Path,
+) -> None:
+    # Codex review 2: the post-commit write is bound to the approval it activates and is
+    # written under the approval lock; a replaced approval is never overtaken by it.
+    live = await _voided(tmp_path)
+    writes: list[dict[str, Any]] = []
+    live.metadata._write_github_policy_request = writes.append
+    live.set_campaign(status="APPROVED_POLICY_PENDING")
+    outcome = live.metadata._ensure_policy_activation(CAMPAIGN_ID, expected_binding="0" * 64)
+    assert outcome == "APPROVAL_SUPERSEDED"
+    assert writes == []
+    live.dispose()
