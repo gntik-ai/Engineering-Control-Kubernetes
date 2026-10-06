@@ -40,6 +40,8 @@ INTENT_STEP = "delivery.publication_intent"
 EFFECT_STEP = "delivery.publication_effect"
 ATTEMPT_STEP = "delivery.publication_attempt"
 UNRESOLVED_EFFECT_STATES = ("STARTED", "UNKNOWN")
+# NEW-145: terminal; an operator reconciled an uncertain effect against the live PR heads.
+RECONCILED_EFFECT_STATE = "RECONCILED"
 # A non-attempt does not grant unlimited retries. This bound is independent of
 # activity retry numbering, which can change across workflow recovery.
 MAX_EFFECT_ADMISSIONS = 5
@@ -292,6 +294,12 @@ class PublicationAuthorityRepository:
                     raise ValueError("publication effect custody changed")
                 if previous.status == "COMPLETE":
                     return {"status": "ALREADY_COMPLETE", "effect_id": str(effect_id)}
+                if previous.status == RECONCILED_EFFECT_STATE:
+                    # NEW-145: resolved, but never re-admitted: the reconciled run is
+                    # terminal; a new delivery attempt publishes under its own intent.
+                    raise ValueError(
+                        "publication effect was reconciled; a new delivery attempt publishes"
+                    )
                 # Includes lost claim/ack response, worker death and stale attempt.
                 # Do not infer absence of an external effect from a timeout.
                 if previous.status != "NOT_ATTEMPTED":

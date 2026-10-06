@@ -2185,6 +2185,9 @@ class GitOpsGitHubHandler:
                     "url": url,
                     "head_sha": str(pull_request.get("headRefOid") or ""),
                     "state": str(pull_request.get("state") or ""),
+                    # NEW-145: a reconciliation proves the PR still targets these.
+                    "head_branch": str(pull_request.get("headRefName") or ""),
+                    "base_branch": str(pull_request.get("baseRefName") or ""),
                 }
             )
         return {"status": "OK", "heads": heads}

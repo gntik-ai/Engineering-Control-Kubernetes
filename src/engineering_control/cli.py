@@ -225,6 +225,10 @@ def parser() -> argparse.ArgumentParser:
     issue_reapprove.add_argument("repository", choices=_CHANGE_REPOSITORIES)
     issue_reapprove.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     issue_reapprove.add_argument("confirmation_phrase")
+    # NEW-145: resolve an uncertain publication effect against the live PR heads.
+    publication_reconcile = commands.add_parser("publication-reconcile")
+    publication_reconcile.add_argument("effect_step_id", type=UUID)
+    publication_reconcile.add_argument("confirmation_phrase")
     commands.add_parser("findings").add_argument("--limit", type=int, default=50)
     for name in ("status", "run"):
         commands.add_parser(name).add_argument("workflow_id")
@@ -614,6 +618,15 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "project": arguments.project,
                 "repository": arguments.repository,
                 "issue_number": arguments.issue_number,
+                "confirmation_phrase": arguments.confirmation_phrase,
+            },
+        )
+    if command == "publication-reconcile":
+        return client.request(
+            "POST",
+            "/v1/publication-effects/reconcile",
+            {
+                "effect_id": str(arguments.effect_step_id),
                 "confirmation_phrase": arguments.confirmation_phrase,
             },
         )

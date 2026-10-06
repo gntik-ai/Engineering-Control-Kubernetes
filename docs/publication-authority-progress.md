@@ -42,8 +42,14 @@ The following remain mandatory, not waived:
 - Cover promotion, merges, comments, issue closure, alternate/global/R3 and legacy
   authority paths, and correction/Continue-As-New run lineage. This follow-up does
   not claim to guard those paths merely because initial publication is guarded.
-- Resolve uncertain effects through bounded authoritative reconciliation. There is
-  no automatic resolution here; permanent blocking is not complete recovery.
+- Resolve uncertain effects through bounded authoritative reconciliation. NEW-145 adds
+  an operator-confirmed path (`engineering-ctl publication-reconcile`) for the provably
+  safe case only: an UNKNOWN `git_push` effect of a terminal run, with a committed UNKNOWN
+  receipt for its current claim and no PR creation in its intent, becomes RECONCILED only
+  if every bound PR is OPEN or MERGED on its recorded branch and base at exactly the head
+  recorded at the last confirmed publication, read live by the GitHub worker. STARTED
+  effects (a publisher may still run) and PR creations still need a fenced resolution;
+  there is no automatic resolution.
 - Review action ordering and approval/lease drift in the interval after admission.
   A short admission deadline is not an atomic transaction with GitHub or a claim
   of exactly-once external effects. Long-running commands remain subject to the

@@ -164,6 +164,13 @@ class IssueAmendObservationInput:
 
 
 @dataclass
+class PublicationHeadsObservationInput:
+    """NEW-145: the bound pull requests whose live heads a publication reconciliation reads."""
+
+    pull_request_urls: list[str]
+
+
+@dataclass
 class ExistingGitHubBacklogLoopInput:
     project: str
     backlog_campaign_id: str

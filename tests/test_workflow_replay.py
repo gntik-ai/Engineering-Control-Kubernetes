@@ -41,6 +41,7 @@ from engineering_control.workflows.definitions import (
     FindingVerificationWorkflow,
     IssueAmendObservationWorkflow,
     IssueDeliveryWorkflow,
+    PublicationHeadsObservationWorkflow,
     StagingGitOpsDeliveryWorkflow,
 )
 from engineering_control.workflows.inputs import (
@@ -50,6 +51,7 @@ from engineering_control.workflows.inputs import (
     FindingVerificationInput,
     IssueAmendObservationInput,
     IssueDeliveryInput,
+    PublicationHeadsObservationInput,
     StagingGitOpsDeliveryInput,
 )
 from engineering_control.workflows.worker_registry import (
@@ -3781,3 +3783,34 @@ async def test_issue_amend_observation_reads_the_body_on_the_github_queue_and_re
     assert queues == [GITHUB_TASK_QUEUE]
     assert _markers(history) == []
     await Replayer(workflows=[IssueAmendObservationWorkflow]).replay_workflow(history)
+
+
+async def test_publication_heads_observation_reads_pr_heads_on_the_github_queue() -> None:
+    """NEW-145: a publication reconciliation reads the bound PRs' live heads with NEW-102's
+    own read-only step on the GitHub worker; a new workflow type, so no patch marker."""
+    urls = [
+        "https://github.com/gntik-ai/falcone/pull/1068",
+        "https://github.com/gntik-ai/falcone-charts/pull/61",
+    ]
+    observed = {
+        "status": "OK",
+        "heads": [{"url": url, "head_sha": "a" * 40, "state": "OPEN"} for url in urls],
+    }
+    history, result = await _run_to_history(
+        PublicationHeadsObservationWorkflow,
+        PublicationHeadsObservationInput(pull_request_urls=urls),
+        _scripted_execute_control_step({"gitops.pr_heads": observed}),
+    )
+
+    assert result == observed
+    assert _scheduled_steps(history) == [
+        {"step": "gitops.pr_heads", "payload": {"pull_requests": [{"url": url} for url in urls]}}
+    ]
+    queues = [
+        event.activity_task_scheduled_event_attributes.task_queue.name
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert queues == [GITHUB_TASK_QUEUE]
+    assert _markers(history) == []
+    await Replayer(workflows=[PublicationHeadsObservationWorkflow]).replay_workflow(history)

@@ -315,6 +315,62 @@ campaign approval for the operation and loop. The move is recorded once in the C
 `recovery_json.issue_execution_approval_reissued` (from/to binding, audit event); correction and
 CI-repair bounds keep counting the whole lineage.
 
+## Reconcile an uncertain publication effect (NEW-145)
+
+A publication whose outcome Hermes could not observe leaves its
+`delivery.publication_effect` Step `UNKNOWN` (or `STARTED`). Until it is resolved, every
+implementation lease of that project is refused ("unresolved publication effect requires
+reconciliation") and the run keeps its leases. This command resolves only the provably safe
+case: an `UNKNOWN` effect whose publisher returned (its committed receipt is `UNKNOWN` for the
+current claim) and whose action is a `git_push` of the recorded branch of an already-bound PR.
+A `STARTED` effect (a publisher may still be running) and any PR creation still need a fenced,
+manual resolution.
+
+1. Find the effect Step id (`delivery.publication_effect`, status `UNKNOWN`) and its ChangeSet.
+2. Make each bound PR branch match the head recorded at the ChangeSet's last confirmed
+   publication (`recovery_json.change_evidence.{source,deployment}.head_sha`), e.g. reset a
+   branch the uncertain push moved. Never edit the database.
+3. Run:
+
+```bash
+engineering-ctl publication-reconcile <effect_step_id> RECONCILE_PUBLICATION_<first 8 hex, upper>
+
+# falcone #972
+engineering-ctl publication-reconcile ba4a87ad-e4ef-573c-a71b-a902641f49bf \
+  RECONCILE_PUBLICATION_BA4A87AD
+```
+
+The API route is `POST /v1/publication-effects/reconcile` (operator channel only, like
+`r3-approve`). The GitHub worker reads every bound PR live (`gitops.pr_heads`, as NEW-102's
+restore does). It refuses with a `PUBLICATION_RECONCILE_*` code unless the effect's run is
+terminal (`RUN_ACTIVE`), the effect is `UNKNOWN` (`EFFECT_STARTED`, `EFFECT_NOT_UNRESOLVED`)
+with a committed `UNKNOWN` receipt for its current claim (`EFFECT_RECEIPT_INVALID`), its action
+is `git_push` and no effect of its publication intent created a PR
+(`EFFECT_ACTION_UNSUPPORTED`), its target is exactly the ChangeSet's recorded PRs and branch
+(`EFFECT_TARGET_UNBOUND`, `PUBLICATION_BINDING_MISSING`), and every bound PR is OPEN or
+MERGED, still on its recorded head branch and base (`PR_RETARGETED`), at exactly its recorded
+head (`HEAD_MISMATCH`, `PR_NOT_OPEN`, `PR_MISSING`).
+
+An `UNKNOWN` receipt does not prove the push is over: a timed-out command kills only its parent
+process, and a git transport child can outlive it. Reconciliation therefore also requires the
+publisher's systemd service (`engineering-github-worker.service` for `github-runner`, read
+on the controller, never supplied by the client) to run with `KillMode=control-group` and to
+have started after the receipt was committed (`PUBLISHER_NOT_SETTLED`,
+`PUBLISHER_SETTLEMENT_UNVERIFIABLE`). If it has not restarted since, restart it (or let the
+next deploy do so) and run the command again. The restart is read before the PR heads, and
+the heads may only be read 30 minutes (`REMOTE_SETTLE`) after it: GitHub can still apply a
+push it had already received when the client was killed, and no remote completion evidence
+exists, so this bounded wait is the fence for that (an explicit assumption: GitHub finishes
+processing a received push well within 30 minutes). A `delivery-runner` effect (worker host) is
+refused as unverifiable here.
+
+In one transaction under the publication locks it then sets the effect to the terminal status
+`RECONCILED` (the receipt is kept; a `reconciliation` record holds the operator, time, method,
+recorded and observed heads), writes a `publication_effect_reconciled` dashboard event, and
+releases the terminal run's component leases. A rerun reports `ALREADY_RECONCILED`. The loop's
+`backlog-retry` then proceeds: the CI-repair restore (NEW-102) and the next delivery child
+acquire their leases normally, and that child publishes under its own new effect.
+
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved

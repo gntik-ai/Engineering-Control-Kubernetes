@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import subprocess
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -64,6 +65,7 @@ from engineering_control.workflows.inputs import (
     MultiProjectAuditInput,
     ObservabilityAcceptanceInput,
     PreviewDeploymentInput,
+    PublicationHeadsObservationInput,
     RecoveryInput,
     RuntimeVerificationInput,
     StagingDeploymentInput,
@@ -84,10 +86,13 @@ class ControlService(Protocol):
     async def reconcile_delivery(self, request: DeliveryReconcile) -> OperationAccepted: ...
     async def signal(self, workflow_id: str, signal: str, argument: Any = None) -> None: ...
     async def current_open_run_id(self, workflow_id: str) -> str | None: ...
+
+    async def publisher_settlement(self, subject: str) -> dict[str, Any] | None: ...
     async def awaited_operator_issue(self, workflow_id: str, run_id: str) -> str | None: ...
 
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
     async def observe_issue_body(self, repository: str, issue_number: int) -> dict[str, Any]: ...
+    async def observe_pull_request_heads(self, urls: list[str]) -> list[dict[str, Any]]: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
     async def start_runtime_verification(
@@ -192,6 +197,24 @@ class TemporalControlService:
         if not isinstance(value, dict):
             raise RuntimeError("issue body observation returned an invalid result")
         return value
+
+    async def observe_pull_request_heads(self, urls: list[str]) -> list[dict[str, Any]]:
+        """NEW-145: live head and state of each pull request, read by the GitHub worker."""
+        value = await self.client.execute_workflow(
+            WorkflowName.PUBLICATION_HEADS_OBSERVATION.value,
+            PublicationHeadsObservationInput(pull_request_urls=list(urls)),
+            id=f"publication-heads-observe-{uuid4()}",
+            task_queue=self.task_queue,
+            execution_timeout=timedelta(seconds=90),
+        )
+        heads = value.get("heads") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("status") != "OK"
+            or not isinstance(heads, list)
+        ):
+            raise RuntimeError("pull request head observation returned an invalid result")
+        return [item for item in heads if isinstance(item, dict)]
 
     async def _start_recorded_workflow(
         self,
@@ -362,6 +385,48 @@ class TemporalControlService:
             raise ValueError("unsupported control signal")
         handle = self.client.get_workflow_handle(workflow_id)
         await handle.signal(signal, argument)
+
+    # NEW-145 review 2: publishers whose systemd service runs on this (controller) host.
+    _PUBLISHER_UNITS = {"github-runner": "engineering-github-worker.service"}
+
+    async def publisher_settlement(self, subject: str) -> dict[str, Any] | None:
+        """The publishing service's current start time and KillMode, read from systemd on
+        this host; None when the publisher is not a local unit or systemd cannot be read."""
+        unit = self._PUBLISHER_UNITS.get(subject)
+        if unit is None:
+            return None
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "systemctl",
+                    "show",
+                    unit,
+                    "--property=ExecMainStartTimestamp,KillMode,ActiveState",
+                    "--timestamp=unix",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+        stamp = values.get("ExecMainStartTimestamp", "")
+        if values.get("ActiveState") != "active" or not stamp.startswith("@"):
+            return None
+        try:
+            started = datetime.fromtimestamp(int(stamp[1:]), UTC)
+        except ValueError:
+            return None
+        return {
+            "unit": unit,
+            "started_at": started.isoformat(),
+            "kill_mode": values.get("KillMode", ""),
+        }
 
     async def current_open_run_id(self, workflow_id: str) -> str | None:
         """NEW-133 review 3: the run id of the workflow's current (latest) execution if it is
