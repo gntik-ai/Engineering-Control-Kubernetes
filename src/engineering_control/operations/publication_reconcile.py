@@ -19,7 +19,7 @@ pre-existing PR. A STARTED effect (a publisher may still be running) and any PR 
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -35,6 +35,11 @@ from engineering_control.operations.publication_authority import (
 )
 
 RECONCILED = RECONCILED_EFFECT_STATE
+# NEW-145 review 3: a push already received by GitHub can still update the ref after the
+# local client is killed. No remote completion evidence exists, so the PR heads may only be
+# read once this long has passed since the publisher's restart (the latest the client can
+# have died); it bounds GitHub's processing of a received push by a wide margin.
+REMOTE_SETTLE = timedelta(minutes=30)
 RECONCILE_EVENT_TYPE = "publication_effect_reconciled"
 RECONCILE_METHOD = "LIVE_PR_HEADS_EQUAL_RECORDED_PUBLICATION"
 # The only action whose effect the bound PRs' live heads and branches fully show.
@@ -222,7 +227,11 @@ def _require_publisher_settled(plan: dict[str, Any], settlement: dict[str, Any] 
     """NEW-145 review 2: a committed UNKNOWN receipt does not prove the push is over (a
     timed-out command kills only its parent; a transport child may survive). Settlement is
     proven only by the publishing service having restarted after the receipt under systemd
-    KillMode=control-group, which kills every process of the old service cgroup."""
+    KillMode=control-group, which kills every process of the old service cgroup.
+
+    Review 3: the restart must also precede the PR-head read by REMOTE_SETTLE, so no local
+    process survived into the observation and GitHub has finished any push it received.
+    ``heads_read_from`` is stamped by the API, before it asks the worker for the heads."""
     if not isinstance(settlement, dict):
         raise _refuse(
             "PUBLISHER_SETTLEMENT_UNVERIFIABLE",
@@ -236,6 +245,7 @@ def _require_publisher_settled(plan: dict[str, Any], settlement: dict[str, Any] 
     try:
         started = datetime.fromisoformat(str(settlement.get("started_at")))
         received = datetime.fromisoformat(plan["receipt_received_at"])
+        heads_read_from = datetime.fromisoformat(str(settlement.get("heads_read_from")))
     except ValueError as error:
         raise _refuse(
             "PUBLISHER_SETTLEMENT_UNVERIFIABLE", "the restart or receipt time is unreadable"
@@ -245,6 +255,12 @@ def _require_publisher_settled(plan: dict[str, Any], settlement: dict[str, Any] 
             "PUBLISHER_NOT_SETTLED",
             "the publisher has not restarted since the UNKNOWN receipt; restart its service "
             "(or wait for the next deploy) and run again",
+        )
+    if heads_read_from < started + REMOTE_SETTLE:
+        raise _refuse(
+            "PUBLISHER_NOT_SETTLED",
+            f"the PR heads were read less than {REMOTE_SETTLE} after the publisher's restart "
+            f"({started.isoformat()}); run again after {(started + REMOTE_SETTLE).isoformat()}",
         )
 
 

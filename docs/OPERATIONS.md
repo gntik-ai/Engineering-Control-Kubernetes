@@ -357,7 +357,11 @@ publisher's systemd service (`engineering-github-worker.service` for `github-run
 on the controller, never supplied by the client) to run with `KillMode=control-group` and to
 have started after the receipt was committed (`PUBLISHER_NOT_SETTLED`,
 `PUBLISHER_SETTLEMENT_UNVERIFIABLE`). If it has not restarted since, restart it (or let the
-next deploy do so) and run the command again. A `delivery-runner` effect (worker host) is
+next deploy do so) and run the command again. The restart is read before the PR heads, and
+the heads may only be read 30 minutes (`REMOTE_SETTLE`) after it: GitHub can still apply a
+push it had already received when the client was killed, and no remote completion evidence
+exists, so this bounded wait is the fence for that (an explicit assumption: GitHub finishes
+processing a received push well within 30 minutes). A `delivery-runner` effect (worker host) is
 refused as unverifiable here.
 
 In one transaction under the publication locks it then sets the effect to the terminal status

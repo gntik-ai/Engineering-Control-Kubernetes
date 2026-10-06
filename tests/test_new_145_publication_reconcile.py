@@ -40,12 +40,22 @@ DEPLOYMENT_PR = "https://github.com/gntik-ai/falcone-charts/pull/61"
 SOURCE_HEAD = "ac3e1fe0" + "a" * 32
 DEPLOYMENT_HEAD = "1c4380db" + "b" * 32
 ACTOR = "cli:engineering-ctl"
-# The GitHub worker's service restarted (whole cgroup killed) after the UNKNOWN receipt.
-SETTLED = {
-    "unit": "engineering-github-worker.service",
-    "started_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-    "kill_mode": "control-group",
-}
+
+
+def _settled(**overrides: Any) -> dict[str, Any]:
+    """The GitHub worker's service restarted (whole cgroup killed) after the UNKNOWN receipt
+    (50 minutes ago), and the heads are read more than REMOTE_SETTLE after that restart."""
+    now = datetime.now(UTC)
+    return {
+        "unit": "engineering-github-worker.service",
+        "started_at": (now - timedelta(minutes=40)).isoformat(),
+        "kill_mode": "control-group",
+        "heads_read_from": now.isoformat(),
+        **overrides,
+    }
+
+
+_FRESH: Any = object()
 TOKEN = "fixture-token-" + "x" * 40
 
 
@@ -90,7 +100,7 @@ class _Effect:
         *,
         phrase: str | None = None,
         actor: str = ACTOR,
-        settlement: dict[str, Any] | None = SETTLED,
+        settlement: dict[str, Any] | None = _FRESH,
     ) -> dict[str, Any]:
         confirmation = phrase or reconcile_phrase(self.effect_id)
         plan: dict[str, Any] = await self.operations.plan_publication_reconcile(
@@ -104,7 +114,7 @@ class _Effect:
             actor,
             plan,
             self.observed() if observed is None else observed,
-            settlement,
+            _settled() if settlement is _FRESH else settlement,
         )
         return result
 
@@ -546,10 +556,22 @@ def test_api_reads_the_live_heads_through_the_github_worker() -> None:
     )
     operations.reconcile_publication_effect = AsyncMock(return_value={"status": "RECONCILED"})
     service = Mock()
-    service.observe_pull_request_heads = AsyncMock(
-        side_effect=[observed, RuntimeError("GitHub unavailable")]
-    )
-    service.publisher_settlement = AsyncMock(return_value=SETTLED)
+    order: list[str] = []
+    settled = _settled()
+    del settled["heads_read_from"]
+
+    async def settlement(subject: str) -> dict[str, Any]:
+        order.append("settlement")
+        return settled
+
+    async def heads(urls: list[str]) -> list[dict[str, Any]]:
+        order.append("heads")
+        if order.count("heads") > 1:
+            raise RuntimeError("GitHub unavailable")
+        return observed
+
+    service.publisher_settlement = AsyncMock(side_effect=settlement)
+    service.observe_pull_request_heads = AsyncMock(side_effect=heads)
     bus = Mock()
     bus.dispatch_pending = AsyncMock(return_value=False)
     body = {"effect_id": effect_id, "confirmation_phrase": "RECONCILE_PUBLICATION_BA4A87AD"}
@@ -586,21 +608,32 @@ def test_api_reads_the_live_heads_through_the_github_worker() -> None:
     assert "PR_HEADS_UNAVAILABLE" in unavailable.json()["detail"]
     assert already.json()["status"] == "ALREADY_RECONCILED"
     service.observe_pull_request_heads.assert_awaited_with([SOURCE_PR, DEPLOYMENT_PR])
-    operations.reconcile_publication_effect.assert_awaited_once_with(
-        UUID(effect_id), body["confirmation_phrase"], ACTOR, plan, observed, SETTLED
-    )
-    # The restart evidence is read on the server for the plan's publisher, never sent.
-    service.publisher_settlement.assert_awaited_once_with("")
+    # The restart evidence is read on the server for the plan's publisher, never sent, and
+    # before the heads; the API stamps when its head read began.
+    assert order == ["settlement", "heads", "settlement", "heads"]
+    service.publisher_settlement.assert_awaited_with("")
+    call = operations.reconcile_publication_effect.await_args_list
+    assert len(call) == 1
+    assert call[0].args[:5] == (UUID(effect_id), body["confirmation_phrase"], ACTOR, plan, observed)
+    sent = call[0].args[5]
+    assert {key: sent[key] for key in settled} == settled
+    assert datetime.fromisoformat(sent["heads_read_from"]) <= datetime.now(UTC)
 
 
 @pytest.mark.parametrize(
     ("settlement", "blocker"),
     [
         (None, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
-        ({**SETTLED, "kill_mode": "process"}, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
-        ({**SETTLED, "started_at": "not a time"}, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
+        ({"kill_mode": "process"}, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
+        ({"started_at": "not a time"}, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
+        ({"heads_read_from": None}, "PUBLISHER_SETTLEMENT_UNVERIFIABLE"),
+        # Review 3: heads read under REMOTE_SETTLE after the restart.
         (
-            {**SETTLED, "started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat()},
+            {"heads_read_from": (datetime.now(UTC) - timedelta(minutes=20)).isoformat()},
+            "PUBLISHER_NOT_SETTLED",
+        ),
+        (
+            {"started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat()},
             "PUBLISHER_NOT_SETTLED",
         ),
     ],
@@ -609,10 +642,12 @@ async def test_a_publisher_not_proven_restarted_after_the_receipt_is_refused(
     tmp_path: Path, settlement: dict[str, Any] | None, blocker: str
 ) -> None:
     """Review 2: a timed-out push's transport child can outlive the UNKNOWN receipt; only a
-    control-group restart of the publisher's service after the receipt proves it is gone."""
+    control-group restart of the publisher's service after the receipt proves it is gone.
+    Review 3: and GitHub may still apply a push it received, so the heads must be read
+    REMOTE_SETTLE after that restart."""
     effect = await _effect(tmp_path)
     with pytest.raises(PublicationReconcileBlocked) as refused:
-        await effect.reconcile(settlement=settlement)
+        await effect.reconcile(settlement=None if settlement is None else _settled(**settlement))
     assert refused.value.blocker == f"PUBLICATION_RECONCILE_{blocker}"
     with effect.handler.sessions() as session:
         assert session.get(Step, effect.effect_id).status == "UNKNOWN"

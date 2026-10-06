@@ -832,6 +832,12 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
         if plan["status"] == "ALREADY_RECONCILED":
             return plan
+        # NEW-145 reviews 2-3: the publisher's restart evidence, read here from systemd (never
+        # from the client) and BEFORE the heads, proves no process of the UNKNOWN claim
+        # survived into the observation; the transaction checks the timestamps.
+        settlement = await service.publisher_settlement(str(plan.get("subject") or ""))
+        if settlement is not None:
+            settlement = {**settlement, "heads_read_from": datetime.now(UTC).isoformat()}
         try:
             observed = await service.observe_pull_request_heads(plan["pull_request_urls"])
         except Exception as error:  # noqa: BLE001 - one bounded operator-facing failure
@@ -840,9 +846,6 @@ def create_app(
                 detail="PUBLICATION_RECONCILE_PR_HEADS_UNAVAILABLE: the pull requests could "
                 "not be read; try again",
             ) from error
-        # NEW-145 review 2: the publisher's restart evidence, read here from systemd (never
-        # from the client), proves no process of the UNKNOWN claim can still push.
-        settlement = await service.publisher_settlement(str(plan.get("subject") or ""))
         try:
             return await repository.reconcile_publication_effect(
                 body.effect_id, body.confirmation_phrase, actor, plan, observed, settlement
