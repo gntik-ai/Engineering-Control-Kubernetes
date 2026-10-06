@@ -41,6 +41,7 @@ from engineering_control.db.models import (
     Step,
     VerificationResult,
 )
+from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
 from engineering_control.security.redaction import SecretRedactor
 
@@ -907,7 +908,12 @@ class DashboardRepository:
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         with self.sessions.begin() as session:
             rows = session.scalars(
-                select(DashboardEvent).where(DashboardEvent.occurred_at < cutoff).limit(10_000)
+                select(DashboardEvent)
+                .where(
+                    DashboardEvent.occurred_at < cutoff,
+                    DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                )
+                .limit(10_000)
             ).all()
             for row in rows:
                 session.delete(row)

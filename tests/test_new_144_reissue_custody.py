@@ -16,7 +16,8 @@ from test_new_143_issue_reapproval import RUN, _Live, _voided
 from engineering_control.activities.metadata import MetadataActivityHandler
 from engineering_control.config import Settings
 from engineering_control.db import runtime_binding
-from engineering_control.db.models import ChangeSet, DashboardEvent, Step
+from engineering_control.db.models import ChangeSet, DashboardEvent, GitHubBacklogCampaign, Step
+from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.operations.issue_delivery_approval import (
     REISSUE_CUSTODY_KEY,
     _prove_reissue,
@@ -85,6 +86,13 @@ async def _reissued(tmp_path: Path) -> tuple[_Live, _Delivery]:
 
 def _ci_repair_child(live: _Live, delivery: _Delivery, repair_round: int = 4) -> dict[str, Any]:
     """The loop records the CI-repair round, registers its child, and the child loads."""
+    registered, child = _register_ci_repair(live, delivery, repair_round)
+    return delivery.load(live, registered, child)
+
+
+def _register_ci_repair(
+    live: _Live, delivery: _Delivery, repair_round: int
+) -> tuple[dict[str, Any], str]:
     token = runtime_binding._current_identity.set(runtime_binding._Identity(live.loop, RUN, RUN))
     try:
         authorized = live.engineering._record_backlog_ci_repair(
@@ -109,7 +117,7 @@ def _ci_repair_child(live: _Live, delivery: _Delivery, repair_round: int = 4) ->
             "orchestration": {"workflow_id": live.loop},
         }
     )
-    return delivery.load(live, registered, child)
+    return registered, child
 
 
 def _recovery(live: _Live, delivery: _Delivery) -> dict[str, Any]:
@@ -285,7 +293,120 @@ async def test_a_tampered_custody_move_is_refused(tmp_path: Path) -> None:
             Step, UUID(change_set.recovery_json["issue_execution_approval"]["approval_id"])
         )
         with pytest.raises(ValueError, match="re-issue record is malformed"):
-            custody_bindings(change_set, origin.result_json)
+            custody_bindings(session, change_set, origin)
         with pytest.raises(ValueError):
             validate_change_set_issue_approval(session, change_set.id)
     _dispose(live, delivery)
+
+
+def _rehash(move: dict[str, Any]) -> dict[str, Any]:
+    body = {key: item for key, item in move.items() if key != "binding_sha256"}
+    return {**body, "binding_sha256": canonical_sha256(body)}
+
+
+def _set_moves(live: _Live, delivery: _Delivery, moves: list[dict[str, Any]]) -> None:
+    with live.operations.sessions.begin() as session:
+        change_set = session.get(ChangeSet, delivery.change_set_id)
+        change_set.recovery_json = {**dict(change_set.recovery_json), REISSUE_CUSTODY_KEY: moves}
+
+
+def _drop_reissue_events(live: _Live) -> None:
+    with live.operations.sessions.begin() as session:
+        for event in session.scalars(
+            select(DashboardEvent).where(DashboardEvent.event_type == "issue_approval_reissued")
+        ):
+            session.delete(event)
+
+
+async def test_a_recorded_move_is_reproven_from_its_authority(tmp_path: Path) -> None:
+    # Codex review: a move with a recomputed (unkeyed) hash naming nonexistent IDs was
+    # accepted without any re-issue event.
+    live, delivery = await _reissued(tmp_path)
+    assert _ci_repair_child(live, delivery)["status"] == "CONFIRMED_LOADED"
+    (move,) = _recovery(live, delivery)[REISSUE_CUSTODY_KEY]
+
+    def refused() -> None:
+        with live.operations.sessions() as session:
+            with pytest.raises(ValueError):
+                validate_change_set_issue_approval(session, delivery.change_set_id)
+        with pytest.raises(ValueError, match="already belongs to another issue approval"):
+            _ci_repair_child(live, delivery, repair_round=5)
+
+    _set_moves(live, delivery, [_rehash({**move, "audit_event_id": 424242})])
+    refused()
+    _set_moves(live, delivery, [_rehash({**move, "approval_id": str(uuid4())})])
+    refused()
+    # The genuine move, but its audit event gone: nothing proves it any more.
+    _set_moves(live, delivery, [move])
+    _drop_reissue_events(live)
+    refused()
+    _dispose(live, delivery)
+
+
+async def test_a_forged_move_without_any_reissue_event_is_refused(tmp_path: Path) -> None:
+    live, delivery = await _reissued(tmp_path)
+    with live.operations.sessions() as session:
+        change_set = session.get(ChangeSet, delivery.change_set_id)
+        origin = session.get(
+            Step, UUID(change_set.recovery_json["issue_execution_approval"]["approval_id"])
+        )
+        campaign = session.get(GitHubBacklogCampaign, live.request.backlog_campaign_id)
+        forged = _rehash(
+            {
+                "version": 1,
+                "from": origin.result_json["campaign_approval_binding"],
+                "to": campaign.approval_binding,
+                "issue_operation_id": str(live.operation_id),
+                "issue_approval_binding": live.request.issue_approval_binding,
+                "loop_workflow_id": live.loop,
+                "approval_id": str(uuid4()),
+                "audit_event_id": 424242,
+                "recorded_at": "2026-10-06T00:00:00+00:00",
+            }
+        )
+    _drop_reissue_events(live)
+    _set_moves(live, delivery, [forged])
+    with pytest.raises(ValueError, match="already belongs to another issue approval"):
+        _ci_repair_child(live, delivery)
+    with live.operations.sessions() as session:
+        with pytest.raises(ValueError):
+            validate_change_set_issue_approval(session, delivery.change_set_id)
+    _dispose(live, delivery)
+
+
+async def test_an_older_reissue_is_never_replayed_over_a_newer_one(tmp_path: Path) -> None:
+    # Codex review: after A -> C, restoring the older re-issued approval B and loading its
+    # earlier registered child recorded C -> B (audit event ids decreasing).
+    live, delivery = await _reissued(tmp_path)  # re-issue B (audit event 1)
+    registered_b, child_b = _register_ci_repair(live, delivery, 4)
+    with live.operations.sessions() as session:
+        campaign = session.get(GitHubBacklogCampaign, live.request.backlog_campaign_id)
+        approval_b = (campaign.approval_binding, deepcopy(campaign.approval_json))
+    live.loop_state("PAUSED", blocker="OPERATOR_PAUSE")
+    assert (await live.reapprove())["status"] == "REAPPROVED"  # re-issue C (audit event 2)
+    live.loop_state("RUNNING")
+    assert _ci_repair_child(live, delivery, 5)["status"] == "CONFIRMED_LOADED"
+    (move,) = _recovery(live, delivery)[REISSUE_CUSTODY_KEY]  # A -> C
+    with live.operations.sessions.begin() as session:
+        campaign = session.get(GitHubBacklogCampaign, live.request.backlog_campaign_id)
+        campaign.approval_binding, campaign.approval_json = approval_b
+        campaign.status = "RUNNING"
+    with pytest.raises(ValueError, match="already belongs to another issue approval"):
+        delivery.load(live, registered_b, child_b)
+    assert _recovery(live, delivery)[REISSUE_CUSTODY_KEY] == [move]
+    # A hand-written out-of-order chain is refused on read as well.
+    with live.operations.sessions() as session:
+        events = session.scalars(
+            select(DashboardEvent)
+            .where(DashboardEvent.event_type == "issue_approval_reissued")
+            .order_by(DashboardEvent.id)
+        ).all()
+        assert [event.id for event in events] == sorted(event.id for event in events)
+        assert move["audit_event_id"] == events[-1].id
+    _dispose(live, delivery)
+
+
+def test_custody_audit_events_survive_dashboard_retention() -> None:
+    from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
+
+    assert "issue_approval_reissued" in RETAINED_DASHBOARD_EVENT_TYPES

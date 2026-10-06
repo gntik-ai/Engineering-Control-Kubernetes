@@ -122,6 +122,7 @@ from engineering_control.quota.broker import QuotaSnapshot as BrokerQuotaSnapsho
 from engineering_control.retention_limits import (
     DASHBOARD_SESSION_REVOCATION_CLEANUP_LIMIT,
     NOTIFICATION_OUTBOX_PENDING_STATUS,
+    RETAINED_DASHBOARD_EVENT_TYPES,
 )
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.workflows.cleanup_scope import (
@@ -7757,7 +7758,8 @@ class MetadataActivityHandler:
             dashboard_event_cleanup_count = int(
                 session.scalar(
                     select(func.count(DashboardEvent.id)).where(
-                        DashboardEvent.occurred_at < event_cutoff
+                        DashboardEvent.occurred_at < event_cutoff,
+                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
                     )
                 )
                 or 0
@@ -8177,7 +8179,10 @@ class MetadataActivityHandler:
             event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
             expired_events = session.scalars(
                 select(DashboardEvent)
-                .where(DashboardEvent.occurred_at < event_cutoff)
+                .where(
+                    DashboardEvent.occurred_at < event_cutoff,
+                    DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                )
                 .order_by(DashboardEvent.id)
                 .limit(10_000)
             ).all()

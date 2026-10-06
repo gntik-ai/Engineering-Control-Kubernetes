@@ -12,3 +12,6 @@ NOTIFICATION_OUTBOX_METRIC_STATUSES = (
     *NOTIFICATION_OUTBOX_WRITE_STATUSES,
     NOTIFICATION_OUTBOX_UNKNOWN_STATUS,
 )
+# NEW-144: audit events that ChangeSet custody re-proves on every read (a NEW-143 issue
+# approval re-issue); dashboard-event retention never deletes them.
+RETAINED_DASHBOARD_EVENT_TYPES = ("issue_approval_reissued",)
