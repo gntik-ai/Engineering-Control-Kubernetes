@@ -406,7 +406,56 @@ async def test_an_older_reissue_is_never_replayed_over_a_newer_one(tmp_path: Pat
     _dispose(live, delivery)
 
 
-def test_custody_audit_events_survive_dashboard_retention() -> None:
+async def test_retention_keeps_only_custody_referenced_reissue_events(tmp_path: Path) -> None:
+    # NEW-144 review 2: a re-issue event outlives retention only while a ChangeSet's
+    # custody chain references it; unreferenced or superseded ones age out (bounded).
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import or_
+
+    from engineering_control.operations.issue_delivery_approval import (
+        custody_referenced_event_ids,
+    )
     from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 
-    assert "issue_approval_reissued" in RETAINED_DASHBOARD_EVENT_TYPES
+    live, delivery = await _reissued(tmp_path)
+    assert _ci_repair_child(live, delivery)["status"] == "CONFIRMED_LOADED"
+    (move,) = _recovery(live, delivery)[REISSUE_CUSTODY_KEY]
+    referenced = move["audit_event_id"]
+    # A second re-issue that no custody chain references (e.g. an unused reapproval).
+    live.loop_state("PAUSED", blocker="OPERATOR_PAUSE")
+    assert (await live.reapprove())["status"] in {"REAPPROVED", "ALREADY_APPROVED"}
+    old = datetime.now(UTC) - timedelta(days=400)
+    with live.operations.sessions.begin() as session:
+        for event in session.scalars(
+            select(DashboardEvent).where(DashboardEvent.event_type == "issue_approval_reissued")
+        ):
+            event.occurred_at = old
+        unreferenced = [
+            event.id
+            for event in session.scalars(
+                select(DashboardEvent).where(
+                    DashboardEvent.event_type == "issue_approval_reissued",
+                    DashboardEvent.id != referenced,
+                )
+            )
+        ]
+    with live.operations.sessions() as session:
+        assert custody_referenced_event_ids(session) == [referenced]
+        expired = {
+            event.id
+            for event in session.scalars(
+                select(DashboardEvent).where(
+                    DashboardEvent.occurred_at < datetime.now(UTC) - timedelta(days=30),
+                    DashboardEvent.event_type == "issue_approval_reissued",
+                    or_(
+                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                        DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
+                    ),
+                )
+            )
+        }
+    assert unreferenced, "the fixture must create an unreferenced re-issue event"
+    assert referenced not in expired
+    assert expired == set(unreferenced)
+    _dispose(live, delivery)

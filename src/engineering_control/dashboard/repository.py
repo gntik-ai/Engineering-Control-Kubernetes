@@ -41,6 +41,7 @@ from engineering_control.db.models import (
     Step,
     VerificationResult,
 )
+from engineering_control.operations.issue_delivery_approval import custody_referenced_event_ids
 from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
 from engineering_control.security.redaction import SecretRedactor
@@ -911,7 +912,10 @@ class DashboardRepository:
                 select(DashboardEvent)
                 .where(
                     DashboardEvent.occurred_at < cutoff,
-                    DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                    or_(
+                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                        DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
+                    ),
                 )
                 .limit(10_000)
             ).all()

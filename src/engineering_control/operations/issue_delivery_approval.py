@@ -256,6 +256,26 @@ def _approval_scope(value: dict[str, Any]) -> dict[str, Any]:
 # NEW-144: ChangeSet.recovery_json record of each move of its custody to a NEW-143
 # re-issued campaign approval of the same issue operation (from -> to campaign binding).
 REISSUE_CUSTODY_KEY = "issue_execution_approval_reissued"
+
+
+def custody_referenced_event_ids(session: Session) -> list[int]:
+    """NEW-144 review 2: the audit events some ChangeSet's custody chain references.
+
+    Only these re-issue events must outlive dashboard-event retention (custody re-proves
+    each recorded move against its event); unreferenced or superseded re-issue events age
+    out like every other event, so the table stays bounded."""
+    referenced: set[int] = set()
+    for recovery in session.scalars(
+        select(ChangeSet.recovery_json).where(ChangeSet.recovery_json.is_not(None))
+    ):
+        moves = recovery.get(REISSUE_CUSTODY_KEY) if isinstance(recovery, dict) else None
+        for move in moves if isinstance(moves, list) else []:
+            event_id = move.get("audit_event_id") if isinstance(move, dict) else None
+            if type(event_id) is int:
+                referenced.add(event_id)
+    return sorted(referenced)
+
+
 # The audit event NEW-143's issue-reapprove writes in its approval transaction.
 REISSUE_EVENT_TYPE = "issue_approval_reissued"
 _REISSUE_MOVE_FIELDS = frozenset(

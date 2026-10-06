@@ -14,7 +14,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import yaml
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from temporalio.exceptions import ApplicationError
@@ -112,6 +112,7 @@ from engineering_control.observability.agent import normalize_agent_role
 from engineering_control.operations.issue_amend import record_consumed_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     bind_change_set_issue_approval,
+    custody_referenced_event_ids,
     validate_change_set_issue_approval,
     validate_child_issue_approval,
 )
@@ -7759,7 +7760,10 @@ class MetadataActivityHandler:
                 session.scalar(
                     select(func.count(DashboardEvent.id)).where(
                         DashboardEvent.occurred_at < event_cutoff,
-                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                        or_(
+                            DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                            DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
+                        ),
                     )
                 )
                 or 0
@@ -8181,7 +8185,10 @@ class MetadataActivityHandler:
                 select(DashboardEvent)
                 .where(
                     DashboardEvent.occurred_at < event_cutoff,
-                    DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                    or_(
+                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
+                        DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
+                    ),
                 )
                 .order_by(DashboardEvent.id)
                 .limit(10_000)
