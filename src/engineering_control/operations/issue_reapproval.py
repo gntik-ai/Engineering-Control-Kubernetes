@@ -43,11 +43,14 @@ from engineering_control.operations.issue_approval import (
     current_issue_approval_binding,
     require_issue_request_approval,
 )
-from engineering_control.operations.issue_delivery_approval import STEP_NAME
+from engineering_control.operations.issue_delivery_approval import (
+    REISSUE_EVENT_TYPE,
+    STEP_NAME,
+)
 from engineering_control.operations.issue_start import issue_start_request, issue_workflow_id
 from engineering_control.operations.models import SolveIssueCommand, parse_command
 
-REAPPROVAL_EVENT_TYPE = "issue_approval_reissued"
+REAPPROVAL_EVENT_TYPE = REISSUE_EVENT_TYPE
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _ISSUE_LOOP = re.compile(
     rf"backlog-loop-(?P<project>falcone|musematic|llmwiki)-(?P<campaign>{_UUID})"
@@ -277,6 +280,7 @@ def record_issue_reapproval(
     approval_binding: str,
     approval_status: str,
     actor: str,
+    issue_approval_binding: str | None = None,
     now: datetime | None = None,
 ) -> int:
     """Audit one re-approval (idempotent per resulting campaign approval binding)."""
@@ -312,6 +316,10 @@ def record_issue_reapproval(
             "repository": repository,
             "approval_binding": approval_binding,
             "approval_status": approval_status,
+            # NEW-144: the operation binding the re-issue continues (custody link).
+            **(
+                {"issue_approval_binding": issue_approval_binding} if issue_approval_binding else {}
+            ),
         },
     )
     session.add(event)

@@ -130,7 +130,9 @@ class _Live:
             item.engine.dispose()
 
 
-async def _voided(tmp_path: Path) -> _Live:
+async def _voided(
+    tmp_path: Path, delivered: Callable[[_Live, dict[str, Any]], None] | None = None
+) -> _Live:
     """issue-start approval, a running loop, backlog-pause voiding it, the general
     re-approval, and the loop paused because the next child registration is refused."""
     operations, metadata, engineering, request = await _approved_direct_request(tmp_path)
@@ -207,7 +209,10 @@ async def _voided(tmp_path: Path) -> _Live:
     live.finding_id = str(finding.id)
     live.set_campaign(status="APPROVED")  # the reconciler activated the issue-start policy
     live.loop_state("RUNNING")
-    assert live.register(1)["status"] == "REGISTERED"
+    first = live.register(1)
+    assert first["status"] == "REGISTERED"
+    if delivered is not None:
+        delivered(live, first)  # NEW-144: the first child loads and delivers its ChangeSet
     # backlog-pause during the GitHub outage voids the campaign approval.
     live.loop_state("PAUSED", blocker="OPERATOR_PAUSE")
     # The operator re-approves through the general backlog-approve (R2, max 5).
