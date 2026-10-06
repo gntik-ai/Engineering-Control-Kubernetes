@@ -14,7 +14,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import yaml
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from sqlalchemy import create_engine, func, or_, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from temporalio.exceptions import ApplicationError
@@ -112,7 +112,7 @@ from engineering_control.observability.agent import normalize_agent_role
 from engineering_control.operations.issue_amend import record_consumed_issue_revision
 from engineering_control.operations.issue_delivery_approval import (
     bind_change_set_issue_approval,
-    custody_referenced_event_ids,
+    expired_unreferenced_reissue_event_ids,
     validate_change_set_issue_approval,
     validate_child_issue_approval,
 )
@@ -7756,18 +7756,17 @@ class MetadataActivityHandler:
                     )
             preview_candidates = self._preview_namespace_cleanup_candidates(session, now)
             event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
+            # NEW-144 review 3: ordinary events counted in SQL; expired re-issue events
+            # filtered against the custody references in Python (no SQL id list).
             dashboard_event_cleanup_count = int(
                 session.scalar(
                     select(func.count(DashboardEvent.id)).where(
                         DashboardEvent.occurred_at < event_cutoff,
-                        or_(
-                            DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
-                            DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
-                        ),
+                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
                     )
                 )
                 or 0
-            )
+            ) + len(expired_unreferenced_reissue_event_ids(session, event_cutoff))
             dashboard_session_revocation_cleanup_count = int(
                 session.scalar(
                     select(func.count(DashboardSessionRevocation.session_binding_hash)).where(
@@ -8181,18 +8180,24 @@ class MetadataActivityHandler:
                 cleaned_previews.append(str(deployment.id))
 
             event_cutoff = now - timedelta(days=self.settings.dashboard_event_retention_days)
-            expired_events = session.scalars(
-                select(DashboardEvent)
-                .where(
-                    DashboardEvent.occurred_at < event_cutoff,
-                    or_(
+            expired_events = list(
+                session.scalars(
+                    select(DashboardEvent)
+                    .where(
+                        DashboardEvent.occurred_at < event_cutoff,
                         DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
-                        DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
-                    ),
-                )
-                .order_by(DashboardEvent.id)
-                .limit(10_000)
-            ).all()
+                    )
+                    .order_by(DashboardEvent.id)
+                    .limit(10_000)
+                ).all()
+            )
+            # NEW-144 review 3: plus expired re-issue events no custody references.
+            for event_id in expired_unreferenced_reissue_event_ids(
+                session, event_cutoff, limit=max(0, 10_000 - len(expired_events))
+            ):
+                stale = session.get(DashboardEvent, event_id)
+                if stale is not None:
+                    expired_events.append(stale)
             for event in expired_events:
                 session.delete(event)
             deleted_dashboard_events = len(expired_events)

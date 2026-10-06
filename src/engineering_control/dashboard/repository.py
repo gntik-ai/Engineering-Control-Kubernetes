@@ -41,7 +41,9 @@ from engineering_control.db.models import (
     Step,
     VerificationResult,
 )
-from engineering_control.operations.issue_delivery_approval import custody_referenced_event_ids
+from engineering_control.operations.issue_delivery_approval import (
+    expired_unreferenced_reissue_event_ids,
+)
 from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 from engineering_control.run_projection import TERMINAL_RUN_OUTCOMES
 from engineering_control.security.redaction import SecretRedactor
@@ -908,17 +910,24 @@ class DashboardRepository:
     def _delete_expired_events(self, retention_days: int) -> int:
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         with self.sessions.begin() as session:
-            rows = session.scalars(
-                select(DashboardEvent)
-                .where(
-                    DashboardEvent.occurred_at < cutoff,
-                    or_(
+            rows = list(
+                session.scalars(
+                    select(DashboardEvent)
+                    .where(
+                        DashboardEvent.occurred_at < cutoff,
                         DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
-                        DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
-                    ),
-                )
-                .limit(10_000)
-            ).all()
+                    )
+                    .limit(10_000)
+                ).all()
+            )
+            # NEW-144 review 3: plus expired re-issue events no custody references
+            # (filtered in Python; never a SQL id list).
+            for event_id in expired_unreferenced_reissue_event_ids(
+                session, cutoff, limit=max(0, 10_000 - len(rows))
+            ):
+                stale = session.get(DashboardEvent, event_id)
+                if stale is not None:
+                    rows.append(stale)
             for row in rows:
                 session.delete(row)
             return len(rows)

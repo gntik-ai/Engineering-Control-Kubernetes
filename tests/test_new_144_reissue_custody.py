@@ -411,12 +411,10 @@ async def test_retention_keeps_only_custody_referenced_reissue_events(tmp_path: 
     # custody chain references it; unreferenced or superseded ones age out (bounded).
     from datetime import UTC, datetime, timedelta
 
-    from sqlalchemy import or_
-
     from engineering_control.operations.issue_delivery_approval import (
         custody_referenced_event_ids,
+        expired_unreferenced_reissue_event_ids,
     )
-    from engineering_control.retention_limits import RETAINED_DASHBOARD_EVENT_TYPES
 
     live, delivery = await _reissued(tmp_path)
     assert _ci_repair_child(live, delivery)["status"] == "CONFIRMED_LOADED"
@@ -442,20 +440,37 @@ async def test_retention_keeps_only_custody_referenced_reissue_events(tmp_path: 
         ]
     with live.operations.sessions() as session:
         assert custody_referenced_event_ids(session) == [referenced]
-        expired = {
-            event.id
-            for event in session.scalars(
-                select(DashboardEvent).where(
-                    DashboardEvent.occurred_at < datetime.now(UTC) - timedelta(days=30),
-                    DashboardEvent.event_type == "issue_approval_reissued",
-                    or_(
-                        DashboardEvent.event_type.not_in(RETAINED_DASHBOARD_EVENT_TYPES),
-                        DashboardEvent.id.not_in(custody_referenced_event_ids(session)),
-                    ),
-                )
-            )
-        }
+        expired = set(
+            expired_unreferenced_reissue_event_ids(session, datetime.now(UTC) - timedelta(days=30))
+        )
     assert unreferenced, "the fixture must create an unreferenced re-issue event"
     assert referenced not in expired
     assert expired == set(unreferenced)
+    _dispose(live, delivery)
+
+
+async def test_retention_does_not_send_custody_references_as_sql_parameters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # NEW-144 review 3: 100,000 references would exceed the driver's parameter limit if
+    # they were a NOT IN list; the cleaner filters in Python, so it still runs.
+    from datetime import UTC, datetime, timedelta
+
+    from engineering_control.operations import issue_delivery_approval
+
+    live, delivery = await _reissued(tmp_path)
+    monkeypatch.setattr(
+        issue_delivery_approval,
+        "custody_referenced_event_ids",
+        lambda session: list(range(1_000_000, 1_100_000)),
+    )
+    old = datetime.now(UTC) - timedelta(days=400)
+    with live.operations.sessions.begin() as session:
+        for event in session.scalars(select(DashboardEvent)):
+            event.occurred_at = old
+    with live.operations.sessions() as session:
+        expired = issue_delivery_approval.expired_unreferenced_reissue_event_ids(
+            session, datetime.now(UTC) - timedelta(days=30)
+        )
+    assert expired  # none of the fixture's re-issue events is in the huge reference set
     _dispose(live, delivery)
