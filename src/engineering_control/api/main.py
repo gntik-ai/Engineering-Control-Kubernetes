@@ -53,6 +53,7 @@ from engineering_control.api.schemas import (
     LoopStartDispatch,
     ObservabilityAcceptanceStart,
     OperationAccepted,
+    PublicationReconcileRequest,
     R3IssueApprovalRequest,
     RecordList,
     RollbackRequest,
@@ -806,6 +807,42 @@ def create_app(
                 body.issue_number,
                 body.confirmation_phrase,
                 actor,
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/publication-effects/reconcile")
+    async def publication_effect_reconcile(
+        body: PublicationReconcileRequest,
+        subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+        service: ControlService = control_dependency,
+    ) -> dict[str, Any]:
+        """NEW-145: resolve an uncertain publication effect by authority.
+
+        Same trust model as /v1/r3-issues/approve. The bound PRs' live heads are read by the
+        GitHub worker and must equal the heads recorded at the last confirmed publication;
+        every other precondition is re-read from durable records."""
+        actor = approval_actor(subject)
+        try:
+            plan = await repository.plan_publication_reconcile(
+                body.effect_id, body.confirmation_phrase, actor
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if plan["status"] == "ALREADY_RECONCILED":
+            return plan
+        try:
+            observed = await service.observe_pull_request_heads(plan["pull_request_urls"])
+        except Exception as error:  # noqa: BLE001 - one bounded operator-facing failure
+            raise HTTPException(
+                status_code=503,
+                detail="PUBLICATION_RECONCILE_PR_HEADS_UNAVAILABLE: the pull requests could "
+                "not be read; try again",
+            ) from error
+        try:
+            return await repository.reconcile_publication_effect(
+                body.effect_id, body.confirmation_phrase, actor, plan, observed
             )
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error

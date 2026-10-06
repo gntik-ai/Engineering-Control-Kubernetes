@@ -1,0 +1,263 @@
+"""NEW-145: bounded, operator-confirmed reconciliation of an uncertain publication effect.
+
+A ``delivery.publication_effect`` Step left STARTED or UNKNOWN blocks every implementation
+lease of its project (leases/component.py) and keeps its run's leases (metadata release):
+the controller cannot know whether the push or PR change happened. This module resolves
+one such effect only by authority: the live heads of the ChangeSet's bound pull requests,
+read by the GitHub worker, must be exactly the heads recorded at the ChangeSet's last
+confirmed publication (``recovery_json.change_evidence``), so the uncertain effect left no
+unrecorded change. The effect then moves to the terminal status RECONCILED with a
+``reconciliation`` record; its immutable receipt is kept. Nothing here talks to GitHub.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from engineering_control.db.models import ChangeSet, ComponentLease, DashboardEvent, Run, Step
+from engineering_control.operations.publication_authority import (
+    EFFECT_STEP,
+    INTENT_STEP,
+    _lock_changeset,
+)
+
+RECONCILED = "RECONCILED"
+RECONCILE_EVENT_TYPE = "publication_effect_reconciled"
+RECONCILE_METHOD = "LIVE_PR_HEADS_EQUAL_RECORDED_PUBLICATION"
+# A STARTED effect is reconcilable only once its claim's start deadline is this far past
+# and its run is terminal: no worker can still be starting or running the effect.
+STARTED_FENCE = timedelta(minutes=15)
+_ACTIVE_RUN_STATES = frozenset({"QUEUED", "RUNNING", "RATE_LIMITED", "AWAITING_APPROVAL"})
+_SHA = re.compile(r"[0-9a-f]{40}")
+_PR_URL = re.compile(
+    r"https://github\.com/(gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki))"
+    r"/pull/[1-9][0-9]{0,9}"
+)
+
+
+class PublicationReconcileBlocked(ValueError):
+    """A refused reconciliation: a stable blocker code and operator guidance."""
+
+    def __init__(self, blocker: str, detail: str) -> None:
+        super().__init__(f"{blocker}: {detail}")
+        self.blocker = blocker
+        self.detail = detail
+
+
+def reconcile_phrase(effect_id: UUID) -> str:
+    return f"RECONCILE_PUBLICATION_{effect_id.hex[:8].upper()}"
+
+
+def _refuse(code: str, detail: str) -> PublicationReconcileBlocked:
+    return PublicationReconcileBlocked(f"PUBLICATION_RECONCILE_{code}", detail)
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _run_terminal(run: Run | None) -> bool:
+    return run is not None and run.status not in _ACTIVE_RUN_STATES and run.finished_at is not None
+
+
+def _recorded_pull_requests(change_set: ChangeSet) -> dict[str, str]:
+    """The ChangeSet's bound PRs and the heads recorded at its last confirmed publication."""
+    recovery = change_set.recovery_json or {}
+    evidence = recovery.get("change_evidence")
+    recorded: dict[str, str] = {}
+    for url, side in (
+        (change_set.source_pr_url, "source"),
+        (change_set.deployment_pr_url, "deployment"),
+    ):
+        if not url:
+            continue
+        entry = evidence.get(side) if isinstance(evidence, dict) else None
+        head = entry.get("head_sha") if isinstance(entry, dict) else None
+        if not isinstance(head, str) or not _SHA.fullmatch(head) or not _PR_URL.fullmatch(url):
+            raise _refuse(
+                "PUBLICATION_BINDING_MISSING",
+                f"the {side} PR has no recorded published head to compare with",
+            )
+        recorded[str(url)] = head
+    if not change_set.source_pr_url:
+        raise _refuse("PUBLICATION_BINDING_MISSING", "the ChangeSet has no published source PR")
+    return recorded
+
+
+def plan_publication_reconcile(
+    session: Session, effect_id: UUID, confirmation: str, now: datetime | None = None
+) -> dict[str, Any]:
+    """Every precondition except the live GitHub read, from durable records.
+
+    ``status`` is RECONCILE (read these PRs, then call reconcile_publication_effect) or
+    ALREADY_RECONCILED (an idempotent rerun: nothing to do)."""
+    current = now or datetime.now(UTC)
+    if confirmation != reconcile_phrase(effect_id):
+        raise _refuse("CONFIRMATION_MISMATCH", f"confirm with {reconcile_phrase(effect_id)}")
+    effect = session.get(Step, effect_id)
+    if effect is None or effect.name != EFFECT_STEP or not isinstance(effect.result_json, dict):
+        raise _refuse("EFFECT_NOT_FOUND", f"no publication effect {effect_id}")
+    if effect.status == RECONCILED:
+        return {
+            "status": "ALREADY_RECONCILED",
+            "effect_id": str(effect.id),
+            "reconciliation": effect.result_json.get("reconciliation"),
+        }
+    run = session.get(Run, effect.run_id)
+    if not _run_terminal(run):
+        raise _refuse(
+            "RUN_ACTIVE", "the effect's run is still active; let it stop (or cancel it) first"
+        )
+    if effect.status == "STARTED":
+        try:
+            start_before = _utc(datetime.fromisoformat(str(effect.result_json["start_before"])))
+        except (KeyError, ValueError) as error:
+            raise _refuse("EFFECT_NOT_FENCED", "the STARTED claim has no start deadline") from error
+        if "receipt" in effect.result_json or current < start_before + STARTED_FENCE:
+            raise _refuse(
+                "EFFECT_NOT_FENCED",
+                f"a STARTED effect is reconcilable only {STARTED_FENCE} after its claim's "
+                "start deadline",
+            )
+    elif effect.status != "UNKNOWN":
+        raise _refuse("EFFECT_NOT_UNRESOLVED", f"the effect is {effect.status}, not unresolved")
+    intent = session.get(Step, UUID(str(effect.result_json.get("intent_id"))))
+    if (
+        intent is None
+        or intent.name != INTENT_STEP
+        or intent.run_id != effect.run_id
+        or not isinstance(intent.result_json, dict)
+    ):
+        raise _refuse("EFFECT_CUSTODY_INVALID", "the effect's publication intent is unavailable")
+    change_set = session.get(ChangeSet, UUID(str(intent.result_json["change_set_id"])))
+    if change_set is None or run is None or run.change_set_id != change_set.id:
+        raise _refuse("EFFECT_CUSTODY_INVALID", "the effect's ChangeSet binding changed")
+    recorded = _recorded_pull_requests(change_set)
+    request = effect.result_json.get("request")
+    target = request.get("repository") if isinstance(request, dict) else None
+    repositories = {
+        match.group(1) for url in recorded if (match := _PR_URL.fullmatch(url)) is not None
+    }
+    if target not in repositories:
+        raise _refuse(
+            "EFFECT_TARGET_UNBOUND", f"the effect's repository {target} has no bound PR to check"
+        )
+    return {
+        "status": "RECONCILE",
+        "effect_id": str(effect.id),
+        "effect_status": effect.status,
+        "change_set_id": str(change_set.id),
+        "change_set_version": change_set.version,
+        "recorded_heads": recorded,
+        "pull_request_urls": list(recorded),
+    }
+
+
+def reconcile_publication_effect(
+    session: Session,
+    effect_id: UUID,
+    confirmation: str,
+    actor: str,
+    planned: dict[str, Any],
+    observed: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Re-check under the publication locks, compare the live heads, and resolve."""
+    current = now or datetime.now(UTC)
+    _lock_changeset(session, UUID(str(planned["change_set_id"])))
+    session.scalar(select(Step).where(Step.id == effect_id).with_for_update())
+    plan = plan_publication_reconcile(session, effect_id, confirmation, current)
+    if plan["status"] == "ALREADY_RECONCILED":
+        return plan
+    if any(plan[key] != planned[key] for key in plan):
+        raise _refuse(
+            "CHANGED", "the effect or its ChangeSet changed since the PR heads were read; run again"
+        )
+    by_url = {str(item.get("url")): item for item in observed if isinstance(item, dict)}
+    checked: list[dict[str, Any]] = []
+    for url, head in plan["recorded_heads"].items():
+        item = by_url.get(url)
+        if item is None:
+            raise _refuse("PR_MISSING", f"{url} was not observed")
+        state = str(item.get("state") or "")
+        live = str(item.get("head_sha") or "")
+        if state not in {"OPEN", "MERGED"}:
+            raise _refuse("PR_NOT_OPEN", f"{url} is {state or 'unknown'}")
+        if live != head:
+            raise _refuse(
+                "HEAD_MISMATCH",
+                f"{url} is at {live[:12] or 'none'}, not the recorded published {head[:12]}; "
+                "reset the PR branch to the recorded head (or let a new delivery publish)",
+            )
+        checked.append(
+            {"url": url, "recorded_head_sha": head, "observed_head_sha": live, "state": state}
+        )
+    effect = session.get(Step, effect_id)
+    run = session.get(Run, effect.run_id) if effect is not None else None
+    if effect is None or run is None:
+        raise _refuse("EFFECT_NOT_FOUND", f"no publication effect {effect_id}")
+    record: dict[str, Any] = {
+        "version": 1,
+        "reconciled_by": actor,
+        "reconciled_at": current.isoformat(),
+        "method": RECONCILE_METHOD,
+        "previous_status": effect.status,
+        "change_set_id": plan["change_set_id"],
+        "change_set_version": plan["change_set_version"],
+        "pull_requests": checked,
+    }
+    event = DashboardEvent(
+        occurred_at=current,
+        level="WARNING",
+        event_type=RECONCILE_EVENT_TYPE,
+        source="controller",
+        host=None,
+        worker_kind="controller",
+        project=run.project,
+        workflow_id=run.workflow_id,
+        temporal_run_id=None,
+        issue_number=None,
+        campaign_id=None,
+        entity_type="publication_effect",
+        entity_id=str(effect.id),
+        current_phase=RECONCILED,
+        message="Uncertain publication effect reconciled against live PR heads by operator",
+        metadata_json={
+            "reconciled_by": actor,
+            "previous_status": effect.status,
+            "method": RECONCILE_METHOD,
+            "pull_requests": checked,
+        },
+    )
+    session.add(event)
+    session.flush()
+    record["audit_event_id"] = int(event.id)
+    # The immutable receipt (if any) stays; only the status and this record are added.
+    effect.result_json = {**effect.result_json, "reconciliation": record}
+    effect.status = RECONCILED
+    released = 0
+    if _run_terminal(run):
+        # The run kept its leases only because its effect was unresolved.
+        for lease in session.scalars(
+            select(ComponentLease).where(
+                ComponentLease.owner_run_id == run.id, ComponentLease.released_at.is_(None)
+            )
+        ):
+            lease.released_at = current
+            released += 1
+    session.flush()
+    return {
+        "status": RECONCILED,
+        "effect_id": str(effect.id),
+        "previous_status": record["previous_status"],
+        "pull_requests": checked,
+        "released_leases": released,
+        "audit_event_id": int(event.id),
+        "production": False,
+    }

@@ -101,6 +101,10 @@ from engineering_control.operations.models import (
     parse_command,
 )
 from engineering_control.operations.projection_health import projection_connection_status
+from engineering_control.operations.publication_reconcile import (
+    plan_publication_reconcile,
+    reconcile_publication_effect,
+)
 from engineering_control.operations.reconciliation import (
     decide_reconciliation,
     safe_execution_binding,
@@ -681,6 +685,50 @@ class OperationsRepository:
             raise ValueError("issue re-approval requires an allowlisted operator channel")
         with self.sessions() as session:
             return plan_issue_reapproval(session, **arguments)
+
+    async def plan_publication_reconcile(
+        self, effect_id: UUID, phrase: str, actor: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._plan_publication_reconcile, effect_id, phrase, actor)
+
+    def _plan_publication_reconcile(
+        self, effect_id: UUID, phrase: str, actor: str
+    ) -> dict[str, Any]:
+        """NEW-145: read-only check before the live PR-head read."""
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("publication reconciliation requires an allowlisted operator channel")
+        with self.sessions() as session:
+            return plan_publication_reconcile(session, effect_id, phrase)
+
+    async def reconcile_publication_effect(
+        self,
+        effect_id: UUID,
+        phrase: str,
+        actor: str,
+        planned: dict[str, Any],
+        observed: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._reconcile_publication_effect, effect_id, phrase, actor, planned, observed
+        )
+
+    def _reconcile_publication_effect(
+        self,
+        effect_id: UUID,
+        phrase: str,
+        actor: str,
+        planned: dict[str, Any],
+        observed: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """NEW-145: resolve the effect, audit it and release its run's leases, atomically."""
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("publication reconciliation requires an allowlisted operator channel")
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            return reconcile_publication_effect(
+                session, effect_id, phrase, actor, planned, observed
+            )
 
     async def issue_amend_precheck(
         self, project: str, repository: str, issue_number: int

@@ -286,6 +286,13 @@ class IssueReapprovalRequest(APIModel):
     confirmation_phrase: str = Field(pattern=r"^REAPPROVE_ISSUE_[A-F0-9]{8}$")
 
 
+class PublicationReconcileRequest(APIModel):
+    """NEW-145: reconcile one uncertain publication effect against the live PR heads."""
+
+    effect_id: UUID
+    confirmation_phrase: str = Field(pattern=r"^RECONCILE_PUBLICATION_[A-F0-9]{8}$")
+
+
 class IssueAmendRequest(APIModel):
     """NEW-115: preview (no confirm) or confirm one backlog issue body amendment."""
 

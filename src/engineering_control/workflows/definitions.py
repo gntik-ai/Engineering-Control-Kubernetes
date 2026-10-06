@@ -37,6 +37,7 @@ from engineering_control.workflows.inputs import (
     MultiProjectAuditInput,
     ObservabilityAcceptanceInput,
     PreviewDeploymentInput,
+    PublicationHeadsObservationInput,
     QuotaRefreshInput,
     RecoveryInput,
     RuntimeVerificationInput,
@@ -2439,6 +2440,12 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
         return context
 
 
+# NEW-145: the pull requests a publication reconciliation may read (same allowlist as
+# gitops.pr_heads).
+_PUBLICATION_PR_URL = re.compile(
+    r"https://github\.com/gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki)"
+    r"/pull/[1-9][0-9]{0,9}"
+)
 _AMEND_ISSUE_REPOSITORIES = frozenset(
     {
         "gntik-ai/falcone",
@@ -2476,6 +2483,35 @@ class IssueAmendObservationWorkflow(ControlledWorkflow):
                 "issue_repository": request.issue_repository,
                 "issue_number": request.issue_number,
             },
+            timeout_minutes=1,
+        )
+
+
+@workflow.defn(name="PublicationHeadsObservationWorkflow")
+class PublicationHeadsObservationWorkflow(ControlledWorkflow):
+    """NEW-145: read the live head and state of a ChangeSet's bound pull requests for an
+    operator publication reconciliation.
+
+    Read-only: it runs NEW-102's own PR-head read (gitops.pr_heads) on the GitHub worker,
+    the same read the CI-repair restore trusts."""
+
+    @workflow.run
+    async def run(self, request: PublicationHeadsObservationInput) -> dict[str, Any]:
+        urls = request.pull_request_urls
+        if (
+            not isinstance(urls, list)
+            or not 1 <= len(urls) <= 2
+            or not all(isinstance(url, str) and _PUBLICATION_PR_URL.fullmatch(url) for url in urls)
+        ):
+            raise ApplicationError(
+                "publication reconciliation pull requests are not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        self._phase = "PUBLICATION_HEADS_OBSERVE"
+        return await self._step(
+            "gitops.pr_heads",
+            {"pull_requests": [{"url": url} for url in urls]},
             timeout_minutes=1,
         )
 
@@ -6028,6 +6064,7 @@ ALL_WORKFLOWS = [
     IssueSolutionLoopWorkflow,
     GitHubBacklogImportWorkflow,
     IssueAmendObservationWorkflow,
+    PublicationHeadsObservationWorkflow,
     ExistingGitHubBacklogLoopWorkflow,
     AutonomousBacklogCampaignWorkflow,
     EnhancementDiscoveryWorkflow,

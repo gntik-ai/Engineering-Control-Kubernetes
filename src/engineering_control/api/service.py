@@ -64,6 +64,7 @@ from engineering_control.workflows.inputs import (
     MultiProjectAuditInput,
     ObservabilityAcceptanceInput,
     PreviewDeploymentInput,
+    PublicationHeadsObservationInput,
     RecoveryInput,
     RuntimeVerificationInput,
     StagingDeploymentInput,
@@ -88,6 +89,7 @@ class ControlService(Protocol):
 
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
     async def observe_issue_body(self, repository: str, issue_number: int) -> dict[str, Any]: ...
+    async def observe_pull_request_heads(self, urls: list[str]) -> list[dict[str, Any]]: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
     async def start_runtime_verification(
@@ -192,6 +194,24 @@ class TemporalControlService:
         if not isinstance(value, dict):
             raise RuntimeError("issue body observation returned an invalid result")
         return value
+
+    async def observe_pull_request_heads(self, urls: list[str]) -> list[dict[str, Any]]:
+        """NEW-145: live head and state of each pull request, read by the GitHub worker."""
+        value = await self.client.execute_workflow(
+            WorkflowName.PUBLICATION_HEADS_OBSERVATION.value,
+            PublicationHeadsObservationInput(pull_request_urls=list(urls)),
+            id=f"publication-heads-observe-{uuid4()}",
+            task_queue=self.task_queue,
+            execution_timeout=timedelta(seconds=90),
+        )
+        heads = value.get("heads") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("status") != "OK"
+            or not isinstance(heads, list)
+        ):
+            raise RuntimeError("pull request head observation returned an invalid result")
+        return [item for item in heads if isinstance(item, dict)]
 
     async def _start_recorded_workflow(
         self,
