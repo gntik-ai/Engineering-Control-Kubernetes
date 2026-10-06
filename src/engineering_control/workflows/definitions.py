@@ -2446,6 +2446,12 @@ _PUBLICATION_PR_URL = re.compile(
     r"https://github\.com/gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki)"
     r"/pull/[1-9][0-9]{0,9}"
 )
+_PUBLICATION_REPOSITORY = re.compile(
+    r"gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki)"
+)
+_PUBLICATION_BRANCH = re.compile(
+    r"agent/(?:falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}"
+)
 _AMEND_ISSUE_REPOSITORIES = frozenset(
     {
         "gntik-ai/falcone",
@@ -2508,12 +2514,32 @@ class PublicationHeadsObservationWorkflow(ControlledWorkflow):
                 type="PolicyViolation",
                 non_retryable=True,
             )
+        listings = request.branch_listings
+        if listings is not None and (
+            not isinstance(listings, list)
+            or not 1 <= len(listings) <= 2
+            or not all(
+                isinstance(item, dict)
+                and set(item) == {"repository", "branch"}
+                and isinstance(item["branch"], str)
+                and _PUBLICATION_BRANCH.fullmatch(item["branch"])
+                and isinstance(item["repository"], str)
+                and _PUBLICATION_REPOSITORY.fullmatch(item["repository"])
+                for item in listings
+            )
+        ):
+            raise ApplicationError(
+                "publication reconciliation branch listings are not allowlisted",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
         self._phase = "PUBLICATION_HEADS_OBSERVE"
-        return await self._step(
-            "gitops.pr_heads",
-            {"pull_requests": [{"url": url} for url in urls]},
-            timeout_minutes=1,
-        )
+        payload: dict[str, Any] = {"pull_requests": [{"url": url} for url in urls]}
+        if listings is not None:
+            # NEW-145b: only a listing request changes the payload; a heads-only read (and
+            # every history recorded before this) schedules exactly the same activity input.
+            payload["branch_listings"] = listings
+        return await self._step("gitops.pr_heads", payload, timeout_minutes=1)
 
 
 @workflow.defn(name="StagingGitOpsDeliveryWorkflow")

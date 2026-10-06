@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -101,6 +102,7 @@ class _Effect:
         phrase: str | None = None,
         actor: str = ACTOR,
         settlement: dict[str, Any] | None = _FRESH,
+        listings: list[dict[str, Any]] | None = _FRESH,
     ) -> dict[str, Any]:
         confirmation = phrase or reconcile_phrase(self.effect_id)
         plan: dict[str, Any] = await self.operations.plan_publication_reconcile(
@@ -115,8 +117,37 @@ class _Effect:
             plan,
             self.observed() if observed is None else observed,
             _settled() if settlement is _FRESH else settlement,
+            self.listings(plan) if listings is _FRESH else listings,
         )
         return result
+
+    def listings(
+        self, plan: dict[str, Any], *, extra: list[dict[str, Any]] | None = None, **bound: Any
+    ) -> list[dict[str, Any]]:
+        """NEW-145b: the worker's complete head-branch listing: by default only the bound PR,
+        created three hours ago (before the uncertain creation's admission)."""
+        bound_by_repository = {
+            "gntik-ai/falcone": SOURCE_PR,
+            "gntik-ai/falcone-charts": DEPLOYMENT_PR,
+        }
+        return [
+            {
+                **item,
+                "pull_requests": [
+                    {
+                        "number": int(bound_by_repository[item["repository"]].rsplit("/", 1)[1]),
+                        "url": bound_by_repository[item["repository"]],
+                        "state": "OPEN",
+                        "base_branch": "main",
+                        "head_sha": SOURCE_HEAD,
+                        "created_at": (datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+                        **bound,
+                    },
+                    *(extra or []),
+                ],
+            }
+            for item in plan.get("branch_listings") or []
+        ]
 
     def effect(self) -> tuple[str, dict[str, Any]]:
         with self.handler.sessions() as session:
@@ -238,6 +269,7 @@ async def _effect(
     action: str = "git_push",
     run_status: str = "BLOCKED",
     also: tuple[str, str, str] | None = None,
+    repository: str = "gntik-ai/falcone",
 ) -> _Effect:
     """falcone #972's intent: the falcone push's effect UNKNOWN, its run BLOCKED."""
     values = await _child(tmp_path)
@@ -283,7 +315,7 @@ async def _effect(
                 },
             )
         )
-        effect_id, effect = _effect_step(intent_id, run.id, "gntik-ai/falcone", action, status)
+        effect_id, effect = _effect_step(intent_id, run.id, repository, action, status)
         session.add(effect)
         if also is not None:
             session.add(_effect_step(intent_id, run.id, *also)[1])
@@ -404,10 +436,10 @@ async def test_wrong_confirmation_and_non_operators_are_refused(tmp_path: Path) 
         ({"status": "NOT_ATTEMPTED"}, "EFFECT_NOT_UNRESOLVED"),
         # A publisher may still run under a STARTED claim, however long ago it began.
         ({"status": "STARTED"}, "EFFECT_STARTED"),
-        ({"action": "pr_create"}, "EFFECT_ACTION_UNSUPPORTED"),
-        # The same intent also created a PR (e.g. a replacement for a retargeted one).
+        ({"action": "pr_merge"}, "EFFECT_ACTION_UNSUPPORTED"),
+        # NEW-145b: another PR creation of the intent whose publisher may still run.
         (
-            {"also": ("gntik-ai/falcone-charts", "pr_create", "COMPLETE")},
+            {"also": ("gntik-ai/falcone-charts", "pr_create", "STARTED")},
             "EFFECT_ACTION_UNSUPPORTED",
         ),
     ],
@@ -474,14 +506,17 @@ async def test_a_reconciled_effects_receipt_stays_immutable(tmp_path: Path) -> N
     _dispose(effect.values)
 
 
-async def test_a_pr_create_effect_of_the_real_binding_code_is_refused(tmp_path: Path) -> None:
-    # Codex review: a retargeted bound PR makes publication create a replacement PR; a
-    # lost response leaves that pr_create effect UNKNOWN while the old PR's head matches.
+async def test_the_real_binding_codes_pr_creation_is_settled_by_the_branch_listing(
+    tmp_path: Path,
+) -> None:
+    # Codex review 1: a retargeted bound PR makes publication create a replacement PR at the
+    # configured base; a lost response leaves that pr_create effect UNKNOWN while the old
+    # PR's head matches. NEW-145b: the complete head-branch listing shows any such PR.
     from test_delivery_activity import FakePublicationRunner, _controller_publisher
 
     from engineering_control.activities.delivery import RepositoryPublication
 
-    effect = await _effect(tmp_path)
+    effect = await _effect(tmp_path)  # the falcone push, UNKNOWN
     plan = _plan(str(effect.change_set_id))["publications"][0]
     runner = FakePublicationRunner(plan["branch"], {"falcone": SOURCE_HEAD})
     handler = _controller_publisher(tmp_path / "publisher", runner)
@@ -497,7 +532,7 @@ async def test_a_pr_create_effect_of_the_real_binding_code_is_refused(tmp_path: 
             RepositoryPublication.model_validate(plan),
             (_LostResponse(), {}, {}),  # type: ignore[arg-type]
         )
-    # The bound PR now targets another base, so the real binding code creates a PR.
+    # No PR at the configured base and exact head, so the real binding code creates one.
     assert actions == [("gntik-ai/falcone", "pr_create")]
     with effect.handler.sessions.begin() as session:
         step = session.get(Step, effect.effect_id)
@@ -506,11 +541,120 @@ async def test_a_pr_create_effect_of_the_real_binding_code_is_refused(tmp_path: 
             intent_id, step.run_id, actions[0][0], actions[0][1], "UNKNOWN"
         )
         session.add(created)
-    with pytest.raises(PublicationReconcileBlocked, match="EFFECT_ACTION_UNSUPPORTED"):
-        await effect.reconcile()  # the push effect: its intent created a PR
     pr_create = _Effect(effect.values, effect.first, created_id)
-    with pytest.raises(PublicationReconcileBlocked, match="EFFECT_ACTION_UNSUPPORTED"):
-        await pr_create.reconcile()  # the pr_create effect itself
+    plan_value = await effect.operations.plan_publication_reconcile(
+        created_id, reconcile_phrase(created_id), ACTOR
+    )
+    assert plan_value["branch_listings"] == [
+        {"repository": "gntik-ai/falcone", "branch": plan["branch"]}
+    ]
+    replacement = {
+        "number": 1070,
+        "url": "https://github.com/gntik-ai/falcone/pull/1070",
+        "state": "OPEN",
+        "base_branch": "main",
+        "head_sha": SOURCE_HEAD,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    # The replacement PR is on the head branch: refused, for both effects of the intent.
+    for target in (effect, pr_create):
+        with pytest.raises(PublicationReconcileBlocked, match="PR_CREATED_UNRECORDED"):
+            await target.reconcile(listings=target.listings(plan_value, extra=[replacement]))
+    # Without the listing nothing can be settled.
+    with pytest.raises(PublicationReconcileBlocked, match="PR_LISTING_MISSING"):
+        await pr_create.reconcile(listings=[])
+    # Only the bound PR, created before the admission: no PR was created.
+    result = await pr_create.reconcile()
+    assert (result["status"], result["previous_status"]) == ("RECONCILED", "UNKNOWN")
+    _dispose(effect.values)
+
+
+async def _live_972(tmp_path: Path) -> _Effect:
+    """falcone #972: falcone git_push COMPLETE, then falcone pr_create UNKNOWN (#1068 exists)."""
+    return await _effect(
+        tmp_path,
+        action="pr_create",
+        also=("gntik-ai/falcone", "git_push", "COMPLETE"),
+    )
+
+
+async def test_the_live_pr_create_shape_reconciles_and_unblocks_the_child(
+    tmp_path: Path,
+) -> None:
+    effect = await _live_972(tmp_path)
+    repair = effect.ci_repair_child()
+    with pytest.raises(ComponentLeaseConflict, match="unresolved publication effect"):
+        effect.handler._acquire_delivery_leases(repair)
+
+    result = await effect.reconcile()
+
+    assert result["status"] == "RECONCILED"
+    assert result["released_leases"] == 1
+    status, value = effect.effect()
+    assert status == "RECONCILED"
+    (listed,) = value["reconciliation"]["pr_create_listings"]
+    assert listed["pull_requests"] == [SOURCE_PR]
+    assert listed["creation_status"] == "UNKNOWN"
+    assert effect.handler._acquire_delivery_leases(repair)["status"] == "LEASES_ACQUIRED"
+    _dispose(effect.values)
+
+
+@pytest.mark.parametrize(
+    ("bound", "extra", "blocker"),
+    [
+        # Another PR on the head branch at another base, or closed: unrecorded creation.
+        (
+            {},
+            [{"url": "https://github.com/gntik-ai/falcone/pull/1070", "base_branch": "dev"}],
+            "PR_CREATED_UNRECORDED",
+        ),
+        (
+            {},
+            [{"url": "https://github.com/gntik-ai/falcone/pull/1069", "state": "CLOSED"}],
+            "PR_CREATED_UNRECORDED",
+        ),
+        # The bound PR itself was created after the uncertain creation's admission.
+        ({"created_at": datetime.now(UTC).isoformat()}, None, "BOUND_PR_CREATED_AFTER_ADMISSION"),
+        ({"created_at": "not a time"}, None, "PR_LISTING_MISSING"),
+    ],
+)
+async def test_a_listing_that_does_not_prove_no_creation_is_refused(
+    tmp_path: Path, bound: dict[str, Any], extra: list[dict[str, Any]] | None, blocker: str
+) -> None:
+    effect = await _live_972(tmp_path)
+    plan = await effect.operations.plan_publication_reconcile(
+        effect.effect_id, reconcile_phrase(effect.effect_id), ACTOR
+    )
+    with pytest.raises(PublicationReconcileBlocked) as refused:
+        await effect.reconcile(listings=effect.listings(plan, extra=extra, **bound))
+    assert refused.value.blocker == f"PUBLICATION_RECONCILE_{blocker}"
+    assert effect.effect()[0] == "UNKNOWN"
+    assert effect.open_leases() == 1
+    _dispose(effect.values)
+
+
+@pytest.mark.parametrize(
+    ("created_ago", "outcome"),
+    [
+        # A completed creation of the bound PR itself (created after its admission) is fine.
+        (timedelta(minutes=30), "RECONCILED"),
+        # A completed creation whose PR is not the bound one (bound PR older) is refused.
+        (timedelta(hours=3), "PR_CREATED_UNRECORDED"),
+    ],
+)
+async def test_a_completed_pr_creation_must_have_created_the_bound_pr(
+    tmp_path: Path, created_ago: timedelta, outcome: str
+) -> None:
+    effect = await _effect(tmp_path, also=("gntik-ai/falcone", "pr_create", "COMPLETE"))
+    plan = await effect.operations.plan_publication_reconcile(
+        effect.effect_id, reconcile_phrase(effect.effect_id), ACTOR
+    )
+    listings = effect.listings(plan, created_at=(datetime.now(UTC) - created_ago).isoformat())
+    if outcome == "RECONCILED":
+        assert (await effect.reconcile(listings=listings))["status"] == "RECONCILED"
+    else:
+        with pytest.raises(PublicationReconcileBlocked, match=outcome):
+            await effect.reconcile(listings=listings)
     _dispose(effect.values)
 
 
@@ -564,11 +708,11 @@ def test_api_reads_the_live_heads_through_the_github_worker() -> None:
         order.append("settlement")
         return settled
 
-    async def heads(urls: list[str]) -> list[dict[str, Any]]:
+    async def heads(urls: list[str], listings: Any = None) -> dict[str, Any]:
         order.append("heads")
         if order.count("heads") > 1:
             raise RuntimeError("GitHub unavailable")
-        return observed
+        return {"heads": observed, "listings": []}
 
     service.publisher_settlement = AsyncMock(side_effect=settlement)
     service.observe_pull_request_heads = AsyncMock(side_effect=heads)
@@ -607,7 +751,7 @@ def test_api_reads_the_live_heads_through_the_github_worker() -> None:
     assert unavailable.status_code == 503
     assert "PR_HEADS_UNAVAILABLE" in unavailable.json()["detail"]
     assert already.json()["status"] == "ALREADY_RECONCILED"
-    service.observe_pull_request_heads.assert_awaited_with([SOURCE_PR, DEPLOYMENT_PR])
+    service.observe_pull_request_heads.assert_awaited_with([SOURCE_PR, DEPLOYMENT_PR], None)
     # The restart evidence is read on the server for the plan's publisher, never sent, and
     # before the heads; the API stamps when its head read began.
     assert order == ["settlement", "heads", "settlement", "heads"]
@@ -615,6 +759,7 @@ def test_api_reads_the_live_heads_through_the_github_worker() -> None:
     call = operations.reconcile_publication_effect.await_args_list
     assert len(call) == 1
     assert call[0].args[:5] == (UUID(effect_id), body["confirmation_phrase"], ACTOR, plan, observed)
+    assert call[0].args[6] == []
     sent = call[0].args[5]
     assert {key: sent[key] for key in settled} == settled
     assert datetime.fromisoformat(sent["heads_read_from"]) <= datetime.now(UTC)
@@ -675,3 +820,139 @@ async def test_publisher_settlement_reads_systemd_on_the_controller(
     assert await service.publisher_settlement("delivery-runner") is None
     stdout = "ExecMainStartTimestamp=n/a\nKillMode=control-group\nActiveState=inactive\n"
     assert await service.publisher_settlement("github-runner") is None
+
+
+def test_the_head_branch_listing_is_paginated_and_never_truncated(tmp_path: Path) -> None:
+    """NEW-145b: every PR (any state, any base) on owner:branch, to the last page."""
+    from engineering_control.adapters.command import CommandResult
+    from engineering_control.adapters.github.client import GhCliBroker, GhCliPolicyError
+
+    branch = "agent/falcone/972/03f89078-61db-5d67-8133-5d9fd6680756"
+    calls: list[list[str]] = []
+    lines: list[str] = []
+
+    class _Runner:
+        def run(self, executable: str, arguments: list[str], **_: Any) -> CommandResult:
+            if arguments[:2] == ["api", "user"]:
+                return CommandResult(0, '{"login":"operator","type":"User"}', "")
+            if arguments[:1] == ["auth"]:
+                return CommandResult(0, "", "")
+            if arguments[:2] == ["repo", "view"]:
+                return CommandResult(0, json.dumps({"nameWithOwner": arguments[2]}), "")
+            calls.append(arguments)
+            return CommandResult(0, "\n".join(lines) + "\n", "")
+
+    def entry(number: int, label: str = f"gntik-ai:{branch}") -> str:
+        return json.dumps(
+            {
+                "number": number,
+                "url": f"https://github.com/gntik-ai/falcone/pull/{number}",
+                "state": "closed",
+                "merged_at": None,
+                "head_label": label,
+                "head_sha": "a" * 40,
+                "base_ref": "main",
+                "created_at": "2026-10-05T20:36:55Z",
+            }
+        )
+
+    broker = GhCliBroker(_Runner(), tmp_path, authenticated_home=tmp_path)  # type: ignore[arg-type]
+    # Three pages' worth (250) of PRs arrive through --paginate and are all returned.
+    lines[:] = [entry(number) for number in range(1, 251)]
+    listed = broker.pull_requests_by_head("gntik-ai/falcone", branch)
+    assert len(listed) == 250
+    assert calls[-1][:4] == ["api", "-X", "GET", "repos/gntik-ai/falcone/pulls"]
+    assert f"head=gntik-ai:{branch}" in calls[-1] and "state=all" in calls[-1]
+    assert "--paginate" in calls[-1]
+    # A listing at the cap is refused, never cut.
+    lines[:] = [entry(number) for number in range(1, GhCliBroker.PULL_REQUESTS_BY_HEAD_CAP + 1)]
+    with pytest.raises(GhCliPolicyError, match="reached its cap"):
+        broker.pull_requests_by_head("gntik-ai/falcone", branch)
+    # A PR of another head is never accepted as this branch's.
+    lines[:] = [entry(1, "someone:agent/other")]
+    with pytest.raises(GhCliPolicyError, match="another head"):
+        broker.pull_requests_by_head("gntik-ai/falcone", branch)
+
+
+def test_the_worker_listing_normalizes_states_and_stays_allowlisted() -> None:
+    from engineering_control.activities.gitops import GitOpsGitHubHandler
+
+    branch = "agent/falcone/972/03f89078-61db-5d67-8133-5d9fd6680756"
+    handler = GitOpsGitHubHandler.__new__(GitOpsGitHubHandler)
+    broker = Mock()
+    broker.view_pull_request.return_value = {
+        "headRefOid": SOURCE_HEAD,
+        "state": "OPEN",
+        "headRefName": branch,
+        "baseRefName": "main",
+    }
+    broker.pull_requests_by_head.return_value = [
+        {
+            "number": 1068,
+            "url": SOURCE_PR,
+            "state": "open",
+            "base_ref": "main",
+            "head_sha": SOURCE_HEAD,
+            "created_at": "2026-10-05T20:36:55Z",
+        },
+        {
+            "number": 1,
+            "url": "https://github.com/gntik-ai/falcone/pull/1",
+            "state": "closed",
+            "merged_at": "2026-01-01T00:00:00Z",
+            "base_ref": "main",
+            "head_sha": "b" * 40,
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    ]
+    handler.broker = broker
+    result = handler._pr_heads(
+        {
+            "pull_requests": [{"url": SOURCE_PR}],
+            "branch_listings": [{"repository": "gntik-ai/falcone", "branch": branch}],
+        }
+    )
+    (listing,) = result["listings"]
+    assert [item["state"] for item in listing["pull_requests"]] == ["OPEN", "MERGED"]
+    assert result["heads"][0]["head_branch"] == branch
+    # A heads-only read returns no listings (unchanged for NEW-102's restore).
+    assert "listings" not in handler._pr_heads({"pull_requests": [{"url": SOURCE_PR}]})
+    with pytest.raises(ValueError, match="outside the allowlist"):
+        handler._pr_heads(
+            {
+                "pull_requests": [{"url": SOURCE_PR}],
+                "branch_listings": [{"repository": "gntik-ai/falcone", "branch": "main"}],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("offset", "outcome"),
+    [
+        # GitHub's whole-second created_at in the admission's own second: either order is
+        # possible, so it is refused rather than read as "before".
+        (timedelta(0), "PR_CREATION_ORDER_AMBIGUOUS"),
+        # The previous whole second ends no later than the admission: provably before.
+        (timedelta(seconds=-1), "RECONCILED"),
+    ],
+)
+async def test_a_creation_in_the_admissions_second_is_ambiguous(
+    tmp_path: Path, offset: timedelta, outcome: str
+) -> None:
+    """Review 1 of NEW-145b: created_at is whole seconds, admitted_at has microseconds."""
+    effect = await _live_972(tmp_path)
+    plan = await effect.operations.plan_publication_reconcile(
+        effect.effect_id, reconcile_phrase(effect.effect_id), ACTOR
+    )
+    admitted = datetime.fromisoformat(effect.effect()[1]["admitted_at"])
+    second = admitted.replace(microsecond=0) + offset
+    created = second.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    listings = effect.listings(plan, created_at=created)
+    if outcome == "RECONCILED":
+        assert (await effect.reconcile(listings=listings))["status"] == "RECONCILED"
+    else:
+        with pytest.raises(PublicationReconcileBlocked) as refused:
+            await effect.reconcile(listings=listings)
+        assert refused.value.blocker == f"PUBLICATION_RECONCILE_{outcome}"
+        assert effect.effect()[0] == "UNKNOWN"
+    _dispose(effect.values)

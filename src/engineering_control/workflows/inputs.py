@@ -168,6 +168,8 @@ class PublicationHeadsObservationInput:
     """NEW-145: the bound pull requests whose live heads a publication reconciliation reads."""
 
     pull_request_urls: list[str]
+    # NEW-145b: head branches whose every PR the reconciliation must see (pr_create effects).
+    branch_listings: list[dict[str, str]] | None = None
 
 
 @dataclass

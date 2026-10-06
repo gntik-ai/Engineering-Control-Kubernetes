@@ -44,12 +44,13 @@ The following remain mandatory, not waived:
   not claim to guard those paths merely because initial publication is guarded.
 - Resolve uncertain effects through bounded authoritative reconciliation. NEW-145 adds
   an operator-confirmed path (`engineering-ctl publication-reconcile`) for the provably
-  safe case only: an UNKNOWN `git_push` effect of a terminal run, with a committed UNKNOWN
-  receipt for its current claim and no PR creation in its intent, becomes RECONCILED only
-  if every bound PR is OPEN or MERGED on its recorded branch and base at exactly the head
-  recorded at the last confirmed publication, read live by the GitHub worker. STARTED
-  effects (a publisher may still run) and PR creations still need a fenced resolution;
-  there is no automatic resolution.
+  safe case only: an UNKNOWN `git_push` or (NEW-145b) `pr_create` effect of a terminal
+  run, with a committed UNKNOWN receipt for its current claim and a settled publisher,
+  becomes RECONCILED only if every bound PR is OPEN or MERGED on its recorded branch and
+  base at exactly the head recorded at the last confirmed publication, and every PR
+  creation of its intent is settled by the complete head-branch PR listing (exactly the
+  bound PR), read live by the GitHub worker. STARTED effects (a publisher may still run)
+  still need a fenced resolution; there is no automatic resolution.
 - Review action ordering and approval/lease drift in the interval after admission.
   A short admission deadline is not an atomic transaction with GitHub or a claim
   of exactly-once external effects. Long-running commands remain subject to the

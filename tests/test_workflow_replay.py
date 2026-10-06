@@ -3814,3 +3814,31 @@ async def test_publication_heads_observation_reads_pr_heads_on_the_github_queue(
     assert queues == [GITHUB_TASK_QUEUE]
     assert _markers(history) == []
     await Replayer(workflows=[PublicationHeadsObservationWorkflow]).replay_workflow(history)
+
+
+async def test_publication_heads_observation_also_lists_head_branch_prs() -> None:
+    """NEW-145b: with branch listings the same read-only step also lists every PR on each
+    head branch; a heads-only input (every earlier history) schedules the same input."""
+    urls = ["https://github.com/gntik-ai/falcone/pull/1068"]
+    branch = "agent/falcone/972/03f89078-61db-5d67-8133-5d9fd6680756"
+    listings = [{"repository": "gntik-ai/falcone", "branch": branch}]
+    observed = {
+        "status": "OK",
+        "heads": [{"url": urls[0], "head_sha": "a" * 40, "state": "OPEN"}],
+        "listings": [{**listings[0], "pull_requests": []}],
+    }
+    history, result = await _run_to_history(
+        PublicationHeadsObservationWorkflow,
+        PublicationHeadsObservationInput(pull_request_urls=urls, branch_listings=listings),
+        _scripted_execute_control_step({"gitops.pr_heads": observed}),
+    )
+
+    assert result == observed
+    assert _scheduled_steps(history) == [
+        {
+            "step": "gitops.pr_heads",
+            "payload": {"pull_requests": [{"url": urls[0]}], "branch_listings": listings},
+        }
+    ]
+    assert _markers(history) == []
+    await Replayer(workflows=[PublicationHeadsObservationWorkflow]).replay_workflow(history)

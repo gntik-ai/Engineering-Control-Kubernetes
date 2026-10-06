@@ -92,7 +92,9 @@ class ControlService(Protocol):
 
     async def validate_backlog_issue_signal(self, workflow_id: str, issue_ref: str) -> None: ...
     async def observe_issue_body(self, repository: str, issue_number: int) -> dict[str, Any]: ...
-    async def observe_pull_request_heads(self, urls: list[str]) -> list[dict[str, Any]]: ...
+    async def observe_pull_request_heads(
+        self, urls: list[str], branch_listings: list[dict[str, str]] | None = None
+    ) -> dict[str, Any]: ...
     async def prepare_deployment(self, request: DeploymentPrepare) -> OperationAccepted: ...
     async def rollback(self, request: RollbackRequest) -> OperationAccepted: ...
     async def start_runtime_verification(
@@ -198,23 +200,34 @@ class TemporalControlService:
             raise RuntimeError("issue body observation returned an invalid result")
         return value
 
-    async def observe_pull_request_heads(self, urls: list[str]) -> list[dict[str, Any]]:
-        """NEW-145: live head and state of each pull request, read by the GitHub worker."""
+    async def observe_pull_request_heads(
+        self, urls: list[str], branch_listings: list[dict[str, str]] | None = None
+    ) -> dict[str, Any]:
+        """NEW-145: live head and state of each pull request, read by the GitHub worker;
+        NEW-145b: with ``branch_listings``, also every PR whose head is each branch."""
         value = await self.client.execute_workflow(
             WorkflowName.PUBLICATION_HEADS_OBSERVATION.value,
-            PublicationHeadsObservationInput(pull_request_urls=list(urls)),
+            PublicationHeadsObservationInput(
+                pull_request_urls=list(urls), branch_listings=branch_listings
+            ),
             id=f"publication-heads-observe-{uuid4()}",
             task_queue=self.task_queue,
             execution_timeout=timedelta(seconds=90),
         )
         heads = value.get("heads") if isinstance(value, dict) else None
+        listings = value.get("listings", []) if isinstance(value, dict) else None
         if (
             not isinstance(value, dict)
             or value.get("status") != "OK"
             or not isinstance(heads, list)
+            or not isinstance(listings, list)
+            or (branch_listings is not None and len(listings) != len(branch_listings))
         ):
             raise RuntimeError("pull request head observation returned an invalid result")
-        return [item for item in heads if isinstance(item, dict)]
+        return {
+            "heads": [item for item in heads if isinstance(item, dict)],
+            "listings": [item for item in listings if isinstance(item, dict)],
+        }
 
     async def _start_recorded_workflow(
         self,

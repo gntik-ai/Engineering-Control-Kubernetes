@@ -322,9 +322,9 @@ A publication whose outcome Hermes could not observe leaves its
 implementation lease of that project is refused ("unresolved publication effect requires
 reconciliation") and the run keeps its leases. This command resolves only the provably safe
 case: an `UNKNOWN` effect whose publisher returned (its committed receipt is `UNKNOWN` for the
-current claim) and whose action is a `git_push` of the recorded branch of an already-bound PR.
-A `STARTED` effect (a publisher may still be running) and any PR creation still need a fenced,
-manual resolution.
+current claim) and whose action is a `git_push` of the recorded branch of an already-bound PR
+or (NEW-145b) a `pr_create` for it. A `STARTED` effect (a publisher may still be running) still
+needs a fenced, manual resolution.
 
 1. Find the effect Step id (`delivery.publication_effect`, status `UNKNOWN`) and its ChangeSet.
 2. Make each bound PR branch match the head recorded at the ChangeSet's last confirmed
@@ -345,11 +345,30 @@ The API route is `POST /v1/publication-effects/reconcile` (operator channel only
 restore does). It refuses with a `PUBLICATION_RECONCILE_*` code unless the effect's run is
 terminal (`RUN_ACTIVE`), the effect is `UNKNOWN` (`EFFECT_STARTED`, `EFFECT_NOT_UNRESOLVED`)
 with a committed `UNKNOWN` receipt for its current claim (`EFFECT_RECEIPT_INVALID`), its action
-is `git_push` and no effect of its publication intent created a PR
-(`EFFECT_ACTION_UNSUPPORTED`), its target is exactly the ChangeSet's recorded PRs and branch
-(`EFFECT_TARGET_UNBOUND`, `PUBLICATION_BINDING_MISSING`), and every bound PR is OPEN or
-MERGED, still on its recorded head branch and base (`PR_RETARGETED`), at exactly its recorded
-head (`HEAD_MISMATCH`, `PR_NOT_OPEN`, `PR_MISSING`).
+is `git_push` or `pr_create` (`EFFECT_ACTION_UNSUPPORTED`), its target is exactly the
+ChangeSet's recorded PRs and branch (`EFFECT_TARGET_UNBOUND`, `PUBLICATION_BINDING_MISSING`),
+and every bound PR is OPEN or MERGED, still on its recorded head branch and base
+(`PR_RETARGETED`), at exactly its recorded head (`HEAD_MISMATCH`, `PR_NOT_OPEN`, `PR_MISSING`).
+
+PR creation (NEW-145b). A created PR need not be a bound URL (for example a replacement at
+the configured base after the bound PR was retargeted), so every `pr_create` effect of the
+effect's publication intent (whether the effect being reconciled or another one, in any status)
+needs listing evidence. The GitHub worker lists every PR whose head is the plan's branch in that
+repository (`gh api repos/<repo>/pulls?head=gntik-ai:<branch>&state=all`, any base, paginated to
+the end; a listing of 1000 or more is refused, never truncated). The listing must be exactly the
+ChangeSet's bound PR for that repository (`PR_CREATED_UNRECORDED`, `PR_LISTING_MISSING`):
+
+- an `UNKNOWN` or `NOT_ATTEMPTED` creation: the bound PR was created before that effect's
+  admission, so the uncertain claim created nothing (`BOUND_PR_CREATED_AFTER_ADMISSION`; GitHub reports `created_at` in whole seconds, so a creation within the admission's own second is refused as `PR_CREATION_ORDER_AMBIGUOUS`);
+- a `COMPLETE` creation: the PR it created must be the bound one, so the bound PR was created
+  at or after its admission (an older bound PR means the created PR is unrecorded:
+  `PR_CREATED_UNRECORDED`);
+- a `STARTED` creation is refused (`EFFECT_ACTION_UNSUPPORTED`): its publisher may still run.
+
+The publisher settlement below covers the latest `UNKNOWN` receipt of the effect and of these
+creations. For falcone #972 the intent holds a `COMPLETE` falcone push and the `UNKNOWN`
+falcone `pr_create` ba4a87ad; the head branch lists only PR #1068, created before the
+admission, so the effect reconciles once both PRs are at their recorded heads.
 
 An `UNKNOWN` receipt does not prove the push is over: a timed-out command kills only its parent
 process, and a git transport child can outlive it. Reconciliation therefore also requires the
@@ -366,7 +385,7 @@ refused as unverifiable here.
 
 In one transaction under the publication locks it then sets the effect to the terminal status
 `RECONCILED` (the receipt is kept; a `reconciliation` record holds the operator, time, method,
-recorded and observed heads), writes a `publication_effect_reconciled` dashboard event, and
+recorded and observed heads and the PR-creation listing evidence), writes a `publication_effect_reconciled` dashboard event, and
 releases the terminal run's component leases. A rerun reports `ALREADY_RECONCILED`. The loop's
 `backlog-retry` then proceeds: the CI-repair restore (NEW-102) and the next delivery child
 acquire their leases normally, and that child publishes under its own new effect.
