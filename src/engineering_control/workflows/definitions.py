@@ -5227,6 +5227,9 @@ class ChangeRequestWorkflow(ControlledWorkflow):
                 "revision": context.get("revision"),
                 "failure_phase": phase,
                 "blocker": blocker,
+                # NEW-146: the step's bounded, redacted message, when it reported one (an
+                # activity input only: replay never compares it, and it is absent otherwise).
+                **_blocker_detail(context),
             },
         )
         return {
@@ -5238,6 +5241,12 @@ class ChangeRequestWorkflow(ControlledWorkflow):
 
 
 _UI_FANOUT_NO_DEDUPE = {"status": "UNAVAILABLE", "matches": []}
+
+
+def _blocker_detail(context: dict[str, Any]) -> dict[str, Any]:
+    """NEW-146: carry a failed step's blocker_detail into change_request.record_failure."""
+    detail = context.get("blocker_detail")
+    return {"blocker_detail": str(detail)[:400]} if detail else {}
 
 
 @workflow.defn(name="UiMigrationPlanWorkflow")
@@ -5991,6 +6000,10 @@ class UiBlueprintFanOutWorkflow(ControlledWorkflow):
             "processed": processed,
             "pending": finalized.get("pending_total", pending),
             **counts,
+            # NEW-146: the blueprint's failed items and why (bounded; finalize reads them).
+            **(
+                {"failed_items": finalized["failed_items"]} if finalized.get("failed_items") else {}
+            ),
         }
 
     async def _fanout_item(self, blueprint_id: str, key: str, source_worktree: str) -> str:
@@ -6063,6 +6076,7 @@ class UiBlueprintFanOutWorkflow(ControlledWorkflow):
                     "revision": context.get("revision"),
                     "failure_phase": phase,
                     "blocker": str(context.get("blocker") or context.get("status") or "FAILED"),
+                    **_blocker_detail(context),
                 },
             )
         except ActivityError:

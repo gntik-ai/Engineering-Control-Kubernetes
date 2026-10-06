@@ -195,3 +195,20 @@ class SecretRedactor:
             report.replacements,
             report.categories,
         )
+
+
+# NEW-146: the bound of an operator-visible failure detail (after redaction).
+BLOCKER_DETAIL_LIMIT = 300
+
+
+def bounded_detail(
+    text: str, redactor: SecretRedactor | None = None, *, limit: int = BLOCKER_DETAIL_LIMIT
+) -> str:
+    """One redacted line of at most ``limit`` characters.
+
+    Redacted before it is cut, so a cut never leaves part of a secret unrecognised."""
+    redacted = str((redactor or SecretRedactor()).redact_text(text).value)
+    line = " ".join(redacted.split())
+    if len(line) > limit:
+        line = line[: limit - 3].rstrip() + "..."
+    return line

@@ -125,7 +125,7 @@ from engineering_control.retention_limits import (
     NOTIFICATION_OUTBOX_PENDING_STATUS,
     RETAINED_DASHBOARD_EVENT_TYPES,
 )
-from engineering_control.security.redaction import SecretRedactor
+from engineering_control.security.redaction import SecretRedactor, bounded_detail
 from engineering_control.workflows.cleanup_scope import (
     CLEANUP_IDENTITY_BLOCKED_PROJECTS,
     CLEANUP_IDENTITY_BLOCKED_SUMMARY,
@@ -1303,8 +1303,11 @@ class MetadataActivityHandler:
                     raise ValueError(
                         "agent invocation idempotency key conflicts with stored blocker"
                     )
+                # NEW-146: the step's bounded, redacted message rides along in the summary.
+                detail = payload.get("blocker_detail")
+                summary = bounded_detail(f"{blocker}: {detail}") if detail else blocker
                 invocation.status = status
-                invocation.summary = blocker
+                invocation.summary = summary
                 invocation.error_code = blocker
                 invocation.finished_at = now
                 run.status = status
@@ -1318,7 +1321,7 @@ class MetadataActivityHandler:
                     execution.ended_at = now
                     execution.retryable = status == "RATE_LIMITED"
                     execution.blocker_code = blocker
-                    execution.error_summary = blocker
+                    execution.error_summary = summary
                     if execution.host is None:
                         execution.transcript_incomplete = True
         return {

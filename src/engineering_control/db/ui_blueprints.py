@@ -15,14 +15,18 @@ from sqlalchemy import create_engine, select, update
 from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.db.models import Run, UiBlueprint
+from engineering_control.db.models import ChangeRequest, DashboardEvent, Run, UiBlueprint
 from engineering_control.db.runtime_binding import new_bound_run
 from engineering_control.engineering.backlog import is_reauthenticated_backlog_operator
 from engineering_control.engineering.ui_blueprint import (
     APPROVAL_PHRASE,
+    FANOUT_RETRY_KINDS,
+    RETRY_FANOUT_PHRASE,
     UI_PLAN_PROJECTS,
     approval_binding,
     blueprint_sha256,
+    fanout_items,
+    item_change_request_id,
     render_markdown,
     ui_fanout_workflow_id,
     ui_plan_workflow_id,
@@ -48,8 +52,23 @@ CONTENT_KEY_FIELD = "inventory_content_key"
 REJECTION_FIELD = "rejection_of"
 
 
+# NEW-146: how many fan-out retry records the blueprint keeps (newest last).
+RETRY_HISTORY = 20
+
+
 class UiBlueprintNotFoundError(ValueError):
     """The requested blueprint does not exist."""
+
+
+class UiFanoutActiveError(ValueError):
+    """NEW-146: a fan-out holds the blueprint's active marker; nothing may be reset."""
+
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"a ui fan-out is active for this blueprint ({workflow_id}); "
+            "retry after it has finished"
+        )
+        self.workflow_id = workflow_id
 
 
 class UiBlueprintRepository:
@@ -182,6 +201,167 @@ class UiBlueprintRepository:
             row.error_code = None
             session.flush()
             return {**self._view(row), "replayed": False}
+
+    async def check_retry(
+        self, blueprint_id: UUID, binding: str, phrase: str, actor: str, kind: str | None
+    ) -> None:
+        await asyncio.to_thread(self.check_retry_sync, blueprint_id, binding, phrase, actor, kind)
+
+    def check_retry_sync(
+        self, blueprint_id: UUID, binding: str, phrase: str, actor: str, kind: str | None
+    ) -> None:
+        """NEW-146: the retry's authorization, checked before a stale marker is released."""
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            if row is None:
+                raise UiBlueprintNotFoundError("ui blueprint not found")
+            self._check_retry(row, binding, phrase, actor, kind)
+
+    @classmethod
+    def _check_retry(
+        cls, row: UiBlueprint, binding: str, phrase: str, actor: str, kind: str | None
+    ) -> None:
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("ui fan-out retry requires an allowlisted operator channel")
+        if kind is not None and kind not in FANOUT_RETRY_KINDS:
+            raise ValueError("ui fan-out retry kind is not known")
+        if row.status != "APPROVED":
+            raise ValueError("only an APPROVED ui blueprint's fan-out can be retried")
+        stored = row.approval_binding_sha256 or ""
+        if not (stored and hmac.compare_digest(stored, binding)):
+            raise ValueError("ui blueprint approval binding does not match")
+        if not hmac.compare_digest(RETRY_FANOUT_PHRASE, phrase):
+            raise ValueError(f"typed confirmation must be {RETRY_FANOUT_PHRASE}")
+        cls._verify(row)
+
+    async def retry_fanout(
+        self,
+        blueprint_id: UUID,
+        binding: str,
+        phrase: str,
+        actor: str,
+        *,
+        kind: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.retry_fanout_sync, blueprint_id, binding, phrase, actor, kind=kind, limit=limit
+        )
+
+    def retry_fanout_sync(
+        self,
+        blueprint_id: UUID,
+        binding: str,
+        phrase: str,
+        actor: str,
+        *,
+        kind: str | None = None,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        """NEW-146: reset an APPROVED blueprint's FAILED fan-out items to the fresh pending
+        state (DRAFTING, revision 1) in one audited transaction, so the next fan-out drafts
+        them again under their unchanged deterministic ids.
+
+        Only a failure a fan-out recorded (FAILED at revision 1, bound to this blueprint item)
+        is reset, at most ``limit`` of them in blueprint order: CANDIDATE, approved,
+        published, rejected and operator-revised (revision > 1) requests are never touched.
+        Refused while any fan-out holds the blueprint's active marker (the caller releases a
+        stale marker first), so a running fan-out never sees its items change under it. A
+        repeated retry is idempotent: already reset items are pending, not FAILED."""
+        limit = max(1, int(limit))
+        with self.sessions.begin() as session:
+            row = self._locked(session, blueprint_id)
+            self._check_retry(row, binding, phrase, actor, kind)
+            if row.active_fanout_workflow_id:
+                raise UiFanoutActiveError(row.active_fanout_workflow_id)
+            digest = str(row.blueprint_sha256)
+            items = [
+                item
+                for item in fanout_items(dict(row.blueprint_json or {}))
+                if kind is None or item.kind == kind or (kind == "gap" and item.is_gap)
+            ]
+            identities = {item_change_request_id(digest, item.key): item.key for item in items}
+            requests = {
+                request.id: request
+                for request in session.scalars(
+                    select(ChangeRequest)
+                    .where(ChangeRequest.id.in_(list(identities)))
+                    .with_for_update()
+                ).all()
+            }
+            now = datetime.now(UTC)
+            reset: list[dict[str, Any]] = []
+            still_failed = 0
+            for change_request_id, item_key in identities.items():
+                request = requests.get(change_request_id)
+                if request is None or request.status != "FAILED" or request.revision != 1:
+                    continue
+                context = request.ui_context_json or {}
+                if (
+                    context.get("blueprint_id") != str(row.id)
+                    or context.get("item_key") != item_key
+                ):
+                    continue
+                if len(reset) >= limit:
+                    still_failed += 1
+                    continue
+                reset.append(
+                    {
+                        "change_request_id": str(change_request_id),
+                        "item_key": item_key,
+                        "error_code": request.error_code,
+                    }
+                )
+                # Back to exactly what create_ui_item_sync writes: the fan-out plan selects
+                # it as pending and re-drafts it from scratch.
+                request.status = "DRAFTING"
+                request.error_code = None
+                request.proposal_json = {}
+                request.review_json = {}
+                request.dedupe_json = {}
+                request.fingerprint = None
+                request.issue_title = None
+                request.issue_body = None
+                request.approval_binding_sha256 = None
+                request.updated_at = now
+            record = {
+                "actor": actor,
+                "at": now.isoformat(),
+                "kind": kind,
+                "limit": limit,
+                "reset": len(reset),
+                "still_failed": still_failed,
+            }
+            fanout = dict(row.fanout_json or {})
+            fanout["retries"] = [*list(fanout.get("retries") or [])[-(RETRY_HISTORY - 1) :], record]
+            row.fanout_json = fanout
+            session.add(
+                DashboardEvent(
+                    occurred_at=now,
+                    level="INFO",
+                    event_type="ui_fanout.retry_requested",
+                    source="controller",
+                    worker_kind="controller",
+                    project=row.project,
+                    entity_type="ui_blueprint",
+                    entity_id=str(row.id),
+                    current_phase="UI_FANOUT_RETRY",
+                    message=f"UI fan-out retry: {len(reset)} failed item(s) reset to pending",
+                    metadata_json={
+                        **record,
+                        "change_request_ids": [entry["change_request_id"] for entry in reset],
+                    },
+                )
+            )
+            session.flush()
+            return {
+                "blueprint_id": str(row.id),
+                "status": row.status,
+                "kind": kind,
+                "reset_count": len(reset),
+                "reset": reset,
+                "still_failed": still_failed,
+            }
 
     async def record_start_failure(self, blueprint_id: UUID) -> None:
         await asyncio.to_thread(
@@ -908,6 +1088,22 @@ class UiBlueprintRepository:
             ).rowcount
         return bool(released == 1)
 
+    async def active_fanout(self, blueprint_id: UUID) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.active_fanout_sync, blueprint_id)
+
+    def active_fanout_sync(self, blueprint_id: UUID) -> dict[str, Any] | None:
+        """NEW-146: the active fan-out marker (workflow id and claim time), if any."""
+        with self.sessions() as session:
+            row = session.get(UiBlueprint, blueprint_id)
+            if row is None:
+                raise UiBlueprintNotFoundError("ui blueprint not found")
+            if not row.active_fanout_workflow_id:
+                return None
+            return {
+                "workflow_id": str(row.active_fanout_workflow_id),
+                "claimed_at": row.fanout_claimed_at,
+            }
+
     def fanout_owner_sync(self, blueprint_id: UUID, workflow_id: str) -> bool:
         """NEW-123 review 4: the fence. Only the fan-out the active marker names may draft;
         a superseded execution (a start delayed past a released stale claim) stops."""
@@ -1073,6 +1269,15 @@ class UiBlueprintRepository:
             "decided_at": cls._iso(row.decided_at),
             "decision_sequence": row.decision_sequence,
             "fanout": row.fanout_json,
+            # NEW-146: offered once a finished fan-out left FAILED items behind.
+            "fanout_retry_command": (
+                f"engineering-ctl ui-blueprint-fanout-retry {row.id} {binding} "
+                f"{RETRY_FANOUT_PHRASE}"
+                if row.status == "APPROVED"
+                and binding
+                and ((row.fanout_json or {}).get("last_run") or {}).get("failed_total")
+                else None
+            ),
             "fanout_workflow_id": row.active_fanout_workflow_id,
             "fanout_sequence": row.fanout_sequence,
             "reviewed_sha256": row.reviewed_sha256,

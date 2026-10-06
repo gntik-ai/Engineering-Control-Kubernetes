@@ -33,6 +33,10 @@ from engineering_control.engineering.change_requests import (
 
 UI_PLAN_PROJECTS = frozenset({"falcone"})
 APPROVAL_PHRASE = "APPROVE_UI_BLUEPRINT"
+# NEW-146: the typed confirmation that resets an approved blueprint's FAILED fan-out items.
+RETRY_FANOUT_PHRASE = "RETRY_UI_FANOUT"
+# NEW-146: --kind filters of a fan-out retry ("gap" is both gap kinds).
+FANOUT_RETRY_KINDS = frozenset({"epic", "page", "cutover", "gap", "backend-gap", "kit-gap"})
 AGENT_PACK_MIN_VERSION = (1, 4, 0)
 AGENT_PACK_SKILL_MISSING = "AGENT_PACK_SKILL_MISSING"
 # skill id -> (role, the skill's output schema in the agent pack and in this package)
@@ -51,6 +55,8 @@ UI_PLAN_PART_SCHEMAS: dict[str, dict[str, str]] = {
 FANOUT_DEFAULT_MAX_ITEMS = 80
 FANOUT_MAX_ITEMS_LIMIT = 600
 FANOUT_BATCH = 10
+# NEW-146: failed items listed (with their failure) in a fan-out's result.
+FANOUT_FAILURES_SHOWN = 10
 WAVE_ORDER = ("u0", "u1", "u2", "u3", "u4", "u5")
 REPOSITORY_FALCONE = "gntik-ai/falcone"
 REPOSITORY_FALCONE_CHARTS = "gntik-ai/falcone-charts"

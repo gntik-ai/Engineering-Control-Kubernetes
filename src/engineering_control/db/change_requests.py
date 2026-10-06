@@ -31,7 +31,7 @@ from engineering_control.engineering.change_requests import (
     render_change_request,
     validate_proposal,
 )
-from engineering_control.security.redaction import SecretRedactor
+from engineering_control.security.redaction import SecretRedactor, bounded_detail
 
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _ISSUE_URL = re.compile(
@@ -418,17 +418,80 @@ class ChangeRequestRepository:
             }
 
     def record_failure_sync(
-        self, change_request_id: UUID, revision: int, error_code: str
+        self,
+        change_request_id: UUID,
+        revision: int,
+        error_code: str,
+        *,
+        phase: str | None = None,
+        blocker: str | None = None,
+        detail: str | None = None,
     ) -> dict[str, Any]:
         code = error_code if _ERROR_CODE.fullmatch(error_code) else "CHANGE_REQUEST_FAILED"
+        # NEW-146: what failed, kept with the request (review_json is empty until a
+        # candidate is persisted, and every redraft clears it): the step's own blocker and
+        # its bounded, redacted message.
+        failure: dict[str, Any] = {}
+        if phase:
+            failure["phase"] = bounded_detail(phase, limit=40)
+        if blocker:
+            failure["blocker"] = bounded_detail(blocker, limit=120)
+        if detail:
+            failure["detail"] = bounded_detail(detail)
         with self.sessions.begin() as session:
             row = self._locked(session, change_request_id)
             if row.status != "DRAFTING" or row.revision != revision:
                 return {"status": "SUPERSEDED", "current_status": row.status}
             row.status = "FAILED"
             row.error_code = code
+            if failure:
+                row.review_json = {"failure": failure}
             session.flush()
-            return {"status": "FAILED", "error_code": code}
+            return {
+                "status": "FAILED",
+                "error_code": code,
+                **({"failure": failure} if failure else {}),
+            }
+
+    def item_failures_sync(self, change_request_ids: list[UUID]) -> list[dict[str, Any]]:
+        """NEW-146: the FAILED fanned-out items among these ids, in the given order, with
+        their recorded failure."""
+        if not change_request_ids:
+            return []
+        with self.sessions() as session:
+            rows = {
+                row.id: row
+                for row in session.scalars(
+                    select(ChangeRequest).where(
+                        ChangeRequest.id.in_(change_request_ids),
+                        ChangeRequest.status == "FAILED",
+                    )
+                ).all()
+            }
+            failures = []
+            for change_request_id in change_request_ids:
+                row = rows.get(change_request_id)
+                if row is None:
+                    continue
+                context = row.ui_context_json if isinstance(row.ui_context_json, dict) else {}
+                failures.append(
+                    {
+                        "change_request_id": str(row.id),
+                        "item_key": context.get("item_key"),
+                        "revision": row.revision,
+                        "error_code": row.error_code,
+                        **self._failure(row),
+                    }
+                )
+            return failures
+
+    @staticmethod
+    def _failure(row: ChangeRequest) -> dict[str, Any]:
+        review = row.review_json if isinstance(row.review_json, dict) else {}
+        failure = review.get("failure") if row.status == "FAILED" else None
+        if not isinstance(failure, dict):
+            return {}
+        return {key: failure[key] for key in ("phase", "blocker", "detail") if key in failure}
 
     @classmethod
     def _approval_fields(cls, row: ChangeRequest) -> dict[str, Any]:
@@ -584,6 +647,8 @@ class ChangeRequestRepository:
             "decision_sequence": row.decision_sequence,
             "workflow_id": change_request_workflow_id(str(row.id), row.revision),
             "ui_context": row.ui_context_json or None,
+            # NEW-146: why a FAILED request failed (blocker and bounded, redacted detail).
+            "failure": cls._failure(row) or None,
         }
 
 

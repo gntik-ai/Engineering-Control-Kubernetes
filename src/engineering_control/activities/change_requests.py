@@ -413,9 +413,18 @@ class ChangeRequestActivityHandler:
 
     def _record_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
         phase = str(payload.get("failure_phase", "internal"))
-        code = _failure_code(phase, str(payload.get("blocker") or payload.get("status") or ""))
+        blocker = str(payload.get("blocker") or payload.get("status") or "")
+        code = _failure_code(phase, blocker)
         change_request_id, revision = self._identity(payload)
-        result = self.repository.record_failure_sync(change_request_id, revision, code)
+        detail = payload.get("blocker_detail")
+        result = self.repository.record_failure_sync(
+            change_request_id,
+            revision,
+            code,
+            phase=phase,
+            blocker=blocker or None,
+            detail=str(detail) if detail else None,
+        )
         return {**self._slim(payload), **result}
 
     def _finalize_run(self, payload: dict[str, Any]) -> dict[str, Any]:
