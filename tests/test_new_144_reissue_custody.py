@@ -473,4 +473,12 @@ async def test_retention_does_not_send_custody_references_as_sql_parameters(
             session, datetime.now(UTC) - timedelta(days=30)
         )
     assert expired  # none of the fixture's re-issue events is in the huge reference set
+    with live.operations.sessions() as session:
+        # NEW-144 review 4: a full batch (limit 0) adds nothing beyond the 10,000 bound.
+        assert (
+            issue_delivery_approval.expired_unreferenced_reissue_event_ids(
+                session, datetime.now(UTC) - timedelta(days=30), limit=0
+            )
+            == []
+        )
     _dispose(live, delivery)

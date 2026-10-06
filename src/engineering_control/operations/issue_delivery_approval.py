@@ -285,6 +285,8 @@ def expired_unreferenced_reissue_event_ids(
     The referenced ids stay a Python set (never a SQL parameter list, which a large
     history would push past the driver's parameter limit); only the bounded population of
     expired re-issue events is read and filtered here."""
+    if limit is not None and limit <= 0:
+        return []
     referenced = set(custody_referenced_event_ids(session))
     found: list[int] = []
     for event_id in session.scalars(
