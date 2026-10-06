@@ -383,6 +383,15 @@ exists, so this bounded wait is the fence for that (an explicit assumption: GitH
 processing a received push well within 30 minutes). A `delivery-runner` effect (worker host) is
 refused as unverifiable here.
 
+NEW-147: publication now binds the existing PR by head branch and base and waits (up to 120 s)
+for GitHub to show the pushed commit, so the #972 race (an UNKNOWN `pr_create` right after a
+`COMPLETE` `git_push`) no longer occurs; if the head never converges the publish blocks with
+`PR_HEAD_NOT_CONVERGED` (retry) and creates nothing. For such an existing effect, a bound PR may
+also be at exactly the head the intent's `COMPLETE` push delivered; the reconciliation records
+the matched basis (`CHANGE_EVIDENCE` or `COMPLETED_PUSH_OF_INTENT`) and leaves `change_evidence`
+unchanged (it is diff-bound to its head), so NEW-102's restore refuses until a new delivery
+republishes or the branch is reset to the recorded head.
+
 In one transaction under the publication locks it then sets the effect to the terminal status
 `RECONCILED` (the receipt is kept; a `reconciliation` record holds the operator, time, method,
 recorded and observed heads and the PR-creation listing evidence), writes a `publication_effect_reconciled` dashboard event, and
