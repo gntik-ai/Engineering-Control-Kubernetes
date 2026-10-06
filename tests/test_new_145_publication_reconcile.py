@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,6 +22,7 @@ from engineering_control.config import Settings
 from engineering_control.db import runtime_binding
 from engineering_control.db.models import ChangeSet, ComponentLease, DashboardEvent, Run, Step
 from engineering_control.leases.component import ComponentLeaseConflict
+from engineering_control.models.publication_authority import PublicationEffectReceipt
 from engineering_control.operations.publication_authority import (
     EFFECT_STEP,
     INTENT_STEP,
@@ -61,8 +62,14 @@ class _Effect:
 
     def observed(self, **overrides: dict[str, Any]) -> list[dict[str, Any]]:
         live = {
-            SOURCE_PR: {"url": SOURCE_PR, "head_sha": SOURCE_HEAD, "state": "OPEN"},
-            DEPLOYMENT_PR: {"url": DEPLOYMENT_PR, "head_sha": DEPLOYMENT_HEAD, "state": "OPEN"},
+            url: {
+                "url": url,
+                "head_sha": head,
+                "state": "OPEN",
+                "head_branch": BRANCH_TEMPLATE.format(change_set_id=self.change_set_id),
+                "base_branch": "main",
+            }
+            for url, head in ((SOURCE_PR, SOURCE_HEAD), (DEPLOYMENT_PR, DEPLOYMENT_HEAD))
         }
         for key, value in overrides.items():
             url = SOURCE_PR if key == "source" else DEPLOYMENT_PR
@@ -143,25 +150,89 @@ class _Effect:
         return loaded
 
 
+BRANCH_TEMPLATE = "agent/falcone/972/{change_set_id}"
+
+
+def _plan(change_set_id: str) -> dict[str, Any]:
+    """The intent's publication plan, as persist_publication_intent stores it."""
+    branch = BRANCH_TEMPLATE.format(change_set_id=change_set_id)
+    return {
+        "change_set_id": change_set_id,
+        "publications": [
+            {
+                "repository": f"gntik-ai/{slug}",
+                "repository_slug": slug,
+                "working_directory": f"/srv/engineering/worktrees/{slug}/{change_set_id}",
+                "branch": branch,
+                "head_sha": head,
+                "base_branch": "main",
+                "title": "falcone #972",
+                "body": "Validated bounded ChangeSet.",
+            }
+            for slug, head in (("falcone", SOURCE_HEAD), ("falcone-charts", DEPLOYMENT_HEAD))
+        ],
+        "deferred_deployment": None,
+    }
+
+
+def _effect_step(
+    intent_id: UUID, run_id: UUID, repository: str, action: str, status: str
+) -> tuple[UUID, Step]:
+    """One effect Step as PublicationAuthorityRepository.claim/receipt leave it."""
+    effect_id = uuid5(NAMESPACE_URL, f"publication-effect:{intent_id}:{repository}:{action}")
+    claim_id = uuid4()
+    now = datetime.now(UTC)
+    result: dict[str, Any] = {
+        "intent_id": str(intent_id),
+        "subject": "github-runner",
+        "claim_id": str(claim_id),
+        "request": {"repository": repository, "action": action},
+        "admitted_at": (now - timedelta(hours=1)).isoformat(),
+        "start_before": (now - timedelta(hours=1)).isoformat(),
+        "admission_number": 1,
+    }
+    if status != "STARTED":
+        result["receipt"] = PublicationEffectReceipt(
+            effect_id=effect_id,
+            claim_id=claim_id,
+            outcome=status,  # type: ignore[arg-type]
+            result_sha256="0" * 64,
+        ).model_dump(mode="json")
+    return effect_id, Step(
+        id=effect_id,
+        run_id=run_id,
+        name=EFFECT_STEP,
+        ordinal=0,
+        status=status,
+        idempotency_key=f"publication-effect:{effect_id}",
+        attempt=1,
+        result_json=result,
+    )
+
+
 async def _effect(
     tmp_path: Path,
     *,
     status: str = "UNKNOWN",
-    start_before_ago: timedelta = timedelta(hours=1),
+    action: str = "git_push",
     run_status: str = "BLOCKED",
+    also: tuple[str, str, str] | None = None,
 ) -> _Effect:
+    """falcone #972's intent: the falcone push's effect UNKNOWN, its run BLOCKED."""
     values = await _child(tmp_path)
     handler: MetadataActivityHandler = values[3]
     first = handler._load_confirmed_finding(values[6])
     acquired = handler._acquire_delivery_leases(first)
     assert acquired["status"] == "LEASES_ACQUIRED"
-    effect_id = uuid4()
     now = datetime.now(UTC)
+    branch = BRANCH_TEMPLATE.format(change_set_id=first["change_set_id"])
     with handler.sessions.begin() as session:
         change_set = session.get(ChangeSet, UUID(first["change_set_id"]))
         change_set.state = "SOURCE_PR"
         change_set.source_pr_url = SOURCE_PR
         change_set.deployment_pr_url = DEPLOYMENT_PR
+        change_set.source_branch = branch
+        change_set.deployment_branch = branch
         change_set.source_head_sha = SOURCE_HEAD
         change_set.deployment_head_sha = DEPLOYMENT_HEAD
         change_set.recovery_json = {
@@ -185,32 +256,16 @@ async def _effect(
                 status="PREPARED",
                 idempotency_key=f"publication-intent:{intent_id}",
                 attempt=1,
-                result_json={"change_set_id": first["change_set_id"]},
+                result_json={
+                    "change_set_id": first["change_set_id"],
+                    "plan": _plan(first["change_set_id"]),
+                },
             )
         )
-        result: dict[str, Any] = {
-            "intent_id": str(intent_id),
-            "subject": "github-runner",
-            "claim_id": str(uuid4()),
-            "request": {"repository": "gntik-ai/falcone", "action": "push"},
-            "admitted_at": (now - timedelta(hours=1)).isoformat(),
-            "start_before": (now - start_before_ago).isoformat(),
-            "admission_number": 1,
-        }
-        if status != "STARTED":
-            result["receipt"] = {"outcome": status, "effect_id": str(effect_id)}
-        session.add(
-            Step(
-                id=effect_id,
-                run_id=run.id,
-                name=EFFECT_STEP,
-                ordinal=0,
-                status=status,
-                idempotency_key=f"publication-effect:{effect_id}",
-                attempt=1,
-                result_json=result,
-            )
-        )
+        effect_id, effect = _effect_step(intent_id, run.id, "gntik-ai/falcone", action, status)
+        session.add(effect)
+        if also is not None:
+            session.add(_effect_step(intent_id, run.id, *also)[1])
     return _Effect(values, first, effect_id)
 
 
@@ -286,6 +341,8 @@ async def test_a_rerun_is_idempotent(tmp_path: Path) -> None:
         ({"deployment": {"state": "CLOSED"}}, "PR_NOT_OPEN"),
         ({"source": {"state": ""}}, "PR_NOT_OPEN"),
         ({"deployment": {"url": None}}, "PR_MISSING"),
+        ({"source": {"base_branch": "release"}}, "PR_RETARGETED"),
+        ({"deployment": {"head_branch": "agent/falcone/972/other"}}, "PR_RETARGETED"),
     ],
 )
 async def test_live_heads_that_differ_from_the_publication_are_refused(
@@ -324,7 +381,14 @@ async def test_wrong_confirmation_and_non_operators_are_refused(tmp_path: Path) 
         ({"run_status": "RUNNING"}, "RUN_ACTIVE"),
         ({"status": "COMPLETE"}, "EFFECT_NOT_UNRESOLVED"),
         ({"status": "NOT_ATTEMPTED"}, "EFFECT_NOT_UNRESOLVED"),
-        ({"status": "STARTED", "start_before_ago": timedelta(0)}, "EFFECT_NOT_FENCED"),
+        # A publisher may still run under a STARTED claim, however long ago it began.
+        ({"status": "STARTED"}, "EFFECT_STARTED"),
+        ({"action": "pr_create"}, "EFFECT_ACTION_UNSUPPORTED"),
+        # The same intent also created a PR (e.g. a replacement for a retargeted one).
+        (
+            {"also": ("gntik-ai/falcone-charts", "pr_create", "COMPLETE")},
+            "EFFECT_ACTION_UNSUPPORTED",
+        ),
     ],
 )
 async def test_effects_that_are_not_provably_settled_are_refused(
@@ -361,30 +425,79 @@ async def test_a_change_after_the_head_read_is_refused(tmp_path: Path) -> None:
     _dispose(effect.values)
 
 
-async def test_a_fenced_started_effect_is_reconcilable(tmp_path: Path) -> None:
-    effect = await _effect(tmp_path, status="STARTED", start_before_ago=timedelta(minutes=16))
-    result = await effect.reconcile()
-    assert (result["status"], result["previous_status"]) == ("RECONCILED", "STARTED")
-    # A late receipt of the reconciled claim is kept once, never changes the status.
-    from engineering_control.models.publication_authority import PublicationEffectReceipt
+async def test_the_receipt_must_be_the_current_claims(tmp_path: Path) -> None:
+    effect = await _effect(tmp_path)
+    with effect.handler.sessions.begin() as session:
+        step = session.get(Step, effect.effect_id)
+        step.result_json = {
+            **step.result_json,
+            "receipt": {**step.result_json["receipt"], "claim_id": str(uuid4())},
+        }
+    with pytest.raises(PublicationReconcileBlocked, match="EFFECT_RECEIPT_INVALID"):
+        await effect.reconcile()
+    _dispose(effect.values)
 
+
+async def test_a_reconciled_effects_receipt_stays_immutable(tmp_path: Path) -> None:
+    effect = await _effect(tmp_path)
+    await effect.reconcile()
     status, value = effect.effect()
     authority = PublicationAuthorityRepository(str(effect.handler.engine.url))
-    receipt = PublicationEffectReceipt(
-        effect_id=effect.effect_id,
-        claim_id=UUID(value["claim_id"]),
-        outcome="NOT_ATTEMPTED",
-        result_sha256="0" * 64,
-    )
+    receipt = PublicationEffectReceipt.model_validate(value["receipt"])
+    # An exact replay is harmless; any other receipt is refused.
     assert authority.receipt("github-runner", receipt)["status"] == "RECONCILED"
-    assert authority.receipt("github-runner", receipt)["status"] == "RECONCILED"
-    status, value = effect.effect()
-    assert status == "RECONCILED"
-    assert value["late_receipt"] == receipt.model_dump(mode="json")
     with pytest.raises(ValueError, match="cannot be rewritten"):
         authority.receipt("github-runner", receipt.model_copy(update={"outcome": "COMPLETE"}))
+    assert effect.effect() == (status, value)
     authority.engine.dispose()
     _dispose(effect.values)
+
+
+async def test_a_pr_create_effect_of_the_real_binding_code_is_refused(tmp_path: Path) -> None:
+    # Codex review: a retargeted bound PR makes publication create a replacement PR; a
+    # lost response leaves that pr_create effect UNKNOWN while the old PR's head matches.
+    from test_delivery_activity import FakePublicationRunner, _controller_publisher
+
+    from engineering_control.activities.delivery import RepositoryPublication
+
+    effect = await _effect(tmp_path)
+    plan = _plan(str(effect.change_set_id))["publications"][0]
+    runner = FakePublicationRunner(plan["branch"], {"falcone": SOURCE_HEAD})
+    handler = _controller_publisher(tmp_path / "publisher", runner)
+    actions: list[tuple[str, str]] = []
+
+    class _LostResponse:
+        def execute(self, *, repository: str, action: str, **_: Any) -> Any:
+            actions.append((repository, action))
+            raise RuntimeError("publication effect outcome is UNKNOWN")
+
+    with pytest.raises(RuntimeError, match="UNKNOWN"):
+        handler._bind_pull_request(
+            RepositoryPublication.model_validate(plan),
+            (_LostResponse(), {}, {}),  # type: ignore[arg-type]
+        )
+    # The bound PR now targets another base, so the real binding code creates a PR.
+    assert actions == [("gntik-ai/falcone", "pr_create")]
+    with effect.handler.sessions.begin() as session:
+        step = session.get(Step, effect.effect_id)
+        intent_id = UUID(step.result_json["intent_id"])
+        created_id, created = _effect_step(
+            intent_id, step.run_id, actions[0][0], actions[0][1], "UNKNOWN"
+        )
+        session.add(created)
+    with pytest.raises(PublicationReconcileBlocked, match="EFFECT_ACTION_UNSUPPORTED"):
+        await effect.reconcile()  # the push effect: its intent created a PR
+    pr_create = _Effect(effect.values, effect.first, created_id)
+    with pytest.raises(PublicationReconcileBlocked, match="EFFECT_ACTION_UNSUPPORTED"):
+        await pr_create.reconcile()  # the pr_create effect itself
+    _dispose(effect.values)
+
+
+def test_a_reconciled_effect_renders_as_completed() -> None:
+    from engineering_control.dashboard.status_mapping import map_status
+
+    assert map_status("RECONCILED").normalized == "completed"
+    assert map_status("RECONCILED", entity_type="publication_effect").blocker_code is None
 
 
 def test_cli_publication_reconcile_parses_into_the_api_request() -> None:

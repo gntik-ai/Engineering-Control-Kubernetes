@@ -173,6 +173,7 @@ _states(
     "PASS",
     "COMPLETE",
     "COMPLETED",
+    "RECONCILED",  # NEW-145: an uncertain publication effect resolved by authority
     "NO_FINDING",
     "CONFIRMED_FINDING",
     "ISSUE_CLOSED",

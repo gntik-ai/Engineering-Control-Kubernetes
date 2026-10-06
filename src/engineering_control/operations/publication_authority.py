@@ -419,19 +419,6 @@ class PublicationAuthorityRepository:
                 # Exact delayed receipt replay is harmless; never overwrite the
                 # retained terminal observation or the newer current claim.
                 return {"status": "NOT_ATTEMPTED", "effect_id": str(effect.id)}
-            if effect.status == RECONCILED_EFFECT_STATE:
-                # NEW-145: a reconciled effect keeps its status. A late receipt of a
-                # reconciled STARTED claim is retained (once) as an observation.
-                kept = effect.result_json.get("receipt") or effect.result_json.get("late_receipt")
-                if kept is None:
-                    effect.result_json = {
-                        **effect.result_json,
-                        "late_receipt": value,
-                        "late_received_at": datetime.now(UTC).isoformat(),
-                    }
-                elif kept != value:
-                    raise ValueError("publication effect receipt cannot be rewritten")
-                return {"status": effect.status, "effect_id": str(effect.id)}
             previous = effect.result_json.get("receipt")
             if previous is not None:
                 if previous != value:

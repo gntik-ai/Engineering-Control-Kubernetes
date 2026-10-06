@@ -320,7 +320,11 @@ CI-repair bounds keep counting the whole lineage.
 A publication whose outcome Hermes could not observe leaves its
 `delivery.publication_effect` Step `UNKNOWN` (or `STARTED`). Until it is resolved, every
 implementation lease of that project is refused ("unresolved publication effect requires
-reconciliation") and the run keeps its leases. Resolve it only by authority:
+reconciliation") and the run keeps its leases. This command resolves only the provably safe
+case: an `UNKNOWN` effect whose publisher returned (its committed receipt is `UNKNOWN` for the
+current claim) and whose action is a `git_push` of the recorded branch of an already-bound PR.
+A `STARTED` effect (a publisher may still be running) and any PR creation still need a fenced,
+manual resolution.
 
 1. Find the effect Step id (`delivery.publication_effect`, status `UNKNOWN`) and its ChangeSet.
 2. Make each bound PR branch match the head recorded at the ChangeSet's last confirmed
@@ -339,10 +343,13 @@ engineering-ctl publication-reconcile ba4a87ad-e4ef-573c-a71b-a902641f49bf \
 The API route is `POST /v1/publication-effects/reconcile` (operator channel only, like
 `r3-approve`). The GitHub worker reads every bound PR live (`gitops.pr_heads`, as NEW-102's
 restore does). It refuses with a `PUBLICATION_RECONCILE_*` code unless the effect's run is
-terminal (`RUN_ACTIVE`), the effect is `UNKNOWN`, or `STARTED` 15 minutes after its claim's
-start deadline with no receipt (`EFFECT_NOT_UNRESOLVED`, `EFFECT_NOT_FENCED`), the ChangeSet
-has recorded published heads for its PRs (`PUBLICATION_BINDING_MISSING`), and every bound PR
-is OPEN or MERGED at exactly its recorded head (`HEAD_MISMATCH`, `PR_NOT_OPEN`, `PR_MISSING`).
+terminal (`RUN_ACTIVE`), the effect is `UNKNOWN` (`EFFECT_STARTED`, `EFFECT_NOT_UNRESOLVED`)
+with a committed `UNKNOWN` receipt for its current claim (`EFFECT_RECEIPT_INVALID`), its action
+is `git_push` and no effect of its publication intent created a PR
+(`EFFECT_ACTION_UNSUPPORTED`), its target is exactly the ChangeSet's recorded PRs and branch
+(`EFFECT_TARGET_UNBOUND`, `PUBLICATION_BINDING_MISSING`), and every bound PR is OPEN or
+MERGED, still on its recorded head branch and base (`PR_RETARGETED`), at exactly its recorded
+head (`HEAD_MISMATCH`, `PR_NOT_OPEN`, `PR_MISSING`).
 
 In one transaction under the publication locks it then sets the effect to the terminal status
 `RECONCILED` (the receipt is kept; a `reconciliation` record holds the operator, time, method,
