@@ -94,6 +94,15 @@ def stage_part_document(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     if not name.startswith("part-"):
         return stage_document(payload)
+    if name.endswith("-previous.json"):
+        # NEW-142: the continued draft; the workflow checks the real file hash.
+        data = (json.dumps(payload["document"], indent=2, sort_keys=True) + "\n").encode()
+        document = {
+            "path": f"/srv/engineering/worktrees/ui-plan-inputs/x/{name}",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+        }
+        return {"status": "STAGED", "document": document}
     result = {"path": f"/in/{name}", "sha256": "3" * 64, "bytes": 1}
     if "-draft-" in name:
         # As the scan worker does: Hermes hashes exactly the part content the reviewer reads.

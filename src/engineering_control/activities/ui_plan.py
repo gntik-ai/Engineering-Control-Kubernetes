@@ -11,7 +11,9 @@ reviews. Hermes never publishes: the operator uses the existing change-publish p
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import re
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -66,6 +68,7 @@ from engineering_control.engineering.ui_blueprint_parts import (
     check_part_review,
     frame_part_id,
     part_content_problems,
+    part_content_sha256,
     part_schema,
     review_digest,
     routed_page_ids,
@@ -73,6 +76,8 @@ from engineering_control.engineering.ui_blueprint_parts import (
 )
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
+
+LOGGER = logging.getLogger(__name__)
 
 _PROVIDER_RESULT_KEYS = frozenset(
     {
@@ -90,7 +95,16 @@ _REQUEST_KEYS = frozenset({"draft_request", "review_request"})
 UI_PLAN_REUSE_KEY_MISSING = "UI_PLAN_REUSE_KEY_MISSING"
 _CONTENT_KEY = re.compile(r"[a-f0-9]{64}")
 _PART_TRANSIENT_KEYS = frozenset(
-    {"mechanical", "mechanical_sha256", "document", "markdown", "frame_brief", "rejected_usage"}
+    {
+        "mechanical",
+        "mechanical_sha256",
+        "document",
+        "markdown",
+        "frame_brief",
+        "rejected_usage",
+        # NEW-142: the earlier run's draft, staged once by the workflow after attempt 1.
+        "continuation_document",
+    }
 )
 
 # Design sections 7 and 10 (2026-10-04), given to the drafter and the reviewer as data.
@@ -163,32 +177,55 @@ def _finding_text(item: Any) -> str:
 
 
 def cumulative_findings(
-    reviews: list[dict[str, Any]], rejections: list[dict[str, Any]], before: int
+    reviews: list[dict[str, Any]],
+    rejections: list[dict[str, Any]],
+    before: int,
+    previous: dict[str, Any] | None = None,
 ) -> tuple[list[str], int]:
     """Every REVISE finding and Hermes rejection finding on drafts 1..before-1 of a part,
     deduplicated (a repeated finding lists every round it was raised in) and labelled by
     round, ordered by each finding's latest occurrence. Past PRIOR_FINDINGS_MAX findings or
     PRIOR_FINDINGS_CHARS characters the findings last raised longest ago are omitted (the
     newest rounds, repeats included, are kept whole); returns the lines and the number
-    omitted."""
-    raised: list[tuple[int, str, str]] = []
-    for review in reviews:
-        attempt = int(review.get("attempt") or 0)
-        if 1 <= attempt < before and review.get("decision") == "REVISE":
-            raised += [
-                (attempt, "review", _finding_text(item)) for item in review.get("findings") or []
-            ]
-    for rejection in rejections:
-        attempt = int(rejection.get("attempt") or 0)
-        if 1 <= attempt < before:
-            source = f"Hermes rejection {rejection.get('code') or ''}".strip()
-            raised += [
-                (attempt, source, _finding_text(item)) for item in rejection.get("details") or []
-            ]
+    omitted.
+
+    NEW-142: `previous` (blueprint_id, reviews, rejections) is the earlier plan run this
+    part continues; all its findings come first, labelled "previous run <id>, round N"."""
+    raised: list[tuple[tuple[int, int], str, str]] = []
+
+    def collect(
+        run: int, prefix: str, items: list[dict[str, Any]], fails: list[dict[str, Any]], limit: int
+    ) -> None:
+        for review in items:
+            attempt = int(review.get("attempt") or 0)
+            if 1 <= attempt < limit and review.get("decision") == "REVISE":
+                label = f"{prefix}round {attempt} (review of draft {attempt})"
+                raised.extend(
+                    ((run, attempt), label, _finding_text(item))
+                    for item in review.get("findings") or []
+                )
+        for rejection in fails:
+            attempt = int(rejection.get("attempt") or 0)
+            if 1 <= attempt < limit:
+                source = f"Hermes rejection {rejection.get('code') or ''}".strip()
+                label = f"{prefix}round {attempt} ({source} of draft {attempt})"
+                raised.extend(
+                    ((run, attempt), label, _finding_text(item))
+                    for item in rejection.get("details") or []
+                )
+
+    if previous:
+        collect(
+            0,
+            f"previous run {str(previous.get('blueprint_id'))[:8]}, ",
+            list(previous.get("reviews") or []),
+            list(previous.get("rejections") or []),
+            1_000,
+        )
+    collect(1, "", reviews, rejections, before)
     rounds: dict[str, list[str]] = {}
     latest: dict[str, int] = {}
-    for position, (attempt, source, text) in enumerate(sorted(raised, key=lambda x: x[0])):
-        label = f"round {attempt} ({source} of draft {attempt})"
+    for position, (_order, label, text) in enumerate(sorted(raised, key=lambda x: x[0])):
         if label not in rounds.setdefault(text, []):
             rounds[text].append(label)
         latest[text] = position
@@ -730,7 +767,84 @@ class UiPlanActivityHandler:
         rejections = [
             item for item in payload.get("part_rejections") or [] if isinstance(item, dict)
         ]
-        return cumulative_findings(reviews, rejections, before)
+        # NEW-142: rejections are also durable now; merge (one per attempt).
+        known = {item.get("attempt") for item in rejections}
+        rejections += [
+            item
+            for item in self.repository.part_rejections_sync(blueprint_id, part_id)
+            if item.get("attempt") not in known
+        ]
+        continuation = payload.get("continuation")
+        previous = None
+        if isinstance(continuation, dict) and continuation.get("blueprint_id"):
+            earlier = UUID(str(continuation["blueprint_id"]))
+            previous = {
+                "blueprint_id": str(earlier),
+                "reviews": self.repository.part_reviews_sync(earlier, part_id),
+                "rejections": self.repository.part_rejections_sync(earlier, part_id),
+            }
+        return cumulative_findings(reviews, rejections, before, previous)
+
+    def _continuation(
+        self,
+        blueprint_id: UUID,
+        kind: str,
+        part_id: str,
+        context: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        """NEW-142: (continuation, document to stage, skip note) for attempt 1 of a part an
+        earlier plan run drafted and reviewed but never approved. Fails closed: a prior
+        draft whose hashes do not match its record, or that no longer validates against
+        the current schema and references, is ignored (the part drafts from scratch)."""
+        previous = self.repository.previous_unresolved_sync(blueprint_id, part_id)
+        if previous is None:
+            return None, None, None
+        note = {"blueprint_id": previous["blueprint_id"], "attempt": previous["attempt"]}
+        content = previous["content"]
+        directory = (payload.get("inputs") or {}).get("input_directory")
+        if not (
+            isinstance(content, dict)
+            and part_content_sha256(content)
+            == previous.get("content_sha256")
+            == previous.get("reviewed_sha256")
+        ):
+            reason = "the earlier draft does not match its recorded hashes"
+        elif problems := part_content_problems(kind, content, context):
+            reason = f"the earlier draft no longer validates: {problems[0]}"[:300]
+        elif not isinstance(directory, str) or not directory:
+            reason = "the plan has no staged input directory"
+        else:
+            document = {
+                "kind": "previous-part-draft",
+                "part_id": part_id,
+                "previous_blueprint_id": previous["blueprint_id"],
+                "previous_attempt": previous["attempt"],
+                "content_sha256": previous["content_sha256"],
+                kind: content,
+            }
+            text = json.dumps(document, indent=2, sort_keys=True) + "\n"
+            name = f"part-{part_id}-previous.json"
+            continuation = {
+                "blueprint_id": previous["blueprint_id"],
+                "attempt": previous["attempt"],
+                "content_sha256": previous["content_sha256"],
+                "file": {
+                    "name": name,
+                    "path": f"{directory.rstrip('/')}/{name}",
+                    "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "bytes": len(text.encode("utf-8")),
+                },
+            }
+            return continuation, document, None
+        LOGGER.warning(
+            "ui plan %s part %s: no continuation from %s: %s",
+            blueprint_id,
+            part_id,
+            previous["blueprint_id"],
+            reason,
+        )
+        return None, None, {**note, "reason": reason}
 
     @staticmethod
     def _part_base(payload: dict[str, Any]) -> dict[str, Any]:
@@ -975,6 +1089,16 @@ class UiPlanActivityHandler:
                         {"frame_brief": self._frame_brief(part_id, reused)} if kind == FRAME else {}
                     ),
                 }
+            # NEW-142: no approval to adopt; continue an earlier run's unresolved draft.
+            continuation, document, skipped = self._continuation(
+                blueprint_id, kind, part_id, context, payload
+            )
+            base.pop("continuation", None)
+            if continuation is not None:
+                base["continuation"] = continuation
+                base["continuation_document"] = document
+            if skipped is not None:
+                base["continuation_skipped"] = skipped
         maximum = self._max_part_attempts(payload)
         if (
             maximum is None
@@ -1015,11 +1139,30 @@ class UiPlanActivityHandler:
             ]
             if not any(item.get("attempt") == entry["attempt"] for item in rejections):
                 base["part_rejections"] = [*rejections, entry]
+            self.repository.record_part_rejection_sync(
+                blueprint_id, part_id, entry["attempt"], entry["code"], entry["details"]
+            )
+        continuation = base.get("continuation")
         history, omitted = (
             self._prior_findings(blueprint_id, part_id, {**payload, **base}, attempt)
-            if attempt >= 2
+            if attempt >= 2 or isinstance(continuation, dict)
             else ([], 0)
         )
+        if attempt == 1 and isinstance(continuation, dict):
+            # NEW-142: continue the earlier run's last reviewed draft, not from scratch.
+            staged = continuation["file"]
+            sections.append(
+                "This part continues an earlier plan run (blueprint "
+                f"{continuation['blueprint_id']}): draft {continuation['attempt']} of this "
+                "exact part (the same part id: the same inputs, kit, frame and provenance) "
+                "was reviewed there and not approved. Its last reviewed draft is staged at "
+                f"{staged['path']} (file sha256 {staged['sha256']}, {staged['bytes']} bytes; "
+                f"part content sha256 {continuation['content_sha256']}). Read it and revise "
+                "that draft, do not draft from scratch: resolve every finding below, from "
+                "every round of that run, and do not regress anything the draft already does "
+                "right. This plan's draft budget is unchanged.\n"
+                + _findings_block("previous run findings", history, omitted)
+            )
         cumulative = (
             "Every finding on this part so far, from every earlier round, labelled by round "
             "(deduplicated). Resolve all of them in this draft, not only the latest round's, "
@@ -1172,10 +1315,35 @@ class UiPlanActivityHandler:
                 context=self._part_check_context(blueprint_id, kind, part, payload),
             )
         except BlueprintRejected as rejected:
+            # NEW-142: durable, so a later plan continuing this part sees the rejection.
+            self.repository.record_part_rejection_sync(
+                blueprint_id,
+                part_id,
+                int(payload.get("draft_attempt") or 1),
+                rejected.code,
+                [str(item) for item in rejected.details],
+            )
             return {**base, "status": "REJECTED", "blocker": rejected.code,
                     "blockers": rejected.details}  # fmt: skip
         attempt = int(payload.get("draft_attempt") or 1)
-        self.repository.record_part_sync(blueprint_id, part_id, kind, attempt, content)
+        continuation = payload.get("continuation")
+        self.repository.record_part_sync(
+            blueprint_id,
+            part_id,
+            kind,
+            attempt,
+            content,
+            # NEW-142: the provenance of a continued draft.
+            continued_from=(
+                {
+                    "blueprint_id": continuation.get("blueprint_id"),
+                    "attempt": continuation.get("attempt"),
+                    "content_sha256": continuation.get("content_sha256"),
+                }
+                if attempt == 1 and isinstance(continuation, dict)
+                else None
+            ),
+        )
         return {
             **base,
             "status": "DRAFT_RECORDED",
@@ -1217,14 +1385,16 @@ class UiPlanActivityHandler:
         sections.append(self._EXHAUSTIVE_REVIEW[kind])
         history, omitted = (
             self._prior_findings(blueprint_id, part_id, payload, attempt)
-            if attempt >= 2
+            if attempt >= 2 or isinstance(payload.get("continuation"), dict)
             else ([], 0)
         )
         if history:
             # NEW-139: a re-review first verifies every earlier finding, then the checklist.
             sections.append(
                 f"This is the review of draft {attempt} of this part. Earlier drafts of it "
-                "drew the findings below (every round, labelled). First verify each one "
+                "drew the findings below (every round, labelled; NEW-142: rounds of a "
+                "previous plan run this part continues are labelled with that run). First "
+                "verify each one "
                 "against this draft: report every one that is not fully resolved as a "
                 "finding again, naming the round it was raised in. Then run the complete "
                 "checklist above and report every remaining violation, exhaustively.\n"

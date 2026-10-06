@@ -5468,6 +5468,8 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
     _STRUCTURAL_REJECTIONS = frozenset({"DRAFT_SCHEMA_INVALID", "DRAFT_STRUCTURE_INVALID"})
     # NEW-138 (operator, 2026-10-05): two redrafts per part; the id is suffixed per part.
     _TWO_REDRAFTS_PATCH = "new-138-two-redrafts"
+    # NEW-142: a part continues an earlier run's unresolved draft; suffixed per part.
+    _CONTINUATION_PATCH = "new-142-continuation"
     # Per part provider call: the request's own timeout is PART_TIMEOUT_SECONDS (1800 s);
     # the activity bound leaves room for the CLI's start-up and result handling.
     _PART_TIMEOUT_MINUTES = 40
@@ -5661,6 +5663,33 @@ class UiMigrationPlanWorkflow(ControlledWorkflow):
                     "terminal": "FAILED",
                     "blocker": str(current.get("blocker") or "DRAFT_INPUT_INVALID"),
                 }
+            continued = current.get("continuation")
+            if (
+                attempt == 1
+                and isinstance(current.get("continuation_document"), dict)
+                and isinstance(continued, dict)
+                and workflow.patched(
+                    f"{self._CONTINUATION_PATCH}-{part.get('kind')}-{part.get('index')}"
+                )
+            ):
+                # NEW-142: stage the earlier run's last reviewed draft the prompt continues
+                # (hash-verified against what ui_plan.prepare_part bound into the prompt).
+                previous = await self._step(
+                    "ui_plan.stage_document",
+                    {
+                        "project": request.project,
+                        "blueprint_id": request.blueprint_id,
+                        "name": str((continued.get("file") or {}).get("name")),
+                        "document": current.get("continuation_document"),
+                    },
+                )
+                if (previous.get("document") or {}).get("sha256") != (
+                    continued.get("file") or {}
+                ).get("sha256"):
+                    return {
+                        **current,
+                        "blocker": str(previous.get("blocker") or "UI_PLAN_INPUTS_UNAVAILABLE"),
+                    }
             current = await self._agent_step(
                 "ui_plan.draft", current, timeout_minutes=self._PART_TIMEOUT_MINUTES
             )

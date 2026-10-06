@@ -53,6 +53,8 @@ _PART_DOCUMENT_NAME = re.compile(
 )
 # NEW-131 review: the complete reviewed frame every batch drafter and reviewer reads.
 _FRAME_BRIEF_NAME = re.compile(r"^part-frame-[a-f0-9]{16}-brief\.json$")
+# NEW-142: an earlier run's last reviewed draft of a part, continued by this plan.
+_PREVIOUS_NAME = re.compile(r"^part-(frame|b[0-9]{3})-[a-f0-9]{16}-previous\.json$")
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
 _MODEL_READERS = ("codex-runner", "claude-runner")
 
@@ -241,6 +243,7 @@ class UiPlanScanSteps:
                 not _DOCUMENT_NAME.fullmatch(name)
                 and part is None
                 and not _FRAME_BRIEF_NAME.fullmatch(name)
+                and not _PREVIOUS_NAME.fullmatch(name)
             ):
                 raise ValueError("ui plan document name is invalid")
             base = self._ui_plan_input_base()
