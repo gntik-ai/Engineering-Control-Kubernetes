@@ -377,11 +377,23 @@ class GhCliBroker:
         )
         return self._list(value, "workflow runs", maximum=limit)
 
+    # NEW-147 review 2: the most PRs one listing may return. ``gh pr list`` pages through
+    # GitHub up to --limit, so a caller that needs a complete listing passes a limit and
+    # treats a listing that reaches it as possibly truncated.
+    PULL_REQUEST_LIST_MAXIMUM = 1000
+
     def list_pull_requests(
-        self, repository: str, *, head: str, state: Literal["open", "closed", "merged", "all"]
+        self,
+        repository: str,
+        *,
+        head: str,
+        state: Literal["open", "closed", "merged", "all"],
+        limit: int = 10,
     ) -> list[dict[str, Any]]:
         repository = self._batch(repository)
         head = self._value(head, "pull request head")
+        if not 1 <= limit <= self.PULL_REQUEST_LIST_MAXIMUM:
+            raise GhCliPolicyError("pull request list limit is out of bounds")
         value = self._json(
             self._run(
                 [
@@ -401,12 +413,12 @@ class GhCliBroker:
                         "headRepository,headRepositoryOwner,isCrossRepository"
                     ),
                     "--limit",
-                    "10",
+                    str(limit),
                 ]
             ).stdout,
             "pull request list",
         )
-        return self._list(value, "pull request list")
+        return self._list(value, "pull request list", maximum=limit)
 
     # NEW-145b: a head-branch listing that reaches this many PRs is refused, never cut.
     PULL_REQUESTS_BY_HEAD_CAP = 1000

@@ -62,11 +62,13 @@ class _RaceRunner(FakePublicationRunner):
     ) -> None:
         super().__init__(branch, heads)
         self.listings = listings
+        self.list_arguments: list[list[str]] = []
         self.list_calls = 0
         self.create_calls = 0
 
     def run(self, executable: str, arguments: list[str], *, cwd: Path, **kwargs: Any):  # type: ignore[no-untyped-def]
         if executable == "gh" and arguments[:2] == ["pr", "list"]:
+            self.list_arguments.append(list(arguments))
             listing = self.listings[min(self.list_calls, len(self.listings) - 1)]
             self.list_calls += 1
             return CommandResult(0, json.dumps(listing), "")
@@ -169,7 +171,7 @@ def test_no_pr_creates_one_and_waits_for_it_to_appear(tmp_path: Path) -> None:
         ([_pr(7, PUSHED_HEAD, state="MERGED"), _pr(8, PUSHED_HEAD)], "multiple GitHub PRs"),
         ([_pr(7, OLD_HEAD), _pr(8, PUSHED_HEAD)], "multiple GitHub PRs"),
         ([_pr(7, OLD_HEAD, state="DRAFTISH")], "unknown state"),
-        ([_pr(n, OLD_HEAD, state="CLOSED") for n in range(1, 11)], "too many GitHub PRs"),
+        ([_pr(n, OLD_HEAD, state="CLOSED") for n in range(1, 1001)], "too many GitHub PRs"),
     ],
 )
 def test_closed_merged_and_ambiguous_prs_never_lead_to_a_creation(
@@ -361,3 +363,46 @@ async def test_reconciliation_refuses_a_bound_pr_with_a_foreign_head(tmp_path: P
             effect.observed(source={"head_sha": PUSHED_HEAD, "head_repository": "attacker/falcone"})
         )
     _dispose(effect.values)
+
+
+def _forks(count: int, head: str, *, state: str = "OPEN") -> list[dict[str, Any]]:
+    """Fork PRs from same-named branches: ``gh pr list --head`` returns them too."""
+    return [_pr(2000 + n, head, state=state, owner=f"fork{n}") for n in range(count)]
+
+
+def test_ten_fork_prs_no_longer_hide_this_repositorys_pr(tmp_path: Path) -> None:
+    """Review 2: gh's default page of 10 filled by forks hid #1068; the listing is complete."""
+    handler, runner, _clock, plan, authority = _binder(
+        tmp_path, [[*_forks(10, OLD_HEAD), _pr(1068, PUSHED_HEAD)]]
+    )
+    assert handler._bind_pull_request(plan, (authority, {}, {}))["pr_number"] == 1068  # type: ignore[arg-type]
+    assert runner.create_calls == 0
+    assert all(
+        arguments[arguments.index("--limit") + 1] == "1000" for arguments in runner.list_arguments
+    )
+
+
+def test_ten_merged_fork_prs_never_hide_this_repositorys_merged_pr(tmp_path: Path) -> None:
+    """Review 2: the merged-branch guard must see this repository's merged PR behind ten
+    merged fork PRs, and refuse before anything is pushed."""
+    handler, runner, _clock, plan, _authority = _binder(
+        tmp_path, [[*_forks(10, OLD_HEAD, state="MERGED"), _pr(1043, OLD_HEAD, state="MERGED")]]
+    )
+    pushes: list[Any] = []
+    handler._push_from_local_worktree = lambda *args, **kwargs: pushes.append(args)  # type: ignore[method-assign]
+    handler._push_from_worker = lambda *args, **kwargs: pushes.append(args)  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="merged pull request's branch cannot be republished"):
+        handler._publish(plan, UUID(plan.branch.rsplit("/", 1)[-1]))
+    assert pushes == [] and runner.create_calls == 0
+
+
+def test_a_merged_listing_at_the_cap_is_refused_before_any_push(tmp_path: Path) -> None:
+    handler, _runner, _clock, plan, _authority = _binder(
+        tmp_path, [_forks(1000, OLD_HEAD, state="MERGED")]
+    )
+    pushes: list[Any] = []
+    handler._push_from_local_worktree = lambda *args, **kwargs: pushes.append(args)  # type: ignore[method-assign]
+    handler._push_from_worker = lambda *args, **kwargs: pushes.append(args)  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="too many merged GitHub PRs"):
+        handler._publish(plan, UUID(plan.branch.rsplit("/", 1)[-1]))
+    assert pushes == []

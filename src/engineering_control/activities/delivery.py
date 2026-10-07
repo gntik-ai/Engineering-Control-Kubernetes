@@ -57,8 +57,11 @@ _T = TypeVar("_T")
 # bound PR to reach the pushed commit, and never creates a second PR meanwhile.
 PR_BIND_CONVERGENCE_SECONDS = 120.0
 _PR_BIND_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 15.0)
-# gh pr list --limit used for publication binding; a full page may be truncated.
-_PR_BIND_LIST_LIMIT = 10
+# NEW-147 review 2: publication listings are complete, not gh's default page of 10.
+# ``gh pr list --head`` matches the branch name in forks too and filters by repository only
+# afterwards, so a short page of fork PRs could hide this repository's own (merged) PR.
+# gh pages up to this limit; a listing that reaches it may be truncated and is refused.
+_PR_BIND_LIST_LIMIT = 1000
 _PUBLISH_HEARTBEAT_SECONDS = 30.0
 
 
@@ -965,11 +968,15 @@ class DeliveryActivityHandler:
             raise ValueError("publication branch does not bind its ChangeSet")
         # NEW-103: a CI repair of the deployment PR may re-publish a ChangeSet whose source
         # PR is already merged; that branch is delivered and must never move.
+        listed_merged = self.broker.list_pull_requests(
+            plan.repository, head=plan.branch, state="merged", limit=_PR_BIND_LIST_LIMIT
+        )
+        if len(listed_merged) >= _PR_BIND_LIST_LIMIT:
+            # A truncated listing could hide this repository's merged PR: never push then.
+            raise ValueError("too many merged GitHub PRs share this publication head to verify")
         merged = [
             item
-            for item in self.broker.list_pull_requests(
-                plan.repository, head=plan.branch, state="merged"
-            )
+            for item in listed_merged
             if item.get("baseRefName") == plan.base_branch
             # NEW-147 review: a fork's PR from a same-named branch is not this branch's.
             and self._own_pull_request(item, plan)
@@ -1211,7 +1218,9 @@ class DeliveryActivityHandler:
         cut list. Fork PRs from a same-named branch are foreign: never bound, and they do not
         block creating this repository's own PR (GitHub allows both, and NEW-145b's complete
         listing of ``owner:branch`` never includes them either)."""
-        value = self.broker.list_pull_requests(plan.repository, head=plan.branch, state="all")
+        value = self.broker.list_pull_requests(
+            plan.repository, head=plan.branch, state="all", limit=_PR_BIND_LIST_LIMIT
+        )
         if len(value) >= _PR_BIND_LIST_LIMIT:
             raise ValueError("too many GitHub PRs share this publication head to bind safely")
         return [
