@@ -206,7 +206,7 @@ BLOCKER_DETAIL_LIMIT = 300
 # front of a credential, so the line-anchored assignment rules are applied anywhere in it.
 # Over-redacting a diagnostic is acceptable; leaking a credential is not.
 _INLINE_CREDENTIAL = re.compile(
-    r"(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret"
+    r"(?is)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret"
     r"|encryption[_-]?key|telegram[_-]?bot[_-]?token|client-key-data)\s*[:=]\s*)"
     # NEW-146 review 4: a quoted value may contain escaped quotes, and an unterminated
     # quote runs to the end of the detail; both are redacted whole.
@@ -223,8 +223,12 @@ def bounded_detail(
     the redactor's rules, credential assignments are redacted anywhere in the line, so a
     label or an exception's own prefix in front of ``password=...`` cannot hide it."""
     redacted = str((redactor or SecretRedactor()).redact_text(text).value)
+    # NEW-146 review 5: the inline rule spans newlines (DOTALL) and runs both before and
+    # after the detail is flattened to one line, so a quoted value split across lines is
+    # redacted whole.
     redacted = _INLINE_CREDENTIAL.sub(lambda match: f"{match.group(1)}{REDACTED}", redacted)
     line = " ".join(redacted.split())
+    line = _INLINE_CREDENTIAL.sub(lambda match: f"{match.group(1)}{REDACTED}", line)
     if len(line) > limit:
         line = line[: limit - 3].rstrip() + "..."
     return line

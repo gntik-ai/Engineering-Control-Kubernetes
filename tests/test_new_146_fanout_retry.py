@@ -792,3 +792,17 @@ def test_an_escaped_or_unterminated_quoted_credential_is_redacted_whole(message:
     """Review 4: a quoted value stops at its closing (unescaped) quote, not an escaped one."""
     detail = error_detail(ValueError(message))
     assert CREDENTIAL not in detail and REDACTED in detail
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f'bad pack: password="first\\\n{CREDENTIAL}" near line 3',
+        f'bad pack: token="unterminated\n{CREDENTIAL}',
+        f"bad pack: client_secret='a\\\n\n{CREDENTIAL}' tail",
+    ],
+)
+def test_a_quoted_credential_split_across_lines_is_redacted_whole(message: str) -> None:
+    """Review 5: an escaped newline or a multi-line unterminated quote must not leak."""
+    detail = error_detail(ValueError(message))
+    assert CREDENTIAL not in detail and REDACTED in detail
