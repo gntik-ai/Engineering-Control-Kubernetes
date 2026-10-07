@@ -113,8 +113,9 @@ _PART_TRANSIENT_KEYS = frozenset(
 OPERATOR_DECISIONS = (
     "Operator decisions (2026-10-04): a side-by-side apps/web-console-next on gntik-ui "
     "(React 19, Tailwind 4) next to the legacy apps/web-console; parity is verified on the "
-    "mocked-backend Playwright harness (no credentials); gntik-ui is consumed as an exact "
-    "pinned canary from GitHub Packages; i18n with es (default) and en, strings migrated per "
+    "mocked-backend Playwright harness (no credentials); gntik-ui is consumed from GitHub "
+    "Packages at the exact version pinned in the project manifest (2026-10-07: the stable "
+    "0.2.0, which replaced the canary pin); i18n with es (default) and en, strings migrated per "
     "page; dead modules are deleted, not migrated; gntik-ui gaps go through the same draft, "
     "review and publish path; waves u0 (foundation) to u5 (cutover). "
     # NEW-134 (2026-10-05): the cutover's legacy retention and build ownership.
@@ -130,9 +131,11 @@ OPERATOR_DECISIONS = (
     "same CSP."
 )
 SEED_FINDINGS = (
-    "Seed findings (design section 7), by reference: gntik-ui has no stable release (all "
-    "packages 0.1.0 canaries); its registry is stale (gntik-ui.invalid dependencies, 15 "
-    "components missing); GitHub Packages tokens are needed by every build; DataTable has no "
+    "Seed findings (design section 7), by reference: gntik-ui had no stable release on "
+    "2026-10-04 (all packages canaries); its first stable release, 0.2.0, was published on "
+    "2026-10-05 and is now pinned, so that finding is resolved; its registry was stale on "
+    "2026-10-04 (gntik-ui.invalid dependencies, 15 components missing; re-check against "
+    "the pinned release); GitHub Packages tokens are needed by every build; DataTable has no "
     "server-side pagination (page, onPageChange, rowCount); templates and blocks fall back "
     "to sample data silently; validate_page misses bg-white, text-black and arbitrary "
     "colour classes; brand colours cannot be overridden; the HTTP MCP transport is "
