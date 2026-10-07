@@ -111,6 +111,19 @@ class SecretRedactor:
             "dashboard_session_revocation_cleanup_truncated",
         }
     )
+    # NEW-148: a JSON Schema document travels in a step payload only as an AgentRequest's
+    # ``output_schema``. Inside one, the members of these keywords are property or definition
+    # NAMES (structure chosen by Hermes and the released pack, not data), so a property
+    # called ``tokens`` keeps its subschema. Every string is still pattern-redacted, and
+    # AgentInstructionPack.enrich refuses any schema that differs from the released one.
+    _schema_document_keys = frozenset({"output_schema"})
+    _schema_name_map_keywords = frozenset(
+        {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+    )
+    # NEW-148: (parent key, key) of model output whose name only looks sensitive. The
+    # triage-ui-gap kit_proposal lists design-token NAMES (e.g. "color.surface.raised"); each
+    # entry is still pattern-redacted like any other string.
+    _structural_data_paths = frozenset({("kit_proposal", "tokens")})
 
     def __init__(self) -> None:
         self._runtime_secrets: set[str] = set()
@@ -143,7 +156,16 @@ class SecretRedactor:
         categories: set[str] = set()
         replacements = 0
 
-        def walk(item: Any, key: str | None = None) -> Any:
+        def walk(
+            item: Any,
+            key: str | None = None,
+            *,
+            parent: str | None = None,
+            schema: bool = False,
+            name: bool = False,
+        ) -> Any:
+            """``schema``: inside a schema document; ``name``: ``key`` is a property or
+            definition name of that schema, not a data key."""
             nonlocal replacements
             if (
                 key is not None
@@ -161,6 +183,11 @@ class SecretRedactor:
                 return item
             if (
                 key is not None
+                and not name
+                # NEW-148: a boolean or null carries no credential; numbers stay redacted
+                # (a YAML ``password: 123456`` parses as one).
+                and not isinstance(item, bool)
+                and (parent, key) not in self._structural_data_paths
                 and self._sensitive_keys.search(key)
                 and not self._safe_reference_keys.search(key)
             ):
@@ -174,11 +201,21 @@ class SecretRedactor:
                 categories.update(report.categories)
                 return report.value
             if isinstance(item, dict):
-                return {str(k): walk(v, str(k)) for k, v in item.items()}
+                names = schema and not name and key in self._schema_name_map_keywords
+                return {
+                    str(k): walk(
+                        v,
+                        str(k),
+                        parent=key,
+                        schema=schema or str(k) in self._schema_document_keys,
+                        name=names,
+                    )
+                    for k, v in item.items()
+                }
             if isinstance(item, list):
-                return [walk(v) for v in item]
+                return [walk(v, parent=key, schema=schema) for v in item]
             if isinstance(item, tuple):
-                return tuple(walk(v) for v in item)
+                return tuple(walk(v, parent=key, schema=schema) for v in item)
             return item
 
         result = walk(value)
