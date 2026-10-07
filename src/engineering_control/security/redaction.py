@@ -208,7 +208,9 @@ BLOCKER_DETAIL_LIMIT = 300
 _INLINE_CREDENTIAL = re.compile(
     r"(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret"
     r"|encryption[_-]?key|telegram[_-]?bot[_-]?token|client-key-data)\s*[:=]\s*)"
-    rf"{_NOT_REDACTED}(?:'[^']*'|\"[^\"]*\"|[^\s,;)\]}}]+)"
+    # NEW-146 review 4: a quoted value may contain escaped quotes, and an unterminated
+    # quote runs to the end of the detail; both are redacted whole.
+    rf"{_NOT_REDACTED}(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|['\"].*|[^\s,;)\]}}]+)"
 )
 
 

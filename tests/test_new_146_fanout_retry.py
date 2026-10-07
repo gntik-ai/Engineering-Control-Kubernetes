@@ -778,3 +778,17 @@ def test_a_credential_in_pydantics_embedded_exception_text_is_redacted() -> None
         _IteratingNoNewline.model_validate({"packs": _raising_iterator()})
     detail = error_detail(raised.value)
     assert CREDENTIAL not in detail
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f'bad pack: client_secret="first\\"{CREDENTIAL}" near line 3',
+        f"bad pack: token='a\\'{CREDENTIAL}' near line 3",
+        f'bad pack: password="unterminated {CREDENTIAL}',
+    ],
+)
+def test_an_escaped_or_unterminated_quoted_credential_is_redacted_whole(message: str) -> None:
+    """Review 4: a quoted value stops at its closing (unescaped) quote, not an escaped one."""
+    detail = error_detail(ValueError(message))
+    assert CREDENTIAL not in detail and REDACTED in detail
