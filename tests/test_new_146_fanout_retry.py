@@ -837,3 +837,19 @@ def test_everything_after_a_credential_assignment_is_redacted(message: str) -> N
     detail = bounded_detail(message)
     assert CREDENTIAL not in detail
     assert bounded_detail(detail) == detail
+
+
+def test_gap_prompt_names_the_allowed_repository_roles() -> None:
+    """NEW-151: drafts named gntik-ai/falcone a second time as "deployment" (gateway routes
+    live in it), which validate_proposal rejects every time; the prompt now states the
+    allowed (repository, role) pairs."""
+    from engineering_control.activities.ui_plan import _repository_roles_rule
+
+    backend = _repository_roles_rule("falcone", "gntik-ai/falcone")
+    assert "gntik-ai/falcone as source; gntik-ai/falcone-charts as deployment" in backend
+    assert "gntik-ai/gntik-ui" not in backend
+    kit = _repository_roles_rule("falcone", "gntik-ai/gntik-ui")
+    assert (
+        kit.endswith("only gntik-ai/falcone-charts is role deployment.")
+        and "gntik-ai/gntik-ui as source" in kit
+    )
