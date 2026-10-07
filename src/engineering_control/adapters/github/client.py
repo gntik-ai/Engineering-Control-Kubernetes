@@ -50,6 +50,28 @@ class GhIdentity:
     account_type: str
 
 
+def pull_request_head_repository(value: dict[str, Any]) -> str | None:
+    """NEW-147 review: ``owner/name`` of a PR's head repository from gh's JSON, or None
+    when it is unknown (a deleted fork, or fields the response lacks)."""
+    owner = value.get("headRepositoryOwner")
+    repository = value.get("headRepository")
+    login = owner.get("login") if isinstance(owner, dict) else None
+    name = repository.get("name") if isinstance(repository, dict) else None
+    if not isinstance(login, str) or not login or not isinstance(name, str) or not name:
+        return None
+    return f"{login}/{name}"
+
+
+def same_repository_pull_request(value: dict[str, Any], repository: str) -> bool:
+    """NEW-147 review: the PR's head branch lives in ``repository`` itself (not a fork).
+    Raises when the head repository cannot be established."""
+    head = pull_request_head_repository(value)
+    cross = value.get("isCrossRepository")
+    if head is None or not isinstance(cross, bool):
+        raise GhCliPolicyError("pull request head repository is unknown")
+    return head.lower() == repository.lower() and not cross
+
+
 class GhCliBroker:
     """Typed GitHub broker that never extracts or handles an OAuth token."""
 
@@ -220,7 +242,8 @@ class GhCliBroker:
                     "--json",
                     (
                         "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
-                        "mergeStateStatus,reviewDecision,statusCheckRollup,mergedAt,mergeCommit"
+                        "mergeStateStatus,reviewDecision,statusCheckRollup,mergedAt,mergeCommit,"
+                        "headRepository,headRepositoryOwner,isCrossRepository"
                     ),
                 ]
             ).stdout,
@@ -354,11 +377,23 @@ class GhCliBroker:
         )
         return self._list(value, "workflow runs", maximum=limit)
 
+    # NEW-147 review 2: the most PRs one listing may return. ``gh pr list`` pages through
+    # GitHub up to --limit, so a caller that needs a complete listing passes a limit and
+    # treats a listing that reaches it as possibly truncated.
+    PULL_REQUEST_LIST_MAXIMUM = 1000
+
     def list_pull_requests(
-        self, repository: str, *, head: str, state: Literal["open", "closed", "merged", "all"]
+        self,
+        repository: str,
+        *,
+        head: str,
+        state: Literal["open", "closed", "merged", "all"],
+        limit: int = 10,
     ) -> list[dict[str, Any]]:
         repository = self._batch(repository)
         head = self._value(head, "pull request head")
+        if not 1 <= limit <= self.PULL_REQUEST_LIST_MAXIMUM:
+            raise GhCliPolicyError("pull request list limit is out of bounds")
         value = self._json(
             self._run(
                 [
@@ -371,14 +406,19 @@ class GhCliBroker:
                     "--state",
                     state,
                     "--json",
-                    "number,url,state,isDraft,headRefOid,baseRefName",
+                    # NEW-147 review: `--head` matches the branch name in forks too; the
+                    # head repository lets callers keep only this repository's PRs.
+                    (
+                        "number,url,state,isDraft,headRefOid,baseRefName,"
+                        "headRepository,headRepositoryOwner,isCrossRepository"
+                    ),
                     "--limit",
-                    "10",
+                    str(limit),
                 ]
             ).stdout,
             "pull request list",
         )
-        return self._list(value, "pull request list")
+        return self._list(value, "pull request list", maximum=limit)
 
     # NEW-145b: a head-branch listing that reaches this many PRs is refused, never cut.
     PULL_REQUESTS_BY_HEAD_CAP = 1000

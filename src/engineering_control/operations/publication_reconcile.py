@@ -24,6 +24,20 @@ that repository. For an UNKNOWN (or NOT_ATTEMPTED) creation the bound PR must ha
 created before the effect's admission, so this claim created nothing; for a COMPLETE
 creation the PR it created must be the bound one (created at or after its admission).
 Anything else is refused.
+
+The PR-binding race (NEW-147). Before NEW-147, publication looked for the bound PR by its
+exact head right after pushing; GitHub moves a PR's head asynchronously, so it found
+none, tried to create one, and GitHub refused (the receipt is UNKNOWN). For an UNKNOWN
+pr_create a bound PR may therefore be at its recorded head or at exactly the head a
+COMPLETE git_push of the same intent pushed (the intent's committed plan head for that
+repository); the reconciliation records which basis matched. It does not rewrite the
+ChangeSet's change_evidence: that record is diff-bound release evidence (changed paths,
+diff hashes, release impact and risk floor) computed for the recorded head, and the pushed
+head's evidence was never persisted, so writing its SHA there would publish a head with
+someone else's risk classification. The ChangeSet keeps its last confirmed publication; the
+next delivery attempt republishes and records the evidence, and NEW-102's restore keeps
+refusing (PUBLISHED_PR_HEAD_CHANGED) while the PR sits at an unrecorded head, which is the
+truthful outcome until then.
 """
 
 from __future__ import annotations
@@ -240,10 +254,37 @@ def plan_publication_reconcile(
             "bound_url": by_repository[repository][0],
             "branch": by_repository[repository][1]["branch"],
         }
+    # NEW-147: the PR-binding race (falcone #972) leaves an UNKNOWN pr_create right after a
+    # COMPLETE git_push of the same intent: GitHub had not yet moved the bound PR to the
+    # pushed commit. For such an intent a bound PR may also be at exactly the head that
+    # completed push delivered, taken from the intent's committed plan (never the client).
+    pushed: dict[str, dict[str, str]] = {}
+    if action == "pr_create":
+        for item in publications:
+            repository = str(item.get("repository"))
+            push = session.get(
+                Step,
+                uuid5(NAMESPACE_URL, f"publication-effect:{intent.id}:{repository}:git_push"),
+            )
+            head = item.get("head_sha")
+            if (
+                push is None
+                or push.name != EFFECT_STEP
+                or push.run_id != effect.run_id
+                or push.status != "COMPLETE"
+                or not isinstance(head, str)
+                or not _SHA.fullmatch(head)
+            ):
+                continue
+            pushed[by_repository[repository][0]] = {
+                "head_sha": head,
+                "push_effect_id": str(push.id),
+            }
     return {
         "status": "RECONCILE",
         "effect_id": str(effect.id),
         "effect_status": effect.status,
+        "completed_push_heads": pushed,
         "change_set_id": str(change_set.id),
         "change_set_version": change_set.version,
         "recorded": recorded,
@@ -426,6 +467,14 @@ def reconcile_publication_effect(
         live = str(item.get("head_sha") or "")
         if state not in {"OPEN", "MERGED"}:
             raise _refuse("PR_NOT_OPEN", f"{url} is {state or 'unknown'}")
+        match = _PR_URL.fullmatch(url)
+        if match is None or item.get("head_repository") != match.group(1):
+            # NEW-147 review: the head branch must be the repository's own (not a fork's).
+            raise _refuse(
+                "PR_HEAD_FOREIGN",
+                f"{url}'s head repository is {item.get('head_repository') or 'unknown'}, "
+                f"not {match.group(1) if match else 'its own'}",
+            )
         if (
             item.get("head_branch") != recorded["branch"]
             or item.get("base_branch") != plan["base_branch"][url]
@@ -436,11 +485,21 @@ def reconcile_publication_effect(
                 f"{url} is {item.get('head_branch')} -> {item.get('base_branch')}, not the "
                 f"recorded {recorded['branch']} -> {plan['base_branch'][url]}",
             )
-        if live != head:
+        completed_push = plan["completed_push_heads"].get(url)
+        if live == head:
+            basis = "CHANGE_EVIDENCE"
+        elif completed_push is not None and live == completed_push["head_sha"]:
+            basis = "COMPLETED_PUSH_OF_INTENT"
+        else:
             raise _refuse(
                 "HEAD_MISMATCH",
-                f"{url} is at {live[:12] or 'none'}, not the recorded published {head[:12]}; "
-                "reset the PR branch to the recorded head (or let a new delivery publish)",
+                f"{url} is at {live[:12] or 'none'}, not the recorded published {head[:12]}"
+                + (
+                    f" nor the intent's completed push {completed_push['head_sha'][:12]}"
+                    if completed_push is not None
+                    else ""
+                )
+                + "; reset the PR branch to the recorded head (or let a new delivery publish)",
             )
         checked.append(
             {
@@ -449,6 +508,13 @@ def reconcile_publication_effect(
                 "recorded_head_sha": head,
                 "observed_head_sha": live,
                 "state": state,
+                # NEW-147: which head the live PR matched.
+                "basis": basis,
+                **(
+                    {"push_effect_id": completed_push["push_effect_id"]}
+                    if basis == "COMPLETED_PUSH_OF_INTENT" and completed_push is not None
+                    else {}
+                ),
             }
         )
     listed = _require_no_unrecorded_pull_request(plan, listings)

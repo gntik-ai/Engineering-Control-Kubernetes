@@ -8,16 +8,23 @@ import re
 import shutil
 import stat
 import tempfile
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.adapters.command import CommandFailure, SafeCommandRunner
-from engineering_control.adapters.github.client import GhCliAuthError, GhCliBroker, GhCliPolicyError
+from engineering_control.adapters.github.client import (
+    GhCliAuthError,
+    GhCliBroker,
+    GhCliPolicyError,
+    same_repository_pull_request,
+)
 from engineering_control.adapters.publication_authority import (
     PublicationAuthorityClient,
     PublicationAuthorityError,
@@ -45,6 +52,23 @@ from engineering_control.policy.github_write import (
 from engineering_control.security.redaction import SecretRedactor
 
 _T = TypeVar("_T")
+# NEW-147: GitHub updates a PR's head asynchronously after a push (falcone #972: #1068 still
+# showed the previous head 3-4 s later). Binding waits this long, with backoff, for the
+# bound PR to reach the pushed commit, and never creates a second PR meanwhile.
+PR_BIND_CONVERGENCE_SECONDS = 120.0
+_PR_BIND_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 15.0)
+# NEW-147 review 2: publication listings are complete, not gh's default page of 10.
+# ``gh pr list --head`` matches the branch name in forks too and filters by repository only
+# afterwards, so a short page of fork PRs could hide this repository's own (merged) PR.
+# gh pages up to this limit; a listing that reaches it may be truncated and is refused.
+_PR_BIND_LIST_LIMIT = 1000
+_PUBLISH_HEARTBEAT_SECONDS = 30.0
+
+
+class PullRequestHeadNotConverged(ValueError):
+    """NEW-147: the publication's PR did not show the pushed commit within the bound."""
+
+
 PublicationContext = tuple[PublicationAuthorityClient, dict[str, Any], dict[str, Any]]
 
 
@@ -155,6 +179,9 @@ class DeliveryActivityHandler:
             {"git": settings.git_executable, "gh": settings.github_executable}
         )
         self.redactor = SecretRedactor()
+        # NEW-147: injectable for the PR-binding convergence wait (tests use a fake clock).
+        self._sleep: Callable[[float], None] = time.sleep
+        self._monotonic: Callable[[], float] = time.monotonic
         broker_root = (settings.run_root / "delivery").resolve()
         broker_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.broker = broker or GhCliBroker(
@@ -186,7 +213,8 @@ class DeliveryActivityHandler:
         if step == "reconcile.inspect_ci":
             return await asyncio.to_thread(self._inspect_ci, payload)
         if step == "reconcile.publish_promotion":
-            return await asyncio.to_thread(self._publish_promotion, payload)
+            # NEW-147 review 3: promotion binding waits for the PR head too; heartbeat it.
+            return await self._with_heartbeat(asyncio.to_thread(self._publish_promotion, payload))
         if step == "final.merge_source":
             return await asyncio.to_thread(self._merge_bound_pull_request, payload, source=True)
         if step == "final.inspect_artifact":
@@ -208,9 +236,14 @@ class DeliveryActivityHandler:
             authority = self.publication_authority or PublicationAuthorityClient(
                 self.settings, self.broker
             )
-            results = await asyncio.to_thread(
-                self._publish_all, plan, (authority, payload, plan.model_dump(mode="json"))
+            results = await self._with_heartbeat(
+                asyncio.to_thread(
+                    self._publish_all, plan, (authority, payload, plan.model_dump(mode="json"))
+                )
             )
+        except PullRequestHeadNotConverged:
+            # NEW-147: retryable; nothing was created while waiting for GitHub.
+            return {**payload, "status": "BLOCKED", "blocker": "PR_HEAD_NOT_CONVERGED"}
         except PublicationAuthorityError as error:
             return {
                 **payload,
@@ -241,6 +274,24 @@ class DeliveryActivityHandler:
         if not isinstance(safe, dict):
             raise TypeError("redacted delivery publication must remain an object")
         return safe
+
+    @staticmethod
+    async def _with_heartbeat(work: Awaitable[_T]) -> _T:
+        """NEW-147: keep a publication (pushes plus the PR-binding wait) alive against the
+        workflow's 2-minute heartbeat timeout; a timed-out publish leaves UNKNOWN effects."""
+        task = asyncio.ensure_future(work)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_PUBLISH_HEARTBEAT_SECONDS)
+                if done:
+                    return task.result()
+                try:
+                    activity.heartbeat({"phase": "publication"})
+                except RuntimeError:
+                    pass  # not running inside an activity (unit tests)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
 
     def _inspect_ci(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -825,6 +876,9 @@ class DeliveryActivityHandler:
                 promotion.model_dump(exclude={"change_set_id"})
             )
             result = self._publish(publication, promotion.change_set_id)
+        except PullRequestHeadNotConverged:
+            # NEW-147 review 3: retryable; nothing was created while waiting for GitHub.
+            return {**payload, "status": "BLOCKED", "blocker": "PR_HEAD_NOT_CONVERGED"}
         except GhCliAuthError:
             return {
                 **payload,
@@ -918,12 +972,18 @@ class DeliveryActivityHandler:
             raise ValueError("publication branch does not bind its ChangeSet")
         # NEW-103: a CI repair of the deployment PR may re-publish a ChangeSet whose source
         # PR is already merged; that branch is delivered and must never move.
+        listed_merged = self.broker.list_pull_requests(
+            plan.repository, head=plan.branch, state="merged", limit=_PR_BIND_LIST_LIMIT
+        )
+        if len(listed_merged) >= _PR_BIND_LIST_LIMIT:
+            # A truncated listing could hide this repository's merged PR: never push then.
+            raise ValueError("too many merged GitHub PRs share this publication head to verify")
         merged = [
             item
-            for item in self.broker.list_pull_requests(
-                plan.repository, head=plan.branch, state="merged"
-            )
+            for item in listed_merged
             if item.get("baseRefName") == plan.base_branch
+            # NEW-147 review: a fork's PR from a same-named branch is not this branch's.
+            and self._own_pull_request(item, plan)
         ]
         if any(item.get("headRefOid") != plan.head_sha for item in merged):
             raise ValueError("a merged pull request's branch cannot be republished")
@@ -1093,7 +1153,14 @@ class DeliveryActivityHandler:
         plan: RepositoryPublication,
         publication_context: PublicationContext | None = None,
     ) -> dict[str, Any]:
-        existing = self._existing_pull_request(plan)
+        """Bind the publication to its one PR for this head branch and base.
+
+        NEW-147: an existing PR is found by head branch and base whatever its head (GitHub
+        updates a PR's head asynchronously after a push), then awaited until it shows the
+        pushed commit. A PR is created only when none can bind (none at all, or only closed
+        ones), and the created PR is awaited the same way. Reading never makes an effect."""
+        existing = self._bindable_pull_request(plan)
+        number: int | None = None
         if existing is None:
             body_path = self._body_file(plan)
             try:
@@ -1111,43 +1178,114 @@ class DeliveryActivityHandler:
                         draft=True,
                     ),
                 )
-                if created is not None and not re.fullmatch(
-                    rf"https://github\.com/{re.escape(plan.repository)}/pull/[1-9][0-9]*",
-                    created,
-                ):
-                    raise ValueError("GitHub PR creation returned an invalid URL")
+                if created is not None:
+                    match = re.fullmatch(
+                        rf"https://github\.com/{re.escape(plan.repository)}/pull/([1-9][0-9]*)",
+                        created,
+                    )
+                    if match is None:
+                        raise ValueError("GitHub PR creation returned an invalid URL")
+                    number = int(match.group(1))
             finally:
                 body_path.unlink(missing_ok=True)
-            existing = self._existing_pull_request(plan)
-        if existing is None or existing.get("headRefOid") != plan.head_sha:
-            raise ValueError("GitHub PR does not bind to the exact validated commit")
+        else:
+            number = int(existing["number"])
+        bound = self._await_bound_pull_request(plan, number)
         return {
             "repository": plan.repository,
             "repository_slug": plan.repository_slug,
             "branch": plan.branch,
             "head_sha": plan.head_sha,
             "base_branch": plan.base_branch,
-            "pr_number": existing["number"],
-            "pr_url": existing["url"],
-            "pr_state": existing["state"],
-            "draft": existing["isDraft"],
+            "pr_number": bound["number"],
+            "pr_url": bound["url"],
+            "pr_state": bound["state"],
+            "draft": bound["isDraft"],
         }
 
-    def _existing_pull_request(
-        self,
-        plan: RepositoryPublication,
-    ) -> dict[str, Any] | None:
-        value = self.broker.list_pull_requests(plan.repository, head=plan.branch, state="all")
-        matches = [
+    @staticmethod
+    def _own_pull_request(item: Any, plan: RepositoryPublication) -> bool:
+        """NEW-147 review: ``gh pr list --head`` matches the branch name in forks too. Only
+        a PR whose head repository is exactly the publication's own (not cross-repository)
+        is this branch's; a PR whose head repository is unknown is refused."""
+        if not isinstance(item, dict):
+            raise ValueError("a GitHub PR for this publication is malformed")
+        try:
+            return same_repository_pull_request(item, plan.repository)
+        except GhCliPolicyError as error:
+            raise ValueError(
+                "a GitHub PR for this publication has no known head repository"
+            ) from error
+
+    def _publication_pull_requests(self, plan: RepositoryPublication) -> list[dict[str, Any]]:
+        """Every PR (any state) from this repository's head branch into this base; never a
+        cut list. Fork PRs from a same-named branch are foreign: never bound, and they do not
+        block creating this repository's own PR (GitHub allows both, and NEW-145b's complete
+        listing of ``owner:branch`` never includes them either)."""
+        value = self.broker.list_pull_requests(
+            plan.repository, head=plan.branch, state="all", limit=_PR_BIND_LIST_LIMIT
+        )
+        if len(value) >= _PR_BIND_LIST_LIMIT:
+            raise ValueError("too many GitHub PRs share this publication head to bind safely")
+        return [
             item
             for item in value
-            if isinstance(item, dict)
-            and item.get("baseRefName") == plan.base_branch
-            and item.get("headRefOid") == plan.head_sha
+            if self._own_pull_request(item, plan) and item.get("baseRefName") == plan.base_branch
         ]
-        if len(matches) > 1:
+
+    def _bindable_pull_request(self, plan: RepositoryPublication) -> dict[str, Any] | None:
+        """NEW-147: the one PR this publication binds to, or None when a PR may be created.
+
+        Exactly one OPEN PR binds, whatever its head. A MERGED PR binds only alone and at
+        exactly the validated head (a merged branch never moves). A CLOSED PR is never bound
+        or reopened, and none may silently stand beside a new one: with no open PR, a closed
+        one refuses (an operator decision). Any other combination is ambiguous and refused."""
+        pulls = self._publication_pull_requests(plan)
+        open_pulls = [item for item in pulls if item.get("state") == "OPEN"]
+        merged = [item for item in pulls if item.get("state") == "MERGED"]
+        closed = [item for item in pulls if item.get("state") == "CLOSED"]
+        if len(open_pulls) + len(merged) + len(closed) != len(pulls):
+            raise ValueError("a GitHub PR for this publication has an unknown state")
+        if len(open_pulls) > 1 or (open_pulls and merged):
             raise ValueError("multiple GitHub PRs bind to the same publication")
-        return matches[0] if matches else None
+        if open_pulls:
+            return open_pulls[0]
+        if merged:
+            if len(merged) != 1 or merged[0].get("headRefOid") != plan.head_sha:
+                raise ValueError("a merged GitHub PR for this publication is at another commit")
+            return merged[0]
+        if closed:
+            raise ValueError(
+                "a closed GitHub PR exists for this publication head; reopen or remove it "
+                "deliberately before publishing again"
+            )
+        return None
+
+    def _await_bound_pull_request(
+        self, plan: RepositoryPublication, number: int | None
+    ) -> dict[str, Any]:
+        """NEW-147: wait (bounded, with backoff) until the bound PR shows the pushed commit.
+
+        ``number`` is the PR found or created (None when a completed creation's response was
+        not available); the PR that binds must stay that one."""
+        deadline = self._monotonic() + PR_BIND_CONVERGENCE_SECONDS
+        attempt = 0
+        while True:
+            current = self._bindable_pull_request(plan)
+            if current is not None and number is not None and int(current["number"]) != number:
+                raise ValueError("the publication's GitHub PR changed while binding")
+            if current is not None and current.get("headRefOid") == plan.head_sha:
+                return current
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise PullRequestHeadNotConverged(
+                    "the publication's GitHub PR did not reach the pushed commit in time"
+                    if current is not None
+                    else "the created GitHub PR did not appear in time"
+                )
+            delay = _PR_BIND_BACKOFF_SECONDS[min(attempt, len(_PR_BIND_BACKOFF_SECONDS) - 1)]
+            self._sleep(min(delay, remaining))
+            attempt += 1
 
     def _bounded_worktree(self, plan: RepositoryPublication) -> Path:
         resolved = self._expected_worktree(plan)

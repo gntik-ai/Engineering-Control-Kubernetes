@@ -125,6 +125,9 @@ class FakePublicationRunner:
                         "isDraft": True,
                         "headRefOid": self.heads[slug],
                         "baseRefName": "main",
+                        "headRepository": {"name": slug},
+                        "headRepositoryOwner": {"login": "gntik-ai"},
+                        "isCrossRepository": False,
                     }
                 ]
                 if repository in self.created
@@ -713,6 +716,9 @@ class MergedSourceRunner(FakePublicationRunner):
                     "isDraft": False,
                     "headRefOid": self.merged_head,
                     "baseRefName": "main",
+                    "headRepository": {"name": "falcone"},
+                    "headRepositoryOwner": {"login": "gntik-ai"},
+                    "isCrossRepository": False,
                 }
                 return CommandResult(0, json.dumps([merged]), "")
         return super().run(executable, arguments, cwd=cwd, **kwargs)
