@@ -406,3 +406,56 @@ def test_a_merged_listing_at_the_cap_is_refused_before_any_push(tmp_path: Path) 
     with pytest.raises(ValueError, match="too many merged GitHub PRs"):
         handler._publish(plan, UUID(plan.branch.rsplit("/", 1)[-1]))
     assert pushes == []
+
+
+@pytest.mark.asyncio
+async def test_promotion_publication_heartbeats_while_it_waits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 3: reconcile.publish_promotion also binds (and may wait 120 s for the PR head),
+    so its dispatch heartbeats like delivery.publish."""
+    import time
+
+    from engineering_control.activities import delivery as delivery_module
+
+    handler, _runner, _clock, _plan, _authority = _binder(tmp_path, [[]])
+    beats: list[Any] = []
+    monkeypatch.setattr(delivery_module, "_PUBLISH_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(delivery_module.activity, "heartbeat", lambda *args: beats.append(args))
+
+    def slow_promotion(payload: dict[str, Any]) -> dict[str, Any]:
+        time.sleep(0.2)
+        return {**payload, "status": "DEPLOYMENT_PR_CREATED"}
+
+    handler._publish_promotion = slow_promotion  # type: ignore[method-assign]
+    payload = {"promotion_publication": {"repository": "gntik-ai/falcone-charts"}}
+    result = await handler.handle("reconcile.publish_promotion", payload)
+    assert result["status"] == "DEPLOYMENT_PR_CREATED"
+    assert beats
+
+
+def test_a_non_converged_promotion_head_is_a_retryable_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from engineering_control.activities import delivery as delivery_module
+
+    handler, runner, _clock, plan, _authority = _binder(tmp_path, [[]])
+
+    class _Promotion:
+        change_set_id = UUID(plan.branch.rsplit("/", 1)[-1])
+
+        def model_dump(self, **_: Any) -> dict[str, Any]:
+            return {}
+
+    monkeypatch.setattr(
+        delivery_module.PromotionPublication, "model_validate", lambda *_: _Promotion()
+    )
+    monkeypatch.setattr(delivery_module.RepositoryPublication, "model_validate", lambda *_: plan)
+
+    def never_converges(*_: Any) -> dict[str, Any]:
+        raise PullRequestHeadNotConverged("stale")
+
+    handler._publish = never_converges  # type: ignore[method-assign]
+    result = handler._publish_promotion({"promotion_publication": {}})
+    assert (result["status"], result["blocker"]) == ("BLOCKED", "PR_HEAD_NOT_CONVERGED")
+    assert runner.create_calls == 0

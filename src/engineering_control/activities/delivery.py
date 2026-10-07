@@ -213,7 +213,8 @@ class DeliveryActivityHandler:
         if step == "reconcile.inspect_ci":
             return await asyncio.to_thread(self._inspect_ci, payload)
         if step == "reconcile.publish_promotion":
-            return await asyncio.to_thread(self._publish_promotion, payload)
+            # NEW-147 review 3: promotion binding waits for the PR head too; heartbeat it.
+            return await self._with_heartbeat(asyncio.to_thread(self._publish_promotion, payload))
         if step == "final.merge_source":
             return await asyncio.to_thread(self._merge_bound_pull_request, payload, source=True)
         if step == "final.inspect_artifact":
@@ -875,6 +876,9 @@ class DeliveryActivityHandler:
                 promotion.model_dump(exclude={"change_set_id"})
             )
             result = self._publish(publication, promotion.change_set_id)
+        except PullRequestHeadNotConverged:
+            # NEW-147 review 3: retryable; nothing was created while waiting for GitHub.
+            return {**payload, "status": "BLOCKED", "blocker": "PR_HEAD_NOT_CONVERGED"}
         except GhCliAuthError:
             return {
                 **payload,
