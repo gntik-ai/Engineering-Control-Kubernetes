@@ -11,6 +11,7 @@ history.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1250,3 +1251,33 @@ def test_variants_too_large_for_the_drafter_are_refused_never_truncated() -> Non
         canonical_variants_text(item)
     record = _review2_record({}, _OWN)
     assert record["spec"]["verbatim_what_changes"] is True
+
+
+def test_the_canonical_review_prompt_keeps_unicode_unescaped(tmp_path: Path) -> None:
+    """Review 3: ASCII-escaped JSON grew 560-character CJK entries sixfold, so a cluster that
+    fit the body limit pushed the reviewer's request past its 200k bound after merging."""
+    from unittest.mock import Mock
+
+    from engineering_control.activities import ui_plan
+    from engineering_control.config import Settings
+
+    handler = ui_plan.UiPlanActivityHandler(Settings(), repository=Mock(), change_requests=Mock())
+    entry = "分页" * 280  # 560 CJK characters
+    continued = [{"heading": f"[gap:a{n}] what_changes", "entries": [entry] * 15} for n in range(2)]
+    review = handler._prepare_item_review(
+        {
+            "proposal": {"title": "Merged", "what_changes": [entry]},
+            "source_worktree": str(tmp_path),
+            "project": "falcone",
+            "target_repository": "gntik-ai/falcone",
+            "item_key": "gap:merged-x",
+            "item_kind": "backend-gap",
+            "description_redacted": "Consolidated gap.",
+            "merged_from": ["gap:a0", "gap:a1"],
+            "continued": continued,
+            "change_request_id": str(uuid4()),
+            "revision": 1,
+        }
+    )
+    prompt = json.dumps(review, ensure_ascii=False)
+    assert entry in prompt and "\\u5206" not in prompt

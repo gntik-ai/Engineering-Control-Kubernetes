@@ -595,6 +595,7 @@ class UiGapConsolidationRepository:
         variants = {item["item_key"]: item for item in state.candidates}
         records: list[dict[str, Any]] = []
         problems: list[str] = []
+        codes: list[str] = []
         for cluster in plan.get("clusters") or []:
             try:
                 records.append(
@@ -609,8 +610,11 @@ class UiGapConsolidationRepository:
                 )
             except ConsolidationRejected as rejected:
                 problems.extend(rejected.details)
+                # NEW-154 review 3: keep the refusal's own code (e.g. UI_GAP_MERGE_TOO_DEEP).
+                codes.append(rejected.code)
         if problems:
-            raise ConsolidationRejected(UI_GAP_CLUSTER_TOO_LARGE, problems)
+            code = codes[0] if len(set(codes)) == 1 else UI_GAP_CLUSTER_TOO_LARGE
+            raise ConsolidationRejected(code, problems)
         return records
 
     @staticmethod

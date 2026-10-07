@@ -1897,12 +1897,17 @@ class UiPlanActivityHandler:
                 if payload.get("merged_from")
                 else ()
             ),
-            _fenced("proposal", json.dumps(proposal, sort_keys=True)),
+            # NEW-154 review 3: Unicode kept as is (ASCII escapes multiply non-Latin text up
+            # to sixfold and could push the review past the request bound after a merge).
+            _fenced("proposal", json.dumps(proposal, sort_keys=True, ensure_ascii=False)),
             *(
                 (
                     "Proposal lists too long for the proposal bounds, rendered in full in the "
                     "issue body (review every entry):\n"
-                    + _fenced("continued", json.dumps(payload["continued"], sort_keys=True)),
+                    + _fenced(
+                        "continued",
+                        json.dumps(payload["continued"], sort_keys=True, ensure_ascii=False),
+                    ),
                 )
                 if payload.get("continued")
                 else ()
