@@ -747,3 +747,34 @@ def test_a_validator_credential_behind_pydantics_prefix_is_redacted(model: type[
     detail = error_detail(raised.value)
     assert CREDENTIAL not in detail
     assert "Value error, " in detail or "Assertion failed, " in detail
+
+
+class _IteratingNoNewline(BaseModel):
+    packs: list[str]
+
+
+def _raising_iterator():  # type: ignore[no-untyped-def]
+    yield "a"
+    raise ValueError(f"password={CREDENTIAL}")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError(5, f"password={CREDENTIAL}"),
+        RuntimeError(f"step failed: token: {CREDENTIAL}, retry later"),
+        ValueError(f"bad pack (client_secret='{CREDENTIAL}') near line 3"),
+    ],
+)
+def test_a_credential_behind_any_exception_prefix_is_redacted(error: BaseException) -> None:
+    """Review 3: OSError's "[Errno 5] " (or any other prefix) must not hide a credential."""
+    detail = error_detail(error)
+    assert CREDENTIAL not in detail and REDACTED in detail
+
+
+def test_a_credential_in_pydantics_embedded_exception_text_is_redacted() -> None:
+    """Review 3: "Error iterating over object, error: ValueError: password=..."."""
+    with pytest.raises(PydanticValidationError) as raised:
+        _IteratingNoNewline.model_validate({"packs": _raising_iterator()})
+    detail = error_detail(raised.value)
+    assert CREDENTIAL not in detail
