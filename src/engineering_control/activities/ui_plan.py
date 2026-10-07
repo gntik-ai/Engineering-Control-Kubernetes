@@ -21,6 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.metadata import _STRUCTURED_OUTPUT_JSON_RULES
+from engineering_control.activities.provider import error_detail
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES
 from engineering_control.config import Settings
 from engineering_control.db.change_requests import ChangeRequestRepository
@@ -32,6 +33,7 @@ from engineering_control.engineering.change_requests import (
     UiContinuedSection,
     change_review_schema,
     prepare_intake,
+    project_repositories,
     validate_proposal,
 )
 from engineering_control.engineering.ui_blueprint import (
@@ -280,6 +282,22 @@ def _previous_file(payload: dict[str, Any]) -> str | None:
     continuation = payload.get("continuation")
     staged = continuation.get("file") if isinstance(continuation, dict) else None
     return str(staged.get("path")) if isinstance(staged, dict) and staged.get("path") else None
+
+
+def _repository_roles_rule(project: str, target_repository: str) -> str:
+    """NEW-151: the (repository, role) pairs change_request.affected_repositories may use.
+    Drafts named the source repository a second time as "deployment" for gateway or route
+    changes that live in it, which validate_proposal rejects every time."""
+    source, deployment = project_repositories(project)
+    pairs = [f"{source} as source", f"{deployment} as deployment"]
+    if target_repository not in (source, deployment):
+        pairs.append(f"{target_repository} as source")
+    return (
+        "change_request.affected_repositories may name only these repositories, each at "
+        f"most once and only with this role: {'; '.join(pairs)}. Every file of {source} "
+        "(including its deploy/, gateway and route configuration) is role source; only "
+        f"{deployment} is role deployment."
+    )
 
 
 def decisions_sha256() -> str:
@@ -1716,6 +1734,7 @@ class UiPlanActivityHandler:
             "invent API details: copy method, path and cross-check class from the evidence "
             "and write anything unknown as unknown in change_request.open_questions. The "
             "existing issue index is not provided: list no probable duplicates. "
+            f"{_repository_roles_rule(str(base['project']), item.target_repository)} "
             f"{_STRUCTURED_OUTPUT_JSON_RULES}",
             _DATA_RULE.replace(
                 "the Hermes-collected snapshot file named below (kit_source snapshot)",
@@ -1769,8 +1788,16 @@ class UiPlanActivityHandler:
             validated = validate_proposal(proposal, str(payload["project"]), item.target_repository)
         except BlueprintRejected as rejected:
             return {**base, "status": "FAILED", "blocker": rejected.code}
-        except ValueError:
-            return {**base, "status": "FAILED", "blocker": "DRAFT_SCHEMA_INVALID"}
+        except ValueError as error:
+            # NEW-151: keep the validation reason (bounded, redacted) for the operator.
+            return {
+                **base,
+                "status": "FAILED",
+                "blocker": "DRAFT_SCHEMA_INVALID",
+                # Review 1: a pydantic error's str() embeds (truncated) input values;
+                # error_detail summarises location and message only.
+                "blocker_detail": error_detail(error),
+            }
         return {**base, "status": "PROPOSAL_READY", "proposal": validated.model_dump(mode="json")}
 
     def _prepare_gap_redraft(self, payload: dict[str, Any]) -> dict[str, Any]:
