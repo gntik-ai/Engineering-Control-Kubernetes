@@ -21,6 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.metadata import _STRUCTURED_OUTPUT_JSON_RULES
+from engineering_control.activities.provider import error_detail
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES
 from engineering_control.config import Settings
 from engineering_control.db.change_requests import ChangeRequestRepository
@@ -79,7 +80,6 @@ from engineering_control.engineering.ui_blueprint_parts import (
 )
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
-from engineering_control.security.redaction import bounded_detail, redact_detail_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1794,9 +1794,9 @@ class UiPlanActivityHandler:
                 **base,
                 "status": "FAILED",
                 "blocker": "DRAFT_SCHEMA_INVALID",
-                "blocker_detail": bounded_detail(
-                    f"{type(error).__name__}: {redact_detail_text(str(error))}"
-                ),
+                # Review 1: a pydantic error's str() embeds (truncated) input values;
+                # error_detail summarises location and message only.
+                "blocker_detail": error_detail(error),
             }
         return {**base, "status": "PROPOSAL_READY", "proposal": validated.model_dump(mode="json")}
 
