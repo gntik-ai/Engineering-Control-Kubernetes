@@ -47,8 +47,10 @@ from engineering_control.engineering.ui_gap_consolidation import (
     CONSOLIDATE_PHRASE,
     CONSOLIDATION_KINDS,
     MERGED,
+    UI_GAP_CLUSTER_TOO_LARGE,
     UI_GAP_INPUTS_CHANGED,
     UI_GAP_NOTHING_TO_CONSOLIDATE,
+    UI_GAP_PLAN_STALE,
     ConsolidationRejected,
     build_plan,
     candidate,
@@ -60,6 +62,7 @@ from engineering_control.engineering.ui_gap_consolidation import (
     gap_links,
     inputs_sha256,
     is_mergeable,
+    member_content_sha256,
     plan_preview,
     plan_sha256,
 )
@@ -152,6 +155,7 @@ class UiGapConsolidationRepository:
                     status=row.status,
                     revision=row.revision,
                     proposal=row.proposal_json if isinstance(row.proposal_json, dict) else None,
+                    description_sha256=row.description_sha256,
                     linked=links,
                 )
             )
@@ -357,6 +361,18 @@ class UiGapConsolidationRepository:
                 candidates=list(row.inputs_json or []),
                 drafter=drafter,
             )
+            try:
+                # The canonical issue bodies must fit before the plan can be proposed.
+                self._records(plan, state, str(blueprint.id), blueprint)
+            except ConsolidationRejected as rejected:
+                row.status = "INVALID"
+                row.error_code = rejected.code
+                row.problems_json = list(rejected.details)
+                return {
+                    "status": "INVALID",
+                    "blocker": rejected.code,
+                    "problems": list(rejected.details),
+                }
             digest = plan_sha256(plan)
             row.plan_json = plan
             row.plan_sha256 = digest
@@ -491,8 +507,13 @@ class UiGapConsolidationRepository:
             session.scalars(
                 select(ChangeRequest).where(ChangeRequest.id.in_(members)).with_for_update()
             ).all()
+            if plan.get("input_sha256") != row.input_sha256:
+                raise ValueError("gap consolidation plan does not match its recorded inputs")
             state = self._gap_state(session, blueprint, None)
             self._check_members(plan, state, digest)
+            # Every canonical is built and sized before anything is written: a cluster whose
+            # issue body cannot fit refuses the whole apply (nothing merged).
+            records = self._records(plan, state, str(blueprint.id), blueprint)
             now = datetime.now(UTC)
             sha = str(row.plan_sha256)
             stamp = {
@@ -501,11 +522,9 @@ class UiGapConsolidationRepository:
                 "at": now.isoformat(),
                 "actor": actor,
             }
-            variants = {item["item_key"]: item for item in state.candidates}
             merge_map: dict[str, dict[str, str]] = {}
             canonicals: list[dict[str, Any]] = []
-            for cluster in plan["clusters"]:
-                record = canonical_record(cluster, member_items=state.items, variants=variants)
+            for cluster, record in zip(plan["clusters"], records, strict=True):
                 self._create_canonical(session, blueprint, record, actor, stamp, now)
                 canonicals.append(record)
                 for member in cluster["members"]:
@@ -568,7 +587,35 @@ class UiGapConsolidationRepository:
             return {**self._view(row), "replayed": False}
 
     @staticmethod
+    def _records(
+        plan: dict[str, Any], state: GapState, blueprint_id: str, blueprint: UiBlueprint
+    ) -> list[dict[str, Any]]:
+        """The canonical record of every cluster, each sized against the issue body limit;
+        every cluster that cannot fit is reported (UI_GAP_CLUSTER_TOO_LARGE)."""
+        variants = {item["item_key"]: item for item in state.candidates}
+        records: list[dict[str, Any]] = []
+        problems: list[str] = []
+        for cluster in plan.get("clusters") or []:
+            try:
+                records.append(
+                    canonical_record(
+                        cluster,
+                        member_items=state.items,
+                        variants=variants,
+                        blueprint_id=blueprint_id,
+                        blueprint_sha256=str(blueprint.blueprint_sha256),
+                        project=blueprint.project,
+                    )
+                )
+            except ConsolidationRejected as rejected:
+                problems.extend(rejected.details)
+        if problems:
+            raise ConsolidationRejected(UI_GAP_CLUSTER_TOO_LARGE, problems)
+        return records
+
+    @staticmethod
     def _check_members(plan: dict[str, Any], state: GapState, digest: str) -> None:
+        stale: list[str] = []
         problems: list[str] = []
         seen: set[str] = set()
         blueprint_keys = {key for key, item in state.items.items() if not item.spec.get("variants")}
@@ -589,6 +636,18 @@ class UiGapConsolidationRepository:
                 ):
                     problems.append(f"{key}: not a gap request of this blueprint")
                     continue
+                current = member_content_sha256(
+                    request.proposal_json if isinstance(request.proposal_json, dict) else None,
+                    request.description_sha256,
+                )
+                if request.revision != member.get("revision") or current != member.get(
+                    "content_sha256"
+                ):
+                    stale.append(
+                        f"{key}: changed since the plan (revision {member.get('revision')} -> "
+                        f"{request.revision}, content "
+                        f"{'unchanged' if current == member.get('content_sha256') else 'changed'})"
+                    )
                 if not is_mergeable(request.status, request.revision, request.issue_url):
                     problems.append(f"{key}: is {request.status} and cannot be merged")
                 repositories.add(request.target_repository)
@@ -597,6 +656,11 @@ class UiGapConsolidationRepository:
             if len(repositories) > 1:
                 names = ", ".join(sorted(repositories))
                 problems.append(f"{cluster['cluster_key']}: mixes repositories {names}")
+        if stale:
+            raise ConsolidationRejected(
+                UI_GAP_PLAN_STALE,
+                [*stale, *problems, "plan again: ui-blueprint-gap-consolidate ... --replan"],
+            )
         if problems:
             raise ConsolidationRejected("UI_GAP_APPLY_REFUSED", problems)
 

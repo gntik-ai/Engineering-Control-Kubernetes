@@ -20,9 +20,15 @@ from uuid import UUID
 
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.change_requests import (
+    MAXIMUM_ISSUE_BODY_CHARACTERS,
+    ChangeReview,
+    ChangeReviewRecord,
     UiChangeContext,
     UiChangeDependency,
     UiContinuedSection,
+    prepare_intake,
+    render_change_request,
+    validate_proposal,
 )
 from engineering_control.engineering.ui_blueprint import (
     WAVE_ORDER,
@@ -30,13 +36,14 @@ from engineering_control.engineering.ui_blueprint import (
     FanoutItem,
     item_change_request_id,
     item_context,
+    item_description,
     schema_errors,
 )
 
 CONSOLIDATE_PHRASE = "CONSOLIDATE_GAPS"
 CONSOLIDATION_KINDS = ("kit-gap", "backend-gap")
 MERGED = "MERGED"
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 CANONICAL_PREFIX = "gap:merged-"
 # Statuses a gap request can be merged from: never PUBLISHED, APPROVED (the operator may be
 # publishing it), REJECTED, MERGED or an operator revision in flight (DRAFTING, revision > 1).
@@ -46,12 +53,21 @@ MAX_CLUSTERS = 60
 # The plan prompt's data budget (the instruction bundle and the task text come on top).
 PLAN_DATA_BUDGET = 120_000
 PLAN_TIMEOUT_SECONDS = 1800
-# The verbatim variants a canonical issue body carries (the body limit is 60000).
-CONTINUED_BUDGET = 36_000
+# What a canonical issue body keeps free for the drafted proposal and its review: the
+# required rendering (header, UI context with every verbatim variant, statement) plus this
+# reserve must fit MAXIMUM_ISSUE_BODY_CHARACTERS, or the cluster is refused before anything
+# is merged.
+CANONICAL_PROPOSAL_RESERVE = 20_000
+MAX_CONTINUED_ENTRIES = 300
+MAX_CONTINUED_ENTRY = 19_000
 
 UI_GAP_PLAN_INPUT_TOO_LARGE = "UI_GAP_PLAN_INPUT_TOO_LARGE"
 UI_GAP_INPUTS_CHANGED = "UI_GAP_INPUTS_CHANGED"
 UI_GAP_NOTHING_TO_CONSOLIDATE = "UI_GAP_NOTHING_TO_CONSOLIDATE"
+# A member changed (revision or content) since the plan: plan again (--replan).
+UI_GAP_PLAN_STALE = "UI_GAP_PLAN_STALE"
+# A cluster whose verbatim criteria cannot fit one issue body: split it.
+UI_GAP_CLUSTER_TOO_LARGE = "UI_GAP_CLUSTER_TOO_LARGE"
 
 
 class ConsolidationRejected(BlueprintRejected):
@@ -103,6 +119,14 @@ def gap_links(blueprint: Mapping[str, Any], gap_id: str) -> list[str]:
     return list(dict.fromkeys(links))
 
 
+def member_content_sha256(proposal: Mapping[str, Any] | None, description_sha256: str) -> str:
+    """What a plan binds of each member besides its revision: the drafted proposal and the
+    item statement. Apply refuses a member whose revision or content hash moved."""
+    return canonical_sha256(
+        {"proposal": dict(proposal or {}), "description_sha256": description_sha256}
+    )
+
+
 def candidate(
     item: FanoutItem,
     *,
@@ -110,9 +134,11 @@ def candidate(
     status: str,
     revision: int,
     proposal: Mapping[str, Any] | None,
+    description_sha256: str,
     linked: Sequence[str],
 ) -> dict[str, Any]:
     """One gap request as the plan step sees it (and as the plan input hash binds it)."""
+    content_sha256 = member_content_sha256(proposal, description_sha256)
     proposal = proposal or {}
     spec = item.spec
     return {
@@ -123,6 +149,7 @@ def candidate(
         "wave": item.wave,
         "status": status,
         "revision": revision,
+        "content_sha256": content_sha256,
         "summary": str(spec.get("summary") or ""),
         "title": str(proposal.get("title") or ""),
         "why": str(proposal.get("why") or ""),
@@ -304,7 +331,8 @@ def build_plan(
     drafter: dict[str, Any],
 ) -> dict[str, Any]:
     """The stored plan: every cluster with its deterministic canonical key and id, its
-    members (id, key, status and revision at plan time) and the drafter's rationale."""
+    members (id, key, status, revision and content hash at plan time) and the drafter's
+    rationale."""
     by_key = {item["item_key"]: item for item in candidates}
     clusters = []
     for cluster in checked["clusters"]:
@@ -324,6 +352,7 @@ def build_plan(
                         "item_key": item["item_key"],
                         "status": item["status"],
                         "revision": item["revision"],
+                        "content_sha256": item["content_sha256"],
                     }
                     for item in members
                 ],
@@ -365,16 +394,63 @@ def _earliest(waves: Iterable[str | None]) -> str | None:
     return next((wave for wave in WAVE_ORDER if wave in present), None)
 
 
+def _variants(
+    keys: Sequence[str],
+    member_items: Mapping[str, FanoutItem],
+    variants: Mapping[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Every member's drafted proposal as a variant and, for a member that is itself a
+    canonical request, every variant it carries (inherited, with the chain of canonical
+    requests it came through in `via`), so no merged criterion is ever lost."""
+    found: list[dict[str, Any]] = []
+    for key in keys:
+        own = variants[key]
+        found.append(
+            {
+                "item_key": key,
+                "via": [],
+                "title": own["title"] or own["summary"],
+                "why": own["why"],
+                "what_changes": list(own["what_changes"]),
+                "acceptance_criteria": list(own["acceptance_criteria"]),
+            }
+        )
+        for inherited in member_items[key].spec.get("variants") or []:
+            found.append({**inherited, "via": [*list(inherited.get("via") or []), key]})
+    return found
+
+
+def _label(variant: Mapping[str, Any]) -> str:
+    via = list(variant.get("via") or [])
+    return f"[{variant['item_key']}{' via ' + ' > '.join(via) if via else ''}]"
+
+
+def _entries(variants: Sequence[Mapping[str, Any]], name: str) -> list[str]:
+    return [
+        f"{_label(variant)} {' '.join(str(entry).split())}"
+        for variant in variants
+        for entry in variant.get(name) or []
+        if str(entry).strip()
+    ]
+
+
 def canonical_record(
     cluster: Mapping[str, Any],
     *,
     member_items: Mapping[str, FanoutItem],
     variants: Mapping[str, dict[str, Any]],
+    blueprint_id: str,
+    blueprint_sha256: str,
+    project: str,
 ) -> dict[str, Any]:
     """Everything the canonical request is built from, fixed at apply time and stored with
     the consolidation (so a resumed fan-out rebuilds exactly the same item): a synthetic gap
     spec in the blueprint's gap shape, the union of the members' evidence, blocks and
-    links, and every member's drafted proposal as a variant."""
+    links, and every member's drafted proposal (and inherited variants) as variants.
+
+    Every variant's acceptance criteria are rendered verbatim in the issue body; their
+    what_changes too when the body allows. Raises UI_GAP_CLUSTER_TOO_LARGE when even the
+    criteria alone leave less than CANONICAL_PROPOSAL_RESERVE of the body limit."""
     keys = [member["item_key"] for member in cluster["members"]]
     items = [member_items[key] for key in keys]
     specs = [item.spec for item in items]
@@ -404,21 +480,13 @@ def canonical_record(
             {"change_request_id": member["change_request_id"], "item_key": member["item_key"]}
             for member in cluster["members"]
         ],
-        "variants": [
-            {
-                "item_key": key,
-                "title": variants[key]["title"] or variants[key]["summary"],
-                "why": variants[key]["why"],
-                "what_changes": list(variants[key]["what_changes"]),
-                "acceptance_criteria": list(variants[key]["acceptance_criteria"]),
-            }
-            for key in keys
-        ],
+        "variants": _variants(keys, member_items, variants),
         "needed_by": list(
             dict.fromkeys(link for key in keys for link in variants[key].get("linked") or [])
         ),
+        "verbatim_what_changes": True,
     }
-    return {
+    record = {
         "cluster_key": cluster["cluster_key"],
         "canonical_id": cluster["canonical_id"],
         "item_kind": cluster["item_kind"],
@@ -426,6 +494,74 @@ def canonical_record(
         "wave": _earliest(item.wave for item in items),
         "spec": spec,
     }
+    sizes: list[int] = []
+    for verbatim in (True, False):
+        spec["verbatim_what_changes"] = verbatim
+        size = canonical_body_floor(
+            record, blueprint_id=blueprint_id, blueprint_sha256=blueprint_sha256, project=project
+        )
+        sizes.append(size)
+        if size + CANONICAL_PROPOSAL_RESERVE <= MAXIMUM_ISSUE_BODY_CHARACTERS:
+            return record
+    criteria = sum(len(entry) for entry in _entries(spec["variants"], "acceptance_criteria"))
+    raise ConsolidationRejected(
+        UI_GAP_CLUSTER_TOO_LARGE,
+        [
+            f"{cluster['cluster_key']} ({cluster['title']}): {len(keys)} members carry "
+            f"{criteria} characters of acceptance criteria; the canonical issue body needs "
+            f"{sizes[-1]} characters plus {CANONICAL_PROPOSAL_RESERVE} for the proposal, over "
+            f"the {MAXIMUM_ISSUE_BODY_CHARACTERS} limit: split the cluster (plan again with "
+            "--replan, or one kind at a time)"
+        ],
+    )
+
+
+def canonical_body_floor(
+    record: Mapping[str, Any], *, blueprint_id: str, blueprint_sha256: str, project: str
+) -> int:
+    """The rendered size of the canonical issue body without its proposal and review: the
+    header, the UI context (every verbatim variant), the statement and a minimal proposal.
+    Returns a size over the limit when the context itself is invalid (too many entries)."""
+    item = canonical_item(record)
+    sections = _continued_sections(item)
+    if sections is None:
+        return MAXIMUM_ISSUE_BODY_CHARACTERS + 1
+    context = canonical_context(item, blueprint_id=blueprint_id, blueprint_sha256=blueprint_sha256)
+    intake = prepare_intake(
+        project, item_description(item, blueprint_id=blueprint_id), item.target_repository
+    )
+    proposal = validate_proposal(
+        {
+            "title": "x",
+            "kind": "feature",
+            "why": "x",
+            "what_changes": ["x"],
+            "out_of_scope": [],
+            "affected_repositories": [{"repository": item.target_repository, "role": "source"}],
+            "acceptance_criteria": ["x"],
+            "risks": [],
+            "rollout": [],
+            "kill_switch": [],
+            "open_questions": [],
+            "proposed_risk": "R1",
+            "risk_rationale": "x",
+        },
+        project,
+        item.target_repository,
+    )
+    rendered = render_change_request(
+        change_request_id=str(record["canonical_id"]),
+        revision=1,
+        project=project,
+        target_repository=item.target_repository,
+        proposal=proposal,
+        review=ChangeReviewRecord.from_rounds(
+            [ChangeReview(decision="APPROVE", summary="x", findings=())]
+        ),
+        description_redacted=intake.description_redacted,
+        ui_context=context,
+    )
+    return len(rendered.body)
 
 
 def canonical_item(record: Mapping[str, Any]) -> FanoutItem:
@@ -449,27 +585,33 @@ def canonical_items(results: Iterable[Mapping[str, Any]]) -> list[FanoutItem]:
     return list(items.values())
 
 
-def canonical_continued(item: FanoutItem) -> tuple[UiContinuedSection, ...]:
-    """Every member's acceptance criteria (and, within the body budget, what_changes),
-    verbatim and labelled with its item key, rendered in full in the canonical issue body:
-    no variant's criterion is ever dropped. Past CONTINUED_BUDGET characters the
-    what_changes section is left to the drafted proposal, which merges them."""
-    sections: dict[str, UiContinuedSection] = {}
-    for name in ("acceptance_criteria", "what_changes"):
-        entries = [
-            f"[{variant['item_key']}] {' '.join(str(entry).split())}"[:19_000]
-            for variant in item.spec.get("variants") or []
-            for entry in variant.get(name) or []
-            if str(entry).strip()
-        ][:300]
+def _continued_sections(item: FanoutItem) -> tuple[UiContinuedSection, ...] | None:
+    """The verbatim sections, or None when they cannot be a valid context (an entry or a
+    section over its bound): nothing is ever cut."""
+    names = ["acceptance_criteria"]
+    if item.spec.get("verbatim_what_changes", True):
+        names.insert(0, "what_changes")
+    sections: list[UiContinuedSection] = []
+    for name in names:
+        entries = _entries(item.spec.get("variants") or [], name)
+        if len(entries) > MAX_CONTINUED_ENTRIES or any(
+            len(entry) > MAX_CONTINUED_ENTRY for entry in entries
+        ):
+            return None
         if entries:
-            sections[name] = UiContinuedSection(field=name, entries=tuple(entries))
-    size = sum(len(entry) for section in sections.values() for entry in section.entries)
-    if size > CONTINUED_BUDGET:
-        sections.pop("what_changes", None)
-    return tuple(
-        sections[name] for name in ("what_changes", "acceptance_criteria") if name in sections
-    )
+            sections.append(UiContinuedSection(field=name, entries=tuple(entries)))  # type: ignore[arg-type]
+    return tuple(sections)
+
+
+def canonical_continued(item: FanoutItem) -> tuple[UiContinuedSection, ...]:
+    """Every variant's acceptance criteria (and what_changes, when the record says the body
+    allows them), verbatim and labelled with the original item key and the canonical
+    requests it came through. The record was sized at plan and apply time, so nothing is
+    dropped here."""
+    sections = _continued_sections(item)
+    if sections is None:
+        raise ConsolidationRejected(UI_GAP_CLUSTER_TOO_LARGE, [item.key])
+    return sections
 
 
 def canonical_context(

@@ -170,9 +170,10 @@ _CONSOLIDATED_GAP_RULE = (
     "requirement, and keep every distinct acceptance criterion of every variant as an "
     "acceptance criterion (merge only exact duplicates). The proposal lists are bounded, so "
     "when the variants do not fit, generalise a criterion only if it still covers every "
-    "variant; every variant's what_changes and acceptance criteria are also rendered verbatim "
-    "in the issue body, labelled with their item keys. The variants (the members' drafted "
-    "proposals) follow."
+    "variant; every variant's acceptance criteria (and, when they fit, its what_changes) are "
+    "also rendered verbatim in the issue body, labelled with their item keys, so keep the "
+    "proposal itself compact (well under 20000 characters in all). The variants (the "
+    "members' drafted proposals, and those a merged canonical request carried) follow."
 )
 
 

@@ -190,13 +190,19 @@ REVIEW = ChangeReviewRecord.from_rounds(
 )
 
 
-def fanned_out(harness: Harness, blueprint_id: str, digest: str) -> dict[str, UUID]:
+def fanned_out(
+    harness: Harness,
+    blueprint_id: str,
+    digest: str,
+    value: dict[str, Any] | None = None,
+    proposals: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, UUID]:
     """Every item drafted to CANDIDATE through the real prepare_item and persist steps
     (no Temporal): the state the live fan-out left behind."""
     writer = ui_fanout_workflow_id(blueprint_id, 1)
     harness.claim(blueprint_id, writer)  # type: ignore[attr-defined]
     ids: dict[str, UUID] = {}
-    for item in fanout_items(document()):
+    for item in fanout_items(value or document()):
         prepared = harness.ui._prepare_item(
             {
                 "blueprint_id": blueprint_id,
@@ -207,7 +213,7 @@ def fanned_out(harness: Harness, blueprint_id: str, digest: str) -> dict[str, UU
         )
         assert prepared["status"] in {"DRAFT_READY", "PROPOSAL_READY"}, prepared
         proposal = (
-            gap_change_request(item.key, item.target_repository)
+            (proposals or {}).get(item.key) or gap_change_request(item.key, item.target_repository)
             if item.is_gap
             else render_item_proposal(item)
         )
@@ -976,3 +982,204 @@ def test_blueprint_with_no_duplicates_has_nothing_to_consolidate(tmp_path: Path)
     assert UiBlueprintRepository(engine=engine).get_sync(UUID(int=1)) is None
     assert isinstance(UiBlueprint.__tablename__, str)
     assert ChangeRequestRepository(engine=engine).list_requests_sync(None, "MERGED", 5) == []
+
+
+# Round 1 (review) -----------------------------------------------------------------------
+
+
+def test_apply_refuses_a_member_revised_since_the_plan(tmp_path: Path) -> None:
+    harness, consolidations, blueprint_id, digest, ids = setup(tmp_path)
+    view = proposed(consolidations, blueprint_id, [("Cursor pagination", [B1, B2])])
+    member = view["plan"]["clusters"][0]["members"][1]
+    assert (member["revision"], len(member["content_sha256"])) == (1, 64)
+    # The operator revises B2 into something else; it is a CANDIDATE again at revision 2.
+    harness.change_requests.revise_sync(ids[B2], "Make it a search API instead.", OPERATOR)
+    other = gap_change_request(B2, FALCONE)
+    other["acceptance_criteria"] = ["Search returns ranked results."]
+    persisted = harness.change_requests.persist_candidate_sync(
+        ids[B2], 2, validate_proposal(other, "falcone", FALCONE), REVIEW, {}
+    )
+    assert persisted["status"] == "CANDIDATE"
+    with pytest.raises(ConsolidationRejected) as refused:
+        consolidations.apply_sync(
+            UUID(blueprint_id), view["plan_sha12"], CONSOLIDATE_PHRASE, OPERATOR
+        )
+    assert refused.value.code == "UI_GAP_PLAN_STALE"
+    assert refused.value.details[0].startswith(f"{B2}: changed since the plan (revision 1 -> 2")
+    assert "--replan" in refused.value.details[-1]
+    assert status(harness, ids[B1]) == "CANDIDATE" and status(harness, ids[B2]) == "CANDIDATE"
+    assert (
+        harness.change_requests.get_sync(item_change_request_id(digest, canonical_key([B1, B2])))
+        is None
+    )
+
+
+def test_apply_refuses_a_member_whose_content_changed_at_the_same_revision(
+    tmp_path: Path,
+) -> None:
+    harness, consolidations, blueprint_id, _digest, ids = setup(tmp_path)
+    view = proposed(consolidations, blueprint_id, [("Cursor pagination", [B1, B2])])
+    with harness.change_requests.sessions.begin() as session:
+        row = session.get(ChangeRequest, ids[B1])
+        assert row is not None
+        row.proposal_json = {**row.proposal_json, "why": "Something else entirely."}
+    with pytest.raises(ConsolidationRejected) as refused:
+        consolidations.apply_sync(
+            UUID(blueprint_id), view["plan_sha12"], CONSOLIDATE_PHRASE, OPERATOR
+        )
+    assert refused.value.code == "UI_GAP_PLAN_STALE"
+    assert "revision 1 -> 1, content changed" in refused.value.details[0]
+    assert status(harness, ids[B1]) == "CANDIDATE"
+
+
+def test_a_canonical_merged_again_keeps_every_inherited_criterion(tmp_path: Path) -> None:
+    harness, consolidations, blueprint_id, digest, ids = setup(tmp_path)
+    first = proposed(consolidations, blueprint_id, [("Cursor pagination", [B1, B2])])
+    consolidations.apply_sync(UUID(blueprint_id), first["plan_sha12"], CONSOLIDATE_PHRASE, OPERATOR)
+    middle = canonical_key([B1, B2])
+    middle_id = item_change_request_id(digest, middle)
+    # The fan-out drafts the canonical request C (its own, merged proposal).
+    writer = ui_fanout_workflow_id(blueprint_id, 2)
+    harness.claim(blueprint_id, writer)  # type: ignore[attr-defined]
+    prepared = harness.ui._prepare_item(
+        {
+            "blueprint_id": blueprint_id,
+            "item_key": middle,
+            "source_worktree": "/srv/x",
+            "orchestration": {"workflow_id": writer},
+        }
+    )
+    assert prepared["status"] == "DRAFT_READY"
+    own = gap_change_request(middle, FALCONE)
+    own["acceptance_criteria"] = ["Every list endpoint takes a cursor."]
+    harness.change_requests.persist_candidate_sync(
+        middle_id, 1, validate_proposal(own, "falcone", FALCONE), REVIEW, {}, fanout_writer=writer
+    )
+    harness.repository.release_fanout_sync(UUID(blueprint_id), writer)
+    # C + D -> E: E carries C's own criterion and, verbatim, A's and B's.
+    second = proposed(consolidations, blueprint_id, [("Paged plans", [middle, PLANS])])
+    consolidations.apply_sync(
+        UUID(blueprint_id), second["plan_sha12"], CONSOLIDATE_PHRASE, OPERATOR
+    )
+    outer = item_change_request_id(digest, canonical_key([middle, PLANS]))
+    view = harness.change_requests.get_sync(outer)
+    assert view is not None
+    sections = {item["field"]: item["entries"] for item in view["ui_context"]["continued"]}
+    # Members in blueprint order (the blueprint gap, then the canonical request).
+    assert sections["acceptance_criteria"] == [
+        f"[{PLANS}] gap-plans-api passes its contract test.",
+        f"[{middle}] Every list endpoint takes a cursor.",
+        f"[{B1} via {middle}] gap-b001-cursor-pagination passes its contract test.",
+        f"[{B2} via {middle}] gap-b002-cursor-pagination passes its contract test.",
+    ]
+    assert [entry["item_key"] for entry in view["ui_context"]["merged_from"]] == [PLANS, middle]
+    assert harness.change_requests.resolve_sync(ids[B1])["change_request_id"] == str(outer)
+    assert harness.change_requests.resolve_sync(ids[B1])["merged_via"] == [
+        str(ids[B1]),
+        str(middle_id),
+    ]
+
+
+def large_document() -> dict[str, Any]:
+    """Eight backend duplicates of one need (the review's reproduction)."""
+    value = document()
+    for index in range(3, 9):
+        identity = f"gap-b00{index}-cursor-pagination"
+        value["gaps"].append(
+            {
+                "id": identity,
+                "type": "BACKEND_GAP",
+                "target_repository": FALCONE,
+                "summary": "Lists need a cursor.",
+                "evidence": [f"evidence for {identity}"],
+                "blocks": ["tenants"],
+                "interim": "client paging",
+                "seed_ref": None,
+            }
+        )
+        value["pages"][0]["gap_ids"].append(identity)
+    return value
+
+
+LARGE = [f"gap:gap-b00{index}-cursor-pagination" for index in range(1, 9)]
+
+
+def large_proposals() -> dict[str, dict[str, Any]]:
+    proposals = {}
+    for key in LARGE:
+        proposal = gap_change_request(key, FALCONE)
+        proposal["acceptance_criteria"] = [
+            f"{key} criterion {number}: " + "x" * (575 - len(key)) for number in range(15)
+        ]
+        proposals[key] = proposal
+    return proposals
+
+
+def test_a_cluster_too_large_for_one_issue_is_refused_before_anything_merges(
+    tmp_path: Path,
+) -> None:
+    harness = Harness(tmp_path)
+    blueprint_id, digest = approved(harness, large_document())
+    ids = fanned_out(harness, blueprint_id, digest, large_document(), large_proposals())
+    consolidations = UiGapConsolidationRepository(engine=harness.engine)
+    criteria = sum(
+        len(f"[{key}] {entry}")
+        for key, proposal in large_proposals().items()
+        for entry in proposal["acceptance_criteria"]
+    )
+    assert criteria >= 74_000  # the review's eight-member reproduction (74,370 characters)
+    # Plan time: the deterministic check refuses the cluster (INVALID, nothing to apply).
+    requested = consolidations.request_plan_sync(UUID(blueprint_id), OPERATOR, "backend-gap", False)
+    identity = UUID(requested["consolidation"]["id"])
+    loaded = consolidations.load_sync(identity, requested["consolidation"]["workflow_id"])
+    recorded = consolidations.record_plan_sync(
+        identity, plan_output(loaded["input_sha256"], [("Cursor pagination", LARGE)], []), {}
+    )
+    assert (recorded["status"], recorded["blocker"]) == ("INVALID", "UI_GAP_CLUSTER_TOO_LARGE")
+    assert "split the cluster" in recorded["problems"][0]
+    # Apply time: the same cluster in a stored plan (bypassing the plan check) is refused
+    # whole, before any member is merged or any canonical created.
+    view = consolidations.get_sync(identity)
+    assert view is not None
+    with harness.repository.sessions.begin() as session:
+        row = session.get(models.UiGapConsolidation, identity)
+        assert row is not None
+        candidates = {item["item_key"]: item for item in row.inputs_json}
+        from engineering_control.engineering.ui_gap_consolidation import build_plan
+
+        plan = build_plan(
+            {"clusters": [{"title": "Cursor pagination", "rationale": "Same need.",
+                           "member_keys": LARGE}], "unclustered": [], "notes": []},
+            blueprint_id=blueprint_id,
+            blueprint_sha256=digest,
+            kind="backend-gap",
+            input_sha256=row.input_sha256,
+            candidates=[candidates[key] for key in LARGE],
+            drafter={},
+        )  # fmt: skip
+        row.plan_json, row.plan_sha256, row.status = plan, plan_sha256(plan), "PROPOSED"
+    with pytest.raises(ConsolidationRejected) as refused:
+        consolidations.apply_sync(
+            UUID(blueprint_id), plan_sha256(plan)[:12], CONSOLIDATE_PHRASE, OPERATOR
+        )
+    assert refused.value.code == "UI_GAP_CLUSTER_TOO_LARGE"
+    assert all(status(harness, ids[key]) == "CANDIDATE" for key in LARGE)
+    assert (
+        harness.change_requests.get_sync(item_change_request_id(digest, canonical_key(LARGE)))
+        is None
+    )
+    with harness.repository.sessions.begin() as session:
+        row = session.get(models.UiGapConsolidation, identity)
+        assert row is not None
+        row.status = "INVALID"
+    # Half the cluster fits: its criteria are all verbatim, what_changes left to the draft
+    # only when needed, and the stored context renders within the body limit.
+    half = proposed(consolidations, blueprint_id, [("Cursor pagination", LARGE[:2])],
+                    kind="backend-gap")  # fmt: skip
+    consolidations.apply_sync(UUID(blueprint_id), half["plan_sha12"], CONSOLIDATE_PHRASE, OPERATOR)
+    canonical = harness.change_requests.get_sync(
+        item_change_request_id(digest, canonical_key(LARGE[:2]))
+    )
+    assert canonical is not None
+    sections = {item["field"]: item["entries"] for item in canonical["ui_context"]["continued"]}
+    assert len(sections["acceptance_criteria"]) == 30

@@ -661,6 +661,14 @@ engineering-ctl change-show <id>             # MERGED: merged_into; pages: block
 - `--apply` is operator-only (CLI or allowlisted `telegram:<id>`), bound to the plan sha and
   the typed `CONSOLIDATE_GAPS`, refused (409) while a fan-out for the blueprint runs or is being
   started, and refused whole if any member was published, approved or rejected since the plan.
+  The plan binds each member's revision and content hash (proposal and statement): a member
+  revised or changed since the plan refuses the apply with `UI_GAP_PLAN_STALE` (plan again
+  with `--replan`). Every canonical issue body is sized before anything is written, at plan
+  time and again at apply: all members' acceptance criteria are kept verbatim (inherited ones
+  of a canonical request merged again too, labelled `[<original key> via <canonical key>]`),
+  what_changes only when they fit, and 20000 characters stay free for the drafted proposal.
+  A cluster that cannot fit the 60000-character body is refused with
+  `UI_GAP_CLUSTER_TOO_LARGE` (the plan is INVALID; split the cluster with `--replan`).
   In one audited transaction (`ui_gap_consolidation.applied` dashboard event) it creates one
   canonical request per cluster (id from the blueprint hash and the sorted member keys, item
   key `gap:merged-<hash>`), marks every member `MERGED` with `merged_into` (never deleted, its
@@ -673,10 +681,9 @@ engineering-ctl change-show <id>             # MERGED: merged_into; pages: block
   no-op that returns the recorded result.
 - The apply then starts (or joins) a fan-out that drafts the canonical requests like any gap:
   Claude drafts with triage-ui-gap from every member's proposal, Codex reviews, and the
-  candidate is published with `change-publish` as usual. Every member's acceptance criteria
-  (and what_changes, within the body budget) are rendered verbatim in the canonical issue body,
-  labelled with their item keys; the body also lists the merged requests and the items that
-  need it. A failed canonical request is retried with `ui-blueprint-fanout-retry`.
+  candidate is published with `change-publish` as usual. The verbatim criteria are rendered in
+  the canonical issue body, labelled with their item keys; the body also lists the merged
+  requests and the items that need it. A failed canonical request is retried with `ui-blueprint-fanout-retry`.
 - Revision 0021 adds `MERGED`, `change_requests.merged_into_id` and `consolidation_json`, and
   the `ui_gap_consolidations` table: run the migration before deploying this release. Its
   downgrade refuses while any request is `MERGED`.
