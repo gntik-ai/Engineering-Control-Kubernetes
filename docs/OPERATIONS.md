@@ -584,3 +584,20 @@ engineering-ctl ui-blueprint-fanout-retry <blueprint> <binding> RETRY_UI_FANOUT 
 - It then starts the next fan-out (`ui-blueprint-fanout-<id>-<n+1>`) with `--max-items` as
   its cap, which drafts and reviews the reset items like any other pending item. A repeat finds
   nothing left to reset; if the start fails (503), repeat the retry or the approval to resume.
+
+### Schema keys and step redaction (NEW-148)
+
+Every step payload is redacted before it is dispatched, and the redactor replaces the value of
+any key whose name contains `token`, `secret`, `session`, `key` (as in `api_key`), `password`
+and similar. An output schema with such a property name is therefore changed in the request and
+refused by the agent pack (`AGENT_PACK_INVALID`, "drifted from the released skill output
+schema"); this failed every gap draft until pack 1.5.3 renamed `kit_proposal.tokens` and
+`tokens_only` to `style_variables` and `style_variables_only`. Tests in both repositories keep
+every Hermes and pack output schema clear of such keys.
+
+The gap draft schema is pinned on both sides, so Hermes and the pack must change together.
+While they disagree, `ui_fanout.plan` (and a new `ui-plan`) stops with `BLOCKED
+AGENT_PACK_SKILL_MISSING` ("skills/triage-ui-gap output schema differs") before any item is
+created or failed. Deploy Hermes first, then release pack 1.5.3 (the quick, reversible step),
+then retry the failed gaps with `ui-blueprint-fanout-retry <blueprint> <binding>
+RETRY_UI_FANOUT --kind gap`. Start or retry no fan-out between the two steps.
