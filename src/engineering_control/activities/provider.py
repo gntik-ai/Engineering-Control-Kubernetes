@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -36,6 +37,8 @@ from engineering_control.observability.agent import (
 )
 from engineering_control.security.redaction import SecretRedactor, bounded_detail
 
+_PYDANTIC_MESSAGE_PREFIX = re.compile(r"^(?:Value error|Assertion failed), ")
+
 
 def error_detail(error: BaseException, redactor: SecretRedactor | None = None) -> str:
     """NEW-146: "<Type>: <message>", redacted and bounded, for a step's blocker_detail.
@@ -50,11 +53,20 @@ def error_detail(error: BaseException, redactor: SecretRedactor | None = None) -
     def safe(text: str) -> str:
         return str(redactor.redact_text(text).value)
 
+    def safe_message(text: str) -> str:
+        # NEW-146 review 2: pydantic prefixes a validator's own message ("Value error, ",
+        # "Assertion failed, "), which would hide a leading credential from the
+        # line-anchored rules; redact the validator's text alone, then restore the label.
+        match = _PYDANTIC_MESSAGE_PREFIX.match(text)
+        if match is None:
+            return safe(text)
+        return f"{match.group(0)}{safe(text[match.end() :])}"
+
     if isinstance(error, PydanticValidationError):
         problems = error.errors(include_url=False, include_context=False, include_input=False)
         shown = "; ".join(
             f"{safe('.'.join(str(part) for part in problem.get('loc', ()))) or '<root>'}: "
-            f"{safe(str(problem.get('msg', problem.get('type', 'invalid'))))}"
+            f"{safe_message(str(problem.get('msg', problem.get('type', 'invalid'))))}"
             for problem in problems[:5]
         )
         message = f"{error.error_count()} validation error(s) for {safe(error.title)}: {shown}"

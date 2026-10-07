@@ -717,3 +717,33 @@ def test_a_stale_fanout_writer_is_a_no_op_after_a_retry(tmp_path: Path) -> None:
     harness.change_requests.revise_sync(UUID(gap), "Try the draft again.", "telegram:42")
     revised = fail(gap, f"change-request-{gap}-2", revision=2)
     assert (revised["status"], revised["revision"]) == ("FAILED", 2)
+
+
+class _CheckedNoNewline(BaseModel):
+    pack: str
+
+    @field_validator("pack")
+    @classmethod
+    def _reject(cls, value: str) -> str:
+        raise ValueError(f"password={CREDENTIAL}")
+
+
+class _AssertedNoNewline(BaseModel):
+    pack: str
+
+    @field_validator("pack")
+    @classmethod
+    def _reject(cls, value: str) -> str:
+        assert value == "", f"token: {CREDENTIAL}"
+        return value
+
+
+@pytest.mark.parametrize("model", [_CheckedNoNewline, _AssertedNoNewline])
+def test_a_validator_credential_behind_pydantics_prefix_is_redacted(model: type[BaseModel]) -> None:
+    """Review 2: pydantic writes "Value error, password=..." (or "Assertion failed, ..."),
+    so the line-anchored rules must see the validator's own text without that prefix."""
+    with pytest.raises(PydanticValidationError) as raised:
+        model.model_validate({"pack": "x"})
+    detail = error_detail(raised.value)
+    assert CREDENTIAL not in detail
+    assert "Value error, " in detail or "Assertion failed, " in detail
