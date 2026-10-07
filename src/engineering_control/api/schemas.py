@@ -427,6 +427,21 @@ class UiFanoutRetry(APIModel):
     max_items: int | None = Field(default=None, ge=1, le=600)
 
 
+class UiGapConsolidationRequest(APIModel):
+    """NEW-154: preview (plan) a consolidation of a blueprint's duplicate gap requests."""
+
+    kind: Literal["kit-gap", "backend-gap"] | None = None
+    # Plan again although a plan for the same inputs exists (it is superseded).
+    replan: bool = False
+
+
+class UiGapConsolidationApply(APIModel):
+    """NEW-154: apply a stored consolidation plan, bound to its sha."""
+
+    plan_sha12: str = Field(pattern=r"^[a-f0-9]{12}$")
+    typed_confirmation: Literal["CONSOLIDATE_GAPS"]
+
+
 class ChangeRequestRevision(APIModel):
     note: str = Field(min_length=3, max_length=2000)
 

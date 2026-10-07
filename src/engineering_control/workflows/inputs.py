@@ -258,6 +258,13 @@ class UiBlueprintFanOutInput:
 
 
 @dataclass
+class UiGapConsolidationPlanInput:
+    """NEW-154: one gap consolidation plan run (its durable record carries the inputs)."""
+
+    consolidation_id: str
+
+
+@dataclass
 class LLMWikiStagingBootstrapInput:
     project: str = "llmwiki"
     environment: str = "staging"

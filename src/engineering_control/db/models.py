@@ -467,10 +467,17 @@ class ChangeRequest(UUIDPrimaryKey, Timestamps, Base):
     # NEW-123: the blueprint item a fanned-out UI migration request came from (labels,
     # dependencies); rendered into the bound issue body. NULL for operator requests.
     ui_context_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # NEW-154: a gap request an operator consolidation merged (status MERGED, terminal)
+    # names the canonical request that replaces it; blocker resolution follows it.
+    merged_into_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True, index=True)
+    # NEW-154: the consolidation record of a merged member, a canonical request, or a
+    # request whose blocked_by was re-pointed (or, once published, still names a member).
+    consolidation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     __table_args__ = (
         CheckConstraint("revision >= 1", name="revision_positive"),
         CheckConstraint(
-            "status IN ('DRAFTING', 'CANDIDATE', 'APPROVED', 'PUBLISHED', 'REJECTED', 'FAILED')",
+            "status IN ('DRAFTING', 'CANDIDATE', 'APPROVED', 'PUBLISHED', 'REJECTED', 'FAILED', "
+            "'MERGED')",
             name="status_known",
         ),
     )
@@ -529,6 +536,46 @@ class UiBlueprint(UUIDPrimaryKey, Timestamps, Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('DRAFTING', 'BLOCKED', 'FAILED', 'CANDIDATE', 'APPROVED', 'SUPERSEDED')",
+            name="status_known",
+        ),
+    )
+
+
+UI_GAP_CONSOLIDATION_STATUSES = (
+    "PLANNING",
+    "PROPOSED",
+    "INVALID",
+    "FAILED",
+    "APPLIED",
+    "SUPERSEDED",
+)
+
+
+class UiGapConsolidation(UUIDPrimaryKey, Timestamps, Base):
+    """NEW-154: one operator-driven consolidation of a blueprint's duplicate gap requests:
+    the model-proposed plan (stored with its sha256) and, once applied, its audit record."""
+
+    __tablename__ = "ui_gap_consolidations"
+    blueprint_id: Mapped[UUID] = mapped_column(Uuid, index=True)
+    project: Mapped[str] = mapped_column(String(32))
+    # kit-gap, backend-gap, or NULL for both.
+    kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(240), unique=True)
+    requested_by: Mapped[str] = mapped_column(String(128))
+    # The eligible gap requests the plan was asked about (ids, keys, statuses, revisions).
+    input_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    inputs_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    plan_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    problems_json: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    applied_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PLANNING', 'PROPOSED', 'INVALID', 'FAILED', 'APPLIED', 'SUPERSEDED')",
             name="status_known",
         ),
     )

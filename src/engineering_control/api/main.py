@@ -61,6 +61,8 @@ from engineering_control.api.schemas import (
     RuntimeVerificationStart,
     UiBlueprintApproval,
     UiFanoutRetry,
+    UiGapConsolidationApply,
+    UiGapConsolidationRequest,
     UiPlanAccepted,
     UiPlanCreate,
 )
@@ -78,9 +80,15 @@ from engineering_control.db.repository import (
 from engineering_control.db.ui_blueprints import (
     UiBlueprintNotFoundError,
     UiBlueprintRepository,
+    UiFanoutActiveError,
+)
+from engineering_control.db.ui_gap_consolidations import (
+    UiGapConsolidationNotFoundError,
+    UiGapConsolidationRepository,
 )
 from engineering_control.engineering.backlog import canonical_operator_approval_actor
 from engineering_control.engineering.change_requests import prepare_intake
+from engineering_control.engineering.ui_gap_consolidation import ConsolidationRejected
 from engineering_control.logging import configure_logging
 from engineering_control.models.enums import Project, RiskClass
 from engineering_control.observability.agent import (
@@ -182,6 +190,12 @@ def create_app(
         if resolved_ui_blueprints is None and service is None:
             resolved_ui_blueprints = UiBlueprintRepository(resolved.database_url.get_secret_value())
         app.state.ui_blueprint_repository = resolved_ui_blueprints
+        # NEW-154: gap consolidations live in the blueprint database (shared engine).
+        app.state.ui_gap_consolidation_repository = (
+            UiGapConsolidationRepository(engine=resolved_ui_blueprints.engine)
+            if resolved_ui_blueprints is not None
+            else None
+        )
         stop = asyncio.Event()
         reconciler = None
         if resolved.projection_reconciliation_enabled and admission_mode in {
@@ -310,9 +324,18 @@ def create_app(
             raise HTTPException(status_code=503, detail="ui blueprint repository unavailable")
         return cast(UiBlueprintRepository, value)
 
+    def gap_consolidations(request: Request) -> UiGapConsolidationRepository:
+        value = getattr(request.app.state, "ui_gap_consolidation_repository", None)
+        if value is None:
+            raise HTTPException(
+                status_code=503, detail="ui gap consolidation repository unavailable"
+            )
+        return cast(UiGapConsolidationRepository, value)
+
     control_dependency = Depends(control)
     change_requests_dependency = Depends(change_requests)
     ui_blueprints_dependency = Depends(ui_blueprints)
+    gap_consolidations_dependency = Depends(gap_consolidations)
     metadata_dependency = Depends(metadata)
     operations_dependency = Depends(operations)
     commands_dependency = Depends(commands)
@@ -1623,6 +1646,129 @@ def create_app(
             },
         }
 
+    # NEW-154: operator-driven consolidation of duplicate gap change requests.
+    @app.post("/v1/ui-blueprints/{blueprint_id}/gap-consolidations")
+    async def ui_gap_consolidation_plan(
+        blueprint_id: UUID,
+        body: UiGapConsolidationRequest,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        consolidations: UiGapConsolidationRepository = gap_consolidations_dependency,
+    ) -> dict[str, Any]:
+        """Preview: the stored plan for the blueprint's current mergeable gap requests, or
+        start its plan workflow (one bounded Claude step) and return the PLANNING record."""
+        actor = approval_actor(subject)
+        try:
+            requested = await consolidations.request_plan(
+                blueprint_id, actor, body.kind, body.replan
+            )
+        except UiBlueprintNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        view: dict[str, Any] = dict(requested["consolidation"])
+        if requested["action"] == "START":
+            try:
+                accepted = await service.start_ui_gap_consolidation(
+                    UUID(str(view["id"])), str(view["workflow_id"])
+                )
+            except Exception as error:  # noqa: BLE001 - surfaced as a durable FAILED row
+                await consolidations.record_start_failure(UUID(str(view["id"])))
+                raise HTTPException(
+                    status_code=503, detail="ui gap consolidation plan could not be started"
+                ) from error
+            view = {
+                **view,
+                "plan_run": {"workflow_id": accepted.workflow_id, "run_id": accepted.run_id},
+                "next": "repeat this command to preview the plan once it is PROPOSED",
+            }
+        return view
+
+    @app.get("/v1/ui-blueprints/{blueprint_id}/gap-consolidations", response_model=RecordList)
+    async def ui_gap_consolidation_list(
+        blueprint_id: UUID,
+        _subject: str = auth_dependency,
+        consolidations: UiGapConsolidationRepository = gap_consolidations_dependency,
+    ) -> RecordList:
+        return RecordList(
+            items=await consolidations.list_consolidations(blueprint_id), next_cursor=None
+        )
+
+    @app.post("/v1/ui-blueprints/{blueprint_id}/gap-consolidations/apply")
+    async def ui_gap_consolidation_apply(
+        blueprint_id: UUID,
+        body: UiGapConsolidationApply,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: UiBlueprintRepository = ui_blueprints_dependency,
+        consolidations: UiGapConsolidationRepository = gap_consolidations_dependency,
+    ) -> dict[str, Any]:
+        """Apply a stored plan by its sha in one audited transaction, then start (or join)
+        the fan-out that drafts the canonical requests (Claude drafts, Codex reviews).
+
+        Refused while a fan-out runs (or is being started) for the blueprint, exactly as a
+        fan-out retry; a marker whose workflow has ended is released once the request is
+        authorized."""
+        actor = approval_actor(subject)
+        try:
+            await consolidations.check_apply(
+                blueprint_id, body.plan_sha12, body.typed_confirmation, actor
+            )
+            marker = await repository.active_fanout(blueprint_id)
+        except (UiBlueprintNotFoundError, UiGapConsolidationNotFoundError) as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if marker is not None:
+            active = marker["workflow_id"]
+            claimed_at = marker["claimed_at"]
+            state, _running = await service.ui_fanout_state(active)
+            if state == "RUNNING" or (
+                state == "NOT_FOUND"
+                and isinstance(claimed_at, datetime)
+                and datetime.now(UTC) - _as_utc(claimed_at) < UI_FANOUT_START_GRACE
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"a ui fan-out is running for this blueprint ({active}); "
+                    "apply the consolidation after it has finished",
+                )
+            await repository.release_fanout(blueprint_id, active)
+        try:
+            applied = await consolidations.apply(
+                blueprint_id, body.plan_sha12, body.typed_confirmation, actor
+            )
+        except UiFanoutActiveError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ConsolidationRejected as error:
+            raise HTTPException(
+                status_code=409, detail={"code": error.code, "problems": error.details}
+            ) from error
+        except (UiBlueprintNotFoundError, UiGapConsolidationNotFoundError) as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        limit = resolved.ui_blueprint_fanout_max_items
+        try:
+            accepted, joined = await ui_fanout_start_or_join(
+                blueprint_id, limit, service, repository
+            )
+        except Exception as error:  # noqa: BLE001 - the apply stands; a repeat resumes
+            raise HTTPException(
+                status_code=503,
+                detail="gap consolidation applied, but the fan-out drafting its canonical "
+                "requests could not be started; repeat the apply to resume",
+            ) from error
+        return {
+            **applied,
+            "fanout": {
+                "workflow_id": accepted.workflow_id,
+                "run_id": accepted.run_id,
+                "max_items": limit,
+                "joined": joined,
+            },
+        }
+
     async def ui_fanout_start_or_join(
         blueprint_id: UUID,
         max_items: int,
@@ -1663,7 +1809,7 @@ def create_app(
         project: str | None = Query(default=None, pattern=r"^(falcone|musematic|llmwiki)$"),
         status: str | None = Query(
             default=None,
-            pattern=r"^(DRAFTING|CANDIDATE|APPROVED|PUBLISHED|REJECTED|FAILED)$",
+            pattern=r"^(DRAFTING|CANDIDATE|APPROVED|PUBLISHED|REJECTED|FAILED|MERGED)$",
         ),
         limit: int = Query(default=20, ge=1, le=200),
         _subject: str = auth_dependency,

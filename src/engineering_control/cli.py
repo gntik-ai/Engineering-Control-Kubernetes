@@ -370,7 +370,15 @@ def parser() -> argparse.ArgumentParser:
     changes.add_argument("--project", choices=("falcone", "musematic", "llmwiki"))
     changes.add_argument(
         "--status",
-        choices=("DRAFTING", "CANDIDATE", "APPROVED", "PUBLISHED", "REJECTED", "FAILED"),
+        choices=(
+            "DRAFTING",
+            "CANDIDATE",
+            "APPROVED",
+            "PUBLISHED",
+            "REJECTED",
+            "FAILED",
+            "MERGED",
+        ),
     )
     changes.add_argument("--limit", type=_bounded_integer(1, 200), default=20, metavar="1-200")
     commands.add_parser("change-show").add_argument("change_request_id")
@@ -415,6 +423,19 @@ def parser() -> argparse.ArgumentParser:
         "--kind", choices=("epic", "page", "cutover", "gap", "backend-gap", "kit-gap")
     )
     ui_retry.add_argument("--max-items", type=_bounded_integer(1, 600), metavar="1-600")
+    # NEW-154: consolidate a blueprint's duplicate gap requests (preview, then apply by sha).
+    ui_consolidate = commands.add_parser("ui-blueprint-gap-consolidate")
+    ui_consolidate.add_argument("blueprint_id")
+    ui_consolidate.add_argument("--kind", choices=("kit-gap", "backend-gap"))
+    ui_consolidate.add_argument(
+        "--replan", action="store_true", help="plan again although a plan for these inputs exists"
+    )
+    ui_consolidate.add_argument(
+        "--apply",
+        nargs=2,
+        metavar=("PLAN_SHA12", "CONSOLIDATE_GAPS"),
+        help="apply the previewed plan with this sha and the typed confirmation",
+    )
     ui_inventory = commands.add_parser("ui-inventory")
     ui_inventory.add_argument("--checkout", type=Path, required=True)
     ui_inventory.add_argument("--project", choices=("falcone",), default="falcone")
@@ -939,6 +960,22 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             retry["max_items"] = arguments.max_items
         return client.request(
             "POST", f"/v1/ui-blueprints/{arguments.blueprint_id}/fanout-retry", retry
+        )
+    if command == "ui-blueprint-gap-consolidate":
+        if arguments.apply is not None:
+            if arguments.replan:
+                raise ValueError("--replan and --apply cannot be combined")
+            plan_sha12, confirmation = arguments.apply
+            return client.request(
+                "POST",
+                f"/v1/ui-blueprints/{arguments.blueprint_id}/gap-consolidations/apply",
+                {"plan_sha12": plan_sha12, "typed_confirmation": confirmation},
+            )
+        consolidate: dict[str, Any] = {"replan": bool(arguments.replan)}
+        if arguments.kind is not None:
+            consolidate["kind"] = arguments.kind
+        return client.request(
+            "POST", f"/v1/ui-blueprints/{arguments.blueprint_id}/gap-consolidations", consolidate
         )
     if command == "changes":
         query = httpx.QueryParams(

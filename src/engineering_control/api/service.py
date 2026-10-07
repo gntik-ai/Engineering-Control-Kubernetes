@@ -42,6 +42,7 @@ from engineering_control.engineering.models import CampaignPlan
 from engineering_control.engineering.ui_blueprint import (
     ui_plan_workflow_id,
 )
+from engineering_control.engineering.ui_gap_consolidation import consolidation_workflow_id
 from engineering_control.models.enums import Project
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
@@ -70,6 +71,7 @@ from engineering_control.workflows.inputs import (
     RuntimeVerificationInput,
     StagingDeploymentInput,
     UiBlueprintFanOutInput,
+    UiGapConsolidationPlanInput,
     UiMigrationPlanInput,
 )
 from engineering_control.workflows.names import WorkflowName
@@ -145,6 +147,9 @@ class ControlService(Protocol):
     ) -> OperationAccepted: ...
     async def start_ui_fanout(
         self, blueprint_id: UUID, max_items: int, workflow_id: str
+    ) -> OperationAccepted: ...
+    async def start_ui_gap_consolidation(
+        self, consolidation_id: UUID, workflow_id: str
     ) -> OperationAccepted: ...
     async def ui_fanout_state(self, workflow_id: str) -> tuple[str, OperationAccepted | None]: ...
 
@@ -973,6 +978,18 @@ class TemporalControlService:
         return await self._start_once(
             WorkflowName.UI_BLUEPRINT_FANOUT.value,
             UiBlueprintFanOutInput(blueprint_id=str(blueprint_id), max_items=max_items),
+            workflow_id,
+        )
+
+    async def start_ui_gap_consolidation(
+        self, consolidation_id: UUID, workflow_id: str
+    ) -> OperationAccepted:
+        """NEW-154: the plan workflow of one gap consolidation record (idempotent)."""
+        if workflow_id != consolidation_workflow_id(str(consolidation_id)):
+            raise ValueError("ui gap consolidation workflow id does not match its record")
+        return await self._start_once(
+            WorkflowName.UI_GAP_CONSOLIDATION_PLAN.value,
+            UiGapConsolidationPlanInput(consolidation_id=str(consolidation_id)),
             workflow_id,
         )
 

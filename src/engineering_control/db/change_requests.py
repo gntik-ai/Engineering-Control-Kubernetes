@@ -29,6 +29,7 @@ from engineering_control.engineering.change_requests import (
     approval_record_matches,
     change_request_workflow_id,
     render_change_request,
+    ui_context_json,
     validate_proposal,
 )
 from engineering_control.security.redaction import SecretRedactor, bounded_detail
@@ -43,6 +44,9 @@ _ISSUE_URL = re.compile(
 
 # NEW-146 review 1: what a fan-out item write that no longer owns its blueprint returns.
 UI_FANOUT_SUPERSEDED = "UI_FANOUT_SUPERSEDED"
+# NEW-154: merge hops blocker resolution follows (a canonical request may be merged again);
+# consolidation refuses chains longer than this (engineering.ui_gap_consolidation).
+from engineering_control.engineering.ui_gap_consolidation import MAX_MERGE_HOPS  # noqa: E402
 
 
 class ChangeRequestNotFoundError(ValueError):
@@ -121,7 +125,7 @@ class ChangeRequestRepository:
         ``fanout_writer``, only the blueprint's active fan-out may create or load it."""
         if not is_reauthenticated_backlog_operator(requested_by):
             raise ValueError("change requests require an allowlisted operator channel")
-        context = ui_context.model_dump(mode="json")
+        context = ui_context_json(ui_context)
         now = datetime.now(UTC)
         with self.sessions.begin() as session:
             if fanout_writer is not None and not self._fanout_owns(
@@ -137,6 +141,11 @@ class ChangeRequestRepository:
                 ):
                     raise ValueError("change request id is bound to another blueprint item")
                 return {**self._summary(row), "created": False}
+            # NEW-154: an item created after a gap consolidation is blocked by the canonical
+            # request, never by a merged one.
+            context["blocked_by"] = self._resolved_dependencies(
+                session, list(context.get("blocked_by") or [])
+            )
             row = ChangeRequest(
                 id=change_request_id,
                 request_key=f"ui-{change_request_id.hex}",
@@ -195,7 +204,102 @@ class ChangeRequestRepository:
     def get_sync(self, change_request_id: UUID) -> dict[str, Any] | None:
         with self.sessions() as session:
             row = session.get(ChangeRequest, change_request_id)
-            return self._view(row) if row is not None else None
+            if row is None:
+                return None
+            view = self._view(row)
+            # NEW-154: a merged request resolves to its canonical one, and every blocker is
+            # shown resolved (a published body may still name a merged request).
+            if row.merged_into_id is not None:
+                view["merged_into"] = self._resolution(session, row)
+            context = row.ui_context_json if isinstance(row.ui_context_json, dict) else {}
+            resolved = [
+                {
+                    "change_request_id": entry.get("change_request_id"),
+                    "item_key": entry.get("item_key"),
+                    **self._resolve_id(session, entry.get("change_request_id")),
+                }
+                for entry in context.get("blocked_by") or []
+                if isinstance(entry, dict)
+            ]
+            if any(entry["merged"] for entry in resolved):
+                # Only when a blocker was merged (e.g. a published body that still names a
+                # merged request): every blocker as the request it stands for now.
+                view["blocked_by_resolved"] = resolved
+            return view
+
+    async def resolve(self, change_request_id: UUID) -> dict[str, Any]:
+        return await asyncio.to_thread(self.resolve_sync, change_request_id)
+
+    def resolve_sync(self, change_request_id: UUID) -> dict[str, Any]:
+        """NEW-154: the request a (possibly merged) change-request id stands for: merged ids
+        resolve, hop by hop, to their canonical request. Delivery and blocker resolution
+        use this for every change-request reference (a published body may name a merged
+        request)."""
+        with self.sessions() as session:
+            row = session.get(ChangeRequest, change_request_id)
+            if row is None:
+                raise ChangeRequestNotFoundError("change request not found")
+            return self._resolution(session, row)
+
+    @classmethod
+    def _resolve_id(cls, session: Any, change_request_id: Any) -> dict[str, Any]:
+        try:
+            identity = UUID(str(change_request_id))
+        except ValueError:
+            return {"resolved_id": None, "merged": False}
+        row = session.get(ChangeRequest, identity)
+        if row is None:
+            return {"resolved_id": str(identity), "merged": False}
+        resolved = cls._resolution(session, row)
+        return {
+            "resolved_id": resolved["change_request_id"],
+            "resolved_item_key": resolved["item_key"],
+            "resolved_status": resolved["status"],
+            "resolved_issue_url": resolved["issue_url"],
+            "merged": bool(resolved["merged_via"]),
+        }
+
+    @staticmethod
+    def _resolution(session: Any, row: ChangeRequest) -> dict[str, Any]:
+        chain: list[str] = []
+        current = row
+        while current.status == "MERGED" and current.merged_into_id is not None:
+            if len(chain) >= MAX_MERGE_HOPS or str(current.id) in chain:
+                raise ValueError("change request merge chain is too long or cyclic")
+            chain.append(str(current.id))
+            following = session.get(ChangeRequest, current.merged_into_id)
+            if following is None:
+                raise ValueError("merged change request names a missing canonical request")
+            current = following
+        context = current.ui_context_json if isinstance(current.ui_context_json, dict) else {}
+        return {
+            "change_request_id": str(current.id),
+            "item_key": context.get("item_key"),
+            "status": current.status,
+            "issue_url": current.issue_url,
+            "merged_via": chain,
+        }
+
+    @classmethod
+    def _resolved_dependencies(
+        cls, session: Any, dependencies: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        resolved: dict[str, dict[str, Any]] = {}
+        for entry in dependencies:
+            target = dict(entry)
+            try:
+                row = session.get(ChangeRequest, UUID(str(entry.get("change_request_id"))))
+            except ValueError:
+                row = None
+            if row is not None and row.status == "MERGED":
+                found = cls._resolution(session, row)
+                if found["item_key"]:
+                    target = {
+                        "change_request_id": found["change_request_id"],
+                        "item_key": found["item_key"],
+                    }
+            resolved.setdefault(str(target["change_request_id"]), target)
+        return list(resolved.values())
 
     async def approve(
         self, change_request_id: UUID, binding: str, phrase: str, actor: str
@@ -669,6 +773,7 @@ class ChangeRequestRepository:
             "fingerprint": row.fingerprint,
             "error_code": row.error_code,
             "issue_url": row.issue_url,
+            "merged_into_id": str(row.merged_into_id) if row.merged_into_id else None,
             "created_at": cls._iso(row.created_at),
             "updated_at": cls._iso(row.updated_at),
         }
@@ -715,6 +820,8 @@ class ChangeRequestRepository:
             "ui_context": row.ui_context_json or None,
             # NEW-146: why a FAILED request failed (blocker and bounded, redacted detail).
             "failure": cls._failure(row) or None,
+            # NEW-154: merge, canonical and re-pointing records of a gap consolidation.
+            "consolidation": row.consolidation_json or None,
         }
 
 

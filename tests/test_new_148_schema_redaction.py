@@ -47,6 +47,9 @@ from engineering_control.engineering.ui_blueprint import (
     ui_fanout_workflow_id,
 )
 from engineering_control.engineering.ui_blueprint_parts import PART_SCHEMAS, part_schema
+from engineering_control.engineering.ui_gap_consolidation import (
+    plan_schema as consolidation_plan_schema,
+)
 from engineering_control.models.core import AgentRequest, AgentResult
 from engineering_control.models.enums import Provider, RunStatus
 from engineering_control.security.redaction import REDACTED, SecretRedactor
@@ -62,6 +65,8 @@ def hermes_output_schemas() -> dict[str, dict[str, Any]]:
     """Every output schema Hermes puts into an AgentRequest."""
     return {
         "gap-draft": gap_draft_schema(),
+        # NEW-154: the gap consolidation plan (Hermes-pinned).
+        "gap-consolidation-plan": consolidation_plan_schema(),
         "blueprint": blueprint_schema(),
         "change-proposal": change_proposal_schema(),
         "review-change": change_review_schema(),

@@ -266,7 +266,9 @@ class ChangeRequestActivityHandler:
         if isinstance(previous, dict) and previous:
             sections.append(
                 "Previous proposal, for reference:\n"
-                + _fenced("previous proposal", json.dumps(previous, sort_keys=True))
+                + _fenced(
+                    "previous proposal", json.dumps(previous, sort_keys=True, ensure_ascii=False)
+                )
             )
         continued = payload.get("ui_continued")
         if isinstance(continued, list) and continued:
@@ -274,7 +276,10 @@ class ChangeRequestActivityHandler:
                 "Continued requirements: these lists belong to this change request and are "
                 "kept verbatim in its issue body. The proposal must stay consistent with every "
                 "entry; never contradict or silently drop one.\n"
-                + _fenced("continued requirements", json.dumps(continued, sort_keys=True))
+                + _fenced(
+                    "continued requirements",
+                    json.dumps(continued, sort_keys=True, ensure_ascii=False),
+                )
             )
         rounds = payload.get("review_rounds")
         if attempt == 2 and isinstance(rounds, list) and rounds:
@@ -282,9 +287,14 @@ class ChangeRequestActivityHandler:
                 "An independent reviewer asked for revisions of your draft. Address every "
                 "finding without adding scope beyond the operator description; when a finding "
                 "cannot be resolved from the description, record it in open_questions.\n"
-                + _fenced("review findings", json.dumps(rounds[-1], sort_keys=True))
+                + _fenced(
+                    "review findings", json.dumps(rounds[-1], sort_keys=True, ensure_ascii=False)
+                )
                 + "\n"
-                + _fenced("previous proposal", json.dumps(payload.get("proposal"), sort_keys=True))
+                + _fenced(
+                    "previous proposal",
+                    json.dumps(payload.get("proposal"), sort_keys=True, ensure_ascii=False),
+                )
             )
         request = AgentRequest(
             run_id=uuid5(
@@ -348,14 +358,18 @@ class ChangeRequestActivityHandler:
                     ),
                     _fenced(
                         "proposal",
-                        json.dumps(proposal.model_dump(mode="json"), sort_keys=True),
+                        json.dumps(
+                            proposal.model_dump(mode="json"), sort_keys=True, ensure_ascii=False
+                        ),
                     ),
                     *(
                         (
                             _fenced(
                                 "continued requirements (part of the proposal, published "
                                 "verbatim in the issue body: review them too)",
-                                json.dumps(payload["ui_continued"], sort_keys=True),
+                                json.dumps(
+                                    payload["ui_continued"], sort_keys=True, ensure_ascii=False
+                                ),
                             ),
                         )
                         if isinstance(payload.get("ui_continued"), list) and payload["ui_continued"]

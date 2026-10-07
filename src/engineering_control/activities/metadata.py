@@ -466,6 +466,7 @@ class MetadataActivityHandler:
         "ui_plan.draft": "draft_request",
         "ui_plan.review": "review_request",
         "ui_fanout.gap_draft": "draft_request",
+        "ui_consolidate.plan": "draft_request",
     }
 
     supported_steps = frozenset(
@@ -1419,6 +1420,8 @@ class MetadataActivityHandler:
             return "ui-migration-plan"
         if provider_step.startswith("ui_fanout."):
             return "ui-blueprint-fanout"
+        if provider_step.startswith("ui_consolidate."):
+            return "ui-gap-consolidation"
         raise ValueError("provider telemetry step has no bounded run type")
 
     @staticmethod
