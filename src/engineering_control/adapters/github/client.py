@@ -1283,6 +1283,10 @@ _AUDIT_SEVERITY_ROW = re.compile(r"^\s*│\s*(?:info|low|moderate|high|critical)
 _AUDIT_TABLE_ROWS = 24
 _TABLE_RULING = re.compile(r"\s*[─━┌┐└┘├┤┬┴┼╭╮╰╯│]+[─━┌┐└┘├┤┬┴┼╭╮╰╯│ ]*")
 _PASSING_LINE = re.compile(r"^\s*(?:ok \d+\b|# Subtest:)")
+# NEW-153: TAP "not ok N - name" (top level only), pytest "FAILED path::test" and go test
+# "--- FAIL: name" lines name one failing test each.
+_FAILING_TEST_LINE = re.compile(r"^(?:not ok \d+ - \S|FAILED \S|--- FAIL: \S)")
+_FAILING_TEST_SUMMARY_LINES = 25
 
 
 def failure_excerpt(
@@ -1313,6 +1317,16 @@ def failure_excerpt(
                     row += 1
         elif _FAILURE_LINE.search(line) and not _PASSING_LINE.match(line):
             keep.extend(range(max(0, index - 1), min(len(lines), index + context + 1)))
+    # NEW-153: every failing test first, by name, so a log whose earlier failure-looking
+    # lines (curl --fail, "0 chart(s) failed") fill the context budget still names them all.
+    failing = [line.strip() for line in lines if _FAILING_TEST_LINE.match(line)]
+    header: list[str] = []
+    if failing:
+        shown = failing[:_FAILING_TEST_SUMMARY_LINES]
+        header = [f"Failing tests ({len(failing)}):", *shown]
+        if len(failing) > len(shown):
+            header.append(f"... and {len(failing) - len(shown)} more")
+        header.append("Context:")
     selected: list[str] = []
     last = -2
     for index in sorted(set(keep)):
@@ -1323,9 +1337,9 @@ def failure_excerpt(
             selected.append("...")
         selected.append(lines[index])
         last = index
-        if len(selected) >= max_lines:
+        if len(header) + len(selected) >= max_lines:
             break
-    return "\n".join(selected)[:max_chars]
+    return "\n".join([*header, *selected][:max_lines])[:max_chars]
 
 
 def _audit_table_rows(lines: list[str]) -> set[int]:
