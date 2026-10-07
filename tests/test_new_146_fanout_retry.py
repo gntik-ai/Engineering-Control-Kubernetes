@@ -820,3 +820,20 @@ def test_a_line_starting_multiline_quoted_credential_is_redacted_whole(message: 
     """Review 6: the redactor's line-anchored rule must not run first and leave the tail."""
     assert CREDENTIAL not in error_detail(ValueError(message))
     assert CREDENTIAL not in bounded_detail(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"password=first,{CREDENTIAL}",
+        f'password=\x1b[31m"first\n{CREDENTIAL}"',
+        f"password= [REDACTED] then {CREDENTIAL}",
+        f"step failed: token: abc; secret={CREDENTIAL}",
+    ],
+)
+def test_everything_after_a_credential_assignment_is_redacted(message: str) -> None:
+    """Review 7: punctuation, ANSI codes and an embedded sentinel cannot shield a credential."""
+    assert CREDENTIAL not in error_detail(ValueError(message))
+    detail = bounded_detail(message)
+    assert CREDENTIAL not in detail
+    assert bounded_detail(detail) == detail

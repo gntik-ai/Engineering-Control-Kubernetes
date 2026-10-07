@@ -201,17 +201,18 @@ class SecretRedactor:
 BLOCKER_DETAIL_LIMIT = 300
 
 
-# NEW-146 review 3: a diagnostic detail is one line, and exception or validation text
-# (``[Errno 5] ...``, ``Value error, ...``, ``error: ValueError: ...``) can put any prefix in
-# front of a credential, so the line-anchored assignment rules are applied anywhere in it.
-# Over-redacting a diagnostic is acceptable; leaking a credential is not.
+# NEW-146 (reviews 3-7): a diagnostic detail is free text that exception and validation
+# messages shape arbitrarily (prefixes, quotes, escapes, punctuation, ANSI codes, newlines),
+# so no value grammar is trusted: from the first credential assignment on, the whole rest
+# of the detail is redacted. Over-redacting a diagnostic is acceptable; a partial leak is not.
 _INLINE_CREDENTIAL = re.compile(
     r"(?is)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret"
     r"|encryption[_-]?key|telegram[_-]?bot[_-]?token|client-key-data)\s*[:=]\s*)"
-    # NEW-146 review 4: a quoted value may contain escaped quotes, and an unterminated
-    # quote runs to the end of the detail; both are redacted whole.
-    rf"{_NOT_REDACTED}(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|['\"].*|[^\s,;)\]}}]+)"
+    # No already-redacted exemption: re-redacting is idempotent, and a sentinel inside the
+    # text must not shield what follows it.
+    r"\S.*"
 )
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
 
 def _redact_inline_credentials(text: str) -> str:
@@ -219,10 +220,10 @@ def _redact_inline_credentials(text: str) -> str:
 
 
 def redact_detail_text(text: str, redactor: SecretRedactor | None = None) -> str:
-    """NEW-146 review 6: a diagnostic's credential assignments are redacted whole on the raw
-    text first, and only then by the redactor's rules: a line-anchored rule that runs first
-    blanks only the first line of a multi-line quoted value and would hide the rest."""
-    inline = _redact_inline_credentials(text)
+    """A diagnostic's text with terminal escapes removed and every credential assignment
+    redacted to the end of the detail, before the redactor's own rules run (a rule that
+    ran first could blank only part of a value and hide the rest from this one)."""
+    inline = _redact_inline_credentials(_ANSI_ESCAPE.sub("", text))
     return str((redactor or SecretRedactor()).redact_text(inline).value)
 
 
