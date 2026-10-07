@@ -44,8 +44,9 @@ _ISSUE_URL = re.compile(
 
 # NEW-146 review 1: what a fan-out item write that no longer owns its blueprint returns.
 UI_FANOUT_SUPERSEDED = "UI_FANOUT_SUPERSEDED"
-# NEW-154: merge hops blocker resolution follows (a canonical request may be merged again).
-MAX_MERGE_HOPS = 10
+# NEW-154: merge hops blocker resolution follows (a canonical request may be merged again);
+# consolidation refuses chains longer than this (engineering.ui_gap_consolidation).
+from engineering_control.engineering.ui_gap_consolidation import MAX_MERGE_HOPS  # noqa: E402
 
 
 class ChangeRequestNotFoundError(ValueError):

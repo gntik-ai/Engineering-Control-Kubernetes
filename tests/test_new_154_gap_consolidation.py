@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1183,3 +1183,70 @@ def test_a_cluster_too_large_for_one_issue_is_refused_before_anything_merges(
     assert canonical is not None
     sections = {item["field"]: item["entries"] for item in canonical["ui_context"]["continued"]}
     assert len(sections["acceptance_criteria"]) == 30
+
+
+def _review2_record(member_spec: dict[str, Any], own: dict[str, Any]) -> dict[str, Any]:
+    from engineering_control.engineering.ui_blueprint import FanoutItem
+    from engineering_control.engineering.ui_gap_consolidation import canonical_record
+
+    items = {
+        key: FanoutItem(key, "backend-gap", "u1", "gntik-ai/falcone", (), dict(member_spec))
+        for key in ("gap:a", "gap:b")
+    }
+    return canonical_record(
+        {
+            "cluster_key": "gap:merged-x",
+            "canonical_id": str(uuid4()),
+            "item_kind": "backend-gap",
+            "target_repository": "gntik-ai/falcone",
+            "title": "Merged",
+            "rationale": "Same need.",
+            "members": [
+                {"change_request_id": str(uuid4()), "item_key": key} for key in ("gap:a", "gap:b")
+            ],
+        },
+        member_items=items,
+        variants={key: dict(own) for key in ("gap:a", "gap:b")},
+        blueprint_id=str(uuid4()),
+        blueprint_sha256="d" * 64,
+        project="falcone",
+    )
+
+
+_OWN = {
+    "title": "t",
+    "summary": "s",
+    "why": "w",
+    "what_changes": ["change"],
+    "acceptance_criteria": ["criterion"],
+    "linked": [],
+}
+
+
+def test_a_merge_chain_longer_than_the_resolver_follows_is_refused() -> None:
+    """Review 2: eleven consolidations in a chain broke resolution of the oldest member."""
+    # Inheriting through a member adds that member to the chain: 8 + 1 earlier canonicals,
+    # plus this one, is exactly the 10 hops resolution follows; one more is refused.
+    within = {"variants": [{**_OWN, "item_key": "gap:o", "via": [f"gap:c{n}" for n in range(8)]}]}
+    assert _review2_record(within, _OWN)["spec"]["variants"]
+    beyond = {"variants": [{**_OWN, "item_key": "gap:o", "via": [f"gap:c{n}" for n in range(9)]}]}
+    with pytest.raises(ConsolidationRejected) as refused:
+        _review2_record(beyond, _OWN)
+    assert refused.value.code == "UI_GAP_MERGE_TOO_DEEP"
+
+
+def test_variants_too_large_for_the_drafter_are_refused_never_truncated() -> None:
+    """Review 2: a trailing what_changes requirement was cut from both agents' prompts."""
+    from engineering_control.engineering.ui_blueprint import FanoutItem
+    from engineering_control.engineering.ui_gap_consolidation import canonical_variants_text
+
+    huge = {**_OWN, "what_changes": ["x" * 21_000]}
+    with pytest.raises(ConsolidationRejected) as refused:
+        _review2_record({}, huge)
+    assert refused.value.code == "UI_GAP_CLUSTER_TOO_LARGE"
+    item = FanoutItem("gap:merged-x", "backend-gap", "u1", "gntik-ai/falcone", (),
+                      {"variants": [{"what_changes": ["y" * 41_000]}]})  # fmt: skip
+    with pytest.raises(ConsolidationRejected):
+        canonical_variants_text(item)
+    record = _review2_record({}, _OWN)
+    assert record["spec"]["verbatim_what_changes"] is True

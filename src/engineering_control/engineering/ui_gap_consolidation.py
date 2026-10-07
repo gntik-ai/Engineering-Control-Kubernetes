@@ -68,6 +68,12 @@ UI_GAP_NOTHING_TO_CONSOLIDATE = "UI_GAP_NOTHING_TO_CONSOLIDATE"
 UI_GAP_PLAN_STALE = "UI_GAP_PLAN_STALE"
 # A cluster whose verbatim criteria cannot fit one issue body: split it.
 UI_GAP_CLUSTER_TOO_LARGE = "UI_GAP_CLUSTER_TOO_LARGE"
+UI_GAP_MERGE_TOO_DEEP = "UI_GAP_MERGE_TOO_DEEP"
+# NEW-154 review 2: the merge hops blocker resolution follows (db.change_requests uses it);
+# a consolidation that would make any original request resolve in more hops is refused.
+MAX_MERGE_HOPS = 10
+# NEW-154 review 2: every variant reaches the canonical drafter in full (never truncated).
+CANONICAL_VARIANTS_LIMIT = 40_000
 
 
 class ConsolidationRejected(BlueprintRejected):
@@ -494,24 +500,42 @@ def canonical_record(
         "wave": _earliest(item.wave for item in items),
         "spec": spec,
     }
-    sizes: list[int] = []
-    for verbatim in (True, False):
-        spec["verbatim_what_changes"] = verbatim
-        size = canonical_body_floor(
-            record, blueprint_id=blueprint_id, blueprint_sha256=blueprint_sha256, project=project
+    # NEW-154 review 2: an original request resolves through one hop per canonical in its
+    # variant's chain, plus this one; refuse anything the resolver could not follow.
+    hops = max((len(variant.get("via") or []) + 1 for variant in spec["variants"]), default=1)
+    if hops > MAX_MERGE_HOPS:
+        raise ConsolidationRejected(
+            UI_GAP_MERGE_TOO_DEEP,
+            [
+                f"{cluster['cluster_key']} ({cluster['title']}): merging it would chain "
+                f"{hops} consolidations, over the {MAX_MERGE_HOPS} the blocker resolution "
+                "follows"
+            ],
         )
-        sizes.append(size)
-        if size + CANONICAL_PROPOSAL_RESERVE <= MAXIMUM_ISSUE_BODY_CHARACTERS:
-            return record
+    # NEW-154 review 2: every variant's what_changes and acceptance criteria are always
+    # given verbatim to the drafter (variants) and the reviewer (issue-body continued
+    # sections); a cluster whose variants do not fit both is refused, never truncated.
+    spec["verbatim_what_changes"] = True
+    variants_size = len(_variants_json(spec["variants"]))
+    size = canonical_body_floor(
+        record, blueprint_id=blueprint_id, blueprint_sha256=blueprint_sha256, project=project
+    )
+    if (
+        size + CANONICAL_PROPOSAL_RESERVE <= MAXIMUM_ISSUE_BODY_CHARACTERS
+        and variants_size <= CANONICAL_VARIANTS_LIMIT
+    ):
+        return record
+    sizes = [size]
     criteria = sum(len(entry) for entry in _entries(spec["variants"], "acceptance_criteria"))
     raise ConsolidationRejected(
         UI_GAP_CLUSTER_TOO_LARGE,
         [
             f"{cluster['cluster_key']} ({cluster['title']}): {len(keys)} members carry "
             f"{criteria} characters of acceptance criteria; the canonical issue body needs "
-            f"{sizes[-1]} characters plus {CANONICAL_PROPOSAL_RESERVE} for the proposal, over "
-            f"the {MAXIMUM_ISSUE_BODY_CHARACTERS} limit: split the cluster (plan again with "
-            "--replan, or one kind at a time)"
+            f"{sizes[-1]} characters plus {CANONICAL_PROPOSAL_RESERVE} for the proposal "
+            f"(limit {MAXIMUM_ISSUE_BODY_CHARACTERS}) and its variants take {variants_size} "
+            f"characters for the drafter (limit {CANONICAL_VARIANTS_LIMIT}): split the cluster "
+            "(plan again with --replan, or one kind at a time)"
         ],
     )
 
@@ -638,11 +662,14 @@ def canonical_context(
     )
 
 
-def canonical_variants_text(item: FanoutItem, limit: int = 40_000) -> str:
-    """The members' drafted proposals, for the canonical drafter (bounded)."""
-    text = json.dumps(item.spec.get("variants") or [], indent=1, sort_keys=True, ensure_ascii=False)
-    return (
-        text
-        if len(text) <= limit
-        else text[:limit] + " [truncated: every entry is in the issue body]"
-    )
+def _variants_json(variants: Any) -> str:
+    return json.dumps(variants or [], indent=1, sort_keys=True, ensure_ascii=False)
+
+
+def canonical_variants_text(item: FanoutItem, limit: int = CANONICAL_VARIANTS_LIMIT) -> str:
+    """The members' drafted proposals, in full, for the canonical drafter. The record was
+    sized at plan and apply time; an oversized record is refused, never truncated."""
+    text = _variants_json(item.spec.get("variants"))
+    if len(text) > limit:
+        raise ConsolidationRejected(UI_GAP_CLUSTER_TOO_LARGE, [item.key])
+    return text
