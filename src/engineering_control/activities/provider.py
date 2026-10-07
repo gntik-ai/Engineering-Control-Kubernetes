@@ -35,7 +35,11 @@ from engineering_control.observability.agent import (
     local_worker_host,
     normalize_agent_role,
 )
-from engineering_control.security.redaction import SecretRedactor, bounded_detail
+from engineering_control.security.redaction import (
+    SecretRedactor,
+    bounded_detail,
+    redact_detail_text,
+)
 
 _PYDANTIC_MESSAGE_PREFIX = re.compile(r"^(?:Value error|Assertion failed), ")
 
@@ -51,7 +55,8 @@ def error_detail(error: BaseException, redactor: SecretRedactor | None = None) -
     redactor = redactor or SecretRedactor()
 
     def safe(text: str) -> str:
-        return str(redactor.redact_text(text).value)
+        # NEW-146 review 6: inline credentials first, then the redactor's rules.
+        return redact_detail_text(text, redactor)
 
     def safe_message(text: str) -> str:
         # NEW-146 review 2: pydantic prefixes a validator's own message ("Value error, ",

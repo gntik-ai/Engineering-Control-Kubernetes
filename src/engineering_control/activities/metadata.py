@@ -125,7 +125,11 @@ from engineering_control.retention_limits import (
     NOTIFICATION_OUTBOX_PENDING_STATUS,
     RETAINED_DASHBOARD_EVENT_TYPES,
 )
-from engineering_control.security.redaction import SecretRedactor, bounded_detail
+from engineering_control.security.redaction import (
+    SecretRedactor,
+    bounded_detail,
+    redact_detail_text,
+)
 from engineering_control.workflows.cleanup_scope import (
     CLEANUP_IDENTITY_BLOCKED_PROJECTS,
     CLEANUP_IDENTITY_BLOCKED_SUMMARY,
@@ -1307,7 +1311,7 @@ class MetadataActivityHandler:
                 detail = payload.get("blocker_detail")
                 # Redacted on its own first: a label in front would hide line-anchored rules.
                 summary = (
-                    bounded_detail(f"{blocker}: {SecretRedactor().redact_text(str(detail)).value}")
+                    bounded_detail(f"{blocker}: {redact_detail_text(str(detail))}")
                     if detail
                     else blocker
                 )

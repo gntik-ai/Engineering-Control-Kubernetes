@@ -53,7 +53,7 @@ from engineering_control.engineering.ui_blueprint import (
     ui_fanout_workflow_id,
 )
 from engineering_control.models.core import AgentRequest
-from engineering_control.security.redaction import BLOCKER_DETAIL_LIMIT, REDACTED
+from engineering_control.security.redaction import BLOCKER_DETAIL_LIMIT, REDACTED, bounded_detail
 from engineering_control.workflows.definitions import UiBlueprintFanOutWorkflow
 from engineering_control.workflows.inputs import UiBlueprintFanOutInput
 
@@ -806,3 +806,17 @@ def test_a_quoted_credential_split_across_lines_is_redacted_whole(message: str) 
     """Review 5: an escaped newline or a multi-line unterminated quote must not leak."""
     detail = error_detail(ValueError(message))
     assert CREDENTIAL not in detail and REDACTED in detail
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f'token="unterminated\n{CREDENTIAL}',
+        f'password="first\\\n{CREDENTIAL}"',
+        f"client_secret='a\\\n{CREDENTIAL}'",
+    ],
+)
+def test_a_line_starting_multiline_quoted_credential_is_redacted_whole(message: str) -> None:
+    """Review 6: the redactor's line-anchored rule must not run first and leave the tail."""
+    assert CREDENTIAL not in error_detail(ValueError(message))
+    assert CREDENTIAL not in bounded_detail(message)

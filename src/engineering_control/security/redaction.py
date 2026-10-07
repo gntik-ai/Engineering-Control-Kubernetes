@@ -214,6 +214,18 @@ _INLINE_CREDENTIAL = re.compile(
 )
 
 
+def _redact_inline_credentials(text: str) -> str:
+    return _INLINE_CREDENTIAL.sub(lambda match: f"{match.group(1)}{REDACTED}", text)
+
+
+def redact_detail_text(text: str, redactor: SecretRedactor | None = None) -> str:
+    """NEW-146 review 6: a diagnostic's credential assignments are redacted whole on the raw
+    text first, and only then by the redactor's rules: a line-anchored rule that runs first
+    blanks only the first line of a multi-line quoted value and would hide the rest."""
+    inline = _redact_inline_credentials(text)
+    return str((redactor or SecretRedactor()).redact_text(inline).value)
+
+
 def bounded_detail(
     text: str, redactor: SecretRedactor | None = None, *, limit: int = BLOCKER_DETAIL_LIMIT
 ) -> str:
@@ -222,13 +234,11 @@ def bounded_detail(
     Redacted before it is cut, so a cut never leaves part of a secret unrecognised. Besides
     the redactor's rules, credential assignments are redacted anywhere in the line, so a
     label or an exception's own prefix in front of ``password=...`` cannot hide it."""
-    redacted = str((redactor or SecretRedactor()).redact_text(text).value)
-    # NEW-146 review 5: the inline rule spans newlines (DOTALL) and runs both before and
-    # after the detail is flattened to one line, so a quoted value split across lines is
-    # redacted whole.
-    redacted = _INLINE_CREDENTIAL.sub(lambda match: f"{match.group(1)}{REDACTED}", redacted)
+    # NEW-146 reviews 5-6: inline credentials (spanning newlines) are redacted on the raw
+    # text before the redactor's rules, and again after flattening to one line.
+    redacted = redact_detail_text(text, redactor)
     line = " ".join(redacted.split())
-    line = _INLINE_CREDENTIAL.sub(lambda match: f"{match.group(1)}{REDACTED}", line)
+    line = _redact_inline_credentials(line)
     if len(line) > limit:
         line = line[: limit - 3].rstrip() + "..."
     return line
