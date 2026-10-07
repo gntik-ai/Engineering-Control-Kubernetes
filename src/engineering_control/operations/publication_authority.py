@@ -274,7 +274,7 @@ class PublicationAuthorityRepository:
             # NEW-115: the issue revision this run loaded (an operator amendment applies
             # only to runs loaded after it).
             approved_body_sha256, approved_updated_at = consumed_issue_revision(
-                change_set, run, issue
+                session, change_set, run, issue
             )
             observation = request.observation
             if (

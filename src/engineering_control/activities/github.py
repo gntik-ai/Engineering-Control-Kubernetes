@@ -67,6 +67,16 @@ ISSUE_BODY_REAPPROVAL_GUIDANCE = (
 )
 
 
+def observed_issue_labels(values: list[Any]) -> list[str]:
+    """Label names as the import classifies them: truncated, stripped, lower case, sorted."""
+    names = (
+        str(item.get("name", ""))[:120]
+        for item in values
+        if isinstance(item, dict) and item.get("name")
+    )
+    return sorted({name.strip().lower() for name in names if name.strip()})
+
+
 class GitHubActivityHandler:
     """Run only typed gh broker activities under the authenticated broker identity."""
 
@@ -166,6 +176,13 @@ class GitHubActivityHandler:
             **(
                 {"title_sha256": hashlib.sha256(value["title"].encode()).hexdigest()}
                 if isinstance(value.get("title"), str)
+                else {}
+            ),
+            # NEW-150: the risk-classification labels, normalized as the backlog import
+            # records them (BacklogIssueRecord.labels_json).
+            **(
+                {"labels": observed_issue_labels(value["labels"])}
+                if isinstance(value.get("labels"), list) and len(value["labels"]) <= 100
                 else {}
             ),
         }

@@ -15,31 +15,75 @@ from test_issue_delivery_approval import _child, _dispose
 from test_new_115_issue_amend import (
     APPROVED,
     EDITED,
+    TITLE,
     _amend,
     _api,
     _approved,
+    _Broker,
     _Client,
     _headers,
-    _refresh,
     _sha,
 )
 
+from engineering_control.activities.github import GitHubActivityHandler
 from engineering_control.cli import dispatch, parser
 from engineering_control.config import Settings
-from engineering_control.db.models import BacklogIssueRecord, ChangeSet, DashboardEvent, Run
+from engineering_control.db.models import (
+    BacklogIssueRecord,
+    ChangeSet,
+    DashboardEvent,
+    Run,
+    Step,
+)
 from engineering_control.operations.issue_amend import (
     AMENDMENT_KEY,
-    ISSUE_TOUCH_REFRESHES_KEY,
+    TOUCH_REFRESH_STEP,
     IssueAmendBlocked,
     consumed_issue_revision,
     effective_issue_revision,
     touch_refresh_binding,
+    touch_refresh_step_id,
 )
 from engineering_control.operations.repository import OperationsRepository
 
 # The fixtures import the issue "now"; a touch is always later.
 TOUCHED = "2099-10-07T07:41:11Z"
 TOUCHED_AT = datetime(2099, 10, 7, 7, 41, 11, tzinfo=UTC)
+
+
+def _labels(operations: Any) -> list[str]:
+    with operations.sessions() as session:
+        return list(session.scalar(select(BacklogIssueRecord)).labels_json)
+
+
+async def _observe(
+    tmp_path: Path,
+    operations: Any,
+    body: str,
+    *,
+    labels: list[str] | None = None,
+    title: str = TITLE,
+    updated: str = TOUCHED,
+) -> dict[str, Any]:
+    """The GitHub worker's issue read (the observation workflow's activity)."""
+    handler = GitHubActivityHandler(Settings(_env_file=None, run_root=tmp_path / "gh-runs"))
+    broker = _Broker(body, title=title, updated=updated)
+    broker.value["labels"] = [
+        {"name": name} for name in (_labels(operations) if labels is None else labels)
+    ]
+    handler.broker = broker  # type: ignore[assignment]
+    return await handler.handle(
+        "delivery.refresh_issue_body", {"issue_repository": "gntik-ai/falcone", "issue_number": 42}
+    )
+
+
+def _steps(operations: Any) -> list[Step]:
+    with operations.sessions() as session:
+        return list(
+            session.scalars(
+                select(Step).where(Step.name == TOUCH_REFRESH_STEP).order_by(Step.created_at)
+            ).all()
+        )
 
 
 async def _touch(operations: Any, observation: dict[str, Any], confirm: str | None, **kw: Any):
@@ -83,7 +127,7 @@ def _state(operations: Any) -> tuple[Any, ...]:
         change_set = session.scalar(select(ChangeSet))
         run = session.scalar(select(Run).where(Run.change_set_id == change_set.id))
         effective = effective_issue_revision(issue)
-        consumed = consumed_issue_revision(change_set, run, issue)
+        consumed = consumed_issue_revision(session, change_set, run, issue)
         return (
             (effective[0], _u(effective[1])),
             (consumed[0], _u(consumed[1])),
@@ -99,7 +143,7 @@ async def test_refresh_mid_delivery_rebinds_only_the_revision_time(tmp_path: Pat
     operations = values[0]
     (approved, imported_at), consumed, import_sha, import_at, recorded = _state(operations)
     assert approved == _sha(APPROVED) and consumed == (approved, imported_at)
-    touched = await _refresh(tmp_path, APPROVED, updated=TOUCHED)
+    touched = await _observe(tmp_path, operations, APPROVED, updated=TOUCHED)
     # issue-amend is refused for a delivery that produced work.
     with pytest.raises(IssueAmendBlocked, match="ISSUE_AMEND_DELIVERY_ACTIVE"):
         await _amend(operations, touched, None)
@@ -126,12 +170,16 @@ async def test_refresh_mid_delivery_rebinds_only_the_revision_time(tmp_path: Pat
     # History is kept: the import, the run's loaded record and approval snapshots.
     assert (now_import_sha, now_import_at, now_recorded) == (import_sha, import_at, recorded)
     assert recorded["run_id"] == loaded["run_id"]
+    (step,) = _steps(operations)
+    entry = step.result_json
+    assert str(step.run_id) == loaded["run_id"] == entry["run_id"]
+    assert applied["refreshed_runs"] == [loaded["run_id"]]
+    assert entry["previous_updated_at"] == imported_at.astimezone(UTC).isoformat()
+    assert entry["updated_at"] == TOUCHED_AT.isoformat()
+    assert entry["refreshed_by"] == "telegram:42"
     with operations.sessions() as session:
         change_set = session.scalar(select(ChangeSet))
-        (entry,) = change_set.recovery_json[ISSUE_TOUCH_REFRESHES_KEY]
-        assert entry["previous_updated_at"] == imported_at.astimezone(UTC).isoformat()
-        assert entry["updated_at"] == TOUCHED_AT.isoformat()
-        assert entry["refreshed_by"] == "telegram:42" and entry["run_id"] == loaded["run_id"]
+        assert "issue_touch_refreshes" not in change_set.recovery_json
         amendment = session.scalar(select(BacklogIssueRecord)).github_snapshot_json[AMENDMENT_KEY]
         assert amendment["change"] == "TOUCH_REFRESHED"
         assert amendment["amendment_count"] == 0 and amendment["touch_refresh_count"] == 1
@@ -157,24 +205,26 @@ async def test_refresh_mid_delivery_rebinds_only_the_revision_time(tmp_path: Pat
 async def test_changed_body_or_title_or_closed_issue_is_refused(tmp_path: Path) -> None:
     values, _loaded = await _running(tmp_path)
     operations = values[0]
-    edited = await _refresh(tmp_path, EDITED, updated=TOUCHED)
+    edited = await _observe(tmp_path, operations, EDITED, updated=TOUCHED)
     for confirm in (None, "a" * 12):
         with pytest.raises(IssueAmendBlocked) as raised:
             await _touch(operations, edited, confirm)
         assert raised.value.blocker == "ISSUE_TOUCH_REFRESH_BODY_CHANGED"
         assert "issue-amend" in raised.value.detail
-    retitled = await _refresh(tmp_path, APPROVED, title="Another title", updated=TOUCHED)
+    retitled = await _observe(
+        tmp_path, operations, APPROVED, title="Another title", updated=TOUCHED
+    )
     with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_TITLE_CHANGED"):
         await _touch(operations, retitled, None)
-    untitled = {**await _refresh(tmp_path, APPROVED, updated=TOUCHED)}
+    untitled = {**await _observe(tmp_path, operations, APPROVED, updated=TOUCHED)}
     untitled.pop("title_sha256")
     with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_TITLE_UNAVAILABLE"):
         await _touch(operations, untitled, None)
-    touched = await _refresh(tmp_path, APPROVED, updated=TOUCHED)
+    touched = await _observe(tmp_path, operations, APPROVED, updated=TOUCHED)
     for state in ("CLOSED", None):
         with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_ISSUE_CLOSED"):
             await _touch(operations, {**touched, "issue_state": state}, None)
-    older = await _refresh(tmp_path, APPROVED, updated="2020-01-01T00:00:00Z")
+    older = await _observe(tmp_path, operations, APPROVED, updated="2020-01-01T00:00:00Z")
     with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_REVISION_STALE"):
         await _touch(operations, older, None)
     with operations.sessions.begin() as session:
@@ -190,7 +240,7 @@ async def test_changed_body_or_title_or_closed_issue_is_refused(tmp_path: Path) 
     with operations.sessions() as session:
         issue = session.scalar(select(BacklogIssueRecord))
         assert AMENDMENT_KEY not in issue.github_snapshot_json
-        assert ISSUE_TOUCH_REFRESHES_KEY not in session.scalar(select(ChangeSet)).recovery_json
+    assert _steps(operations) == []
     assert _events(operations) == []
     _dispose(values)
 
@@ -199,7 +249,7 @@ async def test_changed_body_or_title_or_closed_issue_is_refused(tmp_path: Path) 
 async def test_non_operators_and_wrong_confirmations_are_refused(tmp_path: Path) -> None:
     values, _loaded = await _running(tmp_path)
     operations = values[0]
-    touched = await _refresh(tmp_path, APPROVED, updated=TOUCHED)
+    touched = await _observe(tmp_path, operations, APPROVED, updated=TOUCHED)
     preview = await _touch(operations, touched, None)
     for actor in ("dashboard", "engineering-ctl:root", "telegram:allowlisted"):
         with pytest.raises(ValueError, match="allowlisted operator"):
@@ -210,7 +260,7 @@ async def test_non_operators_and_wrong_confirmations_are_refused(tmp_path: Path)
     with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_CONFIRMATION_MISMATCH"):
         await _touch(operations, touched, _sha(APPROVED)[:12])
     # Touched again between preview and confirmation.
-    later = await _refresh(tmp_path, APPROVED, updated="2099-10-07T08:00:00Z")
+    later = await _observe(tmp_path, operations, APPROVED, updated="2099-10-07T08:00:00Z")
     with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_CONFIRMATION_MISMATCH"):
         await _touch(operations, later, preview["confirm_with"])
     assert _events(operations) == []
@@ -230,7 +280,7 @@ async def test_refresh_applies_to_legacy_and_amended_revisions(tmp_path: Path) -
         recovery = dict(change_set.recovery_json)
         recovery.pop("issue_body_revision")
         change_set.recovery_json = recovery
-    touched = await _refresh(tmp_path, APPROVED, updated=TOUCHED)
+    touched = await _observe(tmp_path, operations, APPROVED, updated=TOUCHED)
     preview = await _touch(operations, touched, None)
     assert preview["consumed_revision"] == "STALE"
     await _touch(operations, touched, preview["confirm_with"])
@@ -248,7 +298,7 @@ async def test_refresh_applies_to_legacy_and_amended_revisions(tmp_path: Path) -
                 "updated_at": "2026-09-01T00:00:00+00:00",
             },
         }
-    later = await _refresh(tmp_path, APPROVED, updated="2099-10-07T09:00:00Z")
+    later = await _observe(tmp_path, operations, APPROVED, updated="2099-10-07T09:00:00Z")
     preview = await _touch(operations, later, None)
     assert preview["consumed_revision"] == "BODY_DIFFERS"
     applied = await _touch(operations, later, preview["confirm_with"])
@@ -262,7 +312,7 @@ async def test_refresh_applies_to_legacy_and_amended_revisions(tmp_path: Path) -
 async def test_the_next_delivery_load_consumes_the_refreshed_revision(tmp_path: Path) -> None:
     values = await _approved(tmp_path)
     operations, _metadata, engineering, handler, payload, _registered, child_payload = values
-    touched = await _refresh(tmp_path, APPROVED, updated=TOUCHED)
+    touched = await _observe(tmp_path, operations, APPROVED, updated=TOUCHED)
     preview = await _touch(operations, touched, None)
     await _touch(operations, touched, preview["confirm_with"])
     retry_payload = {**payload, "child_workflow_id": "backlog-fixture-parent-issue-1-retry-1"}
@@ -286,7 +336,7 @@ async def test_the_next_delivery_load_consumes_the_refreshed_revision(tmp_path: 
     handler._release_delivery_leases(
         {"run_id": reloaded["run_id"], "blocker": "ISSUE_BODY_CHANGED_SINCE_APPROVAL"}
     )
-    edited = await _refresh(tmp_path, EDITED, updated="2099-10-07T10:00:00Z")
+    edited = await _observe(tmp_path, operations, EDITED, updated="2099-10-07T10:00:00Z")
     amended = await _amend(operations, edited, _sha(EDITED)[:12])
     assert amended["status"] == "AMENDED"
     assert amended["approved_updated_at"] == TOUCHED_AT.isoformat()
@@ -296,42 +346,152 @@ async def test_the_next_delivery_load_consumes_the_refreshed_revision(tmp_path: 
     _dispose(values)
 
 
-def test_touch_refresh_records_fail_closed() -> None:
-    change_set = ChangeSet(id=uuid4(), recovery_json={})
-    issue = BacklogIssueRecord(body_sha256="a" * 64, github_updated_at=TOUCHED_AT)
-    run = Run(id=uuid4())
-    assert consumed_issue_revision(change_set, run, issue) == ("a" * 64, TOUCHED_AT)
-    later = TOUCHED_AT + timedelta(hours=1)
-    entry: dict[str, Any] = {
-        "version": 1,
-        "body_sha256": "a" * 64,
-        "previous_updated_at": TOUCHED_AT.isoformat(),
-        "updated_at": later.isoformat(),
-    }
-    entry["binding_sha256"] = touch_refresh_binding(change_set.id, entry)
-    other = {**entry, "body_sha256": "b" * 64, "updated_at": (later + timedelta(1)).isoformat()}
-    other["binding_sha256"] = touch_refresh_binding(change_set.id, other)
-    change_set.recovery_json = {ISSUE_TOUCH_REFRESHES_KEY: [entry, other]}
-    assert consumed_issue_revision(change_set, run, issue) == ("a" * 64, later)
-    # Never backwards: a run that recorded a newer time keeps it.
-    newest = later + timedelta(hours=2)
-    change_set.recovery_json = {
-        ISSUE_TOUCH_REFRESHES_KEY: [entry],
-        "issue_body_revision": {
-            "run_id": str(run.id),
-            "body_sha256": "a" * 64,
-            "updated_at": newest.isoformat(),
-        },
-    }
-    assert consumed_issue_revision(change_set, run, issue) == ("a" * 64, newest)
-    for tampered in (
-        [{**entry, "updated_at": (later + timedelta(days=9)).isoformat()}],
-        [{**entry, "binding_sha256": touch_refresh_binding(uuid4(), entry)}],
-        {"not": "a list"},
-    ):
-        change_set.recovery_json = {ISSUE_TOUCH_REFRESHES_KEY: tampered}
+@pytest.mark.asyncio
+async def test_label_changes_are_refused_and_bound_into_the_token(tmp_path: Path) -> None:
+    """A label can raise the risk class (e.g. security): only an identical set refreshes."""
+    values, _loaded = await _running(tmp_path)
+    operations = values[0]
+    approved = _labels(operations)
+    for labels in ([*approved, "security"], [*approved, "severity:high"], approved[1:]):
+        if labels == approved:
+            continue
+        changed = await _observe(tmp_path, operations, APPROVED, labels=labels)
+        for confirm in (None, "a" * 12):
+            with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_LABELS_CHANGED"):
+                await _touch(operations, changed, confirm)
+    missing = {**await _observe(tmp_path, operations, APPROVED)}
+    missing.pop("labels")
+    with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_LABELS_UNAVAILABLE"):
+        await _touch(operations, missing, None)
+    # Case, whitespace and order are normalized as the import does.
+    same = await _observe(
+        tmp_path, operations, APPROVED, labels=[f"  {name.upper()} " for name in approved[::-1]]
+    )
+    preview = await _touch(operations, same, None)
+    assert preview["status"] == "PREVIEW" and preview["labels"] == sorted(approved)
+    # The token binds the label set: a preview of one set never confirms another.
+    relabeled = {**same, "labels": [*same["labels"], "zz-unrelated"]}
+    with operations.sessions.begin() as session:
+        issue = session.scalar(select(BacklogIssueRecord))
+        issue.labels_json = [*issue.labels_json, "zz-unrelated"]
+    with pytest.raises(IssueAmendBlocked, match="ISSUE_TOUCH_REFRESH_CONFIRMATION_MISMATCH"):
+        await _touch(operations, relabeled, preview["confirm_with"])
+    assert _steps(operations) == [] and _events(operations) == []
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_survives_a_concurrent_recovery_writer(tmp_path: Path) -> None:
+    """A recovery_json read-modify-write (e.g. _record_validation_findings) that read
+    before the refresh committed and wrote after it cannot drop the refresh."""
+    values, _loaded = await _running(tmp_path)
+    operations, handler = values[0], values[3]
+    with handler.sessions() as session:
+        change_set = session.scalar(select(ChangeSet))
+        stale = dict(change_set.recovery_json)
+        change_set_id = change_set.id
+    touched = await _observe(tmp_path, operations, APPROVED)
+    preview = await _touch(operations, touched, None)
+    assert (await _touch(operations, touched, preview["confirm_with"]))["status"] == "REFRESHED"
+    with handler.sessions.begin() as session:
+        change_set = session.get(ChangeSet, change_set_id)
+        change_set.recovery_json = {**stale, "validation_findings": {"findings": ["x"]}}
+    assert _state(operations)[1] == (_sha(APPROVED), TOUCHED_AT)
+    assert len(_steps(operations)) == 1
+    _dispose(values)
+
+
+@pytest.mark.asyncio
+async def test_touch_refresh_records_are_run_bound_and_fail_closed(tmp_path: Path) -> None:
+    values, loaded = await _running(tmp_path)
+    operations = values[0]
+    touched = await _observe(tmp_path, operations, APPROVED)
+    preview = await _touch(operations, touched, None)
+    await _touch(operations, touched, preview["confirm_with"])
+    (step,) = _steps(operations)
+    value = dict(step.result_json)
+    # Never committed: every change below is rolled back with the session.
+    with operations.sessions() as session:
+        change_set = session.scalar(select(ChangeSet))
+        run_a = session.get(Run, step.run_id)
+        # Another delivery run (of another ChangeSet B, or the same one).
+        run_b = Run(
+            id=uuid4(),
+            workflow_id="fixture-other-run",
+            run_type=run_a.run_type,
+            status="RUNNING",
+            project=run_a.project,
+            change_set_id=change_set.id,
+        )
+        session.add(run_b)
+        session.flush()
+        other_change_set = ChangeSet(id=uuid4())
+        issue = session.scalar(select(BacklogIssueRecord))
+        imported = issue.body_sha256, issue.github_updated_at
+
+        def consumed(target_change_set: ChangeSet, run: Run) -> tuple[str, datetime]:
+            sha, at = consumed_issue_revision(session, target_change_set, run, issue)
+            return sha, _u(at)
+
+        # The copy attack: A's record under B's identity, keeping A's change_set_id field
+        # and its original binding (or a binding recomputed with A's ids in the fields).
+        copied = Step(
+            id=touch_refresh_step_id(other_change_set.id, run_b.id, TOUCHED_AT),
+            run_id=run_b.id,
+            name=TOUCH_REFRESH_STEP,
+            ordinal=0,
+            status="COMPLETE",
+            idempotency_key="copied",
+            attempt=1,
+            result_json={**value, "run_id": str(run_b.id), "step_id": None},
+        )
+        copied.result_json["step_id"] = str(copied.id)
+        session.add(copied)
+        session.flush()
+        other_change_set.recovery_json = {}
         with pytest.raises(ValueError, match="touch refresh record is invalid"):
-            consumed_issue_revision(change_set, run, issue)
+            consumed(other_change_set, run_b)
+        assert touch_refresh_binding(
+            other_change_set.id, run_b.id, copied.id, copied.result_json
+        ) != touch_refresh_binding(change_set.id, run_b.id, copied.id, copied.result_json)
+        assert value["binding_sha256"] == touch_refresh_binding(
+            change_set.id, run_a.id, step.id, {**value, "change_set_id": "forged"}
+        )
+        copied.result_json = {**copied.result_json, "change_set_id": str(other_change_set.id)}
+        with pytest.raises(ValueError, match="touch refresh record is invalid"):
+            consumed(other_change_set, run_b)
+        session.delete(copied)
+        session.flush()
+        # A refresh of run A never applies to another run of the same ChangeSet.
+        change_set.recovery_json = {
+            **change_set.recovery_json,
+            "issue_body_revision": {
+                "run_id": str(run_b.id),
+                "body_sha256": imported[0],
+                "updated_at": _u(imported[1]).isoformat(),
+            },
+        }
+        assert consumed(change_set, run_b) == (imported[0], _u(imported[1]))
+        change_set.recovery_json = {
+            **change_set.recovery_json,
+            "issue_body_revision": {**change_set.recovery_json["issue_body_revision"]}
+            | {"run_id": loaded["run_id"]},
+        }
+        assert consumed(change_set, run_a) == (imported[0], TOUCHED_AT)
+        # Tampered records of the run fail closed.
+        row = session.get(Step, step.id)
+        for tampered in (
+            {**value, "updated_at": (TOUCHED_AT + timedelta(days=9)).isoformat()},
+            {**value, "body_sha256": "b" * 64},
+            {**value, "binding_sha256": "0" * 64},
+            {**value, "version": 2},
+            {**value, "updated_at": "not a time"},
+        ):
+            row.result_json = tampered
+            session.flush()
+            with pytest.raises(ValueError, match="touch refresh record is invalid"):
+                consumed(change_set, run_a)
+    _dispose(values)
 
 
 @pytest.mark.asyncio
@@ -360,8 +520,9 @@ async def test_touched_issue_publishes_after_the_refresh(tmp_path: Path) -> None
         assert refused["blocker"] == "PUBLICATION_AUTHORITY_DENIED_OR_UNVERIFIED", refused
         assert runner.pushes == []
 
-        observation = await _refresh(
+        observation = await _observe(
             tmp_path,
+            operations,
             fixture.issue_snapshot["body"],
             title=fixture.issue_snapshot["title"],
             updated=touched_at.isoformat().replace("+00:00", "Z"),

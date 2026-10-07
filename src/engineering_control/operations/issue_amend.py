@@ -17,7 +17,7 @@ import hashlib
 import re
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -52,8 +52,6 @@ AMEND_REASON = "issue amended"
 AMEND_EVENT_TYPE = "issue_body_amended"
 # ChangeSet.recovery_json: the issue revision the current delivery run loaded.
 ISSUE_BODY_REVISION_KEY = "issue_body_revision"
-# ChangeSet.recovery_json: NEW-150 operator touch refreshes (append-only).
-ISSUE_TOUCH_REFRESHES_KEY = "issue_touch_refreshes"
 _RISK_RANK = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 CONFIRMATION_PATTERN = re.compile(r"[a-f0-9]{12,64}")
 DIFF_LINE_LIMIT = 60
@@ -543,16 +541,19 @@ def amend_issue(
 
 
 def consumed_issue_revision(
-    change_set: ChangeSet, run: Run, issue: BacklogIssueRecord
+    session: Session, change_set: ChangeSet, run: Run, issue: BacklogIssueRecord
 ) -> tuple[str, datetime]:
     """The issue revision the publishing delivery run actually loaded (and refreshed to).
 
     delivery.load_confirmed_finding records it under the delivery-startup lock; a later
     amendment never re-binds a run that started from the previous text. ChangeSets loaded
-    before this record existed keep the imported revision."""
+    before this record existed keep the imported revision. NEW-150 operator touch
+    refreshes of this run (:func:`touch_refreshed_revision`) move only its revision time."""
     recorded = (change_set.recovery_json or {}).get(ISSUE_BODY_REVISION_KEY)
     if recorded is None:
-        return touch_refreshed_revision(change_set, issue.body_sha256, issue.github_updated_at)
+        return touch_refreshed_revision(
+            session, change_set, run, issue.body_sha256, issue.github_updated_at
+        )
     if (
         not isinstance(recorded, dict)
         or recorded.get("run_id") != str(run.id)
@@ -562,50 +563,84 @@ def consumed_issue_revision(
     ):
         raise ValueError("publication run did not load the approved issue revision")
     return touch_refreshed_revision(
-        change_set, recorded["body_sha256"], datetime.fromisoformat(recorded["updated_at"])
+        session,
+        change_set,
+        run,
+        recorded["body_sha256"],
+        datetime.fromisoformat(recorded["updated_at"]),
     )
 
 
-def touch_refresh_binding(change_set_id: UUID, value: dict[str, Any]) -> str:
-    """The binding of one NEW-150 touch refresh recorded on a ChangeSet."""
+# NEW-150: one insert-only Step per operator touch refresh of one delivery run. Kept out of
+# the shared ChangeSet.recovery_json, whose read-modify-write writers could drop it.
+TOUCH_REFRESH_STEP = "delivery.issue_touch_refresh"
+_TOUCH_REFRESH_TRUSTED = ("change_set_id", "run_id", "step_id")
+
+
+def touch_refresh_step_id(change_set_id: UUID, run_id: UUID, updated_at: datetime) -> UUID:
+    """The deterministic record of one refresh of one run to one GitHub revision."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"issue-touch-refresh:{change_set_id}:{run_id}:{_utc(updated_at).isoformat()}",
+    )
+
+
+def touch_refresh_binding(
+    change_set_id: UUID, run_id: UUID, step_id: UUID, value: dict[str, Any]
+) -> str:
+    """The binding of one touch refresh, over the trusted row identity.
+
+    The trusted ids come last, so a copied record can never supply its own; the reader also
+    requires the record's copies of them to equal the row it was read from."""
     return canonical_sha256(
         {
+            **{
+                key: item
+                for key, item in value.items()
+                if key != "binding_sha256" and key not in _TOUCH_REFRESH_TRUSTED
+            },
             "change_set_id": str(change_set_id),
-            **{key: item for key, item in value.items() if key != "binding_sha256"},
+            "run_id": str(run_id),
+            "step_id": str(step_id),
         }
     )
 
 
 def touch_refreshed_revision(
-    change_set: ChangeSet, body_sha256: str, updated_at: datetime
+    session: Session, change_set: ChangeSet, run: Run, body_sha256: str, updated_at: datetime
 ) -> tuple[str, datetime]:
-    """NEW-150: a consumed revision with the operator's touch refreshes applied.
+    """NEW-150: a run's consumed revision with the operator's touch refreshes applied.
 
     A GitHub edit that restores the exact text (same body hash) still moves the issue's
-    ``updated_at``. Each refresh (``engineering-ctl issue-touch-refresh``) is appended to
-    the ChangeSet and names the body hash it re-observed; it moves the revision time of a
-    run that consumed exactly that body forward, never the body. The run's own record
-    stays as loaded; a malformed refresh fails closed."""
-    refreshes = (change_set.recovery_json or {}).get(ISSUE_TOUCH_REFRESHES_KEY)
-    if refreshes is None:
-        return body_sha256, updated_at
-    if not isinstance(refreshes, list):
-        raise ValueError("issue touch refresh record is invalid")
+    ``updated_at``. Each refresh (``engineering-ctl issue-touch-refresh``) is an
+    insert-only Step of the run that consumed the revision, naming the body hash it
+    re-observed; it moves that run's revision time forward for exactly that body, never
+    the body. The run's own record stays as loaded; a malformed refresh fails closed."""
     current = _utc(updated_at)
-    for value in refreshes:
-        if (
-            not isinstance(value, dict)
-            or value.get("version") != 1
-            or not isinstance(value.get("body_sha256"), str)
-            or not _SHA256.fullmatch(value["body_sha256"])
-            or not isinstance(value.get("updated_at"), str)
-            or value.get("binding_sha256") != touch_refresh_binding(change_set.id, value)
-        ):
-            raise ValueError("issue touch refresh record is invalid")
+    rows = session.scalars(
+        select(Step)
+        .where(Step.run_id == run.id, Step.name == TOUCH_REFRESH_STEP)
+        .order_by(Step.created_at, Step.id)
+    ).all()
+    for row in rows:
+        value = row.result_json if isinstance(row.result_json, dict) else {}
         try:
-            refreshed = _utc(datetime.fromisoformat(value["updated_at"]))
+            refreshed = _utc(datetime.fromisoformat(str(value.get("updated_at"))))
         except ValueError as error:
             raise ValueError("issue touch refresh record is invalid") from error
+        if (
+            row.status != "COMPLETE"
+            or value.get("version") != 1
+            or value.get("change_set_id") != str(change_set.id)
+            or value.get("run_id") != str(run.id)
+            or value.get("step_id") != str(row.id)
+            or row.id != touch_refresh_step_id(change_set.id, run.id, refreshed)
+            or not isinstance(value.get("body_sha256"), str)
+            or not _SHA256.fullmatch(value["body_sha256"])
+            or value.get("binding_sha256")
+            != touch_refresh_binding(change_set.id, run.id, row.id, value)
+        ):
+            raise ValueError("issue touch refresh record is invalid")
         if value["body_sha256"] == body_sha256 and refreshed > current:
             current = refreshed
     return body_sha256, current
