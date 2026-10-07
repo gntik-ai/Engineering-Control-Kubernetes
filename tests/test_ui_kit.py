@@ -49,8 +49,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = ROOT / "config" / "projects"
 STUB = ROOT / "tests" / "fixtures" / "ui_kit_stub_server.py"
 IMAGE = "ghcr.io/gntik-ai/gntik-ui-mcp"
-DIGEST = "sha256:4613adab5939872306a11d8b428e6cab14ace498855212f20a8859a5b7e1ef63"
-VERSION = "0.0.0-canary-20261003230037"
+DIGEST = "sha256:c6b0d08975006af334c73a18ccd3c291d01be478f2821d21b89d852f205f900b"
+VERSION = "0.2.0"
 
 
 def _policy() -> UiMigrationPolicy:

@@ -168,14 +168,16 @@ def test_a_finding_repeated_in_the_latest_round_survives_the_bound() -> None:
 
 def test_part_ids_and_provenance_are_unchanged() -> None:
     # Pinned from origin/main 62400f4: NEW-139 changes prompt text only.
+    # NEW-149 (2026-10-07) deliberately changed the decisions and seed findings (gntik-ui
+    # 0.2.0 replaces the canary pin): new values below; the approved blueprint is final data.
     assert ui_plan.decisions_sha256() == (
-        "249211f3fa2108b6a9d2289773cf3d1846557b9173b1fe3e4128d0584357bbc6"
+        "d7b472a4c8c34c868888d7a2835eebe3f44d4cec2dbf437e69df42514f7d86da"
     )
     provenance = ui_plan.part_provenance("p" * 64)
-    assert provenance == "8115fa5bcf8c6c1ff0510e029518d9b4da829a4c6227ba3b4905e6d64a11d6c5"
+    assert provenance == "f913a843f1baf9376bf876720e7aa5024c647bda5cf414075337e5b222c47a20"
     assert frame_part_id("c" * 64, "k" * 64, ["a-page", "b-page"], provenance) == (
-        "frame-f65edf2a8b2216a5"
+        "frame-2f38a18b6a93c05e"
     )
     assert batch_part_id(1, "c" * 64, "k" * 64, ["a-page"], "f" * 64, provenance) == (
-        "b001-e6b7bdc5af68cfe1"
+        "b001-9b508acf616d7c28"
     )

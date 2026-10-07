@@ -423,11 +423,14 @@ def test_previous_run_findings_are_labelled_and_bounded() -> None:
 
 def test_part_ids_are_unchanged() -> None:
     # Pinned from origin/main ed92f1d (as in NEW-139): continuation changes no id input.
+    # NEW-149 (2026-10-07) deliberately changed the operator decisions and seed findings
+    # (gntik-ui stable 0.2.0 replaces the canary pin), so part ids of FUTURE plans change;
+    # the approved blueprint is final data and its fan-out never recomputes part ids.
     provenance = ui_plan.part_provenance("p" * 64)
-    assert provenance == "8115fa5bcf8c6c1ff0510e029518d9b4da829a4c6227ba3b4905e6d64a11d6c5"
+    assert provenance == "f913a843f1baf9376bf876720e7aa5024c647bda5cf414075337e5b222c47a20"
     assert frame_part_id("c" * 64, "k" * 64, ["a-page", "b-page"], provenance) == (
-        "frame-f65edf2a8b2216a5"
+        "frame-2f38a18b6a93c05e"
     )
     assert batch_part_id(1, "c" * 64, "k" * 64, ["a-page"], "f" * 64, provenance) == (
-        "b001-e6b7bdc5af68cfe1"
+        "b001-9b508acf616d7c28"
     )

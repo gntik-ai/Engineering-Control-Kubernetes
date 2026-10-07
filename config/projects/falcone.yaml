@@ -169,9 +169,13 @@ delivery_control:
     external_secrets_namespace: external-secrets
     external_secrets_deployment: external-secrets
 # NEW-120: side-by-side console migration to gntik-ui (design docs/ui-migration, decisions
-# 2026-10-04). Exact canary and digest-pinned MCP image, both from gntik-ui main fe6ccc0:
-# 0.0.0-canary-20261003230037 is the version the canary workflow (run 37160322020) published;
-# the digest is the multi-arch index of ghcr.io/gntik-ai/gntik-ui-mcp:sha-fe6ccc0.
+# 2026-10-04). Exact version and digest-pinned MCP image.
+# NEW-149 (operator decision 2026-10-07): gntik-ui's first stable release, 0.2.0, published to
+# GitHub Packages on 2026-10-05 (release commit 5124d34), replaces the canary
+# 0.0.0-canary-20261003230037 (main fe6ccc0) the approved blueprint was planned on; between
+# fe6ccc0 and main de2cdde only versions, changelogs and the release workflow changed. The
+# digest is the multi-arch index of ghcr.io/gntik-ai/gntik-ui-mcp:sha-de2cdde (main after
+# the 0.2.0 registry regeneration). Pre-pull it on the worker before the next kit snapshot.
 ui_migration:
   legacy_app: apps/web-console
   target_app: apps/web-console-next
@@ -179,10 +183,10 @@ ui_migration:
   gntik_ui:
     registry: npm.pkg.github.com
     scope: "@gntik-ai"
-    version: 0.0.0-canary-20261003230037
+    version: 0.2.0
   mcp:
     image: ghcr.io/gntik-ai/gntik-ui-mcp
-    digest: sha256:4613adab5939872306a11d8b428e6cab14ace498855212f20a8859a5b7e1ef63
+    digest: sha256:c6b0d08975006af334c73a18ccd3c291d01be478f2821d21b89d852f205f900b
     socket: /run/gntik-ui-mcp/mcp.sock
   route_tables:
     control_plane_routes: apps/control-plane/routes.mjs
