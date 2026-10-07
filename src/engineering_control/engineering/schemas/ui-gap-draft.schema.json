@@ -578,8 +578,8 @@
         "aria_pattern",
         "keyboard",
         "themes",
-        "tokens_only",
-        "tokens",
+        "style_variables_only",
+        "style_variables",
         "closest_existing",
         "interim_composite"
       ],
@@ -658,10 +658,10 @@
             ]
           }
         },
-        "tokens_only": {
+        "style_variables_only": {
           "type": "boolean"
         },
-        "tokens": {
+        "style_variables": {
           "type": "array",
           "maxItems": 30,
           "items": {

@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+import yaml
 from new_123_fixtures import (
     INVENTORY_SHA,
     KIT_SHA,
@@ -119,9 +120,13 @@ def test_released_pack_f3eca8b_lacks_the_ui_skills() -> None:
     released = Path("/opt/engineering-agent-pack/source")
     if not released.is_dir():
         pytest.skip("no released agent pack on this host")
-    problems = agent_pack_problems(released)
-    if not problems:
+    profile = yaml.safe_load((released / "profiles/engineering.yaml").read_text())
+    version = tuple(int(part) for part in str(profile.get("version", "0.0.0")).split("."))
+    if version >= (1, 4, 0):
+        # NEW-148: a newer pack can differ for other reasons (a schema Hermes has moved on
+        # from); this test is only about a pack without the UI skills.
         pytest.skip("the released pack already carries the UI skills")
+    problems = agent_pack_problems(released)
     assert any("plan-ui-migration" in item or "profile version" in item for item in problems)
 
 
