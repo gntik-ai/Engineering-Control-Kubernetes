@@ -406,5 +406,6 @@ async def test_provider_activity_fails_closed_on_invalid_agent_pack(tmp_path: Pa
 
     assert result["status"] == "BLOCKED"
     assert result["blocker"] == "AGENT_PACK_INVALID"
-    assert result["blocker_detail"] == "ValueError"
+    # NEW-146: the message, not only the type, reaches the operator (bounded, redacted).
+    assert result["blocker_detail"] == "ValueError: unsafe agent pack"
     assert "agent_result" not in result

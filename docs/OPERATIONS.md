@@ -545,3 +545,42 @@ Each fan-out run drafts at most `--max-items` items, capped by `ui_blueprint_fan
 the remaining items; finished items are never drafted twice. Telegram gets "UI fan-out done: N
 drafts". Revision 0020 adds the `ui_blueprints` table and `change_requests.ui_context_json`: run
 the migration before deploying this release.
+
+### Retrying failed fan-out items (NEW-146)
+
+A fan-out item that fails is recorded `FAILED` and is never drafted again by a later fan-out or
+an approval replay. To see why, use `change-show <id>`: its `failure` names the phase, the
+step's own blocker (for example `AGENT_PACK_INVALID`) and a `detail` of at most 300
+characters, redacted (for example `ValueError: <message>`; a pydantic validation error is
+summarised by field and message, never its input). The fan-out result and `ui-plan-status
+<blueprint>` (`fanout.last_run.failed_items`, up to 10, and `failed_total`) list the failed items
+too, and both `ui-plan-status` and the "UI fan-out done" notification then offer the retry
+command. Every provider step that blocks reports such a `blocker_detail`; it is also kept in the
+agent execution's error summary.
+
+Fix the cause first (for an agent pack error, the pack or the worker), then:
+
+```bash
+engineering-ctl ui-plan-status <blueprint>   # fanout_retry_command, fanout.last_run.failed_items
+engineering-ctl ui-blueprint-fanout-retry <blueprint> <binding> RETRY_UI_FANOUT \
+  [--kind gap|backend-gap|kit-gap|epic|page|cutover] [--max-items N]
+```
+
+- `<binding>` is the blueprint's approval binding. Only the CLI operator and allowlisted
+  `telegram:<id>` actors may retry, and only an `APPROVED` blueprint.
+- It is refused (409) while a fan-out for the blueprint runs or is being started. A marker left
+  by a fan-out that has ended is released first, as an approval replay does.
+- In one transaction it resets at most `--max-items` (default and cap
+  `ui_blueprint_fanout_max_items`) of the blueprint's `FAILED` fan-out requests, in blueprint
+  order, to `DRAFTING` revision 1 (proposal, review, failure and error code cleared). It never
+  touches a `CANDIDATE`, approved, published or rejected request, or one that failed after an
+  operator `change-revise` (revision 2 or later). Ids stay the same (blueprint hash plus item
+  key). The reset is recorded in `fanout.retries` and as a `ui_fanout.retry_requested`
+  dashboard event.
+- Every write to a fan-out item at revision 1 (item creation, failure, candidate) is fenced
+  in its own transaction on the blueprint's active fan-out marker: a leftover activity of an
+  earlier fan-out cannot change a reset item; it is a no-op that reports
+  `SUPERSEDED UI_FANOUT_SUPERSEDED`.
+- It then starts the next fan-out (`ui-blueprint-fanout-<id>-<n+1>`) with `--max-items` as
+  its cap, which drafts and reviews the reset items like any other pending item. A repeat finds
+  nothing left to reset; if the start fails (503), repeat the retry or the approval to resume.

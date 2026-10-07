@@ -59,6 +59,7 @@ from engineering_control.api.schemas import (
     RollbackRequest,
     RuntimeVerificationStart,
     UiBlueprintApproval,
+    UiFanoutRetry,
     UiPlanAccepted,
     UiPlanCreate,
 )
@@ -1497,6 +1498,80 @@ def create_app(
         # Hermes drafts the change requests only; the operator publishes each one.
         return {
             **approved,
+            "fanout": {
+                "workflow_id": accepted.workflow_id,
+                "run_id": accepted.run_id,
+                "max_items": max_items,
+                "joined": joined,
+            },
+        }
+
+    @app.post("/v1/ui-blueprints/{blueprint_id}/fanout-retry")
+    async def ui_blueprint_fanout_retry(
+        blueprint_id: UUID,
+        body: UiFanoutRetry,
+        subject: str = auth_dependency,
+        service: ControlService = control_dependency,
+        repository: UiBlueprintRepository = ui_blueprints_dependency,
+    ) -> dict[str, Any]:
+        """NEW-146: reset the blueprint's FAILED fan-out items, then start (or join) a fan-out.
+
+        Refused while a fan-out runs (or is being started) for the blueprint; once the request
+        is authorized, a marker whose workflow has ended is released first, exactly as an
+        approval replay would. The reset re-checks everything under the blueprint row lock."""
+        actor = approval_actor(subject)
+        limit = resolved.ui_blueprint_fanout_max_items
+        max_items = min(body.max_items or limit, limit)
+        try:
+            await repository.check_retry(
+                blueprint_id, body.approval_binding, body.typed_confirmation, actor, body.kind
+            )
+            marker = await repository.active_fanout(blueprint_id)
+        except UiBlueprintNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if marker is not None:
+            active = marker["workflow_id"]
+            claimed_at = marker["claimed_at"]
+            state, _running = await service.ui_fanout_state(active)
+            if state == "RUNNING" or (
+                state == "NOT_FOUND"
+                and isinstance(claimed_at, datetime)
+                and datetime.now(UTC) - _as_utc(claimed_at) < UI_FANOUT_START_GRACE
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"a ui fan-out is running for this blueprint ({active}); "
+                    "retry after it has finished",
+                )
+            # Ended without clearing its marker (or a crashed start): release it once.
+            await repository.release_fanout(blueprint_id, active)
+        try:
+            retried = await repository.retry_fanout(
+                blueprint_id,
+                body.approval_binding,
+                body.typed_confirmation,
+                actor,
+                kind=body.kind,
+                limit=max_items,
+            )
+        except UiBlueprintNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            accepted, joined = await ui_fanout_start_or_join(
+                blueprint_id, max_items, service, repository
+            )
+        except Exception as error:  # noqa: BLE001 - the reset stands; a repeat resumes
+            raise HTTPException(
+                status_code=503,
+                detail="failed ui fan-out items were reset, but the fan-out could not be "
+                "started; repeat the retry (or the approval) to resume",
+            ) from error
+        return {
+            **retried,
             "fanout": {
                 "workflow_id": accepted.workflow_id,
                 "run_id": accepted.run_id,

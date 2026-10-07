@@ -38,7 +38,9 @@ from engineering_control.engineering.ui_blueprint import (
     AGENT_PACK_SKILL_MISSING,
     APPROVAL_PHRASE,
     FANOUT_BATCH,
+    FANOUT_FAILURES_SHOWN,
     FANOUT_MAX_ITEMS_LIMIT,
+    RETRY_FANOUT_PHRASE,
     BlueprintRejected,
     FanoutItem,
     PlanInputs,
@@ -1663,7 +1665,11 @@ class UiPlanActivityHandler:
             item_context(
                 item, blueprint_id=str(blueprint_id), blueprint_sha256=digest, continued=continued
             ),
+            # NEW-146 review 1: the ownership fence again, atomic with the row write.
+            fanout_writer=workflow_id,
         )
+        if created.get("status") == "SUPERSEDED":
+            return {"status": "SKIPPED", "blocker": "UI_FANOUT_SUPERSEDED"}
         base: dict[str, Any] = {
             "blueprint_id": str(blueprint_id),
             "item_key": item.key,
@@ -1683,7 +1689,11 @@ class UiPlanActivityHandler:
         if item.is_gap:
             return self._gap_request(base, item, 1, self._workflow_run(payload))
         if render_error is not None:
-            failed = self.change_requests.record_failure_sync(change_request_id, 1, render_error)
+            failed = self.change_requests.record_failure_sync(
+                change_request_id, 1, render_error, fanout_writer=workflow_id
+            )
+            if failed.get("status") == "SUPERSEDED":
+                return {**base, "status": "SKIPPED", "blocker": "UI_FANOUT_SUPERSEDED"}
             return {**base, "status": "FAILED_RECORDED", "error_code": failed.get("error_code")}
         try:
             proposal = validate_proposal(rendered, project, item.target_repository)
@@ -1821,6 +1831,16 @@ class UiPlanActivityHandler:
             "review_request": request.model_dump(mode="json"),
         }
 
+    def _fanout_failures(self, blueprint_id: UUID) -> tuple[list[dict[str, Any]], str | None]:
+        loaded = self.repository.load_approved_sync(blueprint_id)
+        if loaded["status"] != "APPROVED":
+            return [], None
+        digest = str(loaded["blueprint_sha256"])
+        failures = self.change_requests.item_failures_sync(
+            [item_change_request_id(digest, item.key) for item in fanout_items(loaded["blueprint"])]
+        )
+        return failures, str(loaded.get("approval_binding") or "") or None
+
     def _fanout_finalize(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
         stats: dict[str, Any] = {
@@ -1831,6 +1851,11 @@ class UiPlanActivityHandler:
         blocker = payload.get("blocker")
         if blocker:
             stats["blocker"] = str(blocker)[:80]
+        failures, binding = self._fanout_failures(blueprint_id)
+        if failures:
+            # NEW-146: why items failed, visible on the blueprint and in the fan-out result.
+            stats["failed_total"] = len(failures)
+            stats["failed_items"] = failures[:FANOUT_FAILURES_SHOWN]
         self.repository.record_fanout_sync(blueprint_id, stats)
         orchestration = self._orchestration(payload)
         workflow_id = str(orchestration.get("workflow_id") or "")
@@ -1854,7 +1879,16 @@ class UiPlanActivityHandler:
                         "ui_workflow_id": workflow_id,
                         "commands": [
                             f"{CTL} changes --project {payload.get('project') or 'falcone'} "
-                            "--status CANDIDATE"
+                            "--status CANDIDATE",
+                            # NEW-146: failed items stay FAILED until the operator retries.
+                            *(
+                                [
+                                    f"{CTL} ui-blueprint-fanout-retry {blueprint_id} {binding} "
+                                    f"{RETRY_FANOUT_PHRASE}"
+                                ]
+                                if failures and binding
+                                else []
+                            ),
                         ],
                     },
                 )

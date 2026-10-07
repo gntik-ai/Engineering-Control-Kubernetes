@@ -192,6 +192,14 @@ class ChangeRequestActivityHandler:
         return await asyncio.to_thread(handler, payload)
 
     @staticmethod
+    def _writer(payload: dict[str, Any]) -> str:
+        """NEW-146 review 1: the executing workflow, for the fan-out ownership fence (the
+        repository applies it only to revision 1 of a fanned-out item)."""
+        orchestration = payload.get("orchestration")
+        context = orchestration if isinstance(orchestration, dict) else {}
+        return str(context.get("workflow_id") or "")
+
+    @staticmethod
     def _identity(payload: dict[str, Any]) -> tuple[UUID, int]:
         try:
             change_request_id = UUID(str(payload["change_request_id"]))
@@ -399,7 +407,10 @@ class ChangeRequestActivityHandler:
             )
         except ValueError:
             result = self.repository.record_failure_sync(
-                change_request_id, revision, "PERSIST_INPUT_INVALID"
+                change_request_id,
+                revision,
+                "PERSIST_INPUT_INVALID",
+                fanout_writer=self._writer(payload),
             )
             return {**self._slim(payload), **result}
         result = self.repository.persist_candidate_sync(
@@ -408,14 +419,25 @@ class ChangeRequestActivityHandler:
             proposal,
             review,
             self._dedupe(payload.get("dedupe")),
+            fanout_writer=self._writer(payload),
         )
         return {**self._slim(payload), **result}
 
     def _record_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
         phase = str(payload.get("failure_phase", "internal"))
-        code = _failure_code(phase, str(payload.get("blocker") or payload.get("status") or ""))
+        blocker = str(payload.get("blocker") or payload.get("status") or "")
+        code = _failure_code(phase, blocker)
         change_request_id, revision = self._identity(payload)
-        result = self.repository.record_failure_sync(change_request_id, revision, code)
+        detail = payload.get("blocker_detail")
+        result = self.repository.record_failure_sync(
+            change_request_id,
+            revision,
+            code,
+            phase=phase,
+            blocker=blocker or None,
+            detail=str(detail) if detail else None,
+            fanout_writer=self._writer(payload),
+        )
         return {**self._slim(payload), **result}
 
     def _finalize_run(self, payload: dict[str, Any]) -> dict[str, Any]:

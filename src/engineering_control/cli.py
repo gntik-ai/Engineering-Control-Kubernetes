@@ -401,6 +401,15 @@ def parser() -> argparse.ArgumentParser:
     ui_approve.add_argument("approval_binding")
     ui_approve.add_argument("typed_confirmation")
     ui_approve.add_argument("--max-items", type=_bounded_integer(1, 600), metavar="1-600")
+    # NEW-146: reset the FAILED fan-out items of an approved blueprint and fan out again.
+    ui_retry = commands.add_parser("ui-blueprint-fanout-retry")
+    ui_retry.add_argument("blueprint_id")
+    ui_retry.add_argument("approval_binding")
+    ui_retry.add_argument("typed_confirmation")
+    ui_retry.add_argument(
+        "--kind", choices=("epic", "page", "cutover", "gap", "backend-gap", "kit-gap")
+    )
+    ui_retry.add_argument("--max-items", type=_bounded_integer(1, 600), metavar="1-600")
     ui_inventory = commands.add_parser("ui-inventory")
     ui_inventory.add_argument("--checkout", type=Path, required=True)
     ui_inventory.add_argument("--project", choices=("falcone",), default="falcone")
@@ -904,6 +913,18 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             approval["max_items"] = arguments.max_items
         return client.request(
             "POST", f"/v1/ui-blueprints/{arguments.blueprint_id}/approve", approval
+        )
+    if command == "ui-blueprint-fanout-retry":
+        retry: dict[str, Any] = {
+            "approval_binding": arguments.approval_binding,
+            "typed_confirmation": arguments.typed_confirmation,
+        }
+        if arguments.kind is not None:
+            retry["kind"] = arguments.kind
+        if arguments.max_items is not None:
+            retry["max_items"] = arguments.max_items
+        return client.request(
+            "POST", f"/v1/ui-blueprints/{arguments.blueprint_id}/fanout-retry", retry
         )
     if command == "changes":
         query = httpx.QueryParams(

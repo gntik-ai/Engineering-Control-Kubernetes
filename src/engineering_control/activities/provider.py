@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ from uuid import UUID
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
+from pydantic import ValidationError as PydanticValidationError
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -33,7 +35,49 @@ from engineering_control.observability.agent import (
     local_worker_host,
     normalize_agent_role,
 )
-from engineering_control.security.redaction import SecretRedactor
+from engineering_control.security.redaction import (
+    SecretRedactor,
+    bounded_detail,
+    redact_detail_text,
+)
+
+_PYDANTIC_MESSAGE_PREFIX = re.compile(r"^(?:Value error|Assertion failed), ")
+
+
+def error_detail(error: BaseException, redactor: SecretRedactor | None = None) -> str:
+    """NEW-146: "<Type>: <message>", redacted and bounded, for a step's blocker_detail.
+
+    A pydantic ValidationError (a ValueError) is summarised by location and message only:
+    its str() embeds the offending input values, which can be a whole prompt."""
+    # NEW-146 review 1: every piece is redacted on its own, before any label is put in front
+    # of it: the line-anchored credential rules (password=..., token: ...) match only text
+    # that still starts its line.
+    redactor = redactor or SecretRedactor()
+
+    def safe(text: str) -> str:
+        # NEW-146 review 6: inline credentials first, then the redactor's rules.
+        return redact_detail_text(text, redactor)
+
+    def safe_message(text: str) -> str:
+        # NEW-146 review 2: pydantic prefixes a validator's own message ("Value error, ",
+        # "Assertion failed, "), which would hide a leading credential from the
+        # line-anchored rules; redact the validator's text alone, then restore the label.
+        match = _PYDANTIC_MESSAGE_PREFIX.match(text)
+        if match is None:
+            return safe(text)
+        return f"{match.group(0)}{safe(text[match.end() :])}"
+
+    if isinstance(error, PydanticValidationError):
+        problems = error.errors(include_url=False, include_context=False, include_input=False)
+        shown = "; ".join(
+            f"{safe('.'.join(str(part) for part in problem.get('loc', ()))) or '<root>'}: "
+            f"{safe_message(str(problem.get('msg', problem.get('type', 'invalid'))))}"
+            for problem in problems[:5]
+        )
+        message = f"{error.error_count()} validation error(s) for {safe(error.title)}: {shown}"
+    else:
+        message = safe(str(error)) or "(no message)"
+    return bounded_detail(f"{type(error).__name__}: {message}", redactor)
 
 
 class ProviderAdapter(Protocol):
@@ -147,7 +191,7 @@ class ProviderActivityHandler:
             return self._blocked(
                 echo_payload,
                 "AGENT_PACK_INVALID",
-                detail=type(error).__name__,
+                detail=error_detail(error, self.redactor),
             )
         runtime_payload = {
             **echo_payload,
@@ -389,6 +433,8 @@ class ProviderActivityHandler:
     def _blocked(
         self, payload: dict[str, Any], blocker: str, *, detail: str | None = None
     ) -> dict[str, Any]:
+        # NEW-146: every step's detail is bounded and redacted here, on the one path.
+        detail = bounded_detail(detail, self.redactor) if detail else None
         safe = self.redactor.redact(
             {
                 **payload,

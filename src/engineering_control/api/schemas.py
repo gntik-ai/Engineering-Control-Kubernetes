@@ -408,6 +408,16 @@ class UiBlueprintApproval(APIModel):
     max_items: int | None = Field(default=None, ge=1, le=600)
 
 
+class UiFanoutRetry(APIModel):
+    """NEW-146: reset an approved blueprint's FAILED fan-out items and fan out again."""
+
+    approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
+    typed_confirmation: Literal["RETRY_UI_FANOUT"]
+    kind: Literal["epic", "page", "cutover", "gap", "backend-gap", "kit-gap"] | None = None
+    # Items reset and the fan-out cap of this run; bounded by the configured maximum.
+    max_items: int | None = Field(default=None, ge=1, le=600)
+
+
 class ChangeRequestRevision(APIModel):
     note: str = Field(min_length=3, max_length=2000)
 

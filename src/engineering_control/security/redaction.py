@@ -195,3 +195,51 @@ class SecretRedactor:
             report.replacements,
             report.categories,
         )
+
+
+# NEW-146: the bound of an operator-visible failure detail (after redaction).
+BLOCKER_DETAIL_LIMIT = 300
+
+
+# NEW-146 (reviews 3-7): a diagnostic detail is free text that exception and validation
+# messages shape arbitrarily (prefixes, quotes, escapes, punctuation, ANSI codes, newlines),
+# so no value grammar is trusted: from the first credential assignment on, the whole rest
+# of the detail is redacted. Over-redacting a diagnostic is acceptable; a partial leak is not.
+_INLINE_CREDENTIAL = re.compile(
+    r"(?is)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret"
+    r"|encryption[_-]?key|telegram[_-]?bot[_-]?token|client-key-data)\s*[:=]\s*)"
+    # No already-redacted exemption: re-redacting is idempotent, and a sentinel inside the
+    # text must not shield what follows it.
+    r"\S.*"
+)
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def _redact_inline_credentials(text: str) -> str:
+    return _INLINE_CREDENTIAL.sub(lambda match: f"{match.group(1)}{REDACTED}", text)
+
+
+def redact_detail_text(text: str, redactor: SecretRedactor | None = None) -> str:
+    """A diagnostic's text with terminal escapes removed and every credential assignment
+    redacted to the end of the detail, before the redactor's own rules run (a rule that
+    ran first could blank only part of a value and hide the rest from this one)."""
+    inline = _redact_inline_credentials(_ANSI_ESCAPE.sub("", text))
+    return str((redactor or SecretRedactor()).redact_text(inline).value)
+
+
+def bounded_detail(
+    text: str, redactor: SecretRedactor | None = None, *, limit: int = BLOCKER_DETAIL_LIMIT
+) -> str:
+    """One redacted line of at most ``limit`` characters.
+
+    Redacted before it is cut, so a cut never leaves part of a secret unrecognised. Besides
+    the redactor's rules, credential assignments are redacted anywhere in the line, so a
+    label or an exception's own prefix in front of ``password=...`` cannot hide it."""
+    # NEW-146 reviews 5-6: inline credentials (spanning newlines) are redacted on the raw
+    # text before the redactor's rules, and again after flattening to one line.
+    redacted = redact_detail_text(text, redactor)
+    line = " ".join(redacted.split())
+    line = _redact_inline_credentials(line)
+    if len(line) > limit:
+        line = line[: limit - 3].rstrip() + "..."
+    return line
