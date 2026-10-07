@@ -52,6 +52,8 @@ AMEND_REASON = "issue amended"
 AMEND_EVENT_TYPE = "issue_body_amended"
 # ChangeSet.recovery_json: the issue revision the current delivery run loaded.
 ISSUE_BODY_REVISION_KEY = "issue_body_revision"
+# ChangeSet.recovery_json: NEW-150 operator touch refreshes (append-only).
+ISSUE_TOUCH_REFRESHES_KEY = "issue_touch_refreshes"
 _RISK_RANK = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 CONFIRMATION_PATTERN = re.compile(r"[a-f0-9]{12,64}")
 DIFF_LINE_LIMIT = 60
@@ -143,28 +145,24 @@ def diff_summary(approved: str, current: str) -> tuple[list[str], bool]:
     return [*kept, f"... {len(lines) - len(kept)} more diff lines omitted"], True
 
 
-def resolve_amend_target(
+def locate_issue_target(
     session: Session,
     project: str,
     repository: str,
     issue_number: int,
     *,
     lock: bool = False,
-    now: datetime | None = None,
-    closed_run_ids: frozenset[UUID] = frozenset(),
-    running_runs: list[tuple[UUID, str]] | None = None,
+    code: str = "ISSUE_AMEND",
 ) -> tuple[BacklogIssueRecord, GitHubBacklogCampaign, Finding, ChangeSet | None]:
-    """Find the approved backlog delivery of one issue, or refuse with a blocker.
+    """Find the approved, non-R3 backlog record of one issue and its ChangeSet.
 
-    A Run projected RUNNING blocks the amendment unless the caller verified in Temporal
-    that its workflow is closed (``closed_run_ids``): runs stopped at the body refresh
-    before NEW-115 were never terminalized by release_leases. With ``running_runs`` the
-    RUNNING runs are collected for that verification instead of refused."""
+    With ``lock`` the rows are locked in the delivery-startup order (Finding, then the
+    issue record, then the ChangeSet). Refusals use ``code`` as the blocker prefix."""
     full_repository = f"gntik-ai/{repository}"
     pairs = BACKLOG_PROJECT_PAIRS.get(project)
     if pairs is None or full_repository not in pairs:
         raise IssueAmendBlocked(
-            "ISSUE_AMEND_TARGET_INVALID",
+            f"{code}_TARGET_INVALID",
             f"{full_repository} is not a {project} backlog repository",
         )
     target = f"{full_repository}#{issue_number}"
@@ -200,7 +198,7 @@ def resolve_amend_target(
     campaign = session.get(GitHubBacklogCampaign, issue.backlog_campaign_id) if issue else None
     if issue is None or campaign is None or finding is None:
         raise IssueAmendBlocked(
-            "ISSUE_AMEND_NOT_IN_APPROVED_BACKLOG",
+            f"{code}_NOT_IN_APPROVED_BACKLOG",
             f"{target} has no approved delivery in a {project} backlog campaign; import and "
             f"approve it first (/loop import {project} github-open ..., then /loop "
             f"issue-start {project} {_surface(project, full_repository)} {issue_number})",
@@ -217,7 +215,7 @@ def resolve_amend_target(
     )
     if issue.calculated_risk == "R3" or finding.risk_class == "R3" or r3_approved is not None:
         raise IssueAmendBlocked(
-            "ISSUE_AMEND_R3_REQUIRES_REAPPROVAL",
+            f"{code}_R3_REQUIRES_REAPPROVAL",
             f"{target} is R3 (approved for its exact text); re-import the backlog, then "
             f"/loop r3-candidate {project} {surface} {issue_number} and /loop approve-r3 "
             f"{project} {surface} {issue_number} <binding> <phrase>",
@@ -230,6 +228,30 @@ def resolve_amend_target(
         if lock
         else select(ChangeSet).where(ChangeSet.finding_id == finding.id)
     )
+    return issue, campaign, finding, change_set
+
+
+def resolve_amend_target(
+    session: Session,
+    project: str,
+    repository: str,
+    issue_number: int,
+    *,
+    lock: bool = False,
+    now: datetime | None = None,
+    closed_run_ids: frozenset[UUID] = frozenset(),
+    running_runs: list[tuple[UUID, str]] | None = None,
+) -> tuple[BacklogIssueRecord, GitHubBacklogCampaign, Finding, ChangeSet | None]:
+    """Find the approved backlog delivery of one issue, or refuse with a blocker.
+
+    A Run projected RUNNING blocks the amendment unless the caller verified in Temporal
+    that its workflow is closed (``closed_run_ids``): runs stopped at the body refresh
+    before NEW-115 were never terminalized by release_leases. With ``running_runs`` the
+    RUNNING runs are collected for that verification instead of refused."""
+    issue, campaign, finding, change_set = locate_issue_target(
+        session, project, repository, issue_number, lock=lock
+    )
+    target = f"{issue.repository}#{issue_number}"
     if (
         issue.state != "OPEN"
         or issue.delivery_status == "COMPLETE"
@@ -530,7 +552,7 @@ def consumed_issue_revision(
     before this record existed keep the imported revision."""
     recorded = (change_set.recovery_json or {}).get(ISSUE_BODY_REVISION_KEY)
     if recorded is None:
-        return issue.body_sha256, issue.github_updated_at
+        return touch_refreshed_revision(change_set, issue.body_sha256, issue.github_updated_at)
     if (
         not isinstance(recorded, dict)
         or recorded.get("run_id") != str(run.id)
@@ -539,7 +561,54 @@ def consumed_issue_revision(
         or not isinstance(recorded.get("updated_at"), str)
     ):
         raise ValueError("publication run did not load the approved issue revision")
-    return recorded["body_sha256"], datetime.fromisoformat(recorded["updated_at"])
+    return touch_refreshed_revision(
+        change_set, recorded["body_sha256"], datetime.fromisoformat(recorded["updated_at"])
+    )
+
+
+def touch_refresh_binding(change_set_id: UUID, value: dict[str, Any]) -> str:
+    """The binding of one NEW-150 touch refresh recorded on a ChangeSet."""
+    return canonical_sha256(
+        {
+            "change_set_id": str(change_set_id),
+            **{key: item for key, item in value.items() if key != "binding_sha256"},
+        }
+    )
+
+
+def touch_refreshed_revision(
+    change_set: ChangeSet, body_sha256: str, updated_at: datetime
+) -> tuple[str, datetime]:
+    """NEW-150: a consumed revision with the operator's touch refreshes applied.
+
+    A GitHub edit that restores the exact text (same body hash) still moves the issue's
+    ``updated_at``. Each refresh (``engineering-ctl issue-touch-refresh``) is appended to
+    the ChangeSet and names the body hash it re-observed; it moves the revision time of a
+    run that consumed exactly that body forward, never the body. The run's own record
+    stays as loaded; a malformed refresh fails closed."""
+    refreshes = (change_set.recovery_json or {}).get(ISSUE_TOUCH_REFRESHES_KEY)
+    if refreshes is None:
+        return body_sha256, updated_at
+    if not isinstance(refreshes, list):
+        raise ValueError("issue touch refresh record is invalid")
+    current = _utc(updated_at)
+    for value in refreshes:
+        if (
+            not isinstance(value, dict)
+            or value.get("version") != 1
+            or not isinstance(value.get("body_sha256"), str)
+            or not _SHA256.fullmatch(value["body_sha256"])
+            or not isinstance(value.get("updated_at"), str)
+            or value.get("binding_sha256") != touch_refresh_binding(change_set.id, value)
+        ):
+            raise ValueError("issue touch refresh record is invalid")
+        try:
+            refreshed = _utc(datetime.fromisoformat(value["updated_at"]))
+        except ValueError as error:
+            raise ValueError("issue touch refresh record is invalid") from error
+        if value["body_sha256"] == body_sha256 and refreshed > current:
+            current = refreshed
+    return body_sha256, current
 
 
 def record_consumed_issue_revision(

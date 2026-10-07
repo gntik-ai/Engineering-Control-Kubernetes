@@ -47,6 +47,7 @@ from engineering_control.api.schemas import (
     IssueAmendRequest,
     IssueLoopStart,
     IssueReapprovalRequest,
+    IssueTouchRefreshRequest,
     LLMWikiBootstrapExecuteRequest,
     LLMWikiBootstrapPlanRequest,
     LoopPlanDispatch,
@@ -930,6 +931,48 @@ def create_app(
         ):
             result["retry"] = await _amend_retry(bus, body, result, subject, actor)
         return result
+
+    @app.post("/v1/issues/touch-refresh")
+    async def issue_touch_refresh(
+        body: IssueTouchRefreshRequest,
+        subject: str = auth_dependency,
+        repository: OperationsRepository = operations_dependency,
+        service: ControlService = control_dependency,
+    ) -> dict[str, Any]:
+        """NEW-150: re-observe an issue whose GitHub revision time moved, text unchanged.
+
+        Same trust model as /v1/issues/amend. Without ``confirm`` this is a read-only
+        preview; with it the freshly read revision must match the preview's token and the
+        body and title hashes must equal the approved revision. An active delivery is
+        allowed: only the revision time is re-observed, never the content."""
+        actor = approval_actor(subject)
+        try:
+            await repository.issue_touch_refresh_precheck(
+                body.project, body.repository, body.issue_number
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            observation = await service.observe_issue_body(
+                f"gntik-ai/{body.repository}", body.issue_number
+            )
+        except Exception as error:  # noqa: BLE001 - one bounded operator-facing failure
+            raise HTTPException(
+                status_code=503,
+                detail="ISSUE_TOUCH_REFRESH_BODY_UNAVAILABLE: the GitHub issue could not be "
+                "read; try again",
+            ) from error
+        try:
+            return await repository.touch_refresh_issue(
+                body.project,
+                body.repository,
+                body.issue_number,
+                observation,
+                body.confirm,
+                actor,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     async def _amend_retry(
         bus: TypedCommandBus,

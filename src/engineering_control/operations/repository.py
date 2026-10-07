@@ -74,6 +74,10 @@ from engineering_control.operations.issue_start import (
     issue_request_from_operation,
     issue_workflow_id,
 )
+from engineering_control.operations.issue_touch_refresh import (
+    resolve_touch_target,
+    touch_refresh_issue,
+)
 from engineering_control.operations.models import (
     AdvancedAuditCommand,
     AuditAllProjectsCommand,
@@ -812,6 +816,63 @@ class OperationsRepository:
                 confirmation=confirmation,
                 actor=actor,
                 closed_run_ids=closed_run_ids,
+            )
+
+    async def issue_touch_refresh_precheck(
+        self, project: str, repository: str, issue_number: int
+    ) -> None:
+        """NEW-150: refuse a touch refresh from durable state before reading GitHub."""
+        await asyncio.to_thread(
+            self._issue_touch_refresh_precheck, project, repository, issue_number
+        )
+
+    def _issue_touch_refresh_precheck(
+        self, project: str, repository: str, issue_number: int
+    ) -> None:
+        with self.sessions.begin() as session:
+            resolve_touch_target(session, project, repository, issue_number)
+
+    async def touch_refresh_issue(
+        self,
+        project: str,
+        repository: str,
+        issue_number: int,
+        observation: dict[str, Any],
+        confirmation: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._touch_refresh_issue,
+            project,
+            repository,
+            issue_number,
+            observation,
+            confirmation,
+            actor,
+        )
+
+    def _touch_refresh_issue(
+        self,
+        project: str,
+        repository: str,
+        issue_number: int,
+        observation: dict[str, Any],
+        confirmation: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        if not is_reauthenticated_backlog_operator(actor):
+            raise ValueError("issue touch refresh requires an allowlisted operator channel")
+        with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            return touch_refresh_issue(
+                session,
+                project=project,
+                repository=repository,
+                issue_number=issue_number,
+                observation=observation,
+                confirmation=confirmation,
+                actor=actor,
             )
 
     def _candidate(self, command: Command, session_binding_hash: str) -> CandidateView:

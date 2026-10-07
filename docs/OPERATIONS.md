@@ -399,6 +399,49 @@ releases the terminal run's component leases. A rerun reports `ALREADY_RECONCILE
 `backlog-retry` then proceeds: the CI-repair restore (NEW-102) and the next delivery child
 acquire their leases normally, and that child publishes under its own new effect.
 
+## Issue touched without a content change (NEW-150)
+
+> **Any GitHub edit of an issue under delivery, even a no-op or an edit restored byte for
+> byte, moves its GitHub `updated_at`.** Publication custody (NEW-115) compares that time with
+> the approved revision, so every later publication claim is refused with "fresh GitHub issue
+> observation differs from approval" until the operator runs `issue-touch-refresh`. Avoid
+> editing issues under delivery; if one was touched, run this command.
+
+```bash
+engineering-ctl issue-touch-refresh <project> <repository> <issue_number>            # preview
+engineering-ctl issue-touch-refresh <project> <repository> <issue_number> --confirm <token12>
+
+# falcone #972
+engineering-ctl issue-touch-refresh falcone falcone 972
+engineering-ctl issue-touch-refresh falcone falcone 972 --confirm <confirm_with from the preview>
+```
+
+The API route is `POST /v1/issues/touch-refresh` (operator channel only, like `issue-amend`).
+The GitHub worker reads the issue fresh (the same read path as `issue-amend`). The preview
+shows the approved, consumed and current revision times and `confirm_with`, the first 12 hex
+of a token bound to the target, body hash, title hash and current `updated_at`: a further
+touch between preview and confirm refuses (`CONFIRMATION_MISMATCH`). Unlike `issue-amend`,
+it is allowed while the delivery is active. It refuses with an `ISSUE_TOUCH_REFRESH_*` code
+unless the issue is an approved, non-R3 backlog delivery (`TARGET_INVALID`,
+`NOT_IN_APPROVED_BACKLOG`, `R3_REQUIRES_REAPPROVAL`), open in Hermes and on GitHub
+(`ISSUE_CLOSED`), and its fresh body and title hashes equal the approved revision
+(`BODY_CHANGED`: content changes go through `issue-amend`; `TITLE_CHANGED`). A GitHub time
+before the approved one is refused (`REVISION_STALE`).
+
+Confirmed, it runs under the `issue-amend` lock order (Finding, issue record, ChangeSet) and
+records, in one transaction with an `issue_revision_touch_refreshed` dashboard event (operator,
+body/title hashes, previous approved and consumed times, new time):
+
+- the new time as the issue's effective approved revision (the NEW-115 amendment record with
+  `change: TOUCH_REFRESHED`; body unchanged), so later delivery loads consume it;
+- an entry appended to the ChangeSet's `recovery_json.issue_touch_refreshes` (body hash,
+  previous and new time, operator, binding). A run that consumed exactly that body publishes
+  against the newer time; the run's own `issue_body_revision`, the immutable import and every
+  approval snapshot are unchanged.
+
+A rerun reports `NO_CHANGE`. The next publication claim of the current loop then passes; no
+retry is sent (resume a paused loop with `backlog-retry` as usual).
+
 ## Operator change requests (NEW-108)
 
 An operator can turn a free-text description of a wanted change into one reviewed, approved
