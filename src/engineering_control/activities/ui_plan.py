@@ -22,10 +22,12 @@ from temporalio.exceptions import ApplicationError
 
 from engineering_control.activities.metadata import _STRUCTURED_OUTPUT_JSON_RULES
 from engineering_control.activities.provider import error_detail
+from engineering_control.activities.ui_gap_consolidation import UiGapConsolidationSteps
 from engineering_control.adapters.github.client import ALLOWED_REPOSITORIES
 from engineering_control.config import Settings
 from engineering_control.db.change_requests import ChangeRequestRepository
 from engineering_control.db.ui_blueprints import UiBlueprintRepository
+from engineering_control.db.ui_gap_consolidations import UiGapConsolidationRepository
 from engineering_control.delivery_notifications import CTL, enqueue_milestone, literal
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.change_requests import (
@@ -77,6 +79,10 @@ from engineering_control.engineering.ui_blueprint_parts import (
     review_digest,
     routed_page_ids,
     usage_entry,
+)
+from engineering_control.engineering.ui_gap_consolidation import (
+    canonical_context,
+    canonical_variants_text,
 )
 from engineering_control.models.core import AgentRequest
 from engineering_control.models.enums import ModelClass, Project, Provider
@@ -153,6 +159,20 @@ _DATA_RULE = (
     "No MCP server is configured for you: the gntik-ui kit catalogue is ONLY the "
     "Hermes-collected snapshot file named below (kit_source snapshot); never fetch anything "
     "from the network and never use mcp__ tools."
+)
+
+
+# NEW-154: what the drafter of a canonical (consolidated) gap request is told.
+_CONSOLIDATED_GAP_RULE = (
+    "This finding consolidates several gap change requests that the blueprint fan-out drafted "
+    "separately for the same need (one per page batch); the operator merged them. Draft ONE "
+    "change request that replaces all of them: merge their what_changes without dropping any "
+    "requirement, and keep every distinct acceptance criterion of every variant as an "
+    "acceptance criterion (merge only exact duplicates). The proposal lists are bounded, so "
+    "when the variants do not fit, generalise a criterion only if it still covers every "
+    "variant; every variant's what_changes and acceptance criteria are also rendered verbatim "
+    "in the issue body, labelled with their item keys. The variants (the members' drafted "
+    "proposals) follow."
 )
 
 
@@ -317,30 +337,33 @@ def part_provenance(pack_provenance: str) -> str:
 class UiPlanActivityHandler:
     """Controller-side flow A steps: durable blueprint state and provider requests."""
 
-    supported_steps = frozenset(
-        {
-            "ui_plan.register",
-            "ui_plan.record_inputs",
-            "ui_plan.prepare_draft",
-            "ui_plan.record_draft",
-            "ui_plan.prepare_review",
-            "ui_plan.record_review",
-            "ui_plan.persist",
-            "ui_plan.record_terminal",
-            "ui_plan.finalize_run",
-            "ui_plan.record_parts",
-            "ui_plan.prepare_part",
-            "ui_plan.record_part_draft",
-            "ui_plan.prepare_part_review",
-            "ui_plan.record_part_review",
-            "ui_plan.assemble",
-            "ui_fanout.plan",
-            "ui_fanout.prepare_item",
-            "ui_fanout.record_gap_draft",
-            "ui_fanout.prepare_gap_draft",
-            "ui_fanout.prepare_review",
-            "ui_fanout.finalize",
-        }
+    supported_steps = (
+        frozenset(
+            {
+                "ui_plan.register",
+                "ui_plan.record_inputs",
+                "ui_plan.prepare_draft",
+                "ui_plan.record_draft",
+                "ui_plan.prepare_review",
+                "ui_plan.record_review",
+                "ui_plan.persist",
+                "ui_plan.record_terminal",
+                "ui_plan.finalize_run",
+                "ui_plan.record_parts",
+                "ui_plan.prepare_part",
+                "ui_plan.record_part_draft",
+                "ui_plan.prepare_part_review",
+                "ui_plan.record_part_review",
+                "ui_plan.assemble",
+                "ui_fanout.plan",
+                "ui_fanout.prepare_item",
+                "ui_fanout.record_gap_draft",
+                "ui_fanout.prepare_gap_draft",
+                "ui_fanout.prepare_review",
+                "ui_fanout.finalize",
+            }
+        )
+        | UiGapConsolidationSteps.supported_steps
     )
 
     def __init__(
@@ -348,6 +371,7 @@ class UiPlanActivityHandler:
         settings: Settings,
         repository: UiBlueprintRepository | None = None,
         change_requests: ChangeRequestRepository | None = None,
+        consolidations: UiGapConsolidationRepository | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository or UiBlueprintRepository(
@@ -355,6 +379,11 @@ class UiPlanActivityHandler:
         )
         self.change_requests = change_requests or ChangeRequestRepository(
             engine=self.repository.engine
+        )
+        # NEW-154: the gap consolidation plan steps share the blueprint database.
+        self.consolidation = UiGapConsolidationSteps(
+            settings,
+            consolidations or UiGapConsolidationRepository(engine=self.repository.engine),
         )
 
     async def handle(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -381,6 +410,8 @@ class UiPlanActivityHandler:
             "ui_fanout.prepare_review": self._prepare_item_review,
             "ui_fanout.finalize": self._fanout_finalize,
         }
+        if step in UiGapConsolidationSteps.supported_steps:
+            return await self.consolidation.handle(step, payload)
         handler = handlers.get(step)
         if handler is None:
             raise ApplicationError("unsupported ui plan activity", non_retryable=True)
@@ -1588,8 +1619,16 @@ class UiPlanActivityHandler:
             )
         return loaded
 
-    def _item(self, loaded: dict[str, Any], key: Any) -> FanoutItem:
-        for item in fanout_items(loaded["blueprint"]):
+    def _items(self, blueprint_id: UUID, loaded: dict[str, Any]) -> list[FanoutItem]:
+        """The approved blueprint's items and (NEW-154) the canonical gap requests of its
+        applied gap consolidations, which the fan-out drafts like any other gap."""
+        return [
+            *fanout_items(loaded["blueprint"]),
+            *self.repository.canonical_items_sync(blueprint_id),
+        ]
+
+    def _item(self, blueprint_id: UUID, loaded: dict[str, Any], key: Any) -> FanoutItem:
+        for item in self._items(blueprint_id, loaded):
             if item.key == key:
                 return item
         raise ApplicationError(
@@ -1619,7 +1658,7 @@ class UiPlanActivityHandler:
             # released stale claim). Stop before any work; drafts are never duplicated.
             return {**base, "status": "BLOCKED", "blocker": "UI_FANOUT_SUPERSEDED"}
         self.repository.register_fanout_sync(blueprint_id, workflow_id)
-        items = fanout_items(loaded["blueprint"])
+        items = self._items(blueprint_id, loaded)
         digest = str(loaded["blueprint_sha256"])
         identities = {item.key: item_change_request_id(digest, item.key) for item in items}
         states = self.change_requests.item_states_sync(list(identities.values()))
@@ -1656,7 +1695,7 @@ class UiPlanActivityHandler:
         if not self.repository.fanout_owner_sync(blueprint_id, workflow_id):
             return {"status": "SKIPPED", "blocker": "UI_FANOUT_SUPERSEDED"}
         loaded = self._approved(blueprint_id)
-        item = self._item(loaded, payload.get("item_key"))
+        item = self._item(blueprint_id, loaded, payload.get("item_key"))
         project = str(loaded["project"])
         digest = str(loaded["blueprint_sha256"])
         intake = prepare_intake(
@@ -1679,13 +1718,22 @@ class UiPlanActivityHandler:
                 size = sum(len(entry) for section in continued for entry in section.entries)
                 if size > MAXIMUM_ISSUE_BODY_CHARACTERS:
                     render_error, continued = "RENDERED_BODY_TOO_LARGE", ()
+        if item.spec.get("variants"):
+            # NEW-154: a canonical gap request (created by the consolidation apply) keeps
+            # every merged variant verbatim in its continued sections.
+            context = canonical_context(
+                item, blueprint_id=str(blueprint_id), blueprint_sha256=digest
+            )
+            continued = context.continued
+        else:
+            context = item_context(
+                item, blueprint_id=str(blueprint_id), blueprint_sha256=digest, continued=continued
+            )
         created = self.change_requests.create_ui_item_sync(
             change_request_id,
             intake,
             str(loaded["decided_by"]),
-            item_context(
-                item, blueprint_id=str(blueprint_id), blueprint_sha256=digest, continued=continued
-            ),
+            context,
             # NEW-146 review 1: the ownership fence again, atomic with the row write.
             fanout_writer=workflow_id,
         )
@@ -1705,6 +1753,10 @@ class UiPlanActivityHandler:
             "dedupe_supported": item.target_repository in ALLOWED_REPOSITORIES,
             "continued": [section.model_dump(mode="json") for section in continued],
         }
+        if item.spec.get("variants"):
+            base["merged_from"] = [
+                str(member["item_key"]) for member in item.spec.get("members") or []
+            ]
         if created["status"] != "DRAFTING" or int(created["revision"]) != 1:
             return {**base, "status": "SKIPPED", "current_status": created["status"]}
         if item.is_gap:
@@ -1743,6 +1795,12 @@ class UiPlanActivityHandler:
             "Finding:\n" + _fenced("finding", _bounded_json(gap_finding(item), 20_000)),
             "Item statement:\n" + _fenced("item", str(base["description_redacted"])),
         ]
+        if item.spec.get("variants"):
+            sections.append(
+                _CONSOLIDATED_GAP_RULE
+                + "\n"
+                + _fenced("merged variants", canonical_variants_text(item))
+            )
         rounds = base.get("review_rounds") or []
         if attempt == 2 and rounds:
             sections.append(
@@ -1781,7 +1839,7 @@ class UiPlanActivityHandler:
 
     def _record_gap_draft(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
-        item = self._item(self._approved(blueprint_id), payload.get("item_key"))
+        item = self._item(blueprint_id, self._approved(blueprint_id), payload.get("item_key"))
         base = self._without_provider_results(payload)
         try:
             proposal = gap_proposal(self._structured(payload), item)
@@ -1802,7 +1860,7 @@ class UiPlanActivityHandler:
 
     def _prepare_gap_redraft(self, payload: dict[str, Any]) -> dict[str, Any]:
         blueprint_id = self._blueprint_id(payload)
-        item = self._item(self._approved(blueprint_id), payload.get("item_key"))
+        item = self._item(blueprint_id, self._approved(blueprint_id), payload.get("item_key"))
         return self._gap_request(payload, item, 2, self._workflow_run(payload))
 
     def _prepare_item_review(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1826,6 +1884,18 @@ class UiPlanActivityHandler:
             f"Project: {payload['project']}\nTarget repository: {payload['target_repository']}"
             f"\nItem: {payload['item_key']} ({payload['item_kind']})",
             _fenced("item statement", str(payload["description_redacted"])),
+            *(
+                (
+                    "This item consolidates the duplicate gap requests "
+                    f"{', '.join(payload['merged_from'])} (NEW-154). Their what_changes and "
+                    "acceptance criteria are listed verbatim, labelled with each request's "
+                    "item key, in the continued sections below. Scope also means: the "
+                    "proposal covers every variant and contradicts none (an omitted variant "
+                    "requirement is a scope finding).",
+                )
+                if payload.get("merged_from")
+                else ()
+            ),
             _fenced("proposal", json.dumps(proposal, sort_keys=True)),
             *(
                 (
@@ -1867,7 +1937,7 @@ class UiPlanActivityHandler:
             return [], None
         digest = str(loaded["blueprint_sha256"])
         failures = self.change_requests.item_failures_sync(
-            [item_change_request_id(digest, item.key) for item in fanout_items(loaded["blueprint"])]
+            [item_change_request_id(digest, item.key) for item in self._items(blueprint_id, loaded)]
         )
         return failures, str(loaded.get("approval_binding") or "") or None
 

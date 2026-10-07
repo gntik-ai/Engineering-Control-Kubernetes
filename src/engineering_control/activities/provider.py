@@ -128,6 +128,8 @@ class ProviderActivityHandler:
         "ui_plan.draft": "draft_request",
         "ui_plan.review": "review_request",
         "ui_fanout.gap_draft": "draft_request",
+        # NEW-154: the gap consolidation plan (Claude, Hermes-pinned output schema).
+        "ui_consolidate.plan": "draft_request",
     }
 
     def __init__(

@@ -237,6 +237,13 @@ class ControlActivities:
         "ui_fanout.prepare_gap_draft",
         "ui_fanout.prepare_review",
         "ui_fanout.finalize",
+        # NEW-154: the gap consolidation plan.
+        "ui_consolidate.load",
+        "ui_consolidate.prepare_plan",
+        "ui_consolidate.plan",
+        "ui_consolidate.record_plan",
+        "ui_consolidate.record_failure",
+        "ui_consolidate.finalize",
         "llmwiki.bootstrap.plan",
         "llmwiki.bootstrap.execute",
         "github.refresh_mirrors",
@@ -408,6 +415,7 @@ class ControlActivities:
             "ui_plan.draft",
             "ui_plan.review",
             "ui_fanout.gap_draft",
+            "ui_consolidate.plan",
         }
         - GITOPS_GITHUB_STEPS,
         "scan": {
@@ -476,6 +484,7 @@ class ControlActivities:
             "change_request.draft",
             "ui_plan.draft",
             "ui_fanout.gap_draft",
+            "ui_consolidate.plan",
         },
         "browser": {
             "runtime.browser_checks",

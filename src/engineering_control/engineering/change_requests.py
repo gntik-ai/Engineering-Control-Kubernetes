@@ -22,7 +22,16 @@ from engineering_control.engineering.backlog import (
 )
 from engineering_control.security.redaction import SecretRedactor
 
-CHANGE_REQUEST_STATUSES = ("DRAFTING", "CANDIDATE", "APPROVED", "PUBLISHED", "REJECTED", "FAILED")
+CHANGE_REQUEST_STATUSES = (
+    "DRAFTING",
+    "CANDIDATE",
+    "APPROVED",
+    "PUBLISHED",
+    "REJECTED",
+    "FAILED",
+    # NEW-154: a gap request merged into a canonical one by an operator consolidation.
+    "MERGED",
+)
 DESCRIPTION_MAX_BYTES = 8 * 1024
 DESCRIPTION_MIN_CHARACTERS = 20
 ISSUE_TITLE_PREFIX = "Change request: "
@@ -159,6 +168,22 @@ class UiChangeContext(ChangeRequestModel):
     )
     blocked_by: tuple[UiChangeDependency, ...] = Field(max_length=300)
     continued: tuple[UiContinuedSection, ...] = Field(default=(), max_length=7)
+    # NEW-154: a consolidated gap request names the gap requests it replaces and the
+    # blueprint items that need it. Both are empty (and never rendered) otherwise.
+    merged_from: tuple[UiChangeDependency, ...] = Field(default=(), max_length=60)
+    needed_by: tuple[
+        Annotated[str, Field(pattern=r"^(epic|page|cutover|gap):[a-z0-9][a-z0-9-]{0,99}$")], ...
+    ] = Field(default=(), max_length=300)
+
+
+def ui_context_json(context: UiChangeContext) -> dict[str, Any]:
+    """NEW-154: the stored form of a UI context. The consolidation fields are kept only when
+    set, so every other request stores exactly what it stored before them."""
+    value = context.model_dump(mode="json")
+    for name in ("merged_from", "needed_by"):
+        if not value.get(name):
+            value.pop(name, None)
+    return value
 
 
 class ChangeRequestIntake(ChangeRequestModel):
@@ -469,6 +494,23 @@ def _ui_context_lines(context: UiChangeContext) -> list[str]:
         f"- Item: `{context.item_key}` ({context.item_kind}, wave {context.wave or 'none'})",
         "- Labels: " + ", ".join(f"`{label}`" for label in context.labels),
         *(["- Blocked by:", *blocked] if blocked else ["- Blocked by: none"]),
+        *(
+            [
+                f"- Consolidates {len(context.merged_from)} gap change requests (merged into "
+                "this one):",
+                *(
+                    f"  - change request `{item.change_request_id}` (`{item.item_key}`)"
+                    for item in context.merged_from
+                ),
+            ]
+            if context.merged_from
+            else []
+        ),
+        *(
+            ["- Needed by: " + ", ".join(f"`{key}`" for key in context.needed_by)]
+            if context.needed_by
+            else []
+        ),
         "",
         *(line for section in context.continued for line in _continued_lines(section)),
     ]

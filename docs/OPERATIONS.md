@@ -636,6 +636,51 @@ engineering-ctl ui-blueprint-fanout-retry <blueprint> <binding> RETRY_UI_FANOUT 
   its cap, which drafts and reviews the reset items like any other pending item. A repeat finds
   nothing left to reset; if the start fails (503), repeat the retry or the approval to resume.
 
+### Consolidating duplicate gap requests (NEW-154)
+
+The fan-out drafts one gap request per gap per page batch, so one need (cursor pagination, a
+create wizard, a reveal-once secret dialog) can appear several times. Consolidate them per
+blueprint, one kind at a time if the blueprint is large:
+
+```bash
+engineering-ctl ui-blueprint-gap-consolidate <blueprint> [--kind backend-gap|kit-gap]
+# PLANNING: one bounded Claude step runs (UiGapConsolidationPlanWorkflow). Repeat the same
+# command to see the plan: status PROPOSED, plan_sha12, preview (one line per cluster) and
+# apply_command. A repeat never runs the model again for the same inputs; --replan does.
+engineering-ctl ui-blueprint-gap-consolidate <blueprint> [--kind ...] --apply <plan_sha12> CONSOLIDATE_GAPS
+engineering-ctl ui-plan-status <blueprint>   # change_requests.by_status (MERGED), gap_consolidations
+engineering-ctl change-show <id>             # MERGED: merged_into; pages: blocked_by_resolved
+```
+
+- The plan reads only the blueprint's mergeable gap requests: `CANDIDATE`, `FAILED` or a
+  never-drafted `DRAFTING` revision 1. `PUBLISHED`, `APPROVED`, `REJECTED`, `MERGED` and
+  requests under an operator revision are never included. Hermes checks the plan before it is
+  stored: an unknown or ineligible key, a key in two clusters, or a cluster that mixes target
+  repositories or gap kinds makes it `INVALID` (`problems` lists why; plan again with
+  `--replan`). Gaps without an equivalent stay unclustered. The plan is stored with its sha256.
+- `--apply` is operator-only (CLI or allowlisted `telegram:<id>`), bound to the plan sha and
+  the typed `CONSOLIDATE_GAPS`, refused (409) while a fan-out for the blueprint runs or is being
+  started, and refused whole if any member was published, approved or rejected since the plan.
+  In one audited transaction (`ui_gap_consolidation.applied` dashboard event) it creates one
+  canonical request per cluster (id from the blueprint hash and the sorted member keys, item
+  key `gap:merged-<hash>`), marks every member `MERGED` with `merged_into` (never deleted, its
+  draft kept), and re-points every page, epic and cutover `blocked_by` entry to the canonical
+  request. A `CANDIDATE` request is rendered again (new approval binding); an `APPROVED`,
+  unpublished one goes back to `CANDIDATE` and must be approved again (`result.reopened`). A
+  `PUBLISHED` request is not edited and nothing is changed on GitHub: its
+  `consolidation.merged_references` records the merged id its issue body names, and
+  `change-show` resolves it (`blocked_by_resolved`, `merged_into`). Repeating the apply is a
+  no-op that returns the recorded result.
+- The apply then starts (or joins) a fan-out that drafts the canonical requests like any gap:
+  Claude drafts with triage-ui-gap from every member's proposal, Codex reviews, and the
+  candidate is published with `change-publish` as usual. Every member's acceptance criteria
+  (and what_changes, within the body budget) are rendered verbatim in the canonical issue body,
+  labelled with their item keys; the body also lists the merged requests and the items that
+  need it. A failed canonical request is retried with `ui-blueprint-fanout-retry`.
+- Revision 0021 adds `MERGED`, `change_requests.merged_into_id` and `consolidation_json`, and
+  the `ui_gap_consolidations` table: run the migration before deploying this release. Its
+  downgrade refuses while any request is `MERGED`.
+
 ### Schema keys and step redaction (NEW-148)
 
 Every step payload is redacted before it is dispatched, and the redactor replaces the value of

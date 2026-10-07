@@ -33,3 +33,5 @@ class WorkflowName(StrEnum):
     # NEW-123: UI migration flow A (blueprint) and its approved change-request fan-out.
     UI_MIGRATION_PLAN = "UiMigrationPlanWorkflow"
     UI_BLUEPRINT_FANOUT = "UiBlueprintFanOutWorkflow"
+    # NEW-154: the plan step of an operator-driven gap consolidation.
+    UI_GAP_CONSOLIDATION_PLAN = "UiGapConsolidationPlanWorkflow"

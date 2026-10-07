@@ -44,6 +44,7 @@ from engineering_control.workflows.inputs import (
     StagingDeploymentInput,
     StagingGitOpsDeliveryInput,
     UiBlueprintFanOutInput,
+    UiGapConsolidationPlanInput,
     UiMigrationPlanInput,
 )
 from engineering_control.workflows.provider_stops import (
@@ -517,7 +518,7 @@ class ControlledWorkflow:
             return GITHUB_TASK_QUEUE
         # NEW-123: fixed opposite providers -- Claude drafts the blueprint and the gap change
         # requests; Codex independently reviews (change_request.review routes below).
-        if step in {"ui_plan.draft", "ui_fanout.gap_draft"}:
+        if step in {"ui_plan.draft", "ui_fanout.gap_draft", "ui_consolidate.plan"}:
             return provider_task_queue("claude", default="claude")
         if step == "ui_plan.review":
             return provider_task_queue("codex", default="codex")
@@ -6084,6 +6085,100 @@ class UiBlueprintFanOutWorkflow(ControlledWorkflow):
         return "failed"
 
 
+@workflow.defn(name="UiGapConsolidationPlanWorkflow")
+class UiGapConsolidationPlanWorkflow(ControlledWorkflow):
+    """NEW-154: one bounded Claude step proposes clusters of duplicate gap requests.
+
+    Hermes checks the plan deterministically and stores it with its sha256 (PROPOSED), or
+    records why it was refused (INVALID) or failed. Nothing is merged: the operator applies
+    a stored plan by its sha (one audited transaction, outside this workflow)."""
+
+    @workflow.run
+    async def run(self, request: UiGapConsolidationPlanInput) -> dict[str, Any]:
+        context = await self._step("ui_consolidate.load", asdict(request))
+        if context.get("status") != "READY":
+            return await self._consolidation_end(
+                request, str(context.get("status") or "FAILED"), context.get("blocker")
+            )
+        try:
+            snapshot = await self._step(
+                "project.snapshot",
+                {"project": context.get("project"), "campaign_id": context.get("campaign_id")},
+                timeout_minutes=60,
+            )
+        except ActivityError:
+            return await self._consolidation_failure(request, "UI_GAP_SNAPSHOT_UNAVAILABLE", {})
+        try:
+            context = await self._step(
+                "ui_consolidate.prepare_plan",
+                {**context, "source_worktree": snapshot.get("source_worktree")},
+            )
+            if context.get("status") == "SUPERSEDED":
+                return await self._consolidation_end(request, "SUPERSEDED", None)
+            if context.get("status") != "PLAN_READY":
+                return await self._consolidation_failure(
+                    request, str(context.get("blocker") or "UI_GAP_PLAN_FAILED"), context
+                )
+            context = await self._agent_step("ui_consolidate.plan", context, timeout_minutes=40)
+            if context.get("status") != "SUCCESS":
+                return await self._consolidation_failure(
+                    request, str(context.get("blocker") or context.get("status")), context
+                )
+            recorded = await self._step("ui_consolidate.record_plan", context)
+        except ActivityError:
+            return await self._consolidation_failure(request, "STEP_FAILED", {})
+        return await self._consolidation_end(
+            request, str(recorded.get("status") or "FAILED"), recorded.get("blocker"), recorded
+        )
+
+    async def _consolidation_failure(
+        self, request: UiGapConsolidationPlanInput, blocker: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        recorded = await self._step(
+            "ui_consolidate.record_failure",
+            {
+                "consolidation_id": request.consolidation_id,
+                "blocker": blocker,
+                **_blocker_detail(context),
+            },
+        )
+        return await self._consolidation_end(
+            request, str(recorded.get("status") or "FAILED"), blocker
+        )
+
+    async def _consolidation_end(
+        self,
+        request: UiGapConsolidationPlanInput,
+        status: str,
+        blocker: Any,
+        recorded: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            await self._step(
+                "ui_consolidate.finalize",
+                {
+                    "consolidation_id": request.consolidation_id,
+                    "terminal_status": status,
+                    "error_code": blocker,
+                },
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "ui gap consolidation %s: control Run finalization failed",
+                request.consolidation_id,
+            )
+        return {
+            "status": status,
+            "consolidation_id": request.consolidation_id,
+            "error_code": blocker,
+            **{
+                key: value
+                for key, value in (recorded or {}).items()
+                if key in {"plan_sha256", "clusters", "merged", "problems"}
+            },
+        }
+
+
 ALL_WORKFLOWS = [
     AuditCampaignWorkflow,
     MultiProjectAuditWorkflow,
@@ -6115,4 +6210,5 @@ ALL_WORKFLOWS = [
     ChangeRequestWorkflow,
     UiMigrationPlanWorkflow,
     UiBlueprintFanOutWorkflow,
+    UiGapConsolidationPlanWorkflow,
 ]

@@ -15,7 +15,13 @@ from sqlalchemy import create_engine, select, update
 from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.db.models import ChangeRequest, DashboardEvent, Run, UiBlueprint
+from engineering_control.db.models import (
+    ChangeRequest,
+    DashboardEvent,
+    Run,
+    UiBlueprint,
+    UiGapConsolidation,
+)
 from engineering_control.db.runtime_binding import new_bound_run
 from engineering_control.engineering.backlog import is_reauthenticated_backlog_operator
 from engineering_control.engineering.ui_blueprint import (
@@ -23,6 +29,7 @@ from engineering_control.engineering.ui_blueprint import (
     FANOUT_RETRY_KINDS,
     RETRY_FANOUT_PHRASE,
     UI_PLAN_PROJECTS,
+    FanoutItem,
     approval_binding,
     blueprint_sha256,
     fanout_items,
@@ -41,6 +48,7 @@ from engineering_control.engineering.ui_blueprint_parts import (
     review_digest,
     usage_summary,
 )
+from engineering_control.engineering.ui_gap_consolidation import canonical_items
 
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _SHA = re.compile(r"^[a-f0-9]{40}$")
@@ -54,6 +62,22 @@ REJECTION_FIELD = "rejection_of"
 
 # NEW-146: how many fan-out retry records the blueprint keeps (newest last).
 RETRY_HISTORY = 20
+
+
+def applied_results(session: Session, blueprint_id: UUID) -> list[dict[str, Any]]:
+    """NEW-154: the result records of a blueprint's applied gap consolidations, oldest first."""
+    rows = session.scalars(
+        select(UiGapConsolidation)
+        .where(UiGapConsolidation.blueprint_id == blueprint_id)
+        .where(UiGapConsolidation.status == "APPLIED")
+        .order_by(UiGapConsolidation.applied_at, UiGapConsolidation.id)
+    ).all()
+    return [dict(row.result_json or {}) for row in rows]
+
+
+def blueprint_canonical_items(session: Session, blueprint_id: UUID) -> list[FanoutItem]:
+    """NEW-154: the canonical gap requests consolidations added to the blueprint's items."""
+    return canonical_items(applied_results(session, blueprint_id))
 
 
 class UiBlueprintNotFoundError(ValueError):
@@ -136,7 +160,65 @@ class UiBlueprintRepository:
     def get_sync(self, blueprint_id: UUID) -> dict[str, Any] | None:
         with self.sessions() as session:
             row = session.get(UiBlueprint, blueprint_id)
-            return self._view(row) if row is not None else None
+            if row is None:
+                return None
+            view = self._view(row)
+            if row.blueprint_json and row.blueprint_sha256:
+                # NEW-154: the fanned-out requests by status (MERGED included) and the
+                # blueprint's gap consolidations.
+                view["change_requests"] = self._item_statuses(session, row)
+                view["gap_consolidations"] = self._consolidations(session, row.id)
+            return view
+
+    def canonical_items_sync(self, blueprint_id: UUID) -> list[FanoutItem]:
+        """NEW-154: the canonical gap items of the blueprint's applied consolidations."""
+        with self.sessions() as session:
+            return blueprint_canonical_items(session, blueprint_id)
+
+    @staticmethod
+    def _item_statuses(session: Session, row: UiBlueprint) -> dict[str, Any]:
+        digest = str(row.blueprint_sha256)
+        canonicals = blueprint_canonical_items(session, row.id)
+        items = [*fanout_items(dict(row.blueprint_json or {})), *canonicals]
+        kinds = {item_change_request_id(digest, item.key): item.kind for item in items}
+        rows = session.execute(
+            select(ChangeRequest.id, ChangeRequest.status).where(ChangeRequest.id.in_(list(kinds)))
+        ).all()
+        by_status: dict[str, int] = {}
+        by_kind: dict[str, dict[str, int]] = {}
+        for identity, status in rows:
+            by_status[status] = by_status.get(status, 0) + 1
+            counts = by_kind.setdefault(kinds[identity], {})
+            counts[status] = counts.get(status, 0) + 1
+        return {
+            "items": len(kinds),
+            "created": len(rows),
+            "by_status": dict(sorted(by_status.items())),
+            "by_kind": {kind: dict(sorted(value.items())) for kind, value in by_kind.items()},
+            "merged": by_status.get("MERGED", 0),
+            "canonical": len(canonicals),
+        }
+
+    @staticmethod
+    def _consolidations(session: Session, blueprint_id: UUID) -> list[dict[str, Any]]:
+        rows = session.scalars(
+            select(UiGapConsolidation)
+            .where(UiGapConsolidation.blueprint_id == blueprint_id)
+            .order_by(UiGapConsolidation.created_at.desc())
+            .limit(10)
+        ).all()
+        return [
+            {
+                "id": str(item.id),
+                "kind": item.kind,
+                "status": item.status,
+                "plan_sha12": (item.plan_sha256 or "")[:12] or None,
+                "clusters": len((item.plan_json or {}).get("clusters") or []),
+                "error_code": item.error_code,
+                "applied_by": item.applied_by,
+            }
+            for item in rows
+        ]
 
     async def markdown(self, blueprint_id: UUID) -> str | None:
         return await asyncio.to_thread(self.markdown_sync, blueprint_id)
@@ -277,7 +359,11 @@ class UiBlueprintRepository:
             digest = str(row.blueprint_sha256)
             items = [
                 item
-                for item in fanout_items(dict(row.blueprint_json or {}))
+                for item in [
+                    *fanout_items(dict(row.blueprint_json or {})),
+                    # NEW-154: a canonical gap request fails and is retried like any gap.
+                    *blueprint_canonical_items(session, row.id),
+                ]
                 if kind is None or item.kind == kind or (kind == "gap" and item.is_gap)
             ]
             identities = {item_change_request_id(digest, item.key): item.key for item in items}

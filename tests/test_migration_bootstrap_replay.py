@@ -28,8 +28,8 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
     head_revision = scripts.get_revision(head)
     assert isinstance(head_revision.down_revision, str)
     parent = head_revision.down_revision
-    # NEW-123: 0020 (UI blueprints) follows 0019 (change requests).
-    assert (head, parent) == ("0020", "0019")
+    # NEW-154: 0021 (MERGED and gap consolidations) follows 0020 (UI blueprints).
+    assert (head, parent) == ("0021", "0020")
 
     command.upgrade(config, "head")
     engine = create_engine(database_url)
@@ -52,10 +52,16 @@ def test_fresh_bootstrap_reaches_head_and_latest_revision_round_trips(
         column["name"] for column in inspect(engine).get_columns("runs")
     }
 
-    assert "ui_blueprints" in inspect(engine).get_table_names()
+    assert "ui_gap_consolidations" in inspect(engine).get_table_names()
     command.downgrade(config, parent)
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == parent
+    assert "ui_gap_consolidations" not in inspect(engine).get_table_names()
+    assert "merged_into_id" not in {
+        column["name"] for column in inspect(engine).get_columns("change_requests")
+    }
+    assert "ui_blueprints" in inspect(engine).get_table_names()
+    command.downgrade(config, "0019")
     assert "ui_blueprints" not in inspect(engine).get_table_names()
     assert "ui_context_json" not in {
         column["name"] for column in inspect(engine).get_columns("change_requests")

@@ -51,6 +51,9 @@ class AgentInstructionPack:
         "ui_plan.draft": "plan-ui-migration",
         "ui_plan.review": "plan-ui-migration",
         "ui_fanout.gap_draft": "triage-ui-gap",
+        # NEW-154: the gap consolidation plan runs under the gap triager's role and skill;
+        # its output schema is Hermes-pinned (plan_schema), not the skill's draft schema.
+        "ui_consolidate.plan": "triage-ui-gap",
     }
     # NEW-123: these steps must send exactly the released skill's output schema.
     _pinned_schema_steps = frozenset({"ui_plan.draft", "ui_plan.review", "ui_fanout.gap_draft"})
