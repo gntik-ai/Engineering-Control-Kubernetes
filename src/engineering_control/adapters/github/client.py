@@ -279,7 +279,7 @@ class GhCliBroker:
         return value
 
     def view_issue_body(self, repository: str, number: int) -> dict[str, Any]:
-        """Read one issue's current state and body (read-only)."""
+        """Read one issue's current state, body and labels (read-only)."""
         repository = self._batch(repository)
         if number < 1:
             raise GhCliPolicyError("issue number is invalid")
@@ -292,7 +292,7 @@ class GhCliBroker:
                     "--repo",
                     repository,
                     "--json",
-                    "number,state,title,body,updatedAt",
+                    "number,state,title,body,updatedAt,labels",
                 ]
             ).stdout,
             "issue",

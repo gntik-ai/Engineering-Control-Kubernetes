@@ -210,6 +210,11 @@ def parser() -> argparse.ArgumentParser:
     issue_amend.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     issue_amend.add_argument("--confirm", metavar="SHA_PREFIX", default=None)
     issue_amend.add_argument("--retry", action="store_true")
+    touch_refresh = commands.add_parser("issue-touch-refresh")
+    touch_refresh.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    touch_refresh.add_argument("repository", choices=_CHANGE_REPOSITORIES)
+    touch_refresh.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
+    touch_refresh.add_argument("--confirm", metavar="TOKEN_PREFIX", default=None)
     # NEW-133: one operator-approved extra correction attempt for a ChangeSet blocked only
     # by deterministic validation findings; backlog-retry then resumes the loop.
     extend_correction = commands.add_parser("change-extend-correction")
@@ -651,6 +656,15 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
             amend["confirm"] = arguments.confirm.lower()
             amend["retry"] = bool(arguments.retry)
         return client.request("POST", "/v1/issues/amend", amend)
+    if command == "issue-touch-refresh":
+        touch: dict[str, Any] = {
+            "project": arguments.project,
+            "repository": arguments.repository,
+            "issue_number": arguments.issue_number,
+        }
+        if arguments.confirm is not None:
+            touch["confirm"] = arguments.confirm.lower()
+        return client.request("POST", "/v1/issues/touch-refresh", touch)
     if command in {"status", "run"}:
         return client.request("GET", f"/v1/runs/{arguments.workflow_id}")
     if command in {"pause", "resume", "cancel"}:

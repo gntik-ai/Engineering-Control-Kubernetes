@@ -309,6 +309,15 @@ class IssueAmendRequest(APIModel):
         return self
 
 
+class IssueTouchRefreshRequest(APIModel):
+    """NEW-150: preview (no confirm) or confirm one issue revision-time refresh."""
+
+    project: Literal["falcone", "musematic", "llmwiki"]
+    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"]
+    issue_number: int = Field(ge=1, le=2_147_483_647)
+    confirm: str | None = Field(default=None, pattern=r"^[a-f0-9]{12,64}$")
+
+
 class LoopPlanDispatch(APIModel):
     project: Project
     campaign_id: UUID
