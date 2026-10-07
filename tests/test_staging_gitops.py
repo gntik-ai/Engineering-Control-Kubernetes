@@ -3687,3 +3687,22 @@ async def test_new_118_the_merge_record_is_write_once_per_bound_source_pr(tmp_pa
         assert metadata._source_pr_merged(change_set_id) is True
     finally:
         metadata.engine.dispose()
+
+
+def test_failure_excerpt_names_every_failing_test_first() -> None:
+    """NEW-153: falcone-charts #61 (2026-10-07) failed 10 TAP tests, but noise lines (curl
+    --fail, "0 chart(s) failed") filled the context budget and the excerpt named only one."""
+    from engineering_control.adapters.github.client import failure_excerpt
+
+    noise = "curl --fail --silent --location x\n1 chart(s) linted, 0 chart(s) failed\n" * 40
+    tap = "".join(f"not ok {n} - contract {n} holds\n  error: |-\n" for n in range(150, 160))
+    excerpt = failure_excerpt(noise + tap + "# fail 10\n")
+    head = excerpt.splitlines()
+    assert head[0] == "Failing tests (10):"
+    assert [line for line in head[1:11]] == [
+        f"not ok {n} - contract {n} holds" for n in range(150, 160)
+    ]
+    assert len(head) <= 60 and len(excerpt) <= 4000
+    many = failure_excerpt("".join(f"not ok {n} - t{n}\n" for n in range(1, 101)))
+    assert "Failing tests (100):" in many and "... and 75 more" in many
+    assert len(many.splitlines()) <= 60
