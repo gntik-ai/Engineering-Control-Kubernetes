@@ -47,6 +47,7 @@ from engineering_control.models.enums import Project
 from engineering_control.operations.issue_start import IssueStartUnconfirmedError, issue_workflow_id
 from engineering_control.operations.run_start import RecordedRunStartUnconfirmedError
 from engineering_control.policy.approvals import ApprovalService
+from engineering_control.projects import GLOBAL_PROJECTS
 from engineering_control.workflow_outcome import derive_workflow_application_projection
 from engineering_control.workflows.inputs import (
     AcceptanceLifecycleInput,
@@ -296,7 +297,7 @@ class TemporalControlService:
     async def start_all_project_audits(self, request: MultiProjectAuditStart) -> OperationAccepted:
         group_id = uuid4()
         workflow_id = f"audit-all-{group_id}"
-        projects = (Project.FALCONE, Project.MUSEMATIC, Project.LLMWIKI)
+        projects = tuple(Project(project) for project in GLOBAL_PROJECTS)
         campaigns = {
             project: (
                 uuid4(),

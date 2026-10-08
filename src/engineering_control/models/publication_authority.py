@@ -7,13 +7,9 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictInt
 
-RepositoryName = Literal[
-    "gntik-ai/falcone",
-    "gntik-ai/falcone-charts",
-    "gntik-ai/musematic",
-    "gntik-ai/musematic-deploy",
-    "gntik-ai/llmwiki",
-]
+from engineering_control.projects import RepositoryFullName
+
+RepositoryName = RepositoryFullName
 
 
 class IssueRevisionObservation(BaseModel):

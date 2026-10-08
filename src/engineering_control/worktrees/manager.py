@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import UUID
 
 from engineering_control.leases.file_lease import FileLease
+from engineering_control.projects import DEPLOYMENT_REPOSITORY_SLUGS, REPOSITORY_SLUG_SET
 from engineering_control.security.redaction import SecretRedactor
 from engineering_control.worktrees.agent_config import is_agent_config_path, overlaps
 
@@ -59,10 +60,8 @@ class WorktreeAccess:
 
 
 class GitWorktreeManager:
-    _repositories = frozenset(
-        {"falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"}
-    )
-    _deployment_repositories = frozenset({"falcone-charts", "musematic-deploy", "llmwiki"})
+    _repositories = REPOSITORY_SLUG_SET
+    _deployment_repositories = frozenset(DEPLOYMENT_REPOSITORY_SLUGS)
 
     def __init__(
         self,

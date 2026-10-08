@@ -16,13 +16,18 @@ from pydantic import (
 )
 
 from engineering_control.models.reconciliation import StagingFlowPolicy
+from engineering_control.projects import (
+    REPOSITORY_SLUG_ALTERNATION,
+    SELF_CONTAINED_REPOSITORIES,
+    ProjectName,
+)
 
 Slug = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,119}$")]
 GitSHA = Annotated[str, Field(pattern=r"^[a-f0-9]{40}$")]
 Digest = Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
 RepositoryName = Annotated[
     str,
-    Field(pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"),
+    Field(pattern=rf"^gntik-ai/({REPOSITORY_SLUG_ALTERNATION})$"),
 ]
 CredentialReference = Annotated[
     str,
@@ -81,8 +86,10 @@ class RepositoryPair(EngineeringModel):
 
     @model_validator(mode="after")
     def pair_is_distinct(self) -> RepositoryPair:
-        if self.source.full_name == self.deployment.full_name and str(self.source.full_name) != (
-            "gntik-ai/llmwiki"
+        # NEW-157: only registered self-contained projects share one repository.
+        if (
+            self.source.full_name == self.deployment.full_name
+            and str(self.source.full_name) not in SELF_CONTAINED_REPOSITORIES
         ):
             raise ValueError("source and deployment repositories must be distinct")
         return self
@@ -430,7 +437,7 @@ class MakerRules(EngineeringModel):
 
 class ProjectManifest(EngineeringModel):
     schema_version: Literal[1]
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     repositories: RepositoryPair
     api_url: HttpUrl
     deployment: DeploymentManifest
@@ -532,7 +539,7 @@ class Persona(EngineeringModel):
 
 class PersonaManifest(EngineeringModel):
     schema_version: Literal[1]
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     identity_authority: Literal["falcone", "musematic"]
     persistent_contract: CredentialReference | None = None
     personas: list[Persona] = Field(min_length=3, max_length=30)
@@ -600,7 +607,7 @@ class RetryPolicy(EngineeringModel):
 class E2EFlow(EngineeringModel):
     schema_version: Literal[1]
     id: Slug
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     persona: Slug
     category: Literal[
         "public",
@@ -656,7 +663,7 @@ class RuntimeSnapshot(EngineeringModel):
 
 class ProjectPairSnapshot(EngineeringModel):
     schema_version: Literal[1]
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     source: RepositorySnapshot
     deployment: RepositorySnapshot
     runtime: RuntimeSnapshot
@@ -691,7 +698,7 @@ class CredentialReadiness(EngineeringModel):
 
 
 class CampaignPlan(EngineeringModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     preset: Literal[
         "snapshot",
         "static-full",
@@ -729,7 +736,7 @@ class EnhancementStatus(StrEnum):
 
 class EnhancementRecord(EngineeringModel):
     enhancement_id: str = Field(pattern=r"^enh-[a-f0-9]{16,64}$")
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     campaign_id: str = Field(min_length=1, max_length=200)
     persona: Slug
     observed_problem: str = Field(min_length=1, max_length=2000)

@@ -10,6 +10,7 @@ from uuid import UUID
 from engineering_control.dashboard.observability import DashboardObservabilityProjection
 from engineering_control.dashboard.repository import DashboardRepository
 from engineering_control.dashboard.schemas import ActivityEventInput
+from engineering_control.projects import PROJECT_SET
 
 _STEP_EVENTS = {
     "agent.record_start": "provider.selected",
@@ -218,7 +219,7 @@ def _bounded(value: Any, limit: int) -> str | None:
 
 def _bounded_project(value: Any) -> str | None:
     text = _bounded(value, 32)
-    return text if text in {"falcone", "musematic", "llmwiki", "platform"} else None
+    return text if text in PROJECT_SET | {"platform"} else None
 
 
 def _positive_int(value: Any) -> int | None:

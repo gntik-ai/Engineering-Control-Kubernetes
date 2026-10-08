@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from engineering_control.db.models import BacklogIssueRecord, Issue, NotificationOutbox
+from engineering_control.projects import PROJECT_SET
 from engineering_control.security.redaction import SecretRedactor
 
 LOOP_STATE_TOPIC = "telegram.engineering-backlog-loop-state"
@@ -43,7 +44,7 @@ MILESTONE_EVENTS = frozenset(
 _WORKFLOW_ID = re.compile(r"[A-Za-z0-9._:-]{1,300}")
 _ISSUE = re.compile(r"([A-Za-z0-9._-]{1,100}/)?([A-Za-z0-9._-]{1,100})#([1-9][0-9]{0,8})")
 _CODE = re.compile(r"[A-Z][A-Z0-9_:]{0,159}")
-_PROJECTS = frozenset({"falcone", "musematic", "llmwiki"})
+_PROJECTS = PROJECT_SET
 
 # One line per known blocker. Prefix families are matched below.
 BLOCKER_EXPLANATIONS: dict[str, str] = {

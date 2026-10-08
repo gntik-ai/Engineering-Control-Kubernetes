@@ -57,6 +57,7 @@ from engineering_control.operations.publication_authority import (
     RECONCILED_EFFECT_STATE,
     _lock_changeset,
 )
+from engineering_control.projects import REPOSITORY_SLUG_ALTERNATION
 
 RECONCILED = RECONCILED_EFFECT_STATE
 # NEW-145 review 3: a push already received by GitHub can still update the ref after the
@@ -74,7 +75,7 @@ _SETTLEABLE_CREATE_STATES = frozenset({"UNKNOWN", "NOT_ATTEMPTED", "COMPLETE"})
 _ACTIVE_RUN_STATES = frozenset({"QUEUED", "RUNNING", "RATE_LIMITED", "AWAITING_APPROVAL"})
 _SHA = re.compile(r"[0-9a-f]{40}")
 _PR_URL = re.compile(
-    r"https://github\.com/(gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki))"
+    rf"https://github\.com/(gntik-ai/(?:{REPOSITORY_SLUG_ALTERNATION}))"
     r"/pull/[1-9][0-9]{0,9}"
 )
 

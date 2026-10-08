@@ -8,6 +8,11 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engineering_control.models.enums import Project
+from engineering_control.projects import (
+    PROJECT_ALTERNATION,
+    REPOSITORY_SLUG_ALTERNATION,
+    SOURCE_REPOSITORY_ALTERNATION,
+)
 
 
 class ReconciliationModel(BaseModel):
@@ -20,7 +25,7 @@ class CandidateBuildPolicy(ReconciliationModel):
     artifact_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
     manifest_file: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json$")
     signer_workflow: str = Field(
-        pattern=r"^gntik-ai/(falcone|musematic|llmwiki)/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$"
+        pattern=rf"^gntik-ai/({SOURCE_REPOSITORY_ALTERNATION})/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$"
     )
     deny_self_hosted_runners: bool = True
     blocker: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,119}$")
@@ -39,7 +44,7 @@ class ImmutablePromotionPolicy(ReconciliationModel):
     deployment_file: str
     chart_directory: str | None = None
     values_files: tuple[str, ...] = ()
-    component_lease: str = Field(pattern=r"^(falcone|musematic|llmwiki):[a-z0-9:-]{1,180}$")
+    component_lease: str = Field(pattern=rf"^({PROJECT_ALTERNATION}):[a-z0-9:-]{{1,180}}$")
     image_repositories: dict[str, str]
     digest_paths: dict[str, str]
     blocker: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,119}$")
@@ -159,9 +164,7 @@ class StagingFlowPolicy(ReconciliationModel):
     main_ci_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
     image_workflow: str | None = Field(default=None, pattern=_WORKFLOW_REFERENCE)
     release_tag: ReleaseTagPolicy = Field(default_factory=ReleaseTagPolicy)
-    deploy_repository: str = Field(
-        pattern=r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)$"
-    )
+    deploy_repository: str = Field(pattern=rf"^gntik-ai/({REPOSITORY_SLUG_ALTERNATION})$")
     deploy_values_file: str = Field(pattern=r"^[A-Za-z0-9._/-]{1,240}\.ya?ml$")
     deploy_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
     image_repositories: tuple[str, ...] = Field(min_length=1, max_length=20)
@@ -169,7 +172,7 @@ class StagingFlowPolicy(ReconciliationModel):
     tag_length: int = Field(default=7, ge=7, le=40)
     chart_source_repository: str | None = Field(
         default=None,
-        pattern=r"^https://github\.com/gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki)\.git$",
+        pattern=rf"^https://github\.com/gntik-ai/({REPOSITORY_SLUG_ALTERNATION})\.git$",
     )
     pin_chart_to_merge: bool = False
     # NEW-62: R3 ChangeSets (e.g. database migrations) are never merged unless the project
@@ -232,13 +235,13 @@ class CIReconciliationPlan(ReconciliationModel):
     run_id: UUID
     workflow_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$")
     project: Project
-    repository: str = Field(pattern=r"^gntik-ai/(falcone|musematic|llmwiki)$")
+    repository: str = Field(pattern=rf"^gntik-ai/({SOURCE_REPOSITORY_ALTERNATION})$")
     source_pr_number: int = Field(ge=1)
     source_pr_url: str = Field(
-        pattern=r"^https://github\.com/gntik-ai/(falcone|musematic|llmwiki)/pull/[1-9][0-9]*$"
+        pattern=rf"^https://github\.com/gntik-ai/({SOURCE_REPOSITORY_ALTERNATION})/pull/[1-9][0-9]*$"
     )
     source_branch: str = Field(
-        pattern=r"^agent/(falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}$"
+        pattern=rf"^agent/({PROJECT_ALTERNATION})/[A-Za-z0-9._-]+/[a-f0-9-]{{36}}$"
     )
     source_head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     source_base_branch: str = Field(default="main", pattern=r"^[A-Za-z0-9._/-]{1,120}$")
@@ -267,7 +270,7 @@ class CandidateImage(ReconciliationModel):
 class CandidateArtifactManifest(ReconciliationModel):
     schema_version: Literal[1]
     project: Project
-    source_repository: str = Field(pattern=r"^gntik-ai/(falcone|musematic|llmwiki)$")
+    source_repository: str = Field(pattern=rf"^gntik-ai/({SOURCE_REPOSITORY_ALTERNATION})$")
     source_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     workflow_run_id: int = Field(ge=1)
     images: tuple[CandidateImage, ...] = Field(min_length=1, max_length=64)

@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from engineering_control.projects import PROJECT_ALTERNATION
+
 
 class DashboardModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -17,7 +19,7 @@ class ActivityEventInput(DashboardModel):
     source: str = Field(pattern=r"^(controller|worker|dashboard|hermes)$")
     host: str | None = Field(default=None, max_length=253)
     worker_kind: str | None = Field(default=None, max_length=32)
-    project: str | None = Field(default=None, pattern=r"^(falcone|musematic|llmwiki|platform)$")
+    project: str | None = Field(default=None, pattern=rf"^({PROJECT_ALTERNATION}|platform)$")
     workflow_id: str | None = Field(default=None, max_length=240)
     temporal_run_id: str | None = Field(default=None, max_length=240)
     issue_number: int | None = Field(default=None, ge=1)

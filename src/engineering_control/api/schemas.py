@@ -6,6 +6,16 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from engineering_control.models.enums import AuditLens, Project, RiskClass
+from engineering_control.projects import (
+    GLOBAL_PROJECTS,
+    PROJECTS,
+    ProjectName,
+    RepositoryFullName,
+    RepositorySlug,
+)
+
+# NEW-157: e.g. FALCONE|MUSEMATIC|LLMWIKI for the typed confirmation phrases.
+_PROJECT_PHRASE = "|".join(project.upper() for project in PROJECTS)
 
 CoverageSlug = Annotated[
     str,
@@ -159,46 +169,37 @@ class IssueLoopStart(APIModel):
 
 
 class GitHubBacklogImportRequest(APIModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     source: Literal["github-open"] = "github-open"
     import_filter: Literal["bugs", "bugs-and-docs", "security", "enhancements", "all"]
     maximum_items: int = Field(default=500, ge=1, le=500)
 
 
 class BacklogApprovalCandidateRequest(APIModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     delivery_mode: Literal["source-pr", "full-delivery"]
     maximum_risk: RiskClass
     maximum_items: int = Field(default=1, ge=1, le=50)
 
 
 class BacklogApprovalRequest(APIModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
     typed_confirmation: Literal["APPROVE_EXISTING_GITHUB_BACKLOG_LOOP"]
 
 
 class BacklogOwnershipReleaseRequest(APIModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     typed_confirmation: Literal["RELEASE_GITHUB_WRITE_POLICY_OWNERSHIP"]
 
 
 class ExistingBacklogLoopStart(APIModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     backlog_campaign_id: UUID
     maximum_risk: RiskClass
     delivery_mode: Literal["source-pr", "full-delivery"]
     maximum_items: int = Field(default=1, ge=1, le=50)
-    target_repository: (
-        Literal[
-            "gntik-ai/falcone",
-            "gntik-ai/falcone-charts",
-            "gntik-ai/musematic",
-            "gntik-ai/musematic-deploy",
-            "gntik-ai/llmwiki",
-        ]
-        | None
-    ) = None
+    target_repository: RepositoryFullName | None = None
     target_issue_number: int | None = Field(default=None, ge=1)
     continue_after_blocked_issue: bool = True
     correction_limit: int = Field(default=2, ge=0, le=5)
@@ -249,7 +250,7 @@ class AutonomousBacklogStart(APIModel):
 
     @model_validator(mode="after")
     def exact_project_set(self) -> AutonomousBacklogStart:
-        if set(self.backlog_campaign_ids) != {"falcone", "musematic", "llmwiki"}:
+        if set(self.backlog_campaign_ids) != set(GLOBAL_PROJECTS):
             raise ValueError("global backlog requires exactly Falcone, Musematic, and LLMWiki")
         if self.policy_campaign_id not in set(self.backlog_campaign_ids.values()):
             raise ValueError("policy campaign must be one of the exact imported inventories")
@@ -257,12 +258,12 @@ class AutonomousBacklogStart(APIModel):
 
 
 class R3IssueApprovalRequest(APIModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     surface: Literal["source", "deployment"]
     issue_number: int = Field(ge=1)
     binding: str = Field(pattern=r"^[a-f0-9]{64}$")
     confirmation_phrase: str = Field(
-        pattern=r"^APPROVE_R3_(FALCONE|MUSEMATIC|LLMWIKI)_[0-9]+_[A-F0-9]{16}$"
+        pattern=rf"^APPROVE_R3_({_PROJECT_PHRASE})_[0-9]+_[A-F0-9]{{16}}$"
     )
 
 
@@ -270,7 +271,7 @@ class CorrectionExtensionRequest(APIModel):
     """NEW-133: grant one extra correction attempt to a validation-blocked ChangeSet."""
 
     loop_workflow_id: str = Field(pattern=r"^backlog-loop-[A-Za-z0-9._:-]{1,227}$")
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     issue_number: int = Field(ge=1, le=2_147_483_647)
     change_set_id: UUID
     confirmation_phrase: str = Field(pattern=r"^EXTEND_CORRECTION_ONCE_[A-F0-9]{8}$")
@@ -280,8 +281,8 @@ class IssueReapprovalRequest(APIModel):
     """NEW-143: re-create a voided per-issue approval for the loop's existing operation."""
 
     loop_workflow_id: str = Field(pattern=r"^backlog-loop-[A-Za-z0-9._:-]{1,227}$")
-    project: Literal["falcone", "musematic", "llmwiki"]
-    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"]
+    project: ProjectName
+    repository: RepositorySlug
     issue_number: int = Field(ge=1, le=2_147_483_647)
     confirmation_phrase: str = Field(pattern=r"^REAPPROVE_ISSUE_[A-F0-9]{8}$")
 
@@ -296,8 +297,8 @@ class PublicationReconcileRequest(APIModel):
 class IssueAmendRequest(APIModel):
     """NEW-115: preview (no confirm) or confirm one backlog issue body amendment."""
 
-    project: Literal["falcone", "musematic", "llmwiki"]
-    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"]
+    project: ProjectName
+    repository: RepositorySlug
     issue_number: int = Field(ge=1)
     confirm: str | None = Field(default=None, pattern=r"^[a-f0-9]{12,64}$")
     retry: bool = False
@@ -312,8 +313,8 @@ class IssueAmendRequest(APIModel):
 class IssueTouchRefreshRequest(APIModel):
     """NEW-150: preview (no confirm) or confirm one issue revision-time refresh."""
 
-    project: Literal["falcone", "musematic", "llmwiki"]
-    repository: Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"]
+    project: ProjectName
+    repository: RepositorySlug
     issue_number: int = Field(ge=1, le=2_147_483_647)
     confirm: str | None = Field(default=None, pattern=r"^[a-f0-9]{12,64}$")
 
@@ -380,7 +381,7 @@ class EnhancementRun(APIModel):
 class ChangeRequestCreate(APIModel):
     """NEW-108: one operator change request; the byte bound is enforced at intake."""
 
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     description: str = Field(min_length=1, max_length=8192)
     target_repository: (
         Literal[
@@ -397,9 +398,7 @@ class ChangeRequestCreate(APIModel):
 
 class ChangeRequestApproval(APIModel):
     approval_binding: str = Field(pattern=r"^[a-f0-9]{64}$")
-    typed_confirmation: str = Field(
-        pattern=r"^APPROVE_CHANGE_(FALCONE|MUSEMATIC|LLMWIKI)_[A-F0-9]{16}$"
-    )
+    typed_confirmation: str = Field(pattern=rf"^APPROVE_CHANGE_({_PROJECT_PHRASE})_[A-F0-9]{{16}}$")
 
 
 class UiPlanCreate(APIModel):

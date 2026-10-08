@@ -19,6 +19,7 @@ from engineering_control.adapters.falcone.release import (
 from engineering_control.adapters.musematic.gitops import MusematicGitOpsAdapter, MusematicPromotion
 from engineering_control.config import Settings
 from engineering_control.engineering.configuration import EngineeringCatalog
+from engineering_control.projects import PROJECT_SET
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -132,7 +133,7 @@ class ReleaseActivityHandler:
     def _render(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = payload.get("project")
         snapshot = payload.get("snapshot")
-        if project not in {"falcone", "musematic", "llmwiki"} or not isinstance(snapshot, dict):
+        if project not in PROJECT_SET or not isinstance(snapshot, dict):
             raise ApplicationError(
                 "deployment rendering requires a project and immutable snapshot",
                 type="PolicyViolation",

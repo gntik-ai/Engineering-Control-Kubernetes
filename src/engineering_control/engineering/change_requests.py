@@ -20,6 +20,7 @@ from engineering_control.engineering.backlog import (
     BACKLOG_PROJECT_PAIRS,
     canonical_sha256,
 )
+from engineering_control.projects import REPOSITORY_SLUGS, ProjectName, alternation
 from engineering_control.security.redaction import SecretRedactor
 
 CHANGE_REQUEST_STATUSES = (
@@ -39,12 +40,23 @@ MAXIMUM_ISSUE_BODY_CHARACTERS = 60_000
 CHANGE_REQUEST_KINDS = ("feature", "enhancement", "bug", "chore")
 REVIEW_CATEGORIES = ("code_claim", "testability", "scope", "risk", "other")
 
-_REPOSITORY_PATTERN = (
-    r"^gntik-ai/(falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)$"
-)
 # NEW-123: the UI-kit repository a project's console migration may file change requests in
 # (kit gaps). Hermes never writes these issues: the operator publishes with their own gh.
 UI_KIT_REPOSITORIES: dict[str, tuple[str, ...]] = {"falcone": ("gntik-ai/gntik-ui",)}
+# NEW-157: the registry's repositories plus the UI-kit ones, de-duplicated in order.
+CHANGE_REQUEST_REPOSITORY_ALTERNATION = alternation(
+    dict.fromkeys(
+        (
+            *REPOSITORY_SLUGS,
+            *(
+                repository.removeprefix("gntik-ai/")
+                for repositories in UI_KIT_REPOSITORIES.values()
+                for repository in repositories
+            ),
+        )
+    )
+)
+_REPOSITORY_PATTERN = rf"^gntik-ai/({CHANGE_REQUEST_REPOSITORY_ALTERNATION})$"
 # The GitHub broker accepts only this character set in an issue title (GhCliBroker._value).
 _TITLE_UNSAFE = re.compile(r"[^A-Za-z0-9._:/@+ =,\"'-]+")
 _BINDING = re.compile(r"^[a-f0-9]{64}$")
@@ -187,7 +199,7 @@ def ui_context_json(context: UiChangeContext) -> dict[str, Any]:
 
 
 class ChangeRequestIntake(ChangeRequestModel):
-    project: Literal["falcone", "musematic", "llmwiki"]
+    project: ProjectName
     description_redacted: str = Field(min_length=DESCRIPTION_MIN_CHARACTERS)
     description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     redacted: bool

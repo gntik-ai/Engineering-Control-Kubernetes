@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from engineering_control.projects import GLOBAL_PROJECTS, PROJECTS, REPOSITORY_SLUGS
 from engineering_control.security.redaction import SecretRedactor
 
 
@@ -60,14 +61,8 @@ class APIClient:
         return SecretRedactor().redact(response.json()).value
 
 
-_CHANGE_REPOSITORIES = (
-    "falcone",
-    "falcone-charts",
-    "musematic",
-    "musematic-deploy",
-    "llmwiki",
-    "gntik-ui",
-)
+# NEW-157: the registry's repositories plus the UI-kit repository (change requests only).
+_CHANGE_REPOSITORIES = tuple(dict.fromkeys((*REPOSITORY_SLUGS, "gntik-ui")))
 _CHANGE_DESCRIPTION_MAX_BYTES = 8 * 1024
 
 
@@ -96,7 +91,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
 
     audit = commands.add_parser("audit")
-    audit.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    audit.add_argument("project", choices=PROJECTS)
     audit.add_argument("--name", required=True)
     audit.add_argument("--source-sha", required=True)
     audit.add_argument("--deployment-sha", required=True)
@@ -107,7 +102,7 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--execute", action="store_true")
     for action in ("plan", "start"):
         bounded_audit = commands.add_parser(f"audit-{action}")
-        bounded_audit.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+        bounded_audit.add_argument("project", choices=PROJECTS)
         bounded_audit.add_argument(
             "preset",
             choices=(
@@ -177,7 +172,7 @@ def parser() -> argparse.ArgumentParser:
     campaign_reconcile.add_argument("--observation-token")
     for action in ("locate", "start"):
         issue = commands.add_parser(f"issue-{action}")
-        issue.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+        issue.add_argument("project", choices=PROJECTS)
         issue.add_argument("surface", choices=("source", "deployment"))
         issue.add_argument("issue_number", type=int)
         if action == "start":
@@ -194,24 +189,24 @@ def parser() -> argparse.ArgumentParser:
             # NEW-95: start an R3 issue with the binding of its approved R3 candidate.
             issue.add_argument("--r3-approval", metavar="BINDING", default=None)
     r3_candidate = commands.add_parser("r3-candidate")
-    r3_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    r3_candidate.add_argument("project", choices=PROJECTS)
     r3_candidate.add_argument("surface", choices=("source", "deployment"))
     r3_candidate.add_argument("issue_number", type=int)
     r3_approve = commands.add_parser("r3-approve")
-    r3_approve.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    r3_approve.add_argument("project", choices=PROJECTS)
     r3_approve.add_argument("surface", choices=("source", "deployment"))
     r3_approve.add_argument("issue_number", type=int)
     r3_approve.add_argument("binding")
     r3_approve.add_argument("confirmation_phrase")
     # NEW-115: re-approve an issue body edited after delivery approval (preview first).
     issue_amend = commands.add_parser("issue-amend")
-    issue_amend.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    issue_amend.add_argument("project", choices=PROJECTS)
     issue_amend.add_argument("repository", choices=_CHANGE_REPOSITORIES)
     issue_amend.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     issue_amend.add_argument("--confirm", metavar="SHA_PREFIX", default=None)
     issue_amend.add_argument("--retry", action="store_true")
     touch_refresh = commands.add_parser("issue-touch-refresh")
-    touch_refresh.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    touch_refresh.add_argument("project", choices=PROJECTS)
     touch_refresh.add_argument("repository", choices=_CHANGE_REPOSITORIES)
     touch_refresh.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     touch_refresh.add_argument("--confirm", metavar="TOKEN_PREFIX", default=None)
@@ -219,14 +214,14 @@ def parser() -> argparse.ArgumentParser:
     # by deterministic validation findings; backlog-retry then resumes the loop.
     extend_correction = commands.add_parser("change-extend-correction")
     extend_correction.add_argument("loop_workflow_id")
-    extend_correction.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    extend_correction.add_argument("project", choices=PROJECTS)
     extend_correction.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     extend_correction.add_argument("change_set_id", type=UUID)
     extend_correction.add_argument("confirmation_phrase")
     # NEW-143: re-create a voided per-issue approval for an issue loop's existing operation.
     issue_reapprove = commands.add_parser("issue-reapprove")
     issue_reapprove.add_argument("loop_workflow_id")
-    issue_reapprove.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    issue_reapprove.add_argument("project", choices=PROJECTS)
     issue_reapprove.add_argument("repository", choices=_CHANGE_REPOSITORIES)
     issue_reapprove.add_argument("issue_number", type=_bounded_integer(1, 2_147_483_647))
     issue_reapprove.add_argument("confirmation_phrase")
@@ -279,7 +274,7 @@ def parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("approval_binding")
     bootstrap.add_argument("--execute", action="store_true", required=True)
     backlog_import = commands.add_parser("backlog-import")
-    backlog_import.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    backlog_import.add_argument("project", choices=PROJECTS)
     backlog_import.add_argument(
         "import_filter",
         choices=("bugs", "bugs-and-docs", "security", "enhancements", "all"),
@@ -289,29 +284,29 @@ def parser() -> argparse.ArgumentParser:
     backlog_inventory.add_argument("campaign_id")
     backlog_inventory.add_argument("--limit", type=int, default=20, choices=range(1, 201))
     backlog_plan = commands.add_parser("backlog-plan")
-    backlog_plan.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    backlog_plan.add_argument("project", choices=PROJECTS)
     backlog_plan.add_argument("campaign_id")
     backlog_candidate = commands.add_parser("backlog-approval-candidate")
-    backlog_candidate.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    backlog_candidate.add_argument("project", choices=PROJECTS)
     backlog_candidate.add_argument("campaign_id")
     backlog_candidate.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
     backlog_candidate.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
     backlog_candidate.add_argument("--max-items", type=int, default=1, choices=range(1, 51))
     backlog_approve = commands.add_parser("backlog-approve")
-    backlog_approve.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    backlog_approve.add_argument("project", choices=PROJECTS)
     backlog_approve.add_argument("campaign_id")
     backlog_approve.add_argument("approval_binding")
     backlog_approve.add_argument(
         "typed_confirmation", choices=("APPROVE_EXISTING_GITHUB_BACKLOG_LOOP",)
     )
     backlog_release_ownership = commands.add_parser("backlog-release-ownership")
-    backlog_release_ownership.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    backlog_release_ownership.add_argument("project", choices=PROJECTS)
     backlog_release_ownership.add_argument("campaign_id")
     backlog_release_ownership.add_argument(
         "typed_confirmation", choices=("RELEASE_GITHUB_WRITE_POLICY_OWNERSHIP",)
     )
     backlog_start = commands.add_parser("backlog-start")
-    backlog_start.add_argument("project", choices=("falcone", "musematic", "llmwiki"))
+    backlog_start.add_argument("project", choices=PROJECTS)
     backlog_start.add_argument("campaign_id")
     backlog_start.add_argument("maximum_risk", choices=("R0", "R1", "R2", "R3"))
     backlog_start.add_argument("delivery_mode", choices=("source-pr", "full-delivery"))
@@ -321,9 +316,8 @@ def parser() -> argparse.ArgumentParser:
     global_backlog = commands.add_parser("global-backlog-start")
     global_backlog.add_argument("campaign_id")
     global_backlog.add_argument("policy_campaign_id")
-    global_backlog.add_argument("falcone_campaign_id")
-    global_backlog.add_argument("musematic_campaign_id")
-    global_backlog.add_argument("llmwiki_campaign_id")
+    for project in GLOBAL_PROJECTS:
+        global_backlog.add_argument(f"{project}_campaign_id")
     global_backlog.add_argument("typed_confirmation", choices=("START_GLOBAL_STAGING_R2_BACKLOG",))
     for action in ("pause", "pause-after-current", "resume", "stop-after-current", "cancel"):
         control = commands.add_parser(f"backlog-{action}")
@@ -333,13 +327,7 @@ def parser() -> argparse.ArgumentParser:
         issue_action.add_argument("workflow_id")
         issue_action.add_argument(
             "repository",
-            choices=(
-                "falcone",
-                "falcone-charts",
-                "musematic",
-                "musematic-deploy",
-                "llmwiki",
-            ),
+            choices=REPOSITORY_SLUGS,
         )
         issue_action.add_argument("issue_number", type=int)
         if action == "skip":
@@ -359,15 +347,13 @@ def parser() -> argparse.ArgumentParser:
             )
     # NEW-108 operator change requests: draft -> review -> approve -> publish one issue.
     change_draft = commands.add_parser("change-draft")
-    change_draft.add_argument(
-        "--project", choices=("falcone", "musematic", "llmwiki"), required=True
-    )
+    change_draft.add_argument("--project", choices=PROJECTS, required=True)
     change_source = change_draft.add_mutually_exclusive_group(required=True)
     change_source.add_argument("--file", type=Path)
     change_source.add_argument("--text")
     change_draft.add_argument("--repository", choices=_CHANGE_REPOSITORIES)
     changes = commands.add_parser("changes")
-    changes.add_argument("--project", choices=("falcone", "musematic", "llmwiki"))
+    changes.add_argument("--project", choices=PROJECTS)
     changes.add_argument(
         "--status",
         choices=(
@@ -877,9 +863,8 @@ def dispatch(client: APIClient, arguments: argparse.Namespace) -> Any:
                 "campaign_id": arguments.campaign_id,
                 "policy_campaign_id": arguments.policy_campaign_id,
                 "backlog_campaign_ids": {
-                    "falcone": arguments.falcone_campaign_id,
-                    "musematic": arguments.musematic_campaign_id,
-                    "llmwiki": arguments.llmwiki_campaign_id,
+                    project: getattr(arguments, f"{project}_campaign_id")
+                    for project in GLOBAL_PROJECTS
                 },
                 "environment": "staging",
                 "maximum_risk": "R2",

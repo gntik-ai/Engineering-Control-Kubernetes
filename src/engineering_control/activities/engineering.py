@@ -71,6 +71,7 @@ from engineering_control.operations.issue_delivery_approval import (
     correction_attempt_budget,
     register_child_issue_approval,
 )
+from engineering_control.projects import GLOBAL_PROJECT_SET, PROJECT_ALTERNATION, PROJECT_SET
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -1131,7 +1132,7 @@ class EngineeringActivityHandler:
     def _register_global_backlog(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = UUID(str(payload["campaign_id"]))
         raw_ids = payload.get("backlog_campaign_ids")
-        if not isinstance(raw_ids, dict) or set(raw_ids) != {"falcone", "musematic", "llmwiki"}:
+        if not isinstance(raw_ids, dict) or set(raw_ids) != GLOBAL_PROJECT_SET:
             raise ValueError("global backlog requires one inventory for every project")
         campaign_ids = {project: UUID(str(value)) for project, value in raw_ids.items()}
         policy_campaign_id = UUID(str(payload["policy_campaign_id"]))
@@ -1958,7 +1959,7 @@ class EngineeringActivityHandler:
             value = str(payload.get(key) or "")
             return value if re.fullmatch(pattern, value) else None
 
-        project = bounded("project", r"falcone|musematic|llmwiki")
+        project = bounded("project", PROJECT_ALTERNATION)
         campaign = bounded("backlog_campaign_id", r"[0-9a-f-]{36}")
         workflow_id = bounded("workflow_id", r"[A-Za-z0-9._:-]{1,300}")
         step = bounded("step", r"[a-z_]+\.[a-z_]+")
@@ -2187,7 +2188,7 @@ class EngineeringActivityHandler:
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,300}", workflow_id):
             workflow_id = ""
         project = str(payload.get("project") or "")
-        if project not in {"falcone", "musematic", "llmwiki"}:
+        if project not in PROJECT_SET:
             project = ""
         summary = self._nothing_delivered_summary(payload)
         session.add(

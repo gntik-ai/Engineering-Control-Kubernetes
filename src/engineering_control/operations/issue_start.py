@@ -10,6 +10,7 @@ from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.db.models import BacklogIssueRecord, OperationRequest
 from engineering_control.engineering.backlog import BACKLOG_PROJECT_PAIRS
 from engineering_control.operations.models import SolveIssueCommand, parse_command
+from engineering_control.projects import PROJECT_ALTERNATION
 
 ISSUE_START_UNCONFIRMED = (
     "ISSUE_START_UNCONFIRMED: preserve active ownership; reconcile the canonical execution"
@@ -87,7 +88,7 @@ def issue_request_from_operation(operation: OperationRequest) -> ExistingBacklog
 
 # NEW-128: shared by the retry preflight and /loop amend --retry loop resolution.
 _BACKLOG_LOOP_WORKFLOW = re.compile(
-    r"backlog-loop-(falcone|musematic|llmwiki)-"
+    rf"backlog-loop-({PROJECT_ALTERNATION})-"
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-|$)"
 )
 
