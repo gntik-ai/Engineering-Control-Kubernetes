@@ -37,11 +37,21 @@ def _postgresql_url() -> str:
     value = os.getenv("ENGINEERING_TEST_POSTGRES_URL")
     if not value:
         pytest.skip("ENGINEERING_TEST_POSTGRES_URL is required for real PostgreSQL acceptance")
-    if (
-        value != "postgresql+psycopg://engineering_ci@127.0.0.1:5432/engineering_control_ci"
-        or os.getenv("HERMES_RECONCILIATION_PG_FIXTURE") != "network-none"
-    ):
-        raise AssertionError("PostgreSQL acceptance requires the owned network-none fixture")
+    # Only a disposable database is ever dropped and recreated here: the owned local
+    # network-none fixture, or (NEW-165) the GitHub Actions service container of
+    # .github/workflows/postgresql-acceptance.yml with its synthetic credential.
+    local = (
+        value == "postgresql+psycopg://engineering_ci@127.0.0.1:5432/engineering_control_ci"
+        and os.getenv("HERMES_RECONCILIATION_PG_FIXTURE") == "network-none"
+    )
+    github = (
+        value
+        == "postgresql+psycopg://engineering_ci:synthetic_ci_only@127.0.0.1:5432/engineering_control_ci"
+        and os.getenv("HERMES_RECONCILIATION_PG_FIXTURE") == "github-actions-service"
+        and os.getenv("GITHUB_ACTIONS") == "true"
+    )
+    if not (local or github):
+        raise AssertionError("PostgreSQL acceptance requires an owned disposable fixture")
     return value
 
 
