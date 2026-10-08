@@ -320,6 +320,31 @@ async def test_a_loop_run_changed_after_its_snapshot_is_never_closed(tmp_path) -
         assert session.scalar(select(Run.status).where(Run.workflow_id == loop)) == "RUNNING"
 
 
+@pytest.mark.asyncio
+async def test_a_same_status_loop_state_write_invalidates_the_closer_snapshot(tmp_path) -> None:
+    # Review 3: a reset recording RUNNING over RUNNING changed no column, so the closer's
+    # snapshot still matched and it cancelled the live loop's Run.
+    operations, _metadata, handler, request = await _approved_direct_request(tmp_path)
+    loop = issue_workflow_id(request)
+    _loop_run(operations, loop, "RUNNING")
+    prefix = campaign_loop_prefix("falcone", CAMPAIGN_ID)
+    [(workflow_id, status, updated_at)] = await operations.open_campaign_loops(prefix, exclude=None)
+    await asyncio.sleep(0.01)
+    recorded = handler._record_backlog_loop_state(
+        {
+            "project": "falcone",
+            "backlog_campaign_id": str(CAMPAIGN_ID),
+            "loop_status": "RUNNING",
+            "workflow_id": loop,
+        }
+    )
+    assert recorded.get("status") != "STALE_LOOP_STATE_IGNORED"
+
+    assert not await operations.close_ended_loop_run(workflow_id, status, updated_at)
+    with operations.sessions() as session:
+        assert session.scalar(select(Run.status).where(Run.workflow_id == loop)) == "RUNNING"
+
+
 def test_an_operation_holds_its_campaign_until_its_loop_ends(tmp_path) -> None:
     operation = OperationRequest(status="STARTED", workflow_id="backlog-loop-x")
 
