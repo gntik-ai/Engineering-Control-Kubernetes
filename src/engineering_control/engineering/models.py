@@ -259,11 +259,35 @@ class ToolchainTestCommand(EngineeringModel):
         return _bounded_arguments(argv)
 
 
+# NEW-159: the Node.js majors a project may select. "22" is the worker's /usr/local/bin/node
+# (today's toolchain); others are side-by-side installs under Settings.toolchain_node_roots.
+DEFAULT_TOOLCHAIN_NODE: Literal["22"] = "22"
+# A pinned pnpm release: exact MAJOR.MINOR.PATCH, no range, tag or pre-release.
+_PNPM_VERSION = r"^(?:0|[1-9][0-9]{0,3})\.(?:0|[1-9][0-9]{0,3})\.(?:0|[1-9][0-9]{0,3})$"
+
+
 class ToolchainPolicy(EngineeringModel):
     enabled: bool = False
     prepare: list[ToolchainPrepareCommand] = Field(default_factory=list, max_length=10)
     test_commands: list[ToolchainTestCommand] = Field(default_factory=list, max_length=20)
     cleanup_paths_ignored_only: bool = True
+    # NEW-159: the Node.js major for prepare, baseline, dependency resolution and the
+    # maker/checker sandbox, and an optional pinned pnpm (None keeps the worker's
+    # Settings.toolchain_pnpm_executable). The defaults are exactly today's toolchain.
+    node: Literal["22", "24"] = DEFAULT_TOOLCHAIN_NODE
+    pnpm: str | None = Field(default=None, pattern=_PNPM_VERSION)
+
+    @field_validator("node", mode="before")
+    @classmethod
+    def yaml_integer_major(cls, value: object) -> object:
+        # `node: 24` in YAML is an integer; accept it as the same major, nothing else.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        return value
+
+    @property
+    def default_node_toolchain(self) -> bool:
+        return self.node == DEFAULT_TOOLCHAIN_NODE and self.pnpm is None
 
     @model_validator(mode="after")
     def enabled_requires_prepare(self) -> ToolchainPolicy:

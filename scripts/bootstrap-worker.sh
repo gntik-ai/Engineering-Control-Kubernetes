@@ -7,6 +7,131 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+# NEW-159: optional side-by-side project toolchains (ToolchainPolicy.node / .pnpm) under
+# /opt/engineering-toolchain. They never replace /usr/local/bin/node (Node 22) or
+# /usr/local/bin/pnpm. Without an argument this script behaves exactly as before.
+#   --node-toolchain       full bootstrap, then also install the pinned toolchains
+#   --node-toolchain-only  install only the pinned toolchains and exit
+NODE_TOOLCHAIN_MODE=none
+case "${1-}" in
+  "") ;;
+  --node-toolchain) NODE_TOOLCHAIN_MODE=also ;;
+  --node-toolchain-only) NODE_TOOLCHAIN_MODE=only ;;
+  *)
+    echo "Usage: sudo $0 [--node-toolchain | --node-toolchain-only]" >&2
+    exit 64
+    ;;
+esac
+if (( $# > 1 )); then
+  echo "Usage: sudo $0 [--node-toolchain | --node-toolchain-only]" >&2
+  exit 64
+fi
+
+# Keep in sync with config.py (toolchain_node_roots / toolchain_pnpm_executables) and
+# scripts/verify-worker.sh. Hashes: nodejs.org/dist/v24.21.0/SHASUMS256.txt and the
+# pnpm v11.28.3 GitHub release asset digest (both re-verified by download 2026-10-08).
+TOOLCHAIN_ROOT=/opt/engineering-toolchain
+NODE24_VERSION=24.21.0
+NODE24_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
+NODE24_URL=https://nodejs.org/dist/v${NODE24_VERSION}/node-v${NODE24_VERSION}-linux-x64.tar.xz
+PNPM_PINNED_VERSION=11.28.3
+PNPM_PINNED_SHA256=b0c9673be13d4b914b8045a56986418c55c446bb8d113b65ec65bf7cb7bec35f
+PNPM_PINNED_URL=https://github.com/pnpm/pnpm/releases/download/v${PNPM_PINNED_VERSION}/pnpm-linux-x64.tar.gz
+
+# toolchain_release_ok RELEASE SHA256 CHECK_RELATIVE EXPECTED_VERSION
+toolchain_release_ok() {
+  local release=$1 sha256=$2 check=$3 expected=$4
+  [[ -d ${release} && ! -L ${release} && -f ${release}/.engineering-toolchain ]] &&
+    [[ $(<"${release}/.engineering-toolchain") == "${sha256}" ]] &&
+    [[ $(cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+      "${release}/${check}" --version 2>/dev/null) == "${expected}" ]]
+}
+
+# install_pinned_toolchain LINK URL SHA256 COMPRESSION STRIP CHECK_RELATIVE EXPECTED_VERSION
+# Each verified download is an immutable release directory LINK.<sha256 prefix>; LINK is
+# a symlink (the path Settings uses) switched by an atomic rename. A previous release is
+# never removed, so an interrupted run leaves the published toolchain untouched, and the
+# EXIT trap only ever removes this run's staging directory. Idempotent.
+install_pinned_toolchain() {
+  local name=$1 url=$2 sha256=$3 compression=$4 strip=$5 check=$6 expected=$7
+  local link="${TOOLCHAIN_ROOT}/${name}"
+  local release_name="${name}.${sha256:0:16}"
+  local release="${TOOLCHAIN_ROOT}/${release_name}"
+  local staging
+  if [[ -e ${link} && ! -L ${link} ]]; then
+    echo "${link} exists and is not a symlink; refusing to replace it" >&2
+    exit 1
+  fi
+  if ! toolchain_release_ok "${release}" "${sha256}" "${check}" "${expected}"; then
+    if [[ -e ${release} || -L ${release} ]]; then
+      if [[ $(readlink -- "${link}" 2>/dev/null) == "${release_name}" ]]; then
+        echo "${link} points at an unverifiable release ${release}" >&2
+        exit 1
+      fi
+      rm -rf -- "${release}"  # an unpublished, incomplete release from an earlier run
+    fi
+    staging=$(mktemp -d "${TOOLCHAIN_ROOT}/.${name}.staging.XXXXXX")
+    # shellcheck disable=SC2064 # expand now: the trap removes only this staging directory
+    trap "rm -rf -- '${staging}'" EXIT
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --max-time 900 --output "${staging}/download" "${url}"
+    printf '%s  %s\n' "${sha256}" "${staging}/download" | sha256sum --check --quiet -
+    install -d -m 0755 "${staging}/root"
+    tar "-x${compression}f" "${staging}/download" -C "${staging}/root" \
+      --strip-components="${strip}" --no-same-owner --no-same-permissions
+    rm -f -- "${staging}/download"
+    printf '%s\n' "${sha256}" >"${staging}/root/.engineering-toolchain"
+    chown -R root:root "${staging}/root"
+    chmod -R u+rwX,go+rX,go-w "${staging}/root"
+    chmod 0755 "${staging}/root"
+    toolchain_release_ok "${staging}/root" "${sha256}" "${check}" "${expected}" || {
+      echo "${name}: downloaded toolchain does not report ${expected}" >&2
+      exit 1
+    }
+    # Same filesystem: the complete release appears under its final name atomically.
+    mv -T -- "${staging}/root" "${release}"
+    rm -rf -- "${staging}"
+    trap - EXIT
+  fi
+  if [[ $(readlink -- "${link}" 2>/dev/null) == "${release_name}" ]]; then
+    echo "${name}: ${expected} already installed"
+    return 0
+  fi
+  ln -sfn -- "${release_name}" "${TOOLCHAIN_ROOT}/.${name}.link.new"
+  mv -Tf -- "${TOOLCHAIN_ROOT}/.${name}.link.new" "${link}"
+  [[ $(cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+    "${link}/${check}" --version) == "${expected}" ]]
+  echo "${name}: installed ${expected} (${release_name}; earlier releases are kept)"
+}
+
+install_node_toolchains() {
+  [[ $(uname -m) == x86_64 ]] || {
+    echo "The pinned Node.js 24 and pnpm toolchains are linux-x64 builds" >&2
+    exit 1
+  }
+  for command_name in curl sha256sum tar xz mktemp install; do
+    command -v "${command_name}" >/dev/null || {
+      echo "Required command missing: ${command_name}" >&2
+      exit 1
+    }
+  done
+  install -d -o root -g root -m 0755 "${TOOLCHAIN_ROOT}"
+  install_pinned_toolchain node-24 "${NODE24_URL}" "${NODE24_SHA256}" \
+    J 1 bin/node "v${NODE24_VERSION}"
+  install_pinned_toolchain "pnpm-${PNPM_PINNED_VERSION}" "${PNPM_PINNED_URL}" \
+    "${PNPM_PINNED_SHA256}" z 0 pnpm "${PNPM_PINNED_VERSION}"
+}
+
+if [[ ${NODE_TOOLCHAIN_MODE} == only ]]; then
+  exec 9>/run/engineering-control-bootstrap.lock
+  flock -n 9 || {
+    echo "Another Engineering Control bootstrap is active" >&2
+    exit 1
+  }
+  install_node_toolchains
+  exit 0
+fi
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
 INSTALL_ROOT=/opt/engineering-control
@@ -200,6 +325,9 @@ fi
 chmod -R a+rX "${CLI_ROOT}"
 ln -sfn "${CLI_ROOT}/node_modules/.bin/codex" /usr/local/bin/codex
 ln -sfn "${CLI_ROOT}/node_modules/.bin/claude" /usr/local/bin/claude
+if [[ ${NODE_TOOLCHAIN_MODE} == also ]]; then
+  install_node_toolchains
+fi
 
 install -d -o root -g root -m 0755 \
   /opt/engineering-browser /opt/engineering-browser-runtimes

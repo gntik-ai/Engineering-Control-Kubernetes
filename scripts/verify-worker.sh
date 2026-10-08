@@ -144,6 +144,44 @@ if sudo -u scan-runner test -r /etc/engineering-control/env/release 2>/dev/null;
   echo "FAIL scan runner can read the release credential directory" >&2
   exit 1
 fi
+# NEW-159: optional side-by-side project toolchains (bootstrap-worker.sh
+# --node-toolchain[-only]). Verified when installed, or required with
+# ENGINEERING_VERIFY_NODE_TOOLCHAIN=1 (set it once a project selects node 24).
+# Keep the versions in sync with scripts/bootstrap-worker.sh and config.py.
+TOOLCHAIN_ROOT=/opt/engineering-toolchain
+NODE24_VERSION=24.21.0
+PNPM_PINNED_VERSION=11.28.3
+if [[ -e ${TOOLCHAIN_ROOT} || ${ENGINEERING_VERIFY_NODE_TOOLCHAIN:-0} == 1 ]]; then
+  # The side-by-side install never replaces the workers' Node.js 22.
+  [[ $(/usr/local/bin/node --version) == v22.* ]]
+  [[ -d ${TOOLCHAIN_ROOT} && ! -L ${TOOLCHAIN_ROOT} ]]
+  [[ $(stat -c '%a:%U:%G' "${TOOLCHAIN_ROOT}") == 755:root:root ]]
+  # Each stable path is a symlink to an immutable release directory beside it.
+  for link in "${TOOLCHAIN_ROOT}/node-24" "${TOOLCHAIN_ROOT}/pnpm-${PNPM_PINNED_VERSION}"; do
+    [[ -L ${link} ]]
+    release=$(readlink -f -- "${link}")
+    [[ $(dirname -- "${release}") == "${TOOLCHAIN_ROOT}" && -d ${release} && ! -L ${release} ]]
+    [[ $(stat -c '%a:%U:%G' "${release}") == 755:root:root ]]
+  done
+  if [[ -n $(find "${TOOLCHAIN_ROOT}" \( ! -user root -o ! -group root \
+    -o \( ! -type l -perm /022 \) \) -print -quit) ]]; then
+    echo "FAIL ${TOOLCHAIN_ROOT} has a file not owned by root or writable by others" >&2
+    exit 1
+  fi
+  for identity in codex-runner claude-runner scan-runner; do
+    [[ $(cd / && sudo -u "${identity}" env -i PATH=/usr/bin:/bin \
+      "${TOOLCHAIN_ROOT}/node-24/bin/node" --version) == "v${NODE24_VERSION}" ]]
+    [[ $(cd / && sudo -u "${identity}" env -i \
+      HOME="/var/lib/engineering-control/identities/${identity}" \
+      PATH="${TOOLCHAIN_ROOT}/node-24/bin:/usr/bin:/bin" pnpm_config_pm_on_fail=ignore \
+      "${TOOLCHAIN_ROOT}/pnpm-${PNPM_PINNED_VERSION}/pnpm" --version) == \
+      "${PNPM_PINNED_VERSION}" ]]
+  done
+  echo "PASS node toolchain: node v${NODE24_VERSION}, pnpm ${PNPM_PINNED_VERSION}"
+else
+  echo "SKIP node toolchain: ${TOOLCHAIN_ROOT} is not installed"
+fi
+
 if (( blocked != 0 )); then
   echo "BLOCKED worker verification; all credential-independent checks passed"
   exit 2

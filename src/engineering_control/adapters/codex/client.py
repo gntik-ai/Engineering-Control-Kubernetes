@@ -12,6 +12,7 @@ from uuid import UUID
 from engineering_control.adapters.auth_probe import AuthProbeError, run_auth_probe
 from engineering_control.adapters.process import (
     EventCallback,
+    SandboxToolchain,
     classify_failure,
     run_jsonl_process,
 )
@@ -123,7 +124,11 @@ class CodexCLIAdapter:
         return f"projects={{{entries}}}"
 
     async def execute(
-        self, request: AgentRequest, on_event: EventCallback | None = None
+        self,
+        request: AgentRequest,
+        on_event: EventCallback | None = None,
+        *,
+        toolchain: SandboxToolchain | None = None,
     ) -> AgentResult:
         if request.provider is not self.provider:
             raise ValueError("Codex adapter received a non-Codex request")
@@ -179,6 +184,7 @@ class CodexCLIAdapter:
                 timeout_seconds=request.timeout_seconds,
                 provider=self.provider.value,
                 on_event=on_event,
+                toolchain=toolchain,
             )
             structured_result: dict[str, Any] = {}
             summary = ""

@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,11 +43,15 @@ from engineering_control.engineering.safe_files import (
     write_text_at,
 )
 from engineering_control.engineering.toolchain import (
+    NodeToolchain,
+    ToolchainUnavailableError,
     enabled_toolchain,
     load_toolchain_policy,
     match_toolchain_test_command,
+    payload_node_toolchain,
     prepare_executables,
     render_argv,
+    resolve_node_toolchain,
 )
 from engineering_control.engineering.ui_inventory import (
     SYMLINK_ROOT,
@@ -269,6 +273,9 @@ class ScanActivityHandler(UiPlanScanSteps):
         self.dependency_runner = dependency_runner or SafeCommandRunner(
             {"go": settings.go_executable, "pnpm": settings.toolchain_pnpm_executable}
         )
+        # NEW-159: a project selecting another node/pnpm gets per-call runners whose pnpm
+        # is the selected one; injected runners (tests) are always used as given.
+        self._runners_injected = toolchain_runner is not None, dependency_runner is not None
         self.git_runner = git_runner or SafeCommandRunner({"git": settings.git_executable})
         # NEW-49: None builds a per-command allowlist (see _baseline_executables).
         self.baseline_runner = baseline_runner
@@ -1887,6 +1894,26 @@ class ScanActivityHandler(UiPlanScanSteps):
             "TRIVY_NO_PROGRESS": "true",
         }
 
+    def _node_toolchain_environment(
+        self, environment: dict[str, str], toolchain: NodeToolchain, base_path: str
+    ) -> dict[str, str]:
+        """Add the selected node/pnpm to an environment; the default returns it unchanged."""
+        if toolchain.default:
+            return environment
+        return {**environment, **toolchain.variables, "PATH": toolchain.path(base_path)}
+
+    def _toolchain_runner_for(self, toolchain: NodeToolchain) -> SafeCommandRunner:
+        if toolchain.default or self._runners_injected[0]:
+            return self.toolchain_runner
+        return SafeCommandRunner(prepare_executables(self.settings, toolchain))
+
+    def _dependency_runner_for(self, toolchain: NodeToolchain) -> SafeCommandRunner:
+        if toolchain.default or self._runners_injected[1]:
+            return self.dependency_runner
+        return SafeCommandRunner(
+            {"go": self.settings.go_executable, "pnpm": toolchain.pnpm_executable}
+        )
+
     # NEW-75: the only commands the platform runs to resolve maker-edited manifests
     # (network; no install scripts), and the only files they may change.
     _DEPENDENCY_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
@@ -1909,7 +1936,17 @@ class ScanActivityHandler(UiPlanScanSteps):
             return self._dependency_blocked(
                 payload, "DEPENDENCY_WORKTREE_DIRTY", "the maker left uncommitted changes"
             )
-        environment = self._dependency_environment()
+        try:
+            # NEW-159 review 2: the delivery's carried selection, as for the maker.
+            toolchain = payload_node_toolchain(self.settings, payload)
+        except ToolchainUnavailableError as error:
+            return self._dependency_blocked(payload, error.blocker, str(error))
+        except (OSError, ValueError) as error:
+            return self._dependency_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error))
+        environment = self._node_toolchain_environment(
+            self._dependency_environment(), toolchain, _DEFAULT_PATH
+        )
+        dependency_runner = self._dependency_runner_for(toolchain)
         allowed: set[str] = set()
         commands: list[dict[str, Any]] = []
         for item in raw:
@@ -1934,7 +1971,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             for argv in self._DEPENDENCY_COMMANDS[ecosystem]:
                 record: dict[str, Any] = {"ecosystem": ecosystem, "cwd": directory, "argv": argv}
                 try:
-                    result = self.dependency_runner.run(
+                    result = dependency_runner.run(
                         argv[0],
                         list(argv[1:]),
                         cwd=cwd,
@@ -2299,15 +2336,35 @@ class ScanActivityHandler(UiPlanScanSteps):
             )
         except (OSError, ValueError) as error:
             return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
+        try:
+            # NEW-159 review 3: a re-preparation in the same delivery (e.g. after dependency
+            # resolution) keeps the selection it carries; only the first one reads the manifest.
+            if isinstance(payload.get("toolchain_preparation"), Mapping):
+                toolchain = payload_node_toolchain(self.settings, payload)
+            else:
+                toolchain = resolve_node_toolchain(self.settings, policy)
+        except ToolchainUnavailableError as error:
+            return self._toolchain_blocked(payload, error.blocker, str(error), [])
+        except ValueError as error:
+            return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
+        # NEW-159 review 1: a non-default selection travels in toolchain_preparation to
+        # the maker/checker invocations (the provider worker never reads the manifest).
+        selection = toolchain.selection()
         if policy is None or not policy.enabled:
             return {
                 **payload,
                 "status": "TOOLCHAIN_SKIPPED",
                 "blocker": None,
-                "toolchain_preparation": {"status": "TOOLCHAIN_SKIPPED"},
+                "toolchain_preparation": {
+                    "status": "TOOLCHAIN_SKIPPED",
+                    **({"node_toolchain": selection} if selection is not None else {}),
+                },
             }
         worktree = self._bounded_worktree(payload["source_worktree"])
-        environment = self._toolchain_environment()
+        environment = self._node_toolchain_environment(
+            self._toolchain_environment(), toolchain, _DEFAULT_PATH
+        )
+        toolchain_runner = self._toolchain_runner_for(toolchain)
         before = self._git_status(worktree, ignored=True)
         commands: list[dict[str, Any]] = []
         for command in policy.prepare:
@@ -2323,7 +2380,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             record: dict[str, Any] = {"cwd": command.cwd, "argv": argv}
             started = time.monotonic()
             try:
-                result = self.toolchain_runner.run(
+                result = toolchain_runner.run(
                     argv[0],
                     argv[1:],
                     cwd=cwd,
@@ -2374,18 +2431,21 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "prepare commands modified tracked files: " + ", ".join(tracked[:50]),
                 commands,
             )
+        preparation: dict[str, Any] = {
+            "status": "TOOLCHAIN_READY",
+            "commands": commands,
+            "ignored_paths_created": sorted(path for path, code in created.items() if code == "!!")[
+                :100
+            ],
+            "test_commands": [item.model_dump() for item in policy.test_commands],
+        }
+        if selection is not None:
+            preparation["node_toolchain"] = selection
         return {
             **payload,
             "status": "TOOLCHAIN_READY",
             "blocker": None,
-            "toolchain_preparation": {
-                "status": "TOOLCHAIN_READY",
-                "commands": commands,
-                "ignored_paths_created": sorted(
-                    path for path, code in created.items() if code == "!!"
-                )[:100],
-                "test_commands": [item.model_dump() for item in policy.test_commands],
-            },
+            "toolchain_preparation": preparation,
         }
 
     def _toolchain_cleanup_policy(self, project: str) -> ToolchainPolicy | None:
@@ -2431,8 +2491,11 @@ class ScanActivityHandler(UiPlanScanSteps):
                 commands.append(command)
         base_sha = str(payload.get("source_base_sha", ""))
         try:
+            # NEW-159 review 2: the baseline runs under the delivery's carried selection,
+            # never a later manifest edit, exactly as the maker and checker did.
+            toolchain = payload_node_toolchain(self.settings, payload)
             results = self._baseline_test_results(
-                project, str(payload["source_repository"]), base_sha, policy, commands
+                project, str(payload["source_repository"]), base_sha, policy, commands, toolchain
             )
         except (
             CommandFailure,
@@ -2459,8 +2522,21 @@ class ScanActivityHandler(UiPlanScanSteps):
         return evidence, None
 
     @staticmethod
-    def _baseline_key(cwd: str, argv: list[str]) -> str:
-        return json.dumps({"argv": argv, "cwd": cwd}, sort_keys=True)
+    def _baseline_key(cwd: str, argv: list[str], toolchain: NodeToolchain | None = None) -> str:
+        identity: dict[str, Any] = {"argv": argv, "cwd": cwd}
+        selection = toolchain.selection() if toolchain is not None else None
+        if selection is not None:
+            # NEW-159 review 1: a non-default node/pnpm is part of the cache identity; the
+            # default key is unchanged, so existing baseline caches stay valid.
+            identity["node_toolchain"] = selection
+        return json.dumps(identity, sort_keys=True)
+
+    @staticmethod
+    def _baseline_prepared_marker(base_sha: str, toolchain: NodeToolchain | None) -> str:
+        selection = toolchain.selection() if toolchain is not None else None
+        if selection is None:
+            return f"{base_sha}\n"  # byte-identical to the pre-NEW-159 marker
+        return f"{base_sha} {json.dumps(selection, sort_keys=True)}\n"
 
     @staticmethod
     def _cached_baseline_results(path: Path) -> dict[str, dict[str, Any]]:
@@ -2487,6 +2563,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         base_sha: str,
         policy: ToolchainPolicy,
         commands: list[ToolchainTestCommand],
+        toolchain: NodeToolchain,
     ) -> list[dict[str, Any]]:
         """Run the contract commands at the base once per (project, base, argv), then cache."""
         if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
@@ -2495,7 +2572,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         root.mkdir(parents=True, exist_ok=True, mode=0o750)
         results_path = root / "results.json"
         keys = [
-            self._baseline_key(command.cwd, render_argv(command.argv, self.settings))
+            self._baseline_key(command.cwd, render_argv(command.argv, self.settings), toolchain)
             for command in commands
         ]
         with (root / ".lock").open("a") as lock:
@@ -2503,28 +2580,50 @@ class ScanActivityHandler(UiPlanScanSteps):
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             cached = self._cached_baseline_results(results_path)
             if any(key not in cached for key in keys):
-                worktree = self._baseline_worktree(root, repository, base_sha, policy)
-                environment = {
-                    **self._toolchain_environment(),
-                    "PATH": f"{self.settings.toolchain_pnpm_executable.parent}:{_DEFAULT_PATH}",
-                    # As for the agents (NEW-48), so mypy runs as it did for the maker.
-                    "MYPY_CACHE_DIR": "/dev/null",
-                }
+                worktree = self._baseline_worktree(root, repository, base_sha, policy, toolchain)
+                default_path = f"{self.settings.toolchain_pnpm_executable.parent}:{_DEFAULT_PATH}"
+                environment = self._node_toolchain_environment(
+                    {
+                        **self._toolchain_environment(),
+                        "PATH": default_path,
+                        # As for the agents (NEW-48), so mypy runs as it did for the maker.
+                        "MYPY_CACHE_DIR": "/dev/null",
+                    },
+                    toolchain,
+                    default_path,
+                )
                 for command, key in zip(commands, keys, strict=True):
                     if key not in cached:
-                        cached[key] = self._run_baseline_test(worktree, command, environment)
+                        cached[key] = self._run_baseline_test(
+                            worktree, command, environment, toolchain
+                        )
                         self._atomic_text(
                             results_path, json.dumps(cached, indent=2, sort_keys=True)
                         )
             return [cached[key] for key in keys]
 
     def _baseline_worktree(
-        self, root: Path, repository: str, base_sha: str, policy: ToolchainPolicy
+        self,
+        root: Path,
+        repository: str,
+        base_sha: str,
+        policy: ToolchainPolicy,
+        toolchain: NodeToolchain | None = None,
     ) -> Path:
         """A detached, toolchain-prepared checkout of base_sha owned by the scan worker."""
         worktree = root / "worktree"
         prepared = root / "prepared"
-        if prepared.is_file() and worktree.is_dir() and not worktree.is_symlink():
+        if toolchain is None:
+            toolchain = resolve_node_toolchain(self.settings, policy)
+        # NEW-159 review 1: the checkout is reused only if it was prepared with the same
+        # node/pnpm selection (the default marker is the pre-NEW-159 "<sha>\n").
+        marker = self._baseline_prepared_marker(base_sha, toolchain)
+        if (
+            prepared.is_file()
+            and prepared.read_text(encoding="utf-8") == marker
+            and worktree.is_dir()
+            and not worktree.is_symlink()
+        ):
             if self._git(worktree, ["rev-parse", "HEAD"]).strip() == base_sha:
                 return worktree
         prepared.unlink(missing_ok=True)
@@ -2533,14 +2632,17 @@ class ScanActivityHandler(UiPlanScanSteps):
         if worktree.exists():
             shutil.rmtree(worktree)  # a partial checkout or prepare from an earlier attempt
         self._clone_detached(repository, base_sha, worktree, cwd=root)
-        environment = self._toolchain_environment()
+        environment = self._node_toolchain_environment(
+            self._toolchain_environment(), toolchain, _DEFAULT_PATH
+        )
+        toolchain_runner = self._toolchain_runner_for(toolchain)
         resolved_root = worktree.resolve()
         for command in policy.prepare:
             cwd = (worktree / command.cwd).resolve()
             if not cwd.is_relative_to(resolved_root) or not cwd.is_dir():
                 raise ValueError(f"baseline prepare cwd {command.cwd!r} is not in the checkout")
             argv = render_argv(command.argv, self.settings)
-            result = self.toolchain_runner.run(
+            result = toolchain_runner.run(
                 argv[0],
                 argv[1:],
                 cwd=cwd,
@@ -2553,13 +2655,15 @@ class ScanActivityHandler(UiPlanScanSteps):
                     f"baseline prepare {argv[0]} failed with {result.return_code}: "
                     + (result.stderr.strip() or result.stdout)[-_TOOLCHAIN_STDERR_TAIL:]
                 )
-        prepared.write_text(f"{base_sha}\n", encoding="utf-8")
+        prepared.write_text(marker, encoding="utf-8")
         return worktree
 
-    def _baseline_executables(self, root: Path, cwd: Path, executable: str) -> dict[str, Path]:
+    def _baseline_executables(
+        self, root: Path, cwd: Path, executable: str, toolchain: NodeToolchain | None = None
+    ) -> dict[str, Path]:
         """Contract test commands may run the installers, timeout, or a checkout-local tool."""
         executables = {
-            **prepare_executables(self.settings),
+            **prepare_executables(self.settings, toolchain),
             "timeout": self.settings.timeout_executable,
         }
         if "/" in executable:
@@ -2571,7 +2675,11 @@ class ScanActivityHandler(UiPlanScanSteps):
         return executables
 
     def _run_baseline_test(
-        self, worktree: Path, command: ToolchainTestCommand, environment: dict[str, str]
+        self,
+        worktree: Path,
+        command: ToolchainTestCommand,
+        environment: dict[str, str],
+        toolchain: NodeToolchain | None = None,
     ) -> dict[str, Any]:
         root = worktree.resolve()
         cwd = (worktree / command.cwd).resolve()
@@ -2579,7 +2687,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             raise ValueError(f"baseline test cwd {command.cwd!r} is not in the checkout")
         argv = render_argv(command.argv, self.settings)
         runner = self.baseline_runner or SafeCommandRunner(
-            self._baseline_executables(root, cwd, argv[0])
+            self._baseline_executables(root, cwd, argv[0], toolchain)
         )
         # argv is normally timeout-wrapped (NEW-46); this bound also covers unwrapped ones.
         result = runner.run(
