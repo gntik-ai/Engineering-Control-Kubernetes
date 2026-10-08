@@ -139,6 +139,9 @@ class StagingGitOpsPlan(BaseModel):
         if int(match.group(2)) != self.source_pr_number:
             raise ValueError("source PR number does not match its URL")
         if self.deployment_pr_number is not None:
+            if self.deployment_repository == self.source_repository:
+                # NEW-160: a self-contained project has only its source PR.
+                raise ValueError("a self-contained plan has no deployment PR")
             deployment = _PR_URL.fullmatch(self.deployment_pr_url or "")
             if (
                 deployment is None
@@ -778,7 +781,12 @@ class GitOpsControllerHandler:
             source = _PR_URL.fullmatch(source_url)
             if source is None or not change_set.source_head_sha:
                 raise StagingFlowBlocked("SOURCE_PR_BINDING_MISSING")
-            deployment_url = change_set.deployment_pr_url
+            # NEW-160: a self-contained project (source == deployment repository) has only
+            # its source PR, whatever an earlier publication recorded.
+            self_contained = str(manifest.repositories.source.full_name) == str(
+                manifest.repositories.deployment.full_name
+            )
+            deployment_url = None if self_contained else change_set.deployment_pr_url
             deployment = _PR_URL.fullmatch(deployment_url) if deployment_url else None
             plan = StagingGitOpsPlan(
                 change_set_id=change_set.id,
@@ -2833,15 +2841,35 @@ class GitOpsGitHubHandler:
         if not gate.changeset.enabled and not gate.protected_paths:
             return None
         try:
-            changed = self.broker.pull_request_files(plan.source_repository, plan.source_pr_number)
+            changes = self.broker.pull_request_file_changes(
+                plan.source_repository, plan.source_pr_number
+            )
         except GhCliPolicyError:
-            # A listing at GitHub's file cap cannot prove either rule.
+            # A listing at GitHub's file cap (or a malformed one) cannot prove either rule.
             return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
-        if any(gate.protected(path) for path in changed):
+        # A rename's previous path counts as touched (moving a file out of .github/ or out
+        # of a package is a change there).
+        touched = [
+            path for change in changes for path in (change["path"], change["previous_path"]) if path
+        ]
+        if any(gate.protected(path) for path in touched):
             return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"}
-        if gate.changeset.missing(list(changed)):
+        if gate.changeset.touches_packages(touched) and not any(
+            self._exists_at(plan.source_repository, path, plan.source_head_sha)
+            for path in gate.changeset.changeset_candidates(changes)
+        ):
+            # Only an added or modified .changeset/<name>.md present at the bound head
+            # counts; a removed or renamed-away changeset never does.
             return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
         return None
+
+    def _exists_at(self, repository: str, path: str, ref: str) -> bool:
+        """NEW-160: ``path`` exists at commit ``ref`` (the PR's bound head)."""
+        try:
+            self.broker.repository_file_text(repository, path, ref)
+        except (CommandFailure, GhCliPolicyError):
+            return False
+        return True
 
     # -- 3. release tag + workflow runs ------------------------------------------------
 

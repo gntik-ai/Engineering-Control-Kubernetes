@@ -53,6 +53,8 @@ from engineering_control.activities.gitops import (
     enabled_delivery_gate,
     enabled_staging_flow,
 )
+from engineering_control.activities.metadata import MetadataActivityHandler
+from engineering_control.adapters.command import CommandFailure
 from engineering_control.config import Settings
 from engineering_control.db import models as db
 from engineering_control.db.base import Base
@@ -225,22 +227,49 @@ def test_runtime_readers_fail_closed_and_the_gate_is_the_merge_delivery(tmp_path
 # -- the changeset gate -------------------------------------------------------------------
 
 
+def _change(path: str, status: str = "modified", previous: str = "") -> dict[str, str]:
+    return {"path": path, "status": status, "previous_path": previous}
+
+
 @pytest.mark.parametrize(
-    ("changed", "missing"),
+    ("changes", "candidates"),
     [
-        (["packages/ui/src/button.tsx"], True),
-        (["packages/ui/src/button.tsx", ".changeset/brave-ducks.md"], False),
-        (["blocks/login/index.tsx", ".changeset/README.md"], True),
-        (["packages/ui/src/button.tsx", ".changeset/nested/x.md"], True),
-        (["packages/ui/src/button.tsx", ".changeset/config.json"], True),
-        (["apps/docs/pages/index.mdx"], False),  # no published package touched
-        ([], False),
+        ([_change(".changeset/brave-ducks.md", "added")], [".changeset/brave-ducks.md"]),
+        ([_change(".changeset/brave-ducks.md", "modified")], [".changeset/brave-ducks.md"]),
+        # A deleted changeset, or one renamed away, never counts.
+        ([_change(".changeset/brave-ducks.md", "removed")], []),
+        ([_change("docs/notes.md", "renamed", ".changeset/brave-ducks.md")], []),
+        # Renamed into .changeset/ counts by its new path (still proven at the head).
+        (
+            [_change(".changeset/brave-ducks.md", "renamed", "docs/notes.md")],
+            [".changeset/brave-ducks.md"],
+        ),
+        # Other files are never changesets.
+        (
+            [
+                _change(".changeset/README.md", "added"),
+                _change(".changeset/config.json", "modified"),
+                _change(".changeset/nested/x.md", "added"),
+                _change(".changeset/.md", "added"),
+                _change("packages/ui/CHANGELOG.md", "added"),
+            ],
+            [],
+        ),
     ],
 )
-def test_a_package_change_requires_a_changeset(changed: list[str], missing: bool) -> None:
+def test_only_added_or_modified_changesets_are_candidates(
+    changes: list[dict[str, str]], candidates: list[str]
+) -> None:
     gate = ChangesetGatePolicy(enabled=True, package_paths=("packages/", "blocks/"))
-    assert gate.missing(changed) is missing
-    assert ChangesetGatePolicy().missing(changed) is False
+    assert gate.changeset_candidates(changes) == candidates
+
+
+def test_the_changeset_gate_applies_only_to_package_changes() -> None:
+    gate = ChangesetGatePolicy(enabled=True, package_paths=("packages/", "blocks/"))
+    assert gate.touches_packages(["packages/ui/src/button.tsx"])
+    assert gate.touches_packages(["blocks/login/index.tsx"])
+    assert not gate.touches_packages(["apps/docs/pages/index.mdx", ".changeset/x.md"])
+    assert not ChangesetGatePolicy().touches_packages(["packages/ui/src/button.tsx"])
 
 
 # -- the registry: a self-contained pair outside the global campaign ------------------------
@@ -442,13 +471,32 @@ GREEN = [_check("checks", "SUCCESS"), _check("a11y", "SUCCESS"), _check("visual"
 
 
 class _MergeGh(FakeGh):
+    """Entries are ``path`` (modified) or ``path<TAB>status[<TAB>previous]``; a changeset
+    exists at the head unless removed (or listed in ``absent_at_head``)."""
+
     def __init__(self, changed: list[str]) -> None:
         super().__init__()
-        self.changed = changed
+        self.changed = [
+            "\t".join([*entry.split("\t"), "modified", ""][:3])
+            if "\t" not in entry
+            else "\t".join([*entry.split("\t"), ""][:3])
+            for entry in changed
+        ]
+        self.absent_at_head: set[str] = set()
 
     def _answer(self, args: list[str]) -> str:
         if args[0] == "api" and args[1].endswith("/pulls/41/files"):
+            assert '.[] | [.filename, .status, (.previous_filename // "")] | @tsv' in args
             return "\n".join(self.changed)
+        if args[:3] == ["api", "-X", "GET"] and "/contents/" in args[3]:
+            path = args[3].split("/contents/", 1)[1]
+            assert f"ref={HEAD_SHA}" in args  # proven at the bound head commit
+            present = {
+                entry.split("\t")[0] for entry in self.changed if entry.split("\t")[1] != "removed"
+            } - self.absent_at_head
+            if path not in present:
+                raise CommandFailure("gh api failed: 404")
+            return "---\n'@gntik-ai/ui': patch\n---\nFix.\n"
         if args[:2] == ["pr", "ready"]:
             pull = self.pull_requests[(args[4], int(args[2]))]
             failing = any(
@@ -514,6 +562,23 @@ async def test_the_continue_on_error_visual_job_never_blocks(tmp_path: Path) -> 
     ("changed", "blocker"),
     [
         (["packages/ui/src/button.tsx"], "CHANGESET_MISSING"),
+        # NEW-160 review 1: a deleted or renamed-away changeset never satisfies the gate.
+        (
+            ["packages/ui/src/button.tsx", ".changeset/brave-ducks.md\tremoved"],
+            "CHANGESET_MISSING",
+        ),
+        (
+            ["packages/ui/src/button.tsx", "docs/ducks.md\trenamed\t.changeset/brave-ducks.md"],
+            "CHANGESET_MISSING",
+        ),
+        (["blocks/login/index.tsx", ".changeset/README.md\tadded"], "CHANGESET_MISSING"),
+        # A package file moved out of packages/ is still a package change.
+        (["apps/x/button.tsx\trenamed\tpackages/ui/button.tsx"], "CHANGESET_MISSING"),
+        # .github/ renamed away is still a .github/ change.
+        (
+            [*CHANGED, "ci.yml\trenamed\t.github/workflows/ci.yml"],
+            "MERGE_DELIVERY_PROTECTED_PATH_CHANGED",
+        ),
         ([*CHANGED, ".github/workflows/ci.yml"], "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"),
         ([*CHANGED, "CLAUDE.md"], "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"),
         ([*CHANGED, ".claude/skills/x/SKILL.md"], "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"),
@@ -525,6 +590,30 @@ async def test_the_merge_requires_a_changeset_and_no_protected_path(
     handler, fake = _github(tmp_path, GREEN, changed)
     refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
     assert refused == {"status": "BLOCKED", "blocker": blocker}
+    assert fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    "changeset",
+    [
+        ".changeset/brave-ducks.md\tadded",
+        ".changeset/brave-ducks.md\tmodified",
+        ".changeset/brave-ducks.md\trenamed\tdocs/ducks.md",
+    ],
+)
+async def test_an_added_modified_or_renamed_in_changeset_at_the_head_passes(
+    tmp_path: Path, changeset: str
+) -> None:
+    handler, fake = _github(tmp_path, GREEN, ["packages/ui/src/button.tsx", changeset])
+    merged = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert merged["status"] == "MERGED"
+
+
+async def test_a_changeset_missing_at_the_bound_head_is_refused(tmp_path: Path) -> None:
+    handler, fake = _github(tmp_path, GREEN, CHANGED)
+    fake.absent_at_head.add(".changeset/brave-ducks.md")
+    refused = await handler.handle("gitops.merge", {"plan": _plan(), "target": "source"})
+    assert refused == {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
     assert fake.mutations == []
 
 
@@ -964,3 +1053,215 @@ async def test_the_backlog_loop_counts_a_merge_only_delivery_as_delivered() -> N
     ):
         assert absent not in steps
     await Replayer(workflows=workflows).replay_workflow(history)
+
+
+# -- NEW-160 review 1: a self-contained publication is source-only end to end ---------------
+
+
+def _release_impact(repository: str, paths: list[str], diff: str, floor: str) -> dict[str, Any]:
+    import hashlib
+
+    impact: dict[str, Any] = {
+        "version": 1,
+        "repository": repository,
+        "changed_paths_sha256": hashlib.sha256(
+            "\n".join(path.lower() for path in paths).encode()
+        ).hexdigest(),
+        "diff_sha256": diff,
+        "categories": [],
+        "migration": False,
+        "risk_floor": floor,
+    }
+    impact["sha256"] = hashlib.sha256(
+        json.dumps(impact, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return impact
+
+
+def _self_contained_publication(
+    slug: str, change_set_id: UUID, run_id: UUID, head: str
+) -> dict[str, Any]:
+    """The persist_publication request of a self-contained ChangeSet: one publication
+    (PublicationPlan accepts nothing else), the same worktree for both evidence roles."""
+    paths = ["packages/ui/src/button.tsx", ".changeset/brave-ducks.md"]
+    pr_url = f"https://github.com/gntik-ai/{slug}/pull/41"
+    evidence = {
+        role: {
+            "base_sha": "b" * 40,
+            "head_sha": head,
+            "changed_file_count": len(paths),
+            "changed_paths": paths,
+            "status_sha256": "3" * 64,
+            "diff_sha256": "2" * 64,
+            "diff_redacted_sha256": "4" * 64,
+            "release_impact": _release_impact(
+                slug, paths, "2" * 64, "R2" if role == "deployment" else "R1"
+            ),
+        }
+        for role in ("source", "deployment")
+    }
+    return {
+        "change_set_id": str(change_set_id),
+        "run_id": str(run_id),
+        "status": "SOURCE_PRS_CREATED",
+        "publication_plan": {
+            "change_set_id": str(change_set_id),
+            "publications": [
+                {
+                    "repository_slug": slug,
+                    "branch": f"agent/{slug}/12/{change_set_id}",
+                    "head_sha": head,
+                }
+            ],
+        },
+        "publication_results": [
+            {"repository_slug": slug, "head_sha": head, "pr_state": "OPEN", "pr_url": pr_url}
+        ],
+        "change_evidence": evidence,
+        "agent_result": {
+            "structured_result": {
+                "decision": "PASS",
+                "summary": "independent review passed",
+                "findings": [],
+                "evidence": [{"kind": "diff", "reference": "bounded", "sha256": "7" * 64}],
+                "open_questions": [],
+            }
+        },
+        "maker_provider": "codex",
+        "checker_provider": "claude",
+    }
+
+
+def _implementing(handler: Any, slug: str, project: str) -> tuple[UUID, UUID]:
+    change_set_id, run_id = uuid4(), uuid4()
+    with handler.sessions.begin() as session:
+        session.add(
+            db.ChangeSet(
+                id=change_set_id,
+                finding_id=uuid4(),
+                project=project,
+                risk_class="R1",
+                state="IMPLEMENTING",
+                version=1,
+                source_repository=slug,
+                source_base_sha="b" * 40,
+                deployment_repository=slug,
+                deployment_base_sha="b" * 40,
+                image_digests={},
+                recovery_json={},
+            )
+        )
+        session.add(
+            db.Run(
+                id=run_id,
+                change_set_id=change_set_id,
+                workflow_id=f"delivery-{change_set_id}",
+                run_type="issue-delivery",
+                status="RUNNING",
+                project=project,
+            )
+        )
+    return change_set_id, run_id
+
+
+async def test_a_published_gntik_ui_change_merges_and_is_delivered_without_a_deployment_pr(
+    tmp_path: Path,
+) -> None:
+    database = f"sqlite:///{tmp_path / 'delivery.sqlite'}"
+    metadata = MetadataActivityHandler(Settings(database_url=database))
+    Base.metadata.create_all(metadata.engine)
+    change_set_id, run_id = _implementing(metadata, "gntik-ui", "gntik-ui")
+    # The real publication persistence: one source PR, no deployment PR binding.
+    published = await metadata.handle(
+        "delivery.persist_publication",
+        _self_contained_publication("gntik-ui", change_set_id, run_id, HEAD_SHA),
+    )
+    assert published["status"] == "SOURCE_PR"
+    with metadata.sessions() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None and change_set.source_pr_url == PR_URL
+        assert change_set.deployment_pr_url is None
+        assert change_set.state == "SOURCE_PR"
+    controller = _controller(tmp_path / "controller", FakeKubectl(), database_url=database)
+    prepared = await controller.handle(
+        "gitops.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "project": "gntik-ui",
+            "issue_repository": REPOSITORY,
+            "issue_number": 12,
+        },
+    )
+    assert prepared["status"] == "READY" and prepared["staging_flow"]["merge_only"] is True
+    plan = prepared["plan"]
+    assert plan["deployment_pr_number"] is None and plan["deployment_pr_url"] is None
+    handler, fake = _github(tmp_path / "github", [*GREEN[:2], _check("visual", "FAILURE")], CHANGED)
+    fake.issues[(REPOSITORY, 12)] = {
+        "number": 12,
+        "title": "Button loses its focus ring",
+        "state": "OPEN",
+        "body": "",
+        "comments": [],
+        "url": "https://github.com/gntik-ai/gntik-ui/issues/12",
+        "closedAt": None,
+    }
+    assert (await handler.handle("gitops.pr_checks", {"plan": plan}))["status"] == ("CHECKS_PASSED")
+    merged = await handler.handle("gitops.merge", {"plan": plan, "target": "source"})
+    assert merged["status"] == "MERGED"
+    closed = await handler.handle("gitops.close_issue", {"plan": plan, "merge_sha": MERGE_SHA})
+    assert closed["status"] == "ISSUE_CLOSED"
+    persisted = await controller.handle(
+        "gitops.persist_result",
+        {"plan": plan, "outcome": "MERGE_DELIVERED", "merge_sha": MERGE_SHA},
+    )
+    assert persisted["change_set_state"] == "ISSUE_CLOSED"
+    # Exactly one PR was touched: no deployment PR, branch or checks exist.
+    touched = {(call[0], call[1]) for call in fake.mutations}
+    assert touched == {("pr", "ready"), ("pr", "merge"), ("issue", "comment"), ("issue", "close")}
+    assert all("41" in call or "12" in call for call in fake.mutations)
+
+
+async def test_llmwiki_publication_is_source_only_too(tmp_path: Path) -> None:
+    # llmwiki (self-contained, source-pr) also bound its source PR as the "deployment"
+    # PR; every reader treats None as "no deployment PR", so it now records None as well.
+    metadata = MetadataActivityHandler(
+        Settings(database_url=f"sqlite:///{tmp_path / 'llmwiki.sqlite'}")
+    )
+    Base.metadata.create_all(metadata.engine)
+    change_set_id, run_id = _implementing(metadata, "llmwiki", "llmwiki")
+    request = _self_contained_publication("llmwiki", change_set_id, run_id, HEAD_SHA)
+    request["publication_plan"]["publications"][0]["branch"] = f"agent/llmwiki/12/{change_set_id}"
+    assert (await metadata.handle("delivery.persist_publication", request))["status"] == (
+        "SOURCE_PR"
+    )
+    with metadata.sessions() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        assert change_set.source_pr_url == "https://github.com/gntik-ai/llmwiki/pull/41"
+        assert change_set.deployment_pr_url is None
+        assert change_set.deployment_head_sha == change_set.source_head_sha == HEAD_SHA
+
+
+async def test_a_legacy_duplicate_deployment_binding_is_ignored_for_a_self_contained_plan(
+    tmp_path: Path,
+) -> None:
+    handler = _controller(tmp_path, FakeKubectl())
+    change_set_id = _seed(handler)
+    with handler.sessions.begin() as session:
+        change_set = session.get(db.ChangeSet, change_set_id)
+        assert change_set is not None
+        change_set.deployment_pr_url = PR_URL  # what df93a76's publication recorded
+        change_set.deployment_head_sha = HEAD_SHA
+    prepared = await handler.handle(
+        "gitops.prepare",
+        {
+            "change_set_id": str(change_set_id),
+            "project": "gntik-ui",
+            "issue_repository": REPOSITORY,
+            "issue_number": 12,
+        },
+    )
+    assert prepared["status"] == "READY"
+    assert prepared["plan"]["deployment_pr_number"] is None
+    with pytest.raises(ValidationError, match="self-contained plan has no deployment PR"):
+        _plan(deployment_pr_number=41, deployment_pr_url=PR_URL, deployment_head_sha=HEAD_SHA)

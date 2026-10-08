@@ -267,19 +267,35 @@ class ChangesetGatePolicy(ReconciliationModel):
             raise ValueError("an enabled changeset gate requires package paths")
         return self
 
-    def missing(self, changed: list[str]) -> bool:
-        """True when ``changed`` touches a package but carries no changeset file."""
-        if not self.enabled or not any(
-            path.startswith(prefix) for path in changed for prefix in self.package_paths
-        ):
-            return False
-        return not any(
-            path.startswith(self.directory)
-            and "/" not in path.removeprefix(self.directory)
-            and path.endswith(".md")
-            and path.removeprefix(self.directory).lower() != "readme.md"
-            for path in changed
+    def touches_packages(self, paths: list[str]) -> bool:
+        """True when any changed path (a rename's previous path included) is in a package."""
+        return self.enabled and any(
+            path.startswith(prefix) for path in paths for prefix in self.package_paths
         )
+
+    def changeset_candidates(self, changes: list[dict[str, str]]) -> list[str]:
+        """Changeset files the PR adds or modifies (a rename or copy counts by its new path).
+
+        A removed file, or the previous path of a rename, never counts; neither does any file
+        other than ``<directory><name>.md`` (README.md excluded). The caller still proves each
+        candidate exists at the bound head commit."""
+        candidates: list[str] = []
+        for change in changes:
+            path = change.get("path", "")
+            name = path.removeprefix(self.directory)
+            if (
+                change.get("status") in _CHANGESET_STATUSES
+                and path.startswith(self.directory)
+                and "/" not in name
+                and name.endswith(".md")
+                and name.lower() != "readme.md"
+                and len(name) > len(".md")
+            ):
+                candidates.append(path)
+        return candidates
+
+
+_CHANGESET_STATUSES = frozenset({"added", "modified", "changed", "renamed", "copied"})
 
 
 class MergeDeliveryPolicy(ReconciliationModel):
