@@ -4,7 +4,10 @@ Two guards, both pinning COMPLETE values (extra names, narrowing and reordering 
 * source text: every literal catalog, Literal, regex alternation and registry composition
   in src and the root-owned scripts, per file and enclosing scope (CATALOG_SITES);
 * resolved values: every pydantic field pattern/enum, module/class constant and argparse
-  choice is a full registry catalog in registry order, or pinned (RUNTIME_PINS, CLI_PINS).
+  argument is mapped to its required catalog (RUNTIME_SITES, CLI_SITES; unmapped fails,
+  any choices container is materialised and probed with "rogue");
+* behaviour: every project/repository pattern is compiled and must accept its catalog and
+  reject sentinels (PATTERN_SITES).
 Each guard is proven by mutation tests.
 """
 
@@ -24,7 +27,7 @@ from types import ModuleType
 from typing import Any, get_args
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 
 from engineering_control import projects
 from engineering_control.models.enums import Project
@@ -440,20 +443,11 @@ def _catalog_drift(relative: str, text: str) -> list[str]:
 # --- Resolved catalogs (runtime values) ----------------------------------------------------
 #
 # Composed values (f-string patterns, starred choices, set unions) are checked after
-# Python resolved them: every pydantic field pattern/enum, module- or class-level constant
-# and argparse choice that names a registered project or repository must be a full registry
-# catalog in registry order, or be pinned below with its complete resolved value.
-
-_FULL = frozenset(
-    f"{prefix}{_encode(kind, catalog)}"
-    for prefix in ("", "re:", "enum:")
-    for kind in ("seq", "set", "keys")
-    for catalog in _SYMBOLS.values()
-) | frozenset(
-    # One project's own (source, deployment) pair, as held by the pair maps.
-    _encode("seq", tuple(pair))
-    for pair in (*PROJECT_REPOSITORIES.values(), *PROJECT_REPOSITORY_SLUGS.values())
-)
+# Python resolved them. Every pydantic field pattern/enum, module- or class-level constant
+# and argparse argument that names a registered project or repository is mapped to its
+# required catalog with its complete resolved value (RUNTIME_SITES, CLI_SITES); an
+# unmapped site fails, so new sites must be classified. ``PROJECTS`` etc. stand for the
+# registry tuple in order, ``{PROJECTS}`` for it as an (unordered) set.
 
 
 def _module_assignments(module: ModuleType) -> frozenset[str]:
@@ -494,23 +488,29 @@ def _resolved(value: Any, depth: int = 0) -> list[str]:
     return []
 
 
-def _schema_catalogs(schema: Any) -> list[str]:
-    found: list[str] = []
+def _schema_items(schema: Any, key: str) -> list[Any]:
+    found: list[Any] = []
     if isinstance(schema, dict):
-        for key, item in schema.items():
-            if key == "pattern" and isinstance(item, str):
-                found.extend(_resolved(item))
-            elif key == "enum" and isinstance(item, list):
-                strings = tuple(value for value in item if isinstance(value, str))
-                if set(strings) & _REGISTERED:
-                    found.append("enum:" + _encode("seq", strings))
-            elif key == "const" and isinstance(item, str) and item in _REGISTERED:
-                found.append("enum:" + _encode("seq", (item,)))
-            elif key != "$defs":
-                found.extend(_schema_catalogs(item))
+        for name, item in schema.items():
+            if name == key:
+                found.append(item)
+            elif name != "$defs":
+                found.extend(_schema_items(item, key))
     elif isinstance(schema, list):
         for item in schema:
-            found.extend(_schema_catalogs(item))
+            found.extend(_schema_items(item, key))
+    return found
+
+
+def _schema_catalogs(schema: Any) -> list[str]:
+    found = [value for item in _schema_items(schema, "pattern") for value in _resolved(item)]
+    for item in _schema_items(schema, "enum"):
+        strings = tuple(value for value in item if isinstance(value, str))
+        if set(strings) & _REGISTERED:
+            found.append("enum:" + _encode("seq", strings))
+    for item in _schema_items(schema, "const"):
+        if isinstance(item, str) and item in _REGISTERED:
+            found.append("enum:" + _encode("seq", (item,)))
     return found
 
 
@@ -524,49 +524,80 @@ def _package_modules() -> list[ModuleType]:
     return modules
 
 
+def _models(modules: list[ModuleType]) -> list[tuple[str, type[BaseModel]]]:
+    found = []
+    for module in modules:
+        short = module.__name__.removeprefix("engineering_control.")
+        for name, value in vars(module).items():
+            if (
+                isinstance(value, type)
+                and issubclass(value, BaseModel)
+                and value.__module__ == module.__name__
+            ):
+                found.append((f"{short}:{name}", value))
+    return found
+
+
+def _field_schemas(model: type[BaseModel]) -> dict[str, Any]:
+    try:
+        properties = model.model_json_schema().get("properties", {})
+    except Exception:  # noqa: BLE001 - schema-less models fall back to field metadata
+        properties = {}
+    schemas = {}
+    for field, info in model.model_fields.items():
+        schema = properties.get(info.alias or field)
+        if schema is None:
+            schema = {
+                "pattern": [getattr(item, "pattern", None) for item in info.metadata][0]
+                if any(getattr(item, "pattern", None) for item in info.metadata)
+                else None
+            }
+        schemas[field] = schema
+    return schemas
+
+
 def _runtime_catalogs(modules: list[ModuleType]) -> dict[str, list[str]]:
-    registry_objects = {id(value) for value in vars(projects).values()}
     found: dict[str, list[str]] = {}
 
     def add(key: str, values: list[str]) -> None:
-        values = [value for value in values if value not in _FULL]
         if values:
             found.setdefault(key, []).extend(values)
 
+    for key, model in _models(modules):
+        for field, schema in _field_schemas(model).items():
+            add(f"{key}.{field}", _schema_catalogs(schema))
     for module in modules:
         short = module.__name__.removeprefix("engineering_control.")
         own = _module_assignments(module)
         for name, value in vars(module).items():
-            if name.startswith("__") or id(value) in registry_objects:
+            if name.startswith("__"):
                 continue
             if isinstance(value, type) and value.__module__ == module.__name__:
-                if issubclass(value, BaseModel):
-                    try:
-                        properties = value.model_json_schema().get("properties", {})
-                    except Exception:  # noqa: BLE001 - schema-less models fall back below
-                        properties = {}
-                    for field, info in value.model_fields.items():
-                        schema = properties.get(info.alias or field, {})
-                        catalogs = _schema_catalogs(schema)
-                        if not schema:
-                            catalogs = [
-                                found_value
-                                for item in info.metadata
-                                for found_value in _resolved(getattr(item, "pattern", None))
-                            ]
-                        add(f"{short}:{name}.{field}", catalogs)
-                    continue
-                for attribute, item in vars(value).items():
-                    if not attribute.startswith("__") and id(item) not in registry_objects:
-                        add(f"{short}:{name}.{attribute}", _resolved(item))
-                continue
-            if name in own:
+                if not issubclass(value, BaseModel):
+                    for attribute, item in vars(value).items():
+                        if not re.fullmatch(r"_.*_", attribute):  # dunder/sunder internals
+                            add(f"{short}:{name}.{attribute}", _resolved(item))
+            elif name in own:
                 add(f"{short}:{name}", _resolved(value))
     return found
 
 
-def _cli_catalogs(root: argparse.ArgumentParser) -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
+def _materialise(choices: Any) -> tuple[str, tuple[Any, ...]]:
+    if isinstance(choices, Mapping):
+        return "keys", tuple(choices)
+    if isinstance(choices, (set, frozenset)):
+        return "set", tuple(choices)
+    try:
+        return "seq", tuple(iter(choices))
+    except TypeError:
+        return "opaque", ()
+
+
+def _cli_catalogs(root: argparse.ArgumentParser) -> tuple[dict[str, str], list[str]]:
+    """Every argument with choices naming a registered name (or a project/repository
+    argument) -> its materialised choices; plus arguments whose choices admit "rogue"."""
+    found: dict[str, str] = {}
+    problems: list[str] = []
 
     def walk(parser: argparse.ArgumentParser, command: str) -> None:
         for action in parser._actions:
@@ -574,60 +605,176 @@ def _cli_catalogs(root: argparse.ArgumentParser) -> dict[str, list[str]]:
                 for name, sub in action.choices.items():
                     walk(sub, f"{command} {name}".strip())
                 continue
-            choices = action.choices
             key = f"{command}:{action.dest}"
-            if isinstance(choices, (tuple, list)) and all(isinstance(c, str) for c in choices):
-                encoded = _encode("seq", tuple(choices))
-                if set(choices) & _REGISTERED and encoded not in _FULL:
-                    found.setdefault(key, []).append(encoded)
-            elif choices is None and action.dest in {"project", "repository"}:
-                found.setdefault(key, []).append("unbounded")
+            choices = action.choices
+            if choices is None:
+                if action.dest in {"project", "repository"}:
+                    found[key] = "unbounded"
+                continue
+            try:
+                if "rogue" in choices:
+                    problems.append(f"{key} admits 'rogue'")
+            except TypeError:
+                pass
+            kind, values = _materialise(choices)
+            names = {value for value in values if isinstance(value, str)}
+            if kind == "opaque" or names & _REGISTERED or action.dest in {"project", "repository"}:
+                if kind == "opaque" or len(names) != len(values):
+                    found[key] = f"opaque:{type(choices).__name__}"
+                else:
+                    found[key] = _encode(kind, values)
 
     walk(root, "")
+    return found, problems
+
+
+# --- Name-validating patterns (behaviour) -----------------------------------------------------
+#
+# Every pydantic string pattern whose field name or pattern refers to a project or
+# repository is compiled and probed: each name of its required catalog (in the field's
+# template) is accepted; "rogue"-style names in the template and raw sentinels are rejected.
+# A pattern that does not validate a name is listed with the reason instead.
+
+_UUID = "00000000-0000-4000-8000-000000000000"
+_RAW_SENTINELS = ("rogue", "gntik-ai/rogue", "falcone-rogue", "gntik-ai/falcone-rogue", "")
+_BAD_NAMES = ("rogue", "falcone-rogue", "")
+
+
+def _pattern_fields(modules: list[ModuleType]) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = {}
+    for key, model in _models(modules):
+        for field, schema in _field_schemas(model).items():
+            patterns = [item for item in _schema_items(schema, "pattern") if isinstance(item, str)]
+            relevant = re.search(r"project|repo", field) or any(
+                "gntik-ai" in pattern or any(name in pattern for name in _REGISTERED)
+                for pattern in patterns
+            )
+            if patterns and (relevant or f"{key}.{field}" in PATTERN_SITES):
+                found[f"{key}.{field}"] = patterns
     return found
 
 
-# Resolved values that are not a full registry catalog (pydantic fields, constants, CLI).
-# Reasons as for CATALOG_SITES: runtime/identity-only, single-project features, split-pair
-# deployment repositories, and the UI-kit repository change requests may also target.
-RUNTIME_PINS: dict[str, list[str]] = {
+def _pattern_problems(key: str, patterns: list[str]) -> list[str]:
+    spec = PATTERN_SITES.get(key)
+    if spec is None:
+        return [f"{key}: unclassified project/repository pattern {patterns}"]
+    if isinstance(spec, str):
+        return []
+    compiled = [re.compile(pattern) for pattern in patterns]
+
+    def accepted(value: str) -> bool:
+        return any(pattern.search(value) for pattern in compiled)
+
+    problems = []
+    for names, template in spec:
+        upper = all(name.isupper() for name in names)
+        for name in names:
+            if not accepted(template.format(name)):
+                problems.append(f"{key}: rejects {template.format(name)!r}")
+        for bad in _BAD_NAMES:
+            value = template.format(bad.upper() if upper else bad)
+            if accepted(value):
+                problems.append(f"{key}: accepts {value!r}")
+    for sentinel in _RAW_SENTINELS:
+        if accepted(sentinel) and not (sentinel == "" and key in PATTERN_EMPTY_ALLOWED):
+            problems.append(f"{key}: accepts sentinel {sentinel!r}")
+    return problems
+
+
+# Every resolved catalog site -> its complete required value. Non-full values are, as for
+# CATALOG_SITES: runtime/identity-only, single-project features, split-pair deployment
+# repositories, per-project pairs, and the UI-kit repository change requests may target.
+RUNTIME_SITES: dict[str, list[str]] = {
     "activities.delivery:DeferredDeployment.branch": ["re:(falcone, musematic)"],
     "activities.delivery:DeferredDeployment.repository_slug": [
         "re:(falcone-charts, musematic-deploy)"
     ],
+    "activities.delivery:RepositoryPublication.branch": ["re:PROJECTS"],
+    "activities.delivery:RepositoryPublication.repository": ["re:REPOSITORY_SLUGS"],
+    "activities.delivery:RepositoryPublication.repository_slug": ["re:REPOSITORY_SLUGS"],
+    "activities.gitops:StagingGitOpsPlan.deployment_repository": ["re:REPOSITORY_SLUGS"],
+    "activities.gitops:StagingGitOpsPlan.issue_repository": ["re:REPOSITORY_SLUGS"],
+    "activities.gitops:StagingGitOpsPlan.project": ["enum:PROJECTS"],
+    "activities.gitops:StagingGitOpsPlan.source_repository": ["re:REPOSITORY_SLUGS"],
+    "activities.gitops:_AGENT_BRANCH": ["re:PROJECTS"],
+    "activities.gitops:_LISTING_REPOSITORIES": ["{REPOSITORIES}"],
+    "activities.gitops:_PR_URL": ["re:REPOSITORY_SLUGS"],
+    "activities.gitops:_REPOSITORY": ["re:REPOSITORY_SLUGS"],
     "activities.retention:PreviewNamespaceCleanupCandidate.namespace_prefix": [
         "re:(falcone, musematic)"
     ],
     "activities.retention:PreviewNamespaceCleanupCandidate.project": ["enum:(falcone, musematic)"],
+    "activities.scan:CleanupCandidate.branch": ["re:PROJECTS"],
+    "activities.scan:CleanupCandidate.repository": ["re:REPOSITORY_SLUGS"],
+    "activities.scan:ScanActivityHandler._repositories": [
+        "keys:PROJECTS",
+        "(falcone, falcone-charts)",
+        "(musematic, musematic-deploy)",
+        "(llmwiki, llmwiki)",
+    ],
+    "adapters.github.client:ALLOWED_REPOSITORIES": ["{REPOSITORIES}"],
     "adapters.llmwiki.staging:BootstrapAction.surface": [
         "enum:(falcone, keycloak, llmwiki-runtime, staging-deployment, validation)"
     ],
     "adapters.llmwiki.staging:LLMWikiStagingBootstrapPlan.project": ["enum:(llmwiki)"],
+    "api.schemas:BacklogApprovalCandidateRequest.project": ["enum:PROJECTS"],
+    "api.schemas:BacklogApprovalRequest.project": ["enum:PROJECTS"],
     "api.schemas:BacklogIssueAction.repository": [
         "enum:(falcone, falcone-charts, musematic, musematic-deploy)"
     ],
+    "api.schemas:BacklogOwnershipReleaseRequest.project": ["enum:PROJECTS"],
+    "api.schemas:ChangeRequestApproval.typed_confirmation": ["re:UPPER_PROJECTS"],
+    "api.schemas:ChangeRequestCreate.project": ["enum:PROJECTS"],
     "api.schemas:ChangeRequestCreate.target_repository": [
         "enum:(gntik-ai/falcone, gntik-ai/falcone-charts, gntik-ai/musematic, gntik-ai/musematic-deploy, gntik-ai/llmwiki, gntik-ai/gntik-ui)"  # noqa: E501
     ],
     "api.schemas:ChangeRequestPublication.issue_url": [
         "re:(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
     ],
+    "api.schemas:CorrectionExtensionRequest.project": ["enum:PROJECTS"],
+    "api.schemas:ExistingBacklogLoopStart.project": ["enum:PROJECTS"],
+    "api.schemas:ExistingBacklogLoopStart.target_repository": ["enum:REPOSITORIES"],
+    "api.schemas:GitHubBacklogImportRequest.project": ["enum:PROJECTS"],
+    "api.schemas:IssueAmendRequest.project": ["enum:PROJECTS"],
+    "api.schemas:IssueAmendRequest.repository": ["enum:REPOSITORY_SLUGS"],
+    "api.schemas:IssueReapprovalRequest.project": ["enum:PROJECTS"],
+    "api.schemas:IssueReapprovalRequest.repository": ["enum:REPOSITORY_SLUGS"],
+    "api.schemas:IssueTouchRefreshRequest.project": ["enum:PROJECTS"],
+    "api.schemas:IssueTouchRefreshRequest.repository": ["enum:REPOSITORY_SLUGS"],
     "api.schemas:LLMWikiBootstrapExecuteRequest.project": ["enum:(llmwiki)"],
     "api.schemas:LLMWikiBootstrapPlanRequest.project": ["enum:(llmwiki)"],
+    "api.schemas:R3IssueApprovalRequest.confirmation_phrase": ["re:UPPER_PROJECTS"],
+    "api.schemas:R3IssueApprovalRequest.project": ["enum:PROJECTS"],
     "api.schemas:UiPlanCreate.project": ["enum:(falcone)"],
+    "api.schemas:_PROJECT_PHRASE": ["re:UPPER_PROJECTS"],
     "cli:_CHANGE_REPOSITORIES": [
         "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
     ],
+    "dashboard.app:PROJECTS": ["{PROJECTS}"],
     "dashboard.schemas:ActivityEventInput.project": ["re:(falcone, musematic, llmwiki, platform)"],
     "db.change_requests:_ISSUE_URL": [
         "re:(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
     ],
+    "delivery_notifications:_PROJECTS": ["{PROJECTS}"],
+    "engineering.backlog:BACKLOG_PROJECT_PAIRS": [
+        "keys:PROJECTS",
+        "(gntik-ai/falcone, gntik-ai/falcone-charts)",
+        "(gntik-ai/musematic, gntik-ai/musematic-deploy)",
+        "(gntik-ai/llmwiki, gntik-ai/llmwiki)",
+    ],
+    "engineering.backlog:BACKLOG_REPOSITORIES": ["{REPOSITORIES}"],
+    "engineering.backlog:BacklogApprovalBinding.project": ["enum:PROJECTS"],
+    "engineering.backlog:GitHubBacklogImportSnapshot.project": ["enum:PROJECTS"],
+    "engineering.backlog:_ISSUE_URL": ["re:REPOSITORY_SLUGS"],
+    "engineering.backlog:_REFERENCE": ["re:REPOSITORY_SLUGS"],
+    "engineering.backlog:_REPOSITORY": ["re:REPOSITORY_SLUGS"],
     "engineering.change_requests:AffectedRepository.repository": [
         "re:(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
     ],
     "engineering.change_requests:CHANGE_REQUEST_REPOSITORY_ALTERNATION": [
         "re:(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
     ],
+    "engineering.change_requests:ChangeRequestIntake.project": ["enum:PROJECTS"],
     "engineering.change_requests:ChangeRequestIntake.target_repository": [
         "re:(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
     ],
@@ -635,41 +782,195 @@ RUNTIME_PINS: dict[str, list[str]] = {
     "engineering.change_requests:_REPOSITORY_PATTERN": [
         "re:(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
     ],
-    "engineering.models:CredentialReadiness.reference": ["re:(falcone, musematic)"],
+    "engineering.github:FindingPublication.affected_repositories": ["re:REPOSITORY_SLUGS"],
+    "engineering.github:FindingPublication.project": ["enum:PROJECTS"],
+    "engineering.models:BuildWorkflow.repository": ["re:REPOSITORY_SLUGS"],
+    "engineering.models:CampaignPlan.project": ["enum:PROJECTS"],
+    "engineering.models:CredentialReadiness.reference": ["re:(falcone, musematic)", "re:PROJECTS"],
     "engineering.models:DeploymentManifest.adapter": ["enum:(falcone, musematic, llmwiki-staging)"],
+    "engineering.models:E2EFlow.project": ["enum:PROJECTS"],
+    "engineering.models:EnhancementProposal.affected_repository": ["re:REPOSITORY_SLUGS"],
+    "engineering.models:EnhancementRecord.affected_repository": ["re:REPOSITORY_SLUGS"],
+    "engineering.models:EnhancementRecord.project": ["enum:PROJECTS"],
     "engineering.models:PersonaManifest.identity_authority": ["enum:(falcone, musematic)"],
+    "engineering.models:PersonaManifest.project": ["enum:PROJECTS"],
+    "engineering.models:ProjectManifest.project": ["enum:PROJECTS"],
+    "engineering.models:ProjectPairSnapshot.project": ["enum:PROJECTS"],
+    "engineering.models:RepositoryManifest.full_name": ["re:REPOSITORY_SLUGS"],
+    "engineering.models:RepositoryManifest.issue_repository": ["re:REPOSITORY_SLUGS"],
+    "engineering.toolchain:_PROJECTS": ["{PROJECTS}"],
     "engineering.ui_blueprint:UI_PLAN_PROJECTS": ["{falcone}"],
+    "identity.attestation:ObserverReadinessAttestation.project": ["enum:PROJECTS"],
     "identity.attestation:SuperadminReadinessAttestation.project": ["enum:(falcone, musematic)"],
+    "leases.component:ComponentLeaseManager._component_pattern": ["re:PROJECTS"],
+    "models.final_closure:FinalClosurePlan.issue_repository": ["re:PROJECTS"],
+    "models.final_closure:ProtectedMergeResult.repository": ["re:REPOSITORY_SLUGS"],
+    "models.final_closure:ProtectedPullRequestBinding.head_branch": ["re:PROJECTS"],
+    "models.final_closure:ProtectedPullRequestBinding.repository": ["re:REPOSITORY_SLUGS"],
+    "models.final_closure:ProtectedPullRequestBinding.url": ["re:REPOSITORY_SLUGS"],
+    "models.publication_authority:IssueRevisionObservation.repository": ["enum:REPOSITORIES"],
+    "models.publication_authority:PublicationEffectClaim.repository": ["enum:REPOSITORIES"],
+    "models.reconciliation:CIReconciliationPlan.repository": ["re:PROJECTS"],
+    "models.reconciliation:CIReconciliationPlan.source_branch": ["re:PROJECTS"],
+    "models.reconciliation:CIReconciliationPlan.source_pr_url": ["re:PROJECTS"],
+    "models.reconciliation:CandidateArtifactManifest.source_repository": ["re:PROJECTS"],
+    "models.reconciliation:CandidateBuildPolicy.signer_workflow": ["re:PROJECTS"],
+    "models.reconciliation:ImmutablePromotionPolicy.component_lease": ["re:PROJECTS"],
     "models.reconciliation:PromotionPlan.project": ["enum:(falcone)"],
     "models.reconciliation:PromotionPlan.repository": ["enum:(gntik-ai/falcone-charts)"],
     "models.reconciliation:PromotionPlan.repository_slug": ["enum:(falcone-charts)"],
     "models.reconciliation:PromotionPublication.repository": ["enum:(gntik-ai/falcone-charts)"],
     "models.reconciliation:PromotionPublication.repository_slug": ["enum:(falcone-charts)"],
+    "models.reconciliation:StagingFlowPolicy.chart_source_repository": ["re:REPOSITORY_SLUGS"],
+    "models.reconciliation:StagingFlowPolicy.deploy_repository": ["re:REPOSITORY_SLUGS"],
+    "observability.agent:GatewayEventInput.project": ["enum:PROJECTS"],
+    "operations.issue_reapproval:_ISSUE_LOOP": ["re:PROJECTS"],
+    "operations.issue_start:_BACKLOG_LOOP_WORKFLOW": ["re:PROJECTS"],
     "operations.models:LLMWikiBootstrapPlanCommand.project": ["enum:(llmwiki)"],
+    "operations.models:SolveBacklogCommand.project": ["enum:PROJECTS"],
+    "operations.models:SolveIssueCommand.repository": ["enum:REPOSITORIES"],
+    "operations.models:WorkflowControlCommand.repository": ["enum:REPOSITORY_SLUGS"],
+    "operations.publication_reconcile:_PR_URL": ["re:REPOSITORY_SLUGS"],
+    "operations.registry:_PROJECT": ["PROJECTS"],
+    "policy.github_write:WRITE_REPOSITORIES": ["{REPOSITORIES}"],
+    "workflows.cleanup_scope:CLEANUP_PROJECTS": ["{PROJECTS}"],
+    "workflows.cleanup_scope:CLEANUP_REPOSITORY_PROJECTS": ["keys:REPOSITORY_SLUGS"],
+    "workflows.definitions:MultiProjectAuditWorkflow._projects": ["PROJECTS"],
+    "workflows.definitions:_AMEND_ISSUE_REPOSITORIES": ["{REPOSITORIES}"],
+    "workflows.definitions:_PUBLICATION_BRANCH": ["re:PROJECTS"],
+    "workflows.definitions:_PUBLICATION_PR_URL": ["re:REPOSITORY_SLUGS"],
+    "workflows.definitions:_PUBLICATION_REPOSITORY": ["re:REPOSITORY_SLUGS"],
     "worktrees.manager:GitWorktreeManager._deployment_repositories": [
         "{falcone-charts, llmwiki, musematic-deploy}"
     ],
+    "worktrees.manager:GitWorktreeManager._repositories": ["{REPOSITORY_SLUGS}"],
 }
-CLI_PINS: dict[str, list[str]] = {
-    "bootstrap-plan:project": ["(llmwiki)"],
-    "bootstrap:project": ["(llmwiki)"],
-    "change-draft:repository": [
-        "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
-    ],
-    "issue-amend:repository": [
-        "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
-    ],
-    "issue-reapprove:repository": [
-        "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
-    ],
-    "issue-touch-refresh:repository": [
-        "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)"
-    ],
-    "ui-blueprints:project": ["(falcone)"],
-    "ui-inventory:project": ["(falcone)"],
-    "ui-kit-snapshot:project": ["(falcone)"],
-    "ui-plan:project": ["(falcone)"],
+# Every argparse argument naming a registered project/repository -> its choices.
+CLI_SITES: dict[str, str] = {
+    "audit-plan:project": "PROJECTS",
+    "audit-start:project": "PROJECTS",
+    "audit:project": "PROJECTS",
+    "backlog-approval-candidate:project": "PROJECTS",
+    "backlog-approve:project": "PROJECTS",
+    "backlog-import:project": "PROJECTS",
+    "backlog-plan:project": "PROJECTS",
+    "backlog-release-ownership:project": "PROJECTS",
+    "backlog-retry:repository": "REPOSITORY_SLUGS",
+    "backlog-skip:repository": "REPOSITORY_SLUGS",
+    "backlog-start:project": "PROJECTS",
+    "bootstrap-plan:project": "(llmwiki)",
+    "bootstrap:project": "(llmwiki)",
+    "change-draft:project": "PROJECTS",
+    "change-draft:repository": "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)",  # noqa: E501
+    "change-extend-correction:project": "PROJECTS",
+    "changes:project": "PROJECTS",
+    "issue-amend:project": "PROJECTS",
+    "issue-amend:repository": "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)",  # noqa: E501
+    "issue-locate:project": "PROJECTS",
+    "issue-reapprove:project": "PROJECTS",
+    "issue-reapprove:repository": "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)",  # noqa: E501
+    "issue-start:project": "PROJECTS",
+    "issue-touch-refresh:project": "PROJECTS",
+    "issue-touch-refresh:repository": "(falcone, falcone-charts, musematic, musematic-deploy, llmwiki, gntik-ui)",  # noqa: E501
+    "r3-approve:project": "PROJECTS",
+    "r3-candidate:project": "PROJECTS",
+    "ui-blueprints:project": "(falcone)",
+    "ui-inventory:project": "(falcone)",
+    "ui-kit-snapshot:project": "(falcone)",
+    "ui-plan:project": "(falcone)",
 }
+
+_SPLIT = projects.SPLIT_PROJECTS
+_SEPARATE = projects.SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS
+_CHANGE_SLUGS = (*REPOSITORY_SLUGS, "gntik-ui")
+_BRANCH = "agent/{}/component/" + _UUID
+_PR = "https://github.com/gntik-ai/{}/pull/7"
+# field -> [(names it must accept, template)], or the reason it validates no name.
+PATTERN_SITES: dict[str, list[tuple[tuple[str, ...], str]] | str] = {
+    "activities.delivery:RepositoryPublication.repository": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "activities.delivery:RepositoryPublication.repository_slug": [(REPOSITORY_SLUGS, "{}")],
+    "activities.delivery:RepositoryPublication.branch": [(PROJECTS, _BRANCH)],
+    "activities.delivery:DeferredDeployment.repository_slug": [(_SEPARATE, "{}")],
+    "activities.delivery:DeferredDeployment.branch": [(_SPLIT, _BRANCH)],
+    "activities.gitops:StagingGitOpsPlan.source_repository": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "activities.gitops:StagingGitOpsPlan.deployment_repository": [
+        (REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "activities.gitops:StagingGitOpsPlan.issue_repository": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "activities.retention:PreviewNamespaceCleanupCandidate.namespace_prefix": [
+        (("falcone", "musematic"), "{}-preview-")
+    ],
+    "activities.scan:CleanupCandidate.repository": [(REPOSITORY_SLUGS, "{}")],
+    "activities.scan:CleanupCandidate.branch": [(PROJECTS, _BRANCH)],
+    "adapters.falcone.release:FalconeReleasePlan.chart_repository_sha": "a commit SHA",
+    "adapters.llmwiki.staging:BootstrapAction.idempotency_key": "llmwiki-only idempotency key",
+    "adapters.musematic.gitops:MusematicPromotion.deployment_repository_sha": "a commit SHA",
+    "api.schemas:R3IssueApprovalRequest.confirmation_phrase": [
+        (UPPER_PROJECTS, "APPROVE_R3_{}_7_0123456789ABCDEF")
+    ],
+    "api.schemas:ChangeRequestApproval.typed_confirmation": [
+        (UPPER_PROJECTS, "APPROVE_CHANGE_{}_0123456789ABCDEF")
+    ],
+    "api.schemas:ChangeRequestPublication.issue_url": [
+        (_CHANGE_SLUGS, "https://github.com/gntik-ai/{}/issues/7")
+    ],
+    "dashboard.schemas:ActivityEventInput.project": [((*PROJECTS, "platform"), "{}")],
+    "engineering.backlog:GitHubPullRequestSnapshot.url": (
+        "PR snapshots of an already allowlisted repository; the URL shape only"
+    ),
+    "engineering.change_requests:AffectedRepository.repository": [(_CHANGE_SLUGS, "gntik-ai/{}")],
+    "engineering.change_requests:ChangeRequestIntake.target_repository": [
+        (_CHANGE_SLUGS, "gntik-ai/{}")
+    ],
+    "engineering.github:FindingPublication.affected_repositories": [
+        (REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "engineering.models:RepositoryManifest.full_name": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "engineering.models:RepositoryManifest.issue_repository": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "engineering.models:BuildWorkflow.repository": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "engineering.models:CredentialReadiness.reference": [
+        (("falcone", "musematic"), "worker-attestation:{}-superadmin"),
+        (PROJECTS, "worker-attestation:{}-observer"),
+    ],
+    "engineering.models:EnhancementRecord.affected_repository": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "engineering.models:EnhancementProposal.affected_repository": [
+        (REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "models.final_closure:ProtectedPullRequestBinding.repository": [
+        (REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "models.final_closure:ProtectedPullRequestBinding.url": [(REPOSITORY_SLUGS, _PR)],
+    "models.final_closure:ProtectedPullRequestBinding.head_branch": [(PROJECTS, _BRANCH)],
+    "models.final_closure:FinalClosurePlan.issue_repository": [
+        (projects.SOURCE_REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "models.final_closure:ProtectedMergeResult.repository": [(REPOSITORY_SLUGS, "gntik-ai/{}")],
+    "models.reconciliation:CandidateBuildPolicy.signer_workflow": [
+        (projects.SOURCE_REPOSITORY_SLUGS, "gntik-ai/{}/.github/workflows/ci.yml")
+    ],
+    "models.reconciliation:ImmutablePromotionPolicy.component_lease": [(PROJECTS, "{}:api")],
+    "models.reconciliation:StagingFlowPolicy.deploy_repository": [
+        (REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "models.reconciliation:StagingFlowPolicy.chart_source_repository": [
+        (REPOSITORY_SLUGS, "https://github.com/gntik-ai/{}.git")
+    ],
+    "models.reconciliation:CIReconciliationPlan.repository": [
+        (projects.SOURCE_REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "models.reconciliation:CIReconciliationPlan.source_pr_url": [
+        (projects.SOURCE_REPOSITORY_SLUGS, _PR)
+    ],
+    "models.reconciliation:CIReconciliationPlan.source_branch": [(PROJECTS, _BRANCH)],
+    "models.reconciliation:CandidateImage.repository": "a GHCR image name, not a repository",
+    "models.reconciliation:CandidateArtifactManifest.source_repository": [
+        (projects.SOURCE_REPOSITORY_SLUGS, "gntik-ai/{}")
+    ],
+    "models.reconciliation:PromotionPlan.branch": [(("falcone",), _BRANCH)],
+    "models.reconciliation:PromotionPublication.branch": [(("falcone",), _BRANCH)],
+}
+# Fields whose pattern may legitimately accept the empty string.
+PATTERN_EMPTY_ALLOWED: frozenset[str] = frozenset()
 
 
 def test_registry_is_internally_consistent() -> None:
@@ -770,80 +1071,131 @@ def test_literal_catalog_guard_catches_mutations(relative: str, old: str, new: s
     assert _mutated(relative, old, new) != []
 
 
-def test_resolved_catalogs_are_registry_or_pinned() -> None:
-    assert _runtime_catalogs(_package_modules()) == RUNTIME_PINS
+def test_resolved_catalogs_match_their_required_catalog() -> None:
+    assert _runtime_catalogs(_package_modules()) == RUNTIME_SITES
 
 
-def test_cli_choices_are_registry_or_pinned() -> None:
+def test_cli_arguments_match_their_required_catalog() -> None:
     from engineering_control.cli import parser
 
-    assert _cli_catalogs(parser()) == CLI_PINS
+    found, problems = _cli_catalogs(parser())
+    assert problems == []
+    assert found == CLI_SITES
 
 
-def test_bare_name_patterns_accept_exactly_their_catalog() -> None:
-    """Compile every pydantic pattern that is only a catalog (optionally organization-
-    prefixed): each listed registered name is accepted and a sentinel is rejected."""
-    checked = 0
-    for module in _package_modules():
-        for model in vars(module).values():
-            if not (isinstance(model, type) and issubclass(model, BaseModel)):
-                continue
-            for info in model.model_fields.values():
-                for item in info.metadata:
-                    pattern = getattr(item, "pattern", None)
-                    shape = re.fullmatch(r"\^((?:gntik-ai/)?)\(([a-z0-9|-]+)\)\$", pattern or "")
-                    if shape is None:
-                        continue
-                    prefix, names = shape.group(1), shape.group(2).split("|")
-                    if not set(names) & _REGISTERED:
-                        continue
-                    compiled = re.compile(str(pattern))
-                    for name in names:
-                        assert compiled.fullmatch(prefix + name), (model, pattern, name)
-                    assert not compiled.fullmatch(prefix + "rogue"), (model, pattern)
-                    checked += 1
-    assert checked >= 10
+def test_name_validating_patterns_accept_exactly_their_catalog() -> None:
+    fields = _pattern_fields(_package_modules())
+    problems = [
+        problem for key, patterns in fields.items() for problem in _pattern_problems(key, patterns)
+    ]
+    problems.extend(f"{key}: classified but not found" for key in set(PATTERN_SITES) - set(fields))
+    assert problems == []
 
 
 def test_resolved_guard_catches_mutations(monkeypatch: pytest.MonkeyPatch) -> None:
-    from pydantic import Field, create_model
-
-    from engineering_control import cli
-    from engineering_control.dashboard import schemas
     from engineering_control.workflows import definitions
 
     # A composed pydantic pattern that also accepts "rogue" (the ActivityEventInput field).
-    rogue = create_model(
+    model = create_model(
         "ActivityEventInput",
-        __module__=schemas.__name__,
+        __module__="engineering_control.dashboard.schemas",
         project=(str, Field(pattern=rf"^({projects.PROJECT_ALTERNATION}|platform|rogue)$")),
     )
-    module = ModuleType(schemas.__name__)
-    module.__file__ = schemas.__file__
-    module.ActivityEventInput = rogue  # type: ignore[attr-defined]
-    assert _runtime_catalogs([module]) == {
-        "dashboard.schemas:ActivityEventInput.project": [
-            "re:(falcone, musematic, llmwiki, platform, rogue)"
-        ]
-    }
-    assert RUNTIME_PINS["dashboard.schemas:ActivityEventInput.project"] == [
-        "re:(falcone, musematic, llmwiki, platform)"
-    ]
+    module = _model_module("engineering_control.dashboard.schemas", model)
+    found = _runtime_catalogs([module])
+    key = "dashboard.schemas:ActivityEventInput.project"
+    assert found[key] != RUNTIME_SITES[key]
+    # Another registry catalog at a site that requires PROJECTS.
+    model = create_model(
+        "ActivityEventInput",
+        __module__="engineering_control.dashboard.schemas",
+        project=(str, Field(pattern=rf"^({projects.REPOSITORY_SLUG_ALTERNATION}|platform)$")),
+    )
+    found = _runtime_catalogs([_model_module("engineering_control.dashboard.schemas", model)])
+    assert found[key] != RUNTIME_SITES[key]
     # A reordered workflow catalog, resolved at runtime.
     monkeypatch.setattr(
         definitions.MultiProjectAuditWorkflow, "_projects", ("musematic", "falcone", "llmwiki")
     )
-    assert "workflows.definitions:MultiProjectAuditWorkflow._projects" in _runtime_catalogs(
-        [definitions]
+    found = _runtime_catalogs([definitions])
+    key = "workflows.definitions:MultiProjectAuditWorkflow._projects"
+    assert found[key] != RUNTIME_SITES[key]
+
+
+class _AcceptsEverything(tuple):  # type: ignore[type-arg]
+    def __contains__(self, item: object) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    "choices",
+    [
+        REPOSITORY_SLUGS,  # another registry catalog (audit: PROJECTS -> REPOSITORY_SLUGS)
+        (*PROJECTS, "rogue"),  # an extra name
+        PROJECTS[:-1],  # a dropped name
+        tuple(reversed(PROJECTS)),  # reordered
+        frozenset(PROJECTS),  # unordered where the catalog is ordered
+        set(PROJECTS).union({"rogue"}),  # a set with an extra name
+        dict.fromkeys((*PROJECTS, "rogue")),  # mapping keys
+        _AcceptsEverything(PROJECTS),  # a container admitting any value
+    ],
+)
+def test_cli_guard_catches_mutations(monkeypatch: pytest.MonkeyPatch, choices: Any) -> None:
+    from engineering_control import cli
+
+    monkeypatch.setattr(cli, "PROJECTS", choices)
+    found, problems = _cli_catalogs(cli.parser())
+    assert problems != [] or found != CLI_SITES
+    assert found.get("audit:project") != CLI_SITES["audit:project"] or problems != []
+
+
+@pytest.mark.parametrize(
+    ("key", "pattern"),
+    [
+        # A broadened repository pattern (accepts gntik-ai/rogue).
+        (
+            "models.final_closure:ProtectedMergeResult.repository",
+            rf"^gntik-ai/({projects.REPOSITORY_SLUG_ALTERNATION})?.*$",
+        ),
+        # A broadened branch pattern and an extra alternative.
+        (
+            "models.final_closure:ProtectedPullRequestBinding.head_branch",
+            rf"^agent/({projects.PROJECT_ALTERNATION}|[a-z-]+)/[A-Za-z0-9._-]+/[a-f0-9-]{{36}}$",
+        ),
+        (
+            "dashboard.schemas:ActivityEventInput.project",
+            rf"^({projects.PROJECT_ALTERNATION}|platform|rogue)$",
+        ),
+        # A narrowed pattern rejects a required name.
+        ("activities.scan:CleanupCandidate.repository", r"^(falcone|falcone-charts)$"),
+        # An unanchored pattern accepts the sentinels.
+        ("engineering.models:BuildWorkflow.repository", r"gntik-ai/(falcone|musematic)"),
+    ],
+)
+def test_pattern_guard_catches_mutations(key: str, pattern: str) -> None:
+    assert _pattern_problems(key, [pattern]) != []
+
+
+def test_unclassified_pattern_field_fails() -> None:
+    model = create_model(
+        "NewModel",
+        __module__="engineering_control.new",
+        project_repository=(str, Field(pattern=r"^gntik-ai/.*$")),
     )
-    monkeypatch.undo()
-    # CLI choices: an extra name, a dropped name and a reordering all fail.
-    for mutated in ((*PROJECTS, "rogue"), PROJECTS[:-1], tuple(reversed(PROJECTS))):
-        monkeypatch.setattr(cli, "PROJECTS", mutated)
-        assert _cli_catalogs(cli.parser()) != CLI_PINS
-    monkeypatch.setattr(cli, "PROJECTS", PROJECTS)
-    monkeypatch.setattr(cli, "REPOSITORY_SLUGS", (*REPOSITORY_SLUGS, "rogue"))
-    assert _cli_catalogs(cli.parser()) != CLI_PINS
+    fields = _pattern_fields([_model_module("engineering_control.new", model)])
+    assert (
+        _pattern_problems(
+            "new:NewModel.project_repository", fields["new:NewModel.project_repository"]
+        )
+        != []
+    )
+
+
+def _model_module(name: str, model: type[BaseModel]) -> ModuleType:
+    module = ModuleType(name)
+    module.__file__ = str(SOURCE / "projects.py")  # any parseable file; no own constants
+    setattr(module, model.__name__, model)
+    return module
 
 
 def test_derived_literals_and_choices_equal_the_registry() -> None:
