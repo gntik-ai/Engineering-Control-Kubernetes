@@ -11,7 +11,11 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from sqlalchemy import and_, create_engine, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.activities.gitops import StagingFlowBlocked, enabled_staging_flow
+from engineering_control.activities.gitops import (
+    StagingFlowBlocked,
+    enabled_merge_delivery,
+    enabled_staging_flow,
+)
 from engineering_control.api.schemas import ExistingBacklogLoopStart
 from engineering_control.config import Settings
 from engineering_control.db import models as db
@@ -1622,6 +1626,18 @@ class EngineeringActivityHandler:
             return False
         return True
 
+    def _no_runtime_to_prove(self, payload: dict[str, Any]) -> bool:
+        """NEW-164: a project without a runtime (gntik-ui, NEW-160 merge-only delivery) has
+        nothing to re-reproduce on; in full delivery its PR checks run behind the merge gate,
+        so the independent current-source revalidation is the proof."""
+        if payload.get("delivery_mode") != "full-delivery":
+            return False
+        try:
+            enabled_merge_delivery(self.settings.project_config_root, str(payload.get("project")))
+        except (StagingFlowBlocked, ValueError):
+            return False
+        return True
+
     @staticmethod
     def _runtime_proof_waived(payload: dict[str, Any]) -> bool:
         """NEW-88: the operator accepted, for one source-pr issue operation, the independent
@@ -1674,7 +1690,9 @@ class EngineeringActivityHandler:
         # post-deploy verification (Argo sync + workloads on the new image) is the runtime
         # proof; such issues proceed on the current-source revalidation.
         runtime_gate = mode in {"RUNTIME_REQUIRED", "DEPLOYMENT_REQUIRED"} and not (
-            self._runtime_proven_after_deploy(payload) or self._runtime_proof_waived(payload)
+            self._runtime_proven_after_deploy(payload)
+            or self._no_runtime_to_prove(payload)
+            or self._runtime_proof_waived(payload)
         )
         # NEW-88: the independent current-source revalidation always runs first; before, a
         # runtime-gated issue paused on the runtime blocker without ever being revalidated.
