@@ -188,12 +188,17 @@ def campaign_loop_prefix(project: str, campaign_id: UUID | str) -> str:
     return f"backlog-loop-{project}-{campaign_id}"
 
 
-def open_campaign_loops(session: Session, prefix: str, *, exclude: str | None) -> list[str]:
-    """The campaign's loop Runs (issue-start and campaign-wide) still recorded open."""
-    statement = select(Run.workflow_id).where(
+def open_campaign_loops(
+    session: Session, prefix: str, *, exclude: str | None, issue_loops_only: bool = False
+) -> list[Run]:
+    """The campaign's loop Runs still recorded open: issue-start loops and, unless
+    ``issue_loops_only``, campaign-wide ones."""
+    statement = select(Run).where(
         Run.run_type == "existing-backlog-loop",
         Run.status.in_(OPEN_LOOP_STATES),
-        Run.workflow_id.startswith(prefix, autoescape=True),
+        Run.workflow_id.startswith(
+            f"{prefix}-operation-" if issue_loops_only else prefix, autoescape=True
+        ),
     )
     if exclude is not None:
         statement = statement.where(Run.workflow_id != exclude)
@@ -225,18 +230,40 @@ def require_no_open_sibling_loop(
     A campaign approval names exactly one issue operation, and every loop reports its
     state into the one campaign status. Approving another issue while a sibling loop was
     open (falcone 31c772b3) voided the sibling's approval, let its pause void the new
-    loop's delivery and let its end disable the shared write policy. Checked for every
-    approval preparation, issue-bound or campaign-wide, under the approval and campaign
-    locks; only the request's own issue loop (issue-reapprove of a paused loop) never
-    counts."""
+    loop's delivery and let its end disable the shared write policy. Checked under the
+    approval and campaign locks:
+
+    - an issue-start/issue-reapprove (``own_operation_id``) is refused while any other
+      loop of the campaign is open or still being handed off (a dispatching issue or
+      campaign-wide operation); the request's own loop never counts;
+    - a campaign-wide approval is refused only while an issue loop is open or handed off,
+      so a campaign-wide loop can still renew its own approval."""
     prefix = campaign_loop_prefix(project, campaign.id)
     own_loop = f"{prefix}-operation-{own_operation_id}" if own_operation_id else None
-    loops = open_campaign_loops(session, prefix, exclude=own_loop)
+    loops = open_campaign_loops(
+        session, prefix, exclude=own_loop, issue_loops_only=own_operation_id is None
+    )
     if loops:
         raise ValueError(
-            f"{CAMPAIGN_IN_USE}: another loop of the campaign is open ({loops[0]}); "
+            f"{CAMPAIGN_IN_USE}: another loop of the campaign is open ({loops[0].workflow_id}); "
             "finish, skip or cancel it before starting another issue"
         )
+    if own_operation_id is not None:
+        # A campaign-wide backlog-start still handing off has no loop Run yet.
+        handoffs = session.scalars(
+            select(OperationRequest).where(
+                OperationRequest.action == "solve_backlog",
+                OperationRequest.target_type == "backlog_campaign",
+                OperationRequest.target_id == str(campaign.id),
+                OperationRequest.status.in_({"DISPATCHING", "STARTED"}),
+            )
+        )
+        for handoff in handoffs:
+            if operation_holds_campaign(session, handoff):
+                raise ValueError(
+                    f"{CAMPAIGN_IN_USE}: the campaign-wide operation {handoff.id} is still "
+                    "starting or running; finish, skip or cancel it before starting an issue"
+                )
     approval = campaign.approval_json if isinstance(campaign.approval_json, dict) else {}
     raw = approval.get("binding")
     if not isinstance(raw, dict) or not isinstance(raw.get("issue_approval"), dict):

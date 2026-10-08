@@ -253,6 +253,73 @@ async def test_a_loop_closed_outside_hermes_is_released_only_when_temporal_confi
             await _prepare(metadata, sibling)
 
 
+@pytest.mark.asyncio
+async def test_a_campaign_wide_loop_may_renew_its_own_approval(tmp_path) -> None:
+    # Review 2: an expired write-policy approval of a running campaign-wide loop is renewed
+    # with backlog-approval-candidate; only issue loops block a campaign-wide approval.
+    operations, metadata, _handler, request = await _approved_direct_request(tmp_path)
+    _operation(operations, request.issue_operation_id, status="COMPLETED")
+    _loop_run(operations, campaign_loop_prefix("falcone", CAMPAIGN_ID), "RUNNING")
+    general = BacklogApprovalCandidateRequest(
+        project="falcone",
+        delivery_mode=request.delivery_mode,
+        maximum_risk=request.maximum_risk,
+        maximum_items=5,
+    )
+    assert (await metadata.prepare_backlog_approval(CAMPAIGN_ID, general))["status"] == (
+        "AWAITING_APPROVAL"
+    )
+    # ...but an issue-start is refused while that campaign-wide loop is open.
+    sibling = await _sibling_request(operations, request)
+    with pytest.raises(ValueError, match="ISSUE_START_CAMPAIGN_IN_USE"):
+        await _prepare(metadata, sibling)
+
+
+@pytest.mark.asyncio
+async def test_issue_start_refuses_while_a_campaign_wide_start_hands_off(tmp_path) -> None:
+    # Review 2: a dispatching backlog-start has no loop Run and no issue approval yet.
+    operations, metadata, _handler, request = await _approved_direct_request(tmp_path)
+    _operation(operations, request.issue_operation_id, status="COMPLETED")
+    with operations.sessions.begin() as session:
+        original = session.get(OperationRequest, request.issue_operation_id)
+        handoff = OperationRequest(
+            **{
+                column.name: getattr(original, column.name)
+                for column in OperationRequest.__table__.columns
+                if column.name
+                not in {"id", "idempotency_key", "workflow_id", "target_id", "target_type"}
+            },
+            id=uuid4(),
+            idempotency_key="campaign-wide-handoff-0001",
+            target_type="backlog_campaign",
+            target_id=str(CAMPAIGN_ID),
+        )
+        handoff.action = "solve_backlog"
+        handoff.status = "DISPATCHING"
+        session.add(handoff)
+    sibling = await _sibling_request(operations, request)
+
+    with pytest.raises(ValueError, match="campaign-wide operation"):
+        await _prepare(metadata, sibling)
+    _operation(operations, handoff.id, status="BLOCKED")
+    assert (await _prepare(metadata, sibling))["status"] == "AWAITING_APPROVAL"
+
+
+@pytest.mark.asyncio
+async def test_a_loop_run_changed_after_its_snapshot_is_never_closed(tmp_path) -> None:
+    # Review 2: a reset/restart recording a new state after the closure check must win.
+    operations, _metadata, _handler, request = await _approved_direct_request(tmp_path)
+    loop = issue_workflow_id(request)
+    _loop_run(operations, loop, "PAUSED")
+    prefix = campaign_loop_prefix("falcone", CAMPAIGN_ID)
+    [(workflow_id, status, updated_at)] = await operations.open_campaign_loops(prefix, exclude=None)
+    _loop_run(operations, loop, "RUNNING")  # the restarted workflow records its state
+
+    assert not await operations.close_ended_loop_run(workflow_id, status, updated_at)
+    with operations.sessions() as session:
+        assert session.scalar(select(Run.status).where(Run.workflow_id == loop)) == "RUNNING"
+
+
 def test_an_operation_holds_its_campaign_until_its_loop_ends(tmp_path) -> None:
     operation = OperationRequest(status="STARTED", workflow_id="backlog-loop-x")
 

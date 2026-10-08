@@ -220,6 +220,11 @@ def _global_inventory_approval_current(
     )
 
 
+def _aware(value: datetime) -> datetime:
+    """SQLite drops the timezone of stored timestamps; compare them as UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def command_target(command: Command) -> tuple[str, str, str | None]:
     if isinstance(command, SolveIssueCommand):
         return "github_issue", f"{command.repository}#{command.issue_number}", command.project.value
@@ -1685,20 +1690,33 @@ class OperationsRepository:
                 for row in session.scalars(statement)
             ]
 
-    async def open_campaign_loops(self, prefix: str, *, exclude: str | None) -> list[str]:
+    async def open_campaign_loops(
+        self, prefix: str, *, exclude: str | None
+    ) -> list[tuple[str, str, datetime]]:
         return await asyncio.to_thread(self._open_campaign_loops, prefix, exclude)
 
-    def _open_campaign_loops(self, prefix: str, exclude: str | None) -> list[str]:
+    def _open_campaign_loops(
+        self, prefix: str, exclude: str | None
+    ) -> list[tuple[str, str, datetime]]:
+        """Each open loop Run as (workflow ID, status, updated_at): the snapshot that
+        close_ended_loop_run re-checks before closing."""
         with self.sessions() as session:
-            return open_campaign_loops(session, prefix, exclude=exclude)
+            return [
+                (run.workflow_id, run.status, run.updated_at)
+                for run in open_campaign_loops(session, prefix, exclude=exclude)
+            ]
 
-    async def close_ended_loop_run(self, workflow_id: str) -> bool:
-        return await asyncio.to_thread(self._close_ended_loop_run, workflow_id)
+    async def close_ended_loop_run(
+        self, workflow_id: str, status: str, updated_at: datetime
+    ) -> bool:
+        return await asyncio.to_thread(self._close_ended_loop_run, workflow_id, status, updated_at)
 
-    def _close_ended_loop_run(self, workflow_id: str) -> bool:
+    def _close_ended_loop_run(self, workflow_id: str, status: str, updated_at: datetime) -> bool:
         """NEW-162: close a loop Run still recorded open whose workflow Temporal reports
         closed (e.g. terminated outside Hermes), so it no longer holds its campaign. The
-        caller verified the closure (TemporalControlService.workflow_id_closed)."""
+        caller verified the closure (TemporalControlService.workflow_id_closed) after taking
+        the (status, updated_at) snapshot; any change of the row since (a reset or restart
+        recording a new state) leaves it alone."""
         with self.sessions.begin() as session:
             run = session.scalar(
                 select(Run).where(Run.workflow_id == workflow_id).with_for_update()
@@ -1707,6 +1725,8 @@ class OperationsRepository:
                 run is None
                 or run.run_type != "existing-backlog-loop"
                 or run.status not in OPEN_LOOP_STATES
+                or run.status != status
+                or _aware(run.updated_at) != _aware(updated_at)
             ):
                 return False
             now = datetime.now(UTC)

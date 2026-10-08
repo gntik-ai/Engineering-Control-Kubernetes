@@ -244,13 +244,16 @@ class TypedCommandBus:
         return 1
 
     async def _close_ended_campaign_loops(self, prefix: str, *, exclude: str | None) -> None:
-        """NEW-162: a campaign holds one open loop, so a loop Run left open by a workflow
-        closed outside Hermes (terminated, or its last state write lost) would fence the
-        campaign forever. Close only Runs whose closure Temporal confirms; any observation
-        failure propagates (the start fails closed)."""
-        for workflow_id in await self.operations.open_campaign_loops(prefix, exclude=exclude):
+        """NEW-162: an issue-start or issue-reapprove admits no sibling loop, so a loop Run
+        left open by a workflow closed outside Hermes (terminated, or its last state write
+        lost) would fence the campaign forever. Close only Runs whose closure Temporal
+        confirms and that did not change meanwhile; an observation failure propagates (the
+        start fails closed)."""
+        for workflow_id, status, updated_at in await self.operations.open_campaign_loops(
+            prefix, exclude=exclude
+        ):
             if await self.control.workflow_id_closed(workflow_id):
-                await self.operations.close_ended_loop_run(workflow_id)
+                await self.operations.close_ended_loop_run(workflow_id, status, updated_at)
 
     policy_activation_timeout_seconds = 60.0
     policy_activation_poll_seconds = 2.0
@@ -403,9 +406,6 @@ class TypedCommandBus:
             await self._await_policy_activation(command.backlog_campaign_id, approval)
             return await self.control.start_existing_backlog_loop(request)
         if isinstance(command, SolveBacklogCommand):
-            await self._close_ended_campaign_loops(
-                campaign_loop_prefix(command.project, command.backlog_campaign_id), exclude=None
-            )
             candidate = await self.metadata.prepare_backlog_approval(
                 command.backlog_campaign_id,
                 BacklogApprovalCandidateRequest(
