@@ -334,15 +334,17 @@ Operator decision (2026-10-08): a campaign holds at most one open issue loop.
   The refusal names the open loop or operation and changes nothing. Finish, `backlog-skip` or
   `backlog-cancel` that loop first; a skipped or cancelled issue is started again later with
   `issue-start` (its revalidation runs again).
-- A campaign-wide `backlog-approve`/`backlog-start` is refused the same way while an issue loop
-  of the campaign is open (it used to replace the paused loop's issue approval, #972).
+- An `issue-start` is also refused while a campaign-wide loop of the campaign is open or its
+  `backlog-start` is still being handed off. A campaign-wide `backlog-approve`/`backlog-start` is
+  refused while an issue loop of the campaign is open (it used to replace the paused loop's issue
+  approval, #972); a campaign-wide loop can still renew its own approval.
 - Every approval preparation takes the campaign approval lock and the campaign row lock, so two
   simultaneous starts never both see the campaign free.
 - A loop Run still recorded open whose workflow was closed outside Hermes (e.g. terminated with
-  `temporal workflow terminate`) would fence its campaign. Before preparing, `issue-start`,
-  `backlog-start` and `issue-reapprove` ask Temporal about every other open loop of the campaign
-  and close (`CANCELLED`, dashboard event `backlog.loop_run_closed`) only those Temporal reports
-  closed; an unknown state fails the start.
+  `temporal workflow terminate`) would fence its campaign. Before preparing, `issue-start` and
+  `issue-reapprove` ask Temporal about every other open loop of the campaign and close
+  (`CANCELLED`, dashboard event `backlog.loop_run_closed`) only those Temporal reports closed
+  and whose Run did not change since it was read; an unknown state fails the start.
 - `backlog-skip` of an issue paused on a failed loop step records the skip and completes its loop
   (`COMPLETE_NOTHING_DELIVERED` when nothing was delivered); it no longer fails the loop or the
   campaign. Workflow patch `existing-backlog-loop-step-skip-closes-v1`, evaluated only when the
