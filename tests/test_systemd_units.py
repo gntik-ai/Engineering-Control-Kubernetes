@@ -590,3 +590,23 @@ def test_documented_worker_then_mirror_bootstrap_order_dry_run(tmp_path: Path) -
         line.startswith(("chown", "chmod", "install"))
         for line in calls.read_text(encoding="utf-8").splitlines()
     )
+
+
+def test_mirror_bootstrap_creates_a_missing_root_with_a_traverse_only_mask(
+    tmp_path: Path,
+) -> None:
+    # NEW-162 review 2: the missing-root branch sets the same explicit --x mask as
+    # bootstrap-worker.sh (a recalculated mask re-enables broader inherited entries).
+    mirrors = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
+    (tmp_path / "calls").write_text("", encoding="utf-8")
+    run = _dry_run(tmp_path, mirrors)
+    assert run.returncode == 0, run.stderr
+    root = tmp_path / "srv/engineering/mirrors"
+    root_acl = [
+        line
+        for line in (tmp_path / "calls").read_text(encoding="utf-8").splitlines()
+        if line.startswith("setfacl") and line.endswith(f" {root}")
+    ]
+    assert len(root_acl) == 1
+    assert root_acl[0].startswith("setfacl -n --modify ")
+    assert root_acl[0].split()[-2].endswith(",m::--x")

@@ -66,7 +66,11 @@ from engineering_control.operations.connection_status import (
 from engineering_control.operations.correction_extension import grant_correction_extension
 from engineering_control.operations.dispatch_receipts import record_dispatch_receipt
 from engineering_control.operations.issue_amend import amend_issue, resolve_amend_target
-from engineering_control.operations.issue_approval import current_issue_approval_binding
+from engineering_control.operations.issue_approval import (
+    OPEN_LOOP_STATES,
+    current_issue_approval_binding,
+    open_campaign_loops,
+)
 from engineering_control.operations.issue_reapproval import plan_issue_reapproval
 from engineering_control.operations.issue_start import (
     ISSUE_START_UNCONFIRMED,
@@ -1680,6 +1684,57 @@ class OperationsRepository:
                 )
                 for row in session.scalars(statement)
             ]
+
+    async def open_campaign_loops(self, prefix: str, *, exclude: str | None) -> list[str]:
+        return await asyncio.to_thread(self._open_campaign_loops, prefix, exclude)
+
+    def _open_campaign_loops(self, prefix: str, exclude: str | None) -> list[str]:
+        with self.sessions() as session:
+            return open_campaign_loops(session, prefix, exclude=exclude)
+
+    async def close_ended_loop_run(self, workflow_id: str) -> bool:
+        return await asyncio.to_thread(self._close_ended_loop_run, workflow_id)
+
+    def _close_ended_loop_run(self, workflow_id: str) -> bool:
+        """NEW-162: close a loop Run still recorded open whose workflow Temporal reports
+        closed (e.g. terminated outside Hermes), so it no longer holds its campaign. The
+        caller verified the closure (TemporalControlService.workflow_id_closed)."""
+        with self.sessions.begin() as session:
+            run = session.scalar(
+                select(Run).where(Run.workflow_id == workflow_id).with_for_update()
+            )
+            if (
+                run is None
+                or run.run_type != "existing-backlog-loop"
+                or run.status not in OPEN_LOOP_STATES
+            ):
+                return False
+            now = datetime.now(UTC)
+            previous = run.status
+            run.status = "CANCELLED"
+            run.finished_at = run.finished_at or now
+            run.summary = "loop workflow closed outside Hermes (verified with Temporal)"
+            session.add(
+                DashboardEvent(
+                    occurred_at=now,
+                    level="WARNING",
+                    event_type="backlog.loop_run_closed",
+                    source="controller",
+                    host=None,
+                    worker_kind="controller",
+                    project=run.project,
+                    workflow_id=workflow_id,
+                    temporal_run_id=None,
+                    issue_number=None,
+                    campaign_id=None,
+                    entity_type="run",
+                    entity_id=workflow_id,
+                    current_phase="CANCELLED",
+                    message="Loop workflow closed outside Hermes; its open Run was closed",
+                    metadata_json={"previous_status": previous, "status": "CANCELLED"},
+                )
+            )
+            return True
 
     async def complete_closed_runless_operation(self, operation_id: UUID) -> bool:
         return await asyncio.to_thread(self._complete_closed_runless_operation, operation_id)

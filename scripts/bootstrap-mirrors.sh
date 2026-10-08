@@ -35,7 +35,9 @@ if [[ ! -e ${MIRROR_ROOT} ]]; then
   for identity in "${TRAVERSERS[@]}"; do
     root_acl+="${root_acl:+,}u:${identity}:--x"
   done
-  setfacl --modify "${root_acl}" "${MIRROR_ROOT}"
+  # Same as bootstrap-worker.sh: an explicit traverse-only mask, never a recalculated one
+  # (it would re-enable broader default entries inherited from the parent).
+  setfacl -n --modify "${root_acl},m::--x" "${MIRROR_ROOT}"
 fi
 [[ ! -L ${MIRROR_ROOT} && -d ${MIRROR_ROOT} ]]
 # bootstrap-worker.sh creates the root with these traversal ACLs; an existing root is never

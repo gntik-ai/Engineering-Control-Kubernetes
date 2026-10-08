@@ -15,6 +15,7 @@ import shutil
 import uuid
 from datetime import timedelta
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 import pytest
@@ -43,7 +44,12 @@ from engineering_control.db.models import (
     OperationRequest,
     Run,
 )
+from engineering_control.operations.issue_approval import (
+    campaign_loop_prefix,
+    operation_holds_campaign,
+)
 from engineering_control.operations.issue_start import issue_workflow_id
+from engineering_control.operations.service import TypedCommandBus
 from engineering_control.workflows.definitions import ExistingGitHubBacklogLoopWorkflow
 from engineering_control.workflows.inputs import ExistingGitHubBacklogLoopInput
 from engineering_control.workflows.worker_registry import CONTROL_TASK_QUEUE, GITHUB_TASK_QUEUE
@@ -180,6 +186,94 @@ async def test_the_loops_own_operation_never_counts_as_a_sibling(tmp_path) -> No
     _loop_run(operations, loop, "PAUSED")
 
     assert (await _prepare(metadata, request))["status"] == "AWAITING_APPROVAL"
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_wide_approval_refuses_while_an_issue_loop_is_open(tmp_path) -> None:
+    # Review: a general backlog-approve/backlog-start replaced the issue approval of a paused
+    # issue loop (falcone #972's NEW-143 history); it is refused like an issue-start.
+    operations, metadata, _handler, request = await _approved_direct_request(tmp_path)
+    loop = issue_workflow_id(request)
+    _operation(operations, request.issue_operation_id, status="STARTED", workflow_id=loop)
+    _loop_run(operations, loop, "PAUSED")
+    before = _approval(operations)
+    general = BacklogApprovalCandidateRequest(
+        project="falcone",
+        delivery_mode=request.delivery_mode,
+        maximum_risk=request.maximum_risk,
+        maximum_items=5,
+    )
+
+    with pytest.raises(ValueError, match="ISSUE_START_CAMPAIGN_IN_USE"):
+        await metadata.prepare_backlog_approval(CAMPAIGN_ID, general)
+
+    assert _approval(operations) == before
+    _loop_run(operations, loop, "STOPPED")
+    assert (await metadata.prepare_backlog_approval(CAMPAIGN_ID, general))["status"] == (
+        "AWAITING_APPROVAL"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed", [True, False, None])
+async def test_a_loop_closed_outside_hermes_is_released_only_when_temporal_confirms(
+    tmp_path, closed: bool | None
+) -> None:
+    # Review: a loop terminated outside Hermes kept its Run RUNNING/PAUSED and would fence
+    # its campaign forever under one open loop per campaign.
+    operations, metadata, _handler, request = await _approved_direct_request(tmp_path)
+    loop = issue_workflow_id(request)
+    _operation(operations, request.issue_operation_id, status="STARTED", workflow_id=loop)
+    _loop_run(operations, loop, "PAUSED")
+    sibling = await _sibling_request(operations, request)
+    control = Mock()
+    control.workflow_id_closed = (
+        AsyncMock(side_effect=RuntimeError("temporal unavailable"))
+        if closed is None
+        else AsyncMock(return_value=closed)
+    )
+    bus = TypedCommandBus(control, metadata, operations)
+    prefix = campaign_loop_prefix("falcone", CAMPAIGN_ID)
+
+    if closed is None:
+        # An unknown state never releases anything: the start fails closed.
+        with pytest.raises(RuntimeError):
+            await bus._close_ended_campaign_loops(prefix, exclude=issue_workflow_id(sibling))
+    else:
+        await bus._close_ended_campaign_loops(prefix, exclude=issue_workflow_id(sibling))
+    control.workflow_id_closed.assert_awaited_once_with(loop)
+    with operations.sessions() as session:
+        status = session.scalar(select(Run.status).where(Run.workflow_id == loop))
+    if closed:
+        assert status == "CANCELLED"
+        assert (await _prepare(metadata, sibling))["status"] == "AWAITING_APPROVAL"
+    else:
+        assert status == "PAUSED"
+        with pytest.raises(ValueError, match="ISSUE_START_CAMPAIGN_IN_USE"):
+            await _prepare(metadata, sibling)
+
+
+def test_an_operation_holds_its_campaign_until_its_loop_ends(tmp_path) -> None:
+    operation = OperationRequest(status="STARTED", workflow_id="backlog-loop-x")
+
+    class _Session:
+        def __init__(self, status: str | None) -> None:
+            self.status = status
+
+        def scalar(self, _statement: object) -> str | None:
+            return self.status
+
+    assert operation_holds_campaign(_Session(None), operation)  # type: ignore[arg-type]
+    assert operation_holds_campaign(_Session("PAUSED"), operation)  # type: ignore[arg-type]
+    assert not operation_holds_campaign(_Session("COMPLETE"), operation)  # type: ignore[arg-type]
+    assert operation_holds_campaign(
+        _Session(None),  # type: ignore[arg-type]
+        OperationRequest(status="DISPATCHING"),
+    )
+    assert not operation_holds_campaign(
+        _Session("PAUSED"),  # type: ignore[arg-type]
+        OperationRequest(status="BLOCKED", workflow_id="backlog-loop-x"),
+    )
 
 
 _TEMPORAL_CLI = shutil.which("temporal")

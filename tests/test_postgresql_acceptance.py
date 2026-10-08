@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -14,8 +15,10 @@ from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.engine import make_url
 
 from engineering_control.activities.metadata import MetadataActivityHandler
+from engineering_control.api.schemas import BacklogApprovalCandidateRequest
 from engineering_control.config import Settings
 from engineering_control.dashboard.repository import DashboardRepository
+from engineering_control.db import repository as metadata_repository
 from engineering_control.db.models import (
     ACTIVE_OPERATION_STATUSES,
     ActionCandidate,
@@ -29,6 +32,7 @@ from engineering_control.db.models import (
 )
 from engineering_control.db.repository import SQLMetadataRepository
 from engineering_control.operations.issue_approval import current_issue_approval_binding
+from engineering_control.operations.issue_start import issue_start_request
 from engineering_control.operations.models import RefreshConnectionsCommand, SolveIssueCommand
 from engineering_control.operations.repository import OperationsRepository
 
@@ -565,4 +569,145 @@ async def test_postgresql_dashboard_owner_race_consumes_both_reauth_bindings() -
     assert len(bindings) == 2
     assert all(binding.used_at is not None for binding in bindings)
     await repository.finish(first.operation_id, status="COMPLETED")
+    repository.engine.dispose()
+
+
+@pytest.mark.postgresql
+@pytest.mark.asyncio
+async def test_postgresql_simultaneous_issue_starts_in_one_campaign_admit_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-162: two issue-starts of one campaign preparing at once; the approval and
+    campaign locks serialize the one-open-loop check, so exactly one is admitted."""
+    url = _postgresql_url()
+    repository = OperationsRepository(url)
+    campaign_id = uuid4()
+    first_number = 100_000 + (uuid4().int % 800_000)
+    now = datetime.now(UTC)
+    with repository.sessions.begin() as session:
+        session.add(
+            GitHubBacklogCampaign(
+                id=campaign_id,
+                project="falcone",
+                source_repository="gntik-ai/falcone",
+                deployment_repository="gntik-ai/falcone-charts",
+                imported_at=now,
+                issue_query="is:issue is:open",
+                import_filter="bugs-and-docs",
+                source_default_branch="main",
+                deployment_default_branch="main",
+                source_head_at_import="a" * 40,
+                deployment_head_at_import="b" * 40,
+                issue_count=2,
+                eligible_count=2,
+                deferred_count=0,
+                duplicate_count=0,
+                stale_count=0,
+                already_fixed_count=0,
+                existing_pr_count=0,
+                blocked_count=0,
+                dependency_graph_hash="c" * 64,
+                plan_hash="d" * 64,
+                maximum_items=1,
+                maximum_concurrency=1,
+                status="PLANNED",
+                workflow_id=f"inert-one-open-loop-{campaign_id}",
+            )
+        )
+        session.flush()
+        for offset in (0, 1):
+            number = first_number + offset
+            session.add(
+                BacklogIssueRecord(
+                    id=uuid4(),
+                    backlog_campaign_id=campaign_id,
+                    repository="gntik-ai/falcone",
+                    issue_number=number,
+                    issue_url_reference=f"https://github.com/gntik-ai/falcone/issues/{number}",
+                    title="Synthetic PostgreSQL one-open-loop fixture; no external operation",
+                    state="OPEN",
+                    issue_type="PRODUCT_BUG",
+                    severity="medium",
+                    calculated_risk="R1",
+                    component="api",
+                    source_or_deployment_owner="source",
+                    current_source_reproduction="REPRODUCED_CURRENT_SOURCE",
+                    current_runtime_reproduction="NOT_REQUIRED",
+                    current_runtime_required=False,
+                    reproduction_mode="SOURCE_ONLY",
+                    candidate_status="READY",
+                    eligibility_status="READY",
+                    eligibility_reason="CURRENT_SOURCE_REVALIDATION_PASS",
+                    planned_wave="W1",
+                    planned_order=1 + offset,
+                    delivery_status="NOT_STARTED",
+                    final_closure_status="OPEN",
+                    documentation_impact="DOCUMENTATION_NOT_REQUIRED_WITH_EVIDENCE",
+                    body_sha256="e" * 64,
+                    github_updated_at=now,
+                )
+            )
+    requests = []
+    for offset in (0, 1):
+        command_value = SolveIssueCommand(
+            project="falcone",
+            backlog_campaign_id=campaign_id,
+            repository="gntik-ai/falcone",
+            issue_number=first_number + offset,
+            delivery_mode="source-pr",
+        )
+        created = await repository.create_external(
+            command_value,
+            source_channel="cli",
+            operator_class="engineering-ctl:hermes",
+            idempotency_key=f"one-open-loop-{first_number + offset:012d}",
+        )
+        assert await repository.claim(created.operation_id) is not None
+        requests.append(
+            issue_start_request(command_value, created.operation_id, created.binding_hash)
+        )
+    policy_root = tmp_path / "policy-requests"
+    policy_root.mkdir(mode=0o700)
+    metadata = SQLMetadataRepository(url, github_policy_request_root=policy_root)
+
+    # Widen the window between the check and the commit: unserialized, both would pass.
+    guard = metadata_repository.require_no_open_sibling_loop
+
+    def slow_guard(*args: object, **kwargs: object) -> None:
+        guard(*args, **kwargs)  # type: ignore[arg-type]
+        time.sleep(1.0)
+
+    monkeypatch.setattr(metadata_repository, "require_no_open_sibling_loop", slow_guard)
+    start = threading.Barrier(2, timeout=10)
+    outcomes: list[str] = []
+
+    def prepare(request: object) -> None:
+        start.wait()
+        try:
+            metadata._prepare_backlog_approval(
+                campaign_id,
+                BacklogApprovalCandidateRequest(
+                    project="falcone",
+                    delivery_mode="source-pr",
+                    maximum_risk=requests[0].maximum_risk,
+                    maximum_items=1,
+                ),
+                issue_request=request,  # type: ignore[arg-type]
+            )
+        except ValueError as error:
+            outcomes.append(
+                "REFUSED" if "ISSUE_START_CAMPAIGN_IN_USE" in str(error) else str(error)
+            )
+        else:
+            outcomes.append("PREPARED")
+
+    threads = [threading.Thread(target=prepare, args=(request,)) for request in requests]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert sorted(outcomes) == ["PREPARED", "REFUSED"]
+    for request in requests:
+        await repository.finish(request.issue_operation_id, status="COMPLETED")
+    metadata.engine.dispose()
     repository.engine.dispose()

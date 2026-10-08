@@ -180,39 +180,61 @@ def require_backlog_issue_approval(session: Session, binding: BacklogApprovalBin
 
 
 # NEW-162: loop Run states that still hold their campaign (issue_reapproval keeps the same).
-_OPEN_LOOP_STATES = frozenset({"QUEUED", "RUNNING", "PAUSED", "BLOCKED", "RATE_LIMITED"})
+OPEN_LOOP_STATES = frozenset({"QUEUED", "RUNNING", "PAUSED", "BLOCKED", "RATE_LIMITED"})
 CAMPAIGN_IN_USE = "ISSUE_START_CAMPAIGN_IN_USE"
 
 
+def campaign_loop_prefix(project: str, campaign_id: UUID | str) -> str:
+    return f"backlog-loop-{project}-{campaign_id}"
+
+
+def open_campaign_loops(session: Session, prefix: str, *, exclude: str | None) -> list[str]:
+    """The campaign's loop Runs (issue-start and campaign-wide) still recorded open."""
+    statement = select(Run.workflow_id).where(
+        Run.run_type == "existing-backlog-loop",
+        Run.status.in_(OPEN_LOOP_STATES),
+        Run.workflow_id.startswith(prefix, autoescape=True),
+    )
+    if exclude is not None:
+        statement = statement.where(Run.workflow_id != exclude)
+    return list(session.scalars(statement.order_by(Run.workflow_id)).all())
+
+
+def operation_holds_campaign(session: Session, operation: OperationRequest) -> bool:
+    """NEW-162: an issue operation holds its campaign while it dispatches and, once STARTED,
+    until its loop Run ends (the operation itself is closed lazily). A STARTED operation
+    whose loop has not registered a Run is still being handed off."""
+    if operation.status == "DISPATCHING":
+        return True
+    if operation.status != "STARTED":
+        return False
+    if not operation.workflow_id:
+        return True
+    status = session.scalar(select(Run.status).where(Run.workflow_id == operation.workflow_id))
+    return status is None or status in OPEN_LOOP_STATES
+
+
 def require_no_open_sibling_loop(
-    session: Session, campaign: GitHubBacklogCampaign, request: ExistingBacklogLoopStart
+    session: Session,
+    campaign: GitHubBacklogCampaign,
+    project: str,
+    own_operation_id: UUID | None,
 ) -> None:
-    """NEW-162: a campaign holds at most one open issue loop.
+    """NEW-162: a campaign holds at most one open loop (operator decision 2026-10-08).
 
     A campaign approval names exactly one issue operation, and every loop reports its
     state into the one campaign status. Approving another issue while a sibling loop was
-    open (falcone 31c772b3, 2026-10-08) voided the sibling's approval, let its pause void
-    the new loop's delivery and let its end disable the shared write policy. The request's
-    own loop and operation (issue-reapprove of a paused loop) never count."""
-    own_loop = (
-        f"backlog-loop-{request.project}-{request.backlog_campaign_id}"
-        f"-operation-{request.issue_operation_id}"
-    )
-    open_loop = session.scalar(
-        select(Run.workflow_id)
-        .where(
-            Run.run_type == "existing-backlog-loop",
-            Run.status.in_(_OPEN_LOOP_STATES),
-            Run.workflow_id.startswith(
-                f"backlog-loop-{request.project}-{request.backlog_campaign_id}", autoescape=True
-            ),
-            Run.workflow_id != own_loop,
-        )
-        .limit(1)
-    )
-    if open_loop is not None:
+    open (falcone 31c772b3) voided the sibling's approval, let its pause void the new
+    loop's delivery and let its end disable the shared write policy. Checked for every
+    approval preparation, issue-bound or campaign-wide, under the approval and campaign
+    locks; only the request's own issue loop (issue-reapprove of a paused loop) never
+    counts."""
+    prefix = campaign_loop_prefix(project, campaign.id)
+    own_loop = f"{prefix}-operation-{own_operation_id}" if own_operation_id else None
+    loops = open_campaign_loops(session, prefix, exclude=own_loop)
+    if loops:
         raise ValueError(
-            f"{CAMPAIGN_IN_USE}: another loop of the campaign is open ({open_loop}); "
+            f"{CAMPAIGN_IN_USE}: another loop of the campaign is open ({loops[0]}); "
             "finish, skip or cancel it before starting another issue"
         )
     approval = campaign.approval_json if isinstance(campaign.approval_json, dict) else {}
@@ -220,22 +242,13 @@ def require_no_open_sibling_loop(
     if not isinstance(raw, dict) or not isinstance(raw.get("issue_approval"), dict):
         return
     other_id = str(raw["issue_approval"].get("operation_id", ""))
-    if other_id == str(request.issue_operation_id):
+    if own_operation_id is not None and other_id == str(own_operation_id):
         return
     try:
         other = session.get(OperationRequest, UUID(other_id))
     except ValueError as error:
         raise ValueError(f"{CAMPAIGN_IN_USE}: the campaign approval is malformed") from error
-    if other is None or other.status not in {"DISPATCHING", "STARTED"}:
-        return
-    # A STARTED operation is open until its loop Run ends (the operation itself is closed
-    # lazily); one whose loop never registered a Run is still being handed off.
-    registered = (
-        session.scalar(select(Run.status).where(Run.workflow_id == other.workflow_id))
-        if other.status == "STARTED" and other.workflow_id
-        else None
-    )
-    if registered is None or registered in _OPEN_LOOP_STATES:
+    if other is not None and operation_holds_campaign(session, other):
         raise ValueError(
             f"{CAMPAIGN_IN_USE}: the campaign approval belongs to the open issue operation "
             f"{other.id}; finish, skip or cancel it before starting another issue"
