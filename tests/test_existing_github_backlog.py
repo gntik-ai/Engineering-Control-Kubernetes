@@ -1275,6 +1275,58 @@ def test_runtime_required_issues_proceed_on_source_repro_in_staged_full_delivery
     assert unstaged["blocker"] == "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
 
 
+def test_runtime_required_issues_of_a_project_without_runtime_proceed_in_full_delivery(
+    tmp_path: Path,
+) -> None:
+    # NEW-164: gntik-ui #25 (its text names focus and accessibility announcements) paused at
+    # CURRENT_RUNTIME_REVALIDATION_REQUIRED after a confirmed source revalidation. gntik-ui
+    # has no runtime (NEW-160 merge-only delivery), so no runtime reproduction can exist.
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'gate.sqlite'}",
+        project_config_root=ROOT / "config/projects",
+    )
+    handler = EngineeringActivityHandler(settings)
+    item = {
+        "repository": "gntik-ai/gntik-ui",
+        "issue_number": 25,
+        "reproduction_mode": "RUNTIME_REQUIRED",
+        "current_source_reproduction": "PENDING_CURRENT_STATE_REVALIDATION",
+        "current_runtime_reproduction": "PENDING",
+    }
+    merged = {"project": "gntik-ui", "delivery_mode": "full-delivery", "item": item}
+    # The source revalidation still runs first.
+    assert handler._backlog_revalidate_gate(merged)["blocker"] == (
+        "CURRENT_SOURCE_REVALIDATION_REQUIRED"
+    )
+    confirmed = {**item, "current_source_reproduction": "REPRODUCED_CURRENT_SOURCE"}
+    assert handler._backlog_revalidate_gate({**merged, "item": confirmed})["blocker"] == (
+        "REVALIDATED_ISSUE_FINDING_MATERIALIZATION_REQUIRED"
+    )
+    # Source-pr runs no merge gate, so it keeps the runtime blocker.
+    source_pr = {**merged, "delivery_mode": "source-pr", "item": confirmed}
+    assert handler._backlog_revalidate_gate(source_pr)["blocker"] == (
+        "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
+    )
+    # A disabled merge delivery fails closed.
+    disabled_root = tmp_path / "projects"
+    disabled_root.mkdir()
+    manifest = (ROOT / "config/projects/gntik-ui.yaml").read_text()
+    merge_enabled = "  merge_delivery:\n    enabled: true\n"
+    assert manifest.count(merge_enabled) == 1
+    (disabled_root / "gntik-ui.yaml").write_text(
+        manifest.replace(merge_enabled, "  merge_delivery:\n    enabled: false\n")
+    )
+    disabled = EngineeringActivityHandler(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'disabled.sqlite'}",
+            project_config_root=disabled_root,
+        )
+    )
+    assert disabled._backlog_revalidate_gate({**merged, "item": confirmed})["blocker"] == (
+        "CURRENT_RUNTIME_REVALIDATION_REQUIRED"
+    )
+
+
 def test_source_pr_runtime_proof_waiver_is_per_issue_and_revalidates_source_first(
     tmp_path: Path,
 ) -> None:
