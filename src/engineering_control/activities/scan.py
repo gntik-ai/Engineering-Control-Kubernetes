@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -37,6 +39,18 @@ from engineering_control.engineering.models import (
     ToolchainPolicy,
     ToolchainTestCommand,
     UiMigrationPolicy,
+)
+from engineering_control.engineering.node_test_baseline import (
+    EVIDENCE_TEST_NAMES,
+    MAX_REPORT_BYTES,
+    REPORTER_SOURCE,
+    REPORTER_VERSION,
+    NodeTestCommand,
+    bounded_names,
+    expand_test_paths,
+    parse_node_test_command,
+    parse_reporter_output,
+    sandbox_argv,
 )
 from engineering_control.engineering.safe_files import (
     open_directory_no_follow,
@@ -95,6 +109,14 @@ _TOOLCHAIN_STDERR_TAIL = 2000
 _TOOLCHAIN_HEARTBEAT_SECONDS = 30.0
 _BASELINE_TEST_TIMEOUT_SECONDS = 1200
 _BASELINE_OUTPUT_TAIL = 500
+# NEW-161: maker-chosen `node --test` suites (base only, sandboxed). The
+# per-run bound matches the contract baseline and is never below the 900s integration
+# suites need; the shared budget keeps validate_changeset inside its 120-minute timeout.
+_NODE_TEST_MAX_COMMANDS = 3
+_NODE_TEST_TIMEOUT_SECONDS = 1200
+_NODE_TEST_MIN_SECONDS = 900
+_NODE_TEST_BUDGET_SECONDS = 4800
+_NODE_TEST_OUTPUT_BYTES = 256 * 1024
 _DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
@@ -2462,37 +2484,82 @@ class ScanActivityHandler(UiPlanScanSteps):
             raise ValueError("toolchain cleanup changed tracked or non-ignored worktree files")
 
     def _preexisting_test_failures(
-        self, payload: dict[str, Any], failed_commands: list[str]
+        self, payload: dict[str, Any], failures: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]] | None, str | None]:
         """NEW-49: evidence that every failing maker command also fails at the base commit.
 
-        Returns (None, None) when a FAIL is not eligible (no contract, a non-contract
-        command, or the command passes at the base) and (None, error) when the baseline
-        could not be established; both keep MAKER_TEST_FAILURE.
+        ``failures`` are the maker FAILs with their origin ("source" or "deployment").
+        A contract test command is rerun at the source base (NEW-49, unchanged). NEW-161
+        (review 1, base-only): any other command must be a strictly parsed `node --test`
+        invocation; it runs, sandboxed, only at its own repository's BASE commit and is
+        pre-existing if that run fails with at least one test-level failure in the
+        targeted files. Maker-authored head code is never executed here.
+
+        Returns (None, None) when a FAIL is not eligible and (None, error) when the
+        baseline could not be established; both keep MAKER_TEST_FAILURE.
         """
         project = str(payload.get("project", ""))
         try:
             policy = enabled_toolchain(self.settings.project_config_root, project)
         except (OSError, ValueError):
             return None, None
-        if policy is None:
-            return None, None
         source = Path(str(payload.get("source_worktree", "")))
         commands: list[ToolchainTestCommand] = []
-        for reported in failed_commands:
-            command = match_toolchain_test_command(policy, reported, self.settings, worktree=source)
-            if command is None:
+        node_commands: list[tuple[str, NodeTestCommand, dict[str, Any]]] = []
+        for failure in failures:
+            reported = str(failure["command"])
+            command = (
+                match_toolchain_test_command(policy, reported, self.settings, worktree=source)
+                if policy is not None
+                else None
+            )
+            if command is not None:
+                if command not in commands:
+                    commands.append(command)
+                continue
+            origin = str(failure["origin"])
+            side = self._node_test_side(payload, origin)
+            if side is None:
+                return None, None  # no checkout of that maker's repository is known
+            node_command = parse_node_test_command(
+                reported, prefixes=self.settings.node_test_path_prefixes, worktree=side[2]
+            )
+            if node_command is None:
                 return None, None
-            if command not in commands:
-                commands.append(command)
+            if all((origin, node_command) != item[:2] for item in node_commands):
+                node_commands.append((origin, node_command, failure))
+        if len(node_commands) > _NODE_TEST_MAX_COMMANDS:
+            return None, None
         base_sha = str(payload.get("source_base_sha", ""))
         try:
             # NEW-159 review 2: the baseline runs under the delivery's carried selection,
             # never a later manifest edit, exactly as the maker and checker did.
             toolchain = payload_node_toolchain(self.settings, payload)
-            results = self._baseline_test_results(
-                project, str(payload["source_repository"]), base_sha, policy, commands, toolchain
+            repository = str(payload["source_repository"])
+            results = (
+                self._baseline_test_results(
+                    project, repository, base_sha, policy, commands, toolchain
+                )
+                if policy is not None and commands
+                else []
             )
+            deadline = time.monotonic() + _NODE_TEST_BUDGET_SECONDS
+            node_results = []
+            for origin, node_command, _ in node_commands:
+                side = self._node_test_side(payload, origin)
+                assert side is not None  # checked above
+                node_results.append(
+                    self._node_test_base_result(
+                        project,
+                        origin,
+                        side[0],
+                        side[1],
+                        policy if origin == "source" else None,
+                        node_command,
+                        toolchain,
+                        deadline,
+                    )
+                )
         except (
             CommandFailure,
             KeyError,
@@ -2515,7 +2582,233 @@ class ScanActivityHandler(UiPlanScanSteps):
                     "base_output_tail": result["output_tail"],
                 }
             )
+        for (origin, node_command, failure), base in zip(node_commands, node_results, strict=True):
+            side = self._node_test_side(payload, origin)
+            assert side is not None
+            item = self._node_test_evidence(origin, node_command, side[1], base, failure)
+            if item is None:
+                return None, None
+            evidence.append(item)
         return evidence, None
+
+    @staticmethod
+    def _node_test_side(payload: dict[str, Any], origin: str) -> tuple[str, str, Path] | None:
+        """NEW-161 review 1: (repository, base sha, worktree) of the maker that reported."""
+        if origin not in {"source", "deployment"}:
+            return None
+        repository = payload.get(f"{origin}_repository")
+        base_sha = payload.get(f"{origin}_base_sha")
+        worktree = payload.get(f"{origin}_worktree")
+        if not all(isinstance(value, str) and value for value in (repository, base_sha, worktree)):
+            return None
+        if not re.fullmatch(r"[a-f0-9]{40}", str(base_sha)):
+            return None
+        return str(repository), str(base_sha), Path(str(worktree))
+
+    @staticmethod
+    def _maker_reported(failure: dict[str, Any]) -> dict[str, Any]:
+        reported = failure.get("maker")
+        if not isinstance(reported, dict):
+            return {}
+        bounded: dict[str, Any] = {}
+        for key, value in sorted(reported.items())[:12]:
+            if isinstance(value, str):
+                bounded[str(key)[:40]] = str(SecretRedactor().redact_text(value).value)[
+                    -_BASELINE_OUTPUT_TAIL:
+                ]
+            elif isinstance(value, bool | int | float) or value is None:
+                bounded[str(key)[:40]] = value
+        return bounded
+
+    @classmethod
+    def _node_test_evidence(
+        cls,
+        origin: str,
+        command: NodeTestCommand,
+        base_sha: str,
+        base: dict[str, Any],
+        failure: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """NEW-161 review 1: pre-existing iff the base fails with a test-level failure."""
+        test_failures = base.get("test_failures")
+        if not isinstance(test_failures, dict) or base["exit_code"] == 0:
+            return None  # paths matched nothing, malformed report, or passes at the base
+        failing: Counter[str] = Counter(test_failures)
+        if not failing:
+            return None  # only file-level (import, syntax, process, hook) failures
+        other: Counter[str] = Counter(base.get("other_failures") or {})
+        return {
+            "command": command.display,
+            "kind": "node_test",
+            "origin": origin,
+            "base_sha": base_sha,
+            "base_exit_code": base["exit_code"],
+            "base_output_tail": base["output_tail"],
+            "base_test_files": base["files"][:EVIDENCE_TEST_NAMES],
+            "base_test_file_count": len(base["files"]),
+            "base_failing_count": sum(failing.values()),
+            "base_failing_tests": bounded_names(failing),
+            "base_other_failure_count": sum(other.values()),
+            "base_other_failures": bounded_names(other),
+            "maker_reported": cls._maker_reported(failure),
+            "head_reexecuted": False,
+            "note": (
+                "Base-only check: the head was not re-executed, so a regression inside "
+                "this already-failing non-contract suite is not detected."
+            ),
+        }
+
+    @staticmethod
+    def _node_test_key(
+        command: NodeTestCommand, policy: ToolchainPolicy | None, toolchain: NodeToolchain
+    ) -> str:
+        identity: dict[str, Any] = {
+            "kind": "node_test",
+            "reporter": REPORTER_VERSION,
+            "cwd": command.cwd,
+            "argv": command.argv,
+            # The checkout is prepared by the contract (if any): part of the identity.
+            "prepare": (
+                [item.model_dump(mode="json") for item in policy.prepare]
+                if policy is not None
+                else None
+            ),
+        }
+        selection = toolchain.selection()
+        if selection is not None:
+            identity["node_toolchain"] = selection
+        return json.dumps(identity, sort_keys=True)
+
+    @staticmethod
+    def _cached_node_test_result(value: object) -> bool:
+        if not isinstance(value, dict) or value.get("kind") != "node_test":
+            return False
+
+        def counts(item: object) -> bool:
+            return isinstance(item, dict) and all(
+                isinstance(name, str) and isinstance(count, int) and count > 0
+                for name, count in item.items()
+            )
+
+        files = value.get("files")
+        return (
+            isinstance(value.get("exit_code"), int)
+            and isinstance(files, list)
+            and all(isinstance(item, str) for item in files)
+            and isinstance(value.get("output_tail"), str)
+            and (
+                value.get("test_failures") is None
+                or (counts(value.get("test_failures")) and counts(value.get("other_failures")))
+            )
+        )
+
+    def _node_test_base_result(
+        self,
+        project: str,
+        origin: str,
+        repository: str,
+        base_sha: str,
+        policy: ToolchainPolicy | None,
+        command: NodeTestCommand,
+        toolchain: NodeToolchain,
+        deadline: float,
+    ) -> dict[str, Any]:
+        """NEW-161: the command's result at the base, cached like NEW-49 (per base)."""
+        root = self.settings.toolchain_cache_root / "baselines" / Project(project).value
+        if origin == "deployment":
+            # The deployment repository has its own, never prepared, checkout.
+            root = root / "deployment"
+        root = root / base_sha
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        results_path = root / "results.json"
+        reporter = root / f"node-test-reporter-v{REPORTER_VERSION}.mjs"
+        key = self._node_test_key(command, policy, toolchain)
+        with (root / ".lock").open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            cached = self._cached_baseline_results(results_path)
+            if self._cached_node_test_result(cached.get(key)):
+                return cached[key]
+            if not reporter.is_file() or reporter.read_text(encoding="utf-8") != REPORTER_SOURCE:
+                self._atomic_text(reporter, REPORTER_SOURCE)
+            worktree = self._baseline_worktree(root, repository, base_sha, policy, toolchain)
+            cached[key] = self._run_node_test(worktree, command, toolchain, reporter, deadline)
+            self._atomic_text(results_path, json.dumps(cached, indent=2, sort_keys=True))
+            return cached[key]
+
+    def _run_node_test(
+        self,
+        checkout: Path,
+        command: NodeTestCommand,
+        toolchain: NodeToolchain,
+        reporter: Path,
+        deadline: float,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "kind": "node_test",
+            "cwd": command.cwd,
+            "argv": command.argv,
+            "files": [],
+            "exit_code": -1,
+            "output_tail": "",
+            "test_failures": None,
+            "other_failures": None,
+            "passed": 0,
+        }
+        files = expand_test_paths(checkout, command)
+        if files is None:
+            result["output_tail"] = "a test path matched no file, a symlink or too many entries"
+            return result
+        result["files"] = files
+        timeout_seconds = int(min(_NODE_TEST_TIMEOUT_SECONDS, deadline - time.monotonic()))
+        if timeout_seconds < _NODE_TEST_MIN_SECONDS:
+            raise ValueError("the node test baseline budget is exhausted")
+        node = (toolchain.node_bin / "node").resolve()
+        if not node.is_file():
+            raise ValueError(f"node executable {node} is missing")
+        nonce = secrets.token_hex(16)
+        # NEW-161 review 3: the trusted base writes to a per-run copy-on-write layer
+        # (removed below) instead of failing on a read-only checkout.
+        overlay_root = self.settings.toolchain_cache_root / "node-test-overlay"
+        overlay_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        layer = Path(tempfile.mkdtemp(prefix="run-", dir=overlay_root))
+        upper, work = layer / "upper", layer / "work"
+        upper.mkdir(mode=0o700)
+        work.mkdir(mode=0o700)
+        try:
+            arguments = sandbox_argv(
+                checkout=checkout.resolve(),
+                command=command,
+                files=files,
+                node=node,
+                reporter=reporter.resolve(),
+                nonce=nonce,
+                variables=toolchain.variables,
+                overlay=(upper.resolve(), work.resolve()),
+            )
+            runner = self.baseline_runner or SafeCommandRunner(
+                {"bwrap": self.settings.bwrap_executable}
+            )
+            # Output is held in memory as a bounded tail only.
+            run = runner.run(
+                "bwrap",
+                arguments,
+                cwd=checkout,
+                timeout_seconds=timeout_seconds,
+                check=False,
+                max_output_bytes=MAX_REPORT_BYTES,
+            )
+        finally:
+            _remove_overlay_layer(layer)
+        report = parse_reporter_output(run.stdout, nonce, files, command.cwd)
+        visible = "\n".join(line for line in run.stdout.splitlines() if nonce not in line)
+        text = str(SecretRedactor().redact_text(f"{visible}\n{run.stderr}").value)
+        result["exit_code"] = run.return_code
+        result["output_tail"] = text.strip()[-_BASELINE_OUTPUT_TAIL:]
+        if report is not None:
+            result["test_failures"] = dict(sorted(report.test_failures.items()))
+            result["other_failures"] = dict(sorted(report.other_failures.items()))
+            result["passed"] = report.passed
+        return result
 
     @staticmethod
     def _baseline_key(cwd: str, argv: list[str], toolchain: NodeToolchain | None = None) -> str:
@@ -2528,11 +2821,16 @@ class ScanActivityHandler(UiPlanScanSteps):
         return json.dumps(identity, sort_keys=True)
 
     @staticmethod
-    def _baseline_prepared_marker(base_sha: str, toolchain: NodeToolchain | None) -> str:
+    def _baseline_prepared_marker(
+        base_sha: str, toolchain: NodeToolchain | None, *, contract: bool = True
+    ) -> str:
         selection = toolchain.selection() if toolchain is not None else None
+        # NEW-161: a project without a contract has an unprepared checkout; a later
+        # contract never reuses it (and a contract checkout keeps its NEW-159 marker).
+        unprepared = "" if contract else " unprepared"
         if selection is None:
-            return f"{base_sha}\n"  # byte-identical to the pre-NEW-159 marker
-        return f"{base_sha} {json.dumps(selection, sort_keys=True)}\n"
+            return f"{base_sha}{unprepared}\n"  # byte-identical to the pre-NEW-159 marker
+        return f"{base_sha}{unprepared} {json.dumps(selection, sort_keys=True)}\n"
 
     @staticmethod
     def _cached_baseline_results(path: Path) -> dict[str, dict[str, Any]]:
@@ -2603,17 +2901,20 @@ class ScanActivityHandler(UiPlanScanSteps):
         root: Path,
         repository: str,
         base_sha: str,
-        policy: ToolchainPolicy,
+        policy: ToolchainPolicy | None,
         toolchain: NodeToolchain | None = None,
     ) -> Path:
-        """A detached, toolchain-prepared checkout of base_sha owned by the scan worker."""
+        """A detached, toolchain-prepared checkout of base_sha owned by the scan worker.
+
+        NEW-161: without a contract (policy None) nothing is prepared, as for the maker.
+        """
         worktree = root / "worktree"
         prepared = root / "prepared"
         if toolchain is None:
             toolchain = resolve_node_toolchain(self.settings, policy)
         # NEW-159 review 1: the checkout is reused only if it was prepared with the same
         # node/pnpm selection (the default marker is the pre-NEW-159 "<sha>\n").
-        marker = self._baseline_prepared_marker(base_sha, toolchain)
+        marker = self._baseline_prepared_marker(base_sha, toolchain, contract=policy is not None)
         if (
             prepared.is_file()
             and prepared.read_text(encoding="utf-8") == marker
@@ -2633,7 +2934,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         )
         toolchain_runner = self._toolchain_runner_for(toolchain)
         resolved_root = worktree.resolve()
-        for command in policy.prepare:
+        for command in policy.prepare if policy is not None else []:
             cwd = (worktree / command.cwd).resolve()
             if not cwd.is_relative_to(resolved_root) or not cwd.is_dir():
                 raise ValueError(f"baseline prepare cwd {command.cwd!r} is not in the checkout")
@@ -2713,7 +3014,8 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "status": "REQUEST_CHANGES",
                 "blocker": "INDEPENDENT_CHECKER_DID_NOT_PASS",
             }
-        failed_commands: list[str] = []
+        # NEW-161 review 1: each FAIL keeps the maker (repository) it came from.
+        failed_commands: list[dict[str, Any]] = []
         for key in ("source_maker_result", "deployment_maker_result"):
             maker = payload.get(key)
             if not isinstance(maker, dict) or not isinstance(maker.get("structured_result"), dict):
@@ -2724,7 +3026,11 @@ class ScanActivityHandler(UiPlanScanSteps):
             if not isinstance(tests, list):
                 return {**payload, "status": "BLOCKED", "blocker": "MAKER_TEST_FAILURE"}
             failed_commands.extend(
-                str(test.get("command", ""))
+                {
+                    "origin": key.removesuffix("_maker_result"),
+                    "command": str(test.get("command", "")),
+                    "maker": test,
+                }
                 for test in tests
                 if isinstance(test, dict) and test.get("status") == "FAIL"
             )
@@ -3160,3 +3466,15 @@ class ScanActivityHandler(UiPlanScanSteps):
                 if found is not None:
                     return found
         return None
+
+
+def _remove_overlay_layer(layer: Path) -> None:
+    """NEW-161 review 3: overlayfs leaves its work/work directory mode 000; make every
+    directory traversable before removing the per-run layer."""
+    for directory, names, _files in os.walk(layer, topdown=True, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_symlink():
+                with contextlib.suppress(OSError):
+                    path.chmod(0o700)
+    shutil.rmtree(layer, ignore_errors=True)

@@ -116,6 +116,11 @@ class Settings(BaseSettings):
     python312_executable: Path = Path("/usr/local/bin/python3.12")
     # NEW-49: contract test commands are wrapped in coreutils timeout (NEW-46).
     timeout_executable: Path = Path("/usr/bin/timeout")
+    # NEW-161: a maker-chosen `node --test` suite is rerun at the BASE only, in a
+    # bubblewrap sandbox (no network, read-only system and checkout, size-capped /tmp);
+    # its paths must start with one of these prefixes (relative to the command's cwd).
+    bwrap_executable: Path = Path("/usr/bin/bwrap")
+    node_test_path_prefixes: tuple[str, ...] = ("tests/", "test/")
     # Must sit under the scan worker unit's ReadWritePaths (/srv/engineering/cache/%i).
     toolchain_cache_root: Path = Path("/srv/engineering/cache/scan/toolchain")
     # NEW-52: a retry/correction of a ChangeSet keeps the previous attempt's commits
@@ -302,6 +307,18 @@ class Settings(BaseSettings):
     ) -> dict[Literal["22", "24"], Path]:
         if any(not path.is_absolute() for path in value.values()):
             raise ValueError("toolchain node roots must be absolute paths")
+        return value
+
+    @field_validator("node_test_path_prefixes")
+    @classmethod
+    def plain_node_test_path_prefixes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        segment = r"[A-Za-z0-9_@+][A-Za-z0-9._@+-]*"
+        if not value or any(
+            not re.fullmatch(rf"(?:{segment}/)+", prefix)
+            or any(part in {".", ".."} for part in prefix.split("/"))
+            for prefix in value
+        ):
+            raise ValueError("node test path prefixes must be relative directories ending in /")
         return value
 
     @field_validator("toolchain_pnpm_executables")
