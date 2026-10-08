@@ -65,6 +65,7 @@ from engineering_control.operations.dispatch_receipts import record_dispatch_rec
 from engineering_control.operations.issue_approval import (
     require_backlog_issue_approval,
     require_issue_request_approval,
+    require_no_open_sibling_loop,
 )
 from engineering_control.projects import GLOBAL_PROJECTS, REPOSITORIES
 from engineering_control.retention_limits import (
@@ -990,6 +991,8 @@ class SQLMetadataRepository:
         campaign = session.get(GitHubBacklogCampaign, campaign_id)
         if campaign is None or campaign.project != request.project:
             raise ValueError("backlog approval campaign does not exist")
+        if issue_request is not None:
+            require_no_open_sibling_loop(session, campaign, issue_request)
         binding = approval_binding(
             campaign_id=str(campaign.id),
             project=request.project,

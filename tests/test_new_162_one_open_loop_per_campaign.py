@@ -1,0 +1,299 @@
+"""NEW-162: a campaign holds at most one open issue loop, and a skip closes its own loop.
+
+falcone campaign 31c772b3 (2026-10-08): issue-start of #1008 while #978's loop was paused
+replaced the campaign's one per-issue approval (BacklogApprovalBinding.issue_approval), so
+#978's next child registration was refused ("direct child campaign approval differs from its
+operation"); the loops' pause and end states overwrote the one campaign status; and the
+final skip of #978 re-raised the step error and failed the campaign. Issue-start now refuses
+while another loop of the campaign is open (operator decision 2026-10-08: one open loop per
+campaign), and a skip after a failed loop step completes the loop."""
+
+from __future__ import annotations
+
+import asyncio
+import shutil
+import uuid
+from datetime import timedelta
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from sqlalchemy import select
+from temporalio import activity, workflow
+from temporalio.client import WorkflowFailureError
+from temporalio.exceptions import ApplicationError
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Replayer, Worker
+from test_controlled_operations import CAMPAIGN_ID, _idempotency_fixture, _solve_issue
+from test_issue_operation_approval import _approved_direct_request
+from test_workflow_replay import (
+    _LOOP_WORKFLOWS,
+    _full_delivery_loop_script,
+    _registered_child,
+    _scheduled_steps,
+)
+
+from engineering_control.api.schemas import (
+    BacklogApprovalCandidateRequest,
+    ExistingBacklogLoopStart,
+)
+from engineering_control.db.models import (
+    BacklogIssueRecord,
+    GitHubBacklogCampaign,
+    OperationRequest,
+    Run,
+)
+from engineering_control.operations.issue_start import issue_workflow_id
+from engineering_control.workflows.definitions import ExistingGitHubBacklogLoopWorkflow
+from engineering_control.workflows.inputs import ExistingGitHubBacklogLoopInput
+from engineering_control.workflows.worker_registry import CONTROL_TASK_QUEUE, GITHUB_TASK_QUEUE
+
+
+async def _sibling_request(operations: Any, request: ExistingBacklogLoopStart) -> Any:
+    """Issue #43 of the same campaign, with its own claimed issue-start operation."""
+    with operations.sessions.begin() as session:
+        original = session.scalar(
+            select(BacklogIssueRecord).where(BacklogIssueRecord.issue_number == 42)
+        )
+        session.add(
+            BacklogIssueRecord(
+                **{
+                    column.name: getattr(original, column.name)
+                    for column in BacklogIssueRecord.__table__.columns
+                    if column.name
+                    not in {"id", "issue_number", "issue_url_reference", "finding_id"}
+                },
+                id=uuid4(),
+                issue_number=43,
+                issue_url_reference="https://github.com/gntik-ai/falcone/issues/43",
+            )
+        )
+    created = await operations.create_external(
+        _solve_issue().model_copy(update={"issue_number": 43}),
+        source_channel="cli",
+        operator_class="engineering-ctl:hermes",
+        idempotency_key=_idempotency_fixture("direct", 53),
+    )
+    assert await operations.claim(created.operation_id) is not None
+    return ExistingBacklogLoopStart(
+        **{
+            **request.model_dump(),
+            "target_issue_number": 43,
+            "issue_operation_id": created.operation_id,
+            "issue_approval_binding": created.binding_hash,
+        }
+    )
+
+
+async def _prepare(metadata: Any, request: ExistingBacklogLoopStart) -> dict[str, Any]:
+    return await metadata.prepare_backlog_approval(
+        CAMPAIGN_ID,
+        BacklogApprovalCandidateRequest(
+            project="falcone",
+            delivery_mode=request.delivery_mode,
+            maximum_risk=request.maximum_risk,
+            maximum_items=1,
+        ),
+        issue_request=request,
+    )
+
+
+def _approval(operations: Any) -> tuple[str, str]:
+    with operations.sessions() as session:
+        campaign = session.get(GitHubBacklogCampaign, CAMPAIGN_ID)
+        return campaign.approval_binding, campaign.status
+
+
+def _operation(operations: Any, operation_id: UUID, **values: Any) -> None:
+    with operations.sessions.begin() as session:
+        operation = session.get(OperationRequest, operation_id)
+        for name, value in values.items():
+            setattr(operation, name, value)
+
+
+def _loop_run(operations: Any, workflow_id: str, status: str) -> None:
+    with operations.sessions.begin() as session:
+        run = session.scalar(select(Run).where(Run.workflow_id == workflow_id))
+        if run is None:
+            session.add(
+                Run(
+                    workflow_id=workflow_id,
+                    run_type="existing-backlog-loop",
+                    status=status,
+                    project="falcone",
+                )
+            )
+        else:
+            run.status = status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["PAUSED", "RUNNING", "BLOCKED"])
+async def test_issue_start_refuses_while_a_sibling_loop_is_open(tmp_path, state: str) -> None:
+    operations, metadata, _handler, request = await _approved_direct_request(tmp_path)
+    loop = issue_workflow_id(request)
+    _operation(operations, request.issue_operation_id, status="STARTED", workflow_id=loop)
+    _loop_run(operations, loop, state)
+    sibling = await _sibling_request(operations, request)
+    before = _approval(operations)
+
+    with pytest.raises(ValueError, match="ISSUE_START_CAMPAIGN_IN_USE") as refused:
+        await _prepare(metadata, sibling)
+
+    assert loop in str(refused.value)
+    # The open loop keeps the campaign approval it runs under.
+    assert _approval(operations) == before
+    # Once that loop has ended (skipped, cancelled or delivered), the next issue starts.
+    _loop_run(operations, loop, "COMPLETE")
+    assert (await _prepare(metadata, sibling))["status"] == "AWAITING_APPROVAL"
+
+
+@pytest.mark.asyncio
+async def test_issue_start_refuses_while_the_approved_operation_is_handing_off(
+    tmp_path,
+) -> None:
+    operations, metadata, _handler, request = await _approved_direct_request(tmp_path)
+    sibling = await _sibling_request(operations, request)
+    before = _approval(operations)
+
+    # The approved operation is still dispatching, or started without a registered loop Run.
+    for values in (
+        {"status": "DISPATCHING"},
+        {"status": "STARTED", "workflow_id": issue_workflow_id(request)},
+    ):
+        _operation(operations, request.issue_operation_id, **values)
+        with pytest.raises(ValueError, match="ISSUE_START_CAMPAIGN_IN_USE"):
+            await _prepare(metadata, sibling)
+        assert _approval(operations) == before
+
+    # A blocked or completed operation no longer holds the campaign.
+    _operation(operations, request.issue_operation_id, status="BLOCKED")
+    assert (await _prepare(metadata, sibling))["status"] == "AWAITING_APPROVAL"
+
+
+@pytest.mark.asyncio
+async def test_the_loops_own_operation_never_counts_as_a_sibling(tmp_path) -> None:
+    # issue-reapprove of a paused loop re-runs the same prepare for that loop's operation.
+    operations, metadata, _handler, request = await _approved_direct_request(tmp_path)
+    loop = issue_workflow_id(request)
+    _operation(operations, request.issue_operation_id, status="STARTED", workflow_id=loop)
+    _loop_run(operations, loop, "PAUSED")
+
+    assert (await _prepare(metadata, request))["status"] == "AWAITING_APPROVAL"
+
+
+_TEMPORAL_CLI = shutil.which("temporal")
+_ISSUE_REF = "gntik-ai/musematic#1026"
+
+
+@activity.defn(name="execute_control_step")
+async def _failed_registration(request: dict[str, Any]) -> dict[str, Any]:
+    step = request["step"]
+    if step == "backlog.register_child_run":
+        raise ApplicationError(
+            "direct child campaign approval differs from its operation",
+            type="ValueError",
+            non_retryable=True,
+        )
+    if step == "github.refresh_mirrors":
+        return {"status": "PASS"}
+    script = _full_delivery_loop_script()
+    script["backlog.record_skip"] = {
+        "status": "SKIPPED",
+        "repository": "gntik-ai/musematic",
+        "issue_number": 1026,
+        "reason_code": "BLOCKED_BY_DEPENDENCY",
+    }
+    return _registered_child(step, request, script[step])
+
+
+async def _skip_failed_step(workflows: list[type]) -> tuple[Any, Any]:
+    async with await WorkflowEnvironment.start_local(dev_server_existing_path=_TEMPORAL_CLI) as env:
+        async with (
+            Worker(
+                env.client,
+                task_queue=CONTROL_TASK_QUEUE,
+                workflows=workflows,
+                activities=[_failed_registration],
+            ),
+            Worker(
+                env.client,
+                task_queue=GITHUB_TASK_QUEUE,
+                workflows=workflows,
+                activities=[_failed_registration],
+            ),
+        ):
+            handle = await env.client.start_workflow(
+                ExistingGitHubBacklogLoopWorkflow.run,
+                ExistingGitHubBacklogLoopInput(
+                    project="musematic",
+                    backlog_campaign_id="camp-1",
+                    maximum_risk="R2",
+                    delivery_mode="full-delivery",
+                    continue_after_blocked_issue=False,
+                ),
+                id=f"replay-test-new162-{uuid.uuid4()}",
+                task_queue=CONTROL_TASK_QUEUE,
+                execution_timeout=timedelta(minutes=2),
+            )
+            for _ in range(200):
+                state = await handle.query("status")
+                if str(state.get("phase", "")).startswith("AWAITING_OPERATOR"):
+                    break
+                await asyncio.sleep(0.1)
+            await handle.signal("skip", f"{_ISSUE_REF}|BLOCKED_BY_DEPENDENCY")
+            try:
+                result = await handle.result()
+            except WorkflowFailureError:
+                result = None
+            history = await handle.fetch_history()
+    return history, result
+
+
+def _loop_states(history: Any) -> list[tuple[str, str | None]]:
+    return [
+        (request["payload"]["loop_status"], request["payload"].get("blocker"))
+        for request in _scheduled_steps(history)
+        if request["step"] == "backlog.record_loop_state"
+    ]
+
+
+@pytest.mark.skipif(_TEMPORAL_CLI is None, reason="Temporal CLI dev server unavailable")
+async def test_skipping_a_failed_loop_step_completes_the_loop_and_replays() -> None:
+    history, result = await _skip_failed_step(_LOOP_WORKFLOWS)
+
+    assert result is not None and result["status"] == "COMPLETE"
+    assert result["completion"] == "COMPLETE_NOTHING_DELIVERED"
+    assert _loop_states(history) == [
+        ("PAUSED", "LOOP_STEP_FAILED_BACKLOG_REGISTER_CHILD_RUN"),
+        ("COMPLETE", None),
+    ]
+    steps = [request["step"] for request in _scheduled_steps(history)]
+    assert steps.count("backlog.record_skip") == 1
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)
+
+
+@workflow.defn(name="ExistingGitHubBacklogLoopWorkflow", sandboxed=False)
+class _PreNew162LoopWorkflow(ExistingGitHubBacklogLoopWorkflow):
+    """The loop exactly as it ran before NEW-162 (production #978's shape)."""
+
+    @workflow.run
+    async def run(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
+        return await super().run(request)
+
+    def _loop_step_skip_closes_patched(self) -> bool:
+        return False
+
+
+@pytest.mark.skipif(_TEMPORAL_CLI is None, reason="Temporal CLI dev server unavailable")
+async def test_a_pre_patch_failed_skip_history_replays_on_the_current_loop() -> None:
+    workflows = [_PreNew162LoopWorkflow, *_LOOP_WORKFLOWS[1:]]
+    history, result = await _skip_failed_step(workflows)
+
+    # Before NEW-162 the skip re-raised the step error: the loop (and campaign) FAILED.
+    assert result is None
+    assert _loop_states(history) == [
+        ("PAUSED", "LOOP_STEP_FAILED_BACKLOG_REGISTER_CHILD_RUN"),
+        ("FAILED", None),
+    ]
+    await Replayer(workflows=_LOOP_WORKFLOWS).replay_workflow(history)

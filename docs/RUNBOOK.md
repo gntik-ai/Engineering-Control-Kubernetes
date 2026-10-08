@@ -109,6 +109,41 @@ role entry in `worker_registry.py`, a new systemd unit or template instance, a n
 home, and a fresh `claude`/`codex` OAuth login for that identity (see below). Treat as a real
 code + ops change, not a config-only one.
 
+## Onboarding a project: canonical mirrors on BOTH hosts (NEW-162)
+
+A project's repositories need a canonical bare mirror on the controller **and** on the worker.
+A missing or unreadable mirror on either host fails every revalidation with "canonical mirror
+does not exist" (the GitHub worker's `github.refresh_mirrors` fetches the controller mirror and
+pushes it to the worker copy, which scan-runner then reads).
+
+**Controller** (`hermes-control`): `/srv/engineering/mirrors/<slug>.git`, owner `hermes`, group
+`engineering-control`, group `rwx` with setgid directories (2770 style), other none. Create it
+as `hermes`, then hand the group over:
+
+```bash
+git clone --mirror https://github.com/gntik-ai/<slug>.git /srv/engineering/mirrors/<slug>.git
+sudo chgrp -R engineering-control /srv/engineering/mirrors/<slug>.git
+sudo chmod -R g+rwX,o-rwx /srv/engineering/mirrors/<slug>.git
+sudo find /srv/engineering/mirrors/<slug>.git -type d -exec chmod g+s {} +
+```
+
+**Worker** (`hermes-worker`): `/srv/engineering/mirrors/<slug>.git`, owner
+`scan-runner:scan-runner`, ACL `user:scan-runner:rwx`, `user:hermes:rwx`,
+`user:delivery-runner:r-x`, `user:claude-runner:r-x`, `user:codex-runner:r-x`, `group::---`,
+`other::---`; every directory carries the same default ACL plus `release-runner` `r-x`. The
+root `/srv/engineering/mirrors` stays `scan-runner:scan-runner 0700` with a named-user `--x`
+ACL for `hermes`, `release-runner`, `delivery-runner`, `claude-runner` and `codex-runner`;
+`bootstrap-worker.sh` creates it with those ACLs (re-applied on every run), and
+`bootstrap-mirrors.sh` refuses when `hermes` cannot traverse it, so run the worker bootstrap
+first. Add
+the slug to `repositories=(...)` in `scripts/bootstrap-mirrors.sh` (and the worktree list in
+`scripts/bootstrap-worker.sh`; `tests/test_project_registry.py` pins both to the registry),
+deploy, then run `sudo /opt/engineering-control/source/scripts/bootstrap-mirrors.sh` on the
+worker: it creates only missing mirrors with exactly that layout (cloned and fsck'd as `hermes`
+in a staging directory, then handed to `scan-runner`) and verifies existing ones with
+`git -c safe.directory=<path>`. It never re-owns or re-modes an existing mirror or the mirror
+root (an earlier version re-owned the root to `hermes` and cut `scan-runner` off).
+
 ## Worker Build ID + Deployments versioning (F-11 (a))
 
 `Settings.build_id` (env `ENGINEERING_BUILD_ID`) is wired into both `Worker(...)` constructions

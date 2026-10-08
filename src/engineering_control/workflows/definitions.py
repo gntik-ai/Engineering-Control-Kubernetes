@@ -110,6 +110,10 @@ class ControlledWorkflow:
         self._loop_issue: str | None = None
         # NEW-127: whether this backlog loop registered its own Run (state only).
         self._loop_register_run = False
+        # NEW-162: the backlog loop's results and delivered count (state only), so a skip
+        # that ends the loop from a failed bookkeeping step completes it truthfully.
+        self._loop_results: list[dict[str, Any]] = []
+        self._loop_delivered = 0
 
     @workflow.signal(name="pause")
     async def pause(self) -> None:
@@ -3396,6 +3400,14 @@ def _loop_outcomes(results: list[dict[str, Any]]) -> list[str]:
     return outcomes[-20:]
 
 
+class _LoopIssueSkipped(Exception):  # noqa: N818 - control flow, not an error
+    """NEW-162: the operator skipped the issue a failed loop step paused on."""
+
+    def __init__(self, skipped: dict[str, Any]) -> None:
+        super().__init__("backlog issue skipped after a failed loop step")
+        self.skipped = skipped
+
+
 @workflow.defn(name="ExistingGitHubBacklogLoopWorkflow")
 class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
     """Durably control imported issues; fail closed until current reproduction is proven."""
@@ -3466,6 +3478,10 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 global_child_blocker_return=global_child_blocker_return,
                 register_run=register_run,
             )
+        except _LoopIssueSkipped as skipped:
+            # NEW-162: a skip always closes its own loop (it used to re-raise the step's
+            # error, failing the loop and the whole campaign).
+            return await self._complete_after_skip(request, skipped.skipped, register_run)
         except Exception:
             # Without this, an uncaught exception (e.g. a non-retryable
             # ApplicationError from an activity or child workflow) leaves the
@@ -3510,6 +3526,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         if not isinstance(raw_items, list):
             raise TypeError("existing backlog selection must be a list")
         results: list[dict[str, Any]] = []
+        self._loop_results = results
         # NEW-114: issues actually delivered; a loop ending with none says so.
         delivered = 0
         # raw_items may grow while iterating: an issue that frees its slot (REJECTED,
@@ -3969,6 +3986,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             if request.delivery_mode == "source-pr":
                 if sequential_source_pr:
                     delivered += 1
+                    self._loop_delivered = delivered
                     boundary = await self._after_issue_boundary(
                         request,
                         results,
@@ -4010,6 +4028,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                         return {"status": "BLOCKED", "blocker": staged_blocker, "results": results}
                     if staged == "DONE":
                         delivered += 1
+                        self._loop_delivered = delivered
                     elif staged == "SKIPPED" and self._free_slots_patched(ordinal):
                         # NEW-114 review: an operator skip of the GitOps stage frees the
                         # issue's slot like any other skip.
@@ -4090,6 +4109,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 )
                 return {"status": "BLOCKED", "blocker": blocker, "results": results}
             delivered += 1
+            self._loop_delivered = delivered
             boundary = await self._after_issue_boundary(
                 request,
                 results,
@@ -4673,15 +4693,46 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
                 if register_run:
                     paused["workflow_id"] = workflow.info().workflow_id
                 await self._step("backlog.record_loop_state", paused)
-                outcome, _ = await self._await_delivery_operator(
+                outcome, skipped = await self._await_delivery_operator(
                     request, item, blocker, register_run=register_run
                 )
+                if outcome == "SKIPPED" and self._loop_step_skip_closes_patched():
+                    raise _LoopIssueSkipped(skipped) from error
                 if outcome != "RETRY":
                     raise error
                 resumed = {**_backlog_execution_payload(request), "loop_status": "RUNNING"}
                 if register_run:
                     resumed["workflow_id"] = workflow.info().workflow_id
                 await self._step("backlog.record_loop_state", resumed)
+
+    def _loop_step_skip_closes_patched(self) -> bool:
+        # NEW-162: evaluated only when the skip arrives, so a loop paused on a failed step
+        # before this change also closes cleanly when it is skipped after the deploy.
+        return workflow.patched("existing-backlog-loop-step-skip-closes-v1")
+
+    async def _complete_after_skip(
+        self,
+        request: ExistingGitHubBacklogLoopInput,
+        skipped: dict[str, Any],
+        register_run: bool,
+    ) -> dict[str, Any]:
+        """NEW-162: end the loop after the operator skipped the issue a failed loop step
+        paused on; the skip is already recorded. Completes like the loop's own end (the
+        remaining selected issues, if any, are left for a new start)."""
+        results = [*self._loop_results, skipped]
+        state: dict[str, Any] = {**_backlog_execution_payload(request), "loop_status": "COMPLETE"}
+        if register_run:
+            state["workflow_id"] = workflow.info().workflow_id
+        nothing_delivered = self._loop_delivered == 0 and request.global_campaign_id is None
+        if nothing_delivered:
+            self._phase = "COMPLETE_NOTHING_DELIVERED"
+            state["completion"] = "COMPLETE_NOTHING_DELIVERED"
+            state["outcomes"] = _loop_outcomes(results)
+        await self._step("backlog.record_loop_state", state)
+        outcome: dict[str, Any] = {"status": "COMPLETE", "results": results}
+        if nothing_delivered:
+            outcome.update(completion="COMPLETE_NOTHING_DELIVERED", delivered=0)
+        return outcome
 
     async def _await_delivery_operator(
         self,

@@ -23,7 +23,9 @@ sudo ./scripts/verify-worker.sh
 ```
 
 The mirror bootstrap verifies exact origins and bare-repository structure, stages new clones
-outside the canonical path, and never replaces an existing mirror. GitHub authentication comes
+outside the canonical path, and never replaces, re-owns or re-modes an existing mirror or the
+mirror root; new mirrors get the scan-runner ACL layout described in `docs/RUNBOOK.md`
+("Onboarding a project"). GitHub authentication comes
 only from the installed `gh` credential store of the exact `hermes` broker identity. Engineering
 Control never calls `gh auth token`, copies that store, or places a GitHub token in configuration,
 environment variables, arguments, logs, evidence, or workflow state.
