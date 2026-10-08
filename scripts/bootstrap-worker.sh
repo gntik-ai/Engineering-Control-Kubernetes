@@ -38,47 +38,70 @@ PNPM_PINNED_VERSION=11.28.3
 PNPM_PINNED_SHA256=b0c9673be13d4b914b8045a56986418c55c446bb8d113b65ec65bf7cb7bec35f
 PNPM_PINNED_URL=https://github.com/pnpm/pnpm/releases/download/v${PNPM_PINNED_VERSION}/pnpm-linux-x64.tar.gz
 
-# install_pinned_toolchain NAME URL SHA256 COMPRESSION STRIP CHECK_RELATIVE EXPECTED_VERSION
-# Idempotent: a complete install whose marker and --version match is left untouched.
+# toolchain_release_ok RELEASE SHA256 CHECK_RELATIVE EXPECTED_VERSION
+toolchain_release_ok() {
+  local release=$1 sha256=$2 check=$3 expected=$4
+  [[ -d ${release} && ! -L ${release} && -f ${release}/.engineering-toolchain ]] &&
+    [[ $(<"${release}/.engineering-toolchain") == "${sha256}" ]] &&
+    [[ $(cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+      "${release}/${check}" --version 2>/dev/null) == "${expected}" ]]
+}
+
+# install_pinned_toolchain LINK URL SHA256 COMPRESSION STRIP CHECK_RELATIVE EXPECTED_VERSION
+# Each verified download is an immutable release directory LINK.<sha256 prefix>; LINK is
+# a symlink (the path Settings uses) switched by an atomic rename. A previous release is
+# never removed, so an interrupted run leaves the published toolchain untouched, and the
+# EXIT trap only ever removes this run's staging directory. Idempotent.
 install_pinned_toolchain() {
   local name=$1 url=$2 sha256=$3 compression=$4 strip=$5 check=$6 expected=$7
-  local target="${TOOLCHAIN_ROOT}/${name}"
-  local marker="${target}/.engineering-toolchain"
-  local staging previous
-  if [[ -f ${marker} && ! -L ${target} && $(<"${marker}") == "${sha256}" ]] && \
-    [[ $(cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
-      "${target}/${check}" --version 2>/dev/null) == "${expected}" ]]; then
+  local link="${TOOLCHAIN_ROOT}/${name}"
+  local release_name="${name}.${sha256:0:16}"
+  local release="${TOOLCHAIN_ROOT}/${release_name}"
+  local staging
+  if [[ -e ${link} && ! -L ${link} ]]; then
+    echo "${link} exists and is not a symlink; refusing to replace it" >&2
+    exit 1
+  fi
+  if ! toolchain_release_ok "${release}" "${sha256}" "${check}" "${expected}"; then
+    if [[ -e ${release} || -L ${release} ]]; then
+      if [[ $(readlink -- "${link}" 2>/dev/null) == "${release_name}" ]]; then
+        echo "${link} points at an unverifiable release ${release}" >&2
+        exit 1
+      fi
+      rm -rf -- "${release}"  # an unpublished, incomplete release from an earlier run
+    fi
+    staging=$(mktemp -d "${TOOLCHAIN_ROOT}/.${name}.staging.XXXXXX")
+    # shellcheck disable=SC2064 # expand now: the trap removes only this staging directory
+    trap "rm -rf -- '${staging}'" EXIT
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --max-time 900 --output "${staging}/download" "${url}"
+    printf '%s  %s\n' "${sha256}" "${staging}/download" | sha256sum --check --quiet -
+    install -d -m 0755 "${staging}/root"
+    tar "-x${compression}f" "${staging}/download" -C "${staging}/root" \
+      --strip-components="${strip}" --no-same-owner --no-same-permissions
+    rm -f -- "${staging}/download"
+    printf '%s\n' "${sha256}" >"${staging}/root/.engineering-toolchain"
+    chown -R root:root "${staging}/root"
+    chmod -R u+rwX,go+rX,go-w "${staging}/root"
+    chmod 0755 "${staging}/root"
+    toolchain_release_ok "${staging}/root" "${sha256}" "${check}" "${expected}" || {
+      echo "${name}: downloaded toolchain does not report ${expected}" >&2
+      exit 1
+    }
+    # Same filesystem: the complete release appears under its final name atomically.
+    mv -T -- "${staging}/root" "${release}"
+    rm -rf -- "${staging}"
+    trap - EXIT
+  fi
+  if [[ $(readlink -- "${link}" 2>/dev/null) == "${release_name}" ]]; then
     echo "${name}: ${expected} already installed"
     return 0
   fi
-  staging=$(mktemp -d "${TOOLCHAIN_ROOT}/.${name}.XXXXXX")
-  # shellcheck disable=SC2064 # expand now: the trap must remove this staging directory
-  trap "rm -rf -- '${staging}'" EXIT
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --max-time 900 --output "${staging}/download" "${url}"
-  printf '%s  %s\n' "${sha256}" "${staging}/download" | sha256sum --check --quiet -
-  install -d -m 0755 "${staging}/root"
-  tar "-x${compression}f" "${staging}/download" -C "${staging}/root" \
-    --strip-components="${strip}" --no-same-owner --no-same-permissions
-  rm -f -- "${staging}/download"
+  ln -sfn -- "${release_name}" "${TOOLCHAIN_ROOT}/.${name}.link.new"
+  mv -Tf -- "${TOOLCHAIN_ROOT}/.${name}.link.new" "${link}"
   [[ $(cd / && env -i PATH=/usr/bin:/bin HOME=/nonexistent \
-    "${staging}/root/${check}" --version) == "${expected}" ]] || {
-    echo "${name}: downloaded toolchain does not report ${expected}" >&2
-    exit 1
-  }
-  printf '%s\n' "${sha256}" >"${staging}/root/.engineering-toolchain"
-  chown -R root:root "${staging}/root"
-  chmod -R u+rwX,go+rX,go-w "${staging}/root"
-  chmod 0755 "${staging}/root"
-  previous=""
-  if [[ -e ${target} || -L ${target} ]]; then
-    previous="${staging}/previous"
-    mv -T -- "${target}" "${previous}"
-  fi
-  mv -T -- "${staging}/root" "${target}"
-  rm -rf -- "${staging}"
-  trap - EXIT
-  echo "${name}: installed ${expected}"
+    "${link}/${check}" --version) == "${expected}" ]]
+  echo "${name}: installed ${expected} (${release_name}; earlier releases are kept)"
 }
 
 install_node_toolchains() {

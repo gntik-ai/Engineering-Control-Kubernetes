@@ -23,7 +23,7 @@ from test_delivery_toolchain import (
     _payload,
     _source_repo,
 )
-from test_maker_test_baseline import MYPY
+from test_maker_test_baseline import MYPY, _baseline_root
 from test_maker_test_baseline import _setup as _baseline_setup
 from test_provider_activity import FakeAdapter, FakeInstructionPack, request_for
 
@@ -290,7 +290,10 @@ class RecordingAdapter(FakeAdapter):
 
 
 async def _provider_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings_overrides: dict[str, Any]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings_overrides: dict[str, Any],
+    extra_payload: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], RecordingAdapter]:
     monkeypatch.setattr(
         "engineering_control.activities.provider.activity.heartbeat", lambda _: None
@@ -307,45 +310,87 @@ async def _provider_result(
     )
     result = await handler.handle(
         "delivery.invoke_maker",
-        {"maker_request": request_for(worktree).model_dump(mode="json")},
+        {"maker_request": request_for(worktree).model_dump(mode="json"), **(extra_payload or {})},
     )
     return result, adapter
+
+
+def _prepared(selection: object) -> dict[str, Any]:
+    return {"toolchain_preparation": {"status": "TOOLCHAIN_READY", "node_toolchain": selection}}
 
 
 async def test_provider_default_project_calls_the_adapter_exactly_as_before(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result, adapter = await _provider_result(
-        tmp_path, monkeypatch, {"project_config_root": PROJECTS}
+        tmp_path, monkeypatch, {}, {"toolchain_preparation": {"status": "TOOLCHAIN_READY"}}
     )
     assert result["status"] == "SUCCESS"
     assert adapter.toolchains == ["NOT_PASSED"]
 
 
-async def test_provider_passes_the_selected_node_to_the_sandbox(
+async def test_provider_never_reads_the_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Review 1: the provider worker may be unable to read projects.d; only the payload
+    # selection (from delivery.prepare_toolchain) counts. Absent means the default.
     overrides = {
         **_installs(tmp_path),
         "project_config_root": _manifests(tmp_path, "falcone", {"node": "24"}),
     }
     result, adapter = await _provider_result(tmp_path, monkeypatch, overrides)
     assert result["status"] == "SUCCESS"
-    [sandbox] = adapter.toolchains
-    assert isinstance(sandbox, SandboxToolchain)
-    assert sandbox.path_prefix == (str(tmp_path / "toolchain" / "node-24" / "bin"),)
+    assert adapter.toolchains == ["NOT_PASSED"]
+    unreadable = {"project_config_root": tmp_path / "unreadable"}
+    (tmp_path / "unreadable").mkdir(mode=0o000)
+    try:
+        result, adapter = await _provider_result(
+            tmp_path / "second", monkeypatch, unreadable, _prepared({"node": "24", "pnpm": None})
+        )
+    finally:
+        (tmp_path / "unreadable").chmod(0o700)
+    assert result["status"] == "BLOCKED"  # nothing installed under the default /opt path
+    assert result["blocker"] == TOOLCHAIN_NODE_UNAVAILABLE
 
 
-async def test_provider_fails_closed_when_the_selected_node_is_missing(
+async def test_provider_passes_the_payload_selection_to_the_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    overrides = {
-        **_installs(tmp_path, node=False),
-        "project_config_root": _manifests(tmp_path, "falcone", {"node": "24"}),
-    }
-    result, adapter = await _provider_result(tmp_path, monkeypatch, overrides)
+    result, adapter = await _provider_result(
+        tmp_path, monkeypatch, _installs(tmp_path), _prepared({"node": "24", "pnpm": "11.28.3"})
+    )
+    assert result["status"] == "SUCCESS"
+    [sandbox] = adapter.toolchains
+    assert isinstance(sandbox, SandboxToolchain)
+    assert sandbox.path_prefix == (
+        str(tmp_path / "toolchain" / "pnpm-11.28.3"),
+        str(tmp_path / "toolchain" / "node-24" / "bin"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("installs", "selection", "blocker"),
+    [
+        ({"node": False}, {"node": "24", "pnpm": None}, TOOLCHAIN_NODE_UNAVAILABLE),
+        ({"pnpm": False}, {"node": "24", "pnpm": "11.28.3"}, TOOLCHAIN_PNPM_UNAVAILABLE),
+        ({}, {"node": "20", "pnpm": None}, "TOOLCHAIN_CONTRACT_INVALID"),
+        ({}, {"node": "24", "pnpm": "latest"}, "TOOLCHAIN_CONTRACT_INVALID"),
+        ({}, {"node": "24", "path": "/tmp/x"}, "TOOLCHAIN_CONTRACT_INVALID"),  # noqa: S108
+        ({}, "24", "TOOLCHAIN_CONTRACT_INVALID"),
+    ],
+)
+async def test_provider_fails_closed_on_an_unusable_payload_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    installs: dict[str, bool],
+    selection: object,
+    blocker: str,
+) -> None:
+    result, adapter = await _provider_result(
+        tmp_path, monkeypatch, _installs(tmp_path, **installs), _prepared(selection)
+    )
     assert result["status"] == "BLOCKED"
-    assert result["blocker"] == TOOLCHAIN_NODE_UNAVAILABLE
+    assert result["blocker"] == blocker
     assert adapter.toolchains == []
 
 
@@ -382,6 +427,24 @@ def test_node_24_prepare_prepends_the_selection(tmp_path: Path) -> None:
         "PATH": f"{toolchain / 'pnpm-11.28.3'}:{toolchain / 'node-24' / 'bin'}:{_DEFAULT_PATH}",
     }
     assert runner.calls and all(call["environment"] == expected for call in runner.calls)
+
+
+def test_skipped_toolchain_still_carries_a_non_default_selection(tmp_path: Path) -> None:
+    repo = _source_repo(tmp_path / "worktrees")
+    runner = FakeToolchainRunner()
+    root = _manifests(tmp_path, "musematic", {"enabled": False, "node": "24"})
+    handler = _handler(tmp_path, runner, project_config_root=root, **_installs(tmp_path))
+    result = handler._prepare_toolchain(_payload(repo))
+    assert result["status"] == "TOOLCHAIN_SKIPPED"
+    assert result["toolchain_preparation"] == {
+        "status": "TOOLCHAIN_SKIPPED",
+        "node_toolchain": {"node": "24", "pnpm": None},
+    }
+    assert runner.calls == []
+    default = _handler(tmp_path, runner, project_config_root=PROJECTS)._prepare_toolchain(
+        {**_payload(repo), "project": "llmwiki"}
+    )
+    assert default["toolchain_preparation"] == {"status": "TOOLCHAIN_SKIPPED"}
 
 
 def test_node_24_prepare_uses_an_allowlist_with_the_pinned_pnpm(tmp_path: Path) -> None:
@@ -478,6 +541,46 @@ def test_node_24_baseline_prepends_the_selection(tmp_path: Path) -> None:
     assert prepare.calls  # the baseline checkout was prepared with the same selection
 
 
+def test_default_baseline_cache_identity_is_unchanged() -> None:
+    default = resolve_node_toolchain(Settings(), None)
+    argv = ["timeout", "900", "pytest"]
+    assert ScanActivityHandler._baseline_key("apps", argv, default) == (
+        '{"argv": ["timeout", "900", "pytest"], "cwd": "apps"}'
+    )
+    assert ScanActivityHandler._baseline_key("apps", argv) == (
+        ScanActivityHandler._baseline_key("apps", argv, default)
+    )
+    assert ScanActivityHandler._baseline_prepared_marker("a" * 40, default) == "a" * 40 + "\n"
+
+
+def test_changing_the_selection_at_the_same_base_misses_the_cache(tmp_path: Path) -> None:
+    handler, _, prepare, baseline, payload = _baseline_setup(tmp_path, {tuple(MYPY): 1})
+    default_settings = handler.settings
+    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(baseline.calls) == 1
+    prepared_default = len(prepare.calls)
+
+    handler.settings = default_settings.model_copy(
+        update={
+            "project_config_root": _manifests(tmp_path, "musematic", {"node": "24"}),
+            **_installs(tmp_path),
+        }
+    )
+    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(baseline.calls) == 2  # not served from the node 22 result
+    assert len(prepare.calls) == 2 * prepared_default  # the checkout was re-prepared
+    node_bin = str(tmp_path / "toolchain" / "node-24" / "bin")
+    assert baseline.calls[1]["environment"]["PATH"].startswith(node_bin + ":")
+    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(baseline.calls) == 2  # the node 24 result is cached under its own key
+
+    handler.settings = default_settings
+    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    assert len(baseline.calls) == 2  # the default result is still cached
+    marker = _baseline_root(tmp_path, payload) / "prepared"
+    assert marker.read_text().startswith(payload["source_base_sha"] + " ")
+
+
 def test_baseline_fails_closed_before_any_checkout(tmp_path: Path) -> None:
     handler, _, prepare, baseline, payload = _baseline_setup(tmp_path, {tuple(MYPY): 1})
     handler.settings = handler.settings.model_copy(
@@ -545,6 +648,12 @@ def test_bootstrap_toolchain_section_is_opt_in_and_never_replaces_node_22() -> N
     assert "/usr/local/bin" not in section
     assert "sha256sum --check" in section and "--proto '=https'" in section
     assert "chown -R root:root" in section and "go-w" in section
+    # Review 1: immutable releases, atomic symlink publication, staging-only trap.
+    assert 'local release_name="${name}.${sha256:0:16}"' in section
+    assert 'mv -Tf -- "${TOOLCHAIN_ROOT}/.${name}.link.new" "${link}"' in section
+    assert "trap \"rm -rf -- '${staging}'\" EXIT" in section
+    assert section.count("rm -rf --") == 3  # staging (trap + success), unpublished release
+    assert "previous" not in section.replace("A previous release", "")
     # The Node 22 contract for the full bootstrap is unchanged.
     assert '[[ $("${NODE_BIN}" --version) == v22.* ]]' in bootstrap
 
@@ -557,4 +666,5 @@ def test_verify_checks_the_toolchain_only_when_installed_or_required() -> None:
     )
     assert "SKIP node toolchain" in verify
     assert "755:root:root" in verify
+    assert "[[ -L ${link} ]]" in verify
     assert "for identity in codex-runner claude-runner scan-runner; do" in verify

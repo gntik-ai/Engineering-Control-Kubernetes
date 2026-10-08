@@ -2335,17 +2335,23 @@ class ScanActivityHandler(UiPlanScanSteps):
             )
         except (OSError, ValueError) as error:
             return self._toolchain_blocked(payload, "TOOLCHAIN_CONTRACT_INVALID", str(error), [])
+        try:
+            toolchain = resolve_node_toolchain(self.settings, policy)
+        except ToolchainUnavailableError as error:
+            return self._toolchain_blocked(payload, error.blocker, str(error), [])
+        # NEW-159 review 1: a non-default selection travels in toolchain_preparation to
+        # the maker/checker invocations (the provider worker never reads the manifest).
+        selection = toolchain.selection()
         if policy is None or not policy.enabled:
             return {
                 **payload,
                 "status": "TOOLCHAIN_SKIPPED",
                 "blocker": None,
-                "toolchain_preparation": {"status": "TOOLCHAIN_SKIPPED"},
+                "toolchain_preparation": {
+                    "status": "TOOLCHAIN_SKIPPED",
+                    **({"node_toolchain": selection} if selection is not None else {}),
+                },
             }
-        try:
-            toolchain = resolve_node_toolchain(self.settings, policy)
-        except ToolchainUnavailableError as error:
-            return self._toolchain_blocked(payload, error.blocker, str(error), [])
         worktree = self._bounded_worktree(payload["source_worktree"])
         environment = self._node_toolchain_environment(
             self._toolchain_environment(), toolchain, _DEFAULT_PATH
@@ -2425,8 +2431,8 @@ class ScanActivityHandler(UiPlanScanSteps):
             ],
             "test_commands": [item.model_dump() for item in policy.test_commands],
         }
-        if not toolchain.default:
-            preparation["node_toolchain"] = {"node": toolchain.node, "pnpm": toolchain.pnpm}
+        if selection is not None:
+            preparation["node_toolchain"] = selection
         return {
             **payload,
             "status": "TOOLCHAIN_READY",
@@ -2505,8 +2511,21 @@ class ScanActivityHandler(UiPlanScanSteps):
         return evidence, None
 
     @staticmethod
-    def _baseline_key(cwd: str, argv: list[str]) -> str:
-        return json.dumps({"argv": argv, "cwd": cwd}, sort_keys=True)
+    def _baseline_key(cwd: str, argv: list[str], toolchain: NodeToolchain | None = None) -> str:
+        identity: dict[str, Any] = {"argv": argv, "cwd": cwd}
+        selection = toolchain.selection() if toolchain is not None else None
+        if selection is not None:
+            # NEW-159 review 1: a non-default node/pnpm is part of the cache identity; the
+            # default key is unchanged, so existing baseline caches stay valid.
+            identity["node_toolchain"] = selection
+        return json.dumps(identity, sort_keys=True)
+
+    @staticmethod
+    def _baseline_prepared_marker(base_sha: str, toolchain: NodeToolchain | None) -> str:
+        selection = toolchain.selection() if toolchain is not None else None
+        if selection is None:
+            return f"{base_sha}\n"  # byte-identical to the pre-NEW-159 marker
+        return f"{base_sha} {json.dumps(selection, sort_keys=True)}\n"
 
     @staticmethod
     def _cached_baseline_results(path: Path) -> dict[str, dict[str, Any]]:
@@ -2540,12 +2559,12 @@ class ScanActivityHandler(UiPlanScanSteps):
         root = self.settings.toolchain_cache_root / "baselines" / Project(project).value / base_sha
         root.mkdir(parents=True, exist_ok=True, mode=0o750)
         results_path = root / "results.json"
-        keys = [
-            self._baseline_key(command.cwd, render_argv(command.argv, self.settings))
-            for command in commands
-        ]
         # NEW-159: fails closed (ToolchainUnavailableError) before any checkout.
         toolchain = resolve_node_toolchain(self.settings, policy)
+        keys = [
+            self._baseline_key(command.cwd, render_argv(command.argv, self.settings), toolchain)
+            for command in commands
+        ]
         with (root / ".lock").open("a") as lock:
             # Concurrent ChangeSets on the same base wait for one checkout and one run.
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -2584,7 +2603,17 @@ class ScanActivityHandler(UiPlanScanSteps):
         """A detached, toolchain-prepared checkout of base_sha owned by the scan worker."""
         worktree = root / "worktree"
         prepared = root / "prepared"
-        if prepared.is_file() and worktree.is_dir() and not worktree.is_symlink():
+        if toolchain is None:
+            toolchain = resolve_node_toolchain(self.settings, policy)
+        # NEW-159 review 1: the checkout is reused only if it was prepared with the same
+        # node/pnpm selection (the default marker is the pre-NEW-159 "<sha>\n").
+        marker = self._baseline_prepared_marker(base_sha, toolchain)
+        if (
+            prepared.is_file()
+            and prepared.read_text(encoding="utf-8") == marker
+            and worktree.is_dir()
+            and not worktree.is_symlink()
+        ):
             if self._git(worktree, ["rev-parse", "HEAD"]).strip() == base_sha:
                 return worktree
         prepared.unlink(missing_ok=True)
@@ -2593,8 +2622,6 @@ class ScanActivityHandler(UiPlanScanSteps):
         if worktree.exists():
             shutil.rmtree(worktree)  # a partial checkout or prepare from an earlier attempt
         self._clone_detached(repository, base_sha, worktree, cwd=root)
-        if toolchain is None:
-            toolchain = resolve_node_toolchain(self.settings, policy)
         environment = self._node_toolchain_environment(
             self._toolchain_environment(), toolchain, _DEFAULT_PATH
         )
@@ -2618,7 +2645,7 @@ class ScanActivityHandler(UiPlanScanSteps):
                     f"baseline prepare {argv[0]} failed with {result.return_code}: "
                     + (result.stderr.strip() or result.stdout)[-_TOOLCHAIN_STDERR_TAIL:]
                 )
-        prepared.write_text(f"{base_sha}\n", encoding="utf-8")
+        prepared.write_text(marker, encoding="utf-8")
         return worktree
 
     def _baseline_executables(

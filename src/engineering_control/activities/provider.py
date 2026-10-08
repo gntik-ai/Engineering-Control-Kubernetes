@@ -27,7 +27,7 @@ from engineering_control.agents.instructions import AgentInstructionPack, Instru
 from engineering_control.config import Settings
 from engineering_control.engineering.toolchain import (
     ToolchainUnavailableError,
-    project_node_toolchain,
+    payload_node_toolchain,
 )
 from engineering_control.engineering.ui_blueprint import agent_pack_parts_only
 from engineering_control.handoff.store import HandoffStore
@@ -212,17 +212,13 @@ class ProviderActivityHandler:
             },
         }
         try:
-            # NEW-159: the project's selected node/pnpm for the agent's sandbox (None for
-            # the default toolchain); a selection not installed here fails closed. A
-            # manifest this worker cannot read keeps the pre-NEW-159 default sandbox (the
-            # scan worker's delivery.prepare_toolchain fails closed on it instead).
-            sandbox_toolchain = project_node_toolchain(
-                self.settings, request.project.value
-            ).sandbox()
+            # NEW-159: the node/pnpm delivery.prepare_toolchain resolved from the manifest
+            # travels in the payload (this worker never reads projects.d). Absent is the
+            # default sandbox, exactly as before; a selection not installed here fails
+            # closed.
+            sandbox_toolchain = payload_node_toolchain(self.settings, payload).sandbox()
         except ToolchainUnavailableError as error:
             return self._blocked(runtime_payload, error.blocker, detail=str(error))
-        except OSError:
-            sandbox_toolchain = None
         except ValueError as error:
             return self._blocked(
                 runtime_payload,

@@ -154,10 +154,14 @@ PNPM_PINNED_VERSION=11.28.3
 if [[ -e ${TOOLCHAIN_ROOT} || ${ENGINEERING_VERIFY_NODE_TOOLCHAIN:-0} == 1 ]]; then
   # The side-by-side install never replaces the workers' Node.js 22.
   [[ $(/usr/local/bin/node --version) == v22.* ]]
-  for path in "${TOOLCHAIN_ROOT}" "${TOOLCHAIN_ROOT}/node-24" \
-    "${TOOLCHAIN_ROOT}/pnpm-${PNPM_PINNED_VERSION}"; do
-    [[ -d ${path} && ! -L ${path} ]]
-    [[ $(stat -c '%a:%U:%G' "${path}") == 755:root:root ]]
+  [[ -d ${TOOLCHAIN_ROOT} && ! -L ${TOOLCHAIN_ROOT} ]]
+  [[ $(stat -c '%a:%U:%G' "${TOOLCHAIN_ROOT}") == 755:root:root ]]
+  # Each stable path is a symlink to an immutable release directory beside it.
+  for link in "${TOOLCHAIN_ROOT}/node-24" "${TOOLCHAIN_ROOT}/pnpm-${PNPM_PINNED_VERSION}"; do
+    [[ -L ${link} ]]
+    release=$(readlink -f -- "${link}")
+    [[ $(dirname -- "${release}") == "${TOOLCHAIN_ROOT}" && -d ${release} && ! -L ${release} ]]
+    [[ $(stat -c '%a:%U:%G' "${release}") == 755:root:root ]]
   done
   if [[ -n $(find "${TOOLCHAIN_ROOT}" \( ! -user root -o ! -group root \
     -o \( ! -type l -perm /022 \) \) -print -quit) ]]; then

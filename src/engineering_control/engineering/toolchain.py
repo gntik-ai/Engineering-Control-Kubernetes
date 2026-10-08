@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from engineering_control.adapters.process import SandboxToolchain
 from engineering_control.config import Settings
@@ -132,6 +135,10 @@ class NodeToolchain:
             return None
         return SandboxToolchain(self.path_prefix, _NON_DEFAULT_NODE_VARIABLES)
 
+    def selection(self) -> dict[str, str | None] | None:
+        """The manifest selection as carried in payloads; None for the default."""
+        return None if self.default else {"node": self.node, "pnpm": self.pnpm}
+
 
 def _executable(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
@@ -176,6 +183,26 @@ def project_node_toolchain(settings: Settings, project: str) -> NodeToolchain:
         policy = load_toolchain_policy(settings.project_config_root, project)
     except FileNotFoundError:
         policy = None
+    return resolve_node_toolchain(settings, policy)
+
+
+def payload_node_toolchain(settings: Settings, payload: Mapping[str, Any]) -> NodeToolchain:
+    """NEW-159 review 1: the selection delivery.prepare_toolchain put in the payload.
+
+    Absent (every default project, every non-delivery flow, in-flight runs) is the
+    default toolchain, exactly as before. A present selection is validated and must be
+    installed on this host (ToolchainUnavailableError); a malformed one is ValueError.
+    """
+    preparation = payload.get("toolchain_preparation")
+    raw = preparation.get("node_toolchain") if isinstance(preparation, Mapping) else None
+    if raw is None:
+        return resolve_node_toolchain(settings, None)
+    if not isinstance(raw, Mapping) or set(raw) - {"node", "pnpm"}:
+        raise ValueError("toolchain_preparation.node_toolchain is malformed")
+    try:
+        policy = ToolchainPolicy.model_validate({"node": raw.get("node"), "pnpm": raw.get("pnpm")})
+    except ValidationError as error:
+        raise ValueError("toolchain_preparation.node_toolchain is invalid") from error
     return resolve_node_toolchain(settings, policy)
 
 
