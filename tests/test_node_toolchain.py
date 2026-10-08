@@ -40,6 +40,7 @@ from engineering_control.engineering.toolchain import (
     TOOLCHAIN_NODE_UNAVAILABLE,
     TOOLCHAIN_PNPM_UNAVAILABLE,
     ToolchainUnavailableError,
+    payload_node_toolchain,
     prepare_executables,
     project_node_toolchain,
     resolve_node_toolchain,
@@ -485,6 +486,8 @@ def test_dependency_resolution_uses_the_selection_and_fails_closed(tmp_path: Pat
             **_installs(tmp_path / "a"),
         }
     )
+    # Review 2: the carried selection decides, not the manifest.
+    payload = {**payload, "toolchain_preparation": {"node_toolchain": {"node": "24"}}}
     assert handler._resolve_dependencies(payload)["status"] == "DEPENDENCIES_RESOLVED"
     environment = dependencies.calls[0]["environment"]
     node_bin = tmp_path / "a" / "toolchain" / "node-24" / "bin"
@@ -498,6 +501,7 @@ def test_dependency_resolution_uses_the_selection_and_fails_closed(tmp_path: Pat
             **_installs(tmp_path / "b", node=False),
         }
     )
+    payload = {**payload, "toolchain_preparation": {"node_toolchain": {"node": "24"}}}
     blocked = handler._resolve_dependencies(payload)
     assert blocked["status"] == "BLOCKED"
     assert blocked["blocker"] == TOOLCHAIN_NODE_UNAVAILABLE
@@ -522,6 +526,12 @@ def test_default_baseline_environment_is_unchanged(tmp_path: Path) -> None:
     }
 
 
+def _carrying_node_24(payload: dict[str, Any]) -> dict[str, Any]:
+    """Review 2: a delivery whose prepare step selected Node 24 carries it in the payload."""
+    preparation = dict(payload.get("toolchain_preparation") or {})
+    return {**payload, "toolchain_preparation": {**preparation, "node_toolchain": {"node": "24"}}}
+
+
 def test_node_24_baseline_prepends_the_selection(tmp_path: Path) -> None:
     handler, _, prepare, baseline, payload = _baseline_setup(tmp_path, {tuple(MYPY): 1})
     handler.settings = handler.settings.model_copy(
@@ -530,7 +540,9 @@ def test_node_24_baseline_prepends_the_selection(tmp_path: Path) -> None:
             **_installs(tmp_path),
         }
     )
-    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    assert handler._validate_changeset(_carrying_node_24(payload))["status"] == (
+        "LOCAL_VALIDATION_PASS"
+    )
     [call] = baseline.calls
     node_bin = tmp_path / "toolchain" / "node-24" / "bin"
     assert call["environment"]["PATH"] == f"{node_bin}:/usr/local/bin:{_DEFAULT_PATH}"
@@ -560,18 +572,19 @@ def test_changing_the_selection_at_the_same_base_misses_the_cache(tmp_path: Path
     assert len(baseline.calls) == 1
     prepared_default = len(prepare.calls)
 
+    payload24 = _carrying_node_24(payload)
     handler.settings = default_settings.model_copy(
         update={
             "project_config_root": _manifests(tmp_path, "musematic", {"node": "24"}),
             **_installs(tmp_path),
         }
     )
-    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    assert handler._validate_changeset(payload24)["status"] == "LOCAL_VALIDATION_PASS"
     assert len(baseline.calls) == 2  # not served from the node 22 result
     assert len(prepare.calls) == 2 * prepared_default  # the checkout was re-prepared
     node_bin = str(tmp_path / "toolchain" / "node-24" / "bin")
     assert baseline.calls[1]["environment"]["PATH"].startswith(node_bin + ":")
-    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    assert handler._validate_changeset(payload24)["status"] == "LOCAL_VALIDATION_PASS"
     assert len(baseline.calls) == 2  # the node 24 result is cached under its own key
 
     handler.settings = default_settings
@@ -589,7 +602,7 @@ def test_baseline_fails_closed_before_any_checkout(tmp_path: Path) -> None:
             **_installs(tmp_path, node=False),
         }
     )
-    validated = handler._validate_changeset(payload)
+    validated = handler._validate_changeset(_carrying_node_24(payload))
     assert validated["status"] == "BLOCKED"
     assert validated["blocker"] == "MAKER_TEST_FAILURE"
     assert "Node.js 24 is not installed" in validated["baseline_error"]
@@ -668,3 +681,40 @@ def test_verify_checks_the_toolchain_only_when_installed_or_required() -> None:
     assert "755:root:root" in verify
     assert "[[ -L ${link} ]]" in verify
     assert "for identity in codex-runner claude-runner scan-runner; do" in verify
+
+
+def test_review_2_manifest_edits_never_change_a_running_delivery(tmp_path: Path) -> None:
+    # The manifest now says Node 24, but the delivery carried no selection (default).
+    requests = [{"ecosystem": "pnpm", "directory": "."}]
+    handler, dependencies, _, payload, _ = _dependency_setup(tmp_path, requests)
+    handler.settings = handler.settings.model_copy(
+        update={
+            "project_config_root": _manifests(tmp_path, "musematic", {"node": "24"}),
+            **_installs(tmp_path),
+        }
+    )
+    assert handler._resolve_dependencies(payload)["status"] == "DEPENDENCIES_RESOLVED"
+    assert dependencies.calls[0]["environment"] == handler._dependency_environment()
+
+
+def test_review_2_baseline_runs_under_the_carried_selection(tmp_path: Path) -> None:
+    handler, _, _, baseline, payload = _baseline_setup(tmp_path, {tuple(MYPY): 1})
+    handler.settings = handler.settings.model_copy(
+        update={
+            "project_config_root": _manifests(tmp_path / "m", "musematic", {"node": "24"}),
+            **_installs(tmp_path),
+        }
+    )
+    # The manifest says Node 24 but the delivery carried the default: baseline stays default.
+    assert handler._validate_changeset(payload)["status"] == "LOCAL_VALIDATION_PASS"
+    [call] = baseline.calls
+    assert call["environment"]["PATH"] == f"/usr/local/bin:{_DEFAULT_PATH}"
+
+
+def test_review_2_present_null_selection_is_malformed(tmp_path: Path) -> None:
+    settings = Settings()
+    with pytest.raises(ValueError):
+        payload_node_toolchain(settings, {"toolchain_preparation": {"node_toolchain": None}})
+    assert payload_node_toolchain(
+        settings, {"toolchain_preparation": {}}
+    ) == payload_node_toolchain(settings, {})

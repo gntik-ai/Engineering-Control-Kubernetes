@@ -194,9 +194,10 @@ def payload_node_toolchain(settings: Settings, payload: Mapping[str, Any]) -> No
     installed on this host (ToolchainUnavailableError); a malformed one is ValueError.
     """
     preparation = payload.get("toolchain_preparation")
-    raw = preparation.get("node_toolchain") if isinstance(preparation, Mapping) else None
-    if raw is None:
+    # Review 2: only an absent key is the default; a present null is malformed.
+    if not isinstance(preparation, Mapping) or "node_toolchain" not in preparation:
         return resolve_node_toolchain(settings, None)
+    raw = preparation["node_toolchain"]
     if not isinstance(raw, Mapping) or set(raw) - {"node", "pnpm"}:
         raise ValueError("toolchain_preparation.node_toolchain is malformed")
     try:

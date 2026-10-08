@@ -48,8 +48,8 @@ from engineering_control.engineering.toolchain import (
     enabled_toolchain,
     load_toolchain_policy,
     match_toolchain_test_command,
+    payload_node_toolchain,
     prepare_executables,
-    project_node_toolchain,
     render_argv,
     resolve_node_toolchain,
 )
@@ -1937,7 +1937,8 @@ class ScanActivityHandler(UiPlanScanSteps):
                 payload, "DEPENDENCY_WORKTREE_DIRTY", "the maker left uncommitted changes"
             )
         try:
-            toolchain = project_node_toolchain(self.settings, str(payload["project"]))
+            # NEW-159 review 2: the delivery's carried selection, as for the maker.
+            toolchain = payload_node_toolchain(self.settings, payload)
         except ToolchainUnavailableError as error:
             return self._dependency_blocked(payload, error.blocker, str(error))
         except (OSError, ValueError) as error:
@@ -2483,8 +2484,11 @@ class ScanActivityHandler(UiPlanScanSteps):
                 commands.append(command)
         base_sha = str(payload.get("source_base_sha", ""))
         try:
+            # NEW-159 review 2: the baseline runs under the delivery's carried selection,
+            # never a later manifest edit, exactly as the maker and checker did.
+            toolchain = payload_node_toolchain(self.settings, payload)
             results = self._baseline_test_results(
-                project, str(payload["source_repository"]), base_sha, policy, commands
+                project, str(payload["source_repository"]), base_sha, policy, commands, toolchain
             )
         except (
             CommandFailure,
@@ -2552,6 +2556,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         base_sha: str,
         policy: ToolchainPolicy,
         commands: list[ToolchainTestCommand],
+        toolchain: NodeToolchain,
     ) -> list[dict[str, Any]]:
         """Run the contract commands at the base once per (project, base, argv), then cache."""
         if not re.fullmatch(r"[a-f0-9]{40}", base_sha):
@@ -2559,8 +2564,6 @@ class ScanActivityHandler(UiPlanScanSteps):
         root = self.settings.toolchain_cache_root / "baselines" / Project(project).value / base_sha
         root.mkdir(parents=True, exist_ok=True, mode=0o750)
         results_path = root / "results.json"
-        # NEW-159: fails closed (ToolchainUnavailableError) before any checkout.
-        toolchain = resolve_node_toolchain(self.settings, policy)
         keys = [
             self._baseline_key(command.cwd, render_argv(command.argv, self.settings), toolchain)
             for command in commands
