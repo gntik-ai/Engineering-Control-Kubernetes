@@ -24,21 +24,30 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
-from typing import Any, get_args
+from typing import Annotated, Any, get_args
 
 import pytest
-from pydantic import BaseModel, Field, create_model
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    create_model,
+)
 
 from engineering_control import projects
 from engineering_control.models.enums import Project
 from engineering_control.projects import (
     GLOBAL_PROJECTS,
+    PROJECT_ALTERNATION,
     PROJECT_REPOSITORIES,
     PROJECT_REPOSITORY_SLUGS,
     PROJECTS,
     REPOSITORIES,
     REPOSITORY_SLUGS,
     SELF_CONTAINED,
+    ProjectName,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1325,3 +1334,100 @@ def test_backlog_approval_bindings_are_unchanged(project: str, mode: str) -> Non
         now=datetime(2026, 10, 8, tzinfo=UTC),
     )
     assert binding.sha256() == _PRE_REGISTRY_BINDINGS[(project, mode)]
+
+
+# --- NEW-157 review 3: behaviour probes through the real validators ---------------------------
+#
+# Every pydantic field and every API query/path parameter named like a project or repository is
+# validated with "rogue"-style values through its full annotation (unions, patterns, enums,
+# containers). Fields that accept them today are pinned with the reason; any other field
+# that accepts one fails, so `ProjectName | str` or a dropped `$` anchor cannot slip through.
+
+_PROBE_NAME = re.compile(r"(^|_)(project|projects|repository|repositories|repo|repos)$")
+_PROBE_VALUES = ("rogue", "falcone-rogue", "gntik-ai/rogue", "gntik-ai/falcone-rogue")
+_SNAPSHOT = "GitHub snapshot data, validated against the campaign repositories by the importer"
+_FREE_FORM_FIELDS: dict[str, str] = {
+    "activities.scan:WorktreeAllocationRequest.source_repository": "checked against the manifest",
+    "activities.scan:WorktreeAllocationRequest.deployment_repository": (
+        "checked against the manifest"
+    ),
+    "engineering.backlog:GitHubIssueSnapshot.repository": _SNAPSHOT,
+    "engineering.backlog:GitHubPullRequestSnapshot.repository": _SNAPSHOT,
+    "engineering.backlog:GitHubRepositoryBacklogSnapshot.repository": _SNAPSHOT,
+    "engineering.backlog:LinkedPullRequest.repository": _SNAPSHOT,
+    "engineering.backlog:BacklogIssueRecord.repository": _SNAPSHOT,
+    "models.core:ChangeSet.source_repository": "persisted record; set from the manifest",
+    "models.core:ChangeSet.deployment_repository": "persisted record; set from the manifest",
+    "models.reconciliation:StagingFlowPolicy.image_repositories": "container image names",
+    "operations.models:CapabilityResult.project": "read model rendered from stored rows",
+    "operations.models:CandidateView.project": "read model rendered from stored rows",
+    "policy.github_write:GitHubWritePolicyDocument.safe_repositories": (
+        "root-installed policy document; equality is checked by the reconciler test"
+    ),
+}
+
+
+def _accepts_probe(adapter: TypeAdapter[Any]) -> str | None:
+    for value in _PROBE_VALUES:
+        for candidate in (value, [value], (value,)):
+            try:
+                result = adapter.validate_python(candidate)
+            except (ValidationError, TypeError, ValueError):
+                continue
+            items = result if isinstance(result, (list, tuple, set, frozenset)) else [result]
+            if value in items:
+                return value
+    return None
+
+
+def _probe_targets() -> dict[str, TypeAdapter[Any]]:
+    from engineering_control.api.main import create_app
+    from engineering_control.config import Settings
+
+    targets: dict[str, TypeAdapter[Any]] = {}
+    for key, model in _models(_package_modules()):
+        for name, field in model.model_fields.items():
+            if _PROBE_NAME.search(name):
+                targets[f"{key}.{name}"] = TypeAdapter(field.rebuild_annotation())
+    app = create_app(settings=Settings(), token="x" * 32)
+    for route in app.routes:
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            continue
+        for parameter in [*dependant.query_params, *dependant.path_params]:
+            if _PROBE_NAME.search(parameter.name):
+                key = f"api:{getattr(route, 'path', '?')}:{parameter.name}"
+                targets[key] = TypeAdapter(parameter.field_info.rebuild_annotation())
+    return targets
+
+
+def _probe_failures(targets: dict[str, TypeAdapter[Any]]) -> list[str]:
+    accepted = {key for key, adapter in targets.items() if _accepts_probe(adapter)}
+    problems = [f"{key}: accepts a rogue name" for key in sorted(accepted - set(_FREE_FORM_FIELDS))]
+    problems += [
+        f"{key}: pinned as free-form but no longer accepts rogue names (remove the pin)"
+        for key in sorted(set(_FREE_FORM_FIELDS) - accepted)
+    ]
+    return problems
+
+
+def test_project_and_repository_fields_reject_rogue_names() -> None:
+    targets = _probe_targets()
+    assert any(key.startswith("api:") for key in targets)
+    assert _probe_failures(targets) == []
+
+
+@pytest.mark.parametrize(
+    ("annotation", "key"),
+    [
+        (ProjectName | str, "mutation:project-or-str"),
+        (
+            Annotated[str, StringConstraints(pattern=rf"^({PROJECT_ALTERNATION})")],
+            "mutation:query-pattern-without-anchor",
+        ),
+    ],
+)
+def test_behaviour_probe_catches_mutations(annotation: Any, key: str) -> None:
+    targets = _probe_targets()
+    targets[key] = TypeAdapter(annotation)
+    assert f"{key}: accepts a rogue name" in _probe_failures(targets)
