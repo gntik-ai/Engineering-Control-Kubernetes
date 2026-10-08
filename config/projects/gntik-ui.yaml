@@ -1,0 +1,119 @@
+schema_version: 1
+project: gntik-ui
+# NEW-160: the gntik-ui UI kit (a TypeScript pnpm monorepo). It has no runtime: Hermes
+# builds, deploys and observes nothing for it. A full delivery ends when Hermes merges
+# the PR (with its changeset) after the maker, the independent checker and green CI.
+# Releases (the changesets "Version Packages" PR) and publishing stay with the operator.
+# No runtime API: api_url names the repository.
+api_url: https://github.com/gntik-ai/gntik-ui
+repositories:
+  source:
+    full_name: gntik-ai/gntik-ui
+    url: https://github.com/gntik-ai/gntik-ui.git
+    mirror: /srv/engineering/mirrors/gntik-ui.git
+    default_branch: main
+    issue_repository: gntik-ai/gntik-ui
+  deployment:
+    full_name: gntik-ai/gntik-ui
+    url: https://github.com/gntik-ai/gntik-ui.git
+    mirror: /srv/engineering/mirrors/gntik-ui.git
+    default_branch: main
+    issue_repository: gntik-ai/gntik-ui
+deployment:
+  strategy: none
+  adapter: none
+  release:
+    kind: changesets
+    registry: npm.pkg.github.com
+    publisher: operator
+source_test_commands:
+  - [pnpm, build]
+  - [pnpm, lint]
+  - [pnpm, typecheck]
+  - [pnpm, test]
+  - [pnpm, registry:check]
+  - [node, apps/musematic/scripts/check-kit-only.mjs]
+  - [node, apps/falcone/scripts/check-kit-only.mjs]
+# Self-contained: no separate deployment surface; the registry freshness gate stands in.
+deployment_test_commands:
+  - [pnpm, registry:check]
+delivery_control:
+  source_ci_workflow: ci
+  merge_delivery:
+    enabled: true
+    kind: protected-merge
+    source_ci_workflow: ci
+    allow_r3_merge: false
+    # ci.yml's `visual` job is continue-on-error (baselines are recorded on the CI
+    # runner); its result never blocks the merge. Every other check must pass.
+    non_blocking_checks: [visual]
+    # Every PR that touches a published package carries a changeset.
+    changeset:
+      enabled: true
+      directory: .changeset/
+      package_paths: [packages/, blocks/]
+    # Hermes never merges CI or agent configuration changes (NEW-130 also refuses
+    # .claude/, .codex/ and .mcp.json ChangeSets before they are published).
+    protected_paths: [.github/, .claude/, .codex/, .mcp.json, CLAUDE.md, AGENTS.md]
+toolchain:
+  # Prepared by the scan worker (delivery.prepare_toolchain) in the source worktree before
+  # the maker runs; makers and the checker have no network. NEW-159: Node 24 and the
+  # pinned standalone pnpm (package.json packageManager pnpm@11.28.3, engines.node >=24).
+  enabled: true
+  node: "24"
+  pnpm: 11.28.3
+  prepare:
+    - cwd: "."
+      argv: [pnpm, install, --frozen-lockfile]
+      timeout_seconds: 1200
+  test_commands:
+    # The checks job of .github/workflows/ci.yml, in its order (build first: packages
+    # consume each other's built dist).
+    - cwd: "."
+      argv: [pnpm, build]
+      description: build every package in dependency order (pnpm -r build)
+    - cwd: "."
+      argv: [pnpm, lint]
+      description: eslint over the monorepo
+    - cwd: "."
+      argv: [pnpm, typecheck]
+      description: TypeScript type check of every package
+    - cwd: "."
+      argv: [pnpm, test]
+      description: unit tests of every package (keyboard and axe contracts)
+    - cwd: "."
+      argv: [pnpm, registry:check]
+      description: registry.json and kit-registry.json are up to date (run pnpm registry to regenerate)
+    - cwd: "."
+      argv: [node, apps/musematic/scripts/check-kit-only.mjs]
+      description: the musematic app is built only from the kit
+    - cwd: "."
+      argv: [node, apps/falcone/scripts/check-kit-only.mjs]
+      description: the Falcone app is built only from the kit
+maker_rules:
+  source:
+    - >-
+      Every change to a published package (packages/* or blocks/) adds exactly one
+      changeset file .changeset/<short-kebab-name>.md naming each changed package
+      (e.g. "@gntik-ai/ui": patch) with a one-line user-facing summary. Use patch for
+      fixes, minor for new components or props, and never major unless the issue asks
+      for a breaking change. Hermes refuses to merge a package change without it.
+    - >-
+      When components, blocks or their documented items change, regenerate the kit
+      registry with `pnpm registry` and commit the updated registry.json and
+      kit-registry.json (and llms.txt when it changes); `pnpm registry:check` must pass.
+    - >-
+      The apps (apps/musematic, apps/falcone and the docs) consume only the kit: import
+      from @gntik-ai/* packages, never re-implement or copy kit components into an app.
+    - >-
+      Never edit .github/ (CI and release workflows) or agent configuration (.claude/,
+      .codex/, .mcp.json, CLAUDE.md, AGENTS.md); Hermes refuses such changes. Do not run
+      `changeset version`, bump package versions or edit CHANGELOG.md: releases are the
+      operator's.
+    - >-
+      Do not commit visual baseline screenshots (apps/docs/e2e/__screenshots__) or put
+      [visual-update] in a commit message; the visual job is recorded on the CI runner.
+dependencies: {}
+classification:
+  product: true
+  ui_kit: true

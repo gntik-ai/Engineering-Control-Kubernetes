@@ -80,7 +80,7 @@ sudo -u release-runner /usr/local/bin/argocd version --client --short | \
 sudo -u hermes /usr/local/bin/gh --version | head -n 1 | \
   grep -q '^gh version 2\.98\.0 '
 sudo -u hermes -H /usr/local/bin/gh auth status --hostname github.com >/dev/null
-for repository in falcone falcone-charts musematic musematic-deploy llmwiki; do
+for repository in falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui; do
   sudo -u hermes -H /usr/local/bin/gh repo view "gntik-ai/${repository}" \
     --json nameWithOwner,defaultBranchRef,viewerPermission,isPrivate >/dev/null
 done

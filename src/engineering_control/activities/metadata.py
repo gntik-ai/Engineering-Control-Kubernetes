@@ -4117,7 +4117,12 @@ class MetadataActivityHandler:
                 if isinstance(item, dict)
             }
             source = self._object(results.get(change_set.source_repository), "source PR result")
-            raw_deployment = results.get(change_set.deployment_repository)
+            # NEW-160: a self-contained ChangeSet (llmwiki, gntik-ui) publishes one PR, its
+            # source PR; it never also binds that PR as a deployment PR.
+            self_contained = change_set.source_repository == change_set.deployment_repository
+            raw_deployment = (
+                None if self_contained else results.get(change_set.deployment_repository)
+            )
             deployment = (
                 self._object(raw_deployment, "deployment PR result")
                 if raw_deployment is not None
@@ -4276,6 +4281,8 @@ class MetadataActivityHandler:
             run.summary = (
                 "source and deployment draft PRs published at validated commits"
                 if deployment is not None
+                else "source draft PR published (self-contained repository)"
+                if self_contained
                 else "source draft PR published; deployment waits for immutable artifact"
             )
             run.finished_at = datetime.now(UTC)

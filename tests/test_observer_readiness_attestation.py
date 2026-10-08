@@ -61,6 +61,11 @@ class AttestationObserverRunner:
         raise AssertionError(arguments)
 
 
+def _runtime_manifest(**fields: Any) -> SimpleNamespace:
+    """A fake runtime manifest (NEW-160: runtime readers go through runtime_deployment)."""
+    return SimpleNamespace(**fields, runtime_deployment=lambda: fields["deployment"])
+
+
 def observer_attestation(*, project: str = "falcone") -> dict[str, Any]:
     return ObserverReadinessAttestation(
         project=project,
@@ -133,7 +138,7 @@ def test_pair_snapshot_uses_same_root_group_read_observer_contract(
         Settings(observer_credential_root=credential_root, run_root=run_root),
         observer_runner=AttestationObserverRunner(),  # type: ignore[arg-type]
     )
-    handler.catalog.project = lambda _project: SimpleNamespace(  # type: ignore[method-assign]
+    handler.catalog.project = lambda _project: _runtime_manifest(  # type: ignore[method-assign]
         deployment=SimpleNamespace(
             observer_credential_ref=f"file:{kubeconfig}",
             kubernetes_context_ref="falcone-observer",
@@ -207,7 +212,7 @@ def test_pair_snapshot_reads_the_argocd_application_from_the_argo_namespace(
         Settings(observer_credential_root=credential_root, run_root=run_root),
         observer_runner=AttestationObserverRunner(),  # type: ignore[arg-type]
     )
-    handler.catalog.project = lambda _project: SimpleNamespace(  # type: ignore[method-assign]
+    handler.catalog.project = lambda _project: _runtime_manifest(  # type: ignore[method-assign]
         deployment=SimpleNamespace(
             observer_credential_ref=f"file:{kubeconfig}",
             kubernetes_context_ref="falcone-observer",
@@ -255,7 +260,7 @@ async def test_scan_worker_returns_only_bounded_observer_attestation(tmp_path: P
         Settings(observer_credential_root=credential_root, run_root=run_root),
         observer_runner=AttestationObserverRunner(),  # type: ignore[arg-type]
     )
-    handler.catalog.project = lambda _project: SimpleNamespace(  # type: ignore[method-assign]
+    handler.catalog.project = lambda _project: _runtime_manifest(  # type: ignore[method-assign]
         deployment=SimpleNamespace(
             observer_credential_ref=f"file:{kubeconfig}",
             kubernetes_context_ref="falcone-observer",

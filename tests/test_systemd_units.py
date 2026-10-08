@@ -177,7 +177,7 @@ def test_controller_bootstrap_installs_every_declared_project_manifest() -> None
         path.name for path in (REPOSITORY_ROOT / "config" / "projects").glob("*.yaml")
     )
 
-    assert declared_projects == ["falcone.yaml", "llmwiki.yaml", "musematic.yaml"]
+    assert declared_projects == ["falcone.yaml", "gntik-ui.yaml", "llmwiki.yaml", "musematic.yaml"]
     assert (
         'for project_manifest in "${RELEASE_ROOT}"/source/config/projects/*.yaml; do' in bootstrap
     )
@@ -288,7 +288,10 @@ def test_mirror_bootstrap_is_bounded_and_never_replaces_existing_mirrors() -> No
     script = (REPOSITORY_ROOT / "scripts" / "bootstrap-mirrors.sh").read_text(encoding="utf-8")
 
     assert "set -euo pipefail" in script
-    assert "repositories=(falcone falcone-charts musematic musematic-deploy llmwiki)" in script
+    assert (
+        "repositories=(falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui)"
+        in script
+    )
     assert "if [[ ! -e ${target} ]]; then" in script
     assert "-- --mirror" in script
     assert "remote get-url origin" in script

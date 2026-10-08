@@ -37,7 +37,19 @@ SAFE_REPOSITORIES = (
     "gntik-ai/musematic",
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
+    "gntik-ai/gntik-ui",
 )
+# NEW-160: the allowlist before gntik-ui joined. A policy that an approved campaign enabled
+# before this release (and an activation request it queued) still carries it; it stays
+# valid until that campaign's terminal disable, so the deploy never strands its owner.
+PREVIOUS_SAFE_REPOSITORIES = (
+    "gntik-ai/falcone",
+    "gntik-ai/falcone-charts",
+    "gntik-ai/musematic",
+    "gntik-ai/musematic-deploy",
+    "gntik-ai/llmwiki",
+)
+ACCEPTED_SAFE_REPOSITORIES = frozenset({SAFE_REPOSITORIES, PREVIOUS_SAFE_REPOSITORIES})
 PRE_APPROVAL_STATUSES = frozenset({"IMPORTED", "PLANNED", "AWAITING_APPROVAL"})
 UNAPPROVED_EVIDENCE_STATUSES = PRE_APPROVAL_STATUSES | frozenset(
     {"EXPIRED", "STOPPED", "CANCELLED", "FAILED"}
@@ -111,12 +123,15 @@ def read_request(path: Path, api_uid: int) -> dict[str, Any]:
         "disable-existing-backlog",
     }:
         raise ValueError("GitHub policy action is not allowlisted")
-    if value["project"] not in {"falcone", "musematic", "llmwiki"}:
+    if value["project"] not in {"falcone", "musematic", "llmwiki", "gntik-ui"}:
         raise ValueError("GitHub policy project is invalid")
-    expected_repositories = (
-        SAFE_REPOSITORIES if value["action"] == "enable-existing-backlog" else ()
-    )
-    if tuple(value["safe_repositories"]) != expected_repositories:
+    requested = tuple(value["safe_repositories"])
+    if value["action"] == "enable-existing-backlog":
+        # NEW-160: a request queued by the previous release is still honoured; the policy
+        # it installs is always the current SAFE_REPOSITORIES.
+        if requested not in ACCEPTED_SAFE_REPOSITORIES:
+            raise ValueError("GitHub policy request repository set changed")
+    elif requested != ():
         raise ValueError("GitHub policy request repository set changed")
     requested_by = str(value["requested_by"])
     if not is_reauthenticated_backlog_operator(requested_by):
@@ -199,6 +214,7 @@ def validate_campaign(session: Session, request: dict[str, Any]) -> GitHubBacklo
         "falcone": ["gntik-ai/falcone", "gntik-ai/falcone-charts"],
         "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
         "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
+        "gntik-ui": ["gntik-ai/gntik-ui", "gntik-ai/gntik-ui"],
     }[campaign.project]
     if binding.get("paired_repositories") != expected_pair:
         raise ValueError("GitHub campaign pair changed")
@@ -235,6 +251,7 @@ def verified_owner_expiry(campaign: GitHubBacklogCampaign, now: datetime) -> dat
         "falcone": ["gntik-ai/falcone", "gntik-ai/falcone-charts"],
         "musematic": ["gntik-ai/musematic", "gntik-ai/musematic-deploy"],
         "llmwiki": ["gntik-ai/llmwiki", "gntik-ai/llmwiki"],
+        "gntik-ui": ["gntik-ai/gntik-ui", "gntik-ai/gntik-ui"],
     }.get(campaign.project)
     if (
         not isinstance(raw_binding, dict)
@@ -447,7 +464,7 @@ def validate_current_policy(path: Path, group_id: int) -> None:
     value = GitHubWritePolicyDocument.model_validate(
         yaml.safe_load(path.read_text(encoding="utf-8"))
     )
-    if value.enabled and tuple(value.safe_repositories) != SAFE_REPOSITORIES:
+    if value.enabled and tuple(value.safe_repositories) not in ACCEPTED_SAFE_REPOSITORIES:
         raise ValueError("existing enabled GitHub policy is outside this mission")
     if not value.enabled and value.safe_repositories:
         raise ValueError("disabled GitHub policy contains repositories")

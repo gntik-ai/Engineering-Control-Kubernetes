@@ -53,9 +53,9 @@ from engineering_control.delivery_notifications import (
     explain_blocker,
     literal,
 )
-from engineering_control.engineering.models import ProjectManifest
+from engineering_control.engineering.models import DeploymentManifest, ProjectManifest
 from engineering_control.models.enums import ChangeSetState
-from engineering_control.models.reconciliation import StagingFlowPolicy
+from engineering_control.models.reconciliation import MergeDeliveryPolicy, StagingFlowPolicy
 from engineering_control.policy.github_write import (
     GITOPS_READ_ONLY_GITHUB_STEPS,
     GITOPS_WRITE_CAPABLE_GITHUB_STEPS,
@@ -139,6 +139,9 @@ class StagingGitOpsPlan(BaseModel):
         if int(match.group(2)) != self.source_pr_number:
             raise ValueError("source PR number does not match its URL")
         if self.deployment_pr_number is not None:
+            if self.deployment_repository == self.source_repository:
+                # NEW-160: a self-contained project has only its source PR.
+                raise ValueError("a self-contained plan has no deployment PR")
             deployment = _PR_URL.fullmatch(self.deployment_pr_url or "")
             if (
                 deployment is None
@@ -179,6 +182,58 @@ def enabled_staging_flow(
     if flow is None or not flow.enabled or blockers:
         raise StagingFlowBlocked(blockers[0] if blockers else "STAGING_FLOW_DISABLED")
     return manifest, flow
+
+
+DeliveryGate = StagingFlowPolicy | MergeDeliveryPolicy
+
+
+def enabled_merge_delivery(
+    project_config_root: Path, project: str
+) -> tuple[ProjectManifest, MergeDeliveryPolicy]:
+    """NEW-160: the enabled merge-only full delivery of a project without a runtime."""
+    manifest, _ = load_project_contract(project_config_root, project)
+    merge = manifest.merge_delivery()
+    blockers = manifest.merge_delivery_blockers()
+    if merge is None or not merge.enabled or blockers:
+        raise StagingFlowBlocked(blockers[0] if blockers else "MERGE_DELIVERY_DISABLED")
+    return manifest, merge
+
+
+def enabled_delivery_gate(
+    project_config_root: Path, project: str
+) -> tuple[ProjectManifest, DeliveryGate]:
+    """The PR gate of a project's post-merge delivery: its staging flow, or (NEW-160) its
+    merge-only delivery when the project has no runtime. Fails closed like either."""
+    manifest, _ = load_project_contract(project_config_root, project)
+    if manifest.merge_delivery() is not None:
+        return enabled_merge_delivery(project_config_root, project)
+    return enabled_staging_flow(project_config_root, project)
+
+
+def without_checks(pull_request: dict[str, Any], names: Iterable[str]) -> dict[str, Any]:
+    """NEW-160: the PR view without the named non-blocking (continue-on-error) checks."""
+    ignored = frozenset(names)
+    raw_checks = pull_request.get("statusCheckRollup")
+    if not ignored or not isinstance(raw_checks, list):
+        return pull_request
+    kept = [
+        raw
+        for raw in raw_checks
+        if not (
+            isinstance(raw, dict)
+            and str(raw.get("name") or raw.get("context") or "")[:200] in ignored
+        )
+    ]
+    return {**pull_request, "statusCheckRollup": kept}
+
+
+def _all_passed(pull_request: dict[str, Any]) -> bool:
+    states = _check_states(pull_request)
+    return bool(states) and all(value == "PASSED" for value in states.values())
+
+
+def _non_blocking(gate: DeliveryGate) -> tuple[str, ...]:
+    return gate.non_blocking_checks if isinstance(gate, MergeDeliveryPolicy) else ()
 
 
 def expected_image_tag(flow: StagingFlowPolicy, merge_sha: str) -> str:
@@ -670,6 +725,15 @@ class GitOpsControllerHandler:
             # An unreadable contract must never silently select the flow.
             return {"status": "DISABLED", "enabled": False, "blocker": error.blocker}
         if flow is None or not flow.enabled:
+            merge = manifest.merge_delivery()
+            if merge is not None and merge.enabled:
+                # NEW-160: no runtime; the flow ends at Hermes's protected merge.
+                return {
+                    "status": "ENABLED",
+                    "enabled": True,
+                    "merge_only": True,
+                    "blockers": manifest.merge_delivery_blockers(),
+                }
             return {"status": "DISABLED", "enabled": False}
         return {
             "status": "ENABLED",
@@ -679,7 +743,8 @@ class GitOpsControllerHandler:
 
     def _prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         project = str(payload.get("project", ""))
-        manifest, flow = enabled_staging_flow(self.settings.project_config_root, project)
+        manifest, flow = enabled_delivery_gate(self.settings.project_config_root, project)
+        merge_only = isinstance(flow, MergeDeliveryPolicy)
         change_set_id = UUID(str(payload.get("change_set_id", "")))
         issue_repository = str(payload.get("issue_repository", ""))
         if issue_repository not in {
@@ -696,6 +761,12 @@ class GitOpsControllerHandler:
                 change_set.state == ChangeSetState.RUNTIME_VERIFIED.value
                 and isinstance(record, dict)
                 and record.get("status") == "STAGING_VERIFIED"
+            ) or (
+                # NEW-160: a merge-only delivery ends merged with its issue closed.
+                merge_only
+                and change_set.state == ChangeSetState.ISSUE_CLOSED.value
+                and isinstance(record, dict)
+                and record.get("status") == "MERGE_DELIVERED"
             ):
                 return {"status": "ALREADY_VERIFIED", "staging_gitops": record}
             if change_set.state not in {
@@ -710,7 +781,12 @@ class GitOpsControllerHandler:
             source = _PR_URL.fullmatch(source_url)
             if source is None or not change_set.source_head_sha:
                 raise StagingFlowBlocked("SOURCE_PR_BINDING_MISSING")
-            deployment_url = change_set.deployment_pr_url
+            # NEW-160: a self-contained project (source == deployment repository) has only
+            # its source PR, whatever an earlier publication recorded.
+            self_contained = str(manifest.repositories.source.full_name) == str(
+                manifest.repositories.deployment.full_name
+            )
+            deployment_url = None if self_contained else change_set.deployment_pr_url
             deployment = _PR_URL.fullmatch(deployment_url) if deployment_url else None
             plan = StagingGitOpsPlan(
                 change_set_id=change_set.id,
@@ -731,6 +807,20 @@ class GitOpsControllerHandler:
             )
             if change_set.source_repository != plan.source_repository.rsplit("/", 1)[-1]:
                 raise StagingFlowBlocked("CHANGE_SET_SOURCE_REPOSITORY_MISMATCH")
+        if isinstance(flow, MergeDeliveryPolicy):
+            return {
+                "status": "READY",
+                "plan": plan.model_dump(mode="json"),
+                # NEW-160: no release tag, image build, environment, Argo CD or runtime step.
+                "staging_flow": {
+                    "merge_only": True,
+                    "argo_application": None,
+                    "main_ci_workflow": None,
+                    "image_workflow": None,
+                    "release_tag_enabled": False,
+                    "pin_chart_to_merge": False,
+                },
+            }
         return {
             "status": "READY",
             "plan": plan.model_dump(mode="json"),
@@ -746,7 +836,7 @@ class GitOpsControllerHandler:
     def _persist_result(self, payload: dict[str, Any]) -> dict[str, Any]:
         plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
         outcome = str(payload.get("outcome", ""))
-        if outcome not in {"STAGING_VERIFIED", "BLOCKED", "CANCELLED"}:
+        if outcome not in {"STAGING_VERIFIED", "MERGE_DELIVERED", "BLOCKED", "CANCELLED"}:
             raise ValueError("staging GitOps outcome is invalid")
         merge_sha = payload.get("merge_sha")
         if merge_sha is not None and not _SHA.fullmatch(str(merge_sha)):
@@ -872,6 +962,9 @@ class GitOpsControllerHandler:
                     change_set.deployment_head_sha = plan.deployment_head_sha
             if not stale and outcome == "STAGING_VERIFIED":
                 change_set.state = ChangeSetState.RUNTIME_VERIFIED.value
+            elif not stale and outcome == "MERGE_DELIVERED" and merge_sha is not None:
+                # NEW-160: merged and the issue closed; nothing runs, so nothing to verify.
+                change_set.state = ChangeSetState.ISSUE_CLOSED.value
             elif (
                 not stale
                 and merge_sha is not None
@@ -891,8 +984,9 @@ class GitOpsControllerHandler:
             if workflow_id:
                 run = session.scalar(select(db.Run).where(db.Run.workflow_id == workflow_id))
                 if run is not None and run.run_type == "staging-gitops":
-                    run.status = "SUCCEEDED" if outcome == "STAGING_VERIFIED" else outcome
-                    run.error_code = None if outcome == "STAGING_VERIFIED" else str(blocker)
+                    succeeded = outcome in {"STAGING_VERIFIED", "MERGE_DELIVERED"}
+                    run.status = "SUCCEEDED" if succeeded else outcome
+                    run.error_code = None if succeeded else str(blocker)
                     run.finished_at = datetime.now(UTC)
             state = change_set.state
             if not stale:
@@ -975,6 +1069,17 @@ class GitOpsControllerHandler:
                         if record.get("argo_revision")
                         else ""
                     )
+                ),
+                **common,
+            )
+        elif outcome == "MERGE_DELIVERED":
+            enqueue_milestone(
+                session,
+                event="MERGE_DELIVERED",
+                dedupe_key=f"{plan.change_set_id}:{merge_sha or ''}",
+                detail=(
+                    f"merged {plan.source_pr_url} at {str(merge_sha or '')[:12]} and closed the "
+                    "issue (no runtime to deploy; the operator releases the packages)"
                 ),
                 **common,
             )
@@ -1778,6 +1883,8 @@ class GitOpsControllerHandler:
     @staticmethod
     def _require_staging_target(manifest: ProjectManifest) -> None:
         deployment = manifest.deployment
+        if not isinstance(deployment, DeploymentManifest):
+            raise StagingFlowBlocked("STAGING_FLOW_REQUIRES_RUNTIME")
         if (
             deployment.staging_policy.production
             or deployment.production_supported
@@ -2278,6 +2385,12 @@ class GitOpsGitHubHandler:
             return (plan.issue_repository,)
         raise ValueError("unknown staging GitOps write activity")
 
+    def _gate(self, payload: dict[str, Any]) -> tuple[StagingGitOpsPlan, DeliveryGate]:
+        """The plan and its PR gate: the staging flow or (NEW-160) the merge-only delivery."""
+        plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
+        _, gate = enabled_delivery_gate(self.settings.project_config_root, plan.project)
+        return plan, gate
+
     def _context(self, payload: dict[str, Any]) -> tuple[StagingGitOpsPlan, StagingFlowPolicy]:
         plan = StagingGitOpsPlan.model_validate(payload.get("plan"))
         _, flow = enabled_staging_flow(self.settings.project_config_root, plan.project)
@@ -2417,8 +2530,10 @@ class GitOpsGitHubHandler:
         # NEW-100: the activity heartbeats only on entry, so the optional CI log reads must
         # end within a fixed time of it, whatever the GitHub calls before them cost.
         excerpt_deadline = time.monotonic() + _EXCERPT_DEADLINE_SECONDS
-        plan, flow = self._context(payload)
+        plan, flow = self._gate(payload)
         pull_request = self.broker.view_pull_request(plan.source_repository, plan.source_pr_number)
+        # NEW-160: continue-on-error jobs (gntik-ui's visual baselines) never block.
+        pull_request = without_checks(pull_request, _non_blocking(flow))
         if (
             pull_request.get("headRefOid") != plan.source_head_sha
             or pull_request.get("baseRefName") != plan.source_base_branch
@@ -2440,7 +2555,7 @@ class GitOpsGitHubHandler:
     def _baseline_gate(
         self,
         plan: StagingGitOpsPlan,
-        flow: StagingFlowPolicy,
+        flow: DeliveryGate,
         pull_request: dict[str, Any],
         *,
         create: bool,
@@ -2637,10 +2752,16 @@ class GitOpsGitHubHandler:
     # -- 2. ready + merge --------------------------------------------------------------
 
     def _merge(self, payload: dict[str, Any]) -> dict[str, Any]:
-        plan, flow = self._context(payload)
+        plan, flow = self._gate(payload)
         if plan.risk_class == "R3" and not flow.allow_r3_merge:
             return {"status": "BLOCKED", "blocker": "R3_MERGE_REQUIRES_APPROVAL"}
         target = str(payload.get("target"))
+        if isinstance(flow, MergeDeliveryPolicy):
+            if target != "source":
+                return {"status": "BLOCKED", "blocker": "MERGE_TARGET_INVALID"}
+            refused = self._merge_only_files_gate(plan, flow)
+            if refused is not None:
+                return refused
         if target == "source":
             repository, number, head, base = (
                 plan.source_repository,
@@ -2673,12 +2794,21 @@ class GitOpsGitHubHandler:
             merge_state = str(current.get("mergeStateStatus") or "UNKNOWN")
             if merge_state == "DIRTY":
                 return {"status": "BLOCKED", "blocker": f"{target.upper()}_PR_MERGE_CONFLICT"}
-            if merge_state == "UNSTABLE" and target == "source" and flow.ci_baseline.enabled:
+            filtered = without_checks(current, _non_blocking(flow))
+            if (
+                merge_state == "UNSTABLE"
+                and target == "source"
+                and _non_blocking(flow)
+                and _all_passed(filtered)
+            ):
+                # NEW-160: only the non-blocking (continue-on-error) checks are not green.
+                allow_unstable = True
+            elif merge_state == "UNSTABLE" and target == "source" and flow.ci_baseline.enabled:
                 # NEW-63: non-required checks failed; merge only when the baseline gate
                 # attributes every failure to unchanged main.
                 # The merge gate uses only the verdict, so it reads no CI logs.
                 verdict = self._baseline_gate(
-                    plan, flow, current, create=False, excerpt_deadline=None
+                    plan, flow, filtered, create=False, excerpt_deadline=None
                 )
                 if verdict.get("status") != "CHECKS_PASSED":
                     return {
@@ -2702,6 +2832,44 @@ class GitOpsGitHubHandler:
             "merge_sha": result["merge_sha"],
             "merge": result,
         }
+
+    def _merge_only_files_gate(
+        self, plan: StagingGitOpsPlan, gate: MergeDeliveryPolicy
+    ) -> dict[str, Any] | None:
+        """NEW-160: before the merge, the PR's files carry a changeset when they touch a
+        published package, and never touch a protected path (CI or agent configuration)."""
+        if not gate.changeset.enabled and not gate.protected_paths:
+            return None
+        try:
+            changes = self.broker.pull_request_file_changes(
+                plan.source_repository, plan.source_pr_number
+            )
+        except GhCliPolicyError:
+            # A listing at GitHub's file cap (or a malformed one) cannot prove either rule.
+            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_FILE_LISTING_TRUNCATED"}
+        # A rename's previous path counts as touched (moving a file out of .github/ or out
+        # of a package is a change there).
+        touched = [
+            path for change in changes for path in (change["path"], change["previous_path"]) if path
+        ]
+        if any(gate.protected(path) for path in touched):
+            return {"status": "BLOCKED", "blocker": "MERGE_DELIVERY_PROTECTED_PATH_CHANGED"}
+        if gate.changeset.touches_packages(touched) and not any(
+            self._exists_at(plan.source_repository, path, plan.source_head_sha)
+            for path in gate.changeset.changeset_candidates(changes)
+        ):
+            # Only an added or modified .changeset/<name>.md present at the bound head
+            # counts; a removed or renamed-away changeset never does.
+            return {"status": "BLOCKED", "blocker": "CHANGESET_MISSING"}
+        return None
+
+    def _exists_at(self, repository: str, path: str, ref: str) -> bool:
+        """NEW-160: ``path`` exists at commit ``ref`` (the PR's bound head)."""
+        try:
+            self.broker.repository_file_text(repository, path, ref)
+        except (CommandFailure, GhCliPolicyError):
+            return False
+        return True
 
     # -- 3. release tag + workflow runs ------------------------------------------------
 
@@ -3023,10 +3191,25 @@ class GitOpsGitHubHandler:
     # -- 8. close the delivered issue --------------------------------------------------
 
     def _close_issue(self, payload: dict[str, Any]) -> dict[str, Any]:
-        plan, flow = self._context(payload)
+        plan, gate = self._gate(payload)
         merge_sha = self._merge_sha(payload)
-        image_tag = expected_image_tag(flow, merge_sha)
         marker = f"<!-- engineering-control-staging-gitops:delivered:{plan.change_set_id} -->"
+        if isinstance(gate, MergeDeliveryPolicy):
+            # NEW-160: merged after the maker, the independent checker and green CI.
+            return self._comment_and_close(
+                plan,
+                marker,
+                [
+                    "Delivered by Hermes: merged after the maker, the independent "
+                    "cross-provider review and green CI. There is no runtime to deploy; "
+                    "the operator releases the packages.",
+                    "",
+                    f"- Source PR: {plan.source_pr_url}",
+                    f"- Merge SHA: `{merge_sha}`",
+                ],
+            )
+        flow = gate
+        image_tag = expected_image_tag(flow, merge_sha)
         pinned = payload.get("pinned_repositories")
         lines = [
             "Delivered to staging by Hermes (post-merge GitOps flow).",
@@ -3050,7 +3233,12 @@ class GitOpsGitHubHandler:
             f"- Argo CD application: `{flow.argo_application}` at revision "
             f"`{str(payload.get('argo_revision') or 'unknown')[:400]}`"
         )
-        lines.extend(["", marker, ""])
+        return self._comment_and_close(plan, marker, lines)
+
+    def _comment_and_close(
+        self, plan: StagingGitOpsPlan, marker: str, lines: list[str]
+    ) -> dict[str, Any]:
+        lines = [*lines, "", marker, ""]
         binding = f"changeset:{plan.change_set_id}"
         path = self._body_file("\n".join(lines))
         try:

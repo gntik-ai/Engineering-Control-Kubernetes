@@ -51,7 +51,7 @@ from engineering_control.engineering.backlog import (
     is_reauthenticated_backlog_operator,
     r3_approval_payload_matches,
 )
-from engineering_control.engineering.models import ProjectManifest
+from engineering_control.engineering.models import DeploymentManifest, ProjectManifest
 from engineering_control.models.reconciliation import DeliveryControlPolicy
 from engineering_control.operations.connection_budget import (
     install_diagnostic_sql_budget,
@@ -279,24 +279,39 @@ def _r3_delivery_briefing(manifest: ProjectManifest, surface: str) -> dict[str, 
     (llmwiki-staging) has no production counterpart and no real R3 approval history yet,
     so its checklist is deliberately generic and should get a first real dry run before
     being trusted the way musematic's has been.
+    NEW-160: a project without a runtime (gntik-ui) ends at the protected merge.
     """
+    deployment = manifest.deployment
+    if not isinstance(deployment, DeploymentManifest):
+        merge = manifest.merge_delivery()
+        return {
+            "build_workflow": "none",
+            "build_contract_state": "NOT_APPLICABLE_NO_RUNTIME",
+            "delivery_adapter": "protected-merge",
+            "verification": [
+                f"source-PR-CI-{merge.source_ci_workflow if merge else 'unknown'}-green",
+                "independent-cross-provider-review",
+                "changeset-present-for-published-packages",
+            ],
+            "rollback": "revert-the-merged-PR-before-the-operator-releases-the-packages",
+        }
     repository = (
         manifest.repositories.source if surface == "source" else manifest.repositories.deployment
     ).full_name
     workflow = next(
-        (item for item in manifest.deployment.build_workflows if item.repository == repository),
-        manifest.deployment.build_workflows[0],
+        (item for item in deployment.build_workflows if item.repository == repository),
+        deployment.build_workflows[0],
     )
     build_workflow = f"{workflow.repository}/.github/workflows/{workflow.workflow}"
     build_contract_state = (
         "READY" if workflow.enabled else (workflow.blocker or "CANDIDATE_BUILD_CONTRACT_MISSING")
     )
-    strategy = manifest.deployment.strategy
+    strategy = deployment.strategy
     if strategy == "argocd":
         return {
             "build_workflow": build_workflow,
             "build_contract_state": build_contract_state,
-            "delivery_adapter": f"argocd:{manifest.deployment.argocd_application}",
+            "delivery_adapter": f"argocd:{deployment.argocd_application}",
             "verification": [
                 "Argo-Synced-and-Healthy",
                 "identity-endpoint-200",
@@ -309,7 +324,7 @@ def _r3_delivery_briefing(manifest: ProjectManifest, surface: str) -> dict[str, 
         return {
             "build_workflow": build_workflow,
             "build_contract_state": build_contract_state,
-            "delivery_adapter": f"helm:{manifest.deployment.helm_release}",
+            "delivery_adapter": f"helm:{deployment.helm_release}",
             "verification": [
                 "helm-release-deployed-with-approved-image-digests",
                 "identity-endpoint-200",
@@ -321,7 +336,7 @@ def _r3_delivery_briefing(manifest: ProjectManifest, surface: str) -> dict[str, 
     return {
         "build_workflow": build_workflow,
         "build_contract_state": build_contract_state,
-        "delivery_adapter": f"repo-local-manifest:{manifest.deployment.adapter}",
+        "delivery_adapter": f"repo-local-manifest:{deployment.adapter}",
         "verification": [
             "staging-manifest-applied",
             "identity-endpoint-200",
@@ -1486,6 +1501,10 @@ class OperationsRepository:
         blockers: list[str] = []
         try:
             manifest = self._load_project_manifest(project)
+            if manifest.merge_delivery() is not None:
+                # NEW-160: merge-only full delivery (no runtime): its own contract applies;
+                # candidate build, promotion and staging gates do not exist.
+                return list(dict.fromkeys(manifest.merge_delivery_blockers()))
             policy = DeliveryControlPolicy.model_validate(manifest.delivery_control)
         except (OSError, UnicodeError, ValueError, yaml.YAMLError):
             if self.project_config_root is None:
@@ -1505,8 +1524,9 @@ class OperationsRepository:
             blockers.append(
                 policy.immutable_promotion.blocker or "FULL_DELIVERY_IMMUTABLE_PROMOTION_DISABLED"
             )
-        if not manifest.deployment.staging_policy.enabled:
-            blockers.append(manifest.deployment.staging_policy.blocker)
+        staging_policy = manifest.runtime_deployment().staging_policy
+        if not staging_policy.enabled:
+            blockers.append(staging_policy.blocker)
         return list(dict.fromkeys(blockers))
 
     def _provider_blockers(self, session: Session) -> list[str]:

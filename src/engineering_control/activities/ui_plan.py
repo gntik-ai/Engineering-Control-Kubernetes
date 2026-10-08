@@ -32,6 +32,7 @@ from engineering_control.delivery_notifications import CTL, enqueue_milestone, l
 from engineering_control.engineering.backlog import canonical_sha256
 from engineering_control.engineering.change_requests import (
     MAXIMUM_ISSUE_BODY_CHARACTERS,
+    UI_KIT_REPOSITORIES,
     UiContinuedSection,
     change_review_schema,
     prepare_intake,
@@ -1751,7 +1752,10 @@ class UiPlanActivityHandler:
             "source_worktree": payload.get("source_worktree"),
             "description_redacted": intake.description_redacted,
             "review_rounds": [],
-            "dedupe_supported": item.target_repository in ALLOWED_REPOSITORIES,
+            # NEW-160: gntik-ui is now allowlisted, but a UI-kit gap of this project is
+            # still deduplicated by the operator's gh when publishing (NEW-123).
+            "dedupe_supported": item.target_repository in ALLOWED_REPOSITORIES
+            and item.target_repository not in UI_KIT_REPOSITORIES.get(project, ()),
             "continued": [section.model_dump(mode="json") for section in continued],
         }
         if item.spec.get("variants"):

@@ -873,6 +873,36 @@ class GhCliBroker:
             paths.extend(part for part in entry.split("\t") if part)
         return paths
 
+    PULL_REQUEST_FILE_STATUSES = frozenset(
+        {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}
+    )
+
+    def pull_request_file_changes(self, repository: str, number: int) -> list[dict[str, str]]:
+        """NEW-160: every file a pull request changes with GitHub's status (added, removed,
+        modified, renamed, ...) and, for a rename or copy, its previous path."""
+        repository = self._batch(repository)
+        if number < 1:
+            raise GhCliPolicyError("pull request number is invalid")
+        raw = self._run(
+            [
+                "api",
+                f"repos/{repository}/pulls/{number}/files",
+                "--paginate",
+                "--jq",
+                '.[] | [.filename, .status, (.previous_filename // "")] | @tsv',
+            ]
+        ).stdout
+        entries = [line for line in raw.splitlines() if line.strip()]
+        if len(entries) >= self.PULL_REQUEST_FILE_CAP:
+            raise GhCliPolicyError("pull request file listing reached the GitHub cap")
+        changes: list[dict[str, str]] = []
+        for entry in entries:
+            parts = entry.split("\t")
+            if len(parts) != 3 or not parts[0] or parts[1] not in self.PULL_REQUEST_FILE_STATUSES:
+                raise GhCliPolicyError("pull request file listing is malformed")
+            changes.append({"path": parts[0], "status": parts[1], "previous_path": parts[2]})
+        return changes
+
     def job_log_excerpt(self, repository: str, job_id: int, *, timeout_seconds: int = 15) -> str:
         """NEW-100: the failing lines of one Actions job log, bounded (untrusted text).
 

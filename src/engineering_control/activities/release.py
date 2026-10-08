@@ -140,24 +140,32 @@ class ReleaseActivityHandler:
                 non_retryable=True,
             )
         manifest = self.catalog.project(project)
+        if not manifest.has_runtime():
+            # NEW-160: a project without a runtime (gntik-ui) has nothing to render.
+            raise ApplicationError(
+                "PROJECT_HAS_NO_RUNTIME: the project has no deployment to render",
+                type="PolicyViolation",
+                non_retryable=True,
+            )
+        deployment = manifest.runtime_deployment()
         if project == "llmwiki":
             return self._render_llmwiki(payload, manifest, snapshot)
         try:
-            chart_worktree_key = f"{manifest.deployment.chart_repository}_worktree"
+            chart_worktree_key = f"{deployment.chart_repository}_worktree"
             chart_worktree = Path(str(snapshot.get(chart_worktree_key))).resolve()
             deployment_worktree = Path(str(snapshot.get("deployment_worktree"))).resolve()
             self._bounded_worktree(chart_worktree)
             self._bounded_worktree(deployment_worktree)
-            chart = (chart_worktree / manifest.deployment.chart_path).resolve()
+            chart = (chart_worktree / deployment.chart_path).resolve()
             if not chart.is_dir() or not chart.is_relative_to(chart_worktree):
                 raise ValueError("configured chart path escaped its immutable worktree")
             normal_values = [
                 self._bounded_render_file(chart_worktree, relative)
-                for relative in manifest.deployment.values_paths
+                for relative in deployment.values_paths
             ]
             isolated_values = [
                 self._bounded_render_file(deployment_worktree, relative)
-                for relative in manifest.deployment.secret_bearing_values_paths
+                for relative in deployment.secret_bearing_values_paths
             ]
             lint_arguments = ["lint", str(chart)]
             render_arguments = [
@@ -165,7 +173,7 @@ class ReleaseActivityHandler:
                 "engineering-render",
                 str(chart),
                 "--namespace",
-                manifest.deployment.namespaces[0],
+                deployment.namespaces[0],
             ]
             for values_file in [*normal_values, *isolated_values]:
                 lint_arguments.extend(("--values", str(values_file)))
@@ -180,12 +188,12 @@ class ReleaseActivityHandler:
                 **payload,
                 "status": "DEPLOYMENT_RENDER_PASS",
                 "render_evidence": {
-                    "chart_repository": manifest.deployment.chart_repository,
-                    "chart_path": manifest.deployment.chart_path,
-                    "normal_values_paths": manifest.deployment.values_paths,
+                    "chart_repository": deployment.chart_repository,
+                    "chart_path": deployment.chart_path,
+                    "normal_values_paths": deployment.values_paths,
                     "secret_bearing_values_paths": [
                         "[ISOLATED_SECRET_BEARING_VALUES]"
-                        for _ in manifest.deployment.secret_bearing_values_paths
+                        for _ in deployment.secret_bearing_values_paths
                     ],
                     "helm_lint_sha256": hashlib.sha256(lint.stdout.encode()).hexdigest(),
                     "rendered_sha256": rendered.stdout_sha256,

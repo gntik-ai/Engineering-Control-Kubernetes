@@ -223,6 +223,126 @@ class StagingFlowPolicy(ReconciliationModel):
         return self
 
 
+_CHECK_NAME = r"^[A-Za-z0-9][A-Za-z0-9 ._()/:-]{0,199}$"
+_REPOSITORY_PREFIX = re.compile(r"[A-Za-z0-9._-]{1,100}(?:/[A-Za-z0-9._-]{1,100}){0,5}/")
+
+
+def _repository_prefix(value: str) -> bool:
+    return _REPOSITORY_PREFIX.fullmatch(value) is not None and ".." not in value.split("/")
+
+
+def _repository_path(value: str) -> bool:
+    """A repository prefix (``dir/``) or one repository-relative file path."""
+    return _repository_prefix(value if value.endswith("/") else f"{value}/")
+
+
+class ChangesetGatePolicy(ReconciliationModel):
+    """NEW-160: a delivered PR that touches a published package carries a changeset.
+
+    Checked on the PR's file list before Hermes merges: when any changed path starts with
+    one of ``package_paths``, at least one added or modified ``<directory><name>.md`` (not
+    README.md) must be part of the PR."""
+
+    enabled: bool = False
+    directory: str = ".changeset/"
+    package_paths: tuple[str, ...] = Field(default=(), max_length=20)
+
+    @field_validator("directory")
+    @classmethod
+    def repository_directory(cls, value: str) -> str:
+        if not _repository_prefix(value) or value.startswith(".github/"):
+            raise ValueError("the changeset directory must be a repository prefix")
+        return value
+
+    @field_validator("package_paths")
+    @classmethod
+    def repository_prefixes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values) or not all(_repository_prefix(v) for v in values):
+            raise ValueError("changeset package paths must be unique repository prefixes")
+        return values
+
+    @model_validator(mode="after")
+    def enabled_requires_paths(self) -> ChangesetGatePolicy:
+        if self.enabled and not self.package_paths:
+            raise ValueError("an enabled changeset gate requires package paths")
+        return self
+
+    def touches_packages(self, paths: list[str]) -> bool:
+        """True when any changed path (a rename's previous path included) is in a package."""
+        return self.enabled and any(
+            path.startswith(prefix) for path in paths for prefix in self.package_paths
+        )
+
+    def changeset_candidates(self, changes: list[dict[str, str]]) -> list[str]:
+        """Changeset files the PR adds or modifies (a rename or copy counts by its new path).
+
+        A removed file, or the previous path of a rename, never counts; neither does any file
+        other than ``<directory><name>.md`` (README.md excluded). The caller still proves each
+        candidate exists at the bound head commit."""
+        candidates: list[str] = []
+        for change in changes:
+            path = change.get("path", "")
+            name = path.removeprefix(self.directory)
+            if (
+                change.get("status") in _CHANGESET_STATUSES
+                and path.startswith(self.directory)
+                and "/" not in name
+                and name.endswith(".md")
+                and name.lower() != "readme.md"
+                and len(name) > len(".md")
+            ):
+                candidates.append(path)
+        return candidates
+
+
+_CHANGESET_STATUSES = frozenset({"added", "modified", "changed", "renamed", "copied"})
+
+
+class MergeDeliveryPolicy(ReconciliationModel):
+    """NEW-160: full delivery that ends at Hermes's protected merge (no runtime).
+
+    For a project without a deployment (``deployment.strategy: none``, e.g. the gntik-ui
+    kit): after the maker, the independent checker and green PR CI, Hermes merges the source
+    PR and closes the issue with the merge evidence. There is no release tag, image build,
+    staging GitOps or runtime verification; publishing packages stays with the operator."""
+
+    enabled: bool = False
+    kind: Literal["protected-merge"] = "protected-merge"
+    source_ci_workflow: str = Field(pattern=_WORKFLOW_REFERENCE)
+    allow_r3_merge: bool = False
+    ci_baseline: CiBaselinePolicy = Field(default_factory=CiBaselinePolicy)
+    # Check names of continue-on-error jobs (e.g. gntik-ui's visual baselines): neither
+    # their failure nor their pending state blocks the merge. Every other check must pass.
+    non_blocking_checks: tuple[str, ...] = Field(default=(), max_length=10)
+    changeset: ChangesetGatePolicy = Field(default_factory=ChangesetGatePolicy)
+    # Paths (``dir/`` prefixes or files) a merge-only PR may never touch; CI configuration
+    # by default.
+    protected_paths: tuple[str, ...] = Field(default=(".github/",), max_length=20)
+
+    @field_validator("protected_paths")
+    @classmethod
+    def protected_prefixes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values) or not all(_repository_path(v) for v in values):
+            raise ValueError("protected paths must be unique repository paths")
+        return values
+
+    def protected(self, path: str) -> bool:
+        """True when ``path`` is (under) one of the protected paths."""
+        return any(
+            path.startswith(item) if item.endswith("/") else path == item
+            for item in self.protected_paths
+        )
+
+    @field_validator("non_blocking_checks")
+    @classmethod
+    def check_names(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values) or not all(
+            re.fullmatch(_CHECK_NAME, value) for value in values
+        ):
+            raise ValueError("non-blocking checks must be unique bounded check names")
+        return values
+
+
 class DeliveryControlPolicy(ReconciliationModel):
     source_ci_workflow: str = Field(min_length=1, max_length=160)
     candidate_build: CandidateBuildPolicy

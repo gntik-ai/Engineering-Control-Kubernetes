@@ -582,8 +582,9 @@ def test_rendered_item_proposals_validate_and_bind_their_context() -> None:
 def test_gntik_ui_is_an_allowed_change_request_repository_for_falcone_only() -> None:
     assert target_repository_allowed("falcone", "gntik-ai/gntik-ui")
     assert not target_repository_allowed("musematic", "gntik-ai/gntik-ui")
-    # The Hermes GitHub broker never gains it: only the operator's own gh publishes there.
-    assert "gntik-ai/gntik-ui" not in ALLOWED_REPOSITORIES
+    # NEW-160: the Hermes GitHub broker gained it as the gntik-ui project's own repository;
+    # falcone's UI-kit change requests are still published by the operator's own gh.
+    assert "gntik-ai/gntik-ui" in ALLOWED_REPOSITORIES
     intake = prepare_intake(
         "falcone", "Add server-side pagination to DataTable for long lists.", "gntik-ai/gntik-ui"
     )

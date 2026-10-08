@@ -129,8 +129,14 @@ def test_policy_rejects_unpinned_pnpm_versions(pnpm: str) -> None:
 
 
 def test_existing_project_manifests_keep_the_default_toolchain() -> None:
-    # NEW-157 registry: every shipped project stays on Node 22 and the worker pnpm.
-    for project in sorted(PROJECT_SET):
+    # NEW-157 registry: every shipped project stays on Node 22 and the worker pnpm, except
+    # NEW-160's gntik-ui (Node 24 and pnpm 11.28.3, NEW-159).
+    gntik_ui = ProjectManifest.model_validate(
+        yaml.safe_load((PROJECTS / "gntik-ui.yaml").read_text())
+    )
+    assert gntik_ui.toolchain is not None
+    assert (gntik_ui.toolchain.node, gntik_ui.toolchain.pnpm) == ("24", "11.28.3")
+    for project in sorted(PROJECT_SET - {"gntik-ui"}):
         path = PROJECTS / f"{project}.yaml"
         manifest = ProjectManifest.model_validate(yaml.safe_load(path.read_text()))
         toolchain = project_node_toolchain(Settings(project_config_root=PROJECTS), project)

@@ -20,6 +20,7 @@ REQUIRED_REPOSITORIES = (
     "gntik-ai/musematic",
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
+    "gntik-ai/gntik-ui",
 )
 
 
