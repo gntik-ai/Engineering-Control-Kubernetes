@@ -252,6 +252,7 @@ def _fail(
     kind: str = "test",
     failure: str | None = "testCodeFailure",
     cause: str = "error",
+    codes: tuple[str, ...] = (),
 ) -> str:
     record = {
         "name": name,
@@ -260,12 +261,13 @@ def _fail(
         "type": kind,
         "failure": failure,
         "error_cause": cause,
+        "error_codes": list(codes),
     }
     return f"{NONCE} FAIL {json.dumps(record)}"
 
 
 def _block(*lines: str, passed: int = 1, nonce: str = NONCE) -> str:
-    begin = f"{nonce} BEGIN " + json.dumps({"hermes": 2, "passed": passed, "truncated": False})
+    begin = f"{nonce} BEGIN " + json.dumps({"hermes": 3, "passed": passed, "truncated": False})
     count = sum(" FAIL " in line for line in lines)
     return "\n".join([begin, *lines, f"{nonce} END {count}"])
 
@@ -311,7 +313,7 @@ def test_reporter_output_needs_this_runs_complete_block() -> None:
         _block(_fail("x")).rsplit("\n", 1)[0],  # no END marker: truncated tail
         _block(f"{NONCE} FAIL not json"),
         _block(f"{NONCE} FAIL []"),
-        f"{NONCE} BEGIN " + json.dumps({"hermes": 2, "passed": 0, "truncated": True}),
+        f"{NONCE} BEGIN " + json.dumps({"hermes": 3, "passed": 0, "truncated": True}),
         f"{NONCE} BEGIN " + json.dumps({"hermes": 1, "passed": 0, "truncated": False}),
     ]:
         assert parse_reporter_output(text, NONCE, FILES, ".") is None
@@ -752,7 +754,7 @@ def test_base_result_is_cached(tmp_path: Path) -> None:
         "cwd": ".",
         "kind": "node_test",
         "prepare": None,
-        "reporter": 2,
+        "reporter": 3,
     }
     assert value["exit_code"] == 1 and len(value["test_failures"]) == 9
     assert (root / "prepared").read_text() == f"{payload['source_base_sha']} unprepared\n"
@@ -917,9 +919,34 @@ def test_real_sandbox_tmpfs_is_capped_and_the_checkout_read_only(tmp_path: Path)
 
     validated = handler._validate_changeset(payload)
 
+    # Review 2: failures the sandbox itself causes (ENOSPC on the capped /tmp, EROFS on the
+    # read-only checkout) are never pre-existing evidence; only genuine failures count.
     [evidence] = validated["preexisting_test_failures"]
-    assert f"{LIMITS}#0: fills tmp" in evidence["base_failing_tests"]
-    assert f"{LIMITS}#0: writes checkout" in evidence["base_failing_tests"]
+    assert f"{LIMITS}#0: fills tmp" not in evidence["base_failing_tests"]
+    assert f"{LIMITS}#0: writes checkout" not in evidence["base_failing_tests"]
+    assert evidence["base_failing_tests"]
     checkout = _baseline_root(tmp_path, payload["source_base_sha"]) / "worktree"
     assert not (checkout / "written.txt").exists()
     assert not os.listdir(checkout / "tests" / "integration" / "098-plan-base-limits")[1:]
+
+
+@pytest.mark.parametrize("code", ["EROFS", "ENOSPC", "EACCES", "EPERM", "EDQUOT", "ENOTFOUND"])
+def test_review_2_sandbox_error_codes_are_never_test_level(code: str) -> None:
+    text = _block(_fail("writes", codes=(code,)), _fail("real"))
+    report = parse_reporter_output(text, NONCE, ["tests/a.test.mjs"], ".")
+    assert report is not None
+    assert list(report.test_failures) == ["tests/a.test.mjs#0: real"]
+    assert "tests/a.test.mjs#0: writes" in report.other_failures
+
+
+def test_review_2_records_without_error_codes_are_malformed() -> None:
+    record = {
+        "name": "x",
+        "nesting": 0,
+        "file": "/work/tests/a.test.mjs",
+        "type": "test",
+        "failure": "testCodeFailure",
+        "error_cause": "error",
+    }
+    text = _block(f"{NONCE} FAIL {json.dumps(record)}")
+    assert parse_reporter_output(text, NONCE, ["tests/a.test.mjs"], ".") is None

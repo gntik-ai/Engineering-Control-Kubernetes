@@ -41,12 +41,25 @@ SANDBOX_REPORTER = "/run/hermes-node-test/reporter.mjs"
 SANDBOX_TMP = "/tmp"  # noqa: S108 - a private size-capped tmpfs inside the sandbox
 NONCE_VARIABLE = "HERMES_NODE_TEST_NONCE"
 
-REPORTER_VERSION = 2
+REPORTER_VERSION = 3
 # Buffers one JSON line per failed test and prints them, between nonce markers, to
 # stdout when the run ends (so the block survives a bounded output tail). It keeps what
 # separates a test failure from a file-level one (import, syntax, process exit, hooks).
 REPORTER_SOURCE = """\
-// Hermes NEW-161 node:test reporter v2 (scan worker, base-only pre-existing baseline).
+// Hermes NEW-161 node:test reporter v3 (scan worker, base-only pre-existing baseline).
+// Review 2: error codes along the cause chain let sandbox-induced failures be excluded.
+const ERRNO = /\\b(E[A-Z]{2,15})\\b/g;
+function errorCodes(error) {
+  const codes = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 6 && codes.size < 8; depth += 1) {
+    if (typeof current.code === 'string') codes.add(current.code.slice(0, 40));
+    const text = typeof current.message === 'string' ? current.message.slice(0, 2000) : '';
+    for (const match of text.matchAll(ERRNO)) { if (codes.size < 8) codes.add(match[1]); }
+    current = current.cause;
+  }
+  return [...codes];
+}
 export default async function* hermesReporter(source) {
   const nonce = process.env.HERMES_NODE_TEST_NONCE ?? '';
   const lines = [];
@@ -66,15 +79,34 @@ export default async function* hermesReporter(source) {
       type: data.details?.type === 'suite' ? 'suite' : 'test',
       failure: typeof error?.failureType === 'string' ? error.failureType : null,
       error_cause: error?.cause instanceof Error ? 'error' : typeof error?.cause,
+      error_codes: errorCodes(error),
     }));
   }
-  yield `${nonce} BEGIN ${JSON.stringify({ hermes: 2, passed, truncated })}\\n`;
+  yield `${nonce} BEGIN ${JSON.stringify({ hermes: 3, passed, truncated })}\\n`;
   for (const line of lines) yield `${nonce} FAIL ${line}\\n`;
   yield `${nonce} END ${lines.length}\\n`;
 }
 """
 # node:test failure types that a test body (not its file, process or hooks) produced.
 _TEST_LEVEL_FAILURES = frozenset({"testCodeFailure", "testTimeoutFailure"})
+# Review 2: errors the sandbox itself causes (read-only checkout, capped /tmp, no network,
+# dropped privileges). A base failure carrying one is never evidence of a real failure.
+SANDBOX_ERROR_CODES = frozenset(
+    {
+        "EROFS",
+        "ENOSPC",
+        "EDQUOT",
+        "EACCES",
+        "EPERM",
+        "EMFILE",
+        "ENFILE",
+        "ENETUNREACH",
+        "EAI_AGAIN",
+        "ENOTFOUND",
+        "ECONNREFUSED",
+        "EHOSTUNREACH",
+    }
+)
 
 # Characters that never appear in an accepted command, quoted or not: we never use a
 # shell, but a command that needs one is not the plain invocation this exemption covers.
@@ -328,6 +360,8 @@ def parse_reporter_output(
             or not (record.get("file") is None or isinstance(record.get("file"), str))
             or record.get("type") not in {"test", "suite"}
             or not (record.get("failure") is None or isinstance(record.get("failure"), str))
+            or not isinstance(record.get("error_codes"), list)
+            or not all(isinstance(code, str) for code in record["error_codes"])
         ):
             return None
         count += 1
@@ -342,6 +376,7 @@ def parse_reporter_output(
             and record["failure"] in _TEST_LEVEL_FAILURES
             and not (record["nesting"] == 0 and record["name"] in file_names)
             and record.get("error_cause") != "string"
+            and not SANDBOX_ERROR_CODES.intersection(record["error_codes"])
         ):
             test_failures[identity] += 1
         else:
