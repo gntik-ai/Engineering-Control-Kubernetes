@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -2765,27 +2766,39 @@ class ScanActivityHandler(UiPlanScanSteps):
         if not node.is_file():
             raise ValueError(f"node executable {node} is missing")
         nonce = secrets.token_hex(16)
-        arguments = sandbox_argv(
-            checkout=checkout.resolve(),
-            command=command,
-            files=files,
-            node=node,
-            reporter=reporter.resolve(),
-            nonce=nonce,
-            variables=toolchain.variables,
-        )
-        runner = self.baseline_runner or SafeCommandRunner(
-            {"bwrap": self.settings.bwrap_executable}
-        )
-        # Output is held in memory as a bounded tail only; nothing is written to disk.
-        run = runner.run(
-            "bwrap",
-            arguments,
-            cwd=checkout,
-            timeout_seconds=timeout_seconds,
-            check=False,
-            max_output_bytes=MAX_REPORT_BYTES,
-        )
+        # NEW-161 review 3: the trusted base writes to a per-run copy-on-write layer
+        # (removed below) instead of failing on a read-only checkout.
+        overlay_root = self.settings.toolchain_cache_root / "node-test-overlay"
+        overlay_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        layer = Path(tempfile.mkdtemp(prefix="run-", dir=overlay_root))
+        upper, work = layer / "upper", layer / "work"
+        upper.mkdir(mode=0o700)
+        work.mkdir(mode=0o700)
+        try:
+            arguments = sandbox_argv(
+                checkout=checkout.resolve(),
+                command=command,
+                files=files,
+                node=node,
+                reporter=reporter.resolve(),
+                nonce=nonce,
+                variables=toolchain.variables,
+                overlay=(upper.resolve(), work.resolve()),
+            )
+            runner = self.baseline_runner or SafeCommandRunner(
+                {"bwrap": self.settings.bwrap_executable}
+            )
+            # Output is held in memory as a bounded tail only.
+            run = runner.run(
+                "bwrap",
+                arguments,
+                cwd=checkout,
+                timeout_seconds=timeout_seconds,
+                check=False,
+                max_output_bytes=MAX_REPORT_BYTES,
+            )
+        finally:
+            _remove_overlay_layer(layer)
         report = parse_reporter_output(run.stdout, nonce, files, command.cwd)
         visible = "\n".join(line for line in run.stdout.splitlines() if nonce not in line)
         text = str(SecretRedactor().redact_text(f"{visible}\n{run.stderr}").value)
@@ -3453,3 +3466,15 @@ class ScanActivityHandler(UiPlanScanSteps):
                 if found is not None:
                     return found
         return None
+
+
+def _remove_overlay_layer(layer: Path) -> None:
+    """NEW-161 review 3: overlayfs leaves its work/work directory mode 000; make every
+    directory traversable before removing the per-run layer."""
+    for directory, names, _files in os.walk(layer, topdown=True, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_symlink():
+                with contextlib.suppress(OSError):
+                    path.chmod(0o700)
+    shutil.rmtree(layer, ignore_errors=True)

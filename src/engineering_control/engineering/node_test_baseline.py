@@ -420,14 +420,18 @@ def sandbox_argv(
     reporter: Path,
     nonce: str,
     variables: dict[str, str],
+    overlay: tuple[Path, Path] | None = None,
 ) -> list[str]:
-    """bubblewrap arguments: no network, everything read-only but a size-capped /tmp.
+    """bubblewrap arguments: no network, a read-only system and a size-capped /tmp.
 
-    The base checkout is bound read-only; the report goes to stdout between nonce
-    markers, so no host path is writable. ``node`` must be the resolved executable; its
-    installation is bound read-only.
+    The report goes to stdout between nonce markers. ``node`` must be the resolved
+    executable; its installation is bound read-only. Review 3: with ``overlay`` (upper,
+    work), the trusted BASE checkout is a writable copy-on-write view whose writes land
+    in that per-run upper directory (removed by the caller), so base code that writes
+    to its checkout behaves as on a real machine instead of failing on a read-only one
+    in a way it may itself swallow. Without it the checkout is bound read-only.
     """
-    for path in (checkout, node, reporter):
+    for path in (checkout, node, reporter, *(overlay or ())):
         if not path.is_absolute() or "\n" in str(path):
             raise ValueError(f"node test sandbox path {path} is not a plain absolute path")
     if not re.fullmatch(r"[0-9a-f]{32}", nonce):
@@ -468,8 +472,11 @@ def sandbox_argv(
         "--ro-bind",
         str(reporter),
         SANDBOX_REPORTER,
-        "--ro-bind",
-        str(checkout),
+        *(
+            ["--overlay-src", str(checkout), "--overlay", str(overlay[0]), str(overlay[1])]
+            if overlay is not None
+            else ["--ro-bind", str(checkout)]
+        ),
         SANDBOX_WORKTREE,
         "--remount-ro",
         "/dev",

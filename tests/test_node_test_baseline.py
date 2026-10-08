@@ -480,7 +480,11 @@ class SandboxRunner:
 
     def run(self, executable: str, arguments: Any, *, cwd: Path, **kwargs: Any) -> CommandResult:
         arguments = list(arguments)
-        checkout = Path(arguments[arguments.index("/work") - 1])
+        checkout = Path(
+            arguments[arguments.index("--overlay-src") + 1]
+            if "--overlay-src" in arguments
+            else arguments[arguments.index("/work") - 1]
+        )
         self.calls.append(
             {"executable": executable, "arguments": arguments, "checkout": checkout, **kwargs}
         )
@@ -950,3 +954,31 @@ def test_review_2_records_without_error_codes_are_malformed() -> None:
     }
     text = _block(f"{NONCE} FAIL {json.dumps(record)}")
     assert parse_reporter_output(text, NONCE, ["tests/a.test.mjs"], ".") is None
+
+
+@REAL_SANDBOX
+def test_review_3_base_code_that_swallows_write_errors_passes(tmp_path: Path) -> None:
+    # Trusted base code that catches its own write failure and only asserts the result:
+    # with a read-only checkout it failed as a plain assertion (no error code) and was
+    # counted as pre-existing. The copy-on-write layer lets it pass, as on a real machine.
+    node = _real_node()
+    assert node is not None
+    prelude = (
+        "import assert from 'node:assert';\n"
+        "import { writeFileSync } from 'node:fs';\n"
+        "function save() { try { writeFileSync('state.json', '{}'); return true; }"
+        " catch { return false; } }\n"
+        "test('saves state', () => { assert.equal(save(), true); });\n"
+    )
+    handler, payload = _setup(
+        tmp_path, None, settings=_settings(tmp_path, node.parent.parent), prelude=prelude
+    )
+
+    validated = handler._validate_changeset(payload)
+
+    for evidence in validated.get("preexisting_test_failures") or []:
+        assert f"{LIMITS}#0: saves state" not in evidence["base_failing_tests"]
+    checkout = _baseline_root(tmp_path, payload["source_base_sha"]) / "worktree"
+    assert not (checkout / "state.json").exists()  # the layer was discarded
+    overlay = handler.settings.toolchain_cache_root / "node-test-overlay"
+    assert not list(overlay.iterdir())  # and removed
