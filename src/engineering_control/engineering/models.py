@@ -15,7 +15,7 @@ from pydantic import (
     model_validator,
 )
 
-from engineering_control.models.reconciliation import StagingFlowPolicy
+from engineering_control.models.reconciliation import MergeDeliveryPolicy, StagingFlowPolicy
 from engineering_control.projects import (
     REPOSITORY_SLUG_ALTERNATION,
     SELF_CONTAINED_REPOSITORIES,
@@ -167,6 +167,29 @@ class DeploymentManifest(EngineeringModel):
         if overlap:
             raise ValueError("secret-bearing values paths cannot be normal render inputs")
         return self
+
+
+class PackageReleasePolicy(EngineeringModel):
+    """NEW-160: how a no-runtime project's changes reach consumers. Informational for
+    Hermes: it never versions or publishes packages; the operator merges the release PR."""
+
+    kind: Literal["changesets"]
+    registry: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9-]+)+$")
+    publisher: Literal["operator"] = "operator"
+
+
+class NoDeploymentManifest(EngineeringModel):
+    """NEW-160: a project without a runtime (e.g. the gntik-ui kit).
+
+    Hermes builds, deploys and observes nothing for it: no staging flow, observer,
+    namespaces, images or personas. Its full delivery ends at the protected merge
+    (``delivery_control.merge_delivery``)."""
+
+    strategy: Literal["none"]
+    adapter: Literal["none"]
+    release: PackageReleasePolicy
+    production_supported: Literal[False] = False
+    production_installed: Literal[False] = False
 
 
 TOOLCHAIN_PREPARE_EXECUTABLES = frozenset({"uv", "pnpm", "go", "trivy"})
@@ -464,7 +487,10 @@ class ProjectManifest(EngineeringModel):
     project: ProjectName
     repositories: RepositoryPair
     api_url: HttpUrl
-    deployment: DeploymentManifest
+    # NEW-160: ``strategy: none`` selects the no-runtime variant.
+    deployment: Annotated[
+        DeploymentManifest | NoDeploymentManifest, Field(discriminator="strategy")
+    ]
     delivery_control: dict[str, object]
     source_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
     deployment_test_commands: list[list[str]] = Field(min_length=1, max_length=20)
@@ -485,13 +511,61 @@ class ProjectManifest(EngineeringModel):
             raise ValueError("a deployment pin requires separate source and deployment repos")
         return self
 
+    @model_validator(mode="after")
+    def runtime_matches_delivery(self) -> ProjectManifest:
+        """NEW-160: a merge-only delivery is exactly the no-runtime deployment's."""
+        runtime = self.has_runtime()
+        if not runtime and (
+            self.staging_flow() is not None
+            or self.deployment_pin is not None
+            or self.ui_migration is not None
+        ):
+            raise ValueError("a project without a runtime has no staging, pin or UI migration")
+        if not runtime and self.merge_delivery() is None:
+            raise ValueError("a project without a runtime requires delivery_control.merge_delivery")
+        if runtime and "merge_delivery" in self.delivery_control:
+            raise ValueError("merge-only delivery is reserved for projects without a runtime")
+        return self
+
+    def has_runtime(self) -> bool:
+        """NEW-160: False for ``deployment.strategy: none`` (nothing to deploy or observe)."""
+        return isinstance(self.deployment, DeploymentManifest)
+
+    def runtime_deployment(self) -> DeploymentManifest:
+        """The runtime deployment contract; fails closed for a project without one."""
+        if not isinstance(self.deployment, DeploymentManifest):
+            raise ValueError("PROJECT_HAS_NO_RUNTIME")
+        return self.deployment
+
     @field_validator("delivery_control")
     @classmethod
     def typed_staging_flow(cls, value: dict[str, object]) -> dict[str, object]:
         raw = value.get("staging_flow")
         if raw is not None:
             StagingFlowPolicy.model_validate(raw)
+        merge = value.get("merge_delivery")
+        if merge is not None:
+            MergeDeliveryPolicy.model_validate(merge)
         return value
+
+    def merge_delivery(self) -> MergeDeliveryPolicy | None:
+        """NEW-160: the typed merge-only full delivery, or None when absent."""
+        raw = self.delivery_control.get("merge_delivery")
+        return MergeDeliveryPolicy.model_validate(raw) if raw is not None else None
+
+    def merge_delivery_blockers(self) -> list[str]:
+        """NEW-160: cross-check an enabled merge-only delivery against this contract."""
+        merge = self.merge_delivery()
+        if merge is None or not merge.enabled:
+            return ["MERGE_DELIVERY_DISABLED"]
+        blockers: list[str] = []
+        if self.has_runtime():
+            blockers.append("MERGE_DELIVERY_REQUIRES_NO_RUNTIME")
+        if str(self.repositories.source.full_name) != str(self.repositories.deployment.full_name):
+            blockers.append("MERGE_DELIVERY_REQUIRES_SELF_CONTAINED_REPOSITORY")
+        if merge.source_ci_workflow != self.delivery_control.get("source_ci_workflow"):
+            blockers.append("MERGE_DELIVERY_SOURCE_CI_WORKFLOW_MISMATCH")
+        return blockers
 
     def staging_flow(self) -> StagingFlowPolicy | None:
         """Return the typed post-merge staging GitOps flow, or None when absent."""
@@ -505,6 +579,8 @@ class ProjectManifest(EngineeringModel):
             return ["STAGING_FLOW_DISABLED"]
         blockers: list[str] = []
         deployment = self.deployment
+        if not isinstance(deployment, DeploymentManifest):
+            return ["STAGING_FLOW_REQUIRES_RUNTIME"]
         if deployment.strategy != "argocd":
             blockers.append("STAGING_FLOW_REQUIRES_ARGOCD_STRATEGY")
         if deployment.argocd_application != flow.argo_application:

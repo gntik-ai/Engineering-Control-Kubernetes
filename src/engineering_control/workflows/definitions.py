@@ -2411,7 +2411,7 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
 
     @workflow.run
     async def run(self, request: GitHubBacklogImportInput) -> dict[str, Any]:
-        if request.project not in {"falcone", "musematic", "llmwiki"}:
+        if request.project not in {"falcone", "musematic", "llmwiki", "gntik-ui"}:
             raise ApplicationError(
                 "existing GitHub backlog project is not allowlisted",
                 type="PolicyViolation",
@@ -2444,14 +2444,14 @@ class GitHubBacklogImportWorkflow(ControlledWorkflow):
 # NEW-145: the pull requests a publication reconciliation may read (same allowlist as
 # gitops.pr_heads).
 _PUBLICATION_PR_URL = re.compile(
-    r"https://github\.com/gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki)"
+    r"https://github\.com/gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
     r"/pull/[1-9][0-9]{0,9}"
 )
 _PUBLICATION_REPOSITORY = re.compile(
-    r"gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki)"
+    r"gntik-ai/(?:falcone|falcone-charts|musematic|musematic-deploy|llmwiki|gntik-ui)"
 )
 _PUBLICATION_BRANCH = re.compile(
-    r"agent/(?:falcone|musematic|llmwiki)/[A-Za-z0-9._-]+/[a-f0-9-]{36}"
+    r"agent/(?:falcone|musematic|llmwiki|gntik-ui)/[A-Za-z0-9._-]+/[a-f0-9-]{36}"
 )
 _AMEND_ISSUE_REPOSITORIES = frozenset(
     {
@@ -2460,6 +2460,7 @@ _AMEND_ISSUE_REPOSITORIES = frozenset(
         "gntik-ai/musematic",
         "gntik-ai/musematic-deploy",
         "gntik-ai/llmwiki",
+        "gntik-ai/gntik-ui",
     }
 )
 
@@ -2567,6 +2568,9 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
     _SCOPE_RESYNCS = 1
     # NEW-118: resources Argo CD would prune are escalated at once (Hermes never prunes).
     _PRUNE_PATCH = "gitops-argo-prune-escalation-v1"
+    # NEW-160: a project without a runtime (gntik-ui) ends at the protected merge. Checked
+    # only when gitops.prepare reports merge_only, which no earlier history recorded.
+    _MERGE_ONLY_PATCH = "gitops-merge-only-delivery-v1"
     # Tests run the real flow with short timers. Production keeps 1.0, and _timer then
     # returns the very same timedelta, so every timer command stays byte-identical.
     _TIMER_SCALE = 1.0
@@ -2716,6 +2720,15 @@ class StagingGitOpsDeliveryWorkflow(ControlledWorkflow):
                 )
         merge_sha = evidence["merge_sha"]
         merged_base = {**base, "merge_sha": merge_sha}
+        if flow.get("merge_only") is True and workflow.patched(self._MERGE_ONLY_PATCH):
+            # NEW-160: no release tag, image build, environment gate, Argo CD sync or
+            # runtime verification exists; close the delivered issue with the merge.
+            if not await self._checkpoint("GITOPS_CLOSE_ISSUE"):
+                return {"status": "CANCELLED", "blocker": "CANCELLED"}
+            closed = await self._github_write_step("gitops.close_issue", merged_base)
+            if closed.get("status") != "ISSUE_CLOSED":
+                return self._blocked(closed, "DELIVERED_ISSUE_CLOSE_FAILED")
+            return {"status": "MERGE_DELIVERED"}
 
         # 3. Release tag (optional) and the image-producing builds.
         if flow.get("release_tag_enabled"):
@@ -3401,7 +3414,7 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
         return workflow.patched("existing-backlog-blocked-start-closes-run-v1")
 
     async def _run_loop(self, request: ExistingGitHubBacklogLoopInput) -> dict[str, Any]:
-        if request.project not in {"falcone", "musematic", "llmwiki"}:
+        if request.project not in {"falcone", "musematic", "llmwiki", "gntik-ui"}:
             raise ApplicationError(
                 "existing backlog loop project is not allowlisted",
                 type="PolicyViolation",
@@ -4370,7 +4383,9 @@ class ExistingGitHubBacklogLoopWorkflow(ControlledWorkflow):
             elif staged is None:
                 staged = {"status": "BLOCKED", "blocker": "CHANGE_SET_BINDING_MISSING"}
             results.append({**staged, "stage": "staging-gitops"})
-            if staged.get("status") == "STAGING_VERIFIED":
+            # NEW-160: MERGE_DELIVERED is a merge-only child's success (no prior history
+            # recorded it, so this widening replays every earlier result unchanged).
+            if staged.get("status") in {"STAGING_VERIFIED", "MERGE_DELIVERED"}:
                 return "DONE", ""
             blocker = str(staged.get("blocker") or staged.get("status") or "STAGING_GITOPS_FAILED")
             if (

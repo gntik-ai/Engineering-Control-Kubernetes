@@ -244,9 +244,9 @@ install -d -o scan-runner -g scan-runner -m 0700 "${PLATFORM_ROOT}/mirrors"
 install -d -o root -g root -m 0711 \
   "${PLATFORM_ROOT}/worktrees" "${PLATFORM_ROOT}/runs" \
   "${PLATFORM_ROOT}/evidence" "${PLATFORM_ROOT}/cache" "${PLATFORM_ROOT}/tmp"
-for repository in falcone falcone-charts musematic musematic-deploy llmwiki \
+for repository in falcone falcone-charts musematic musematic-deploy llmwiki gntik-ui \
   gntik-ai-falcone gntik-ai-falcone-charts gntik-ai-musematic gntik-ai-musematic-deploy \
-  gntik-ai-llmwiki; do
+  gntik-ai-llmwiki gntik-ai-gntik-ui; do
   install -d -o scan-runner -g scan-runner -m 0730 \
     "${PLATFORM_ROOT}/worktrees/${repository}"
 done
@@ -280,15 +280,20 @@ RELEASE_ID=$(git -C "${SOURCE_ROOT}" rev-parse --verify HEAD) || {
 }
 RELEASE_ROOT=$(install_committed_release "${SOURCE_ROOT}" "${INSTALL_ROOT}" "${RELEASE_ID}")
 ln -sfn "${RELEASE_ROOT}/source" "${INSTALL_ROOT}/source"
-for project in falcone musematic llmwiki; do
+for project in falcone musematic llmwiki gntik-ui; do
+  install -o root -g root -m 0644 \
+    "${RELEASE_ROOT}/source/config/projects/${project}.yaml" \
+    "${CONFIG_ROOT}/projects.d/${project}.yaml"
+  # NEW-160: credentials, personas and flows exist only for projects with a runtime;
+  # gntik-ui (a UI kit, delivered by a protected merge) has none.
+  if [[ ${project} == gntik-ui ]]; then
+    continue
+  fi
   if [[ ${project} == falcone || ${project} == musematic ]]; then
     install -d -o root -g browser-runner -m 0750 "${CONFIG_ROOT}/credentials/${project}"
   else
     install -d -o root -g root -m 0711 "${CONFIG_ROOT}/credentials/${project}"
   fi
-  install -o root -g root -m 0644 \
-    "${RELEASE_ROOT}/source/config/projects/${project}.yaml" \
-    "${CONFIG_ROOT}/projects.d/${project}.yaml"
   install -o root -g root -m 0644 \
     "${RELEASE_ROOT}/source/config/personas/${project}.yaml" \
     "${CONFIG_ROOT}/personas.d/${project}.yaml"

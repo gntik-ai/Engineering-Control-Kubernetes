@@ -20,12 +20,14 @@ ORGANIZATION: Final = "gntik-ai"
 
 # mypy cannot build a Literal from a tuple, so the Literal is the source and the tuples
 # are derived from it.
-ProjectName = Literal["falcone", "musematic", "llmwiki"]
+ProjectName = Literal["falcone", "musematic", "llmwiki", "gntik-ui"]
 # Projects of the global / multi-project campaign paths (all-project audit, backlog
 # campaign id maps). A project may be registered without joining them.
 GlobalProjectName = Literal["falcone", "musematic", "llmwiki"]
 # Repository slugs (name without the organization), source then deployment per project.
-RepositorySlug = Literal["falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki"]
+RepositorySlug = Literal[
+    "falcone", "falcone-charts", "musematic", "musematic-deploy", "llmwiki", "gntik-ui"
+]
 BranchName = Literal["main", "master"]
 RepositoryFullName = Literal[
     "gntik-ai/falcone",
@@ -33,6 +35,7 @@ RepositoryFullName = Literal[
     "gntik-ai/musematic",
     "gntik-ai/musematic-deploy",
     "gntik-ai/llmwiki",
+    "gntik-ai/gntik-ui",
 ]
 
 PROJECTS: Final[tuple[ProjectName, ...]] = get_args(ProjectName)
@@ -51,6 +54,8 @@ PROJECT_REPOSITORY_SLUGS: Final[MappingProxyType[str, tuple[str, str]]] = Mappin
         "falcone": ("falcone", "falcone-charts"),
         "musematic": ("musematic", "musematic-deploy"),
         "llmwiki": ("llmwiki", "llmwiki"),
+        # NEW-160: the UI kit monorepo; delivery ends at Hermes's protected merge.
+        "gntik-ui": ("gntik-ui", "gntik-ui"),
     }
 )
 # project -> (source full name, deployment full name)
@@ -94,7 +99,7 @@ SEPARATE_DEPLOYMENT_REPOSITORY_SLUGS: Final[tuple[str, ...]] = tuple(
 )
 # Default branch of a project's source and deployment repositories.
 DEFAULT_BRANCH: Final[MappingProxyType[str, BranchName]] = MappingProxyType(
-    {"falcone": "main", "musematic": "main", "llmwiki": "master"}
+    {"falcone": "main", "musematic": "main", "llmwiki": "master", "gntik-ui": "main"}
 )
 
 

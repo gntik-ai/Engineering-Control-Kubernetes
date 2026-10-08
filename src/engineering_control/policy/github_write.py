@@ -71,6 +71,10 @@ GITHUB_ACTIVITY_STEPS = (
     | CHANGE_REQUEST_READ_ONLY_GITHUB_STEPS
 )
 WRITE_REPOSITORIES = ALLOWED_REPOSITORIES - READ_ONLY_REPOSITORIES
+# NEW-160: the write allowlist before gntik-ui joined. A policy enabled for a campaign
+# approved before that release still lists exactly these until its terminal disable
+# (scripts/reconcile-backlog-github-policy.py PREVIOUS_SAFE_REPOSITORIES).
+PREVIOUS_WRITE_REPOSITORIES = WRITE_REPOSITORIES - {"gntik-ai/gntik-ui"}
 
 
 class GitHubWriteDenialReason(StrEnum):

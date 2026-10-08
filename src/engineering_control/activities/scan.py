@@ -894,7 +894,9 @@ class ScanActivityHandler(UiPlanScanSteps):
         if project_value not in PROJECT_SET:
             raise ValueError("observer attestation project is invalid")
         manifest = self.catalog.project(project_value)
-        raw_path = Path(manifest.deployment.observer_credential_ref.removeprefix("file:"))
+        # NEW-160: fails closed (PROJECT_HAS_NO_RUNTIME) for a project without a runtime.
+        deployment = manifest.runtime_deployment()
+        raw_path = Path(deployment.observer_credential_ref.removeprefix("file:"))
         checked = datetime.now(UTC).isoformat()
         base = {
             "project": project_value,
@@ -924,17 +926,17 @@ class ScanActivityHandler(UiPlanScanSteps):
         observer = KubernetesObserver(
             self.observer_runner,
             kubeconfig=kubeconfig,
-            context=manifest.deployment.kubernetes_context_ref,
+            context=deployment.kubernetes_context_ref,
             working_directory=self.settings.run_root / "scan",
         )
         try:
-            primary_namespace = manifest.deployment.namespaces[0]
+            primary_namespace = deployment.namespaces[0]
             observer.verify_permissions(
                 (primary_namespace,), ("deployments", "statefulsets", "pods", "events")
             )
-            for namespace in manifest.deployment.namespaces[1:]:
+            for namespace in deployment.namespaces[1:]:
                 observer.verify_permissions((namespace,), ("pods", "events"))
-            if manifest.deployment.argocd_application:
+            if deployment.argocd_application:
                 observer.verify_permissions(("argocd",), ("applications.argoproj.io",))
             identity = observer.identity()
         except (CommandFailure, PermissionError, ValueError, json.JSONDecodeError):
@@ -949,8 +951,8 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "blocker_code": "OBSERVER_AUTHORIZATION_INVALID",
             }
         target_valid = (
-            identity.get("context") == manifest.deployment.kubernetes_context_ref
-            and identity.get("api_server") == manifest.deployment.api_server_identity
+            identity.get("context") == deployment.kubernetes_context_ref
+            and identity.get("api_server") == deployment.api_server_identity
         )
         return {
             **base,
@@ -1395,7 +1397,9 @@ class ScanActivityHandler(UiPlanScanSteps):
         if snapshot is None:
             raise ValueError("paired snapshot requires both repository snapshots")
         manifest = self.catalog.project(project.value)
-        raw_credential = Path(manifest.deployment.observer_credential_ref.removeprefix("file:"))
+        # NEW-160: fails closed (PROJECT_HAS_NO_RUNTIME) for a project without a runtime.
+        deployment = manifest.runtime_deployment()
+        raw_credential = Path(deployment.observer_credential_ref.removeprefix("file:"))
         try:
             kubeconfig = self._observer_credential(raw_credential)
         except (OSError, ValueError):
@@ -1408,29 +1412,29 @@ class ScanActivityHandler(UiPlanScanSteps):
                     if not raw_credential.is_file()
                     else "KUBERNETES_OBSERVER_CREDENTIAL_PERMISSIONS"
                 ),
-                "missing_credential_ref": manifest.deployment.observer_credential_ref,
+                "missing_credential_ref": deployment.observer_credential_ref,
             }
         observer = KubernetesObserver(
             self.observer_runner,
             kubeconfig=kubeconfig,
-            context=manifest.deployment.kubernetes_context_ref,
+            context=deployment.kubernetes_context_ref,
             working_directory=self.settings.run_root / "scan",
         )
-        namespace = manifest.deployment.namespaces[0]
+        namespace = deployment.namespaces[0]
         resources = ["deployments", "statefulsets", "pods", "events"]
         observer.verify_permissions((namespace,), tuple(resources))
         # The Argo CD Application lives in the Argo CD namespace, not the workload one
         # (gntik-ai/falcone#1027 review): read it there.
         argo_namespace = "argocd"
-        if manifest.deployment.strategy == "argocd":
+        if deployment.strategy == "argocd":
             flow = manifest.staging_flow()
             argo_namespace = flow.argo_namespace if flow is not None else "argocd"
             resources.append("applications.argoproj.io")
             observer.verify_permissions((argo_namespace,), ("applications.argoproj.io",))
         identity = observer.identity()
-        if identity["context"] != manifest.deployment.kubernetes_context_ref:
+        if identity["context"] != deployment.kubernetes_context_ref:
             raise PermissionError("observer Kubernetes context changed")
-        if identity["api_server"] != manifest.deployment.api_server_identity:
+        if identity["api_server"] != deployment.api_server_identity:
             raise PermissionError("observer API server identity changed")
         summaries: dict[str, Any] = {}
         revisions: set[str] = set()
@@ -1439,11 +1443,7 @@ class ScanActivityHandler(UiPlanScanSteps):
         pod_names: list[str] = []
         helm_revisions: set[int] = set()
         for resource in resources:
-            name = (
-                manifest.deployment.argocd_application
-                if resource == "applications.argoproj.io"
-                else None
-            )
+            name = deployment.argocd_application if resource == "applications.argoproj.io" else None
             resource_namespace = (
                 argo_namespace if resource == "applications.argoproj.io" else namespace
             )
@@ -1453,7 +1453,7 @@ class ScanActivityHandler(UiPlanScanSteps):
             summary = self._summarize_runtime_resource(
                 resource,
                 observed,
-                revision_annotation=manifest.deployment.deployment_revision_annotation,
+                revision_annotation=deployment.deployment_revision_annotation,
             )
             summaries[resource] = summary
             revisions.update(summary["revisions"])
@@ -1461,11 +1461,9 @@ class ScanActivityHandler(UiPlanScanSteps):
             failures.extend(summary["failures"])
             if resource == "pods":
                 pod_names.extend(summary["names"][:3])
-            if manifest.deployment.helm_release_revision_annotation:
+            if deployment.helm_release_revision_annotation:
                 helm_revisions.update(
-                    self._integer_annotations(
-                        observed, manifest.deployment.helm_release_revision_annotation
-                    )
+                    self._integer_annotations(observed, deployment.helm_release_revision_annotation)
                 )
         logs = self._bounded_redacted_logs(observer, namespace, pod_names)
         intended_revision = str(snapshot["deployment_sha"])
@@ -1491,7 +1489,7 @@ class ScanActivityHandler(UiPlanScanSteps):
                 "kubernetes_identity": identity,
                 "workload_observation": summaries,
             }
-        if manifest.deployment.strategy == "helm" and len(helm_revisions) != 1:
+        if deployment.strategy == "helm" and len(helm_revisions) != 1:
             return {
                 **payload,
                 "status": "BLOCKED",
@@ -1504,13 +1502,11 @@ class ScanActivityHandler(UiPlanScanSteps):
                 f"image-{index}": digest for index, digest in enumerate(sorted(image_digests), 1)
             },
             "helm_release_revision": next(iter(helm_revisions), None),
-            "argocd_revision": (
-                deployed_revision if manifest.deployment.strategy == "argocd" else None
-            ),
+            "argocd_revision": (deployed_revision if deployment.strategy == "argocd" else None),
             "kubernetes_context_identity": str(identity["username"]),
             "api_server_identity": str(identity["api_server"]),
             "namespace": namespace,
-            "runtime_url": str(manifest.deployment.runtime_url),
+            "runtime_url": str(deployment.runtime_url),
             "deployed_revision": deployed_revision,
         }
         pair = ProjectPairSnapshot.model_validate(

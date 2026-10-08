@@ -49,6 +49,12 @@ def test_project_delivery_controls_are_strict_and_match_discovered_reality() -> 
             (ROOT / "config" / "projects" / f"{project.value}.yaml").read_text(encoding="utf-8")
         )
         assert value["project"] == project.value
+        if project is Project.GNTIK_UI:
+            # NEW-160: no runtime: a merge-only delivery, never the candidate pipeline.
+            assert value["delivery_control"]["merge_delivery"]["enabled"] is True
+            with pytest.raises(ValueError):
+                DeliveryControlPolicy.model_validate(value["delivery_control"])
+            continue
         policies[project] = DeliveryControlPolicy.model_validate(value["delivery_control"])
     assert policies[Project.FALCONE].source_ci_workflow == "ci"
     assert policies[Project.FALCONE].candidate_build.enabled is False

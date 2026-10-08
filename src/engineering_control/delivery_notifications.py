@@ -33,6 +33,8 @@ MILESTONE_EVENTS = frozenset(
         "CI_REPAIR_STARTED",
         "PRS_MERGED",
         "STAGING_VERIFIED",
+        # NEW-160: a project without a runtime (gntik-ui) is delivered by the merge.
+        "MERGE_DELIVERED",
         "DELIVERY_BLOCKED",
         "STAGING_BLOCKED",
         # NEW-123: UI migration flow A milestones.
@@ -108,6 +110,18 @@ BLOCKER_EXPLANATIONS: dict[str, str] = {
     "SOURCE_PR_CI_REGRESSION": "the source PR's CI fails checks that pass on main",
     "DEPLOYMENT_PR_CI_REGRESSION": "the deployment PR's CI fails checks that pass on main",
     "SOURCE_PR_CI_FAILED": "the source PR's CI failed",
+    # NEW-160: merge-only delivery (projects without a runtime, e.g. gntik-ui).
+    "CHANGESET_MISSING": (
+        "the PR changes a published package but carries no .changeset/*.md; add one with a "
+        "backlog-retry correction or skip the issue"
+    ),
+    "MERGE_DELIVERY_PROTECTED_PATH_CHANGED": (
+        "the PR touches a protected path (CI configuration); Hermes never merges it"
+    ),
+    "MERGE_DELIVERY_FILE_LISTING_TRUNCATED": (
+        "the PR's file list reached GitHub's cap, so the changeset and protected-path "
+        "rules cannot be proven"
+    ),
     "DEPLOYMENT_PR_CI_FAILED": "the deployment PR's CI failed",
     "SOURCE_PR_CI_TIMEOUT": "the source PR's CI did not finish within its bound",
     "DEPLOYMENT_PR_CI_TIMEOUT": "the deployment PR's CI did not finish within its bound",
@@ -525,6 +539,7 @@ def enqueue_milestone(
         "CI_REPAIR_STARTED": "CI repair started",
         "PRS_MERGED": "PRs merged",
         "STAGING_VERIFIED": "STAGING_VERIFIED",
+        "MERGE_DELIVERED": "MERGE_DELIVERED",
         "DELIVERY_BLOCKED": "delivery BLOCKED",
         "STAGING_BLOCKED": "staging delivery BLOCKED",
         "UI_BLUEPRINT_READY": "UI blueprint ready for approval",

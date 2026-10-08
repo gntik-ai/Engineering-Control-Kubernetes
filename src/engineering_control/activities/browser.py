@@ -593,7 +593,7 @@ class BrowserActivityHandler:
                 ) as (credentials, credential_path):
                     plan_value = self._browser_plan(
                         ordered,
-                        str(manifest.deployment.runtime_url),
+                        str(manifest.runtime_deployment().runtime_url),
                         str(manifest.api_url),
                         campaign_id,
                         credentials,
