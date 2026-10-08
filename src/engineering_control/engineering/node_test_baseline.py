@@ -5,16 +5,18 @@ project without a contract (falcone) therefore blocked forever on a maker FAIL i
 suite that already fails on main (#978: tests/integration/098-plan-base-limits fails 9
 of 16 on main with "Unhandled fake SQL").
 
-This module is pure: a strict parser for one allowlisted invocation shape, a Python
-glob expansion against a checkout, the reporter the scan worker controls, the parser of
-its output, the bubblewrap argument vector the scan worker runs it in, and the subset
-rule. Anything it does not accept returns None, which keeps MAKER_TEST_FAILURE.
+This module is pure: a strict parser for one allowlisted invocation shape, a bounded
+non-following glob expansion against a checkout, the reporter the scan worker controls,
+the parser of its output and the bubblewrap argument vector the scan worker runs it in.
+Review 1: only the BASE (trusted main code) is ever executed; maker-authored head code
+never runs in the scan worker. Anything not accepted returns None (MAKER_TEST_FAILURE).
 """
 
 from __future__ import annotations
 
-import glob
+import fnmatch
 import json
+import os
 import re
 import shlex
 from collections import Counter
@@ -24,40 +26,55 @@ from pathlib import Path
 # Bounds (the scan worker also bounds the number of commands and the run time).
 MAX_PATH_ARGUMENTS = 32
 MAX_TEST_FILES = 400
-MAX_REPORT_BYTES = 16 * 1024 * 1024
+MAX_GLOB_VISITS = 20_000
+MAX_REPORT_BYTES = 4 * 1024 * 1024
 MAX_FAILING_TESTS = 5000
 EVIDENCE_TEST_NAMES = 50
 EVIDENCE_NAME_CHARS = 200
+# The sandbox's only writable mount: a size-capped tmpfs (no host filesystem is writable).
+SANDBOX_TMPFS_BYTES = 256 * 1024 * 1024
 
-# Inside the sandbox: the checkout is an overlay at /work (writes are discarded), so
-# reported file paths are identical for the base and the head run.
+# Inside the sandbox the base checkout is read-only at /work, so reported file paths
+# do not depend on where the scan worker keeps its checkout.
 SANDBOX_WORKTREE = "/work"
-SANDBOX_CONTROL = "/run/hermes-node-test"
-SANDBOX_REPORTER = f"{SANDBOX_CONTROL}/reporter.mjs"
-SANDBOX_OUTPUT = f"{SANDBOX_CONTROL}/out"
-SANDBOX_REPORT = f"{SANDBOX_OUTPUT}/report.jsonl"
-SANDBOX_TMP = "/tmp"  # noqa: S108 - a private tmpfs inside the sandbox, never the host's
+SANDBOX_REPORTER = "/run/hermes-node-test/reporter.mjs"
+SANDBOX_TMP = "/tmp"  # noqa: S108 - a private size-capped tmpfs inside the sandbox
+NONCE_VARIABLE = "HERMES_NODE_TEST_NONCE"
 
-REPORTER_VERSION = 1
-# One JSON line per finished test, written to a file the test code never prints to.
-# skip/todo are not failures (node:test does not fail the run for them either).
+REPORTER_VERSION = 2
+# Buffers one JSON line per failed test and prints them, between nonce markers, to
+# stdout when the run ends (so the block survives a bounded output tail). It keeps what
+# separates a test failure from a file-level one (import, syntax, process exit, hooks).
 REPORTER_SOURCE = """\
-// Hermes NEW-161 node:test reporter v1 (scan worker, pre-existing failure baseline).
+// Hermes NEW-161 node:test reporter v2 (scan worker, base-only pre-existing baseline).
 export default async function* hermesReporter(source) {
+  const nonce = process.env.HERMES_NODE_TEST_NONCE ?? '';
+  const lines = [];
+  let passed = 0;
+  let truncated = false;
   for await (const event of source) {
     if (event.type !== 'test:pass' && event.type !== 'test:fail') continue;
     const data = event.data ?? {};
     if (data.skip || data.todo) continue;
-    yield JSON.stringify({
-      hermes: 1,
-      event: event.type === 'test:fail' ? 'fail' : 'pass',
-      name: String(data.name ?? ''),
+    if (event.type === 'test:pass') { passed += 1; continue; }
+    if (lines.length >= 5000) { truncated = true; continue; }
+    const error = data.details?.error;
+    lines.push(JSON.stringify({
+      name: String(data.name ?? '').slice(0, 500),
       nesting: Number.isInteger(data.nesting) ? data.nesting : 0,
-      file: typeof data.file === 'string' ? data.file : null,
-    }) + '\\n';
+      file: typeof data.file === 'string' ? data.file.slice(0, 1000) : null,
+      type: data.details?.type === 'suite' ? 'suite' : 'test',
+      failure: typeof error?.failureType === 'string' ? error.failureType : null,
+      error_cause: error?.cause instanceof Error ? 'error' : typeof error?.cause,
+    }));
   }
+  yield `${nonce} BEGIN ${JSON.stringify({ hermes: 2, passed, truncated })}\\n`;
+  for (const line of lines) yield `${nonce} FAIL ${line}\\n`;
+  yield `${nonce} END ${lines.length}\\n`;
 }
 """
+# node:test failure types that a test body (not its file, process or hooks) produced.
+_TEST_LEVEL_FAILURES = frozenset({"testCodeFailure", "testTimeoutFailure"})
 
 # Characters that never appear in an accepted command, quoted or not: we never use a
 # shell, but a command that needs one is not the plain invocation this exemption covers.
@@ -193,32 +210,61 @@ def parse_node_test_command(
     return NodeTestCommand(cwd, tuple(flags), tuple(paths))
 
 
-def expand_test_paths(checkout: Path, command: NodeTestCommand) -> list[str] | None:
-    """Expand the paths in Python against one checkout (never a shell).
+def _walk(
+    directory: Path, segments: list[str], prefix: str, found: list[str], visits: list[int]
+) -> bool:
+    """Match one segment per level; never follows a symlink. False aborts the expansion."""
+    if not segments:
+        return True
+    segment, rest = segments[0], segments[1:]
+    try:
+        with os.scandir(directory) as entries:
+            listed = sorted(entries, key=lambda entry: entry.name)
+    except OSError:
+        return False
+    for entry in listed:
+        visits[0] += 1
+        if visits[0] > MAX_GLOB_VISITS:
+            return False
+        if entry.name.startswith(".") or not fnmatch.fnmatchcase(entry.name, segment):
+            continue
+        if entry.is_symlink():
+            return False  # a symlinked file or directory is never expanded
+        relative = f"{prefix}{entry.name}"
+        if rest:
+            if entry.is_dir(follow_symlinks=False) and not _walk(
+                Path(entry.path), rest, f"{relative}/", found, visits
+            ):
+                return False
+        elif entry.is_file(follow_symlinks=False) and _FILE.fullmatch(relative):
+            if relative not in found:
+                found.append(relative)
+                if len(found) > MAX_TEST_FILES:
+                    return False
+    return True
 
-    Returns the sorted, de-duplicated files relative to the cwd, or None when a path
-    matches nothing, leaves the checkout, or the bound is exceeded.
+
+def expand_test_paths(checkout: Path, command: NodeTestCommand) -> list[str] | None:
+    """Expand the paths in Python against one checkout (never a shell, never a symlink).
+
+    A bounded, non-following walk: returns the matched files relative to the cwd, or None
+    when a path matches nothing, meets a symlink, or a visit/file bound is exceeded.
     """
-    root = checkout.resolve()
-    base = (root / command.cwd).resolve()
-    if not base.is_relative_to(root) or not base.is_dir():
+    base = checkout
+    if command.cwd != ".":
+        for part in command.cwd.split("/"):
+            base = base / part
+            if base.is_symlink() or not base.is_dir():
+                return None
+    if checkout.is_symlink() or not checkout.is_dir():
         return None
     files: list[str] = []
+    visits = [0]
     for pattern in command.paths:
-        matches = sorted(glob.glob(pattern, root_dir=base))  # hidden entries excluded
-        if not any(character in pattern for character in "*?"):
-            matches = [pattern] if (base / pattern).is_file() else []
-        selected = [
-            match
-            for match in matches
-            if _FILE.fullmatch(match)
-            and not _has_dot_segment(match)
-            and (base / match).is_file()
-            and (base / match).resolve().is_relative_to(root)
-        ]
-        if not selected:
+        matched: list[str] = []
+        if not _walk(base, pattern.split("/"), "", matched, visits) or not matched:
             return None
-        files.extend(item for item in selected if item not in files)
+        files.extend(item for item in matched if item not in files)
         if len(files) > MAX_TEST_FILES:
             return None
     return files
@@ -226,50 +272,81 @@ def expand_test_paths(checkout: Path, command: NodeTestCommand) -> list[str] | N
 
 @dataclass(frozen=True)
 class NodeTestReport:
-    failing: Counter[str]
+    """Failures at one run: test-level (in a targeted file) vs everything else."""
+
+    test_failures: Counter[str]
+    other_failures: Counter[str]
     passed: int
 
 
-def parse_reporter_output(text: str) -> NodeTestReport | None:
-    """The reporter's JSON lines -> failing test identities; None when malformed.
+def parse_reporter_output(
+    text: str, nonce: str, files: list[str], cwd: str
+) -> NodeTestReport | None:
+    """The reporter block for this run's nonce -> classified failures; None when malformed.
 
-    A test identity is ``<file relative to the checkout>#<nesting>: <name>`` so equal
-    names in different files (or nesting levels) never mask each other; the multiset
-    comparison also keeps duplicate identities apart.
+    A test identity is ``<file relative to the checkout>#<nesting>: <name>``. A failure is
+    test-level only if a test (not a suite) body failed (testCodeFailure or
+    testTimeoutFailure) in one of the files the command targets; file-level failures
+    (import, syntax, process exit: reported under the file's own path), hook failures,
+    suites and failures outside the targeted files are "other".
     """
-    failing: Counter[str] = Counter()
-    passed = 0
-    for line in text.splitlines():
-        if not line.strip():
-            continue
+    lines = text.splitlines()
+    begin = f"{nonce} BEGIN "
+    starts = [index for index, line in enumerate(lines) if line.startswith(begin)]
+    if len(starts) != 1 or not nonce:
+        return None
+    try:
+        summary = json.loads(lines[starts[0]][len(begin) :])
+    except ValueError:
+        return None
+    if (
+        not isinstance(summary, dict)
+        or summary.get("hermes") != REPORTER_VERSION
+        or not isinstance(summary.get("passed"), int)
+        or summary.get("truncated") is not False
+    ):
+        return None
+    root = f"{SANDBOX_WORKTREE}/"
+    targeted = {f"{root}{item}" if cwd == "." else f"{root}{cwd}/{item}" for item in files}
+    file_names = set(files) | {path[len(root) :] for path in targeted} | targeted
+    test_failures: Counter[str] = Counter()
+    other_failures: Counter[str] = Counter()
+    count = 0
+    for line in lines[starts[0] + 1 :]:
+        if line == f"{nonce} END {count}":
+            return NodeTestReport(test_failures, other_failures, summary["passed"])
+        if not line.startswith(f"{nonce} FAIL "):
+            continue  # test output interleaved with the block (isolation=none)
         try:
-            record = json.loads(line)
+            record = json.loads(line[len(nonce) + 6 :])
         except ValueError:
             return None
         if (
             not isinstance(record, dict)
-            or record.get("hermes") != REPORTER_VERSION
-            or record.get("event") not in {"pass", "fail"}
             or not isinstance(record.get("name"), str)
             or not isinstance(record.get("nesting"), int)
             or not (record.get("file") is None or isinstance(record.get("file"), str))
+            or record.get("type") not in {"test", "suite"}
+            or not (record.get("failure") is None or isinstance(record.get("failure"), str))
         ):
             return None
-        if record["event"] == "pass":
-            passed += 1
-            continue
-        file = record["file"] or ""
-        if file == SANDBOX_WORKTREE or file.startswith(f"{SANDBOX_WORKTREE}/"):
-            file = file[len(SANDBOX_WORKTREE) + 1 :]
-        failing[f"{file}#{record['nesting']}: {record['name']}"] += 1
-        if sum(failing.values()) > MAX_FAILING_TESTS:
+        count += 1
+        if count > MAX_FAILING_TESTS:
             return None
-    return NodeTestReport(failing, passed)
-
-
-def regressions(base: Counter[str], head: Counter[str]) -> list[str]:
-    """Head failures not covered by base failures (multiset difference)."""
-    return sorted((head - base).elements())
+        file = record["file"]
+        relative = file[len(root) :] if isinstance(file, str) and file.startswith(root) else ""
+        identity = f"{relative}#{record['nesting']}: {record['name']}"
+        if (
+            file in targeted
+            and record["type"] == "test"
+            and record["failure"] in _TEST_LEVEL_FAILURES
+            and not (record["nesting"] == 0 and record["name"] in file_names)
+            and record.get("error_cause") != "string"
+        ):
+            test_failures[identity] += 1
+        else:
+            other_failures[identity] += 1
+    return None  # no END marker: truncated or interrupted
 
 
 def bounded_names(failing: Counter[str]) -> list[str]:
@@ -306,16 +383,20 @@ def sandbox_argv(
     files: list[str],
     node: Path,
     reporter: Path,
-    output: Path,
+    nonce: str,
     variables: dict[str, str],
 ) -> list[str]:
-    """bubblewrap arguments: no network, read-only system, checkout as a discarded overlay.
+    """bubblewrap arguments: no network, everything read-only but a size-capped /tmp.
 
-    ``node`` must be the resolved executable; its installation is bound read-only.
+    The base checkout is bound read-only; the report goes to stdout between nonce
+    markers, so no host path is writable. ``node`` must be the resolved executable; its
+    installation is bound read-only.
     """
-    for path in (checkout, node, reporter, output):
-        if not path.is_absolute() or any(character in str(path) for character in ":,\n"):
+    for path in (checkout, node, reporter):
+        if not path.is_absolute() or "\n" in str(path):
             raise ValueError(f"node test sandbox path {path} is not a plain absolute path")
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise ValueError("node test report nonce must be 32 hex characters")
     installation = node.parent.parent
     binds: list[str] = []
     if not node.is_relative_to("/usr"):
@@ -329,6 +410,7 @@ def sandbox_argv(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         **variables,
+        NONCE_VARIABLE: nonce,
     }
     setenv: list[str] = []
     for key, value in sorted(environment.items()):
@@ -344,18 +426,20 @@ def sandbox_argv(
         "/proc",
         "--dev",
         "/dev",
+        "--size",
+        str(SANDBOX_TMPFS_BYTES),
         "--tmpfs",
         SANDBOX_TMP,
         "--ro-bind",
         str(reporter),
         SANDBOX_REPORTER,
-        "--bind",
-        str(output),
-        SANDBOX_OUTPUT,
-        "--overlay-src",
+        "--ro-bind",
         str(checkout),
-        "--tmp-overlay",
         SANDBOX_WORKTREE,
+        "--remount-ro",
+        "/dev",
+        "--remount-ro",
+        "/",
         "--chdir",
         cwd,
         "--clearenv",
@@ -365,6 +449,6 @@ def sandbox_argv(
         "--test",
         *command.flags,
         f"--test-reporter={SANDBOX_REPORTER}",
-        f"--test-reporter-destination={SANDBOX_REPORT}",
+        "--test-reporter-destination=stdout",
         *files,
     ]

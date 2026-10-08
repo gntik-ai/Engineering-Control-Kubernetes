@@ -116,9 +116,9 @@ class Settings(BaseSettings):
     python312_executable: Path = Path("/usr/local/bin/python3.12")
     # NEW-49: contract test commands are wrapped in coreutils timeout (NEW-46).
     timeout_executable: Path = Path("/usr/bin/timeout")
-    # NEW-161: a maker-chosen `node --test` suite is rerun at the base and the head in a
-    # bubblewrap sandbox (no network, read-only system, discarded checkout overlay); its
-    # paths must start with one of these prefixes (relative to the command's cwd).
+    # NEW-161: a maker-chosen `node --test` suite is rerun at the BASE only, in a
+    # bubblewrap sandbox (no network, read-only system and checkout, size-capped /tmp);
+    # its paths must start with one of these prefixes (relative to the command's cwd).
     bwrap_executable: Path = Path("/usr/bin/bwrap")
     node_test_path_prefixes: tuple[str, ...] = ("tests/", "test/")
     # Must sit under the scan worker unit's ReadWritePaths (/srv/engineering/cache/%i).
