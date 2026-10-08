@@ -1387,7 +1387,8 @@ def _probe_targets() -> dict[str, TypeAdapter[Any]]:
     targets: dict[str, TypeAdapter[Any]] = {}
     for key, model in _models(_package_modules()):
         for name, field in model.model_fields.items():
-            if _PROBE_NAME.search(name):
+            # Review 4: catalog fields with other names (e.g. full_name) are probed too.
+            if _PROBE_NAME.search(name) or f"{key}.{name}" in PATTERN_SITES:
                 targets[f"{key}.{name}"] = TypeAdapter(field.rebuild_annotation())
     app = create_app(settings=Settings(), token="x" * 32)
     for route in app.routes:
@@ -1396,7 +1397,10 @@ def _probe_targets() -> dict[str, TypeAdapter[Any]]:
             continue
         for parameter in [*dependant.query_params, *dependant.path_params]:
             if _PROBE_NAME.search(parameter.name):
-                key = f"api:{getattr(route, 'path', '?')}:{parameter.name}"
+                # Review 4: the method is part of the key, so GET and POST never collide.
+                methods = ",".join(sorted(getattr(route, "methods", None) or ()))
+                key = f"api:{methods}:{getattr(route, 'path', '?')}:{parameter.name}"
+                assert key not in targets, f"duplicate probe key {key}"
                 targets[key] = TypeAdapter(parameter.field_info.rebuild_annotation())
     return targets
 
@@ -1428,6 +1432,28 @@ def test_project_and_repository_fields_reject_rogue_names() -> None:
     ],
 )
 def test_behaviour_probe_catches_mutations(annotation: Any, key: str) -> None:
+    targets = _probe_targets()
+    targets[key] = TypeAdapter(annotation)
+    assert f"{key}: accepts a rogue name" in _probe_failures(targets)
+
+
+def test_behaviour_probe_covers_every_route_and_catalog_field() -> None:
+    targets = _probe_targets()
+    assert "api:GET:/v1/r3-issues/candidate:project" in targets
+    assert "engineering.models:RepositoryManifest.full_name" in targets
+
+
+@pytest.mark.parametrize(
+    ("key", "annotation"),
+    [
+        (
+            "api:GET:/v1/r3-issues/candidate:project",
+            Annotated[str, StringConstraints(pattern=rf"^({PROJECT_ALTERNATION})")],
+        ),
+        ("engineering.models:RepositoryManifest.full_name", str),
+    ],
+)
+def test_behaviour_probe_catches_review_4_mutations(key: str, annotation: Any) -> None:
     targets = _probe_targets()
     targets[key] = TypeAdapter(annotation)
     assert f"{key}: accepts a rogue name" in _probe_failures(targets)
